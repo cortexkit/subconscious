@@ -34,6 +34,7 @@ use std::{error::Error, fmt};
 use serde::{Deserialize, Serialize};
 
 pub mod manifest;
+pub mod session;
 
 /// Envelope protocol version this build speaks.
 pub const PROTOCOL_VERSION: u8 = 1;

@@ -54,7 +54,7 @@ development_status:
   # ---------- Epic 2: Concurrent tool execution (the headline) ----------
   epic-2: backlog
   2-1-concurrent-in-flight-out-of-order: backlog             # + per-channel FIFO delivery-order AC
-  2-2-cross-session-concurrency: backlog                     # headline demo, independent of AFT Leg 2
+  2-2-cross-session-concurrency: done                        # merged 9ab20e4 (PROOF: subc-core UNCHANGED — fast=86µs while slow=500ms; design already delivers it). Concurrent-module stub substrate (writer-task + delay-spawn) built for 2.3/2.4 reuse. 67 tests.
   2-3-request-cancellation: backlog                          # + cancel/response race + idempotency
   2-4-per-channel-flow-control-window: backlog               # + multi-channel no-starvation
   2-5-liveness-status-from-cache: backlog                    # + status-cache population protocol

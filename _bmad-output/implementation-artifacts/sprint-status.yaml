@@ -36,8 +36,8 @@ development_status:
   1-1-freeze-the-subc-aft-contract-story-zero: in-progress      # incl. Spike A (recorded real-AFT trace) + command->frame mapping gate + crate repo home
   1-0-daemon-bootstrap-discovery-singleton: backlog          # per-user socket, race-free singleton, conflict guard
   1-2-daemon-absent-fallback: backlog
-  1-3-wire-envelope-codec: backlog
-  1-4-socket-transport-splice-router-mux-ready: backlog
+  1-3-wire-envelope-codec: done                              # envelope codec in subc-protocol (baseline commit)
+  1-4-socket-transport-splice-router-mux-ready: done         # merged e304851 (27 tests green)
   1-5-process-supervision-fake-aft-stub: backlog             # + module-death mid-mutation AC
   1-6-hello-capability-manifest-registration: backlog        # + channel lifecycle/GOODBYE + version floor
   1-7-dual-scope-identity: backlog                           # + ProjectRootId canonicalization edge cases

@@ -1,0 +1,10 @@
+[package]
+name = "subc-protocol"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Shared wire contract for subc <-> modules: the 17-byte envelope, JSON-RPC body shapes, and the capability manifest. Single source of truth, depended on by subc-core and AFT."
+
+[dependencies]
+# Envelope is pure std (no deps) by design — it is the splice-router hot path.
+# serde + serde_json are added when the JSON-RPC body shapes + manifest schema land (Story 1.1 AC1).

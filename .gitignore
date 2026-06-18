@@ -1,0 +1,13 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Commit Cargo.lock (this workspace builds the subc-core binary).
+
+.DS_Store
+
+# Agent runtime + local tooling installs (reinstallable, not project deliverables)
+/.alfonso
+/.opencode
+/.agents
+/_bmad

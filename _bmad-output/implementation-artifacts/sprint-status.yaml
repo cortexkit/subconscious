@@ -1,0 +1,73 @@
+# generated: 2026-06-18
+# last_updated: 2026-06-18 (story 1-1 created)
+# project: subconscious
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:    backlog -> in-progress -> done
+# Story Status:   backlog -> ready-for-dev -> in-progress -> review -> done
+# Retrospective:  optional <-> done
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic -> in-progress automatically when its first story is created (create-story).
+# - Stories can run in parallel if file ownership / task boundaries are separable
+#   (subc-core stories vs the TS plugin client vs the fake-AFT stub are good parallel seams).
+# - Story 1-1 (contract freeze / Story Zero, incl. Spike A) is the precondition for ALL others.
+# - Cross-track gates (not subc stories, do not block siblings):
+#     1-9 (e2e real AFT) -> AFT Leg 1;  2-6 (within-root parallelism) -> AFT Leg 2.
+# - Addendum ACs (epics.md "v1 Hardening" + "Council review") fold into each story's
+#   acceptance criteria at the story-file (create-story) stage; numbering here is the
+#   clean monotonic target sequence.
+
+generated: 2026-06-18
+last_updated: 2026-06-18
+project: subconscious
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  # ---------- Epic 1: AFT through subc + cross-instance dedup (the spine) ----------
+  epic-1: in-progress
+  1-1-freeze-the-subc-aft-contract-story-zero: in-progress      # incl. Spike A (recorded real-AFT trace) + command->frame mapping gate + crate repo home
+  1-0-daemon-bootstrap-discovery-singleton: backlog          # per-user socket, race-free singleton, conflict guard
+  1-2-daemon-absent-fallback: backlog
+  1-3-wire-envelope-codec: backlog
+  1-4-socket-transport-splice-router-mux-ready: backlog
+  1-5-process-supervision-fake-aft-stub: backlog             # + module-death mid-mutation AC
+  1-6-hello-capability-manifest-registration: backlog        # + channel lifecycle/GOODBYE + version floor
+  1-7-dual-scope-identity: backlog                           # + ProjectRootId canonicalization edge cases
+  1-8-async-push-forwarding: backlog                         # + misroute/closed-channel + PUSH flow control
+  1-8b-typescript-mode-2-plugin-client: backlog             # harness-facing half of mode 2; gates 1-9
+  1-9-e2e-real-aft-opencode: backlog                         # GATE: AFT Leg 1; + hoisting fidelity AC
+  1-10-cross-instance-dedup-close: backlog                   # felt win; + session-isolation-under-sharing AC
+  1-11-latency-gate: backlog                                 # round-trip vs NDJSON baseline, regression gate
+  epic-1-retrospective: optional
+
+  # ---------- Epic 2: Concurrent tool execution (the headline) ----------
+  epic-2: backlog
+  2-1-concurrent-in-flight-out-of-order: backlog             # + per-channel FIFO delivery-order AC
+  2-2-cross-session-concurrency: backlog                     # headline demo, independent of AFT Leg 2
+  2-3-request-cancellation: backlog                          # + cancel/response race + idempotency
+  2-4-per-channel-flow-control-window: backlog               # + multi-channel no-starvation
+  2-5-liveness-status-from-cache: backlog                    # + status-cache population protocol
+  2-6-within-root-parallelism: backlog                       # GATE: AFT Leg 2 (felt-headline critical path)
+  epic-2-retrospective: optional
+
+  # ---------- Epic 3: Any MCP harness (coverage) ----------
+  epic-3: backlog
+  3-0-spike-mcp-facade-transform-trace: backlog              # Spike B: validates "framing-only" before 3-1
+  3-1-classic-mcp-facade: backlog
+  3-2-verify-third-harness-e2e: backlog                      # v1-done bar (>=1 harness beyond OC/Pi)
+  epic-3-retrospective: optional
+
+  # ---------- Epic 4: Live updates & standalone resilience (robustness) ----------
+  epic-4: backlog
+  4-1-hot-swap-aft-binary-drain-to-quiescence: backlog       # scope-cut: drain-to-quiescence (zero-pause -> v1.1)
+  4-2-nested-child-process-cleanup: backlog                  # + manifest re-read / unknown_tool
+  4-3-daemon-death-mid-session-recovery: backlog             # + two-writer/split-brain mutual exclusion
+  epic-4-retrospective: optional

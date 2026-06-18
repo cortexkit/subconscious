@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use subc_protocol::{
-    manifest::ModuleManifest, ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
+    manifest::{Concurrency, ModuleManifest, ProviderRole},
+    ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
 };
 use tracing::{debug, warn};
 
@@ -272,10 +273,12 @@ impl ControlHandler {
             };
 
         if let Some(sink) = sink {
+            let concurrency = manifest_concurrency(&registration.manifest);
             if let Err(err) = self.forwarding.register_module_connection(
                 connection_id,
                 registration.manifest.module_id.clone(),
                 negotiated_ver,
+                concurrency,
                 sink,
             ) {
                 let _ = self.registry.deregister_connection(connection_id);
@@ -525,6 +528,19 @@ impl Default for ControlHandler {
     fn default() -> Self {
         Self::new(Arc::new(Registry::default()))
     }
+}
+
+fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {
+    manifest
+        .provides
+        .iter()
+        .find_map(|provider| match provider {
+            ProviderRole::ToolProvider { concurrency, .. } => Some(concurrency.clone()),
+            ProviderRole::PipelineStage { .. }
+            | ProviderRole::ManagementSurface { .. }
+            | ProviderRole::InternalService { .. } => None,
+        })
+        .unwrap_or(Concurrency::ModuleManaged)
 }
 
 fn negotiate_version(peer_version: u8) -> Result<u8, String> {

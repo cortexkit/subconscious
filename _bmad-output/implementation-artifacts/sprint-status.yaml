@@ -53,7 +53,7 @@ development_status:
 
   # ---------- Epic 2: Concurrent tool execution (the headline) ----------
   epic-2: backlog
-  2-1-concurrent-in-flight-out-of-order: backlog             # + per-channel FIFO delivery-order AC
+  2-1-concurrent-in-flight-out-of-order: done                # merged 7d470e8 (same-channel out-of-order by corr closeout). Concurrent-in-flight + out-of-order proven WITHIN (2.1) + ACROSS (2.2) channels; declared-concurrency honored (2.4 serial->1). 70 tests.
   2-2-cross-session-concurrency: done                        # merged 9ab20e4 (PROOF: subc-core UNCHANGED — fast=86µs while slow=500ms; design already delivers it). Concurrent-module stub substrate (writer-task + delay-spawn) built for 2.3/2.4 reuse. 67 tests.
   2-3-request-cancellation: done                             # merged ca741d7 (DUMB-FORWARD, Oracle bg_cd286aa5): subc-core PRODUCTION UNCHANGED, module owns terminal via claim-under-lock. 5 race-matrix tests (cancel-before/after, double-cancel, uncancellable-completion, unknown-channel). 65 tests.
   2-4-per-channel-flow-control-window: done                  # merged 0b223a7. FIRST real Epic-2 subc-core mechanism: ChannelFlow credit counter (type-byte only, thin-core held), window from manifest concurrency (serial->1 ENFORCED, module_managed->32, stateless->1024). CANCEL bypass, over-release guard, teardown-wakes-waiters (no hang), no credit leak. 4 real tests. 69 tests. Honest: no full same-socket cross-channel fairness (later scheduler story).

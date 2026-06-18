@@ -118,6 +118,8 @@ dependencies = [
 name = "subc-core"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "subc-protocol",
  "tokio",
 ]

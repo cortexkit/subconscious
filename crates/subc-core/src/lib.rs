@@ -6,12 +6,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod control;
 mod frame;
 pub mod frame_io;
+pub mod registry;
 pub mod router;
 pub mod server;
 
+pub use control::{
+    ControlHandler, HelloAckBody, HelloBody, SubcSelfHandler, MIN_SUPPORTED_VERSION,
+};
 pub use frame::{Frame, FrameBuildError};
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};
-pub use router::{Backend, EchoBackend, Router, RouterError, SubcSelfHandler};
+pub use registry::{ChannelState, ConnectionId, ModuleRegistration, Registry, RegistryError};
+pub use router::{Backend, EchoBackend, Router, RouterConnection, RouterError};
 pub use server::{handle_connection, serve_listener, serve_uds, ConnectionError, ServerError};

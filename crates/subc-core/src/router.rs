@@ -1,8 +1,16 @@
-use std::{collections::HashMap, error::Error, fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use subc_protocol::{Flags, FrameType, Priority};
 
-use crate::{Frame, FrameBuildError};
+use crate::{control::ControlHandler, registry::ConnectionId, Frame, FrameBuildError};
 
 /// A destination that can receive an opaque envelope body for a routed channel.
 ///
@@ -20,19 +28,34 @@ pub trait Backend: Send + Sync {
 /// the socket layer may translate that into an `ERROR` frame for the peer.
 pub struct Router {
     backends: HashMap<u16, Arc<dyn Backend>>,
-    self_handler: Arc<dyn Backend>,
+    self_handler: ChannelZeroHandler,
+    next_connection_id: AtomicU64,
 }
 
 impl Router {
+    /// Build a router with an arbitrary legacy channel-0 backend.
+    ///
+    /// Tests can still inject custom self handlers this way. Production/default
+    /// wiring uses [`Router::with_default_self_handler`], which installs the real
+    /// HELLO/manifest control handler.
     pub fn new(self_handler: Arc<dyn Backend>) -> Self {
         Self {
             backends: HashMap::new(),
-            self_handler,
+            self_handler: ChannelZeroHandler::Legacy(self_handler),
+            next_connection_id: AtomicU64::new(1),
+        }
+    }
+
+    pub fn with_control_handler(control_handler: Arc<ControlHandler>) -> Self {
+        Self {
+            backends: HashMap::new(),
+            self_handler: ChannelZeroHandler::Control(control_handler),
+            next_connection_id: AtomicU64::new(1),
         }
     }
 
     pub fn with_default_self_handler() -> Self {
-        Self::new(Arc::new(SubcSelfHandler))
+        Self::with_control_handler(Arc::new(ControlHandler::default()))
     }
 
     pub fn register_backend<B>(&mut self, channel: u16, backend: B) -> Result<(), RouterError>
@@ -57,12 +80,32 @@ impl Router {
         Ok(())
     }
 
+    /// Start a connection-scoped routing context. Dropping the guard releases
+    /// any control-plane registrations owned by the connection.
+    pub fn begin_connection(&self) -> RouterConnection {
+        let raw = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        RouterConnection {
+            id: ConnectionId::new(raw),
+            control_handler: self.self_handler.control_handler(),
+        }
+    }
+
     /// Route a frame by header only, moving the body bytes unchanged into the
-    /// selected backend.
+    /// selected backend. Direct callers without a connection context use the
+    /// synthetic [`ConnectionId::LOCAL`] control-plane owner.
     pub fn route(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        self.route_for_connection(ConnectionId::LOCAL, frame)
+    }
+
+    /// Route a frame associated with one socket connection.
+    pub fn route_for_connection(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
         let channel = frame.header.channel;
         if channel == 0 {
-            return self.self_handler.handle(frame);
+            return self.self_handler.handle(connection_id, frame);
         }
 
         let backend = self
@@ -79,6 +122,48 @@ impl Router {
 impl Default for Router {
     fn default() -> Self {
         Self::with_default_self_handler()
+    }
+}
+
+enum ChannelZeroHandler {
+    Legacy(Arc<dyn Backend>),
+    Control(Arc<ControlHandler>),
+}
+
+impl ChannelZeroHandler {
+    fn handle(&self, connection_id: ConnectionId, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        match self {
+            Self::Legacy(handler) => handler.handle(frame),
+            Self::Control(handler) => handler.handle_control(connection_id, frame),
+        }
+    }
+
+    fn control_handler(&self) -> Option<Arc<ControlHandler>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Control(handler) => Some(Arc::clone(handler)),
+        }
+    }
+}
+
+/// Connection-scoped cleanup guard returned by [`Router::begin_connection`].
+#[must_use]
+pub struct RouterConnection {
+    id: ConnectionId,
+    control_handler: Option<Arc<ControlHandler>>,
+}
+
+impl RouterConnection {
+    pub fn id(&self) -> ConnectionId {
+        self.id
+    }
+}
+
+impl Drop for RouterConnection {
+    fn drop(&mut self) {
+        if let Some(control_handler) = &self.control_handler {
+            let _ = control_handler.cleanup_connection(self.id);
+        }
     }
 }
 
@@ -99,40 +184,6 @@ impl Backend for EchoBackend {
         )
         .map_err(RouterError::FrameBuild)?;
         Ok(vec![response])
-    }
-}
-
-/// The default channel-0 handler for the skeleton daemon.
-///
-/// Story 1.6 will replace this with HELLO/manifest registration. For now, PING
-/// is answered as PONG; other channel-0 frames receive an ERROR frame so they do
-/// not fall through to module backends.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SubcSelfHandler;
-
-impl Backend for SubcSelfHandler {
-    fn handle(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
-        match frame.header.ty {
-            FrameType::Ping => Ok(vec![Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Pong,
-                frame.header.flags,
-                0,
-                frame.header.corr,
-                Vec::new(),
-            )
-            .map_err(RouterError::FrameBuild)?]),
-            FrameType::Goodbye => Ok(Vec::new()),
-            _ => Ok(vec![Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Error,
-                Flags::new(false, Priority::Passive, false),
-                0,
-                frame.header.corr,
-                b"subc channel-0 handler not implemented".to_vec(),
-            )
-            .map_err(RouterError::FrameBuild)?]),
-        }
     }
 }
 

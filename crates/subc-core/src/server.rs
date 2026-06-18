@@ -37,6 +37,8 @@ pub async fn handle_connection<S>(mut stream: S, router: Arc<Router>) -> Result<
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let connection = router.begin_connection();
+
     loop {
         let Some(frame) = read_frame(&mut stream)
             .await
@@ -45,7 +47,7 @@ where
             return Ok(());
         };
 
-        match router.route(frame) {
+        match router.route_for_connection(connection.id(), frame) {
             Ok(responses) => {
                 for response in responses {
                     write_frame(&mut stream, &response)

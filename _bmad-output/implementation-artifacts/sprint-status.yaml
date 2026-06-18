@@ -57,7 +57,7 @@ development_status:
   2-2-cross-session-concurrency: done                        # merged 9ab20e4 (PROOF: subc-core UNCHANGED — fast=86µs while slow=500ms; design already delivers it). Concurrent-module stub substrate (writer-task + delay-spawn) built for 2.3/2.4 reuse. 67 tests.
   2-3-request-cancellation: done                             # merged ca741d7 (DUMB-FORWARD, Oracle bg_cd286aa5): subc-core PRODUCTION UNCHANGED, module owns terminal via claim-under-lock. 5 race-matrix tests (cancel-before/after, double-cancel, uncancellable-completion, unknown-channel). 65 tests.
   2-4-per-channel-flow-control-window: done                  # merged 0b223a7. FIRST real Epic-2 subc-core mechanism: ChannelFlow credit counter (type-byte only, thin-core held), window from manifest concurrency (serial->1 ENFORCED, module_managed->32, stateless->1024). CANCEL bypass, over-release guard, teardown-wakes-waiters (no hang), no credit leak. 4 real tests. 69 tests. Honest: no full same-socket cross-channel fairness (later scheduler story).
-  2-5-liveness-status-from-cache: backlog                    # + status-cache population protocol
+  2-5-liveness-status-from-cache: in-progress                # Oracle bg_f4d933c9 + AFK channel-0 adaptation (NO envelope change). StatusCache per (endpoint,route_channel), opaque latest-wins; liveness from subc state; polls answered LOCAL (never forwarded); evict on cleanup. Dispatched bg_2cc21d49. Wire shapes subc-core-LOCAL — promotion+AFT-co-sign DEFERRED (flagged for Ufuk).
   2-6-within-root-parallelism: backlog                       # GATE: AFT Leg 2 (felt-headline critical path)
   epic-2-retrospective: optional
 

@@ -12,8 +12,9 @@ use std::{
 use serde_json::Value;
 use subc_core::{
     read_frame, serve_listener, write_frame, AttachAck, AttachRequest, ConfigTier, ControlHandler,
-    ForwardingTable, Frame, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, Router,
-    SupervisedModule, Supervisor, SUBC_SOCKET_ENV,
+    ForwardingTable, Frame, LivenessReply, ModuleSpec, ModuleState, ModuleStatus, PassivePoll,
+    PollOp, Registry, RestartPolicy, Router, StatusReply, SupervisedModule, Supervisor,
+    SUBC_SOCKET_ENV,
 };
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
 use tokio::{
@@ -122,6 +123,280 @@ async fn attach_then_forward_request_round_trips_through_stub() {
     assert_eq!(response.body, payload);
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_poll_returns_cached_status_without_forwarding_to_stub() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-status-cache";
+    let events_path = server.stub_events_path("status-cache");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+                ("FAKE_AFT_STATUS".to_string(), "indexing".to_string()),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 111, "ses-status-cache").await;
+    let status_event = wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "status_published"
+            && event["route_channel"].as_u64() == Some(u64::from(ack.route_channel))
+    })
+    .await;
+    assert_eq!(status_event["status"].as_str(), Some("indexing"));
+
+    let poll_corr = 112;
+    write_frame(
+        &mut client,
+        &passive_poll_frame(poll_corr, PollOp::Status, ack.route_channel),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let response = read_frame_timeout(&mut client).await;
+    assert_status_reply(&response, poll_corr, "indexing");
+
+    let events = stub_events(&events_path);
+    assert!(
+        events.iter().all(|event| matches!(
+            event.get("kind").and_then(Value::as_str),
+            Some("attach" | "status_published")
+        )),
+        "status poll should be answered locally; unexpected stub events: {events:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-busy-local-poll";
+    let events_path = server.stub_events_path("busy-local-poll");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                ("FAKE_AFT_STATUS".to_string(), "scanning".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 121, "ses-busy-local-poll").await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "status_published"
+            && event["route_channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["status"] == "scanning"
+    })
+    .await;
+
+    let data_corr = 122;
+    let status_corr = 123;
+    let liveness_corr = 124;
+    let payload = br#"{"delay_ms":2000,"jsonrpc":"2.0","id":"busy"}"#;
+    let data_sent = Instant::now();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, data_corr, payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, data_corr)
+    })
+    .await;
+
+    let polls_sent = Instant::now();
+    write_frame(
+        &mut client,
+        &passive_poll_frame(status_corr, PollOp::Status, ack.route_channel),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &passive_poll_frame(liveness_corr, PollOp::Liveness, ack.route_channel),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let status_response = read_frame_timeout(&mut client).await;
+    let liveness_response = read_frame_timeout(&mut client).await;
+    let poll_latency = Instant::now().duration_since(polls_sent);
+    eprintln!("busy-module local poll latency: {poll_latency:?}");
+    assert_status_reply(&status_response, status_corr, "scanning");
+    assert_liveness_reply(&liveness_response, liveness_corr, true);
+    assert!(
+        poll_latency < Duration::from_millis(300),
+        "passive polls queued behind busy module: poll_latency={poll_latency:?}"
+    );
+
+    let events = stub_events(&events_path);
+    assert_stub_did_not_observe_corrs(&events, &[status_corr, liveness_corr]);
+
+    let data_response = read_frame_timeout_for(&mut client, Duration::from_secs(3)).await;
+    let data_latency = Instant::now().duration_since(data_sent);
+    eprintln!("busy-module data response latency: {data_latency:?}");
+    assert_response(&data_response, ack.route_channel, data_corr, payload);
+    assert!(
+        data_latency >= Duration::from_millis(1_800),
+        "busy request did not exercise the requested delay: data_latency={data_latency:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_poll_cache_miss_returns_status_unavailable() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-status-miss";
+    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 131, "ses-status-miss").await;
+
+    let poll_corr = 132;
+    write_frame(
+        &mut client,
+        &passive_poll_frame(poll_corr, PollOp::Status, ack.route_channel),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let error = read_frame_timeout(&mut client).await;
+    let body = assert_error(&error, 0, poll_corr, "status_unavailable");
+    assert!(body.message.contains(&ack.route_channel.to_string()));
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_cache_is_evicted_when_client_detaches() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-status-eviction";
+    let events_path = server.stub_events_path("status-eviction");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+                ("FAKE_AFT_STATUS".to_string(), "evict-me".to_string()),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut first, first_ack) = attach_client(&server, &project, 141, "ses-status-evict-1").await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "status_published"
+            && event["route_channel"].as_u64() == Some(u64::from(first_ack.route_channel))
+    })
+    .await;
+
+    write_frame(
+        &mut first,
+        &passive_poll_frame(142, PollOp::Status, first_ack.route_channel),
+    )
+    .await
+    .unwrap();
+    first.flush().await.unwrap();
+    let first_status = read_frame_timeout(&mut first).await;
+    assert_status_reply(&first_status, 142, "evict-me");
+
+    drop(first);
+    wait_for_binding_count(&server.forwarding, 0, Duration::from_secs(1)).await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "detach"
+            && event["route_channel"].as_u64() == Some(u64::from(first_ack.route_channel))
+    })
+    .await;
+
+    let (mut second, second_ack) =
+        attach_client(&server, &project, 143, "ses-status-evict-2").await;
+    assert_ne!(first_ack.route_channel, second_ack.route_channel);
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "status_published"
+            && event["route_channel"].as_u64() == Some(u64::from(second_ack.route_channel))
+    })
+    .await;
+
+    write_frame(
+        &mut second,
+        &passive_poll_frame(144, PollOp::Status, first_ack.route_channel),
+    )
+    .await
+    .unwrap();
+    second.flush().await.unwrap();
+    let old_route_error = read_frame_timeout(&mut second).await;
+    assert_error(&old_route_error, 0, 144, "status_unavailable");
+
+    write_frame(
+        &mut second,
+        &passive_poll_frame(145, PollOp::Status, second_ack.route_channel),
+    )
+    .await
+    .unwrap();
+    second.flush().await.unwrap();
+    let second_status = read_frame_timeout(&mut second).await;
+    assert_status_reply(&second_status, 145, "evict-me");
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_poll_returns_false_after_module_connection_is_gone() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-liveness-gone";
+    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 151, "ses-liveness-gone").await;
+    assert_liveness_reply(
+        &poll_liveness(&mut client, 152, ack.route_channel).await,
+        152,
+        true,
+    );
+
+    module.stop().await.unwrap();
+    wait_for_registration_absent(&server.registry, module_id, Duration::from_secs(1)).await;
+    wait_for_binding_count(&server.forwarding, 0, Duration::from_secs(1)).await;
+
+    let response = poll_liveness(&mut client, 153, ack.route_channel).await;
+    assert_liveness_reply(&response, 153, false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1413,6 +1688,29 @@ fn cancel_frame(channel: u16, corr: u64) -> Frame {
     frame
 }
 
+fn passive_poll_frame(corr: u64, op: PollOp, route_channel: u16) -> Frame {
+    let body = serde_json::to_vec(&PassivePoll { op, route_channel }).unwrap();
+    Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
+}
+
+async fn poll_liveness(stream: &mut UnixStream, corr: u64, route_channel: u16) -> Frame {
+    write_frame(
+        stream,
+        &passive_poll_frame(corr, PollOp::Liveness, route_channel),
+    )
+    .await
+    .unwrap();
+    stream.flush().await.unwrap();
+    read_frame_timeout(stream).await
+}
+
 async fn read_until_push_and_response(
     stream: &mut UnixStream,
     route_channel: u16,
@@ -1464,6 +1762,22 @@ fn assert_response(frame: &Frame, route_channel: u16, corr: u64, body: &[u8]) {
     assert_eq!(frame.body, body);
 }
 
+fn assert_status_reply(frame: &Frame, corr: u64, expected_status: &str) {
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    let body: StatusReply = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body.status, expected_status);
+}
+
+fn assert_liveness_reply(frame: &Frame, corr: u64, expected_live: bool) {
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    let body: LivenessReply = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body.live, expected_live);
+}
+
 fn assert_error(frame: &Frame, route_channel: u16, corr: u64, code: &str) -> ErrorBody {
     assert_eq!(frame.header.ty, FrameType::Error);
     assert_eq!(frame.header.channel, route_channel);
@@ -1475,6 +1789,17 @@ fn assert_error(frame: &Frame, route_channel: u16, corr: u64, code: &str) -> Err
 
 async fn read_frame_timeout(stream: &mut UnixStream) -> Frame {
     timeout(READ_TIMEOUT, async {
+        read_frame(stream)
+            .await
+            .unwrap()
+            .expect("connection should stay open")
+    })
+    .await
+    .expect("timed out waiting for frame")
+}
+
+async fn read_frame_timeout_for(stream: &mut UnixStream, wait: Duration) -> Frame {
+    timeout(wait, async {
         read_frame(stream)
             .await
             .unwrap()
@@ -1646,6 +1971,17 @@ fn event_is_terminal(event: &Value, terminal: &str, channel: u16, corr: u64) -> 
         && event["terminal"] == terminal
         && event["channel"].as_u64() == Some(u64::from(channel))
         && event["corr"].as_u64() == Some(corr)
+}
+
+fn assert_stub_did_not_observe_corrs(events: &[Value], forbidden_corrs: &[u64]) {
+    for event in events {
+        if let Some(corr) = event.get("corr").and_then(Value::as_u64) {
+            assert!(
+                !forbidden_corrs.contains(&corr),
+                "stub observed a passive poll corr {corr}; events: {events:?}"
+            );
+        }
+    }
 }
 
 fn event_position<F>(events: &[Value], matches: F) -> usize

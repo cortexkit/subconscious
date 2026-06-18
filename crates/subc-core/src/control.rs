@@ -10,10 +10,11 @@ use tracing::{debug, warn};
 use crate::{
     forwarding::{
         AttachAck, AttachRelay, AttachRelayOutcome, AttachRelayResponse, AttachRequest,
-        DetachRelay, ForwardingError, ForwardingTable, ReleasedRoute,
+        DetachRelay, ForwardingError, ForwardingTable, ModuleEndpointId, ReleasedRoute,
     },
     registry::{ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
+    status::{LivenessReply, PassivePoll, PollOp, StatusReply, StatusUpdate},
     Frame, ProjectRootId,
 };
 
@@ -123,7 +124,24 @@ impl ControlHandler {
                         "module-originated channel-0 REQUEST is not supported",
                     )?]);
                 }
+                if let Ok(poll) = serde_json::from_slice::<PassivePoll>(&frame.body) {
+                    return self.handle_passive_poll(ctx, frame, poll);
+                }
                 self.handle_attach(ctx, frame).await
+            }
+            FrameType::Push => {
+                let Some(endpoint) = self
+                    .forwarding
+                    .module_endpoint_for_connection(ctx.connection_id)
+                    .map_err(RouterError::Forwarding)?
+                else {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "unsupported_control_frame",
+                        "client-originated channel-0 PUSH is not supported",
+                    )?]);
+                };
+                self.handle_status_update(endpoint, frame)
             }
             FrameType::Response | FrameType::Error
                 if self
@@ -455,6 +473,74 @@ impl ControlHandler {
         }
     }
 
+    fn handle_status_update(
+        &self,
+        endpoint: ModuleEndpointId,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let update = match serde_json::from_slice::<StatusUpdate>(&frame.body) {
+            Ok(update) => update,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_status_update",
+                    format!("malformed StatusUpdate body: {err}"),
+                )?])
+            }
+        };
+
+        self.forwarding
+            .cache_status(endpoint, update.route_channel, update.status)
+            .map_err(RouterError::Forwarding)?;
+        Ok(Vec::new())
+    }
+
+    fn handle_passive_poll(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        poll: PassivePoll,
+    ) -> Result<Vec<Frame>, RouterError> {
+        match poll.op {
+            PollOp::Liveness => {
+                // follow-up: thread Supervisor process state into this proof-level
+                // liveness once that state is available on the passive path.
+                let live = self
+                    .forwarding
+                    .client_route_is_bound_to_active_module(ctx.connection_id, poll.route_channel)
+                    .map_err(RouterError::Forwarding)?;
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &LivenessReply { live },
+                    "LivenessReply",
+                )?])
+            }
+            PollOp::Status => {
+                let Some(endpoint) = self
+                    .forwarding
+                    .client_route_endpoint(ctx.connection_id, poll.route_channel)
+                    .map_err(RouterError::Forwarding)?
+                else {
+                    return Ok(vec![status_unavailable_frame(&frame, poll.route_channel)?]);
+                };
+
+                let Some(status) = self
+                    .forwarding
+                    .get_status(endpoint, poll.route_channel)
+                    .map_err(RouterError::Forwarding)?
+                else {
+                    return Ok(vec![status_unavailable_frame(&frame, poll.route_channel)?]);
+                };
+
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &StatusReply { status },
+                    "StatusReply",
+                )?])
+            }
+        }
+    }
+
     fn handle_module_relay_response(
         &self,
         connection_id: ConnectionId,
@@ -596,6 +682,38 @@ fn control_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, Ro
         body,
     )
     .map_err(RouterError::FrameBuild)
+}
+
+fn control_response_body_frame<T: Serialize>(
+    frame: &Frame,
+    reply: &T,
+    label: &'static str,
+) -> Result<Frame, RouterError> {
+    let body = serde_json::to_vec(reply).map_err(|err| {
+        RouterError::backend(
+            0,
+            frame.header.corr,
+            format!("failed to encode {label}: {err}"),
+        )
+    })?;
+
+    Frame::build_with_version(
+        response_version(frame),
+        FrameType::Response,
+        control_flags(),
+        0,
+        frame.header.corr,
+        body,
+    )
+    .map_err(RouterError::FrameBuild)
+}
+
+fn status_unavailable_frame(frame: &Frame, route_channel: u16) -> Result<Frame, RouterError> {
+    control_error_frame(
+        frame,
+        "status_unavailable",
+        format!("status unavailable for route channel {route_channel}"),
+    )
 }
 
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {

@@ -208,6 +208,9 @@ impl Router {
                     frame_type = ?frame.header.ty,
                     "forwarding module data-plane frame to client"
                 );
+                if is_terminal_frame(frame.header.ty) {
+                    route.flow.release();
+                }
                 route.sink.send(frame).await?;
                 return Ok(());
             }
@@ -328,14 +331,35 @@ impl ForwardBackend {
     pub async fn handle(&self, ctx: RouteCtx, frame: Frame) -> Result<(), RouterError> {
         let channel = frame.header.channel;
         let corr = frame.header.corr;
+        let frame_type = frame.header.ty;
         let route = self
             .forwarding
             .client_route(ctx.connection_id, channel)
             .map_err(RouterError::Forwarding)?
             .ok_or(RouterError::UnknownChannel { channel, corr })?;
 
-        route.sink.send(frame).await
+        // CANCEL and other non-REQUEST frames bypass the request-credit window;
+        // the original request's credit is freed only by the module's terminal frame.
+        let acquired_credit = frame_type == FrameType::Request;
+        if acquired_credit {
+            route.flow.acquire().await.map_err(|err| {
+                RouterError::backend(channel, corr, format!("{err} for route channel {channel}"))
+            })?;
+        }
+
+        let result = route.sink.send(frame).await;
+        if acquired_credit && result.is_err() {
+            route.flow.release();
+        }
+        result
     }
+}
+
+fn is_terminal_frame(frame_type: FrameType) -> bool {
+    matches!(
+        frame_type,
+        FrameType::Response | FrameType::Error | FrameType::StreamEnd
+    )
 }
 
 /// Typed router errors. Routable failures can be translated to canonical JSON

@@ -803,6 +803,355 @@ async fn single_client_pipelined_requests_preserve_corr_fifo_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serial_flow_control_window_holds_second_request_until_terminal() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-serial-flow";
+    let events_path = server.stub_events_path("serial-flow");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 901, "ses-serial-flow").await;
+    let first_corr = 902;
+    let second_corr = 903;
+    let first_payload = br#"{"delay_ms":300,"jsonrpc":"2.0","id":"serial-1"}"#;
+    let second_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"serial-2"}"#;
+
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, first_corr, first_payload),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, second_corr, second_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, first_corr)
+    })
+    .await;
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event_is_request_received(event, ack.route_channel, second_corr)
+    })
+    .await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_terminal(event, "response", ack.route_channel, first_corr)
+    })
+    .await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, second_corr)
+    })
+    .await;
+
+    let first_response = read_frame_timeout(&mut client).await;
+    assert_response(
+        &first_response,
+        ack.route_channel,
+        first_corr,
+        first_payload,
+    );
+    let second_response = read_frame_timeout(&mut client).await;
+    assert_response(
+        &second_response,
+        ack.route_channel,
+        second_corr,
+        second_payload,
+    );
+
+    let events = stub_events(&events_path);
+    let first_request_pos = event_position(&events, |event| {
+        event_is_request_received(event, ack.route_channel, first_corr)
+    });
+    let first_terminal_pos = event_position(&events, |event| {
+        event_is_terminal(event, "response", ack.route_channel, first_corr)
+    });
+    let second_request_pos = event_position(&events, |event| {
+        event_is_request_received(event, ack.route_channel, second_corr)
+    });
+    assert!(
+        first_request_pos < first_terminal_pos && first_terminal_pos < second_request_pos,
+        "serial flow-control ordering violated: {events:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-cancel-flow";
+    let events_path = server.stub_events_path("cancel-flow");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 911, "ses-cancel-flow").await;
+    let cancelled_corr = 912;
+    let followup_corr = 913;
+    let cancellable_payload = br#"{"delay_ms":500,"jsonrpc":"2.0","id":"cancel-flow"}"#;
+    let followup_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"after-cancel-flow"}"#;
+
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, cancelled_corr, cancellable_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, cancelled_corr)
+    })
+    .await;
+    sleep(Duration::from_millis(20)).await;
+
+    let cancel_sent = Instant::now();
+    write_frame(
+        &mut client,
+        &cancel_frame(ack.route_channel, cancelled_corr),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, followup_corr, followup_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let cancelled = read_frame_timeout(&mut client).await;
+    let cancel_latency = Instant::now().duration_since(cancel_sent);
+    assert_error(&cancelled, ack.route_channel, cancelled_corr, "cancelled");
+    assert!(
+        cancel_latency < Duration::from_millis(250),
+        "cancel should bypass full window; latency={cancel_latency:?}"
+    );
+    let followup = read_frame_timeout(&mut client).await;
+    assert_response(
+        &followup,
+        ack.route_channel,
+        followup_corr,
+        followup_payload,
+    );
+
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_terminal(event, "error", ack.route_channel, cancelled_corr)
+            && event["code"] == "cancelled"
+    })
+    .await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, followup_corr)
+    })
+    .await;
+    let events = stub_events(&events_path);
+    let cancelled_terminal_pos = event_position(&events, |event| {
+        event_is_terminal(event, "error", ack.route_channel, cancelled_corr)
+    });
+    let followup_request_pos = event_position(&events, |event| {
+        event_is_request_received(event, ack.route_channel, followup_corr)
+    });
+    assert!(
+        cancelled_terminal_pos < followup_request_pos,
+        "follow-up request should wait for cancelled terminal credit release: {events:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flow_control_over_release_guard_does_not_grow_serial_window() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-over-release";
+    let events_path = server.stub_events_path("over-release");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                ("FAKE_AFT_DOUBLE_TERMINAL".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 921, "ses-over-release").await;
+    let warmup_corr = 922;
+    let warmup_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"warmup"}"#;
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, warmup_corr, warmup_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let warmup_first = read_frame_timeout(&mut client).await;
+    assert_response(
+        &warmup_first,
+        ack.route_channel,
+        warmup_corr,
+        warmup_payload,
+    );
+    let warmup_duplicate = read_frame_timeout(&mut client).await;
+    assert_response(
+        &warmup_duplicate,
+        ack.route_channel,
+        warmup_corr,
+        warmup_payload,
+    );
+
+    let slow_corr = 923;
+    let fast_corr = 924;
+    let slow_payload = br#"{"delay_ms":300,"jsonrpc":"2.0","id":"over-release-slow"}"#;
+    let fast_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"over-release-fast"}"#;
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, slow_corr, slow_payload),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, fast_corr, fast_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, slow_corr)
+    })
+    .await;
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event_is_request_received(event, ack.route_channel, fast_corr)
+    })
+    .await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_terminal(event, "response", ack.route_channel, slow_corr)
+    })
+    .await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, fast_corr)
+    })
+    .await;
+
+    let events = stub_events(&events_path);
+    let slow_terminal_pos = event_position(&events, |event| {
+        event_is_terminal(event, "response", ack.route_channel, slow_corr)
+    });
+    let fast_request_pos = event_position(&events, |event| {
+        event_is_request_received(event, ack.route_channel, fast_corr)
+    });
+    assert!(
+        slow_terminal_pos < fast_request_pos,
+        "double terminal grew serial window beyond one credit: {events:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-flow-teardown";
+    let events_path = server.stub_events_path("flow-teardown");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 931, "ses-flow-teardown").await;
+    let inflight_corr = 932;
+    let blocked_corr = 933;
+    let inflight_payload = br#"{"delay_ms":5000,"jsonrpc":"2.0","id":"inflight"}"#;
+    let blocked_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"blocked"}"#;
+
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, inflight_corr, inflight_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, inflight_corr)
+    })
+    .await;
+
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, blocked_corr, blocked_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    sleep(Duration::from_millis(50)).await;
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event_is_request_received(event, ack.route_channel, blocked_corr)
+    })
+    .await;
+
+    module.stop().await.unwrap();
+    let outcome = read_frame_or_close_timeout(&mut client, Duration::from_secs(2)).await;
+    if let Some(frame) = outcome {
+        assert_error(&frame, ack.route_channel, blocked_corr, "backend_error");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succeeds() {
     let server = TestServer::start();
     let supervisor = supervisor(&server, 4, Duration::from_millis(20));
@@ -1185,6 +1534,53 @@ where
         }
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn assert_no_stub_event_within<F>(path: &Path, wait: Duration, matches: F)
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + wait;
+    loop {
+        let events = stub_events(path);
+        if let Some(event) = events.iter().find(|event| matches(event)) {
+            panic!("unexpected stub event within {wait:?}: {event:?}; events: {events:?}");
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn event_is_request_received(event: &Value, channel: u16, corr: u64) -> bool {
+    event["kind"] == "request_received"
+        && event["channel"].as_u64() == Some(u64::from(channel))
+        && event["corr"].as_u64() == Some(corr)
+}
+
+fn event_is_terminal(event: &Value, terminal: &str, channel: u16, corr: u64) -> bool {
+    event["kind"] == "terminal"
+        && event["terminal"] == terminal
+        && event["channel"].as_u64() == Some(u64::from(channel))
+        && event["corr"].as_u64() == Some(corr)
+}
+
+fn event_position<F>(events: &[Value], matches: F) -> usize
+where
+    F: FnMut(&Value) -> bool,
+{
+    events
+        .iter()
+        .position(matches)
+        .unwrap_or_else(|| panic!("stub event missing from {events:?}"))
+}
+
+async fn read_frame_or_close_timeout(stream: &mut UnixStream, wait: Duration) -> Option<Frame> {
+    timeout(wait, read_frame(stream))
+        .await
+        .expect("timed out waiting for frame or clean close")
+        .expect("frame read failed while waiting for frame or clean close")
 }
 
 fn stub_events(path: &Path) -> Vec<Value> {

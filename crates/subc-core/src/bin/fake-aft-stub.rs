@@ -10,8 +10,8 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_core::{
-    read_frame, write_frame, AttachRelay, DetachRelay, Frame, HelloAckBody, HelloBody,
-    SUBC_SOCKET_ENV,
+    read_frame, write_frame, AttachRelay, AttachRelayResponse, DetachRelay, Frame, HelloAckBody,
+    HelloBody, SUBC_SOCKET_ENV,
 };
 use subc_protocol::{
     manifest::{
@@ -166,13 +166,16 @@ async fn handle_control_request(
     config: &StubConfig,
 ) -> Result<(), StubError> {
     if let Ok(relay) = serde_json::from_slice::<AttachRelay>(&frame.body) {
+        let route_channel = relay.route_channel;
+        let relay_config = relay.config;
         record_event(
             config,
             json!({
                 "kind": "attach",
-                "route_channel": relay.route_channel,
+                "route_channel": route_channel,
                 "corr": frame.header.corr,
                 "reject": config.reject_attach,
+                "config": relay_config,
             }),
         )?;
         if config.reject_attach {
@@ -195,7 +198,8 @@ async fn handle_control_request(
             return Ok(());
         }
 
-        let body = serde_json::to_vec(&json!({ "accept": true })).map_err(StubError::Json)?;
+        let body =
+            serde_json::to_vec(&AttachRelayResponse { accept: true }).map_err(StubError::Json)?;
         let response = Frame::build_with_version(
             frame.header.ver,
             FrameType::Response,

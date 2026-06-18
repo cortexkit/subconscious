@@ -2,55 +2,16 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fmt,
-    path::PathBuf,
     sync::{Mutex, MutexGuard},
 };
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+pub use subc_protocol::session::{
+    AttachAck, AttachRelay, AttachRelayResponse, AttachRequest, ConfigTier, DetachRelay,
+};
 use subc_protocol::ErrorBody;
 use tokio::sync::oneshot;
 
 use crate::{registry::ConnectionId, router::FrameSink};
-
-/// Client-originated channel-0 control RPC body for binding a harness session to a module route.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AttachRequest {
-    pub project_root: PathBuf,
-    pub harness: String,
-    pub session: String,
-    #[serde(default)]
-    pub config: Value,
-}
-
-/// subc's channel-0 response body for an accepted session attach.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AttachAck {
-    pub route_channel: u16,
-}
-
-/// subc-to-module channel-0 control RPC body asking the singleton module to bind a route channel.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AttachRelay {
-    pub route_channel: u16,
-    pub project_root: PathBuf,
-    pub harness: String,
-    pub session: String,
-    #[serde(default)]
-    pub config: Value,
-}
-
-/// subc-to-module channel-0 control RPC body telling the module a route channel is gone.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DetachRelay {
-    pub route_channel: u16,
-}
-
-/// Module response body for an accepted attach relay.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct AttachRelayResponse {
-    pub accept: bool,
-}
 
 /// Module connection identity used in forwarding keys.
 ///

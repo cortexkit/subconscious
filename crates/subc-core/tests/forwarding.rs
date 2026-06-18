@@ -358,6 +358,83 @@ async fn two_clients_attach_same_module_and_round_trip_independently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_session_slow_call_does_not_block_fast_call() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-cross-session-delay";
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut slow_client, slow_ack) = attach_client(&server, &project, 525, "ses-cross-slow").await;
+    let (mut fast_client, fast_ack) = attach_client(&server, &project, 526, "ses-cross-fast").await;
+    assert_ne!(slow_ack.route_channel, fast_ack.route_channel);
+
+    let slow_payload = br#"{"delay_ms":500,"jsonrpc":"2.0","id":"slow"}"#;
+    let fast_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"fast"}"#;
+    write_frame(
+        &mut slow_client,
+        &data_request(slow_ack.route_channel, 527, slow_payload),
+    )
+    .await
+    .unwrap();
+    slow_client.flush().await.unwrap();
+    let slow_sent = Instant::now();
+
+    write_frame(
+        &mut fast_client,
+        &data_request(fast_ack.route_channel, 528, fast_payload),
+    )
+    .await
+    .unwrap();
+    fast_client.flush().await.unwrap();
+    let fast_sent = Instant::now();
+
+    let ((slow_received_at, slow_response), (fast_received_at, fast_response)) =
+        timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                async {
+                    let response = read_frame_timeout(&mut slow_client).await;
+                    (Instant::now(), response)
+                },
+                async {
+                    let response = read_frame_timeout(&mut fast_client).await;
+                    (Instant::now(), response)
+                }
+            )
+        })
+        .await
+        .expect("timed out waiting for cross-session responses");
+
+    assert_response(&slow_response, slow_ack.route_channel, 527, slow_payload);
+    assert_response(&fast_response, fast_ack.route_channel, 528, fast_payload);
+
+    let slow_latency = slow_received_at.duration_since(slow_sent);
+    let fast_latency = fast_received_at.duration_since(fast_sent);
+    eprintln!("cross-session latencies: fast={fast_latency:?}, slow={slow_latency:?}");
+    assert!(
+        fast_received_at < slow_received_at,
+        "fast response should arrive before slow: fast_latency={fast_latency:?}, slow_latency={slow_latency:?}"
+    );
+    assert!(
+        fast_latency < Duration::from_millis(50),
+        "fast call queued behind slow call: fast_latency={fast_latency:?}, slow_latency={slow_latency:?}"
+    );
+    assert!(
+        slow_latency >= Duration::from_millis(450),
+        "slow call did not exercise the requested 500ms delay: slow_latency={slow_latency:?}, fast_latency={fast_latency:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_client_fanout_pushes_route_to_each_bound_client() {
     let server = TestServer::start();
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));

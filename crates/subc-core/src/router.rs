@@ -12,7 +12,12 @@ use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::{control::ControlHandler, registry::ConnectionId, Frame, FrameBuildError};
+use crate::{
+    control::ControlHandler,
+    forwarding::{ForwardingError, ForwardingTable},
+    registry::ConnectionId,
+    Frame, FrameBuildError,
+};
 
 /// Cheaply cloneable handle to one connection's bounded outbound frame queue.
 ///
@@ -49,12 +54,12 @@ pub struct RouteCtx {
 /// Closed set of data-plane backends for non-zero channels.
 ///
 /// Channel 0 is structurally special and remains [`Router::control`], not an
-/// enum variant. `Forward(Arc<ForwardBackend>)` joins this enum in Epic 2 when
-/// subc learns to splice to supervised module sockets; for now the only
-/// data-plane backend is the in-memory echo test/wiring backend.
+/// enum variant. Static/test backends live in [`Router::backends`]; the forwarding
+/// backend is selected dynamically only when a per-connection forwarding binding exists.
 #[derive(Debug, Clone)]
 pub enum Backend {
     Echo(EchoBackend),
+    Forward(ForwardBackend),
 }
 
 impl From<EchoBackend> for Backend {
@@ -63,10 +68,17 @@ impl From<EchoBackend> for Backend {
     }
 }
 
+impl From<ForwardBackend> for Backend {
+    fn from(backend: ForwardBackend) -> Self {
+        Self::Forward(backend)
+    }
+}
+
 impl Backend {
     pub async fn handle(&self, ctx: RouteCtx, frame: Frame) -> Result<(), RouterError> {
         match self {
             Self::Echo(backend) => backend.handle(ctx, frame).await,
+            Self::Forward(backend) => backend.handle(ctx, frame).await,
         }
     }
 }
@@ -80,14 +92,19 @@ impl Backend {
 pub struct Router {
     backends: HashMap<u16, Backend>,
     control: Arc<ControlHandler>,
+    forwarding: Arc<ForwardingTable>,
+    forward_backend: Backend,
     next_connection_id: AtomicU64,
 }
 
 impl Router {
     pub fn with_control_handler(control: Arc<ControlHandler>) -> Self {
+        let forwarding = control.forwarding();
         Self {
             backends: HashMap::new(),
             control,
+            forwarding: Arc::clone(&forwarding),
+            forward_backend: Backend::Forward(ForwardBackend::new(forwarding)),
             // ConnectionId::LOCAL is 0; real socket ids start at 1 and never collide.
             next_connection_id: AtomicU64::new(1),
         }
@@ -95,6 +112,10 @@ impl Router {
 
     pub fn with_default_self_handler() -> Self {
         Self::with_control_handler(Arc::new(ControlHandler::default()))
+    }
+
+    pub fn forwarding(&self) -> Arc<ForwardingTable> {
+        Arc::clone(&self.forwarding)
     }
 
     pub fn register_backend(
@@ -148,11 +169,43 @@ impl Router {
                 frame_type = ?frame.header.ty,
                 "routing control frame"
             );
-            let responses = self.control.handle_control(ctx.connection_id, frame)?;
+            let responses = self.control.handle_control_frame(ctx, frame).await?;
             for response in responses {
                 ctx.egress.send(response).await?;
             }
             return Ok(());
+        }
+
+        if let Some(route) = self
+            .forwarding
+            .module_route(ctx.connection_id, channel)
+            .map_err(RouterError::Forwarding)?
+        {
+            debug!(
+                connection_id = ctx.connection_id.get(),
+                channel,
+                corr,
+                frame_type = ?frame.header.ty,
+                "forwarding module data-plane frame to client"
+            );
+            route.sink.send(frame).await?;
+            return Ok(());
+        }
+
+        if self
+            .forwarding
+            .client_route(ctx.connection_id, channel)
+            .map_err(RouterError::Forwarding)?
+            .is_some()
+        {
+            debug!(
+                connection_id = ctx.connection_id.get(),
+                channel,
+                corr,
+                frame_type = ?frame.header.ty,
+                "forwarding client data-plane frame to module"
+            );
+            return self.forward_backend.handle(ctx.clone(), frame).await;
         }
 
         let Some(backend) = self.backends.get(&channel) else {
@@ -229,6 +282,30 @@ impl EchoBackend {
     }
 }
 
+/// Data-plane backend that splices client frames to the module connection bound at attach time.
+#[derive(Debug, Clone)]
+pub struct ForwardBackend {
+    forwarding: Arc<ForwardingTable>,
+}
+
+impl ForwardBackend {
+    pub fn new(forwarding: Arc<ForwardingTable>) -> Self {
+        Self { forwarding }
+    }
+
+    pub async fn handle(&self, ctx: RouteCtx, frame: Frame) -> Result<(), RouterError> {
+        let channel = frame.header.channel;
+        let corr = frame.header.corr;
+        let route = self
+            .forwarding
+            .client_route(ctx.connection_id, channel)
+            .map_err(RouterError::Forwarding)?
+            .ok_or(RouterError::UnknownChannel { channel, corr })?;
+
+        route.sink.send(frame).await
+    }
+}
+
 /// Typed router errors. Routable failures can be translated to canonical JSON
 /// `ERROR` frames with [`RouterError::to_error_frame`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +324,7 @@ pub enum RouterError {
         message: String,
     },
     FrameBuild(FrameBuildError),
+    Forwarding(ForwardingError),
 }
 
 impl RouterError {
@@ -272,7 +350,10 @@ impl RouterError {
                 corr,
                 message,
             } => error_frame(*channel, *corr, "backend_error", message.clone()),
-            Self::ReservedChannelZero | Self::DuplicateChannel { .. } | Self::FrameBuild(_) => None,
+            Self::ReservedChannelZero
+            | Self::DuplicateChannel { .. }
+            | Self::FrameBuild(_)
+            | Self::Forwarding(_) => None,
         }
     }
 }
@@ -313,6 +394,7 @@ impl fmt::Display for RouterError {
                 "backend error on channel {channel} corr {corr}: {message}"
             ),
             Self::FrameBuild(err) => write!(f, "failed to build routed frame: {err}"),
+            Self::Forwarding(err) => write!(f, "forwarding error: {err}"),
         }
     }
 }
@@ -321,6 +403,7 @@ impl Error for RouterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::FrameBuild(err) => Some(err),
+            Self::Forwarding(err) => Some(err),
             Self::ReservedChannelZero
             | Self::DuplicateChannel { .. }
             | Self::UnknownChannel { .. }

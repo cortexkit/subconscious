@@ -44,7 +44,7 @@ development_status:
   1-8-data-plane-forwarding-spike: done                      # merged 7c59bc0 (walking skeleton: AttachRequest/Ack/Relay + ForwardingTable + ForwardBackend + bidirectional demux + stub auto-accept; 1 real-socket round-trip test). Oracle-reviewed bg_8c592eb1.
   1-8c-promote-attach-shapes-to-protocol: done               # merged 3ade87e (Attach/Ack/Relay/RelayResponse/Detach -> subc-protocol::session; ConfigTier{tier,source,doc} two-tier labeled list, doc=opaque verbatim text; config-forwarded-unchanged test). Co-sign-ready for AFT shim.
   1-8a-forwarding-hardening: done                            # merged 312a692 (detach-relay + config_divergence reject + multi-client + FIFO + channel-gone race + REAL-restart generation invalidation; 7 forwarding integration tests; legacy handle_control now cfg(test)). 64 tests green.
-  1-8-async-push-forwarding: backlog                         # PUSH fan-out (module-owned) + channel-gone replay; builds on the forwarding data plane
+  1-8-async-push-forwarding: done                            # merged 85add8a (positive PUSH delivery + multi-client per-channel fan-out coverage; router change COMMENT-ONLY — §4.9 boundary held, AFT owns fan-out/replay). AFT confirms needs nothing from subc beyond channel→connection routing. 66 tests.
   1-8b-typescript-mode-2-plugin-client: backlog             # harness-facing half of mode 2; gates 1-9
   1-9-e2e-real-aft-opencode: backlog                         # GATE: AFT Leg 1; + hoisting fidelity AC
   1-10-cross-instance-dedup-close: backlog                   # felt win; + session-isolation-under-sharing AC

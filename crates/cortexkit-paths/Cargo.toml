@@ -1,8 +1,11 @@
 [package]
 name = "cortexkit-paths"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
-publish = false
 description = "Shared CortexKit-neutral path canonicalization primitives for project root identities."
+license = "MIT"
+keywords = ["path", "canonicalization", "realpath", "cortexkit"]
+categories = ["filesystem"]
+# repository = "https://github.com/<org>/<repo>"  # TODO(publish): no git remote configured yet — set before `cargo publish`, or omit.
 
 [dependencies]

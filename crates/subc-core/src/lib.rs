@@ -8,10 +8,12 @@
 
 mod frame;
 pub mod frame_io;
+pub mod identity;
 pub mod router;
 pub mod server;
 
 pub use frame::{Frame, FrameBuildError};
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};
+pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
 pub use router::{Backend, EchoBackend, Router, RouterError, SubcSelfHandler};
 pub use server::{handle_connection, serve_listener, serve_uds, ConnectionError, ServerError};

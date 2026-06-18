@@ -212,8 +212,8 @@ impl Router {
                 return Ok(());
             }
 
-            // follow-up: unsolicited PUSH fan-out/replay remains module-owned; subc only drops
-            // stale route frames during the emit-before-detach race.
+            // follow-up: durable PUSH replay remains module-owned; subc only drops
+            // stale route frames for released channels.
             warn!(
                 connection_id = ctx.connection_id.get(),
                 channel,

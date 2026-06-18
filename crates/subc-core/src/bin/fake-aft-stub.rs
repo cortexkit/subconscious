@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
     fmt, fs,
@@ -27,6 +27,8 @@ const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
 const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
 const FAKE_AFT_EVENTS_PATH_ENV: &str = "FAKE_AFT_EVENTS_PATH";
 const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
+const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";
+const FAKE_AFT_FANOUT_ON_REQUEST_ENV: &str = "FAKE_AFT_FANOUT_ON_REQUEST";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 
@@ -43,6 +45,7 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
             path: config.socket_path.clone(),
             source,
         })?;
+    let mut state = StubState::default();
 
     send_hello(&mut stream, &config.module_id).await?;
     expect_hello_ack(&mut stream).await?;
@@ -56,7 +59,7 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
                     std::process::exit(2);
                 }
                 frame = read_frame(&mut stream) => {
-                    if !handle_frame(&mut stream, frame?, &config).await? {
+                    if !handle_frame(&mut stream, frame?, &config, &mut state).await? {
                         return Ok(());
                     }
                 }
@@ -66,7 +69,7 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
 
     loop {
         let frame = read_frame(&mut stream).await?;
-        if !handle_frame(&mut stream, frame, &config).await? {
+        if !handle_frame(&mut stream, frame, &config, &mut state).await? {
             return Ok(());
         }
     }
@@ -103,6 +106,7 @@ async fn handle_frame(
     stream: &mut UnixStream,
     frame: Option<Frame>,
     config: &StubConfig,
+    state: &mut StubState,
 ) -> Result<bool, StubError> {
     let Some(frame) = frame else {
         return Ok(false);
@@ -125,7 +129,7 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(stream, frame, config).await?;
+            handle_control_request(stream, frame, config, state).await?;
             Ok(true)
         }
         FrameType::Error => {
@@ -143,6 +147,14 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request => {
+            if config.fanout_on_request {
+                for channel in state.bound_channels.iter().copied() {
+                    write_push(stream, frame.header.ver, channel).await?;
+                }
+            } else if config.push_on_request {
+                write_push(stream, frame.header.ver, frame.header.channel).await?;
+            }
+
             let response = Frame::build_with_version(
                 frame.header.ver,
                 FrameType::Response,
@@ -164,6 +176,7 @@ async fn handle_control_request(
     stream: &mut UnixStream,
     frame: Frame,
     config: &StubConfig,
+    state: &mut StubState,
 ) -> Result<(), StubError> {
     if let Ok(relay) = serde_json::from_slice::<AttachRelay>(&frame.body) {
         let route_channel = relay.route_channel;
@@ -211,6 +224,7 @@ async fn handle_control_request(
         .map_err(StubError::FrameBuild)?;
         write_frame(stream, &response).await?;
         stream.flush().await.map_err(StubError::Io)?;
+        state.bound_channels.insert(route_channel);
         return Ok(());
     }
 
@@ -223,6 +237,7 @@ async fn handle_control_request(
             "corr": frame.header.corr,
         }),
     )?;
+    state.bound_channels.remove(&detach.route_channel);
 
     if config.emit_after_detach {
         let stale = Frame::build_with_version(
@@ -245,6 +260,20 @@ async fn handle_control_request(
         )?;
     }
 
+    Ok(())
+}
+
+async fn write_push(stream: &mut UnixStream, version: u8, channel: u16) -> Result<(), StubError> {
+    let push = Frame::build_with_version(
+        version,
+        FrameType::Push,
+        Flags::new(false, Priority::Passive, true),
+        channel,
+        0,
+        b"push-event".to_vec(),
+    )
+    .map_err(StubError::FrameBuild)?;
+    write_frame(stream, &push).await?;
     Ok(())
 }
 
@@ -319,6 +348,13 @@ struct StubConfig {
     reject_attach: bool,
     events_path: Option<PathBuf>,
     emit_after_detach: bool,
+    push_on_request: bool,
+    fanout_on_request: bool,
+}
+
+#[derive(Debug, Default)]
+struct StubState {
+    bound_channels: BTreeSet<u16>,
 }
 
 impl StubConfig {
@@ -349,6 +385,8 @@ impl StubConfig {
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
             events_path,
             emit_after_detach: env_flag(FAKE_AFT_EMIT_AFTER_DETACH_ENV),
+            push_on_request: env_flag(FAKE_AFT_PUSH_ON_REQUEST_ENV),
+            fanout_on_request: env_flag(FAKE_AFT_FANOUT_ON_REQUEST_ENV),
         })
     }
 }

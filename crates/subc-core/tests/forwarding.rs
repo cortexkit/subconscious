@@ -125,6 +125,38 @@ async fn attach_then_forward_request_round_trips_through_stub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_client_receives_unsolicited_push_and_response_on_bound_route() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-push-single";
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [("FAKE_AFT_PUSH_ON_REQUEST", "1")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 151, "ses-push-single").await;
+    assert!(ack.route_channel > 0);
+
+    let payload = br#"{"jsonrpc":"2.0","id":"push-single","method":"read"}"#;
+    write_frame(&mut client, &data_request(ack.route_channel, 152, payload))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let (push, _response) =
+        read_until_push_and_response(&mut client, ack.route_channel, 152, payload).await;
+    assert_eq!(push.header.channel, ack.route_channel);
+    assert_eq!(push.body, b"push-event");
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_drop_sends_detach_relay_and_removes_binding() {
     let server = TestServer::start();
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
@@ -321,6 +353,44 @@ async fn two_clients_attach_same_module_and_round_trip_independently() {
     assert_eq!(second_response.header.channel, second_ack.route_channel);
     assert_eq!(second_response.header.corr, 504);
     assert_eq!(second_response.body, second_payload);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_client_fanout_pushes_route_to_each_bound_client() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-push-fanout";
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [("FAKE_AFT_FANOUT_ON_REQUEST", "1")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut first, first_ack) = attach_client(&server, &project, 551, "ses-fanout-one").await;
+    let (mut second, second_ack) = attach_client(&server, &project, 552, "ses-fanout-two").await;
+    assert_ne!(first_ack.route_channel, second_ack.route_channel);
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 2);
+
+    let first_payload = br#"{"jsonrpc":"2.0","id":"fanout-trigger"}"#;
+    write_frame(
+        &mut first,
+        &data_request(first_ack.route_channel, 553, first_payload),
+    )
+    .await
+    .unwrap();
+    first.flush().await.unwrap();
+
+    let (first_push, _first_response) =
+        read_until_push_and_response(&mut first, first_ack.route_channel, 553, first_payload).await;
+    let second_push = read_push(&mut second, second_ack.route_channel).await;
+    assert_ne!(first_push.header.channel, second_ack.route_channel);
+    assert_ne!(second_push.header.channel, first_ack.route_channel);
 
     module.stop().await.unwrap();
 }
@@ -527,6 +597,57 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
         body.to_vec(),
     )
     .unwrap()
+}
+
+async fn read_until_push_and_response(
+    stream: &mut UnixStream,
+    route_channel: u16,
+    response_corr: u64,
+    response_body: &[u8],
+) -> (Frame, Frame) {
+    let mut push = None;
+    let mut response = None;
+
+    for _ in 0..2 {
+        let frame = read_frame_timeout(stream).await;
+        assert_eq!(frame.header.channel, route_channel);
+        match frame.header.ty {
+            FrameType::Push if push.is_none() => {
+                assert_push(&frame, route_channel);
+                push = Some(frame);
+            }
+            FrameType::Response if response.is_none() => {
+                assert_response(&frame, route_channel, response_corr, response_body);
+                response = Some(frame);
+            }
+            ty => panic!("unexpected frame type while waiting for PUSH and Response: {ty:?}"),
+        }
+    }
+
+    (
+        push.expect("missing PUSH frame"),
+        response.expect("missing Response frame"),
+    )
+}
+
+async fn read_push(stream: &mut UnixStream, route_channel: u16) -> Frame {
+    let frame = read_frame_timeout(stream).await;
+    assert_push(&frame, route_channel);
+    frame
+}
+
+fn assert_push(frame: &Frame, route_channel: u16) {
+    assert_eq!(frame.header.ty, FrameType::Push);
+    assert_eq!(frame.header.channel, route_channel);
+    assert_eq!(frame.header.corr, 0);
+    assert_eq!(frame.body, b"push-event");
+}
+
+fn assert_response(frame: &Frame, route_channel: u16, corr: u64, body: &[u8]) {
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, route_channel);
+    assert_eq!(frame.header.corr, corr);
+    assert_eq!(frame.body, body);
 }
 
 async fn read_frame_timeout(stream: &mut UnixStream) -> Frame {

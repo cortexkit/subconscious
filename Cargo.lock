@@ -17,6 +17,8 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cortexkit-paths"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30c3c61a48e327675a8baf6698cb96c6225c785a2e3988bc581b7c5305e90752"
 
 [[package]]
 name = "errno"

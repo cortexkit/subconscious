@@ -1,14 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cortexkit-paths",
     "crates/subc-protocol",
     "crates/subc-core",
 ]
 
 # subc monorepo.
-# - crates/subc-protocol : the shared wire contract (envelope + JSON-RPC shapes + manifest).
-#   Depended on by subc-core (this repo) AND by AFT (sibling repo) via a path dependency:
+# - crates/subc-protocol : the shared wire contract (envelope + session shapes + manifest).
+#   subc-OWNED (it IS subc's wire contract). Depended on by subc-core (this repo)
+#   AND by AFT (sibling repo) via a path dependency:
 #   in aft's Cargo.toml ->  subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 #   (git dependency is the CI / cross-machine upgrade when needed.)
-# - crates/subc-core     : the daemon (added when Epic 1 build stories begin).
+# - crates/subc-core     : the daemon.
+#
+# NOTE: cortexkit-paths is NOT here — it's a product-neutral primitive living in
+# the cortexkit/commons monorepo (https://github.com/cortexkit/commons) and is
+# consumed from crates.io (cortexkit-paths = "0.1"), because AFT uses it without
+# subc. subc-protocol stays here precisely because it is subc-defining.

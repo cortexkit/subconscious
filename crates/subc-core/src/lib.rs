@@ -19,7 +19,8 @@ pub mod supervise;
 
 pub use control::{ControlHandler, HelloAckBody, HelloBody, MIN_SUPPORTED_VERSION};
 pub use forwarding::{
-    AttachAck, AttachRelay, AttachRequest, ForwardingError, ForwardingTable, ModuleEndpointId,
+    AttachAck, AttachRelay, AttachRequest, DetachRelay, ForwardingError, ForwardingTable,
+    ModuleEndpointId,
 };
 pub use frame::{Frame, FrameBuildError};
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};

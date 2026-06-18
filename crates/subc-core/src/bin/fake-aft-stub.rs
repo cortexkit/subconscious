@@ -14,7 +14,7 @@ use std::{
 use serde_json::{json, Value};
 use subc_core::{
     read_frame, write_frame, AttachRelay, AttachRelayResponse, DetachRelay, Frame, HelloAckBody,
-    HelloBody, SUBC_SOCKET_ENV,
+    HelloBody, StatusUpdate, SUBC_SOCKET_ENV,
 };
 use subc_protocol::{
     manifest::{
@@ -40,6 +40,7 @@ const FAKE_AFT_FANOUT_ON_REQUEST_ENV: &str = "FAKE_AFT_FANOUT_ON_REQUEST";
 const FAKE_AFT_DELAY_FROM_BODY_ENV: &str = "FAKE_AFT_DELAY_FROM_BODY";
 const FAKE_AFT_CONCURRENCY_ENV: &str = "FAKE_AFT_CONCURRENCY";
 const FAKE_AFT_DOUBLE_TERMINAL_ENV: &str = "FAKE_AFT_DOUBLE_TERMINAL";
+const FAKE_AFT_STATUS_ENV: &str = "FAKE_AFT_STATUS";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
@@ -516,6 +517,7 @@ async fn handle_control_request(
         .map_err(StubError::FrameBuild)?;
         send_outbound(writer, response).await?;
         state.bound_channels.insert(route_channel);
+        emit_status_update(writer, config, frame.header.ver, route_channel).await?;
         return Ok(());
     }
 
@@ -568,6 +570,33 @@ async fn send_push(
     )
     .map_err(StubError::FrameBuild)?;
     send_outbound(writer, push).await
+}
+
+async fn emit_status_update(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+    version: u8,
+    route_channel: u16,
+) -> Result<(), StubError> {
+    let Some(status) = config.status.as_ref() else {
+        return Ok(());
+    };
+    let body = serde_json::to_vec(&StatusUpdate {
+        route_channel,
+        status: status.clone(),
+    })
+    .map_err(StubError::Json)?;
+    let push = Frame::build_with_version(version, FrameType::Push, control_flags(), 0, 0, body)
+        .map_err(StubError::FrameBuild)?;
+    send_outbound(writer, push).await?;
+    record_event(
+        config,
+        json!({
+            "kind": "status_published",
+            "route_channel": route_channel,
+            "status": status,
+        }),
+    )
 }
 
 async fn send_outbound(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), StubError> {
@@ -691,6 +720,7 @@ struct StubConfig {
     delay_from_body: bool,
     concurrency: Concurrency,
     double_terminal: bool,
+    status: Option<String>,
 }
 
 struct StubState {
@@ -728,6 +758,13 @@ impl StubConfig {
             .transpose()?;
         let events_path = env::var_os(FAKE_AFT_EVENTS_PATH_ENV).map(PathBuf::from);
         let concurrency = concurrency_from_env()?;
+        let status = env::var(FAKE_AFT_STATUS_ENV).ok().map(|raw| {
+            if raw.is_empty() {
+                "idle".to_string()
+            } else {
+                raw
+            }
+        });
 
         Ok(Self {
             socket_path,
@@ -741,6 +778,7 @@ impl StubConfig {
             delay_from_body: env_flag(FAKE_AFT_DELAY_FROM_BODY_ENV),
             concurrency,
             double_terminal: env_flag(FAKE_AFT_DOUBLE_TERMINAL_ENV),
+            status,
         })
     }
 }

@@ -15,6 +15,7 @@ pub mod identity;
 pub mod registry;
 pub mod router;
 pub mod server;
+pub mod status;
 pub mod supervise;
 
 pub use control::{ControlHandler, HelloAckBody, HelloBody, MIN_SUPPORTED_VERSION};
@@ -31,6 +32,7 @@ pub use router::{
     RouterError,
 };
 pub use server::{handle_connection, serve_listener, serve_uds, ConnectionError, ServerError};
+pub use status::{LivenessReply, PassivePoll, PollOp, StatusReply, StatusUpdate};
 pub use supervise::{
     ExitKind, ExitReport, ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError,
     SupervisedModule, Supervisor, SUBC_SOCKET_ENV,

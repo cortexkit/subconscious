@@ -86,6 +86,7 @@ struct ForwardingInner {
     reserved_routes: HashSet<(ModuleEndpointId, u16)>,
     client_to_module: HashMap<(ConnectionId, u16), ModuleRoute>,
     module_to_client: HashMap<(ModuleEndpointId, u16), ClientRoute>,
+    status: HashMap<(ModuleEndpointId, u16), String>,
     pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<AttachRelayOutcome>>,
 }
 
@@ -200,9 +201,9 @@ impl ForwardingTable {
         endpoint: ModuleEndpointId,
         route_channel: u16,
     ) -> Result<(), ForwardingError> {
-        self.lock_inner()?
-            .reserved_routes
-            .remove(&(endpoint, route_channel));
+        let mut inner = self.lock_inner()?;
+        inner.reserved_routes.remove(&(endpoint, route_channel));
+        inner.status.remove(&(endpoint, route_channel));
         Ok(())
     }
 
@@ -267,6 +268,75 @@ impl ForwardingTable {
             .cloned())
     }
 
+    pub(crate) fn cache_status(
+        &self,
+        endpoint: ModuleEndpointId,
+        route_channel: u16,
+        status: String,
+    ) -> Result<(), ForwardingError> {
+        let mut inner = self.lock_inner()?;
+        if !matches!(inner.active_module.as_ref(), Some(module) if module.endpoint == endpoint) {
+            return Err(ForwardingError::StaleModuleEndpoint);
+        }
+
+        let route_key = (endpoint, route_channel);
+        if inner.module_to_client.contains_key(&route_key)
+            || inner.reserved_routes.contains(&route_key)
+        {
+            inner.status.insert(route_key, status);
+        } else {
+            warn!(
+                route_channel,
+                generation = endpoint.generation,
+                connection_id = endpoint.connection_id.get(),
+                "dropping status update for unbound route channel"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_status(
+        &self,
+        endpoint: ModuleEndpointId,
+        route_channel: u16,
+    ) -> Result<Option<String>, ForwardingError> {
+        Ok(self
+            .lock_inner()?
+            .status
+            .get(&(endpoint, route_channel))
+            .cloned())
+    }
+
+    pub(crate) fn client_route_endpoint(
+        &self,
+        client_connection_id: ConnectionId,
+        route_channel: u16,
+    ) -> Result<Option<ModuleEndpointId>, ForwardingError> {
+        Ok(self
+            .lock_inner()?
+            .client_to_module
+            .get(&(client_connection_id, route_channel))
+            .map(|route| route.endpoint))
+    }
+
+    pub(crate) fn client_route_is_bound_to_active_module(
+        &self,
+        client_connection_id: ConnectionId,
+        route_channel: u16,
+    ) -> Result<bool, ForwardingError> {
+        let inner = self.lock_inner()?;
+        let Some(route) = inner
+            .client_to_module
+            .get(&(client_connection_id, route_channel))
+        else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            inner.active_module.as_ref(),
+            Some(module) if module.endpoint == route.endpoint
+        ))
+    }
+
     pub fn active_binding_count(&self) -> Result<usize, ForwardingError> {
         Ok(self.lock_inner()?.client_to_module.len())
     }
@@ -309,6 +379,9 @@ impl ForwardingTable {
             inner
                 .module_to_client
                 .retain(|(endpoint, _), _| *endpoint != module.endpoint);
+            inner
+                .status
+                .retain(|(endpoint, _), _| *endpoint != module.endpoint);
 
             let pending_keys: Vec<_> = inner
                 .pending_relays
@@ -345,6 +418,7 @@ impl ForwardingTable {
                 inner
                     .module_to_client
                     .remove(&(route.endpoint, route_channel));
+                inner.status.remove(&(route.endpoint, route_channel));
                 released.push(ReleasedRoute {
                     route_channel,
                     module_sink: route.sink,

@@ -18,8 +18,9 @@ pub const FIRST_MODULE_CHANNEL: u16 = 1;
 pub struct ConnectionId(u64);
 
 impl ConnectionId {
-    /// Synthetic connection id used by connection-unaware unit tests and direct
-    /// `Router::route` callers.
+    /// Synthetic connection id used by unit tests. Router-issued connection ids
+    /// start at 1, so this 0 value never collides with a real socket owner.
+    #[cfg(test)]
     pub const LOCAL: Self = Self(0);
 
     pub fn new(raw: u64) -> Self {
@@ -34,7 +35,6 @@ impl ConnectionId {
 /// Lifecycle state for a module's channel allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelState {
-    Allocated,
     Active,
     Closed,
 }
@@ -93,16 +93,15 @@ impl Registry {
         }
 
         let channel = inner.allocate_channel()?;
-        let mut registration = ModuleRegistration {
+        let registration = ModuleRegistration {
             manifest,
             negotiated_ver,
             channels: vec![channel],
-            state: ChannelState::Allocated,
+            state: ChannelState::Active,
             connection_id,
         };
 
         inner.channels.insert(channel, module_id.clone());
-        registration.state = ChannelState::Active;
         inner.modules.insert(module_id, registration.clone());
         Ok(registration)
     }
@@ -131,15 +130,6 @@ impl Registry {
         Ok(self.lock_inner()?.modules.len())
     }
 
-    /// Deregister a single module by id, releasing all channel allocations.
-    pub fn deregister_module(
-        &self,
-        module_id: &str,
-    ) -> Result<Option<ModuleRegistration>, RegistryError> {
-        let mut inner = self.lock_inner()?;
-        Ok(inner.close_module(module_id))
-    }
-
     /// Deregister every module owned by a dropped connection.
     pub fn deregister_connection(
         &self,
@@ -166,6 +156,8 @@ impl Registry {
 
 impl RegistryInner {
     fn allocate_channel(&mut self) -> Result<u16, RegistryError> {
+        // Worst case under full allocation scans every non-zero u16 channel once
+        // before reporting exhaustion.
         let mut candidate = self.next_channel;
         for _ in FIRST_MODULE_CHANNEL..=u16::MAX {
             if candidate == 0 {

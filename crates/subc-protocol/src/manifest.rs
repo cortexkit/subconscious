@@ -79,11 +79,19 @@ pub struct Tool {
 }
 
 /// How subc may deliver concurrent in-flight calls to the provider.
+///
+/// subc honors these semantics per FR16; the dispatcher that acts on them is
+/// Epic 2, while the manifest contract is frozen here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Concurrency {
+    /// One in-flight call at a time with strict submission and response order.
     Serial,
+    /// Concurrent in-flight calls may span channels, while subc preserves FIFO
+    /// submission within each channel; the module schedules internally.
     ModuleManaged,
+    /// Fully parallel delivery with no ordering guarantee across or within
+    /// channels.
     StatelessParallel,
 }
 

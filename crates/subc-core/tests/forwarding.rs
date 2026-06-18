@@ -435,6 +435,88 @@ async fn cross_session_slow_call_does_not_block_fast_call() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_channel_responses_return_out_of_order_by_corr() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-same-channel-oood";
+    let events_path = server.stub_events_path("same-channel-oood");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 631, "ses-same-channel-oood").await;
+
+    const CA: u64 = 632;
+    const CB: u64 = 633;
+    let payload_a = br#"{"delay_ms":300,"jsonrpc":"2.0","id":"req-a"}"#;
+    let payload_b = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"req-b"}"#;
+
+    write_frame(&mut client, &data_request(ack.route_channel, CA, payload_a))
+        .await
+        .unwrap();
+    write_frame(&mut client, &data_request(ack.route_channel, CB, payload_b))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let sent = Instant::now();
+
+    let first_response = read_frame_timeout(&mut client).await;
+    let first_received_at = Instant::now();
+    let second_response = read_frame_timeout(&mut client).await;
+    let second_received_at = Instant::now();
+
+    assert_response(&first_response, ack.route_channel, CB, payload_b);
+    assert_response(&second_response, ack.route_channel, CA, payload_a);
+
+    let b_latency = first_received_at.duration_since(sent);
+    let a_latency = second_received_at.duration_since(sent);
+    eprintln!(
+        "same-channel out-of-order latencies: B(corr={CB})={b_latency:?}, A(corr={CA})={a_latency:?}"
+    );
+    assert!(
+        first_received_at < second_received_at,
+        "B should arrive before A: b_latency={b_latency:?}, a_latency={a_latency:?}"
+    );
+    assert!(
+        b_latency < Duration::from_millis(80),
+        "fast request B should not wait behind A's delay: b_latency={b_latency:?}"
+    );
+    assert!(
+        a_latency >= Duration::from_millis(250),
+        "slow request A should reflect ~300ms delay: a_latency={a_latency:?}"
+    );
+
+    let events = stub_events(&events_path);
+    let a_recv_pos = event_position(&events, |event| {
+        event_is_request_received(event, ack.route_channel, CA)
+    });
+    let b_recv_pos = event_position(&events, |event| {
+        event_is_request_received(event, ack.route_channel, CB)
+    });
+    let a_terminal_pos = event_position(&events, |event| {
+        event_is_terminal(event, "response", ack.route_channel, CA)
+    });
+    assert!(
+        a_recv_pos < a_terminal_pos && b_recv_pos < a_terminal_pos,
+        "A and B should both be in-flight at the stub before A's terminal: {events:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_before_response_for_cancellable_request_returns_cancelled_error() {
     let server = TestServer::start();
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));

@@ -75,3 +75,11 @@ Additional seed vectors:
 - **#3 other edges:** none beyond Windows-verbatim. AFT routes its ~10+ scattered root-identity canonicalization sites through this crate during P0; operation/relative-path sites stay the AFT-side `CanonicalPath` layer.
 
 **Converged → crate creation proceeds.** (The "Open for AFT" section above is now resolved by this block.)
+
+## DELTA 1 addendum — Windows drive-letter case (vector #12)
+
+The Windows non-verbatim normalization ALSO uppercases the drive letter (`c:\foo` → `C:\foo`), because Windows drive letters are case-insensitive and two consumers spelling the drive differently must collapse to ONE id. This is **drive-letter-specific** and does NOT contradict the no-general-case-fold rule (#9): the rest of the path keeps realpath's stored case; only the drive letter is uppercased. Reference: AFT's `windows_non_verbatim_path` (resolver.rs:583-588). Applied within the same `#[cfg(windows)]` step (strip verbatim + UNC, then uppercase drive).
+
+| # | input | expected |
+|---|---|---|
+| 12 | (Windows) `c:\<existing>` (lowercase drive) | `C:\<existing>` (drive uppercased) |

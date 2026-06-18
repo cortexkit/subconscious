@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub mod control;
+pub mod forwarding;
 mod frame;
 pub mod frame_io;
 pub mod identity;
@@ -17,12 +18,16 @@ pub mod server;
 pub mod supervise;
 
 pub use control::{ControlHandler, HelloAckBody, HelloBody, MIN_SUPPORTED_VERSION};
+pub use forwarding::{
+    AttachAck, AttachRelay, AttachRequest, ForwardingError, ForwardingTable, ModuleEndpointId,
+};
 pub use frame::{Frame, FrameBuildError};
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};
 pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
 pub use registry::{ChannelState, ConnectionId, ModuleRegistration, Registry, RegistryError};
 pub use router::{
-    Backend, EchoBackend, FrameSink, RouteCtx, Router, RouterConnection, RouterError,
+    Backend, EchoBackend, ForwardBackend, FrameSink, RouteCtx, Router, RouterConnection,
+    RouterError,
 };
 pub use server::{handle_connection, serve_listener, serve_uds, ConnectionError, ServerError};
 pub use supervise::{

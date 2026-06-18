@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, env, error::Error, fmt, io, path::PathBuf, time::Duration};
 
 use serde_json::json;
-use subc_core::{read_frame, write_frame, Frame, HelloAckBody, HelloBody, SUBC_SOCKET_ENV};
+use subc_core::{
+    read_frame, write_frame, AttachRelay, Frame, HelloAckBody, HelloBody, SUBC_SOCKET_ENV,
+};
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
@@ -106,6 +108,23 @@ async fn handle_frame(stream: &mut UnixStream, frame: Option<Frame>) -> Result<b
             Ok(true)
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
+        FrameType::Request if frame.header.channel == 0 => {
+            let _relay =
+                serde_json::from_slice::<AttachRelay>(&frame.body).map_err(StubError::Json)?;
+            let body = serde_json::to_vec(&json!({ "accept": true })).map_err(StubError::Json)?;
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                control_flags(),
+                0,
+                frame.header.corr,
+                body,
+            )
+            .map_err(StubError::FrameBuild)?;
+            write_frame(stream, &response).await?;
+            stream.flush().await.map_err(StubError::Io)?;
+            Ok(true)
+        }
         FrameType::Request => {
             let response = Frame::build_with_version(
                 frame.header.ver,

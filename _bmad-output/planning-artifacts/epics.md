@@ -290,8 +290,8 @@ So that abandoned work stops and resources free.
 
 **Given** an in-flight correlation id,
 **When** subc forwards a CANCEL for it,
-**Then** the module decides abort-safety (a non-mutating read is droppable; a mutation mid-commit completes), and subc resolves the corr id as cancelled.
-**And** CANCEL is a pure-header frame (`len=0`).
+**Then** the module decides abort-safety (a non-mutating read is droppable; a mutation mid-commit completes), and **subc delivers the module's terminal frame for that corr** — an `Error{code:"cancelled"}` for an aborted read, or a normal `Response` if a mutation completed. subc tracks nothing per-corr and synthesizes nothing (DUMB-FORWARD; preserves the §6.1 thin-core contract — Oracle-reviewed bg_cd286aa5).
+**And** CANCEL is a pure-header frame (`len=0`), forwarded by the existing route demux; cancel-vs-response is benign best-effort, double/stale cancel is a module no-op, cancel-on-unknown-channel keeps the `unknown_channel` ERROR.
 
 ### Story 2.4: Per-channel flow-control window
 

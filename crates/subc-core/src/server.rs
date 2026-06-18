@@ -1,11 +1,19 @@
 use std::{error::Error, fmt, io, path::Path, sync::Arc};
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::UnixListener,
+    sync::mpsc,
+};
+use tracing::{debug, warn};
+
+use crate::{
+    read_frame,
+    router::{FrameSink, RouteCtx, Router},
+    write_frame, FrameIoError, RouterError,
 };
 
-use crate::{read_frame, router::Router, write_frame, FrameIoError, RouterError};
+const CONNECTION_EGRESS_BUFFER: usize = 64;
 
 /// Bind a Unix-domain socket at `path` and serve connections forever.
 ///
@@ -25,47 +33,144 @@ pub async fn serve_listener(
 ) -> Result<(), ServerError> {
     loop {
         let (stream, _) = listener.accept().await.map_err(ServerError::Accept)?;
+        debug!("accepted subc Unix socket connection");
         let router = Arc::clone(&router);
         tokio::spawn(async move {
-            let _ = handle_connection(stream, router).await;
+            if let Err(err) = handle_connection(stream, router).await {
+                warn!(error = %err, "subc connection ended with error");
+            }
         });
     }
 }
 
-/// Run the frame read -> route -> write loop for one connection.
-pub async fn handle_connection<S>(mut stream: S, router: Arc<Router>) -> Result<(), ConnectionError>
+/// Run the serial frame read -> route loop for one connection.
+///
+/// Outbound frames flow through a bounded [`FrameSink`] drained by one writer
+/// task. This locks in the streaming-capable sink shape while intentionally
+/// keeping inbound dispatch serial: each routed frame is awaited before reading
+/// the next one.
+pub async fn handle_connection<S>(stream: S, router: Arc<Router>) -> Result<(), ConnectionError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let connection = router.begin_connection();
+    let connection_id = connection.id();
+    debug!(
+        connection_id = connection_id.get(),
+        "subc connection opened"
+    );
 
+    let (mut read_half, write_half) = tokio::io::split(stream);
+    let (tx, rx) = mpsc::channel::<crate::Frame>(CONNECTION_EGRESS_BUFFER);
+    let writer = tokio::spawn(drain_writer(write_half, rx));
+
+    let egress = FrameSink::new(tx);
+    let ctx = RouteCtx {
+        connection_id,
+        egress: egress.clone(),
+    };
+
+    let loop_result = connection_loop(&mut read_half, &router, &ctx).await;
+
+    drop(ctx);
+    drop(egress);
+    drop(connection);
+
+    let writer_result = writer.await.map_err(ConnectionError::WriterTask);
+    let result = match (loop_result, writer_result) {
+        (Err(loop_err), Ok(Ok(()))) => Err(loop_err),
+        (Err(loop_err), Ok(Err(writer_err))) => {
+            warn!(
+                connection_id = connection_id.get(),
+                writer_error = %writer_err,
+                "writer failed while closing after connection error"
+            );
+            Err(loop_err)
+        }
+        (Err(loop_err), Err(join_err)) => {
+            warn!(
+                connection_id = connection_id.get(),
+                join_error = %join_err,
+                "writer task join failed while closing after connection error"
+            );
+            Err(loop_err)
+        }
+        (Ok(()), Ok(Ok(()))) => Ok(()),
+        (Ok(()), Ok(Err(writer_err))) => Err(ConnectionError::FrameIo(writer_err)),
+        (Ok(()), Err(join_err)) => Err(join_err),
+    };
+
+    match &result {
+        Ok(()) => debug!(
+            connection_id = connection_id.get(),
+            "subc connection closed"
+        ),
+        Err(err) => debug!(
+            connection_id = connection_id.get(),
+            error = %err,
+            "subc connection exited with error"
+        ),
+    }
+
+    result
+}
+
+async fn connection_loop<R>(
+    read_half: &mut R,
+    router: &Router,
+    ctx: &RouteCtx,
+) -> Result<(), ConnectionError>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
-        let Some(frame) = read_frame(&mut stream)
+        let Some(frame) = read_frame(read_half)
             .await
             .map_err(ConnectionError::FrameIo)?
         else {
             return Ok(());
         };
 
-        match router.route_for_connection(connection.id(), frame) {
-            Ok(responses) => {
-                for response in responses {
-                    write_frame(&mut stream, &response)
-                        .await
-                        .map_err(ConnectionError::FrameIo)?;
-                }
-            }
-            Err(err) => {
-                if let Some(error_frame) = err.to_error_frame() {
-                    write_frame(&mut stream, &error_frame)
-                        .await
-                        .map_err(ConnectionError::FrameIo)?;
-                } else {
-                    return Err(ConnectionError::Router(err));
-                }
+        if let Err(err) = router.route_for_connection(ctx, frame).await {
+            if let Some(error_frame) = err.to_error_frame() {
+                warn!(
+                    connection_id = ctx.connection_id.get(),
+                    error = %err,
+                    "routing failure recovered with ERROR frame"
+                );
+                ctx.egress
+                    .send(error_frame)
+                    .await
+                    .map_err(ConnectionError::Router)?;
+            } else {
+                debug!(
+                    connection_id = ctx.connection_id.get(),
+                    error = %err,
+                    "fatal routing failure"
+                );
+                return Err(ConnectionError::Router(err));
             }
         }
     }
+}
+
+async fn drain_writer<W>(
+    write_half: W,
+    mut rx: mpsc::Receiver<crate::Frame>,
+) -> Result<(), FrameIoError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut writer = BufWriter::new(write_half);
+    while let Some(frame) = rx.recv().await {
+        write_frame(&mut writer, &frame).await?;
+        while let Ok(frame) = rx.try_recv() {
+            write_frame(&mut writer, &frame).await?;
+        }
+        writer.flush().await.map_err(FrameIoError::Io)?;
+    }
+    writer.flush().await.map_err(FrameIoError::Io)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -95,6 +200,7 @@ impl Error for ServerError {
 pub enum ConnectionError {
     FrameIo(FrameIoError),
     Router(RouterError),
+    WriterTask(tokio::task::JoinError),
 }
 
 impl fmt::Display for ConnectionError {
@@ -102,6 +208,7 @@ impl fmt::Display for ConnectionError {
         match self {
             Self::FrameIo(err) => write!(f, "frame connection error: {err}"),
             Self::Router(err) => write!(f, "router connection error: {err}"),
+            Self::WriterTask(err) => write!(f, "connection writer task failed: {err}"),
         }
     }
 }
@@ -111,6 +218,7 @@ impl Error for ConnectionError {
         match self {
             Self::FrameIo(err) => Some(err),
             Self::Router(err) => Some(err),
+            Self::WriterTask(err) => Some(err),
         }
     }
 }
@@ -118,7 +226,9 @@ impl Error for ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_protocol::{DecodeError, Flags, FrameType, Priority, HEADER_LEN, PROTOCOL_VERSION};
+    use subc_protocol::{
+        DecodeError, ErrorBody, Flags, FrameType, Priority, HEADER_LEN, PROTOCOL_VERSION,
+    };
     use tokio::io::{duplex, AsyncWriteExt};
 
     use crate::{frame_io::ReadStage, EchoBackend, Frame};
@@ -250,6 +360,8 @@ mod tests {
         assert_eq!(error.header.ty, FrameType::Error);
         assert_eq!(error.header.channel, 42);
         assert_eq!(error.header.corr, 10);
+        let error_body: ErrorBody = serde_json::from_slice(&error.body).unwrap();
+        assert_eq!(error_body.code, "unknown_channel");
 
         let response = crate::read_frame(&mut client).await.unwrap().unwrap();
         assert_eq!(response.header.ty, FrameType::Response);

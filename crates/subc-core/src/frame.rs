@@ -10,18 +10,6 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Build a frame from a caller-provided header and body, validating that
-    /// `header.len` matches the body byte length.
-    pub fn new(header: EnvelopeHeader, body: Vec<u8>) -> Result<Self, FrameBuildError> {
-        if header.len as usize != body.len() {
-            return Err(FrameBuildError::BodyLengthMismatch {
-                header_len: header.len,
-                body_len: body.len(),
-            });
-        }
-        Ok(Self { header, body })
-    }
-
     /// Build a v1 frame, filling `len` from the opaque body bytes.
     pub fn build(
         ty: FrameType,
@@ -70,8 +58,6 @@ impl Frame {
 pub enum FrameBuildError {
     /// The opaque body cannot be represented by the envelope's `u32` length.
     BodyTooLarge { body_len: usize },
-    /// The caller-supplied header length disagrees with the body byte length.
-    BodyLengthMismatch { header_len: u32, body_len: usize },
 }
 
 impl fmt::Display for FrameBuildError {
@@ -80,13 +66,6 @@ impl fmt::Display for FrameBuildError {
             Self::BodyTooLarge { body_len } => {
                 write!(f, "frame body is too large for u32 len: {body_len} bytes")
             }
-            Self::BodyLengthMismatch {
-                header_len,
-                body_len,
-            } => write!(
-                f,
-                "frame header len ({header_len}) does not match body length ({body_len})"
-            ),
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, io};
 
-use subc_protocol::{decode_header, DecodeError, HEADER_LEN};
+use subc_protocol::{decode_header, DecodeError, HEADER_LEN, MAX_FRAME_BODY_LEN};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::Frame;
@@ -17,6 +17,10 @@ pub enum ReadStage {
 pub enum FrameIoError {
     Io(io::Error),
     DecodeHeader(DecodeError),
+    BodyTooLarge {
+        len: u32,
+        max: u32,
+    },
     UnexpectedEof {
         stage: ReadStage,
         expected: usize,
@@ -37,12 +41,21 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Option<Frame>, FrameIoError
 where
     R: AsyncRead + Unpin,
 {
+    // v1 uses the current 17-byte fixed header. A v2 reader would first read the
+    // 5-byte frozen prefix (`len` + `ver`), then read the version-specific
+    // remainder before decoding.
     let mut header_bytes = [0u8; HEADER_LEN];
     if !read_exact_or_clean_eof(reader, &mut header_bytes, ReadStage::Header).await? {
         return Ok(None);
     }
 
     let header = decode_header(&header_bytes).map_err(FrameIoError::DecodeHeader)?;
+    if header.len > MAX_FRAME_BODY_LEN {
+        return Err(FrameIoError::BodyTooLarge {
+            len: header.len,
+            max: MAX_FRAME_BODY_LEN,
+        });
+    }
     let body_len = header.len as usize;
     let mut body = vec![0u8; body_len];
     if body_len > 0 {
@@ -55,7 +68,8 @@ where
 /// Write one complete frame to an async stream.
 ///
 /// The header's `len` must match the opaque body length; mismatches are reported
-/// as a typed error rather than silently rewriting the header.
+/// as a typed error rather than silently rewriting the header. This function does
+/// not flush buffered writers; callers choose their own flush cadence.
 pub async fn write_frame<W>(writer: &mut W, frame: &Frame) -> Result<(), FrameIoError>
 where
     W: AsyncWrite + Unpin,
@@ -77,7 +91,6 @@ where
             .await
             .map_err(FrameIoError::Io)?;
     }
-    writer.flush().await.map_err(FrameIoError::Io)?;
     Ok(())
 }
 
@@ -140,7 +153,10 @@ impl fmt::Display for FrameIoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "frame I/O error: {err}"),
-            Self::DecodeHeader(err) => write!(f, "invalid envelope header: {err:?}"),
+            Self::DecodeHeader(err) => write!(f, "invalid envelope header: {err}"),
+            Self::BodyTooLarge { len, max } => {
+                write!(f, "frame body length {len} exceeds max {max}")
+            }
             Self::UnexpectedEof {
                 stage,
                 expected,
@@ -164,8 +180,9 @@ impl Error for FrameIoError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::DecodeHeader(_)
-            | Self::UnexpectedEof { .. }
+            Self::DecodeHeader(err) => Some(err),
+            Self::UnexpectedEof { .. }
+            | Self::BodyTooLarge { .. }
             | Self::BodyLengthMismatch { .. } => None,
         }
     }
@@ -273,6 +290,54 @@ mod tests {
                 expected: 4,
                 actual: 2
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pure_header_frame_with_body_len_is_typed_decode_error() {
+        let (mut client, mut server) = duplex(64);
+        let mut header = [0u8; HEADER_LEN];
+        header[0..4].copy_from_slice(&1u32.to_le_bytes());
+        header[4] = PROTOCOL_VERSION;
+        header[5] = FrameType::Ping as u8;
+        header[6] = Flags::new(false, Priority::Passive, false).0;
+
+        let writer = tokio::spawn(async move {
+            client.write_all(&header).await.unwrap();
+        });
+
+        let err = read_frame(&mut server).await.unwrap_err();
+        writer.await.unwrap();
+        assert!(matches!(
+            err,
+            FrameIoError::DecodeHeader(DecodeError::PureHeaderFrameWithBody {
+                ty: FrameType::Ping,
+                len: 1
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn body_len_over_cap_is_rejected_before_allocation() {
+        let (mut client, mut server) = duplex(64);
+        let mut header = [0u8; HEADER_LEN];
+        header[0..4].copy_from_slice(&(MAX_FRAME_BODY_LEN + 1).to_le_bytes());
+        header[4] = PROTOCOL_VERSION;
+        header[5] = FrameType::Request as u8;
+        header[6] = Flags::new(false, Priority::Passive, false).0;
+
+        let writer = tokio::spawn(async move {
+            client.write_all(&header).await.unwrap();
+        });
+
+        let err = read_frame(&mut server).await.unwrap_err();
+        writer.await.unwrap();
+        assert!(matches!(
+            err,
+            FrameIoError::BodyTooLarge {
+                len,
+                max: MAX_FRAME_BODY_LEN
+            } if len == MAX_FRAME_BODY_LEN + 1
         ));
     }
 }

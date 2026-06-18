@@ -9,6 +9,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
+name = "cortexkit-paths"
+version = "0.0.0"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -124,6 +128,7 @@ dependencies = [
 name = "subc-core"
 version = "0.0.0"
 dependencies = [
+ "cortexkit-paths",
  "serde",
  "serde_json",
  "subc-protocol",

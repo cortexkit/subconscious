@@ -41,7 +41,9 @@ development_status:
   1-5-process-supervision-fake-aft-stub: done                # merged 9ab9a50 (Supervisor lifecycle + fake-aft-stub bin + 5 real-subprocess integration tests); in-flight-request-death AC deferred to forwarding story (needs ForwardBackend)
   1-6-hello-capability-manifest-registration: done           # merged ed14d88 (HELLO/registration/lifecycle/version-floor)
   1-7-dual-scope-identity: done                              # ProjectRootId canonicalization (228fbd5); extracted to shared cortexkit-paths crate ed1709d (+Windows non-verbatim); per-command scope table (AC5) still gated on AFT co-sign
-  1-8-async-push-forwarding: backlog                         # + misroute/closed-channel + PUSH flow control
+  1-8-data-plane-forwarding-spike: done                      # merged 7c59bc0 (walking skeleton: AttachRequest/Ack/Relay + ForwardingTable + ForwardBackend + bidirectional demux + stub auto-accept; 1 real-socket round-trip test). Oracle-reviewed bg_8c592eb1.
+  1-8a-forwarding-hardening: in-progress                     # EXPAND: config_divergence reject, multi-client+FIFO-stress, restart/generation invalidation + late-frame channel-gone, detach-relay on GOODBYE/drop, legacy sync handle_control test-only cleanup
+  1-8-async-push-forwarding: backlog                         # PUSH fan-out (module-owned) + channel-gone replay; builds on the forwarding data plane
   1-8b-typescript-mode-2-plugin-client: backlog             # harness-facing half of mode 2; gates 1-9
   1-9-e2e-real-aft-opencode: backlog                         # GATE: AFT Leg 1; + hoisting fidelity AC
   1-10-cross-instance-dedup-close: backlog                   # felt win; + session-isolation-under-sharing AC

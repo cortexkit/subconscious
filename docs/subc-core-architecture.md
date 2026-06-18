@@ -70,24 +70,28 @@ Two kinds of actor open a connection to subc:
 - **Clients** consume: harnesses/agents (tool plane), the CK app/CLI/human (mgmt plane), the LLM-runner (proxy + tool planes).
 - **Modules** provide one or more roles, and may *also* be clients (bidirectional).
 
-One connection **multiplexes** many logical channels (route = `(component, session)`, assigned at HELLO). Correlation ids carry many in-flight requests on one socket — this is what makes head-of-line blocking impossible at the transport layer, and lets subc answer liveness/status from its own cache without forwarding.
+One connection **multiplexes** many logical channels. A channel is the per-frame route handle (u16); it is **bound once, at session-attach, to the triple `(project_root, harness, session)`** (§4.2) and never re-sent per frame. Correlation ids carry many in-flight requests on one socket — this is what makes head-of-line blocking impossible at the transport layer, and lets subc answer liveness/status from its own cache without forwarding.
 
 ### 4.2 HELLO handshake
 
-A client:
-```jsonc
-HELLO {
-  "protocol_ver": 1,
-  "actor": "client",
-  "harness": "opencode" | "pi" | "codex" | "ck-app" | "cli" | ...,
-  "project_root": "/abs/path",      // resolved to canonical ProjectRootId by subc
-  "session_id": "ses_...",          // (session_id, harness) composite
-  "role": "agent" | "dashboard" | "cli"
-}
-HELLO_ACK { "channel": u16, "daemon_ver": "...", "capabilities": {...}, "project_id": "git:<hash>|dir:<hash>" }
-```
+There are **two distinct channel-0 handshakes** (do not conflate them):
 
-A module registers a **manifest** (below) instead of a client identity, and receives a control channel plus any consumer channels it asks for.
+**(1) Module registration** — a *module* (e.g. AFT) connects and registers its **manifest** (§4.3). Implemented today; body shapes match the `subc-protocol` types:
+```jsonc
+HELLO     { "manifest": { /* ModuleManifest, §4.3 */ }, "protocol_ver": 1 }
+HELLO_ACK { "negotiated_ver": u8, "channels": [u16], "subc_capabilities": ["..."] }
+```
+Version below `MIN_SUPPORTED_VERSION` → a channel-0 `ERROR { code, message }` (the unified error body, §4.8), not registered. Duplicate active `module_id` is rejected (route-hijack guard); stale registrations are released on GOODBYE or connection-drop.
+
+**(2) Session attach** — a *harness session* connects to be routed to a module. It carries the triple + its config; subc resolves the canonical `ProjectRootId`, then **relays the attach to the module — a vetoed request/response, not a local ack** (the module owns config reconciliation, §4.7):
+```jsonc
+ATTACH { "project_root": "/abs/path", "harness": "opencode"|"pi"|..., "session_id": "ses_...",
+         "config": { /* opaque, provenance-tagged user+project tiers, §4.7 */ } }
+```
+- **Accept** → subc binds a **route channel** to `(connection, project_root, harness, session)` and acks. The channel is now the per-frame handle (§4.1).
+- **`config_divergence`** → subc returns a channel-0 `ERROR { code:"config_divergence", message:<diff> }`, binds nothing. (A later harness whose canonical RootConfig diverges from a warm root's, §4.7.)
+
+The triple binds to the channel **once** here; data frames thereafter are `channel + corr + opaque body`. See §4.9 for the single-AFT routing model this attach feeds.
 
 ### 4.3 Capability registration — the module manifest
 
@@ -191,7 +195,7 @@ Tagged union on `role`. A module lists as many as it plays.
   "circuit_breaker": { "identical_failures": 3 }
 }
 ```
-- subc-core owns the scheduler + the single project lease; the LLM-runner module *executes* the loop. Today MC and AFT have separate lease tables in separate DBs — centralizing the lease here is what stops two modules dreaming the same project at once.
+- subc-core owns the scheduler + the single project lease; the LLM-runner module *executes* the loop. Today MC and AFT have separate lease tables in separate DBs — centralizing the lease here is what stops two modules dreaming the same project at once. The lease is keyed **per canonical `ProjectRootId` (per-path), not per-repo** — a git worktree is its own root (distinct working state, often a distinct branch) and gets its own lease; per-repo keying would wrongly serialize genuinely-different contexts (and worktrees are a first-class workflow here). RepoId stays a module concern (§4.9).
 
 ### 4.7 Bindings (`bindings{}`)
 
@@ -208,6 +212,7 @@ Tagged union on `role`. A module lists as many as it plays.
 - **Config is a binding, not a file.** `source: subc_mediated` means the module's config lives behind subc and is editable remotely through the mgmt plane. The module owns the *schema* (declared in `management_surface.config_schema`); subc owns the *store and the transport*. This is what makes "control my server's config from my laptop" work.
 - **Config is layered, and the layering is part of the contract** (MC's constraint). subc stores the declared `tiers` (e.g. `user` overridden by `project`) as **data, never flattened**, and never mixes tiers across the edit transport. Token expansion (`{env:}`/`{file:}`) is gated **per tier** — allowed at `user`, denied at `project` (secret-exfiltration safety). subc does not expand tokens: the module merges and expands at **use-time on the machine where it runs**, so `{file:}`/`{env:}` resolve on the server and secrets never travel to the CK app. subc owns the layered store + per-tier transport; the module owns merge + expansion + the trust rule.
 - **subc's config store is provenance-preserving dumb storage.** Each tier is kept as a distinct, origin-tagged, raw document; subc does **no semantic preprocessing** — no merge, no expansion, no validation, no field-stripping. The module's per-tier trust policy is broader than token-gating and is applied at load *before* merge (e.g. MC strips privilege-escalation and process-level fields from the untrusted project tier, and drops an inherited embedding key on endpoint redirect), so any flattening, pre-expansion, or field alteration by subc would erase what the module must police. The stored and transported form is **always the raw token** — the CK app reads/edits the literal `{env:…}`/`{file:…}`, never a resolved value; secrets resolve once at module use-time on the module's machine and never re-enter the store or the wire. This is the config instance of subc's general rule: **store and route without interpreting** (the same splice-without-parse property the tool and proxy planes have).
+- **Config cardinality is the module's schema, computed module-side (AFT, source-verified).** Because one module instance serves many roots and harnesses (§4.9), config splits three ways — but subc does **not** know this partition (knowing which keys are which = interpreting config = breaking thin-core). subc forwards the raw provenance-tagged tiers (§4.2 ATTACH); the module computes: **RootConfig** = artifact-shaping/executable-choosing keys (search max-file-size; semantic backend/model/base_url; LSP server set + binary paths; diagnostic-cache cap) — **canonical per root, reconciled across harnesses**; **demand overlay** = feature booleans (search/semantic/callgraph/inspect) — **ref-counted union** (build the root artifact if *any* attached session wants it, expose the tool surface per session); **SessionConfig** = per-`(harness,session)` (restrict-to-root, url-fetch, formatter/checker, bash, backups, filters). This is why the index artifacts can be safely root-shared: search/semantic indexes are **not** pure functions of files (semantic fingerprint = backend/model/base_url/dim), so sharing is sound **only** with a canonical-per-root config — and a later harness whose RootConfig **diverges** is rejected at attach (`config_divergence`, §4.2) with an actionable diff. That structural rule is what kills the embedding flip/flop (NFR10): one canonical embedding backend per root, never a silent rebuild war.
 
 ---
 
@@ -221,7 +226,7 @@ The frame that carries every message in §4.1–4.7 on the local subc↔module l
    4      1    ver       u8      envelope version
    5      1    type      u8      REQUEST/RESPONSE/PUSH/STREAM_DATA/STREAM_END/ERROR/CANCEL/PING/PONG/HELLO/HELLO_ACK/GOODBYE
    6      1    flags     u8      bit0 BINARY (bulk-lane raw body) · bits1-2 PRIORITY (passive/interactive/background) · bit3 LAST (stream-final) · 4-7 reserved
-   7      2    channel   u16     route = (component, session); 0 = subc itself
+   7      2    channel   u16     route handle; bound once at session-attach to (project_root,harness,session) (§4.2/§4.9); 0 = subc itself
    9      8    corr      u64     correlation id; CANCEL carries the target call's corr
   17 → body
 ```
@@ -246,6 +251,20 @@ So any reader of any version can always: read 5 bytes → learn `ver` → look u
 
 ---
 
+### 4.9 Single-process routing & the session-attach data plane
+
+The routing model under one-AFT-process (§2.1), source-verified with AFT:
+
+- **Route by module-kind to one pid; the module self-demuxes.** subc does not run a per-root process pool. All AFT traffic goes to the one AFT process; AFT picks the right internal `ProjectActor` by `project_root`. subc still resolves the canonical `ProjectRootId` at attach — for its own lease/scheduler (§4.6) and PUSH routing — **not** to select an instance.
+- **The triple binds to a channel once, at attach.** Per-frame routing is `channel → connection` (1:1); the `(project_root, harness, session)` triple rides the §4.2 ATTACH, never per-frame. This is what keeps the 17-byte envelope unchanged under the harness/root/session fan-out.
+- **Bidirectional channel-0 relay.** `attach-relay` (subc→module: channel bound to the triple — also the module's *ensure-or-create-`ProjectActor`* signal; first attach warms a cold root, later attaches bind to the warm actor) and `detach-relay` (subc→module: channel gone on GOODBYE/connection-drop — decrements the actor's session refcount, feeds idle-evict).
+- **PUSH fan-out is the module's, not subc's.** subc stays a pure `channel → connection` router. Unsolicited PUSH (bash completion, watcher `status_changed`, bash_watch) is targeted by the module: request-triggered PUSH echoes the originating channel; a root-wide `status_changed` fans out to **all** channels bound to that root (the module's `root → [channels]` index *is* its `ProjectActor` session set — zero new state). Keeping all PUSH-target choice in one owner avoids fragmenting channel-gone policy.
+- **Channel-gone = two converging signals → one module policy.** The proactive `detach-relay` (authoritative) and a reactive per-send channel-gone outcome (subc best-effort drops a PUSH handed to a dead connection during the emit-before-detach race). The module applies one per-frame-type policy: **queue-for-replay** (completion/watch — disk/DB-durable, keyed by `(harness,session)`, survives detach **and** actor-evict **and** process-restart) vs **drop/coalesce** (status). subc just delivers a replayed PUSH on the new channel after re-attach.
+- **RepoId is the module's, not shared.** subc keys everything per-path (`ProjectRootId`); a per-repo notion (git common-dir) lives module-side and only matters if a real per-repo coordinated resource ever emerges (not v1).
+- **Path-identity is shared by construction.** The `ProjectRootId` canonicalization is a small published, dependency-light, cortexkit-neutral crate (`cortexkit-paths`) that subc *and* AFT call — byte-identical canonicalization, not two algorithms reconciled by test vectors. Workspace-root walk-up is harness-owned (shared in the plugin bridge so OC+Pi can't diverge); subc/AFT only realpath-canonicalize the received root (authoritatively, so cross-language TS realpath parity is not load-bearing — walk-up parity is).
+
+---
+
 ## 5. Core services a module can rely on
 
 | Service | Contract |
@@ -266,24 +285,31 @@ So any reader of any version can always: read 5 bytes → learn `ver` → look u
 
 The headline v1 goal — non-mutating tools run in parallel, mutating serialized — is delivered by **two parts that interlock but version independently**: subc's delivery contract, and the module's executor.
 
-### 6.1 subc's delivery contract (locked; built day one)
+### 6.1 subc's delivery contract (locked) — and what is built vs Epic 2
 
-subc models concurrency from the first release, regardless of how far any module's executor has matured:
-- **Concurrent in-flight** — many requests outstanding per channel, identified by correlation id.
-- **Out-of-order responses** — a response carries its corr id; subc never assumes response order matches request order.
-- **Per-channel FIFO _delivery_** — subc hands a channel's requests to the module in submission order, but does not wait for a response before delivering the next. Delivery order only; *execution* order is the module's.
-- **Cancel** — subc forwards a CANCEL for a corr id (session interrupted, harness aborts, client gone). First-class from day one — long callgraph cold-builds and embedding runs make it matter before Leg 2 even exists.
-- **Per-channel flow-control window** — a bounded number of un-acked in-flight requests per channel, so a slow module cannot make subc buffer unboundedly.
+The contract is **locked**; the *implementation* lands in two stages. The shape that makes concurrency additive is built now; the concurrent dispatch itself is Epic 2 (it has no real consumer until the module-forwarding backend exists). Honest status:
+
+| Contract element | Status |
+|---|---|
+| Sink-based async backend + per-connection writer task | **built** (the streaming/PUSH-capable shape) |
+| Per-connection backpressure (bounded outbound queue) | **built** |
+| Out-of-order responses (corr-id carried, never assumed ordered) | **built** (shape) |
+| Per-channel FIFO submission, governed by the module's declared `concurrency` (§4.4) | **contracted** |
+| Concurrent in-flight dispatch | **Epic 2** (serial dispatch today; no forwarding backend yet) |
+| CANCEL handling | **Epic 2** (frame type reserved in the envelope; no handler yet) |
+| Per-channel flow-control window (un-acked cap) | **Epic 2** |
+
+**Per-mode FIFO (FR16):** ordering is per-module, declared via manifest `concurrency`: `serial` = one in-flight, strict order; `module_managed` = concurrent in-flight across channels, per-channel FIFO submission preserved within a channel (module schedules internally) — AFT's mode; `stateless_parallel` = fully parallel, no ordering. The dispatcher that *acts* on this lands with the forwarding backend (Epic 2).
 
 This contract is **delivery semantics only.** subc never learns which calls mutate, never orders execution, never reasons about resources. All execution consistency — including two calls touching the same resource in one parallel batch — is the module's.
 
 ### 6.2 The module side (declared; grows into the contract)
 
 A module honors the contract per its declared `concurrency` (§4.4). AFT declares `module_managed` and matures in two legs **without the wire contract changing** (source-verified by AFT):
-- **Leg 1 — transport + per-root router.** NDJSON-on-stdin → subc socket; the main loop becomes a router; one `AppContext` instance per root. Delivers **cross-root** parallelism; each per-root actor is still single-threaded and processes concurrent-in-flight calls through an internal FIFO — serial per root, for now.
-- **Leg 2 — within-root reader-writer executor.** Non-mutating handlers run on a thread pool against shareable index state; mutating handlers take a write barrier. This is what makes non-mutating tools actually run in parallel within a root.
+- **Leg 1 — in-process `ProjectActor` extraction.** AFT stays **one process** (it is a singleton module, §2.1); subc routes all AFT traffic to that one pid and AFT **self-demuxes by `project_root`** internally. Leg 1 lifts the single `AppContext` into a `ProjectActor` map keyed by `ProjectRootId`, sharing the few genuinely process-global services (bash registry, filter registry, stdout), plus the transport shim (stdin → subc socket). Ships incrementally, single-root working throughout. It does **not** itself deliver parallelism — each actor is still single-threaded.
+- **Leg 2 — within-root reader-writer executor (`RefCell` → `Arc`).** Non-mutating handlers run on a thread pool against shareable index state; mutating handlers take a write barrier. This is what makes non-mutating tools actually run in parallel within a root — and once the `ProjectActor` map is concurrent, cross-root parallelism falls out for free.
 
-Because the contract is "concurrent-in-flight + cancel + windows," **subc does not gate on AFT's Leg 2 timing** — AFT accepts concurrency from Leg 1 (serial internally) and runs it truly concurrently after Leg 2. Both legs are in v1 (the headline is Leg 2), built Leg-1-then-Leg-2, not big-banged.
+Because the contract is "concurrent-in-flight + cancel + windows," **subc does not gate on AFT's Leg 2 timing** — AFT accepts the concurrency contract from Leg 1 (serial internally) and runs it truly concurrently after Leg 2. The felt within-root headline arrives **with** Leg 2 (so it is the critical path for the headline; cross-session concurrency is subc-owned and lands independently).
 
 ### 6.3 What each leg delivers (so the metric is honest)
 
@@ -296,7 +322,7 @@ Leg 2 is interior-mutability surgery, not a thin wrapper, because AFT's non-muta
 - The query substrate is `RefCell<Option<T>>` (`search_index`, `semantic_index`, `callgraph`, `callgraph_store`) — `!Sync`, so `AppContext` cannot be shared across threads even for pure reads; accessors hand out borrows, not clones.
 - Several "reads" mutate internally: the callgraph navigation ops (`callers`/`call_tree`/`impact`/`trace_*`) lazily open + populate + generation-revalidate the store via `borrow_mut()`; `semantic_search` lazily loads the embedding model via `borrow_mut()`; `outline` fills the symbol cache on miss; `config()`/`lsp()` hand out `Ref`/`RefMut`.
 
-So Leg 2 requires: **(a)** convert the index structures from `RefCell`-owned to genuinely shareable (`Arc` + internal `RwLock`, or `Arc<immutable snapshot>`; `CallGraphStore` is SQLite → a read-only connection pool or snapshot handle); **(b)** move all lazy-build / lazy-open / model-load / generation-revalidation **out of the read path** (eager, or behind a one-time write barrier) so reads are genuinely `&`-only. Already thread-safe and needing no work: `symbol_cache`, `inspect_manager`, `bash_background`, `filter_registry`, and the channel-backed persistent stores. _(Full per-field conversion inventory: forthcoming from AFT.)_
+So Leg 2 requires: **(a)** convert the index structures from `RefCell`-owned to genuinely shareable (`Arc` + internal `RwLock`, or `Arc<immutable snapshot>`; `CallGraphStore` is SQLite → a read-only connection pool or snapshot handle); **(b)** move all lazy-build / lazy-open / model-load / generation-revalidation **out of the read path** (eager, or behind a one-time write barrier) so reads are genuinely `&`-only. Already thread-safe and needing no work: `symbol_cache`, `inspect_manager`, `bash_background`, `filter_registry`, and the channel-backed persistent stores. _(Full per-field inventory delivered by AFT — the AppContext substrate inventory (v3): a combined `ProjectActor`-extraction sizer + Leg-2 `Arc`-readiness map, Oracle-validated. Two corrections it surfaced: the provider/parser is a read-path mutator too (via `outline`/`zoom`) and `inspect` is a serial **writer** not a read; and `callgraph_store` downgrades barrier→wrap — it already holds `Mutex<Connection>`, so `Arc`-shared parallel readers are safe with no pool.)_
 
 ---
 
@@ -319,9 +345,10 @@ Nothing requires a core change. The claim holds **until a module needs a plane t
 
 ## 8. Open forks (carried)
 
-1. **Framing** — hand-rolled length-prefix vs `h2`-with-JSON-bodies (mux/cancellation for free vs heavier TS client).
-2. **Canonical normalized shape** — the exact representation codecs and the transform target (OpenCode parts-based MessageLike is a candidate).
-3. **Conformance-gate corpus** — recorded real provider payloads + assertions for codec certification.
-4. **AFT concurrency-refactor shape** — reader-writer over per-root state; size pending AFT-Alfonso (do non-mutating handlers touch RefCell state, or are they clean against the Arc indexes?).
-5. **Session/message-data owner** — what serves the dashboard's session/message view in a harness-agnostic, remote world (pending MC-Alfonso).
-6. **Single-process vs per-root** — measurement-gated (RSS decomposition); secondary to concurrency.
+Genuinely open (all later-plane / cross-team, none blocking v1 tool-plane):
+1. **Canonical normalized shape** (proxy plane) — the exact representation codecs and the transform target (OpenCode parts-based MessageLike is a candidate).
+2. **Conformance-gate corpus** (proxy plane) — recorded real provider payloads + assertions for codec certification.
+3. **Session/message-data owner** (mgmt plane) — what serves the dashboard's session/message view in a harness-agnostic, remote world (pending MC-Alfonso).
+4. **`cortexkit-paths` repo home** — own-repo/`cortexkit-commons` vs subc-monorepo workspace member (cross-project topology; Ufuk's call). Doesn't block — AFT depends on the published crate, not the source location.
+
+**Resolved since (were open forks):** framing → locked 17-byte length-prefix envelope (§4.8); single-process-vs-per-root → **single AFT process**, singleton module (§2.1, §4.9); AFT concurrency-refactor shape → in-process `ProjectActor` extraction (Leg 1) + `RefCell`→`Arc` (Leg 2), sized by AFT's substrate inventory v3 (§6.2/§6.4).

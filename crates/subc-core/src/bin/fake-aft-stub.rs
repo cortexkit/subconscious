@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -20,7 +22,12 @@ use subc_protocol::{
     },
     ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
 };
-use tokio::{io::AsyncWriteExt, net::UnixStream, time::sleep};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
+    net::UnixStream,
+    sync::mpsc,
+    time::sleep,
+};
 
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
@@ -29,8 +36,10 @@ const FAKE_AFT_EVENTS_PATH_ENV: &str = "FAKE_AFT_EVENTS_PATH";
 const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";
 const FAKE_AFT_FANOUT_ON_REQUEST_ENV: &str = "FAKE_AFT_FANOUT_ON_REQUEST";
+const FAKE_AFT_DELAY_FROM_BODY_ENV: &str = "FAKE_AFT_DELAY_FROM_BODY";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
+const STUB_EGRESS_BUFFER: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), StubError> {
@@ -39,16 +48,40 @@ async fn main() -> Result<(), StubError> {
 }
 
 async fn run(config: StubConfig) -> Result<(), StubError> {
-    let mut stream = UnixStream::connect(&config.socket_path)
+    let stream = UnixStream::connect(&config.socket_path)
         .await
         .map_err(|source| StubError::Connect {
             path: config.socket_path.clone(),
             source,
         })?;
+    let (mut read_half, write_half) = tokio::io::split(stream);
+    let (tx, rx) = mpsc::channel::<Frame>(STUB_EGRESS_BUFFER);
+    let writer = tokio::spawn(drain_writer(write_half, rx));
+
+    let loop_result = module_loop(&mut read_half, tx.clone(), config).await;
+    drop(tx);
+
+    let writer_result = writer.await.map_err(StubError::WriterTask);
+    match (loop_result, writer_result) {
+        (Err(loop_err), _) => Err(loop_err),
+        (Ok(()), Ok(Ok(()))) => Ok(()),
+        (Ok(()), Ok(Err(writer_err))) => Err(StubError::FrameIo(writer_err)),
+        (Ok(()), Err(join_err)) => Err(join_err),
+    }
+}
+
+async fn module_loop<R>(
+    read_half: &mut R,
+    writer: mpsc::Sender<Frame>,
+    config: StubConfig,
+) -> Result<(), StubError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut state = StubState::default();
 
-    send_hello(&mut stream, &config.module_id).await?;
-    expect_hello_ack(&mut stream).await?;
+    send_hello(&writer, &config.module_id).await?;
+    expect_hello_ack(read_half).await?;
 
     if let Some(crash_after) = config.crash_after {
         let crash = sleep(crash_after);
@@ -58,8 +91,8 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
                 _ = &mut crash => {
                     std::process::exit(2);
                 }
-                frame = read_frame(&mut stream) => {
-                    if !handle_frame(&mut stream, frame?, &config, &mut state).await? {
+                frame = read_frame(read_half) => {
+                    if !handle_frame(frame?, &config, &mut state, &writer).await? {
                         return Ok(());
                     }
                 }
@@ -68,14 +101,33 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
     }
 
     loop {
-        let frame = read_frame(&mut stream).await?;
-        if !handle_frame(&mut stream, frame, &config, &mut state).await? {
+        let frame = read_frame(read_half).await?;
+        if !handle_frame(frame, &config, &mut state, &writer).await? {
             return Ok(());
         }
     }
 }
 
-async fn send_hello(stream: &mut UnixStream, module_id: &str) -> Result<(), StubError> {
+async fn drain_writer<W>(
+    write_half: W,
+    mut rx: mpsc::Receiver<Frame>,
+) -> Result<(), subc_core::FrameIoError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut writer = BufWriter::new(write_half);
+    while let Some(frame) = rx.recv().await {
+        write_frame(&mut writer, &frame).await?;
+        while let Ok(frame) = rx.try_recv() {
+            write_frame(&mut writer, &frame).await?;
+        }
+        writer.flush().await.map_err(subc_core::FrameIoError::Io)?;
+    }
+    writer.flush().await.map_err(subc_core::FrameIoError::Io)?;
+    Ok(())
+}
+
+async fn send_hello(writer: &mpsc::Sender<Frame>, module_id: &str) -> Result<(), StubError> {
     let body = serde_json::to_vec(&HelloBody {
         manifest: manifest(module_id),
         protocol_ver: PROTOCOL_VERSION,
@@ -83,12 +135,14 @@ async fn send_hello(stream: &mut UnixStream, module_id: &str) -> Result<(), Stub
     .map_err(StubError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, HELLO_CORR, body)
         .map_err(StubError::FrameBuild)?;
-    write_frame(stream, &frame).await?;
-    stream.flush().await.map_err(StubError::Io)
+    send_outbound(writer, frame).await
 }
 
-async fn expect_hello_ack(stream: &mut UnixStream) -> Result<HelloAckBody, StubError> {
-    let Some(frame) = read_frame(stream).await? else {
+async fn expect_hello_ack<R>(reader: &mut R) -> Result<HelloAckBody, StubError>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(frame) = read_frame(reader).await? else {
         return Err(StubError::ConnectionClosedBeforeHelloAck);
     };
 
@@ -103,10 +157,10 @@ async fn expect_hello_ack(stream: &mut UnixStream) -> Result<HelloAckBody, StubE
 }
 
 async fn handle_frame(
-    stream: &mut UnixStream,
     frame: Option<Frame>,
     config: &StubConfig,
     state: &mut StubState,
+    writer: &mpsc::Sender<Frame>,
 ) -> Result<bool, StubError> {
     let Some(frame) = frame else {
         return Ok(false);
@@ -123,13 +177,12 @@ async fn handle_frame(
                 Vec::new(),
             )
             .map_err(StubError::FrameBuild)?;
-            write_frame(stream, &pong).await?;
-            stream.flush().await.map_err(StubError::Io)?;
+            send_outbound(writer, pong).await?;
             Ok(true)
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(stream, frame, config, state).await?;
+            handle_control_request(frame, config, state, writer).await?;
             Ok(true)
         }
         FrameType::Error => {
@@ -147,36 +200,75 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request => {
-            if config.fanout_on_request {
-                for channel in state.bound_channels.iter().copied() {
-                    write_push(stream, frame.header.ver, channel).await?;
-                }
-            } else if config.push_on_request {
-                write_push(stream, frame.header.ver, frame.header.channel).await?;
+            let delay = response_delay(config, &frame.body);
+            let fanout_channels = state.bound_channels.iter().copied().collect::<Vec<_>>();
+            let request_writer = writer.clone();
+            let request_config = config.clone();
+
+            if delay.is_zero() {
+                handle_data_request(
+                    request_writer,
+                    frame,
+                    request_config,
+                    fanout_channels,
+                    delay,
+                )
+                .await?;
+            } else {
+                tokio::spawn(async move {
+                    let _ = handle_data_request(
+                        request_writer,
+                        frame,
+                        request_config,
+                        fanout_channels,
+                        delay,
+                    )
+                    .await;
+                });
             }
 
-            let response = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Response,
-                frame.header.flags,
-                frame.header.channel,
-                frame.header.corr,
-                frame.body,
-            )
-            .map_err(StubError::FrameBuild)?;
-            write_frame(stream, &response).await?;
-            stream.flush().await.map_err(StubError::Io)?;
             Ok(true)
         }
         _ => Ok(true),
     }
 }
 
+async fn handle_data_request(
+    writer: mpsc::Sender<Frame>,
+    frame: Frame,
+    config: StubConfig,
+    fanout_channels: Vec<u16>,
+    delay: Duration,
+) -> Result<(), StubError> {
+    if config.fanout_on_request {
+        for channel in fanout_channels {
+            send_push(&writer, frame.header.ver, channel).await?;
+        }
+    } else if config.push_on_request {
+        send_push(&writer, frame.header.ver, frame.header.channel).await?;
+    }
+
+    if !delay.is_zero() {
+        sleep(delay).await;
+    }
+
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Response,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.corr,
+        frame.body,
+    )
+    .map_err(StubError::FrameBuild)?;
+    send_outbound(&writer, response).await
+}
+
 async fn handle_control_request(
-    stream: &mut UnixStream,
     frame: Frame,
     config: &StubConfig,
     state: &mut StubState,
+    writer: &mpsc::Sender<Frame>,
 ) -> Result<(), StubError> {
     if let Ok(relay) = serde_json::from_slice::<AttachRelay>(&frame.body) {
         let route_channel = relay.route_channel;
@@ -206,8 +298,7 @@ async fn handle_control_request(
                 body,
             )
             .map_err(StubError::FrameBuild)?;
-            write_frame(stream, &response).await?;
-            stream.flush().await.map_err(StubError::Io)?;
+            send_outbound(writer, response).await?;
             return Ok(());
         }
 
@@ -222,8 +313,7 @@ async fn handle_control_request(
             body,
         )
         .map_err(StubError::FrameBuild)?;
-        write_frame(stream, &response).await?;
-        stream.flush().await.map_err(StubError::Io)?;
+        send_outbound(writer, response).await?;
         state.bound_channels.insert(route_channel);
         return Ok(());
     }
@@ -249,8 +339,7 @@ async fn handle_control_request(
             b"stale-after-detach".to_vec(),
         )
         .map_err(StubError::FrameBuild)?;
-        write_frame(stream, &stale).await?;
-        stream.flush().await.map_err(StubError::Io)?;
+        send_outbound(writer, stale).await?;
         record_event(
             config,
             json!({
@@ -263,7 +352,11 @@ async fn handle_control_request(
     Ok(())
 }
 
-async fn write_push(stream: &mut UnixStream, version: u8, channel: u16) -> Result<(), StubError> {
+async fn send_push(
+    writer: &mpsc::Sender<Frame>,
+    version: u8,
+    channel: u16,
+) -> Result<(), StubError> {
     let push = Frame::build_with_version(
         version,
         FrameType::Push,
@@ -273,8 +366,26 @@ async fn write_push(stream: &mut UnixStream, version: u8, channel: u16) -> Resul
         b"push-event".to_vec(),
     )
     .map_err(StubError::FrameBuild)?;
-    write_frame(stream, &push).await?;
-    Ok(())
+    send_outbound(writer, push).await
+}
+
+async fn send_outbound(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), StubError> {
+    writer
+        .send(frame)
+        .await
+        .map_err(|_| StubError::WriterClosed)
+}
+
+fn response_delay(config: &StubConfig, body: &[u8]) -> Duration {
+    if !config.delay_from_body {
+        return Duration::ZERO;
+    }
+
+    let delay_ms = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("delay_ms").and_then(Value::as_u64))
+        .unwrap_or(0);
+    Duration::from_millis(delay_ms)
 }
 
 fn record_event(config: &StubConfig, event: Value) -> Result<(), StubError> {
@@ -340,7 +451,7 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StubConfig {
     socket_path: PathBuf,
     module_id: String,
@@ -350,6 +461,7 @@ struct StubConfig {
     emit_after_detach: bool,
     push_on_request: bool,
     fanout_on_request: bool,
+    delay_from_body: bool,
 }
 
 #[derive(Debug, Default)]
@@ -387,6 +499,7 @@ impl StubConfig {
             emit_after_detach: env_flag(FAKE_AFT_EMIT_AFTER_DETACH_ENV),
             push_on_request: env_flag(FAKE_AFT_PUSH_ON_REQUEST_ENV),
             fanout_on_request: env_flag(FAKE_AFT_FANOUT_ON_REQUEST_ENV),
+            delay_from_body: env_flag(FAKE_AFT_DELAY_FROM_BODY_ENV),
         })
     }
 }
@@ -415,6 +528,8 @@ enum StubError {
     FrameIo(subc_core::FrameIoError),
     FrameBuild(subc_core::FrameBuildError),
     Json(serde_json::Error),
+    WriterClosed,
+    WriterTask(tokio::task::JoinError),
     ConnectionClosedBeforeHelloAck,
     UnexpectedHelloAck {
         ty: FrameType,
@@ -443,6 +558,8 @@ impl fmt::Display for StubError {
             Self::FrameIo(err) => write!(f, "frame I/O error: {err}"),
             Self::FrameBuild(err) => write!(f, "frame build error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
+            Self::WriterClosed => write!(f, "module writer task closed"),
+            Self::WriterTask(err) => write!(f, "module writer task failed: {err}"),
             Self::ConnectionClosedBeforeHelloAck => {
                 write!(f, "connection closed before HELLO_ACK")
             }
@@ -464,7 +581,9 @@ impl Error for StubError {
             Self::FrameIo(err) => Some(err),
             Self::FrameBuild(err) => Some(err),
             Self::Json(err) => Some(err),
+            Self::WriterTask(err) => Some(err),
             Self::MissingEnv { .. }
+            | Self::WriterClosed
             | Self::ConnectionClosedBeforeHelloAck
             | Self::UnexpectedHelloAck { .. }
             | Self::HelloRejected { .. } => None,

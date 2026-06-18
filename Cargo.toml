@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/subc-protocol"]
+members = ["crates/subc-protocol", "crates/subc-core"]
 
 # subc monorepo.
 # - crates/subc-protocol : the shared wire contract (envelope + JSON-RPC shapes + manifest).

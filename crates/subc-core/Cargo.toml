@@ -1,0 +1,10 @@
+[package]
+name = "subc-core"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "subc daemon core: Unix socket transport and opaque-byte splice router."
+
+[dependencies]
+subc-protocol = { path = "../subc-protocol" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync"] }

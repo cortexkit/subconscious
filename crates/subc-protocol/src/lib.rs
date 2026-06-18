@@ -29,6 +29,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod manifest;
+
 /// Envelope protocol version this build speaks.
 pub const PROTOCOL_VERSION: u8 = 1;
 

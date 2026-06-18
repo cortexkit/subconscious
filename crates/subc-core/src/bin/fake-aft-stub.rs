@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
     error::Error,
     fmt, fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -25,7 +26,7 @@ use subc_protocol::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::UnixStream,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::sleep,
 };
 
@@ -40,6 +41,9 @@ const FAKE_AFT_DELAY_FROM_BODY_ENV: &str = "FAKE_AFT_DELAY_FROM_BODY";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
+
+type InFlightKey = (u16, u64);
+type InFlightRegistry = Arc<Mutex<HashMap<InFlightKey, oneshot::Sender<()>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), StubError> {
@@ -199,21 +203,45 @@ async fn handle_frame(
             )?;
             Ok(true)
         }
+        FrameType::Cancel => {
+            handle_cancel(frame, config, state, writer).await?;
+            Ok(true)
+        }
         FrameType::Request => {
-            let delay = response_delay(config, &frame.body);
+            let behavior = request_behavior(config, &frame.body);
             let fanout_channels = state.bound_channels.iter().copied().collect::<Vec<_>>();
             let request_writer = writer.clone();
             let request_config = config.clone();
 
-            if delay.is_zero() {
+            if behavior.delay.is_zero() {
                 handle_data_request(
                     request_writer,
                     frame,
                     request_config,
                     fanout_channels,
-                    delay,
+                    behavior.delay,
                 )
                 .await?;
+            } else if behavior.cancellable {
+                let key = (frame.header.channel, frame.header.corr);
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                {
+                    let mut in_flight = lock_in_flight(&state.in_flight)?;
+                    in_flight.insert(key, cancel_tx);
+                }
+                let in_flight = Arc::clone(&state.in_flight);
+                tokio::spawn(async move {
+                    let _ = handle_cancellable_data_request(
+                        request_writer,
+                        frame,
+                        request_config,
+                        fanout_channels,
+                        behavior.delay,
+                        in_flight,
+                        cancel_rx,
+                    )
+                    .await;
+                });
             } else {
                 tokio::spawn(async move {
                     let _ = handle_data_request(
@@ -221,7 +249,7 @@ async fn handle_frame(
                         frame,
                         request_config,
                         fanout_channels,
-                        delay,
+                        behavior.delay,
                     )
                     .await;
                 });
@@ -233,6 +261,45 @@ async fn handle_frame(
     }
 }
 
+async fn handle_cancel(
+    frame: Frame,
+    config: &StubConfig,
+    state: &StubState,
+    writer: &mpsc::Sender<Frame>,
+) -> Result<(), StubError> {
+    let key = (frame.header.channel, frame.header.corr);
+    let cancel_tx = {
+        let mut in_flight = lock_in_flight(&state.in_flight)?;
+        in_flight.remove(&key)
+    };
+    let claimed = cancel_tx.is_some();
+
+    record_event(
+        config,
+        json!({
+            "kind": "cancel",
+            "channel": frame.header.channel,
+            "corr": frame.header.corr,
+            "claimed": claimed,
+        }),
+    )?;
+
+    if let Some(cancel_tx) = cancel_tx {
+        // follow-up (2.4): flow-control decides CANCEL window-bypass/credit semantics.
+        let _ = cancel_tx.send(());
+        emit_cancelled_error(
+            writer,
+            config,
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.corr,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn handle_data_request(
     writer: mpsc::Sender<Frame>,
     frame: Frame,
@@ -240,28 +307,135 @@ async fn handle_data_request(
     fanout_channels: Vec<u16>,
     delay: Duration,
 ) -> Result<(), StubError> {
-    if config.fanout_on_request {
-        for channel in fanout_channels {
-            send_push(&writer, frame.header.ver, channel).await?;
-        }
-    } else if config.push_on_request {
-        send_push(&writer, frame.header.ver, frame.header.channel).await?;
-    }
+    send_requested_pushes(
+        &writer,
+        &config,
+        frame.header.ver,
+        frame.header.channel,
+        &fanout_channels,
+    )
+    .await?;
 
     if !delay.is_zero() {
         sleep(delay).await;
     }
 
+    emit_response(&writer, &config, frame).await
+}
+
+async fn handle_cancellable_data_request(
+    writer: mpsc::Sender<Frame>,
+    frame: Frame,
+    config: StubConfig,
+    fanout_channels: Vec<u16>,
+    delay: Duration,
+    in_flight: InFlightRegistry,
+    cancel_rx: oneshot::Receiver<()>,
+) -> Result<(), StubError> {
+    let key = (frame.header.channel, frame.header.corr);
+    send_requested_pushes(
+        &writer,
+        &config,
+        frame.header.ver,
+        frame.header.channel,
+        &fanout_channels,
+    )
+    .await?;
+
+    tokio::select! {
+        _ = sleep(delay) => {}
+        _ = cancel_rx => return Ok(()),
+    }
+
+    let claimed = {
+        let mut in_flight = lock_in_flight(&in_flight)?;
+        in_flight.remove(&key).is_some()
+    };
+    if !claimed {
+        return Ok(());
+    }
+
+    emit_response(&writer, &config, frame).await
+}
+
+async fn send_requested_pushes(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+    version: u8,
+    request_channel: u16,
+    fanout_channels: &[u16],
+) -> Result<(), StubError> {
+    if config.fanout_on_request {
+        for channel in fanout_channels {
+            send_push(writer, version, *channel).await?;
+        }
+    } else if config.push_on_request {
+        send_push(writer, version, request_channel).await?;
+    }
+
+    Ok(())
+}
+
+async fn emit_response(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+    frame: Frame,
+) -> Result<(), StubError> {
+    let channel = frame.header.channel;
+    let corr = frame.header.corr;
     let response = Frame::build_with_version(
         frame.header.ver,
         FrameType::Response,
         frame.header.flags,
-        frame.header.channel,
-        frame.header.corr,
+        channel,
+        corr,
         frame.body,
     )
     .map_err(StubError::FrameBuild)?;
-    send_outbound(&writer, response).await
+    send_outbound(writer, response).await?;
+    record_event(
+        config,
+        json!({
+            "kind": "terminal",
+            "terminal": "response",
+            "channel": channel,
+            "corr": corr,
+        }),
+    )
+}
+
+async fn emit_cancelled_error(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+    version: u8,
+    channel: u16,
+    corr: u64,
+) -> Result<(), StubError> {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: "cancelled".to_string(),
+        message: "request cancelled by client".to_string(),
+    })
+    .map_err(StubError::Json)?;
+    let frame = Frame::build_with_version(
+        version,
+        FrameType::Error,
+        Flags::new(false, Priority::Passive, false),
+        channel,
+        corr,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
+    send_outbound(writer, frame).await?;
+    record_event(
+        config,
+        json!({
+            "kind": "terminal",
+            "terminal": "error",
+            "code": "cancelled",
+            "channel": channel,
+            "corr": corr,
+        }),
+    )
 }
 
 async fn handle_control_request(
@@ -376,16 +550,42 @@ async fn send_outbound(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(),
         .map_err(|_| StubError::WriterClosed)
 }
 
-fn response_delay(config: &StubConfig, body: &[u8]) -> Duration {
+#[derive(Debug, Clone, Copy)]
+struct RequestBehavior {
+    delay: Duration,
+    cancellable: bool,
+}
+
+fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
     if !config.delay_from_body {
-        return Duration::ZERO;
+        return RequestBehavior {
+            delay: Duration::ZERO,
+            cancellable: true,
+        };
     }
 
-    let delay_ms = serde_json::from_slice::<Value>(body)
-        .ok()
+    // Test-only body flag: {"uncancellable": true, "delay_ms": N} models
+    // mutation-like work that ignores CANCEL and completes normally.
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let delay_ms = parsed
+        .as_ref()
         .and_then(|value| value.get("delay_ms").and_then(Value::as_u64))
         .unwrap_or(0);
-    Duration::from_millis(delay_ms)
+    let uncancellable = parsed
+        .as_ref()
+        .and_then(|value| value.get("uncancellable").and_then(Value::as_bool))
+        .unwrap_or(false);
+
+    RequestBehavior {
+        delay: Duration::from_millis(delay_ms),
+        cancellable: !uncancellable,
+    }
+}
+
+fn lock_in_flight(
+    in_flight: &InFlightRegistry,
+) -> Result<std::sync::MutexGuard<'_, HashMap<InFlightKey, oneshot::Sender<()>>>, StubError> {
+    in_flight.lock().map_err(|_| StubError::InFlightPoisoned)
 }
 
 fn record_event(config: &StubConfig, event: Value) -> Result<(), StubError> {
@@ -464,9 +664,18 @@ struct StubConfig {
     delay_from_body: bool,
 }
 
-#[derive(Debug, Default)]
 struct StubState {
     bound_channels: BTreeSet<u16>,
+    in_flight: InFlightRegistry,
+}
+
+impl Default for StubState {
+    fn default() -> Self {
+        Self {
+            bound_channels: BTreeSet::new(),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl StubConfig {
@@ -530,6 +739,7 @@ enum StubError {
     Json(serde_json::Error),
     WriterClosed,
     WriterTask(tokio::task::JoinError),
+    InFlightPoisoned,
     ConnectionClosedBeforeHelloAck,
     UnexpectedHelloAck {
         ty: FrameType,
@@ -560,6 +770,7 @@ impl fmt::Display for StubError {
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::WriterClosed => write!(f, "module writer task closed"),
             Self::WriterTask(err) => write!(f, "module writer task failed: {err}"),
+            Self::InFlightPoisoned => write!(f, "in-flight registry lock poisoned"),
             Self::ConnectionClosedBeforeHelloAck => {
                 write!(f, "connection closed before HELLO_ACK")
             }
@@ -584,6 +795,7 @@ impl Error for StubError {
             Self::WriterTask(err) => Some(err),
             Self::MissingEnv { .. }
             | Self::WriterClosed
+            | Self::InFlightPoisoned
             | Self::ConnectionClosedBeforeHelloAck
             | Self::UnexpectedHelloAck { .. }
             | Self::HelloRejected { .. } => None,

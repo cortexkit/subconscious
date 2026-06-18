@@ -39,8 +39,8 @@ development_status:
   1-3-wire-envelope-codec: done                              # envelope codec in subc-protocol (baseline commit)
   1-4-socket-transport-splice-router-mux-ready: done         # merged e304851 (27 tests green)
   1-5-process-supervision-fake-aft-stub: backlog             # + module-death mid-mutation AC
-  1-6-hello-capability-manifest-registration: backlog        # + channel lifecycle/GOODBYE + version floor
-  1-7-dual-scope-identity: backlog                           # + ProjectRootId canonicalization edge cases
+  1-6-hello-capability-manifest-registration: done           # merged ed14d88 (HELLO/registration/lifecycle/version-floor)
+  1-7-dual-scope-identity: done                              # ProjectRootId canonicalization (228fbd5); per-command scope table (AC5) still gated on AFT co-sign
   1-8-async-push-forwarding: backlog                         # + misroute/closed-channel + PUSH flow control
   1-8b-typescript-mode-2-plugin-client: backlog             # harness-facing half of mode 2; gates 1-9
   1-9-e2e-real-aft-opencode: backlog                         # GATE: AFT Leg 1; + hoisting fidelity AC

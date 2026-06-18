@@ -294,106 +294,25 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
 }
 
 fn user_socket_token() -> String {
-    if let Some(uid) = env::var_os("UID").and_then(|value| numeric_token(value.to_string_lossy())) {
-        return uid;
-    }
-
-    if let Some(uid) = uid_from_proc_status()
-        .or_else(uid_from_owned_temp_probe)
-        .or_else(uid_from_home_metadata)
-    {
-        return uid.to_string();
-    }
-
-    if let Some(user) =
-        env::var_os("USER").and_then(|value| sanitize_token(value.to_string_lossy()))
-    {
-        return user;
-    }
-
-    if let Some(home_leaf) = env::var_os("HOME").and_then(|home| {
-        PathBuf::from(home)
-            .file_name()
-            .and_then(|leaf| sanitize_token(leaf.to_string_lossy()))
-    }) {
-        return home_leaf;
-    }
-
-    "unknown".to_string()
-}
-
-fn numeric_token(value: impl AsRef<str>) -> Option<String> {
-    let value = value.as_ref().trim();
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn sanitize_token(value: impl AsRef<str>) -> Option<String> {
-    let sanitized: String = value
-        .as_ref()
-        .chars()
-        .filter_map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
-                Some(ch)
-            } else if ch.is_whitespace() || ch == '/' || ch == '\\' {
-                Some('_')
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if sanitized.is_empty() {
-        None
-    } else {
-        Some(sanitized)
-    }
-}
-
-fn uid_from_proc_status() -> Option<u32> {
-    let status = fs::read_to_string("/proc/self/status").ok()?;
-    status.lines().find_map(|line| {
-        let rest = line.strip_prefix("Uid:")?;
-        rest.split_whitespace().next()?.parse().ok()
-    })
-}
-
-fn uid_from_home_metadata() -> Option<u32> {
-    let home = env::var_os("HOME")?;
-    fs::metadata(home).ok().map(|metadata| metadata.uid())
-}
-
-fn uid_from_owned_temp_probe() -> Option<u32> {
-    let temp_dir = env::temp_dir();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
+    let probe_path = env::temp_dir().join(format!(".subc-uid-probe-{}-{nonce}", process::id()));
 
-    for attempt in 0..8u8 {
-        let probe_path = temp_dir.join(format!(
-            ".subc-uid-probe-{}-{nonce}-{attempt}",
-            process::id()
-        ));
-        let file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe_path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
-        };
-        let uid = file.metadata().ok().map(|metadata| metadata.uid());
-        drop(file);
-        let _ = fs::remove_file(&probe_path);
-        return uid;
-    }
+    let uid = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+        .ok()
+        .and_then(|file| {
+            let uid = file.metadata().ok().map(|metadata| metadata.uid());
+            drop(file);
+            let _ = fs::remove_file(&probe_path);
+            uid
+        });
 
-    None
+    uid.map_or_else(|| "unknown".to_string(), |uid| uid.to_string())
 }
 
 /// Bootstrap-layer errors are deliberately typed so startup never panics for

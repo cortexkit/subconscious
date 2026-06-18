@@ -26,6 +26,7 @@ instead of trying to fit an unbounded JSON body under the `len: u32` frame cap.
 | `bash` | `REQUEST` → immediate `RESPONSE` to acknowledge task start, then async `PUSH` frames for output/completion events | `REQUEST`/start `RESPONSE`: `interactive`, `BINARY=0`; output `PUSH`: usually `interactive`, `BINARY=0`, `LAST=0`; completion `PUSH`: `interactive`, `BINARY=0`, `LAST=1` when it is the final event for that task | Output may be chunked as events, but not as the request response stream | Yes | The `RESPONSE` returns the task handle/start result. Later `PUSH` bodies carry task output and terminal status keyed by task id. |
 | `semantic_search` cold-build canceled mid-flight | `REQUEST` with `corr = C`; later `CANCEL` with `corr = C` and `len = 0` | `REQUEST`: `interactive` or `background` by caller intent, `BINARY=0`; `CANCEL`: same priority class is acceptable, `BINARY=0`, `LAST=0`, `len=0` | No, unless the implementation had already chosen a stream result | No | The terminal result is race-dependent: the module may observe cancellation and stop, or the response may already have been produced. The frame-shape requirement is the pure-header `CANCEL` targeting the original correlation id. |
 | `callgraph` cold-build canceled mid-flight | `REQUEST` with `corr = C`; optional early `STREAM_DATA`; `CANCEL` with `corr = C` and `len = 0`; no further stream frames after cancellation is observed | `REQUEST`/stream priority by caller intent; stream frames `BINARY=0`; `STREAM_END` has `LAST=1` only if the stream completes before cancel; `CANCEL` is pure-header | May have started streaming before cancel | No | Exercises the same cancel delivery contract for a long project-scoped build/dump. |
+| Subc-generated routing/control error | `ERROR` on the relevant `channel`/`corr` | `passive`; `BINARY=0`, `LAST=0` | No | No | Body is canonical JSON `ErrorBody { code: string, message: string }` for all subc-generated errors, including control-plane errors and unknown-channel routing failures. |
 
 ## Frame-shape classes covered
 
@@ -38,3 +39,6 @@ instead of trying to fit an unbounded JSON body under the `len: u32` frame cap.
    frames for output and completion.
 5. **Cancellation:** `semantic_search` and `callgraph` cold-builds are interrupted
    by pure-header `CANCEL` frames whose `corr` targets the in-flight request.
+6. **Subc-generated errors:** `ERROR` frames carry canonical JSON
+   `ErrorBody { code, message }` regardless of whether they originate in the
+   control path or the router's unknown-channel path.

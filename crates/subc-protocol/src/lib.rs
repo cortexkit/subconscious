@@ -1,10 +1,10 @@
 //! subc wire contract.
 //!
 //! This crate is the single source of truth for the subc <-> module wire,
-//! shared by subc-core and AFT. It currently defines the **envelope** (the
-//! fixed 17-byte routing header subc splices on); the JSON-RPC body shapes and
-//! the capability manifest land alongside it as Story 1.1 (contract freeze)
-//! completes.
+//! shared by subc-core and AFT. It defines the **envelope** (the fixed
+//! 17-byte routing header subc splices on), the canonical subc-generated body
+//! schemas such as [`ErrorBody`], and the capability manifest. JSON-RPC request
+//! and response bodies remain module-owned opaque payloads to subc.
 //!
 //! ## The envelope (locked — see docs/subc-core-architecture.md §4.8)
 //!
@@ -29,6 +29,10 @@
 
 #![forbid(unsafe_code)]
 
+use std::{error::Error, fmt};
+
+use serde::{Deserialize, Serialize};
+
 pub mod manifest;
 
 /// Envelope protocol version this build speaks.
@@ -41,6 +45,20 @@ pub const HEADER_LEN: usize = 17;
 /// every envelope version. A reader needs only these to learn the version and
 /// thus the full header length.
 pub const FROZEN_PREFIX_LEN: usize = 5;
+
+/// Maximum v1 frame body accepted before allocation.
+///
+/// This 64 MiB starting cap prevents a malformed header from forcing an
+/// unbounded allocation. Future protocol versions can negotiate or encode a
+/// different cap while preserving the frozen prefix.
+pub const MAX_FRAME_BODY_LEN: u32 = 64 * 1024 * 1024;
+
+/// Canonical JSON body for all subc-generated `ERROR` frames.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorBody {
+    pub code: String,
+    pub message: String,
+}
 
 /// Frame kind (`type` byte at offset 5).
 ///
@@ -82,6 +100,10 @@ impl FrameType {
             _ => return None,
         })
     }
+
+    pub fn is_pure_header(self) -> bool {
+        matches!(self, Self::Cancel | Self::Ping | Self::Pong | Self::Goodbye)
+    }
 }
 
 /// Scheduling priority carried in `flags` bits 1-2. subc schedules on this
@@ -116,7 +138,7 @@ const FLAG_RESERVED_MASK: u8 = 0b1111_0000; // bits 4-7 must be zero
 pub struct Flags(pub u8);
 
 impl Flags {
-    /// Build flags from components. Returns `None` for an out-of-range priority.
+    /// Build flags from typed components.
     pub fn new(binary: bool, priority: Priority, last: bool) -> Self {
         let mut b = 0u8;
         if binary {
@@ -194,7 +216,43 @@ pub enum DecodeError {
     UnknownFrameType { byte: u8 },
     /// A reserved flag bit (4-7) is set.
     ReservedFlagBits { flags: u8 },
+    /// Priority bits 1-2 hold the reserved value `0b11`.
+    ReservedPriorityBits { flags: u8 },
+    /// A pure-header frame declared body bytes.
+    PureHeaderFrameWithBody { ty: FrameType, len: u32 },
 }
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooShortForPrefix { have } => {
+                write!(f, "header shorter than frozen prefix: have {have} bytes")
+            }
+            Self::UnsupportedVersion { ver } => write!(f, "unsupported envelope version {ver}"),
+            Self::TooShortForHeader { have, need } => {
+                write!(
+                    f,
+                    "header too short for version: have {have} bytes, need {need}"
+                )
+            }
+            Self::UnknownFrameType { byte } => write!(f, "unknown frame type byte {byte}"),
+            Self::ReservedFlagBits { flags } => {
+                write!(f, "reserved flag bits set in flags 0b{flags:08b}")
+            }
+            Self::ReservedPriorityBits { flags } => {
+                write!(f, "reserved priority bits set in flags 0b{flags:08b}")
+            }
+            Self::PureHeaderFrameWithBody { ty, len } => {
+                write!(
+                    f,
+                    "pure-header frame {ty:?} declared non-zero body length {len}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for DecodeError {}
 
 /// How many header bytes a given envelope version occupies. Driven by the
 /// frozen prefix: read `ver`, then learn the full header length here.
@@ -231,6 +289,12 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     let flags = Flags(bytes[6]);
     if flags.has_reserved_bits() {
         return Err(DecodeError::ReservedFlagBits { flags: bytes[6] });
+    }
+    if flags.priority().is_none() {
+        return Err(DecodeError::ReservedPriorityBits { flags: bytes[6] });
+    }
+    if ty.is_pure_header() && len != 0 {
+        return Err(DecodeError::PureHeaderFrameWithBody { ty, len });
     }
     let channel = u16::from_le_bytes([bytes[7], bytes[8]]);
     let corr = u64::from_le_bytes([
@@ -369,6 +433,36 @@ mod tests {
         assert_eq!(
             decode_header(&b),
             Err(DecodeError::ReservedFlagBits { flags: 0b1000_0000 })
+        );
+    }
+
+    #[test]
+    fn reject_reserved_priority_bits() {
+        let mut b = [0u8; HEADER_LEN];
+        b[4] = PROTOCOL_VERSION;
+        b[5] = FrameType::Request as u8;
+        b[6] = 0b0000_0110; // priority bits 1-2 are reserved value 0b11
+        assert_eq!(
+            decode_header(&b),
+            Err(DecodeError::ReservedPriorityBits { flags: 0b0000_0110 })
+        );
+    }
+
+    #[test]
+    fn reject_pure_header_frame_with_body_len() {
+        let h = hdr(
+            1,
+            FrameType::Ping,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            1,
+        );
+        assert_eq!(
+            decode_header(&h.encode()),
+            Err(DecodeError::PureHeaderFrameWithBody {
+                ty: FrameType::Ping,
+                len: 1
+            })
         );
     }
 }

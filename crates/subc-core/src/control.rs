@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use subc_protocol::{manifest::ModuleManifest, Flags, FrameType, Priority, PROTOCOL_VERSION};
+use subc_protocol::{
+    manifest::ModuleManifest, ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
+};
+use tracing::debug;
 
 use crate::{
     registry::{ConnectionId, Registry, RegistryError},
-    router::{Backend, RouterError},
+    router::RouterError,
     Frame,
 };
 
@@ -85,6 +88,11 @@ impl ControlHandler {
         connection_id: ConnectionId,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
+        debug!(
+            connection_id = connection_id.get(),
+            corr = frame.header.corr,
+            "handling HELLO"
+        );
         let hello = match serde_json::from_slice::<HelloBody>(&frame.body) {
             Ok(hello) => hello,
             Err(err) => {
@@ -175,6 +183,7 @@ impl ControlHandler {
     }
 
     fn handle_goodbye(&self, connection_id: ConnectionId) -> Result<Vec<Frame>, RouterError> {
+        debug!(connection_id = connection_id.get(), "handling GOODBYE");
         self.registry
             .deregister_connection(connection_id)
             .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
@@ -185,31 +194,6 @@ impl ControlHandler {
 impl Default for ControlHandler {
     fn default() -> Self {
         Self::new(Arc::new(Registry::default()))
-    }
-}
-
-impl Backend for ControlHandler {
-    fn handle(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
-        self.handle_control(ConnectionId::LOCAL, frame)
-    }
-}
-
-/// Compatibility wrapper for older tests/callers that named the skeleton
-/// self-handler directly. It now delegates to the real control handler.
-#[derive(Debug, Default, Clone)]
-pub struct SubcSelfHandler {
-    inner: ControlHandler,
-}
-
-impl SubcSelfHandler {
-    pub fn registry(&self) -> Arc<Registry> {
-        self.inner.registry()
-    }
-}
-
-impl Backend for SubcSelfHandler {
-    fn handle(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
-        self.inner.handle(frame)
     }
 }
 
@@ -239,8 +223,8 @@ fn control_error_frame(
     code: &'static str,
     message: impl Into<String>,
 ) -> Result<Frame, RouterError> {
-    let body = serde_json::to_vec(&ControlErrorBody {
-        code,
+    let body = serde_json::to_vec(&ErrorBody {
+        code: code.to_string(),
         message: message.into(),
     })
     .map_err(|err| {
@@ -274,12 +258,6 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct ControlErrorBody {
-    code: &'static str,
-    message: String,
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
@@ -295,7 +273,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::{registry::ChannelState, Router};
+    use crate::{registry::ChannelState, router::FrameSink, RouteCtx, Router};
+    use tokio::sync::mpsc;
 
     fn manifest(module_id: &str, protocol_ver: u8) -> ModuleManifest {
         ModuleManifest {
@@ -371,6 +350,17 @@ mod tests {
             b"opaque".to_vec(),
         )
         .unwrap()
+    }
+
+    fn route_ctx(connection_id: ConnectionId) -> (RouteCtx, mpsc::Receiver<Frame>) {
+        let (tx, rx) = mpsc::channel(8);
+        (
+            RouteCtx {
+                connection_id,
+                egress: FrameSink::new(tx),
+            },
+            rx,
+        )
     }
 
     fn parse_ack(frame: &Frame) -> HelloAckBody {
@@ -476,47 +466,51 @@ mod tests {
         assert_eq!(registration.channels, first_ack.channels);
     }
 
-    #[test]
-    fn goodbye_tears_down_registration_and_later_channel_is_unknown() {
+    #[tokio::test]
+    async fn goodbye_tears_down_registration_and_later_channel_is_unknown() {
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
         let router = Router::with_control_handler(Arc::clone(&control));
         let connection = router.begin_connection();
+        let (ctx, mut rx) = route_ctx(connection.id());
 
-        let responses = router
-            .route_for_connection(connection.id(), hello_frame("aft", PROTOCOL_VERSION, 11))
+        router
+            .route_for_connection(&ctx, hello_frame("aft", PROTOCOL_VERSION, 11))
+            .await
             .unwrap();
-        let channel = parse_ack(&responses[0]).channels[0];
+        let response = rx.recv().await.unwrap();
+        let channel = parse_ack(&response).channels[0];
         assert!(registry.is_channel_active(channel).unwrap());
 
         let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 0, 12, Vec::new()).unwrap();
-        let goodbye_responses = router
-            .route_for_connection(connection.id(), goodbye)
-            .unwrap();
-        assert!(goodbye_responses.is_empty());
+        router.route_for_connection(&ctx, goodbye).await.unwrap();
+        assert!(rx.try_recv().is_err());
         assert!(registry.get_module("aft").unwrap().is_none());
         assert!(!registry.is_channel_active(channel).unwrap());
 
-        let err = router.route(channel_request(channel, 13)).unwrap_err();
-        assert!(
-            matches!(err, RouterError::UnknownChannel { channel: c, corr: 13 } if c == channel)
-        );
-        let error_frame = err.to_error_frame().unwrap();
+        router
+            .route_for_connection(&ctx, channel_request(channel, 13))
+            .await
+            .unwrap();
+        let error_frame = rx.recv().await.unwrap();
         assert_eq!(error_frame.header.ty, FrameType::Error);
         assert_eq!(error_frame.header.channel, channel);
     }
 
-    #[test]
-    fn dropping_router_connection_releases_orphaned_channels() {
+    #[tokio::test]
+    async fn dropping_router_connection_releases_orphaned_channels() {
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
         let router = Router::with_control_handler(control);
         let connection = router.begin_connection();
+        let (ctx, mut rx) = route_ctx(connection.id());
 
-        let responses = router
-            .route_for_connection(connection.id(), hello_frame("aft", PROTOCOL_VERSION, 31))
+        router
+            .route_for_connection(&ctx, hello_frame("aft", PROTOCOL_VERSION, 31))
+            .await
             .unwrap();
-        let channel = parse_ack(&responses[0]).channels[0];
+        let response = rx.recv().await.unwrap();
+        let channel = parse_ack(&response).channels[0];
         assert!(registry.is_channel_active(channel).unwrap());
         assert!(registry.get_module("aft").unwrap().is_some());
 

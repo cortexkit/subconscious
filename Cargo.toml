@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/subc-protocol"]
+
+# subc monorepo.
+# - crates/subc-protocol : the shared wire contract (envelope + JSON-RPC shapes + manifest).
+#   Depended on by subc-core (this repo) AND by AFT (sibling repo) via a path dependency:
+#   in aft's Cargo.toml ->  subc-protocol = { path = "../subconscious/crates/subc-protocol" }
+#   (git dependency is the CI / cross-machine upgrade when needed.)
+# - crates/subc-core     : the daemon (added when Epic 1 build stories begin).

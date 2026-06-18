@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use subc_protocol::{
     manifest::ModuleManifest, ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     forwarding::{
         AttachAck, AttachRelay, AttachRelayOutcome, AttachRelayResponse, AttachRequest,
-        ForwardingError, ForwardingTable,
+        DetachRelay, ForwardingError, ForwardingTable, ReleasedRoute,
     },
     registry::{ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
@@ -75,11 +75,12 @@ impl ControlHandler {
         Arc::clone(&self.forwarding)
     }
 
-    /// Compatibility entry point for local/unit control handling that does not have a socket sink.
+    /// Test-only compatibility entry point for unit control handling that does not have a socket sink.
     ///
     /// The real server path uses [`Self::handle_control_frame`] so module HELLO registration can
     /// record the module connection's [`crate::FrameSink`] and session attach can await the module
-    /// relay response.
+    /// relay response. This seam stays cfg(test) so production has only one channel-0 path.
+    #[cfg(test)]
     pub fn handle_control(
         &self,
         connection_id: ConnectionId,
@@ -144,9 +145,54 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
-        let registrations = self.registry.deregister_connection(connection_id)?;
-        let _ = self.forwarding.cleanup_connection(connection_id);
-        Ok(registrations)
+        let registrations = self.registry.deregister_connection(connection_id);
+        if let Ok(released_routes) = self.forwarding.cleanup_connection(connection_id) {
+            self.emit_detach_relays(released_routes);
+        }
+        registrations
+    }
+
+    fn emit_detach_relays(&self, released_routes: Vec<ReleasedRoute>) {
+        for released in released_routes {
+            let body = match serde_json::to_vec(&DetachRelay {
+                route_channel: released.route_channel,
+            }) {
+                Ok(body) => body,
+                Err(err) => {
+                    warn!(
+                        route_channel = released.route_channel,
+                        error = %err,
+                        "failed to encode detach-relay"
+                    );
+                    continue;
+                }
+            };
+            let frame = match Frame::build_with_version(
+                released.negotiated_ver,
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                body,
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    warn!(
+                        route_channel = released.route_channel,
+                        error = %err,
+                        "failed to build detach-relay frame"
+                    );
+                    continue;
+                }
+            };
+            if let Err(err) = released.module_sink.try_send(frame) {
+                warn!(
+                    route_channel = released.route_channel,
+                    error = %err,
+                    "best-effort detach-relay was not delivered"
+                );
+            }
+        }
     }
 
     fn handle_hello(
@@ -466,9 +512,11 @@ impl ControlHandler {
         self.registry
             .deregister_connection(connection_id)
             .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
-        self.forwarding
+        let released_routes = self
+            .forwarding
             .cleanup_connection(connection_id)
             .map_err(RouterError::Forwarding)?;
+        self.emit_detach_relays(released_routes);
         Ok(Vec::new())
     }
 }

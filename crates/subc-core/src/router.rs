@@ -42,6 +42,18 @@ impl FrameSink {
             .await
             .map_err(|_| RouterError::backend(channel, corr, "connection writer closed"))
     }
+
+    pub(crate) fn try_send(&self, frame: Frame) -> Result<(), RouterError> {
+        let channel = frame.header.channel;
+        let corr = frame.header.corr;
+        self.tx.try_send(frame).map_err(|err| {
+            RouterError::backend(
+                channel,
+                corr,
+                format!("connection writer unavailable: {err}"),
+            )
+        })
+    }
 }
 
 /// Per-route context shared with backends besides the frame itself.
@@ -87,8 +99,9 @@ impl Backend {
 ///
 /// Channel 0 is reserved for subc itself and is always dispatched to the
 /// dedicated control handler. Other channels must be explicitly registered.
-/// Unknown non-zero channels are translated to canonical JSON `ERROR` frames on
-/// the connection sink so the peer can continue using the same socket.
+/// Unknown client-originated non-zero channels are translated to canonical JSON `ERROR` frames on
+/// the connection sink so the peer can continue using the same socket. Module-originated frames for
+/// released route channels are logged and dropped as the channel-gone race backstop.
 pub struct Router {
     backends: HashMap<u16, Backend>,
     control: Arc<ControlHandler>,
@@ -176,19 +189,38 @@ impl Router {
             return Ok(());
         }
 
-        if let Some(route) = self
+        let is_module_connection = self
             .forwarding
-            .module_route(ctx.connection_id, channel)
+            .module_endpoint_for_connection(ctx.connection_id)
             .map_err(RouterError::Forwarding)?
-        {
-            debug!(
+            .is_some();
+
+        if is_module_connection {
+            if let Some(route) = self
+                .forwarding
+                .module_route(ctx.connection_id, channel)
+                .map_err(RouterError::Forwarding)?
+            {
+                debug!(
+                    connection_id = ctx.connection_id.get(),
+                    channel,
+                    corr,
+                    frame_type = ?frame.header.ty,
+                    "forwarding module data-plane frame to client"
+                );
+                route.sink.send(frame).await?;
+                return Ok(());
+            }
+
+            // follow-up: unsolicited PUSH fan-out/replay remains module-owned; subc only drops
+            // stale route frames during the emit-before-detach race.
+            warn!(
                 connection_id = ctx.connection_id.get(),
                 channel,
                 corr,
                 frame_type = ?frame.header.ty,
-                "forwarding module data-plane frame to client"
+                "dropping module data-plane frame for released route channel"
             );
-            route.sink.send(frame).await?;
             return Ok(());
         }
 

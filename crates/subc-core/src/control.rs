@@ -7,9 +7,13 @@ use subc_protocol::{
 use tracing::debug;
 
 use crate::{
+    forwarding::{
+        AttachAck, AttachRelay, AttachRelayOutcome, AttachRelayResponse, AttachRequest,
+        ForwardingError, ForwardingTable,
+    },
     registry::{ConnectionId, Registry, RegistryError},
-    router::RouterError,
-    Frame,
+    router::{RouteCtx, RouterError},
+    Frame, ProjectRootId,
 };
 
 /// Lowest envelope version this subc build will negotiate.
@@ -22,6 +26,7 @@ pub const MIN_SUPPORTED_VERSION: u8 = 1;
 const CAP_MANIFEST_REGISTRATION: &str = "manifest_registration_v1";
 const CAP_CHANNEL_LIFECYCLE: &str = "channel_lifecycle_v1";
 const CAP_PING_PONG: &str = "ping_pong_v1";
+const CAP_SESSION_ATTACH: &str = "session_attach_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HelloBody {
@@ -40,17 +45,24 @@ pub struct HelloAckBody {
 #[derive(Debug, Clone)]
 pub struct ControlHandler {
     registry: Arc<Registry>,
+    forwarding: Arc<ForwardingTable>,
     subc_capabilities: Arc<[String]>,
 }
 
 impl ControlHandler {
     pub fn new(registry: Arc<Registry>) -> Self {
+        Self::with_forwarding(registry, Arc::new(ForwardingTable::default()))
+    }
+
+    pub fn with_forwarding(registry: Arc<Registry>, forwarding: Arc<ForwardingTable>) -> Self {
         Self {
             registry,
+            forwarding,
             subc_capabilities: Arc::from([
                 CAP_MANIFEST_REGISTRATION.to_string(),
                 CAP_CHANNEL_LIFECYCLE.to_string(),
                 CAP_PING_PONG.to_string(),
+                CAP_SESSION_ATTACH.to_string(),
             ]),
         }
     }
@@ -59,6 +71,15 @@ impl ControlHandler {
         Arc::clone(&self.registry)
     }
 
+    pub fn forwarding(&self) -> Arc<ForwardingTable> {
+        Arc::clone(&self.forwarding)
+    }
+
+    /// Compatibility entry point for local/unit control handling that does not have a socket sink.
+    ///
+    /// The real server path uses [`Self::handle_control_frame`] so module HELLO registration can
+    /// record the module connection's [`crate::FrameSink`] and session attach can await the module
+    /// relay response.
     pub fn handle_control(
         &self,
         connection_id: ConnectionId,
@@ -66,8 +87,51 @@ impl ControlHandler {
     ) -> Result<Vec<Frame>, RouterError> {
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
-            FrameType::Hello => self.handle_hello(connection_id, frame),
+            FrameType::Hello => self.handle_hello(connection_id, None, frame),
             FrameType::Goodbye => self.handle_goodbye(connection_id),
+            ty => Ok(vec![control_error_frame(
+                &frame,
+                "unsupported_control_frame",
+                format!("unsupported channel-0 frame {ty:?}"),
+            )?]),
+        }
+    }
+
+    pub async fn handle_control_frame(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        match frame.header.ty {
+            FrameType::Ping => Ok(vec![pong(&frame)?]),
+            FrameType::Hello => {
+                self.handle_hello(ctx.connection_id, Some(ctx.egress.clone()), frame)
+            }
+            FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
+            FrameType::Request => {
+                if self
+                    .forwarding
+                    .module_endpoint_for_connection(ctx.connection_id)
+                    .map_err(RouterError::Forwarding)?
+                    .is_some()
+                {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "unsupported_control_frame",
+                        "module-originated channel-0 REQUEST is not supported",
+                    )?]);
+                }
+                self.handle_attach(ctx, frame).await
+            }
+            FrameType::Response | FrameType::Error
+                if self
+                    .forwarding
+                    .module_endpoint_for_connection(ctx.connection_id)
+                    .map_err(RouterError::Forwarding)?
+                    .is_some() =>
+            {
+                self.handle_module_relay_response(ctx.connection_id, frame)
+            }
             ty => Ok(vec![control_error_frame(
                 &frame,
                 "unsupported_control_frame",
@@ -80,12 +144,15 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
-        self.registry.deregister_connection(connection_id)
+        let registrations = self.registry.deregister_connection(connection_id)?;
+        let _ = self.forwarding.cleanup_connection(connection_id);
+        Ok(registrations)
     }
 
     fn handle_hello(
         &self,
         connection_id: ConnectionId,
+        sink: Option<crate::FrameSink>,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
         debug!(
@@ -158,6 +225,22 @@ impl ControlHandler {
                 }
             };
 
+        if let Some(sink) = sink {
+            if let Err(err) = self.forwarding.register_module_connection(
+                connection_id,
+                registration.manifest.module_id.clone(),
+                negotiated_ver,
+                sink,
+            ) {
+                let _ = self.registry.deregister_connection(connection_id);
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    forwarding_error_code(&err),
+                    err.to_string(),
+                )?]);
+            }
+        }
+
         let ack = HelloAckBody {
             negotiated_ver,
             channels: registration.channels,
@@ -182,11 +265,210 @@ impl ControlHandler {
         .map_err(RouterError::FrameBuild)?])
     }
 
+    async fn handle_attach(&self, ctx: &RouteCtx, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        debug!(
+            connection_id = ctx.connection_id.get(),
+            corr = frame.header.corr,
+            "handling session attach"
+        );
+        let attach = match serde_json::from_slice::<AttachRequest>(&frame.body) {
+            Ok(attach) => attach,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_attach_request",
+                    format!("malformed AttachRequest body: {err}"),
+                )?])
+            }
+        };
+
+        let project_root = match ProjectRootId::from_path(&attach.project_root) {
+            Ok(project_root) => project_root,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_project_root",
+                    err.to_string(),
+                )?])
+            }
+        };
+
+        let pending = match self.forwarding.begin_attach_relay() {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    forwarding_error_code(&err),
+                    err.to_string(),
+                )?])
+            }
+        };
+        let endpoint = pending.endpoint;
+        let route_channel = pending.route_channel;
+        let relay_corr = pending.corr;
+
+        let relay = AttachRelay {
+            route_channel,
+            project_root: project_root.as_path().to_path_buf(),
+            harness: attach.harness,
+            session: attach.session,
+            config: attach.config,
+        };
+        let relay_body = serde_json::to_vec(&relay).map_err(|err| {
+            RouterError::backend(
+                0,
+                frame.header.corr,
+                format!("failed to encode AttachRelay: {err}"),
+            )
+        })?;
+        let relay_frame = Frame::build_with_version(
+            pending.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            relay_corr,
+            relay_body,
+        )
+        .map_err(RouterError::FrameBuild)?;
+
+        if let Err(err) = pending.module_sink.send(relay_frame).await {
+            let _ = self.forwarding.cancel_pending_relay(endpoint, relay_corr);
+            let _ = self
+                .forwarding
+                .release_reserved_route(endpoint, route_channel);
+            return Ok(vec![control_error_frame(
+                &frame,
+                "module_unavailable",
+                err.to_string(),
+            )?]);
+        }
+
+        match pending.receiver.await {
+            Ok(AttachRelayOutcome::Accepted) => {
+                if let Err(err) = self.forwarding.commit_route(
+                    ctx.connection_id,
+                    ctx.egress.clone(),
+                    endpoint,
+                    route_channel,
+                ) {
+                    let _ = self
+                        .forwarding
+                        .release_reserved_route(endpoint, route_channel);
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        forwarding_error_code(&err),
+                        err.to_string(),
+                    )?]);
+                }
+                let body = serde_json::to_vec(&AttachAck { route_channel }).map_err(|err| {
+                    RouterError::backend(
+                        0,
+                        frame.header.corr,
+                        format!("failed to encode AttachAck: {err}"),
+                    )
+                })?;
+                Ok(vec![Frame::build_with_version(
+                    response_version(&frame),
+                    FrameType::Response,
+                    control_flags(),
+                    0,
+                    frame.header.corr,
+                    body,
+                )
+                .map_err(RouterError::FrameBuild)?])
+            }
+            Ok(AttachRelayOutcome::Rejected(body)) => {
+                let _ = self
+                    .forwarding
+                    .release_reserved_route(endpoint, route_channel);
+                Ok(vec![control_error_body_frame(&frame, body)?])
+            }
+            Ok(AttachRelayOutcome::ModuleGone(message)) => {
+                let _ = self
+                    .forwarding
+                    .release_reserved_route(endpoint, route_channel);
+                Ok(vec![control_error_frame(
+                    &frame,
+                    "module_unavailable",
+                    message,
+                )?])
+            }
+            Err(_) => {
+                let _ = self
+                    .forwarding
+                    .release_reserved_route(endpoint, route_channel);
+                Ok(vec![control_error_frame(
+                    &frame,
+                    "module_unavailable",
+                    "attach relay waiter was canceled before the module responded",
+                )?])
+            }
+        }
+    }
+
+    fn handle_module_relay_response(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let outcome = match frame.header.ty {
+            FrameType::Response => {
+                let body = match serde_json::from_slice::<AttachRelayResponse>(&frame.body) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "invalid_attach_relay_response",
+                            format!("malformed AttachRelay response body: {err}"),
+                        )?])
+                    }
+                };
+                if body.accept {
+                    AttachRelayOutcome::Accepted
+                } else {
+                    AttachRelayOutcome::Rejected(ErrorBody {
+                        code: "config_divergence".to_string(),
+                        message: "module rejected AttachRelay".to_string(),
+                    })
+                }
+            }
+            FrameType::Error => {
+                let body = match serde_json::from_slice::<ErrorBody>(&frame.body) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "invalid_attach_relay_error",
+                            format!("malformed AttachRelay ERROR body: {err}"),
+                        )?])
+                    }
+                };
+                AttachRelayOutcome::Rejected(body)
+            }
+            ty => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "unsupported_control_frame",
+                    format!("unsupported module channel-0 frame {ty:?}"),
+                )?])
+            }
+        };
+
+        let _ = self
+            .forwarding
+            .complete_pending_relay(connection_id, frame.header.corr, outcome)
+            .map_err(RouterError::Forwarding)?;
+        Ok(Vec::new())
+    }
+
     fn handle_goodbye(&self, connection_id: ConnectionId) -> Result<Vec<Frame>, RouterError> {
         debug!(connection_id = connection_id.get(), "handling GOODBYE");
         self.registry
             .deregister_connection(connection_id)
             .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
+        self.forwarding
+            .cleanup_connection(connection_id)
+            .map_err(RouterError::Forwarding)?;
         Ok(Vec::new())
     }
 }
@@ -223,11 +505,17 @@ fn control_error_frame(
     code: &'static str,
     message: impl Into<String>,
 ) -> Result<Frame, RouterError> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.into(),
-    })
-    .map_err(|err| {
+    control_error_body_frame(
+        frame,
+        ErrorBody {
+            code: code.to_string(),
+            message: message.into(),
+        },
+    )
+}
+
+fn control_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, RouterError> {
+    let body = serde_json::to_vec(&error).map_err(|err| {
         RouterError::backend(
             0,
             frame.header.corr,
@@ -244,6 +532,17 @@ fn control_error_frame(
         body,
     )
     .map_err(RouterError::FrameBuild)
+}
+
+fn forwarding_error_code(err: &ForwardingError) -> &'static str {
+    match err {
+        ForwardingError::NoModuleConnection => "module_unavailable",
+        ForwardingError::StaleModuleEndpoint
+        | ForwardingError::UnknownReservation { .. }
+        | ForwardingError::RouteChannelExhausted
+        | ForwardingError::RelayCorrelationExhausted
+        | ForwardingError::Poisoned => "forwarding_error",
+    }
 }
 
 fn response_version(frame: &Frame) -> u8 {

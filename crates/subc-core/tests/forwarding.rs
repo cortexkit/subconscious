@@ -435,6 +435,298 @@ async fn cross_session_slow_call_does_not_block_fast_call() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_before_response_for_cancellable_request_returns_cancelled_error() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-cancel-before";
+    let events_path = server.stub_events_path("cancel-before");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 801, "ses-cancel-before").await;
+    let corr = 802;
+    let payload = br#"{"delay_ms":500,"jsonrpc":"2.0","id":"cancel-before"}"#;
+    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let cancel_sent = Instant::now();
+    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let terminal = read_frame_timeout(&mut client).await;
+    let cancel_latency = Instant::now().duration_since(cancel_sent);
+    eprintln!("cancel-before-response latency: {cancel_latency:?}");
+    let body = assert_error(&terminal, ack.route_channel, corr, "cancelled");
+    assert!(body.message.contains("cancelled"));
+    assert!(
+        cancel_latency < Duration::from_millis(250),
+        "cancelled terminal should arrive well before 500ms delay; latency={cancel_latency:?}"
+    );
+
+    let cancel_event = wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "cancel"
+            && event["channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["corr"].as_u64() == Some(corr)
+            && event["claimed"].as_bool() == Some(true)
+    })
+    .await;
+    assert_eq!(cancel_event["claimed"].as_bool(), Some(true));
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "terminal"
+            && event["terminal"] == "error"
+            && event["code"] == "cancelled"
+            && event["channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["corr"].as_u64() == Some(corr)
+    })
+    .await;
+    assert_no_frame_within(&mut client, Duration::from_millis(550)).await;
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_response_is_idempotent_noop() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-cancel-after";
+    let events_path = server.stub_events_path("cancel-after");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 811, "ses-cancel-after").await;
+    let corr = 812;
+    let payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"cancel-after"}"#;
+    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_response(&response, ack.route_channel, corr, payload);
+
+    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let cancel_event = wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "cancel"
+            && event["channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["corr"].as_u64() == Some(corr)
+            && event["claimed"].as_bool() == Some(false)
+    })
+    .await;
+    assert_eq!(cancel_event["claimed"].as_bool(), Some(false));
+    assert_no_frame_within(&mut client, Duration::from_millis(100)).await;
+
+    let followup_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"cancel-after-followup"}"#;
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, corr + 1, followup_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let followup = read_frame_timeout(&mut client).await;
+    assert_response(&followup, ack.route_channel, corr + 1, followup_payload);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn double_cancel_emits_exactly_one_cancelled_error() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-double-cancel";
+    let events_path = server.stub_events_path("double-cancel");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 821, "ses-double-cancel").await;
+    let corr = 822;
+    let payload = br#"{"delay_ms":500,"jsonrpc":"2.0","id":"double-cancel"}"#;
+    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
+        .await
+        .unwrap();
+    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let terminal = read_frame_timeout(&mut client).await;
+    assert_error(&terminal, ack.route_channel, corr, "cancelled");
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "cancel"
+            && event["channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["corr"].as_u64() == Some(corr)
+            && event["claimed"].as_bool() == Some(true)
+    })
+    .await;
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "cancel"
+            && event["channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["corr"].as_u64() == Some(corr)
+            && event["claimed"].as_bool() == Some(false)
+    })
+    .await;
+    assert_no_frame_within(&mut client, Duration::from_millis(550)).await;
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_for_uncancellable_delayed_request_allows_normal_response() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-uncancellable";
+    let events_path = server.stub_events_path("uncancellable");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_EVENTS_PATH".to_string(),
+                    events_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 831, "ses-uncancellable").await;
+    let corr = 832;
+    let payload = br#"{"delay_ms":200,"uncancellable":true,"jsonrpc":"2.0","id":"uncancellable"}"#;
+    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let cancel_sent = Instant::now();
+    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let cancel_event = wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "cancel"
+            && event["channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["corr"].as_u64() == Some(corr)
+            && event["claimed"].as_bool() == Some(false)
+    })
+    .await;
+    assert_eq!(cancel_event["claimed"].as_bool(), Some(false));
+
+    let response = read_frame_timeout(&mut client).await;
+    let latency = Instant::now().duration_since(cancel_sent);
+    assert_response(&response, ack.route_channel, corr, payload);
+    assert!(
+        latency >= Duration::from_millis(150),
+        "uncancellable request should complete after its configured delay; latency={latency:?}"
+    );
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "terminal"
+            && event["terminal"] == "response"
+            && event["channel"].as_u64() == Some(u64::from(ack.route_channel))
+            && event["corr"].as_u64() == Some(corr)
+    })
+    .await;
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_channel_cancel_returns_unknown_channel_error_and_survives() {
+    let server = TestServer::start();
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-unknown-cancel";
+    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 841, "ses-unknown-cancel").await;
+    let unknown_channel = if ack.route_channel == u16::MAX {
+        u16::MAX - 1
+    } else {
+        u16::MAX
+    };
+    assert_ne!(unknown_channel, ack.route_channel);
+
+    let unknown_corr = 842;
+    write_frame(&mut client, &cancel_frame(unknown_channel, unknown_corr))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let error_frame = read_frame_timeout(&mut client).await;
+    let body = assert_error(
+        &error_frame,
+        unknown_channel,
+        unknown_corr,
+        "unknown_channel",
+    );
+    assert!(body.message.contains("unknown channel"));
+
+    let payload = br#"{"jsonrpc":"2.0","id":"after-unknown-cancel"}"#;
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, unknown_corr + 1, payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_response(&response, ack.route_channel, unknown_corr + 1, payload);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_client_fanout_pushes_route_to_each_bound_client() {
     let server = TestServer::start();
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
@@ -676,6 +968,20 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
     .unwrap()
 }
 
+fn cancel_frame(channel: u16, corr: u64) -> Frame {
+    let frame = Frame::build(
+        FrameType::Cancel,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        corr,
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(frame.header.len, 0);
+    assert!(frame.body.is_empty());
+    frame
+}
+
 async fn read_until_push_and_response(
     stream: &mut UnixStream,
     route_channel: u16,
@@ -727,6 +1033,15 @@ fn assert_response(frame: &Frame, route_channel: u16, corr: u64, body: &[u8]) {
     assert_eq!(frame.body, body);
 }
 
+fn assert_error(frame: &Frame, route_channel: u16, corr: u64, code: &str) -> ErrorBody {
+    assert_eq!(frame.header.ty, FrameType::Error);
+    assert_eq!(frame.header.channel, route_channel);
+    assert_eq!(frame.header.corr, corr);
+    let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body.code, code);
+    body
+}
+
 async fn read_frame_timeout(stream: &mut UnixStream) -> Frame {
     timeout(READ_TIMEOUT, async {
         read_frame(stream)
@@ -736,6 +1051,15 @@ async fn read_frame_timeout(stream: &mut UnixStream) -> Frame {
     })
     .await
     .expect("timed out waiting for frame")
+}
+
+async fn assert_no_frame_within(stream: &mut UnixStream, wait: Duration) {
+    match timeout(wait, read_frame(stream)).await {
+        Err(_) => {}
+        Ok(Ok(Some(frame))) => panic!("unexpected frame within {wait:?}: {frame:?}"),
+        Ok(Ok(None)) => panic!("connection closed while expecting no frame for {wait:?}"),
+        Ok(Err(err)) => panic!("frame read failed while expecting no frame for {wait:?}: {err}"),
+    }
 }
 
 fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supervisor {

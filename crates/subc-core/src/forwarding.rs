@@ -40,6 +40,12 @@ pub struct AttachRelay {
     pub config: Value,
 }
 
+/// subc-to-module channel-0 control RPC body telling the module a route channel is gone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetachRelay {
+    pub route_channel: u16,
+}
+
 /// Module response body for an accepted attach relay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AttachRelayResponse {
@@ -60,11 +66,19 @@ pub struct ModuleEndpointId {
 pub(crate) struct ModuleRoute {
     pub endpoint: ModuleEndpointId,
     pub sink: FrameSink,
+    pub negotiated_ver: u8,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClientRoute {
     pub sink: FrameSink,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReleasedRoute {
+    pub route_channel: u16,
+    pub module_sink: FrameSink,
+    pub negotiated_ver: u8,
 }
 
 #[derive(Debug)]
@@ -177,17 +191,17 @@ impl ForwardingTable {
             return Err(ForwardingError::UnknownReservation { route_channel });
         }
 
-        let module_sink = inner
+        let (module_sink, negotiated_ver) = inner
             .active_module
             .as_ref()
-            .ok_or(ForwardingError::NoModuleConnection)?
-            .sink
-            .clone();
+            .map(|module| (module.sink.clone(), module.negotiated_ver))
+            .ok_or(ForwardingError::NoModuleConnection)?;
         inner.client_to_module.insert(
             (client_connection_id, route_channel),
             ModuleRoute {
                 endpoint,
                 sink: module_sink,
+                negotiated_ver,
             },
         );
         inner
@@ -283,7 +297,7 @@ impl ForwardingTable {
     pub(crate) fn cleanup_connection(
         &self,
         connection_id: ConnectionId,
-    ) -> Result<(), ForwardingError> {
+    ) -> Result<Vec<ReleasedRoute>, ForwardingError> {
         let mut inner = self.lock_inner()?;
         if let Some(module) = inner
             .active_module
@@ -318,7 +332,7 @@ impl ForwardingTable {
                     module.module_id
                 )));
             }
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let route_channels: Vec<u16> = inner
@@ -327,6 +341,7 @@ impl ForwardingTable {
             .filter(|(client_id, _)| *client_id == connection_id)
             .map(|(_, route_channel)| *route_channel)
             .collect();
+        let mut released = Vec::with_capacity(route_channels.len());
         for route_channel in route_channels {
             if let Some(route) = inner
                 .client_to_module
@@ -335,10 +350,14 @@ impl ForwardingTable {
                 inner
                     .module_to_client
                     .remove(&(route.endpoint, route_channel));
-                // follow-up: send detach-relay to the module and reconcile emit-before-detach races.
+                released.push(ReleasedRoute {
+                    route_channel,
+                    module_sink: route.sink,
+                    negotiated_ver: route.negotiated_ver,
+                });
             }
         }
-        Ok(())
+        Ok(released)
     }
 
     fn lock_inner(&self) -> Result<MutexGuard<'_, ForwardingInner>, ForwardingError> {

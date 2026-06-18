@@ -1,8 +1,17 @@
-use std::{collections::BTreeMap, env, error::Error, fmt, io, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env,
+    error::Error,
+    fmt, fs,
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use subc_core::{
-    read_frame, write_frame, AttachRelay, Frame, HelloAckBody, HelloBody, SUBC_SOCKET_ENV,
+    read_frame, write_frame, AttachRelay, DetachRelay, Frame, HelloAckBody, HelloBody,
+    SUBC_SOCKET_ENV,
 };
 use subc_protocol::{
     manifest::{
@@ -15,6 +24,9 @@ use tokio::{io::AsyncWriteExt, net::UnixStream, time::sleep};
 
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
+const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
+const FAKE_AFT_EVENTS_PATH_ENV: &str = "FAKE_AFT_EVENTS_PATH";
+const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 
@@ -44,7 +56,7 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
                     std::process::exit(2);
                 }
                 frame = read_frame(&mut stream) => {
-                    if !handle_frame(&mut stream, frame?).await? {
+                    if !handle_frame(&mut stream, frame?, &config).await? {
                         return Ok(());
                     }
                 }
@@ -54,7 +66,7 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
 
     loop {
         let frame = read_frame(&mut stream).await?;
-        if !handle_frame(&mut stream, frame).await? {
+        if !handle_frame(&mut stream, frame, &config).await? {
             return Ok(());
         }
     }
@@ -87,7 +99,11 @@ async fn expect_hello_ack(stream: &mut UnixStream) -> Result<HelloAckBody, StubE
     }
 }
 
-async fn handle_frame(stream: &mut UnixStream, frame: Option<Frame>) -> Result<bool, StubError> {
+async fn handle_frame(
+    stream: &mut UnixStream,
+    frame: Option<Frame>,
+    config: &StubConfig,
+) -> Result<bool, StubError> {
     let Some(frame) = frame else {
         return Ok(false);
     };
@@ -109,20 +125,21 @@ async fn handle_frame(stream: &mut UnixStream, frame: Option<Frame>) -> Result<b
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Request if frame.header.channel == 0 => {
-            let _relay =
-                serde_json::from_slice::<AttachRelay>(&frame.body).map_err(StubError::Json)?;
-            let body = serde_json::to_vec(&json!({ "accept": true })).map_err(StubError::Json)?;
-            let response = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Response,
-                control_flags(),
-                0,
-                frame.header.corr,
-                body,
-            )
-            .map_err(StubError::FrameBuild)?;
-            write_frame(stream, &response).await?;
-            stream.flush().await.map_err(StubError::Io)?;
+            handle_control_request(stream, frame, config).await?;
+            Ok(true)
+        }
+        FrameType::Error => {
+            let body = serde_json::from_slice::<ErrorBody>(&frame.body).ok();
+            record_event(
+                config,
+                json!({
+                    "kind": "error",
+                    "channel": frame.header.channel,
+                    "corr": frame.header.corr,
+                    "code": body.as_ref().map(|body| body.code.as_str()),
+                    "message": body.as_ref().map(|body| body.message.as_str()),
+                }),
+            )?;
             Ok(true)
         }
         FrameType::Request => {
@@ -141,6 +158,110 @@ async fn handle_frame(stream: &mut UnixStream, frame: Option<Frame>) -> Result<b
         }
         _ => Ok(true),
     }
+}
+
+async fn handle_control_request(
+    stream: &mut UnixStream,
+    frame: Frame,
+    config: &StubConfig,
+) -> Result<(), StubError> {
+    if let Ok(relay) = serde_json::from_slice::<AttachRelay>(&frame.body) {
+        record_event(
+            config,
+            json!({
+                "kind": "attach",
+                "route_channel": relay.route_channel,
+                "corr": frame.header.corr,
+                "reject": config.reject_attach,
+            }),
+        )?;
+        if config.reject_attach {
+            let body = serde_json::to_vec(&ErrorBody {
+                code: "config_divergence".to_string(),
+                message: "fake AFT rejected AttachRelay by FAKE_AFT_REJECT_ATTACH".to_string(),
+            })
+            .map_err(StubError::Json)?;
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Error,
+                control_flags(),
+                0,
+                frame.header.corr,
+                body,
+            )
+            .map_err(StubError::FrameBuild)?;
+            write_frame(stream, &response).await?;
+            stream.flush().await.map_err(StubError::Io)?;
+            return Ok(());
+        }
+
+        let body = serde_json::to_vec(&json!({ "accept": true })).map_err(StubError::Json)?;
+        let response = Frame::build_with_version(
+            frame.header.ver,
+            FrameType::Response,
+            control_flags(),
+            0,
+            frame.header.corr,
+            body,
+        )
+        .map_err(StubError::FrameBuild)?;
+        write_frame(stream, &response).await?;
+        stream.flush().await.map_err(StubError::Io)?;
+        return Ok(());
+    }
+
+    let detach = serde_json::from_slice::<DetachRelay>(&frame.body).map_err(StubError::Json)?;
+    record_event(
+        config,
+        json!({
+            "kind": "detach",
+            "route_channel": detach.route_channel,
+            "corr": frame.header.corr,
+        }),
+    )?;
+
+    if config.emit_after_detach {
+        let stale = Frame::build_with_version(
+            frame.header.ver,
+            FrameType::Push,
+            Flags::new(false, Priority::Passive, true),
+            detach.route_channel,
+            u64::from(detach.route_channel) + 9_000,
+            b"stale-after-detach".to_vec(),
+        )
+        .map_err(StubError::FrameBuild)?;
+        write_frame(stream, &stale).await?;
+        stream.flush().await.map_err(StubError::Io)?;
+        record_event(
+            config,
+            json!({
+                "kind": "stale_emit",
+                "route_channel": detach.route_channel,
+            }),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn record_event(config: &StubConfig, event: Value) -> Result<(), StubError> {
+    let Some(path) = config.events_path.as_ref() else {
+        return Ok(());
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(StubError::Io)?;
+    }
+    append_json_line(path, event)
+}
+
+fn append_json_line(path: &Path, event: Value) -> Result<(), StubError> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(StubError::Io)?;
+    writeln!(file, "{event}").map_err(StubError::Io)
 }
 
 fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
@@ -191,6 +312,9 @@ struct StubConfig {
     socket_path: PathBuf,
     module_id: String,
     crash_after: Option<Duration>,
+    reject_attach: bool,
+    events_path: Option<PathBuf>,
+    emit_after_detach: bool,
 }
 
 impl StubConfig {
@@ -212,13 +336,24 @@ impl StubConfig {
                     .map_err(|source| StubError::InvalidCrashAfter { raw, source })
             })
             .transpose()?;
+        let events_path = env::var_os(FAKE_AFT_EVENTS_PATH_ENV).map(PathBuf::from);
 
         Ok(Self {
             socket_path,
             module_id,
             crash_after,
+            reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
+            events_path,
+            emit_after_detach: env_flag(FAKE_AFT_EMIT_AFTER_DETACH_ENV),
         })
     }
+}
+
+fn env_flag(key: &str) -> bool {
+    matches!(
+        env::var(key).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 #[derive(Debug)]

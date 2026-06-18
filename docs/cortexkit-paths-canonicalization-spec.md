@@ -48,3 +48,30 @@ Given a real existing dir `R` (canonical `Rc`):
 - Confirm vector #9's exact expectation on your case-insensitive test envs (we expect realpath returns the on-disk stored case; flag if your platform observations differ).
 - Confirm the `NonExistentPath` reject is right for **all** ProjectRootId callers on your side at attach time (operation-target/create-file handling stays your layer atop `CanonicalPath`).
 - Any additional edge case from your ad-hoc canonicalization consolidation (P0) that should become a seed vector.
+
+---
+
+## DELTA 1 — Windows verbatim prefix (DECIDED, in-crate, `#[cfg(windows)]`)
+
+`std::fs::canonicalize` returns the **verbatim extended-length** form on Windows. The crate MUST normalize it to **non-verbatim** before producing the id — otherwise subc, AFT, and the harness walk-up all diverge on Windows and the by-construction parity breaks exactly where it is hardest to debug, and the verbatim prefix leaks into anything that keys/compares/displays the id:
+
+- `\\?\C:\foo`  →  `C:\foo`
+- `\\?\UNC\server\share`  →  `\\server\share`
+
+This lives in the SHARED crate (NOT an AFT post-process), or subc/AFT diverge on Windows. Reference impl: AFT's `windows_non_verbatim_path` (`crates/aft/src/inspect/oxc_engine/resolver.rs`, mirrored in `lsp/position.rs`) — fold it in as the canonical implementation. The crate is Windows-correct from v0 (AFT needs it standalone pre-daemon).
+
+Additional seed vectors:
+
+| # | input | expected |
+|---|---|---|
+| 10 | (Windows) `\\?\C:\<existing>` | `C:\<existing>` (verbatim stripped) |
+| 11 | (Windows) `\\?\UNC\server\share\<existing>` | `\\server\share\<existing>` (verbatim UNC stripped) |
+
+## Resolution status (AFT review — converged)
+
+- **DELTA 1 (Windows verbatim):** folded in above; AFT's `windows_non_verbatim_path` is the reference impl; lives in the shared crate, Windows-correct from v0.
+- **#2 NonExistentPath reject:** CONFIRMED correct for ProjectRootId at attach (a project root always exists at configure/attach). AFT's current root canonicalization uses a `canonicalize_or_normalize` fallback; switching ProjectRootId to reject is the right tightening. The normalize fallback stays AFT-side on `CanonicalPath` for operation-target/create-file paths.
+- **#9 case-insensitive stored-case:** matches AFT's assumption (realpath stored case, no fold). Provisionally confirmed; AFT adds a live-verified case-collision vector when the crate lands.
+- **#3 other edges:** none beyond Windows-verbatim. AFT routes its ~10+ scattered root-identity canonicalization sites through this crate during P0; operation/relative-path sites stay the AFT-side `CanonicalPath` layer.
+
+**Converged → crate creation proceeds.** (The "Open for AFT" section above is now resolved by this block.)

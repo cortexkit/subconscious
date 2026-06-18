@@ -285,21 +285,24 @@ The routing model under one-AFT-process (§2.1), source-verified with AFT:
 
 The headline v1 goal — non-mutating tools run in parallel, mutating serialized — is delivered by **two parts that interlock but version independently**: subc's delivery contract, and the module's executor.
 
-### 6.1 subc's delivery contract (locked) — and what is built vs Epic 2
+### 6.1 subc's delivery contract (locked) — and what is built
 
-The contract is **locked**; the *implementation* lands in two stages. The shape that makes concurrency additive is built now; the concurrent dispatch itself is Epic 2 (it has no real consumer until the module-forwarding backend exists). Honest status:
+The contract is **locked**. Epic 2 implemented the subc side of it; everything below is **proven end-to-end against the fake-AFT stub** (real-AFT e2e is gated on AFT Leg 1, and within-root parallelism on Leg 2 — see §6.2/§6.3). Honest status:
 
 | Contract element | Status |
 |---|---|
-| Sink-based async backend + per-connection writer task | **built** (the streaming/PUSH-capable shape) |
+| Sink-based async backend + per-connection writer task | **built** (streaming/PUSH-capable) |
 | Per-connection backpressure (bounded outbound queue) | **built** |
-| Out-of-order responses (corr-id carried, never assumed ordered) | **built** (shape) |
-| Per-channel FIFO submission, governed by the module's declared `concurrency` (§4.4) | **contracted** |
-| Concurrent in-flight dispatch | **Epic 2** (serial dispatch today; no forwarding backend yet) |
-| CANCEL handling | **Epic 2** (frame type reserved in the envelope; no handler yet) |
-| Per-channel flow-control window (un-acked cap) | **Epic 2** |
+| Forwarding data plane (session-attach → `ForwardBackend` → bidirectional channel demux; PUSH; detach-relay) | **built** (Epic 1 close) |
+| Concurrent in-flight dispatch + out-of-order responses (corr carried, never assumed ordered) | **built + proven** (2.1/2.2 — `ForwardBackend` returns without awaiting; per-connection tasks; module-reader demux. Cross-session: fast call unblocked while a 500ms call runs) |
+| CANCEL (pure-header, dumb-forward — module owns abort/terminal) | **built + proven** (2.3) |
+| Per-channel flow-control window (un-acked cap), sized by declared `concurrency` | **built + proven** (2.4 — `ChannelFlow` credit counter, type-byte only; `serial→1` enforced) |
+| Liveness/status answered from subc cache (passive poll never forwarded) | **built + proven** (2.5 — channel-0 local; kills the #117 passive-poll-behind-scan; status shapes subc-core-local pending AFT co-sign) |
+| Within-root parallelism (slow read doesn't block quick reads on one root) | **Leg-2-gated** (2.6 — AFT's reader-writer executor; §6.4) |
 
-**Per-mode FIFO (FR16):** ordering is per-module, declared via manifest `concurrency`: `serial` = one in-flight, strict order; `module_managed` = concurrent in-flight across channels, per-channel FIFO submission preserved within a channel (module schedules internally) — AFT's mode; `stateless_parallel` = fully parallel, no ordering. The dispatcher that *acts* on this lands with the forwarding backend (Epic 2).
+**Per-mode FIFO (FR16):** ordering is per-module, declared via manifest `concurrency`: `serial` = one in-flight, strict order (now **enforced** by the flow-control window 2.4 — subc never sends a 2nd request before the 1st's terminal); `module_managed` = concurrent in-flight across channels, per-channel FIFO submission preserved within a channel (module schedules internally) — AFT's mode; `stateless_parallel` = fully parallel, no ordering.
+
+**Honest limitation (2.4):** the per-channel window bounds each channel's outstanding work, but does NOT give full same-socket cross-channel fairness — one ordered client stream means a window-blocked channel can still head-of-line later frames on its own socket. Full per-channel fairness (client-side credits / per-channel queues) is a later scheduler story, deliberately out of v1.
 
 This contract is **delivery semantics only.** subc never learns which calls mutate, never orders execution, never reasons about resources. All execution consistency — including two calls touching the same resource in one parallel batch — is the module's.
 
@@ -313,7 +316,7 @@ Because the contract is "concurrent-in-flight + cancel + windows," **subc does n
 
 ### 6.3 What each leg delivers (so the metric is honest)
 
-- **subc mux, immediately:** the bridge-kill half of AFT #117 (a sidebar status poll timing out behind a heavy scan and killing the bridge) is gone the moment subc owns the connection, independent of either leg — subc supervises the process, so **liveness is always answerable by subc directly** and never queues behind the busy actor. One Leg-1 caveat: module-originated **status** (index state, code-health) is refreshed by the module's push-frames, and a single-threaded Leg-1 actor cannot emit a refresh mid-scan until it yields — so subc's cached *status* may be briefly stale during a long scan (liveness never is). Stale status is a far lesser issue than the bridge-kill, and Leg 2 removes the staleness window entirely.
+- **subc mux, immediately (implemented — Story 2.5):** the bridge-kill half of AFT #117 (a sidebar status poll timing out behind a heavy scan and killing the bridge) is gone the moment subc owns the connection, independent of either leg — subc supervises the process, so **liveness is always answerable by subc directly** and never queues behind the busy actor. subc serves a passive liveness/status poll **locally from its own state + an opaque module-pushed status cache, never forwarding to the busy module** (proven: polls answered in ~100µs while a serial module is occupied by a 2s request). One Leg-1 caveat: module-originated **status** (index state, code-health) is refreshed by the module's push-frames, and a single-threaded Leg-1 actor cannot emit a refresh mid-scan until it yields — so subc's cached *status* may be briefly stale during a long scan (liveness never is). Stale status is a far lesser issue than the bridge-kill, and Leg 2 removes the staleness window entirely.
 - **Leg 2:** the "heavy scan blocks the quick reads behind it, _within one root_" half is gone only when the reader-writer executor lands. The v1 concurrency metric (a slow search + N quick reads that don't queue) therefore depends on Leg 2 — which is in v1.
 
 ### 6.4 The Leg 2 substrate cost (source-verified by AFT)

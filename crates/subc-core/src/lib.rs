@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bootstrap;
 pub mod control;
 mod frame;
 pub mod frame_io;

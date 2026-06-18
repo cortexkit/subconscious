@@ -1,19 +1,20 @@
 #![forbid(unsafe_code)]
 
-use std::{env, path::PathBuf, process, sync::Arc};
-
-use subc_core::{serve_uds, Router};
+use std::process;
 
 #[tokio::main]
 async fn main() {
-    let Some(path) = env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: subc-core <unix-socket-path>");
-        process::exit(2);
-    };
+    init_tracing();
 
-    let router = Arc::new(Router::with_default_self_handler());
-    if let Err(err) = serve_uds(&path, router).await {
+    if let Err(err) = subc_core::bootstrap::run().await {
+        tracing::error!(error = %err, "subc-core failed");
         eprintln!("subc-core: {err}");
         process::exit(1);
     }
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 }

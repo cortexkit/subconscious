@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use subc_core::{
-    read_frame, serve_listener, write_frame, AttachAck, AttachRequest, ControlHandler,
+    read_frame, serve_listener, write_frame, AttachAck, AttachRequest, ConfigTier, ControlHandler,
     ForwardingTable, Frame, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, Router,
     SupervisedModule, Supervisor, SUBC_SOCKET_ENV,
 };
@@ -73,11 +73,35 @@ async fn attach_then_forward_request_round_trips_through_stub() {
     let server = TestServer::start();
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-forwarding";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
+    let events_path = server.stub_events_path("attach-forwarding");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [(
+                "FAKE_AFT_EVENTS_PATH",
+                events_path.to_string_lossy().into_owned(),
+            )],
+        ))
+        .unwrap();
     wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 101, "ses-forwarding").await;
+    let attach_event = wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    let forwarded_config: Vec<ConfigTier> =
+        serde_json::from_value(attach_event["config"].clone()).unwrap();
+    assert_eq!(forwarded_config, attach_config(&project, "ses-forwarding"));
+    assert_eq!(
+        forwarded_config
+            .iter()
+            .map(|tier| tier.tier.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user", "project"]
+    );
     assert!(ack.route_channel > 0);
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 1);
     assert!(server
@@ -459,8 +483,27 @@ fn attach_request(project: &TestProject, session: &str) -> AttachRequest {
         project_root: project.path.clone(),
         harness: "opencode".to_string(),
         session: session.to_string(),
-        config: json!({ "session": session }),
+        config: attach_config(project, session),
     }
+}
+
+fn attach_config(project: &TestProject, session: &str) -> Vec<ConfigTier> {
+    vec![
+        ConfigTier {
+            tier: "user".to_string(),
+            source: "/abs/user/aft.jsonc".to_string(),
+            doc: "{ // user defaults\n  \"auto_accept\": false\n}".to_string(),
+        },
+        ConfigTier {
+            tier: "project".to_string(),
+            source: project
+                .path
+                .join("aft.jsonc")
+                .to_string_lossy()
+                .into_owned(),
+            doc: format!(r#"{{ "session": "{session}", "semantic": true }}"#),
+        },
+    ]
 }
 
 fn attach_frame(corr: u64, attach: AttachRequest) -> Frame {

@@ -2,16 +2,23 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fmt,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 pub use subc_protocol::session::{
     AttachAck, AttachRelay, AttachRelayResponse, AttachRequest, ConfigTier, DetachRelay,
 };
-use subc_protocol::ErrorBody;
-use tokio::sync::oneshot;
+use subc_protocol::{manifest::Concurrency, ErrorBody};
+use tokio::sync::{oneshot, Semaphore};
+use tracing::warn;
 
 use crate::{registry::ConnectionId, router::FrameSink};
+
+/// Default per-channel request-credit window for modules that schedule internally.
+const DEFAULT_MODULE_MANAGED_WINDOW: usize = 32;
+
+/// High per-channel cap for stateless modules; this is an OOM guard, not scheduling policy.
+const STATELESS_PARALLEL_WINDOW: usize = 1024;
 
 /// Module connection identity used in forwarding keys.
 ///
@@ -28,11 +35,13 @@ pub(crate) struct ModuleRoute {
     pub endpoint: ModuleEndpointId,
     pub sink: FrameSink,
     pub negotiated_ver: u8,
+    pub flow: Arc<ChannelFlow>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClientRoute {
     pub sink: FrameSink,
+    pub flow: Arc<ChannelFlow>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +74,7 @@ struct ModuleConnection {
     endpoint: ModuleEndpointId,
     sink: FrameSink,
     negotiated_ver: u8,
+    concurrency: Concurrency,
 }
 
 #[derive(Debug, Default)]
@@ -91,6 +101,7 @@ impl ForwardingTable {
         connection_id: ConnectionId,
         module_id: String,
         negotiated_ver: u8,
+        concurrency: Concurrency,
         sink: FrameSink,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         let mut inner = self.lock_inner()?;
@@ -104,6 +115,7 @@ impl ForwardingTable {
             endpoint,
             sink,
             negotiated_ver,
+            concurrency,
         });
         if inner.next_route_channel == 0 {
             inner.next_route_channel = 1;
@@ -152,22 +164,34 @@ impl ForwardingTable {
             return Err(ForwardingError::UnknownReservation { route_channel });
         }
 
-        let (module_sink, negotiated_ver) = inner
+        let (module_sink, negotiated_ver, window) = inner
             .active_module
             .as_ref()
-            .map(|module| (module.sink.clone(), module.negotiated_ver))
+            .map(|module| {
+                (
+                    module.sink.clone(),
+                    module.negotiated_ver,
+                    window_for(&module.concurrency),
+                )
+            })
             .ok_or(ForwardingError::NoModuleConnection)?;
+        let flow = Arc::new(ChannelFlow::new(window));
         inner.client_to_module.insert(
             (client_connection_id, route_channel),
             ModuleRoute {
                 endpoint,
                 sink: module_sink,
                 negotiated_ver,
+                flow: Arc::clone(&flow),
             },
         );
-        inner
-            .module_to_client
-            .insert((endpoint, route_channel), ClientRoute { sink: client_sink });
+        inner.module_to_client.insert(
+            (endpoint, route_channel),
+            ClientRoute {
+                sink: client_sink,
+                flow,
+            },
+        );
         Ok(())
     }
 
@@ -270,6 +294,15 @@ impl ForwardingTable {
             inner
                 .reserved_routes
                 .retain(|(endpoint, _)| *endpoint != module.endpoint);
+            let removed_flows: Vec<_> = inner
+                .client_to_module
+                .values()
+                .filter(|route| route.endpoint == module.endpoint)
+                .map(|route| Arc::clone(&route.flow))
+                .collect();
+            for flow in removed_flows {
+                flow.close();
+            }
             inner
                 .client_to_module
                 .retain(|_, route| route.endpoint != module.endpoint);
@@ -308,6 +341,7 @@ impl ForwardingTable {
                 .client_to_module
                 .remove(&(connection_id, route_channel))
             {
+                route.flow.close();
                 inner
                     .module_to_client
                     .remove(&(route.endpoint, route_channel));
@@ -378,6 +412,69 @@ fn endpoint_for_connection(
         .as_ref()
         .filter(|module| module.endpoint.connection_id == connection_id)
         .map(|module| module.endpoint)
+}
+
+/// Per-channel request-credit accounting shared by the client and module route halves.
+#[derive(Debug)]
+pub(crate) struct ChannelFlow {
+    sem: Semaphore,
+    window: usize,
+}
+
+impl ChannelFlow {
+    fn new(window: usize) -> Self {
+        debug_assert!(window > 0, "flow-control window must be non-zero");
+        Self {
+            sem: Semaphore::new(window),
+            window,
+        }
+    }
+
+    pub(crate) async fn acquire(&self) -> Result<(), ChannelFlowClosed> {
+        let permit = self.sem.acquire().await.map_err(|_| ChannelFlowClosed)?;
+        // Credits are returned by terminal frames on the module->client path, not
+        // by this task's RAII lifetime.
+        permit.forget();
+        Ok(())
+    }
+
+    pub(crate) fn release(&self) {
+        let available = self.sem.available_permits();
+        if available < self.window {
+            self.sem.add_permits(1);
+        } else {
+            // Protocol-conforming modules emit exactly one terminal per request.
+            // This guard is a best-effort safety net against window growth, not a
+            // security boundary against malicious peers.
+            warn!(
+                window = self.window,
+                available, "flow-control over-release ignored"
+            );
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.sem.close();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChannelFlowClosed;
+
+impl fmt::Display for ChannelFlowClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "flow-control window closed")
+    }
+}
+
+impl Error for ChannelFlowClosed {}
+
+fn window_for(concurrency: &Concurrency) -> usize {
+    match concurrency {
+        Concurrency::Serial => 1,
+        Concurrency::ModuleManaged => DEFAULT_MODULE_MANAGED_WINDOW,
+        Concurrency::StatelessParallel => STATELESS_PARALLEL_WINDOW,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

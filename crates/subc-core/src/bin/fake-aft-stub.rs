@@ -38,6 +38,8 @@ const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";
 const FAKE_AFT_FANOUT_ON_REQUEST_ENV: &str = "FAKE_AFT_FANOUT_ON_REQUEST";
 const FAKE_AFT_DELAY_FROM_BODY_ENV: &str = "FAKE_AFT_DELAY_FROM_BODY";
+const FAKE_AFT_CONCURRENCY_ENV: &str = "FAKE_AFT_CONCURRENCY";
+const FAKE_AFT_DOUBLE_TERMINAL_ENV: &str = "FAKE_AFT_DOUBLE_TERMINAL";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
@@ -84,7 +86,7 @@ where
 {
     let mut state = StubState::default();
 
-    send_hello(&writer, &config.module_id).await?;
+    send_hello(&writer, &config.module_id, config.concurrency.clone()).await?;
     expect_hello_ack(read_half).await?;
 
     if let Some(crash_after) = config.crash_after {
@@ -131,9 +133,13 @@ where
     Ok(())
 }
 
-async fn send_hello(writer: &mpsc::Sender<Frame>, module_id: &str) -> Result<(), StubError> {
+async fn send_hello(
+    writer: &mpsc::Sender<Frame>,
+    module_id: &str,
+    concurrency: Concurrency,
+) -> Result<(), StubError> {
     let body = serde_json::to_vec(&HelloBody {
-        manifest: manifest(module_id),
+        manifest: manifest(module_id, concurrency),
         protocol_ver: PROTOCOL_VERSION,
     })
     .map_err(StubError::Json)?;
@@ -208,6 +214,14 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request => {
+            record_event(
+                config,
+                json!({
+                    "kind": "request_received",
+                    "channel": frame.header.channel,
+                    "corr": frame.header.corr,
+                }),
+            )?;
             let behavior = request_behavior(config, &frame.body);
             let fanout_channels = state.bound_channels.iter().copied().collect::<Vec<_>>();
             let request_writer = writer.clone();
@@ -285,7 +299,8 @@ async fn handle_cancel(
     )?;
 
     if let Some(cancel_tx) = cancel_tx {
-        // follow-up (2.4): flow-control decides CANCEL window-bypass/credit semantics.
+        // Story 2.4 resolves the flow-control interaction: CANCEL bypasses
+        // request credits; the request credit returns only on this terminal.
         let _ = cancel_tx.send(());
         emit_cancelled_error(
             writer,
@@ -392,16 +407,13 @@ async fn emit_response(
         frame.body,
     )
     .map_err(StubError::FrameBuild)?;
-    send_outbound(writer, response).await?;
-    record_event(
-        config,
-        json!({
-            "kind": "terminal",
-            "terminal": "response",
-            "channel": channel,
-            "corr": corr,
-        }),
-    )
+    send_outbound(writer, response.clone()).await?;
+    record_terminal(config, "response", None, channel, corr)?;
+    if config.double_terminal {
+        send_outbound(writer, response).await?;
+        record_terminal(config, "response", None, channel, corr)?;
+    }
+    Ok(())
 }
 
 async fn emit_cancelled_error(
@@ -425,17 +437,32 @@ async fn emit_cancelled_error(
         body,
     )
     .map_err(StubError::FrameBuild)?;
-    send_outbound(writer, frame).await?;
-    record_event(
-        config,
-        json!({
-            "kind": "terminal",
-            "terminal": "error",
-            "code": "cancelled",
-            "channel": channel,
-            "corr": corr,
-        }),
-    )
+    send_outbound(writer, frame.clone()).await?;
+    record_terminal(config, "error", Some("cancelled"), channel, corr)?;
+    if config.double_terminal {
+        send_outbound(writer, frame).await?;
+        record_terminal(config, "error", Some("cancelled"), channel, corr)?;
+    }
+    Ok(())
+}
+
+fn record_terminal(
+    config: &StubConfig,
+    terminal: &str,
+    code: Option<&str>,
+    channel: u16,
+    corr: u64,
+) -> Result<(), StubError> {
+    let mut event = json!({
+        "kind": "terminal",
+        "terminal": terminal,
+        "channel": channel,
+        "corr": corr,
+    });
+    if let Some(code) = code {
+        event["code"] = json!(code);
+    }
+    record_event(config, event)
 }
 
 async fn handle_control_request(
@@ -608,7 +635,7 @@ fn append_json_line(path: &Path, event: Value) -> Result<(), StubError> {
     writeln!(file, "{event}").map_err(StubError::Io)
 }
 
-fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
+fn manifest(module_id: &str, concurrency: Concurrency) -> subc_protocol::manifest::ModuleManifest {
     subc_protocol::manifest::ModuleManifest {
         module_id: module_id.to_string(),
         module_version: "0.0.0-fake".to_string(),
@@ -621,7 +648,7 @@ fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
                 schema: json!({"type": "object"}),
             }],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
+            concurrency,
             emits_push: true,
             sub_supervises: true,
         }],
@@ -662,6 +689,8 @@ struct StubConfig {
     push_on_request: bool,
     fanout_on_request: bool,
     delay_from_body: bool,
+    concurrency: Concurrency,
+    double_terminal: bool,
 }
 
 struct StubState {
@@ -698,6 +727,7 @@ impl StubConfig {
             })
             .transpose()?;
         let events_path = env::var_os(FAKE_AFT_EVENTS_PATH_ENV).map(PathBuf::from);
+        let concurrency = concurrency_from_env()?;
 
         Ok(Self {
             socket_path,
@@ -709,7 +739,21 @@ impl StubConfig {
             push_on_request: env_flag(FAKE_AFT_PUSH_ON_REQUEST_ENV),
             fanout_on_request: env_flag(FAKE_AFT_FANOUT_ON_REQUEST_ENV),
             delay_from_body: env_flag(FAKE_AFT_DELAY_FROM_BODY_ENV),
+            concurrency,
+            double_terminal: env_flag(FAKE_AFT_DOUBLE_TERMINAL_ENV),
         })
+    }
+}
+
+fn concurrency_from_env() -> Result<Concurrency, StubError> {
+    let Some(raw) = env::var(FAKE_AFT_CONCURRENCY_ENV).ok() else {
+        return Ok(Concurrency::ModuleManaged);
+    };
+    match raw.as_str() {
+        "serial" => Ok(Concurrency::Serial),
+        "module_managed" => Ok(Concurrency::ModuleManaged),
+        "stateless_parallel" => Ok(Concurrency::StatelessParallel),
+        _ => Err(StubError::InvalidConcurrency { raw }),
     }
 }
 
@@ -728,6 +772,9 @@ enum StubError {
     InvalidCrashAfter {
         raw: String,
         source: std::num::ParseIntError,
+    },
+    InvalidConcurrency {
+        raw: String,
     },
     Connect {
         path: PathBuf,
@@ -756,6 +803,10 @@ impl fmt::Display for StubError {
             Self::InvalidCrashAfter { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_CRASH_AFTER_MS_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidConcurrency { raw } => write!(
+                f,
+                "invalid {FAKE_AFT_CONCURRENCY_ENV} value '{raw}': expected serial, module_managed, or stateless_parallel"
             ),
             Self::Connect { path, source } => {
                 write!(
@@ -794,6 +845,7 @@ impl Error for StubError {
             Self::Json(err) => Some(err),
             Self::WriterTask(err) => Some(err),
             Self::MissingEnv { .. }
+            | Self::InvalidConcurrency { .. }
             | Self::WriterClosed
             | Self::InFlightPoisoned
             | Self::ConnectionClosedBeforeHelloAck

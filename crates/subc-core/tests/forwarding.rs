@@ -14,7 +14,7 @@ use serde_json::Value;
 use subc_core::{
     read_frame, write_frame, AttachAck, AttachRequest, ConfigTier, ForwardingTable, Frame,
     LivenessReply, ModuleSpec, ModuleState, ModuleStatus, PassivePoll, PollOp, Registry,
-    RestartPolicy, StatusReply, SupervisedModule, Supervisor,
+    RestartPolicy, StatusReply, SupervisedModule, Supervisor, SupervisorProcessLiveness,
 };
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
 use tokio::{
@@ -24,19 +24,25 @@ use tokio::{
 };
 
 mod common;
-use common::{connect_authed_client, TestDaemon};
+use common::{connect_authed_client, start_test_daemon_with_process_liveness, TestDaemon};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct TestServer {
     daemon: TestDaemon,
+    process_liveness: Arc<SupervisorProcessLiveness>,
 }
 
 impl TestServer {
     async fn start() -> Self {
+        let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+        let daemon =
+            start_test_daemon_with_process_liveness("forwarding-server", process_liveness.clone())
+                .await;
         Self {
-            daemon: TestDaemon::start("forwarding-server").await,
+            daemon,
+            process_liveness,
         }
     }
 
@@ -1835,6 +1841,7 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, backoff),
     )
+    .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.connection_file_path.clone())
 }

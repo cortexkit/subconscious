@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use subc_protocol::{
@@ -15,6 +15,7 @@ use crate::{
     registry::{ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
     status::{LivenessReply, PassivePoll, PollOp, StatusReply, StatusUpdate},
+    supervise::ModuleProcessLiveness,
     Frame, ProjectRootId,
 };
 
@@ -44,11 +45,23 @@ pub struct HelloAckBody {
 }
 
 /// Real channel-0 control handler for subc itself.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlHandler {
     registry: Arc<Registry>,
     forwarding: Arc<ForwardingTable>,
+    process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     subc_capabilities: Arc<[String]>,
+}
+
+impl fmt::Debug for ControlHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlHandler")
+            .field("registry", &self.registry)
+            .field("forwarding", &self.forwarding)
+            .field("process_liveness", &self.process_liveness.is_some())
+            .field("subc_capabilities", &self.subc_capabilities)
+            .finish()
+    }
 }
 
 impl ControlHandler {
@@ -60,6 +73,7 @@ impl ControlHandler {
         Self {
             registry,
             forwarding,
+            process_liveness: None,
             subc_capabilities: Arc::from([
                 CAP_MANIFEST_REGISTRATION.to_string(),
                 CAP_CHANNEL_LIFECYCLE.to_string(),
@@ -67,6 +81,14 @@ impl ControlHandler {
                 CAP_SESSION_ATTACH.to_string(),
             ]),
         }
+    }
+
+    pub fn with_process_liveness(
+        mut self,
+        process_liveness: Arc<dyn ModuleProcessLiveness>,
+    ) -> Self {
+        self.process_liveness = Some(process_liveness);
+        self
     }
 
     pub fn registry(&self) -> Arc<Registry> {
@@ -503,12 +525,19 @@ impl ControlHandler {
     ) -> Result<Vec<Frame>, RouterError> {
         match poll.op {
             PollOp::Liveness => {
-                // follow-up: thread Supervisor process state into this proof-level
-                // liveness once that state is available on the passive path.
-                let live = self
+                let route_bound_to_active_module = self
                     .forwarding
                     .client_route_is_bound_to_active_module(ctx.connection_id, poll.route_channel)
                     .map_err(RouterError::Forwarding)?;
+                let process_running = if route_bound_to_active_module {
+                    self.process_running_for_route(ctx.connection_id, poll.route_channel)
+                        .map_err(|message| {
+                            RouterError::backend(frame.header.channel, frame.header.corr, message)
+                        })?
+                } else {
+                    false
+                };
+                let live = route_bound_to_active_module && process_running;
                 Ok(vec![control_response_body_frame(
                     &frame,
                     &LivenessReply { live },
@@ -539,6 +568,46 @@ impl ControlHandler {
                 )?])
             }
         }
+    }
+
+    fn process_running_for_route(
+        &self,
+        connection_id: ConnectionId,
+        route_channel: u16,
+    ) -> Result<bool, String> {
+        let Some(process_liveness) = &self.process_liveness else {
+            return Ok(true);
+        };
+        let Some(module_id) = self.module_id_for_route(connection_id, route_channel)? else {
+            return Ok(true);
+        };
+        Ok(process_liveness.process_live(&module_id).unwrap_or(true))
+    }
+
+    fn module_id_for_route(
+        &self,
+        connection_id: ConnectionId,
+        route_channel: u16,
+    ) -> Result<Option<String>, String> {
+        if let Some(registration) =
+            self.registry
+                .module_for_channel(route_channel)
+                .map_err(|err| {
+                    format!(
+                        "registry error resolving module for route channel {route_channel}: {err}"
+                    )
+                })?
+        {
+            return Ok(Some(registration.manifest.module_id));
+        }
+
+        self.forwarding
+            .client_route_module_id(connection_id, route_channel)
+            .map_err(|err| {
+                format!(
+                    "forwarding error resolving module for route channel {route_channel}: {err}"
+                )
+            })
     }
 
     fn handle_module_relay_response(
@@ -852,6 +921,70 @@ mod tests {
         serde_json::from_slice(&frame.body).unwrap()
     }
 
+    fn parse_liveness(frame: &Frame) -> LivenessReply {
+        serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    fn passive_poll_frame(corr: u64, op: PollOp, route_channel: u16) -> Frame {
+        let body = serde_json::to_vec(&PassivePoll { op, route_channel }).unwrap();
+        Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+    }
+
+    fn bind_liveness_route(
+        registry: &Registry,
+        forwarding: &ForwardingTable,
+        module_id: &str,
+    ) -> (RouteCtx, u16) {
+        let module_connection = ConnectionId::new(101);
+        let client_connection = ConnectionId::new(202);
+        let registration = registry
+            .register(
+                manifest(module_id, PROTOCOL_VERSION),
+                PROTOCOL_VERSION,
+                module_connection,
+            )
+            .unwrap();
+        let (module_tx, _module_rx) = mpsc::channel(8);
+        let endpoint = forwarding
+            .register_module_connection(
+                module_connection,
+                module_id.to_string(),
+                PROTOCOL_VERSION,
+                manifest_concurrency(&registration.manifest),
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let pending = forwarding.begin_attach_relay().unwrap();
+        assert_eq!(pending.endpoint, endpoint);
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                AttachRelayOutcome::Accepted,
+            )
+            .unwrap();
+        let (client_ctx, _client_rx) = route_ctx(client_connection);
+        forwarding
+            .commit_route(
+                client_connection,
+                client_ctx.egress.clone(),
+                endpoint,
+                pending.route_channel,
+            )
+            .unwrap();
+        (client_ctx, pending.route_channel)
+    }
+
+    struct FakeProcessLiveness {
+        live: Option<bool>,
+    }
+
+    impl ModuleProcessLiveness for FakeProcessLiveness {
+        fn process_live(&self, _module_id: &str) -> Option<bool> {
+            self.live
+        }
+    }
+
     #[test]
     fn hello_registers_manifest_and_returns_ack_with_active_channel() {
         let registry = Arc::new(Registry::default());
@@ -945,6 +1078,81 @@ mod tests {
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.connection_id, ConnectionId::new(1));
         assert_eq!(registration.channels, first_ack.channels);
+    }
+
+    #[test]
+    fn liveness_poll_reports_false_when_process_liveness_reports_dead() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let process_liveness = Arc::new(FakeProcessLiveness { live: Some(false) });
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_process_liveness(process_liveness);
+        let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-dead");
+        let poll = PassivePoll {
+            op: PollOp::Liveness,
+            route_channel,
+        };
+
+        let responses = handler
+            .handle_passive_poll(
+                &ctx,
+                passive_poll_frame(41, PollOp::Liveness, route_channel),
+                poll,
+            )
+            .unwrap();
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].header.ty, FrameType::Response);
+        assert!(!parse_liveness(&responses[0]).live);
+    }
+
+    #[test]
+    fn liveness_poll_without_process_source_uses_bound_route() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-bound-only");
+        let poll = PassivePoll {
+            op: PollOp::Liveness,
+            route_channel,
+        };
+
+        let responses = handler
+            .handle_passive_poll(
+                &ctx,
+                passive_poll_frame(42, PollOp::Liveness, route_channel),
+                poll,
+            )
+            .unwrap();
+
+        assert!(parse_liveness(&responses[0]).live);
+    }
+
+    #[test]
+    fn liveness_poll_untracked_process_source_uses_bound_route() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let process_liveness = Arc::new(FakeProcessLiveness { live: None });
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_process_liveness(process_liveness);
+        let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-untracked");
+        let poll = PassivePoll {
+            op: PollOp::Liveness,
+            route_channel,
+        };
+
+        let responses = handler
+            .handle_passive_poll(
+                &ctx,
+                passive_poll_frame(43, PollOp::Liveness, route_channel),
+                poll,
+            )
+            .unwrap();
+
+        assert!(parse_liveness(&responses[0]).live);
     }
 
     #[tokio::test]

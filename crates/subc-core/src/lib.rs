@@ -37,6 +37,7 @@ pub use server::{
 };
 pub use status::{LivenessReply, PassivePoll, PollOp, StatusReply, StatusUpdate};
 pub use supervise::{
-    ExitKind, ExitReport, ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError,
-    SupervisedModule, Supervisor, SUBC_ARG,
+    ExitKind, ExitReport, ModuleProcessLiveness, ModuleSpec, ModuleState, ModuleStatus,
+    RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorProcessLiveness,
+    SUBC_ARG,
 };

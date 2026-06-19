@@ -3,126 +3,187 @@ use std::{
     error::Error,
     ffi::OsString,
     fmt, fs, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use subc_protocol::{Flags, FrameType, Priority};
 use tokio::{
-    net::{UnixListener, UnixStream},
+    net::{TcpListener, TcpStream},
     time::{sleep, timeout},
 };
 use tracing::{info, warn};
 
 use crate::{
-    read_frame,
-    server::{serve_listener, ServerError},
-    write_frame, Frame, FrameBuildError, FrameIoError, Router,
+    auth::{authenticate_client, AuthError},
+    connection_file::{
+        self, generate_daemon_id, generate_key, write_atomic, ConnectionFileError, ConnectionInfo,
+        Endpoint, SCHEMA_VERSION,
+    },
+    server::{serve_listeners, ServerAuth, ServerError},
+    Router,
 };
+use std::sync::Arc;
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 
-const SOCKET_MODE: u32 = 0o600;
-const PING_CORR: u64 = 0x5355_4243_5049_4e47; // "SUBCPING"
-const PING_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_BIND_RACE_RETRIES: usize = 8;
+pub const DEFAULT_SUBC_PORT: u16 = 8757;
+pub const SUBC_PORT_ENV: &str = "SUBC_PORT";
+const CONNECTION_FILE_NAME: &str = "subc-connection.json";
+const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const START_LOCK_RETRIES: usize = 40;
 const START_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+/// Runtime bootstrap configuration. Production uses the default fixed port and
+/// optional daemon-config override; tests pass port 0 to let the OS assign a free
+/// loopback port and discover it from the connection file.
+#[derive(Debug, Clone)]
+pub struct BootstrapConfig {
+    pub connection_file_path: PathBuf,
+    pub port: u16,
+    pub daemon_ver: String,
+}
+
+impl BootstrapConfig {
+    pub fn new(connection_file_path: impl Into<PathBuf>, port: u16) -> Self {
+        Self {
+            connection_file_path: connection_file_path.into(),
+            port,
+            daemon_ver: DAEMON_VERSION.to_owned(),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, BootstrapError> {
+        let port = match env::var(SUBC_PORT_ENV) {
+            Ok(raw) if !raw.trim().is_empty() => raw
+                .parse::<u16>()
+                .map_err(|source| BootstrapError::InvalidPort { raw, source })?,
+            Ok(_) | Err(_) => DEFAULT_SUBC_PORT,
+        };
+        Ok(Self::new(connection_file_path(), port))
+    }
+}
 
 /// Result of singleton discovery.
 #[derive(Debug)]
 pub enum Outcome {
-    /// A live daemon answered on the socket path; this invocation should exit 0.
+    /// A live daemon authenticated from the connection file; this invocation should exit 0.
     AlreadyRunning,
-    /// This process won the singleton race and owns the bound listener.
-    Bound(UnixListener),
+    /// This process won the singleton race, owns bound loopback listener(s), and
+    /// has published a fresh connection file.
+    Bound(BoundDaemon),
 }
 
-/// Resolve subc's per-user Unix-domain socket path.
+#[derive(Debug)]
+pub struct BoundDaemon {
+    pub listeners: Vec<TcpListener>,
+    pub connection_info: ConnectionInfo,
+    pub connection_file_path: PathBuf,
+}
+
+/// Resolve subc's per-user TCP connection-file path.
 ///
-/// `$XDG_RUNTIME_DIR/subc.sock` is preferred because the runtime directory is
-/// already per-user on Unix desktops. Without it, subc falls back to the system
-/// temp dir with a user token in the filename so different OS users do not
-/// collide on shared `/tmp`-style directories.
-pub fn socket_path() -> PathBuf {
+/// `$XDG_RUNTIME_DIR/subc-connection.json` is preferred because the runtime
+/// directory is already per-user on Unix desktops. Without it, subc falls back
+/// to the system temp dir with a per-user token in the filename so different OS
+/// users do not collide on shared temp directories.
+pub fn connection_file_path() -> PathBuf {
     if let Some(runtime_dir) = non_empty_os_var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("subc.sock");
+        return PathBuf::from(runtime_dir).join(CONNECTION_FILE_NAME);
     }
 
-    env::temp_dir().join(format!("subc-{}.sock", user_socket_token()))
+    env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
 }
 
 /// Resolve, claim, and serve the per-user daemon singleton.
 ///
-/// A second invocation is successful: if a live daemon answers PING/PONG, this
-/// returns `Ok(())` after logging and the caller exits with status 0.
+/// A second invocation is successful: if a live daemon authenticates from the
+/// existing connection file, this returns `Ok(())` after logging and the caller
+/// exits with status 0.
 pub async fn run() -> Result<(), BootstrapError> {
-    let path = socket_path();
-    match ensure_singleton(&path).await? {
+    let config = BootstrapConfig::from_env()?;
+    match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
-            info!(socket = %path.display(), "subc daemon already running");
+            info!("subc daemon already running");
             Ok(())
         }
-        Outcome::Bound(listener) => {
-            info!(socket = %path.display(), "subc daemon starting");
+        Outcome::Bound(bound) => {
+            info!(
+                connection_file = %bound.connection_file_path.display(),
+                endpoints = ?bound.connection_info.endpoints,
+                "subc daemon starting"
+            );
             let router = Arc::new(Router::with_default_self_handler());
-            serve_listener(listener, router)
+            let auth = ServerAuth::new(
+                bound.connection_info.key.clone(),
+                bound.connection_info.daemon_id,
+                bound.connection_info.daemon_ver.clone(),
+            );
+            serve_listeners(bound.listeners, router, auth)
                 .await
                 .map_err(BootstrapError::Serve)
         }
     }
 }
 
-/// Find an existing daemon or atomically bind `path` for this daemon.
+/// Find an existing daemon or atomically bind loopback TCP for this daemon.
 ///
-/// The algorithm is intentionally connect-first: a listener that accepts a
-/// connection and answers the channel-0 PING/PONG control frame is treated as
-/// live. A listener that accepts but does not PONG is considered live-but-foreign
-/// and is never clobbered. Stale socket files are reclaimed only while holding a
-/// short-lived start lock, then `bind` remains the final atomic singleton guard.
-pub async fn ensure_singleton(path: impl AsRef<Path>) -> Result<Outcome, BootstrapError> {
-    let path = path.as_ref().to_path_buf();
+/// The algorithm is intentionally connect-first: an endpoint from the connection
+/// file is treated as live only after the TCP+key server-proof authenticates for
+/// that file's key and daemon_id. Stale or foreign connection files are reclaimed
+/// only while holding the per-user start lock; the TCP port is never the
+/// singleton primitive.
+pub async fn ensure_singleton(
+    connection_file_path: impl AsRef<Path>,
+    port: u16,
+) -> Result<Outcome, BootstrapError> {
+    ensure_singleton_with_config(BootstrapConfig::new(connection_file_path.as_ref(), port)).await
+}
 
-    for attempt in 0..MAX_BIND_RACE_RETRIES {
-        if matches!(probe_existing(&path).await?, Probe::Live) {
-            return Ok(Outcome::AlreadyRunning);
-        }
+pub async fn ensure_singleton_with_config(
+    config: BootstrapConfig,
+) -> Result<Outcome, BootstrapError> {
+    let path = config.connection_file_path;
 
-        let _lock = StartLock::acquire(&path).await?;
-
-        // Re-probe after acquiring the start lock so a peer that won the race
-        // between our first failed connect and the lock acquisition is observed
-        // instead of unlinked.
-        if matches!(probe_existing(&path).await?, Probe::Live) {
-            return Ok(Outcome::AlreadyRunning);
-        }
-
-        remove_stale_path_if_present(&path)?;
-
-        match UnixListener::bind(&path) {
-            Ok(listener) => {
-                let listener = set_owner_only_permissions(&path, listener)?;
-                return Ok(Outcome::Bound(listener));
-            }
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                warn!(
-                    socket = %path.display(),
-                    attempt = attempt + 1,
-                    "socket bind raced with another process; retrying discovery"
-                );
-                continue;
-            }
-            Err(source) => return Err(BootstrapError::Bind { path, source }),
-        }
+    if matches!(probe_existing(&path).await?, Probe::Live) {
+        return Ok(Outcome::AlreadyRunning);
     }
 
-    Err(BootstrapError::BindRaceExhausted {
-        path,
-        attempts: MAX_BIND_RACE_RETRIES,
-    })
+    let _lock = StartLock::acquire(&path).await?;
+
+    // Re-probe after acquiring the start lock so a peer that won the race between
+    // our first failed probe and the lock acquisition is observed instead of
+    // overwritten.
+    if matches!(probe_existing(&path).await?, Probe::Live) {
+        return Ok(Outcome::AlreadyRunning);
+    }
+
+    remove_stale_connection_file_if_present(&path)?;
+
+    let (listeners, endpoints) = bind_loopback(config.port).await?;
+    let connection_info = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        endpoints,
+        key: generate_key().map_err(BootstrapError::GenerateConnectionFile)?,
+        daemon_id: generate_daemon_id().map_err(BootstrapError::GenerateConnectionFile)?,
+        pid: process::id(),
+        daemon_ver: config.daemon_ver,
+    };
+
+    if let Err(source) = write_atomic(&path, &connection_info) {
+        drop(listeners);
+        return Err(BootstrapError::ConnectionFileWrite { path, source });
+    }
+
+    Ok(Outcome::Bound(BoundDaemon {
+        listeners,
+        connection_info,
+        connection_file_path: path,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,75 +193,74 @@ enum Probe {
 }
 
 async fn probe_existing(path: &Path) -> Result<Probe, BootstrapError> {
-    match UnixStream::connect(path).await {
-        Ok(stream) => {
-            confirm_subc_pong(path, stream).await?;
-            Ok(Probe::Live)
+    let info = match connection_file::read(path) {
+        Ok(info) => info,
+        Err(source) if is_absent_or_stale_connection_file(&source) => {
+            return Ok(Probe::StaleOrAbsent)
         }
-        Err(err) if is_stale_or_absent_connect_error(&err) => Ok(Probe::StaleOrAbsent),
-        Err(source) => Err(BootstrapError::ConnectProbe {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-async fn confirm_subc_pong(path: &Path, mut stream: UnixStream) -> Result<(), BootstrapError> {
-    let ping = Frame::build(
-        FrameType::Ping,
-        Flags::new(false, Priority::Passive, false),
-        0,
-        PING_CORR,
-        Vec::new(),
-    )
-    .map_err(BootstrapError::PingFrameBuild)?;
-
-    write_frame(&mut stream, &ping)
-        .await
-        .map_err(|source| BootstrapError::PingWrite {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let frame = timeout(PING_TIMEOUT, read_frame(&mut stream))
-        .await
-        .map_err(|_| BootstrapError::PingTimeout {
-            path: path.to_path_buf(),
-            timeout: PING_TIMEOUT,
-        })?
-        .map_err(|source| BootstrapError::PingRead {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let Some(frame) = frame else {
-        return Err(BootstrapError::ForeignSocket {
-            path: path.to_path_buf(),
-            reason: "peer closed before PONG".to_string(),
-        });
+        Err(source) => {
+            return Err(BootstrapError::ConnectionFileRead {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
     };
 
-    if frame.header.ty == FrameType::Pong
-        && frame.header.channel == 0
-        && frame.header.corr == PING_CORR
-        && frame.body.is_empty()
-    {
-        return Ok(());
+    for endpoint in &info.endpoints {
+        if matches!(probe_endpoint(&info, endpoint).await, Probe::Live) {
+            return Ok(Probe::Live);
+        }
     }
 
-    Err(BootstrapError::ForeignSocket {
-        path: path.to_path_buf(),
-        reason: format!(
-            "expected channel-0 PONG corr {PING_CORR}, got {:?} channel {} corr {} ({} body bytes)",
-            frame.header.ty,
-            frame.header.channel,
-            frame.header.corr,
-            frame.body.len()
-        ),
-    })
+    Ok(Probe::StaleOrAbsent)
 }
 
-fn remove_stale_path_if_present(path: &Path) -> Result<(), BootstrapError> {
+async fn probe_endpoint(info: &ConnectionInfo, endpoint: &Endpoint) -> Probe {
+    let Ok(ip) = endpoint.host.parse::<IpAddr>() else {
+        return Probe::StaleOrAbsent;
+    };
+    if !ip.is_loopback() {
+        return Probe::StaleOrAbsent;
+    }
+    let addr = SocketAddr::new(ip, endpoint.port);
+
+    let mut stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) | Err(_) => return Probe::StaleOrAbsent,
+    };
+
+    match authenticate_client(&mut stream, info, PROBE_AUTH_DEADLINE).await {
+        Ok(()) => Probe::Live,
+        Err(AuthError::DaemonIdMismatch)
+        | Err(AuthError::InvalidServerProof)
+        | Err(AuthError::UnexpectedEof { .. })
+        | Err(AuthError::Timeout { .. })
+        | Err(AuthError::JsonEncode { .. })
+        | Err(AuthError::JsonDecode { .. })
+        | Err(AuthError::Io { .. })
+        | Err(AuthError::MessageTooLarge { .. })
+        | Err(AuthError::KeyTooShort { .. })
+        | Err(AuthError::Random(_))
+        | Err(AuthError::InvalidClientAuth) => Probe::StaleOrAbsent,
+    }
+}
+
+fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
+    match err {
+        ConnectionFileError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => true,
+        ConnectionFileError::JsonRead { .. }
+        | ConnectionFileError::UnsupportedSchema { .. }
+        | ConnectionFileError::Invalid { .. }
+        | ConnectionFileError::KeyTooShort { .. } => true,
+        ConnectionFileError::MissingParent { .. }
+        | ConnectionFileError::MissingFileName { .. }
+        | ConnectionFileError::Io { .. }
+        | ConnectionFileError::JsonWrite { .. }
+        | ConnectionFileError::Random(_) => false,
+    }
+}
+
+fn remove_stale_connection_file_if_present(path: &Path) -> Result<(), BootstrapError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -211,46 +271,76 @@ fn remove_stale_path_if_present(path: &Path) -> Result<(), BootstrapError> {
     }
 }
 
-fn set_owner_only_permissions(
-    path: &Path,
-    listener: UnixListener,
-) -> Result<UnixListener, BootstrapError> {
-    if let Err(source) = fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE)) {
-        drop(listener);
-        let _ = fs::remove_file(path);
-        return Err(BootstrapError::SetPermissions {
-            path: path.to_path_buf(),
+async fn bind_loopback(port: u16) -> Result<(Vec<TcpListener>, Vec<Endpoint>), BootstrapError> {
+    let v4_host = Ipv4Addr::LOCALHOST;
+    let v4 = TcpListener::bind((v4_host, port))
+        .await
+        .map_err(|source| BootstrapError::Bind {
+            host: v4_host.to_string(),
+            port,
             source,
-        });
+        })?;
+    let actual_port = v4
+        .local_addr()
+        .map_err(|source| BootstrapError::LocalAddr {
+            host: v4_host.to_string(),
+            source,
+        })?
+        .port();
+
+    let mut listeners = vec![v4];
+    let mut endpoints = vec![Endpoint {
+        host: v4_host.to_string(),
+        port: actual_port,
+    }];
+
+    let v6_host = Ipv6Addr::LOCALHOST;
+    match TcpListener::bind((v6_host, actual_port)).await {
+        Ok(v6) => {
+            listeners.push(v6);
+            endpoints.push(Endpoint {
+                host: v6_host.to_string(),
+                port: actual_port,
+            });
+        }
+        Err(err) if ipv6_loopback_unavailable(&err) => {
+            warn!(
+                port = actual_port,
+                error = %err,
+                "IPv6 loopback unavailable; serving only IPv4 loopback"
+            );
+        }
+        Err(source) => {
+            drop(listeners);
+            return Err(BootstrapError::Bind {
+                host: v6_host.to_string(),
+                port: actual_port,
+                source,
+            });
+        }
     }
 
-    Ok(listener)
+    Ok((listeners, endpoints))
 }
 
-fn is_stale_or_absent_connect_error(err: &io::Error) -> bool {
-    if matches!(
+fn ipv6_loopback_unavailable(err: &io::Error) -> bool {
+    matches!(
         err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-    ) {
-        return true;
-    }
-
-    // Connecting to a regular file at the socket path returns ENOTSOCK. The
-    // value is 88 on Linux and 38 on Darwin/BSD; keep the constants local to
-    // avoid pulling in libc or unsafe just for this classification.
-    matches!(err.raw_os_error(), Some(88) | Some(38))
+        io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+    ) || matches!(err.raw_os_error(), Some(47) | Some(49) | Some(97))
 }
 
 struct StartLock {
     path: PathBuf,
+    _file: fs::File,
 }
 
 impl StartLock {
-    async fn acquire(socket_path: &Path) -> Result<Self, BootstrapError> {
-        let path = start_lock_path(socket_path);
+    async fn acquire(connection_file_path: &Path) -> Result<Self, BootstrapError> {
+        let path = start_lock_path(connection_file_path);
         for _ in 0..START_LOCK_RETRIES {
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+            match open_owner_only_lock(&path) {
+                Ok(file) => return Ok(Self { path, _file: file }),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                     sleep(START_LOCK_RETRY_DELAY).await;
                 }
@@ -267,17 +357,28 @@ impl StartLock {
 
 impl Drop for StartLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        let _ = fs::remove_file(&self.path);
     }
 }
 
-fn start_lock_path(socket_path: &Path) -> PathBuf {
-    let file_name = socket_path
+fn open_owner_only_lock(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn start_lock_path(connection_file_path: &Path) -> PathBuf {
+    let file_name = connection_file_path
         .file_name()
         .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "subc.sock".into());
-    let lock_name = format!("{file_name}.lock");
-    socket_path
+        .unwrap_or_else(|| CONNECTION_FILE_NAME.into());
+    let lock_name = format!("{file_name}.start-lock");
+    connection_file_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
@@ -293,7 +394,23 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
     }
 }
 
-fn user_socket_token() -> String {
+fn user_connection_token() -> String {
+    #[cfg(unix)]
+    if let Some(uid) = unix_uid_token() {
+        return uid;
+    }
+
+    for key in ["USER", "USERNAME", "HOME", "USERPROFILE"] {
+        if let Some(value) = non_empty_os_var(key) {
+            return sanitize_token(&value.to_string_lossy());
+        }
+    }
+
+    "unknown".to_string()
+}
+
+#[cfg(unix)]
+fn unix_uid_token() -> Option<String> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -312,76 +429,114 @@ fn user_socket_token() -> String {
             uid
         });
 
-    uid.map_or_else(|| "unknown".to_string(), |uid| uid.to_string())
+    uid.map(|uid| uid.to_string())
+}
+
+fn sanitize_token(raw: &str) -> String {
+    let mut token = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            token.push(ch);
+        } else {
+            token.push('_');
+        }
+    }
+    if token.is_empty() {
+        "unknown".to_string()
+    } else {
+        token
+    }
 }
 
 /// Bootstrap-layer errors are deliberately typed so startup never panics for
 /// ordinary daemon-discovery races or stale filesystem state.
 #[derive(Debug)]
 pub enum BootstrapError {
-    ConnectProbe { path: PathBuf, source: io::Error },
-    PingFrameBuild(FrameBuildError),
-    PingWrite { path: PathBuf, source: FrameIoError },
-    PingRead { path: PathBuf, source: FrameIoError },
-    PingTimeout { path: PathBuf, timeout: Duration },
-    ForeignSocket { path: PathBuf, reason: String },
-    StartLockCreate { path: PathBuf, source: io::Error },
-    StartLockBusy { path: PathBuf, attempts: usize },
-    RemoveStale { path: PathBuf, source: io::Error },
-    Bind { path: PathBuf, source: io::Error },
-    BindRaceExhausted { path: PathBuf, attempts: usize },
-    SetPermissions { path: PathBuf, source: io::Error },
+    InvalidPort {
+        raw: String,
+        source: std::num::ParseIntError,
+    },
+    ConnectionFileRead {
+        path: PathBuf,
+        source: ConnectionFileError,
+    },
+    ConnectionFileWrite {
+        path: PathBuf,
+        source: ConnectionFileError,
+    },
+    GenerateConnectionFile(ConnectionFileError),
+    StartLockCreate {
+        path: PathBuf,
+        source: io::Error,
+    },
+    StartLockBusy {
+        path: PathBuf,
+        attempts: usize,
+    },
+    RemoveStale {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Bind {
+        host: String,
+        port: u16,
+        source: io::Error,
+    },
+    LocalAddr {
+        host: String,
+        source: io::Error,
+    },
     Serve(ServerError),
 }
 
 impl fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ConnectProbe { path, source } => {
-                write!(f, "failed to probe socket {}: {source}", path.display())
+            Self::InvalidPort { raw, source } => {
+                write!(f, "invalid {SUBC_PORT_ENV} value '{raw}': {source}")
             }
-            Self::PingFrameBuild(err) => write!(f, "failed to build startup PING: {err}"),
-            Self::PingWrite { path, source } => {
-                write!(f, "failed to write PING to {}: {source}", path.display())
-            }
-            Self::PingRead { path, source } => {
-                write!(f, "failed to read PONG from {}: {source}", path.display())
-            }
-            Self::PingTimeout { path, timeout } => write!(
+            Self::ConnectionFileRead { path, source } => write!(
                 f,
-                "timed out after {:?} waiting for PONG from {}",
-                timeout,
+                "failed to read connection file {}: {source}",
                 path.display()
             ),
-            Self::ForeignSocket { path, reason } => write!(
+            Self::ConnectionFileWrite { path, source } => write!(
                 f,
-                "socket {} is occupied by a live non-subc peer: {reason}",
+                "failed to publish connection file {}: {source}",
                 path.display()
             ),
+            Self::GenerateConnectionFile(err) => {
+                write!(f, "failed to generate connection-file auth material: {err}")
+            }
             Self::StartLockCreate { path, source } => {
-                write!(f, "failed to create start lock {}: {source}", path.display())
+                write!(
+                    f,
+                    "failed to create start lock {}: {source}",
+                    path.display()
+                )
             }
             Self::StartLockBusy { path, attempts } => write!(
                 f,
                 "start lock {} remained busy after {attempts} attempts",
                 path.display()
             ),
-            Self::RemoveStale { path, source } => {
-                write!(f, "failed to remove stale socket {}: {source}", path.display())
-            }
-            Self::Bind { path, source } => {
-                write!(f, "failed to bind socket {}: {source}", path.display())
-            }
-            Self::BindRaceExhausted { path, attempts } => write!(
+            Self::RemoveStale { path, source } => write!(
                 f,
-                "socket {} was won by another process but never became connectable after {attempts} retries",
+                "failed to remove stale connection file {}: {source}",
                 path.display()
             ),
-            Self::SetPermissions { path, source } => write!(
-                f,
-                "failed to set socket permissions 0600 on {}: {source}",
-                path.display()
-            ),
+            Self::Bind { host, port, source } if source.kind() == io::ErrorKind::AddrInUse => {
+                write!(
+                    f,
+                    "port {port} in use on loopback {host}: {source}; set the port in config"
+                )
+            }
+            Self::Bind { host, port, source } => {
+                write!(f, "failed to bind loopback TCP {host}:{port}: {source}")
+            }
+            Self::LocalAddr { host, source } => {
+                write!(f, "failed to read local address for {host}: {source}")
+            }
             Self::Serve(err) => write!(f, "daemon server failed: {err}"),
         }
     }
@@ -390,18 +545,16 @@ impl fmt::Display for BootstrapError {
 impl Error for BootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ConnectProbe { source, .. }
-            | Self::StartLockCreate { source, .. }
+            Self::InvalidPort { source, .. } => Some(source),
+            Self::ConnectionFileRead { source, .. }
+            | Self::ConnectionFileWrite { source, .. }
+            | Self::GenerateConnectionFile(source) => Some(source),
+            Self::StartLockCreate { source, .. }
             | Self::RemoveStale { source, .. }
             | Self::Bind { source, .. }
-            | Self::SetPermissions { source, .. } => Some(source),
-            Self::PingFrameBuild(err) => Some(err),
-            Self::PingWrite { source, .. } | Self::PingRead { source, .. } => Some(source),
+            | Self::LocalAddr { source, .. } => Some(source),
             Self::Serve(err) => Some(err),
-            Self::PingTimeout { .. }
-            | Self::ForeignSocket { .. }
-            | Self::StartLockBusy { .. }
-            | Self::BindRaceExhausted { .. } => None,
+            Self::StartLockBusy { .. } => None,
         }
     }
 }
@@ -409,7 +562,13 @@ impl Error for BootstrapError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::Mutex, time::SystemTime};
+    use crate::server::ServerAuth;
+    use std::sync::Mutex;
+    use tokio::io::AsyncReadExt;
+    use tokio::task::JoinHandle;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -420,6 +579,12 @@ mod tests {
 
     impl EnvGuard {
         fn set(key: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
             let previous = env::var_os(key);
             env::set_var(key, value);
             Self { key, previous }
@@ -449,111 +614,213 @@ mod tests {
         env::temp_dir().join(format!("subc-core-{name}-{}-{nonce}", process::id()))
     }
 
-    fn temp_socket_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        // Keep the whole UDS path below Darwin/BSD sun_path limits;
-        // std::env::temp_dir() is often too long on macOS.
-        let dir = PathBuf::from("/tmp").join(format!("sc-{}-{nonce}", process::id()));
+    fn temp_connection_file_path(name: &str) -> PathBuf {
+        let dir = unique_temp_dir(name);
         fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{name}.sock"))
+        dir.join("conn.json")
     }
 
-    fn cleanup_socket_path(path: &Path) {
+    fn cleanup_connection_file_path(path: &Path) {
         let _ = fs::remove_file(path);
-        let _ = fs::remove_dir(start_lock_path(path));
+        let _ = fs::remove_file(start_lock_path(path));
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
     }
 
+    fn auth_for(info: &ConnectionInfo) -> ServerAuth {
+        ServerAuth::new(info.key.clone(), info.daemon_id, info.daemon_ver.clone())
+    }
+
+    fn start_server(bound: BoundDaemon) -> JoinHandle<Result<(), ServerError>> {
+        let auth = auth_for(&bound.connection_info);
+        tokio::spawn(serve_listeners(
+            bound.listeners,
+            Arc::new(Router::with_default_self_handler()),
+            auth,
+        ))
+    }
+
+    fn expect_bound(outcome: Outcome) -> BoundDaemon {
+        match outcome {
+            Outcome::Bound(bound) => bound,
+            Outcome::AlreadyRunning => panic!("fresh connection file unexpectedly had a daemon"),
+        }
+    }
+
+    async fn connect_from_info(conn: &ConnectionInfo) -> io::Result<TcpStream> {
+        let endpoint = conn
+            .endpoints
+            .first()
+            .expect("test connection file should have an endpoint");
+        let ip: IpAddr = endpoint.host.parse().unwrap();
+        TcpStream::connect(SocketAddr::new(ip, endpoint.port)).await
+    }
+
+    fn make_connection_info(port: u16) -> ConnectionInfo {
+        ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_owned(),
+                port,
+            }],
+            key: generate_key().unwrap(),
+            daemon_id: generate_daemon_id().unwrap(),
+            pid: process::id(),
+            daemon_ver: "test-subc".to_owned(),
+        }
+    }
+
     #[test]
-    fn socket_path_uses_xdg_runtime_dir_when_set() {
+    fn connection_file_path_uses_xdg_runtime_dir_when_set() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let runtime_dir = unique_temp_dir("xdg-runtime");
         fs::create_dir_all(&runtime_dir).unwrap();
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
 
-        assert_eq!(socket_path(), runtime_dir.join("subc.sock"));
+        assert_eq!(
+            connection_file_path(),
+            runtime_dir.join(CONNECTION_FILE_NAME)
+        );
 
         let _ = fs::remove_dir_all(runtime_dir);
     }
 
     #[test]
-    fn socket_path_falls_back_to_temp_dir_with_user_token_when_xdg_unset() {
+    fn connection_file_path_falls_back_to_temp_dir_with_user_token_when_xdg_unset() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let _xdg = EnvGuard::unset("XDG_RUNTIME_DIR");
 
         assert_eq!(
-            socket_path(),
-            env::temp_dir().join(format!("subc-{}.sock", user_socket_token()))
+            connection_file_path(),
+            env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
         );
     }
 
+    #[test]
+    fn configured_port_uses_default_and_env_override() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _port = EnvGuard::unset(SUBC_PORT_ENV);
+        assert_eq!(BootstrapConfig::from_env().unwrap().port, DEFAULT_SUBC_PORT);
+
+        let _port = EnvGuard::set_str(SUBC_PORT_ENV, "9012");
+        assert_eq!(BootstrapConfig::from_env().unwrap().port, 9012);
+    }
+
     #[tokio::test]
-    async fn second_singleton_probe_against_served_socket_reports_already_running() {
-        let path = temp_socket_path("already-running");
+    async fn second_singleton_probe_against_served_tcp_daemon_reports_already_running() {
+        let path = temp_connection_file_path("already-running");
 
-        let listener = match ensure_singleton(&path).await.unwrap() {
-            Outcome::Bound(listener) => listener,
-            Outcome::AlreadyRunning => panic!("fresh temp socket unexpectedly had a daemon"),
-        };
-        let server = tokio::spawn(serve_listener(
-            listener,
-            Arc::new(Router::with_default_self_handler()),
-        ));
+        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        let server = start_server(bound);
 
-        let second = ensure_singleton(&path).await.unwrap();
+        let second = ensure_singleton(&path, 0).await.unwrap();
         assert!(matches!(second, Outcome::AlreadyRunning));
 
         server.abort();
         let _ = server.await;
-        cleanup_socket_path(&path);
+        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
-    async fn stale_socket_file_is_reclaimed() {
-        let path = temp_socket_path("stale-reclaim");
-        let stale_listener = UnixListener::bind(&path).unwrap();
-        drop(stale_listener);
+    async fn stale_unbound_connection_file_is_reclaimed() {
+        let path = temp_connection_file_path("stale-reclaim");
+        let stale = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let stale_port = stale.local_addr().unwrap().port();
+        drop(stale);
+        let stale_info = make_connection_info(stale_port);
+        write_atomic(&path, &stale_info).unwrap();
 
-        let listener = match ensure_singleton(&path).await.unwrap() {
-            Outcome::Bound(listener) => listener,
-            Outcome::AlreadyRunning => panic!("stale socket was misdetected as live"),
-        };
-
-        drop(listener);
-        cleanup_socket_path(&path);
+        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        assert_ne!(bound.connection_info.key, stale_info.key);
+        drop(bound.listeners);
+        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
-    async fn touched_stale_file_is_reclaimed() {
-        let path = temp_socket_path("regular-file-reclaim");
-        fs::write(&path, b"not a socket").unwrap();
+    async fn foreign_reused_port_connection_file_is_reclaimed_after_auth_probe_fails() {
+        let path = temp_connection_file_path("foreign-reclaim");
+        let foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let foreign_port = foreign.local_addr().unwrap().port();
+        write_atomic(&path, &make_connection_info(foreign_port)).unwrap();
+        let foreign_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = foreign.accept().await {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
 
-        let listener = match ensure_singleton(&path).await.unwrap() {
-            Outcome::Bound(listener) => listener,
-            Outcome::AlreadyRunning => panic!("regular file was misdetected as live"),
-        };
+        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        assert!(bound
+            .connection_info
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.port != foreign_port));
 
-        drop(listener);
-        cleanup_socket_path(&path);
+        drop(bound.listeners);
+        let _ = foreign_task.await;
+        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
-    async fn bound_socket_permissions_are_owner_only() {
-        let path = temp_socket_path("permissions");
-        let listener = match ensure_singleton(&path).await.unwrap() {
-            Outcome::Bound(listener) => listener,
-            Outcome::AlreadyRunning => panic!("fresh temp socket unexpectedly had a daemon"),
-        };
+    async fn bind_conflict_on_fixed_port_fails_loud_without_reselecting() {
+        let path = temp_connection_file_path("bind-conflict");
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+
+        let err = ensure_singleton(&path, occupied_port).await.unwrap_err();
+        assert!(matches!(
+            err,
+            BootstrapError::Bind { ref source, .. } if source.kind() == io::ErrorKind::AddrInUse
+        ));
+        assert!(err.to_string().contains("set the port in config"));
+
+        drop(occupied);
+        cleanup_connection_file_path(&path);
+    }
+
+    #[tokio::test]
+    async fn key_rotation_republishes_new_material_and_old_file_fails_auth() {
+        let path = temp_connection_file_path("key-rotation");
+        let first = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        let old_info = first.connection_info.clone();
+        let fixed_port = old_info.endpoints[0].port;
+        drop(first.listeners);
+
+        let second = expect_bound(ensure_singleton(&path, fixed_port).await.unwrap());
+        let new_info = second.connection_info.clone();
+        assert_ne!(old_info.key, new_info.key);
+        assert_ne!(old_info.daemon_id, new_info.daemon_id);
+        let server = start_server(second);
+
+        let mut old_stream = connect_from_info(&old_info).await.unwrap();
+        let old_auth = authenticate_client(&mut old_stream, &old_info, PROBE_AUTH_DEADLINE).await;
+        assert!(
+            old_auth.is_err(),
+            "old key must not authenticate after restart"
+        );
+
+        let reread = connection_file::read(&path).unwrap();
+        let mut new_stream = connect_from_info(&reread).await.unwrap();
+        authenticate_client(&mut new_stream, &reread, PROBE_AUTH_DEADLINE)
+            .await
+            .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        cleanup_connection_file_path(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_connection_file_permissions_are_owner_only() {
+        let path = temp_connection_file_path("permissions");
+        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, SOCKET_MODE);
+        assert_eq!(mode, 0o600);
 
-        drop(listener);
-        cleanup_socket_path(&path);
+        drop(bound.listeners);
+        cleanup_connection_file_path(&path);
     }
 }

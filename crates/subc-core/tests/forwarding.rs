@@ -99,10 +99,16 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
         attach_event["target"]["module_id"].as_str(),
         Some(module_id)
     );
-    let canonical_project = fs::canonicalize(&project.path).unwrap();
+    // subc canonicalizes project_root via cortexkit-paths (ProjectRootId) before
+    // relaying — NOT raw fs::canonicalize, which keeps Windows' verbatim \\?\ prefix.
+    // Assert against the same canonicalization subc uses so this holds on every OS.
+    let canonical_project = subc_core::ProjectRootId::from_path(&project.path)
+        .unwrap()
+        .as_path()
+        .to_path_buf();
     assert_eq!(
         attach_event["identity"]["project_root"].as_str(),
-        Some(canonical_project.to_str().unwrap())
+        canonical_project.to_str()
     );
     assert_eq!(
         attach_event["identity"]["session"].as_str(),

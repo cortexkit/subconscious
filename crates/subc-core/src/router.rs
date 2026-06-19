@@ -227,6 +227,29 @@ impl Router {
             return Ok(());
         }
 
+        if frame.header.ty == FrameType::Goodbye {
+            if self
+                .control
+                .handle_route_goodbye(ctx.connection_id, channel)?
+            {
+                return Ok(());
+            }
+
+            let err = RouterError::UnknownChannel { channel, corr };
+            if let Some(error_frame) = err.to_error_frame() {
+                warn!(
+                    connection_id = ctx.connection_id.get(),
+                    channel,
+                    corr,
+                    error = %err,
+                    "unknown route GOODBYE channel; emitted ERROR frame"
+                );
+                ctx.egress.send(error_frame).await?;
+                return Ok(());
+            }
+            return Err(err);
+        }
+
         if self
             .forwarding
             .client_route(ctx.connection_id, channel)

@@ -207,6 +207,19 @@ impl ForwardingTable {
         Ok(())
     }
 
+    pub(crate) fn release_client_route(
+        &self,
+        client_connection_id: ConnectionId,
+        route_channel: u16,
+    ) -> Result<Option<ReleasedRoute>, ForwardingError> {
+        let mut inner = self.lock_inner()?;
+        Ok(release_client_route_locked(
+            &mut inner,
+            client_connection_id,
+            route_channel,
+        ))
+    }
+
     pub(crate) fn cancel_pending_relay(
         &self,
         endpoint: ModuleEndpointId,
@@ -429,20 +442,10 @@ impl ForwardingTable {
             .collect();
         let mut released = Vec::with_capacity(route_channels.len());
         for route_channel in route_channels {
-            if let Some(route) = inner
-                .client_to_module
-                .remove(&(connection_id, route_channel))
+            if let Some(route) =
+                release_client_route_locked(&mut inner, connection_id, route_channel)
             {
-                route.flow.close();
-                inner
-                    .module_to_client
-                    .remove(&(route.endpoint, route_channel));
-                inner.status.remove(&(route.endpoint, route_channel));
-                released.push(ReleasedRoute {
-                    route_channel,
-                    module_sink: route.sink,
-                    negotiated_ver: route.negotiated_ver,
-                });
+                released.push(route);
             }
         }
         Ok(released)
@@ -505,6 +508,26 @@ fn endpoint_for_connection(
         .as_ref()
         .filter(|module| module.endpoint.connection_id == connection_id)
         .map(|module| module.endpoint)
+}
+
+fn release_client_route_locked(
+    inner: &mut ForwardingInner,
+    client_connection_id: ConnectionId,
+    route_channel: u16,
+) -> Option<ReleasedRoute> {
+    let route = inner
+        .client_to_module
+        .remove(&(client_connection_id, route_channel))?;
+    route.flow.close();
+    inner
+        .module_to_client
+        .remove(&(route.endpoint, route_channel));
+    inner.status.remove(&(route.endpoint, route_channel));
+    Some(ReleasedRoute {
+        route_channel,
+        module_sink: route.sink,
+        negotiated_ver: route.negotiated_ver,
+    })
 }
 
 /// Per-channel request-credit accounting shared by the client and module route halves.

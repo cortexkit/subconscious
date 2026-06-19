@@ -20,9 +20,8 @@ use subc_protocol::{
         Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
-    session::{AttachRelay, AttachRelayResponse, DetachRelay},
-    ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, StatusUpdate,
-    PROTOCOL_VERSION,
+    session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, AuthError, ConnectionFileError};
 use tokio::{
@@ -230,6 +229,10 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
+        FrameType::Goodbye => {
+            handle_route_goodbye(frame, config, state, writer).await?;
+            Ok(true)
+        }
         FrameType::Request if frame.header.channel == 0 => {
             handle_control_request(frame, config, state, writer).await?;
             Ok(true)
@@ -510,28 +513,51 @@ async fn handle_control_request(
     state: &mut StubState,
     writer: &mpsc::Sender<Frame>,
 ) -> Result<(), StubError> {
-    if let Ok(relay) = serde_json::from_slice::<AttachRelay>(&frame.body) {
-        let route_channel = relay.route_channel;
-        let relay_config = relay.config;
-        record_event(
-            config,
-            json!({
-                "kind": "attach",
-                "route_channel": route_channel,
-                "corr": frame.header.corr,
-                "reject": config.reject_attach,
-                "config": relay_config,
-            }),
-        )?;
-        if config.reject_attach {
-            let body = serde_json::to_vec(&ErrorBody {
-                code: "config_divergence".to_string(),
-                message: "fake AFT rejected AttachRelay by FAKE_AFT_REJECT_ATTACH".to_string(),
-            })
-            .map_err(StubError::Json)?;
+    let request =
+        serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(StubError::Json)?;
+    match request {
+        ModuleControlRequest::RouteBind {
+            route_channel,
+            target,
+            identity,
+            config: relay_config,
+        } => {
+            record_event(
+                config,
+                json!({
+                    "kind": "attach",
+                    "route_channel": route_channel,
+                    "corr": frame.header.corr,
+                    "reject": config.reject_attach,
+                    "target": target,
+                    "identity": identity,
+                    "config": relay_config,
+                }),
+            )?;
+            if config.reject_attach {
+                let body = serde_json::to_vec(&ErrorBody {
+                    code: "config_divergence".to_string(),
+                    message: "fake AFT rejected route.bind by FAKE_AFT_REJECT_ATTACH".to_string(),
+                })
+                .map_err(StubError::Json)?;
+                let response = Frame::build_with_version(
+                    frame.header.ver,
+                    FrameType::Error,
+                    control_flags(),
+                    0,
+                    frame.header.corr,
+                    body,
+                )
+                .map_err(StubError::FrameBuild)?;
+                send_outbound(writer, response).await?;
+                return Ok(());
+            }
+
+            let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
+                .map_err(StubError::Json)?;
             let response = Frame::build_with_version(
                 frame.header.ver,
-                FrameType::Error,
+                FrameType::Response,
                 control_flags(),
                 0,
                 frame.header.corr,
@@ -539,44 +565,37 @@ async fn handle_control_request(
             )
             .map_err(StubError::FrameBuild)?;
             send_outbound(writer, response).await?;
-            return Ok(());
+            state.bound_channels.insert(route_channel);
+            emit_status_update(writer, config, frame.header.ver, route_channel).await?;
         }
-
-        let body =
-            serde_json::to_vec(&AttachRelayResponse { accept: true }).map_err(StubError::Json)?;
-        let response = Frame::build_with_version(
-            frame.header.ver,
-            FrameType::Response,
-            control_flags(),
-            0,
-            frame.header.corr,
-            body,
-        )
-        .map_err(StubError::FrameBuild)?;
-        send_outbound(writer, response).await?;
-        state.bound_channels.insert(route_channel);
-        emit_status_update(writer, config, frame.header.ver, route_channel).await?;
-        return Ok(());
     }
+    Ok(())
+}
 
-    let detach = serde_json::from_slice::<DetachRelay>(&frame.body).map_err(StubError::Json)?;
+async fn handle_route_goodbye(
+    frame: Frame,
+    config: &StubConfig,
+    state: &mut StubState,
+    writer: &mpsc::Sender<Frame>,
+) -> Result<(), StubError> {
+    let route_channel = frame.header.channel;
     record_event(
         config,
         json!({
             "kind": "detach",
-            "route_channel": detach.route_channel,
+            "route_channel": route_channel,
             "corr": frame.header.corr,
         }),
     )?;
-    state.bound_channels.remove(&detach.route_channel);
+    state.bound_channels.remove(&route_channel);
 
     if config.emit_after_detach {
         let stale = Frame::build_with_version(
             frame.header.ver,
             FrameType::Push,
             Flags::new(false, Priority::Passive, true),
-            detach.route_channel,
-            u64::from(detach.route_channel) + 9_000,
+            route_channel,
+            u64::from(route_channel) + 9_000,
             b"stale-after-detach".to_vec(),
         )
         .map_err(StubError::FrameBuild)?;
@@ -585,7 +604,7 @@ async fn handle_control_request(
             config,
             json!({
                 "kind": "stale_emit",
-                "route_channel": detach.route_channel,
+                "route_channel": route_channel,
             }),
         )?;
     }
@@ -619,7 +638,7 @@ async fn emit_status_update(
     let Some(status) = config.status.as_ref() else {
         return Ok(());
     };
-    let body = serde_json::to_vec(&StatusUpdate {
+    let body = serde_json::to_vec(&ModuleControlPush::RouteStatus {
         route_channel,
         status: status.clone(),
     })

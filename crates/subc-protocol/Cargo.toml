@@ -1,9 +1,12 @@
 [package]
 name = "subc-protocol"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
-publish = false
+publish = true
 description = "Shared wire contract for subc <-> modules: the 17-byte envelope, JSON-RPC body shapes, and the capability manifest. Single source of truth, depended on by subc-core and AFT."
+license = "MIT"
+# Intended repository URL for first crates.io publish; pending Ufuk confirmation before publishing.
+repository = "https://github.com/cortexkit/subconscious"
 
 [dependencies]
 # Envelope remains pure std; serde is used only by body/manifest schemas.

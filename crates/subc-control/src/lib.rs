@@ -24,6 +24,9 @@ pub mod ops {
     pub const CATALOG_LIST: &str = "catalog.list";
     pub const ROUTE_OPEN: &str = "route.open";
     pub const ROUTE_POLL: &str = "route.poll";
+    pub const SUPERVISOR_LIST: &str = "supervisor.list";
+    pub const SUPERVISOR_RESTART: &str = "supervisor.restart";
+    pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -46,6 +49,12 @@ pub enum ClientControlRequest {
     },
     #[serde(rename = "route.poll")]
     RoutePoll { route_channel: u16, kind: PollKind },
+    #[serde(rename = "supervisor.list")]
+    SupervisorList {},
+    #[serde(rename = "supervisor.restart")]
+    SupervisorRestart { module_id: String },
+    #[serde(rename = "supervisor.set_enabled")]
+    SupervisorSetEnabled { module_id: String, enabled: bool },
 }
 
 /// subc's channel-0 response body for client control RPCs.
@@ -71,6 +80,13 @@ pub enum ClientControlResponse {
         status: Option<String>,
         live: Option<bool>,
     },
+    #[serde(rename = "supervisor.list")]
+    SupervisorList {
+        generation: u64,
+        modules: Vec<SupervisorEntry>,
+    },
+    #[serde(rename = "supervisor.ack")]
+    SupervisorAck { module_id: String, applied: bool },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +101,14 @@ pub struct CatalogEntry {
     pub module_id: String,
     pub roles: Vec<ProviderRole>,
     pub control_ops: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorEntry {
+    pub module_id: String,
+    pub state: String,
+    pub enabled: bool,
+    pub live: bool,
 }
 
 #[cfg(test)]

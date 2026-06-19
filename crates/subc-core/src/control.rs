@@ -1,7 +1,9 @@
-use std::{fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use serde::Serialize;
-use subc_control::{ops, CatalogEntry, ClientControlRequest, ClientControlResponse, PollKind};
+use subc_control::{
+    ops, CatalogEntry, ClientControlRequest, ClientControlResponse, PollKind, SupervisorEntry,
+};
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
     session::{ConfigTier, ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
@@ -16,7 +18,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
-    supervise::ModuleProcessLiveness,
+    supervise::{ModuleProcessLiveness, SupervisorHandle},
     Frame, ProjectRootId,
 };
 
@@ -37,6 +39,9 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::CATALOG_LIST,
     ops::ROUTE_OPEN,
     ops::ROUTE_POLL,
+    ops::SUPERVISOR_LIST,
+    ops::SUPERVISOR_RESTART,
+    ops::SUPERVISOR_SET_ENABLED,
 ];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
@@ -47,6 +52,7 @@ pub struct ControlHandler {
     registry: Arc<Registry>,
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
+    supervisor: SupervisorHandle,
     subc_capabilities: Arc<[String]>,
 }
 
@@ -56,6 +62,7 @@ impl fmt::Debug for ControlHandler {
             .field("registry", &self.registry)
             .field("forwarding", &self.forwarding)
             .field("process_liveness", &self.process_liveness.is_some())
+            .field("supervisor", &self.supervisor)
             .field("subc_capabilities", &self.subc_capabilities)
             .finish()
     }
@@ -71,6 +78,7 @@ impl ControlHandler {
             registry,
             forwarding,
             process_liveness: None,
+            supervisor: SupervisorHandle::new(),
             subc_capabilities: Arc::from([
                 CAP_MANIFEST_REGISTRATION.to_string(),
                 CAP_CHANNEL_LIFECYCLE.to_string(),
@@ -85,6 +93,11 @@ impl ControlHandler {
         process_liveness: Arc<dyn ModuleProcessLiveness>,
     ) -> Self {
         self.process_liveness = Some(process_liveness);
+        self
+    }
+
+    pub fn with_supervisor(mut self, supervisor: SupervisorHandle) -> Self {
+        self.supervisor = supervisor;
         self
     }
 
@@ -308,29 +321,31 @@ impl ControlHandler {
             }
         };
 
-        let registration =
-            match self
-                .registry
-                .register(hello.manifest, negotiated_ver, connection_id)
-            {
-                Ok(registration) => registration,
-                Err(RegistryError::DuplicateModuleId { module_id }) => {
-                    return Ok(vec![control_error_frame(
-                        &frame,
-                        "duplicate_module_id",
-                        format!(
+        let control_ops = effective_module_control_ops(hello.control_ops);
+        let registration = match self.registry.register_with_control_ops(
+            hello.manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+        ) {
+            Ok(registration) => registration,
+            Err(RegistryError::DuplicateModuleId { module_id }) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "duplicate_module_id",
+                    format!(
                         "module_id '{module_id}' is already registered; duplicate HELLO rejected"
                     ),
-                    )?])
-                }
-                Err(err) => {
-                    return Ok(vec![control_error_frame(
-                        &frame,
-                        "registry_error",
-                        err.to_string(),
-                    )?])
-                }
-            };
+                )?])
+            }
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "registry_error",
+                    err.to_string(),
+                )?])
+            }
+        };
 
         if manifest_provides_routable_role(&registration.manifest) {
             if let Some(sink) = sink {
@@ -354,6 +369,7 @@ impl ControlHandler {
 
         let ack = ModuleHelloAckBody {
             negotiated_ver,
+            subc_ops: subc_ops(),
             subc_capabilities: self.subc_capabilities.as_ref().to_vec(),
         };
         let body = serde_json::to_vec(&ack).map_err(|err| {
@@ -398,6 +414,14 @@ impl ControlHandler {
                 route_channel,
                 kind,
             } => self.handle_route_poll(ctx, frame, route_channel, kind),
+            ClientControlRequest::SupervisorList {} => self.handle_supervisor_list(frame),
+            ClientControlRequest::SupervisorRestart { module_id } => {
+                self.handle_supervisor_restart(frame, module_id).await
+            }
+            ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
+                self.handle_supervisor_set_enabled(frame, module_id, enabled)
+                    .await
+            }
         }
     }
 
@@ -432,15 +456,10 @@ impl ControlHandler {
             })
             .map(|registration| {
                 let roles = registration.manifest.provides;
-                let control_ops = if roles.iter().any(is_routable_role) {
-                    module_baseline_control_ops()
-                } else {
-                    Vec::new()
-                };
                 CatalogEntry {
                     module_id: registration.manifest.module_id,
                     roles,
-                    control_ops,
+                    control_ops: registration.control_ops,
                 }
             })
             .collect();
@@ -477,6 +496,16 @@ impl ControlHandler {
             .get_module(&target_module_id)
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
         else {
+            if let Some(status) = self.supervisor_status(&target_module_id, frame.header.corr)? {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "target_unavailable",
+                    format!(
+                        "module_id '{target_module_id}' is supervised but not available (state={}, enabled={}, live={})",
+                        status.state, status.enabled, status.live
+                    ),
+                )?]);
+            }
             return Ok(vec![control_error_frame(
                 &frame,
                 "unknown_module",
@@ -523,6 +552,12 @@ impl ControlHandler {
                 "target_unavailable",
                 format!("module_id '{target_module_id}' has no live forwarding connection"),
             )?]);
+        }
+
+        if let Some(error) =
+            self.guard_module_control_op(&frame, &target_module_id, "route.bind")?
+        {
+            return Ok(vec![error]);
         }
 
         let project_root = match ProjectRootId::from_path(&identity.project_root) {
@@ -661,6 +696,156 @@ impl ControlHandler {
                 )?])
             }
         }
+    }
+
+    fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        let generation = self
+            .registry
+            .generation()
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let modules = self
+            .supervisor
+            .list()
+            .into_iter()
+            .map(|module| {
+                let status = module.status().map_err(|err| {
+                    RouterError::backend(
+                        0,
+                        frame.header.corr,
+                        format!("failed to read supervisor status: {err}"),
+                    )
+                })?;
+                Ok(SupervisorEntry {
+                    module_id: status.module_id,
+                    state: status.state.to_string(),
+                    enabled: status.enabled,
+                    live: status.live,
+                })
+            })
+            .collect::<Result<Vec<_>, RouterError>>()?;
+        let response = ClientControlResponse::SupervisorList {
+            generation,
+            modules,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorList",
+        )?])
+    }
+
+    async fn handle_supervisor_restart(
+        &self,
+        frame: Frame,
+        module_id: String,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(module) = self.supervisor.get(&module_id) else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{module_id}' is not supervised"),
+            )?]);
+        };
+
+        if let Err(err) = module.restart().await {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "target_unavailable",
+                format!("failed to restart module_id '{module_id}': {err}"),
+            )?]);
+        }
+
+        let response = ClientControlResponse::SupervisorAck {
+            module_id,
+            applied: true,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorAck",
+        )?])
+    }
+
+    async fn handle_supervisor_set_enabled(
+        &self,
+        frame: Frame,
+        module_id: String,
+        enabled: bool,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(module) = self.supervisor.get(&module_id) else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{module_id}' is not supervised"),
+            )?]);
+        };
+
+        let applied = match module.set_enabled(enabled).await {
+            Ok(applied) => applied,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "target_unavailable",
+                    format!("failed to set module_id '{module_id}' enabled={enabled}: {err}"),
+                )?])
+            }
+        };
+
+        let response = ClientControlResponse::SupervisorAck { module_id, applied };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorAck",
+        )?])
+    }
+
+    fn supervisor_status(
+        &self,
+        module_id: &str,
+        corr: u64,
+    ) -> Result<Option<crate::supervise::ModuleStatus>, RouterError> {
+        self.supervisor
+            .get(module_id)
+            .map(|module| {
+                module.status().map_err(|err| {
+                    RouterError::backend(
+                        0,
+                        corr,
+                        format!(
+                            "failed to read supervisor status for module_id '{module_id}': {err}"
+                        ),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    fn guard_module_control_op(
+        &self,
+        frame: &Frame,
+        module_id: &str,
+        op: &str,
+    ) -> Result<Option<Frame>, RouterError> {
+        if self.module_grants_op(module_id, op, frame.header.corr)? {
+            return Ok(None);
+        }
+
+        Ok(Some(control_error_frame(
+            frame,
+            "op_not_allowed",
+            format!("module_id '{module_id}' did not grant control op '{op}'"),
+        )?))
+    }
+
+    fn module_grants_op(&self, module_id: &str, op: &str, corr: u64) -> Result<bool, RouterError> {
+        let Some(registration) = self
+            .registry
+            .get_module(module_id)
+            .map_err(|err| RouterError::backend(0, corr, err.to_string()))?
+        else {
+            return Ok(false);
+        };
+        Ok(module_registration_grants_op(&registration.control_ops, op))
     }
 
     fn handle_status_update(
@@ -838,11 +1023,32 @@ fn subc_ops() -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn module_baseline_control_ops() -> Vec<String> {
     MODULE_BASELINE_CONTROL_OPS
         .iter()
         .map(|op| (*op).to_string())
         .collect()
+}
+
+fn effective_module_control_ops(declared: Option<Vec<String>>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut effective = Vec::new();
+    for op in MODULE_BASELINE_CONTROL_OPS {
+        if seen.insert((*op).to_string()) {
+            effective.push((*op).to_string());
+        }
+    }
+    for op in declared.unwrap_or_default() {
+        if seen.insert(op.clone()) {
+            effective.push(op);
+        }
+    }
+    effective
+}
+
+fn module_registration_grants_op(control_ops: &[String], op: &str) -> bool {
+    MODULE_BASELINE_CONTROL_OPS.contains(&op) || control_ops.iter().any(|granted| granted == op)
 }
 
 fn target_module_id(target: &RouteTarget) -> &str {
@@ -1078,9 +1284,19 @@ mod tests {
     }
 
     fn hello_frame(module_id: &str, protocol_ver: u8, corr: u64) -> Frame {
+        hello_frame_with_control_ops(module_id, protocol_ver, corr, None)
+    }
+
+    fn hello_frame_with_control_ops(
+        module_id: &str,
+        protocol_ver: u8,
+        corr: u64,
+        control_ops: Option<Vec<String>>,
+    ) -> Frame {
         let body = serde_json::to_vec(&ModuleHelloBody {
             manifest: manifest(module_id, protocol_ver),
             protocol_ver,
+            control_ops,
         })
         .unwrap();
         Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
@@ -1147,10 +1363,11 @@ mod tests {
         let module_connection = ConnectionId::new(101);
         let client_connection = ConnectionId::new(202);
         let registration = registry
-            .register(
+            .register_with_control_ops(
                 manifest(module_id, PROTOCOL_VERSION),
                 PROTOCOL_VERSION,
                 module_connection,
+                module_baseline_control_ops(),
             )
             .unwrap();
         let (module_tx, _module_rx) = mpsc::channel(8);
@@ -1217,11 +1434,79 @@ mod tests {
         assert!(ack
             .subc_capabilities
             .contains(&CAP_MANIFEST_REGISTRATION.to_string()));
+        assert!(ack.subc_ops.contains(&ops::SUPERVISOR_LIST.to_string()));
+        assert!(ack.subc_ops.contains(&ops::SUPERVISOR_RESTART.to_string()));
+        assert!(ack
+            .subc_ops
+            .contains(&ops::SUPERVISOR_SET_ENABLED.to_string()));
 
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.negotiated_ver, PROTOCOL_VERSION);
         assert_eq!(registration.state, ChannelState::Active);
         assert_eq!(registration.connection_id, conn);
+        assert_eq!(registration.control_ops, module_baseline_control_ops());
+    }
+
+    #[test]
+    fn hello_control_ops_none_is_baseline_and_guard_rejects_synthetic_gated_op() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let conn = ConnectionId::new(1);
+        let responses = handler
+            .handle_control(
+                conn,
+                hello_frame_with_control_ops("aft", PROTOCOL_VERSION, 7, None),
+            )
+            .unwrap();
+        assert_eq!(responses[0].header.ty, FrameType::HelloAck);
+        let registration = registry.get_module("aft").unwrap().unwrap();
+        assert_eq!(registration.control_ops, module_baseline_control_ops());
+
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 77, Vec::new()).unwrap();
+        assert!(handler
+            .guard_module_control_op(&frame, "aft", "route.bind")
+            .unwrap()
+            .is_none());
+        let error = handler
+            .guard_module_control_op(&frame, "aft", "test.synthetic")
+            .unwrap()
+            .expect("synthetic ungranted op should be rejected");
+        assert_eq!(error.header.ty, FrameType::Error);
+        assert_eq!(parse_error(&error)["code"], "op_not_allowed");
+    }
+
+    #[test]
+    fn hello_control_ops_some_adds_optional_grants() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame_with_control_ops(
+                    "aft",
+                    PROTOCOL_VERSION,
+                    7,
+                    Some(vec![
+                        "future.synthetic".to_string(),
+                        "route.bind".to_string(),
+                    ]),
+                ),
+            )
+            .unwrap();
+        let registration = registry.get_module("aft").unwrap().unwrap();
+        assert_eq!(
+            registration.control_ops,
+            vec![
+                "route.bind".to_string(),
+                "route.status".to_string(),
+                "future.synthetic".to_string(),
+            ]
+        );
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 78, Vec::new()).unwrap();
+        assert!(handler
+            .guard_module_control_op(&frame, "aft", "future.synthetic")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

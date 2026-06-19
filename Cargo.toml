@@ -4,6 +4,7 @@ members = [
     "crates/subc-protocol",
     "crates/subc-transport",
     "crates/subc-core",
+    "crates/subc-mcp",
 ]
 
 # subc monorepo.

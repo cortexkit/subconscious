@@ -40,6 +40,7 @@ pub struct ModuleRegistration {
     pub negotiated_ver: u8,
     pub state: ChannelState,
     pub connection_id: ConnectionId,
+    pub control_ops: Vec<String>,
 }
 
 /// Control-plane registry for module manifests and supervision ownership.
@@ -67,6 +68,17 @@ impl Registry {
         negotiated_ver: u8,
         connection_id: ConnectionId,
     ) -> Result<ModuleRegistration, RegistryError> {
+        self.register_with_control_ops(manifest, negotiated_ver, connection_id, Vec::new())
+    }
+
+    /// Register a module manifest with the module's effective granted control op set.
+    pub fn register_with_control_ops(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+    ) -> Result<ModuleRegistration, RegistryError> {
         let mut inner = self.lock_inner()?;
         let module_id = manifest.module_id.clone();
         if inner.modules.contains_key(&module_id) {
@@ -78,6 +90,7 @@ impl Registry {
             negotiated_ver,
             state: ChannelState::Active,
             connection_id,
+            control_ops,
         };
 
         inner.modules.insert(module_id, registration.clone());

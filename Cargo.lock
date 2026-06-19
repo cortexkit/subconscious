@@ -269,12 +269,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-control"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-protocol",
+]
+
+[[package]]
 name = "subc-core"
 version = "0.0.0"
 dependencies = [
  "cortexkit-paths",
  "serde",
  "serde_json",
+ "subc-control",
  "subc-protocol",
  "subc-transport",
  "tokio",
@@ -288,6 +298,7 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+ "subc-control",
  "subc-core",
  "subc-protocol",
  "subc-transport",

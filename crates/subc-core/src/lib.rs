@@ -15,14 +15,10 @@ pub mod identity;
 pub mod registry;
 pub mod router;
 pub mod server;
-pub mod status;
 pub mod supervise;
 
-pub use control::{ControlHandler, HelloAckBody, HelloBody, MIN_SUPPORTED_VERSION};
-pub use forwarding::{
-    AttachAck, AttachRelay, AttachRelayResponse, AttachRequest, ConfigTier, DetachRelay,
-    ForwardingError, ForwardingTable, ModuleEndpointId,
-};
+pub use control::{ControlHandler, MIN_SUPPORTED_VERSION};
+pub use forwarding::{ForwardingError, ForwardingTable, ModuleEndpointId};
 pub use frame::{Frame, FrameBuildError};
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};
 pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
@@ -35,7 +31,6 @@ pub use server::{
     handle_connection, serve_listener, serve_listeners, ConnectionError, ServerAuth, ServerError,
     DEFAULT_AUTH_DEADLINE, DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS,
 };
-pub use status::{LivenessReply, PassivePoll, PollOp, StatusReply, StatusUpdate};
 pub use supervise::{
     ExitKind, ExitReport, ModuleProcessLiveness, ModuleSpec, ModuleState, ModuleStatus,
     RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorProcessLiveness,

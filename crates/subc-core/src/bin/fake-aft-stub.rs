@@ -14,16 +14,15 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_core::{
-    read_frame, write_frame, AttachRelay, AttachRelayResponse, DetachRelay, Frame, HelloAckBody,
-    HelloBody, StatusUpdate,
-};
+use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
-    ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
+    session::{AttachRelay, AttachRelayResponse, DetachRelay},
+    ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, StatusUpdate,
+    PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, AuthError, ConnectionFileError};
 use tokio::{
@@ -178,7 +177,7 @@ async fn send_hello(
     module_id: &str,
     concurrency: Concurrency,
 ) -> Result<(), StubError> {
-    let body = serde_json::to_vec(&HelloBody {
+    let body = serde_json::to_vec(&ModuleHelloBody {
         manifest: manifest(module_id, concurrency),
         protocol_ver: PROTOCOL_VERSION,
     })
@@ -188,7 +187,7 @@ async fn send_hello(
     send_outbound(writer, frame).await
 }
 
-async fn expect_hello_ack<R>(reader: &mut R) -> Result<HelloAckBody, StubError>
+async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, StubError>
 where
     R: AsyncRead + Unpin,
 {

@@ -29,12 +29,47 @@
 
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 pub mod manifest;
 pub mod session;
+
+/// Per-route bind identity shared by client-facing and module-facing control.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BindIdentity {
+    pub project_root: PathBuf,
+    pub harness: String,
+    pub session: String,
+}
+
+/// Explicit target for a route open/bind operation.
+///
+/// RouteTarget.kind ↔ ProviderRole mapping:
+///
+/// | RouteTarget.kind | required ProviderRole | disambiguator |
+/// |---|---|---|
+/// | `tool_provider` | `ToolProvider` | v1: ≤1 per module |
+/// | `management_surface` | `ManagementSurface` | v1: ≤1 per module |
+/// | `internal_service` | `InternalService` | `service_id` (multiple allowed) |
+///
+/// `ProviderRole::PipelineStage` is intentionally unroutable; pipeline modules
+/// are wired by an orchestrator rather than opened directly by clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RouteTarget {
+    ToolProvider {
+        module_id: String,
+    },
+    ManagementSurface {
+        module_id: String,
+    },
+    InternalService {
+        module_id: String,
+        service_id: String,
+    },
+}
 
 /// Envelope protocol version this build speaks.
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -59,6 +94,28 @@ pub const MAX_FRAME_BODY_LEN: u32 = 64 * 1024 * 1024;
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+}
+
+/// Module-to-subc `HELLO` body used during module registration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModuleHelloBody {
+    pub manifest: manifest::ModuleManifest,
+    pub protocol_ver: u8,
+}
+
+/// subc-to-module `HELLO_ACK` body used during module registration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModuleHelloAckBody {
+    pub negotiated_ver: u8,
+    pub channels: Vec<u16>,
+    pub subc_capabilities: Vec<String>,
+}
+
+/// Module-to-subc channel-0 `Push` body that refreshes the latest status for a route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusUpdate {
+    pub route_channel: u16,
+    pub status: String,
 }
 
 /// Frame kind (`type` byte at offset 5).
@@ -325,6 +382,55 @@ mod tests {
             channel,
             corr,
         }
+    }
+
+    #[test]
+    fn bind_identity_round_trips_json() {
+        let identity = BindIdentity {
+            project_root: PathBuf::from("/tmp/project"),
+            harness: "opencode".to_string(),
+            session: "session-1".to_string(),
+        };
+
+        let encoded = serde_json::to_vec(&identity).unwrap();
+        let decoded: BindIdentity = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn route_target_variants_round_trip_json() {
+        let targets = [
+            RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            RouteTarget::ManagementSurface {
+                module_id: "memory".to_string(),
+            },
+            RouteTarget::InternalService {
+                module_id: "bus".to_string(),
+                service_id: "dm".to_string(),
+            },
+        ];
+
+        for target in targets {
+            let encoded = serde_json::to_vec(&target).unwrap();
+            let decoded: RouteTarget = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, target);
+        }
+    }
+
+    #[test]
+    fn error_body_round_trips_json() {
+        let body = ErrorBody {
+            code: "config_divergence".to_string(),
+            message: "active config differs".to_string(),
+        };
+
+        let encoded = serde_json::to_vec(&body).unwrap();
+        let decoded: ErrorBody = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, body);
     }
 
     #[test]

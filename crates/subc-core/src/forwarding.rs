@@ -5,9 +5,6 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-pub use subc_protocol::session::{
-    AttachAck, AttachRelay, AttachRelayResponse, AttachRequest, ConfigTier, DetachRelay,
-};
 use subc_protocol::{manifest::Concurrency, ErrorBody};
 use tokio::sync::{oneshot, Semaphore};
 use tracing::warn;

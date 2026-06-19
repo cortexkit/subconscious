@@ -17,9 +17,10 @@ use std::{
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use subc_control::{AttachAck, AttachRequest};
 use subc_protocol::{
-    decode_header, session::AttachAck, session::AttachRequest, session::ConfigTier, EnvelopeHeader,
-    ErrorBody, Flags, FrameType, Priority, HEADER_LEN, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
+    decode_header, session::ConfigTier, EnvelopeHeader, ErrorBody, Flags, FrameType, Priority,
+    HEADER_LEN, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
 };
 use subc_transport::{
     authenticate_client, authenticate_server, connection_file, generate_daemon_id, generate_key,

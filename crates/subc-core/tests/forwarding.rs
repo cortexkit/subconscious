@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     ops::Deref,
     path::{Path, PathBuf},
@@ -13,10 +14,17 @@ use std::{
 use serde_json::Value;
 use subc_core::{
     read_frame, write_frame, AttachAck, AttachRequest, ConfigTier, ForwardingTable, Frame,
-    LivenessReply, ModuleSpec, ModuleState, ModuleStatus, PassivePoll, PollOp, Registry,
-    RestartPolicy, StatusReply, SupervisedModule, Supervisor, SupervisorProcessLiveness,
+    HelloAckBody, HelloBody, LivenessReply, ModuleSpec, ModuleState, ModuleStatus, PassivePoll,
+    PollOp, Registry, RestartPolicy, StatusReply, SupervisedModule, Supervisor,
+    SupervisorProcessLiveness,
 };
-use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
+use subc_protocol::{
+    manifest::{
+        Bindings, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope, ModuleManifest,
+        StorageBinding, StorageKind, StorageScope, TrustTier,
+    },
+    ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -113,6 +121,61 @@ async fn attach_then_forward_request_round_trips_through_stub() {
     assert_eq!(response.body, payload);
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_tool_provider_hello_registers_without_hijacking_active_forwarding_module() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let provider_id = "fake-aft-role-aware-provider";
+    let events_path = server.stub_events_path("role-aware-provider");
+    let provider = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            provider_id,
+            [(
+                "FAKE_AFT_EVENTS_PATH",
+                events_path.to_string_lossy().into_owned(),
+            )],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, provider_id, Duration::from_secs(1)).await;
+
+    let consumer_id = "subc-mcp-consumer-role-aware";
+    let mut consumer = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let consumer_ack =
+        register_manifest_on_stream(&mut consumer, consumer_manifest(consumer_id), 301).await;
+    let consumer_registration =
+        wait_for_registration(&server.registry, consumer_id, Duration::from_secs(1)).await;
+    assert_eq!(consumer_registration.channels, consumer_ack.channels);
+
+    let liveness = poll_liveness(&mut consumer, 302, consumer_ack.channels[0]).await;
+    assert_liveness_reply(&liveness, 302, false);
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 303, "ses-role-aware").await;
+    let attach = wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "attach"
+            && event["route_channel"].as_u64() == Some(u64::from(ack.route_channel))
+    })
+    .await;
+    assert_eq!(
+        attach["route_channel"].as_u64(),
+        Some(u64::from(ack.route_channel))
+    );
+
+    let payload = br#"{"jsonrpc":"2.0","id":"role-aware"}"#;
+    write_frame(&mut client, &data_request(ack.route_channel, 304, payload))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_response(&response, ack.route_channel, 304, payload);
+
+    drop(consumer);
+    provider.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -463,6 +526,117 @@ async fn client_drop_sends_detach_relay_and_removes_binding() {
         .forwarding
         .has_route_channel(ack.route_channel)
         .unwrap());
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-route-goodbye";
+    let events_path = server.stub_events_path("route-goodbye");
+    let module = supervisor
+        .spawn(stub_spec_with_env(
+            &server,
+            module_id,
+            [(
+                "FAKE_AFT_EVENTS_PATH",
+                events_path.to_string_lossy().into_owned(),
+            )],
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let first_ack = attach_on_stream(&mut client, &project, 601, "ses-route-a").await;
+    let second_ack = attach_on_stream(&mut client, &project, 602, "ses-route-b").await;
+    assert_ne!(first_ack.route_channel, second_ack.route_channel);
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 2);
+
+    write_frame(&mut client, &goodbye_frame(first_ack.route_channel, 603))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    wait_for_binding_count(&server.forwarding, 1, Duration::from_secs(1)).await;
+    let detach = wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event["kind"] == "detach"
+            && event["route_channel"].as_u64() == Some(u64::from(first_ack.route_channel))
+    })
+    .await;
+    assert_eq!(
+        detach["route_channel"].as_u64(),
+        Some(u64::from(first_ack.route_channel))
+    );
+    assert!(!server
+        .forwarding
+        .has_route_channel(first_ack.route_channel)
+        .unwrap());
+    assert!(server
+        .forwarding
+        .has_route_channel(second_ack.route_channel)
+        .unwrap());
+
+    let stale_payload = br#"{"jsonrpc":"2.0","id":"route-a-after-goodbye"}"#;
+    write_frame(
+        &mut client,
+        &data_request(first_ack.route_channel, 604, stale_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let error_frame = read_frame_timeout(&mut client).await;
+    let body = assert_error(
+        &error_frame,
+        first_ack.route_channel,
+        604,
+        "unknown_channel",
+    );
+    assert!(body.message.contains("unknown channel"));
+
+    let live_payload = br#"{"jsonrpc":"2.0","id":"route-b-live"}"#;
+    write_frame(
+        &mut client,
+        &data_request(second_ack.route_channel, 605, live_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_response(&response, second_ack.route_channel, 605, live_payload);
+
+    let mut unknown_channel = u16::MAX;
+    while unknown_channel == first_ack.route_channel || unknown_channel == second_ack.route_channel
+    {
+        unknown_channel -= 1;
+    }
+    write_frame(&mut client, &goodbye_frame(unknown_channel, 606))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let error_frame = read_frame_timeout(&mut client).await;
+    let body = assert_error(&error_frame, unknown_channel, 606, "unknown_channel");
+    assert!(body.message.contains("unknown channel"));
+
+    let after_unknown_payload = br#"{"jsonrpc":"2.0","id":"route-b-after-unknown"}"#;
+    write_frame(
+        &mut client,
+        &data_request(second_ack.route_channel, 607, after_unknown_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_response(
+        &response,
+        second_ack.route_channel,
+        607,
+        after_unknown_payload,
+    );
 
     module.stop().await.unwrap();
 }
@@ -1623,6 +1797,72 @@ where
     serde_json::from_slice(&error_frame.body).unwrap()
 }
 
+fn consumer_manifest(module_id: &str) -> ModuleManifest {
+    ModuleManifest {
+        module_id: module_id.to_string(),
+        module_version: "0.0.0-consumer".to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: Vec::new(),
+        consumes: Vec::new(),
+        scheduled_tasks: Vec::new(),
+        bindings: Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: false,
+            },
+            config: ConfigBinding {
+                source: ConfigSource::SubcMediated,
+                tiers: Vec::new(),
+                expansion: BTreeMap::new(),
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: Vec::new(),
+                optional: vec![IdentityScope::Project],
+            },
+        },
+    }
+}
+
+fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
+    let protocol_ver = manifest.protocol_ver;
+    let body = serde_json::to_vec(&HelloBody {
+        manifest,
+        protocol_ver,
+    })
+    .unwrap();
+    Frame::build(
+        FrameType::Hello,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
+}
+
+async fn register_manifest_on_stream<S>(
+    stream: &mut S,
+    manifest: ModuleManifest,
+    corr: u64,
+) -> HelloAckBody
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(stream, &hello_frame(manifest, corr))
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    let ack_frame = read_frame_timeout(stream).await;
+    assert_eq!(ack_frame.header.ty, FrameType::HelloAck);
+    assert_eq!(ack_frame.header.channel, 0);
+    assert_eq!(ack_frame.header.corr, corr);
+    serde_json::from_slice(&ack_frame.body).unwrap()
+}
+
 fn attach_request(project: &TestProject, session: &str) -> AttachRequest {
     AttachRequest {
         project_root: project.path.clone(),
@@ -1672,6 +1912,20 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
         body.to_vec(),
     )
     .unwrap()
+}
+
+fn goodbye_frame(channel: u16, corr: u64) -> Frame {
+    let frame = Frame::build(
+        FrameType::Goodbye,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        corr,
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(frame.header.len, 0);
+    assert!(frame.body.is_empty());
+    frame
 }
 
 fn cancel_frame(channel: u16, corr: u64) -> Frame {

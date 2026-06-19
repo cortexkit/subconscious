@@ -193,6 +193,26 @@ impl ControlHandler {
         registrations
     }
 
+    pub(crate) fn handle_route_goodbye(
+        &self,
+        connection_id: ConnectionId,
+        route_channel: u16,
+    ) -> Result<bool, RouterError> {
+        debug!(
+            connection_id = connection_id.get(),
+            route_channel, "handling route GOODBYE"
+        );
+        let Some(released_route) = self
+            .forwarding
+            .release_client_route(connection_id, route_channel)
+            .map_err(RouterError::Forwarding)?
+        else {
+            return Ok(false);
+        };
+        self.emit_detach_relays(vec![released_route]);
+        Ok(true)
+    }
+
     fn emit_detach_relays(&self, released_routes: Vec<ReleasedRoute>) {
         for released in released_routes {
             let body = match serde_json::to_vec(&DetachRelay {
@@ -312,21 +332,23 @@ impl ControlHandler {
                 }
             };
 
-        if let Some(sink) = sink {
-            let concurrency = manifest_concurrency(&registration.manifest);
-            if let Err(err) = self.forwarding.register_module_connection(
-                connection_id,
-                registration.manifest.module_id.clone(),
-                negotiated_ver,
-                concurrency,
-                sink,
-            ) {
-                let _ = self.registry.deregister_connection(connection_id);
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    forwarding_error_code(&err),
-                    err.to_string(),
-                )?]);
+        if manifest_provides_tools(&registration.manifest) {
+            if let Some(sink) = sink {
+                let concurrency = manifest_concurrency(&registration.manifest);
+                if let Err(err) = self.forwarding.register_module_connection(
+                    connection_id,
+                    registration.manifest.module_id.clone(),
+                    negotiated_ver,
+                    concurrency,
+                    sink,
+                ) {
+                    let _ = self.registry.deregister_connection(connection_id);
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        forwarding_error_code(&err),
+                        err.to_string(),
+                    )?]);
+                }
             }
         }
 
@@ -683,6 +705,13 @@ impl Default for ControlHandler {
     fn default() -> Self {
         Self::new(Arc::new(Registry::default()))
     }
+}
+
+fn manifest_provides_tools(manifest: &ModuleManifest) -> bool {
+    manifest
+        .provides
+        .iter()
+        .any(|role| matches!(role, ProviderRole::ToolProvider { .. }))
 }
 
 fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {

@@ -65,6 +65,7 @@ struct RegistryInner {
     modules: HashMap<String, ModuleRegistration>,
     channels: HashMap<u16, String>,
     next_channel: u16,
+    generation: u64,
 }
 
 impl Default for RegistryInner {
@@ -73,6 +74,7 @@ impl Default for RegistryInner {
             modules: HashMap::new(),
             channels: HashMap::new(),
             next_channel: FIRST_MODULE_CHANNEL,
+            generation: 0,
         }
     }
 }
@@ -103,6 +105,7 @@ impl Registry {
 
         inner.channels.insert(channel, module_id.clone());
         inner.modules.insert(module_id, registration.clone());
+        inner.bump_generation();
         Ok(registration)
     }
 
@@ -128,6 +131,17 @@ impl Registry {
 
     pub fn active_module_count(&self) -> Result<usize, RegistryError> {
         Ok(self.lock_inner()?.modules.len())
+    }
+
+    pub fn list_modules(&self) -> Result<(u64, Vec<ModuleRegistration>), RegistryError> {
+        let inner = self.lock_inner()?;
+        let mut modules = inner.modules.values().cloned().collect::<Vec<_>>();
+        modules.sort_by(|left, right| left.manifest.module_id.cmp(&right.manifest.module_id));
+        Ok((inner.generation, modules))
+    }
+
+    pub fn generation(&self) -> Result<u64, RegistryError> {
+        Ok(self.lock_inner()?.generation)
     }
 
     /// Deregister every module owned by a dropped connection.
@@ -182,7 +196,12 @@ impl RegistryInner {
             self.channels.remove(channel);
         }
         registration.state = ChannelState::Closed;
+        self.bump_generation();
         Some(registration)
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 

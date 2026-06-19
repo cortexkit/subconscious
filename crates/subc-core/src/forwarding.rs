@@ -49,17 +49,17 @@ pub(crate) struct ReleasedRoute {
 }
 
 #[derive(Debug)]
-pub(crate) struct PendingAttachRelay {
+pub(crate) struct PendingRouteBindRelay {
     pub endpoint: ModuleEndpointId,
     pub module_sink: FrameSink,
     pub negotiated_ver: u8,
     pub route_channel: u16,
     pub corr: u64,
-    pub receiver: oneshot::Receiver<AttachRelayOutcome>,
+    pub receiver: oneshot::Receiver<RouteBindRelayOutcome>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum AttachRelayOutcome {
+pub(crate) enum RouteBindRelayOutcome {
     Accepted,
     Rejected(ErrorBody),
     ModuleGone(String),
@@ -84,7 +84,7 @@ struct ForwardingInner {
     client_to_module: HashMap<(ConnectionId, u16), ModuleRoute>,
     module_to_client: HashMap<(ModuleEndpointId, u16), ClientRoute>,
     status: HashMap<(ModuleEndpointId, u16), String>,
-    pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<AttachRelayOutcome>>,
+    pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<RouteBindRelayOutcome>>,
 }
 
 /// Dynamic forwarding state shared by the control plane and data-plane router.
@@ -124,11 +124,22 @@ impl ForwardingTable {
         Ok(endpoint)
     }
 
-    pub(crate) fn begin_attach_relay(&self) -> Result<PendingAttachRelay, ForwardingError> {
+    pub(crate) fn begin_route_bind_relay_for(
+        &self,
+        module_id: &str,
+    ) -> Result<PendingRouteBindRelay, ForwardingError> {
+        self.begin_route_bind_relay_inner(module_id)
+    }
+
+    fn begin_route_bind_relay_inner(
+        &self,
+        expected_module_id: &str,
+    ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.lock_inner()?;
         let module = inner
             .active_module
             .clone()
+            .filter(|module| module.module_id == expected_module_id)
             .ok_or(ForwardingError::NoModuleConnection)?;
         let route_channel = inner.allocate_route_channel(module.endpoint)?;
         let corr = inner.allocate_relay_corr(module.endpoint)?;
@@ -137,7 +148,7 @@ impl ForwardingTable {
             .reserved_routes
             .insert((module.endpoint, route_channel));
         inner.pending_relays.insert((module.endpoint, corr), sender);
-        Ok(PendingAttachRelay {
+        Ok(PendingRouteBindRelay {
             endpoint: module.endpoint,
             module_sink: module.sink,
             negotiated_ver: module.negotiated_ver,
@@ -230,7 +241,7 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
         corr: u64,
-        outcome: AttachRelayOutcome,
+        outcome: RouteBindRelayOutcome,
     ) -> Result<bool, ForwardingError> {
         let mut inner = self.lock_inner()?;
         let Some(endpoint) = endpoint_for_connection(&inner, connection_id) else {
@@ -249,6 +260,14 @@ impl ForwardingTable {
     ) -> Result<Option<ModuleEndpointId>, ForwardingError> {
         let inner = self.lock_inner()?;
         Ok(endpoint_for_connection(&inner, connection_id))
+    }
+
+    pub(crate) fn active_module_id(&self) -> Result<Option<String>, ForwardingError> {
+        Ok(self
+            .lock_inner()?
+            .active_module
+            .as_ref()
+            .map(|module| module.module_id.clone()))
     }
 
     pub(crate) fn client_route(
@@ -423,7 +442,7 @@ impl ForwardingTable {
                 .filter_map(|key| inner.pending_relays.remove(&key))
                 .collect();
             for sender in pending {
-                let _ = sender.send(AttachRelayOutcome::ModuleGone(format!(
+                let _ = sender.send(RouteBindRelayOutcome::ModuleGone(format!(
                     "module '{}' connection closed during attach relay",
                     module.module_id
                 )));

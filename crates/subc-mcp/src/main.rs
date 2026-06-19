@@ -17,10 +17,11 @@ use std::{
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use subc_control::{AttachAck, AttachRequest};
+use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
-    decode_header, session::ConfigTier, EnvelopeHeader, ErrorBody, Flags, FrameType, Priority,
-    HEADER_LEN, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
+    decode_header, manifest::ProviderRole, session::ConfigTier, BindIdentity, EnvelopeHeader,
+    ErrorBody, Flags, FrameType, Priority, RouteTarget, HEADER_LEN, MAX_FRAME_BODY_LEN,
+    PROTOCOL_VERSION,
 };
 use subc_transport::{
     authenticate_client, authenticate_server, connection_file, generate_daemon_id, generate_key,
@@ -28,7 +29,7 @@ use subc_transport::{
 };
 use tokio::{
     io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
-    net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpListener, TcpStream},
+    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
     sync::{mpsc, oneshot, Mutex},
     time,
 };
@@ -445,32 +446,75 @@ async fn handle_shim_connection(
 }
 
 async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<u16> {
+    let catalog = catalog_list(subc).await?;
+    let module_id = select_tool_provider(&catalog)?;
     let session = generated_session_id(&hello.shim_session_id)?;
-    let attach = AttachRequest {
-        project_root: hello.project_root.clone(),
-        harness: hello.harness.clone(),
-        session,
+    let request = ClientControlRequest::RouteOpen {
+        target: RouteTarget::ToolProvider { module_id },
+        identity: BindIdentity {
+            project_root: hello.project_root.clone(),
+            harness: hello.harness.clone(),
+            session,
+        },
         config: Vec::<ConfigTier>::new(),
     };
-    let body = serde_json::to_vec(&attach)?;
+    let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr();
     let frame = EnvelopeFrame::build(FrameType::Request, control_flags(), 0, corr, body)?;
     let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
 
     match response.header.ty {
         FrameType::Response if response.header.channel == 0 => {
-            let ack: AttachAck = serde_json::from_slice(&response.body)?;
-            Ok(ack.route_channel)
+            match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
+                ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+                other => Err(other_error(format!(
+                    "unexpected route.open response body: {other:?}"
+                ))),
+            }
         }
-        FrameType::Error => Err(error_response(
-            "subc rejected session attach",
-            &response.body,
-        )),
+        FrameType::Error => Err(error_response("subc rejected route.open", &response.body)),
         ty => Err(other_error(format!(
-            "unexpected attach response frame {ty:?} on channel {} corr {}",
+            "unexpected route.open response frame {ty:?} on channel {} corr {}",
             response.header.channel, response.header.corr
         ))),
     }
+}
+
+async fn catalog_list(subc: &SubcClient) -> Result<Vec<CatalogEntry>> {
+    let request = ClientControlRequest::CatalogList { module_id: None };
+    let body = serde_json::to_vec(&request)?;
+    let corr = subc.next_corr();
+    let frame = EnvelopeFrame::build(FrameType::Request, control_flags(), 0, corr, body)?;
+    let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
+
+    match response.header.ty {
+        FrameType::Response if response.header.channel == 0 => {
+            match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
+                ClientControlResponse::CatalogList { modules, .. } => Ok(modules),
+                other => Err(other_error(format!(
+                    "unexpected catalog.list response body: {other:?}"
+                ))),
+            }
+        }
+        FrameType::Error => Err(error_response("subc rejected catalog.list", &response.body)),
+        ty => Err(other_error(format!(
+            "unexpected catalog.list response frame {ty:?} on channel {} corr {}",
+            response.header.channel, response.header.corr
+        ))),
+    }
+}
+
+fn select_tool_provider(modules: &[CatalogEntry]) -> Result<String> {
+    modules
+        .iter()
+        .find(|entry| {
+            entry
+                .roles
+                .iter()
+                .any(|role| matches!(role, ProviderRole::ToolProvider { .. }))
+        })
+        .map(|entry| entry.module_id.clone())
+        .ok_or_else(|| other_error("catalog.list returned no tool_provider module"))
 }
 
 async fn phase1_length_prefixed_loop(
@@ -521,13 +565,23 @@ async fn send_route_goodbye(subc: &SubcClient, route_channel: u16) -> Result<()>
     subc.send(frame).await
 }
 
-async fn subc_reader_loop(
-    mut read_half: OwnedReadHalf,
+async fn subc_reader_loop<R>(
+    mut read_half: R,
     pending: Arc<Mutex<HashMap<PendingKey, oneshot::Sender<EnvelopeFrame>>>>,
-) {
+) where
+    R: AsyncRead + Unpin,
+{
     loop {
         match read_envelope_frame(&mut read_half).await {
             Ok(Some(frame)) => {
+                if frame.header.ty == FrameType::Push && frame.header.channel == 0 {
+                    eprintln!(
+                        "subc-mcp module: ignoring unrecognized channel-0 Push corr={}",
+                        frame.header.corr
+                    );
+                    continue;
+                }
+
                 let key = (frame.header.channel, frame.header.corr);
                 let reply = pending.lock().await.remove(&key);
                 if let Some(reply) = reply {
@@ -923,4 +977,62 @@ fn invalid_input(message: impl Into<String>) -> BoxError {
 
 fn other_error(message: impl Into<String>) -> BoxError {
     stdio::Error::other(message.into()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn client_ignores_unknown_channel_zero_push() {
+        let (mut server, client) = tokio::io::duplex(4096);
+        let pending: Arc<Mutex<HashMap<PendingKey, oneshot::Sender<EnvelopeFrame>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pending.lock().await.insert((0, 42), reply_tx);
+
+        let reader_pending = Arc::clone(&pending);
+        let reader = tokio::spawn(async move {
+            subc_reader_loop(client, reader_pending).await;
+        });
+
+        let push = EnvelopeFrame::build(
+            FrameType::Push,
+            control_flags(),
+            0,
+            42,
+            br#"{"op":"catalog.changed","generation":2}"#.to_vec(),
+        )
+        .unwrap();
+        write_envelope_frame(&mut server, &push).await.unwrap();
+        server.flush().await.unwrap();
+
+        time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            pending.lock().await.contains_key(&(0, 42)),
+            "unknown channel-0 Push must not satisfy a pending request"
+        );
+
+        let response = EnvelopeFrame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            42,
+            br#"{"op":"route.open","route_channel":7}"#.to_vec(),
+        )
+        .unwrap();
+        write_envelope_frame(&mut server, &response).await.unwrap();
+        server.flush().await.unwrap();
+
+        let delivered = time::timeout(Duration::from_secs(1), reply_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.header.ty, FrameType::Response);
+        assert_eq!(delivered.header.channel, 0);
+        assert_eq!(delivered.header.corr, 42);
+
+        drop(server);
+        reader.await.unwrap();
+    }
 }

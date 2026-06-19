@@ -12,12 +12,10 @@ use std::{
     time::Duration,
 };
 
-use subc_core::{
-    auth::authenticate_client,
-    connection_file::{
-        generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
-    },
-    serve_listener, ControlHandler, ForwardingTable, Registry, Router, ServerAuth,
+use subc_core::{serve_listener, ControlHandler, ForwardingTable, Registry, Router, ServerAuth};
+use subc_transport::{
+    authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
+    SCHEMA_VERSION,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -85,7 +83,7 @@ pub async fn start_test_daemon(name: &str) -> TestDaemon {
 }
 
 pub async fn connect_authed_client(path: impl AsRef<Path>) -> io::Result<TcpStream> {
-    let conn = subc_core::connection_file::read(path.as_ref()).map_err(io::Error::other)?;
+    let conn = subc_transport::read(path.as_ref()).map_err(io::Error::other)?;
     let endpoint = conn.endpoints.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

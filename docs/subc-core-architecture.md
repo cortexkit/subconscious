@@ -39,7 +39,7 @@ subc-core is a **splice-router with services around it**. It moves opaque bytes 
 
 Every v1 module — AFT, MC transform, embedding engine, codec, auth, LLM-runner — is a **singleton**: one instance per (per-user) machine, supervised as one long-lived process. subc routes traffic to a module by module-kind + channel, never to a per-root instance.
 
-- **AFT is a singleton too** (decided 2026-06, authoritative). One `aft` process total; AFT self-demuxes by `project_root` internally via an in-process **ProjectActor map** keyed by `ProjectRootId`. Per-root idle-evict is AFT-internal (today's 30-min idle-bridge policy lifted inside AFT). subc still resolves the canonical `ProjectRootId` at HELLO — needed for the per-project **lease**, the **scheduler**, and other modules (MC renders project memories, etc.) — but does **not** use it to select an AFT instance.
+- **AFT is a singleton too** (decided 2026-06, authoritative). One `aft` process total; AFT self-demuxes by `project_root` internally via an in-process **ProjectActor map** keyed by `ProjectRootId`. Per-root idle-evict is AFT-internal (today's 30-min idle-bridge policy lifted inside AFT). subc resolves the canonical `ProjectRootId` at **session attach** (the `route.open` boundary, §4.2) — needed for the per-project **lease**, the **scheduler**, and other modules (MC renders project memories, etc.) — but does **not** use it to select an AFT instance.
 - **Why one process, not a per-root pool:** operability (one PID, one log stream — users reason about a single process) + **upgrade atomicity** (the process is the upgrade unit; all roots must run the same AFT version — a per-root pool would force an N-process version barrier to get the consistency you want anyway; "independent per-root hot-update" is a mis-feature, not a benefit). RAM is not a factor — the embedding pipeline moves to the singleton embedding module regardless.
 - **Accepted cost:** crash blast-radius — a panic serving one root takes the process down for all roots; mitigated by AFT's panic-hardening + subc's auto-restart. Acceptable for a local tool.
 - **`per-project-pool` cardinality is NOT built** — no current or foreseeable module needs it. It is an additive supervision capability if a future module ever requires it, not a v1 surface.
@@ -70,28 +70,37 @@ Two kinds of actor open a connection to subc:
 - **Clients** consume: harnesses/agents (tool plane), the CK app/CLI/human (mgmt plane), the LLM-runner (proxy + tool planes).
 - **Modules** provide one or more roles, and may *also* be clients (bidirectional).
 
-One connection **multiplexes** many logical channels. A channel is the per-frame route handle (u16); it is **bound once, at session-attach, to the triple `(project_root, harness, session)`** (§4.2) and never re-sent per frame. Correlation ids carry many in-flight requests on one socket — this is what makes head-of-line blocking impossible at the transport layer, and lets subc answer liveness/status from its own cache without forwarding.
+One connection **multiplexes** many logical channels. A channel is the per-frame route handle (u16); it is **bound once, at `route.open`** (§4.2), to a `(target provider, BindIdentity{project_root, harness, session})` pair, and never re-sent per frame. One client connection can hold **many** route channels — one per `(project × provider)` — so the MCP gateway fans a single connection out to AFT + MC + future providers; channel numbers are unique **per client connection** across all its providers (§4.9). Correlation ids carry many in-flight requests on one socket — this is what makes head-of-line blocking impossible at the transport layer, and lets subc answer liveness/status from its own cache without forwarding.
+
+> **The channel-0 control protocol is specified in full in [`docs/subc-control-protocol.md`](./subc-control-protocol.md) (v0.4, AFT co-signed).** This section gives the model; that doc is the authoritative wire contract (direction-split tagged enums, dotted ops, the `subc-control` client crate vs `subc-protocol` module crate split).
 
 ### 4.2 HELLO handshake
 
 There are **two distinct channel-0 handshakes** (do not conflate them):
 
-**(1) Module registration** — a *module* (e.g. AFT) connects and registers its **manifest** (§4.3). Implemented today; body shapes match the `subc-protocol` types:
+**(1) Module registration** — a *module* (e.g. AFT) connects and registers its **manifest** (§4.3). Implemented; body shapes are the `subc-protocol` module-facing types ([control-protocol §5](./subc-control-protocol.md)):
 ```jsonc
-HELLO     { "manifest": { /* ModuleManifest, §4.3 */ }, "protocol_ver": 1 }
-HELLO_ACK { "negotiated_ver": u8, "channels": [u16], "subc_capabilities": ["..."] }
+HELLO     { "manifest": { /* ModuleManifest, §4.3 */ }, "protocol_ver": 1,
+            "control_ops": null }  // Option<[String]>: null = full baseline (recv route.bind+GOODBYE, emit RouteBindAck/Error + route.status + GOODBYE); Some([...]) opts into ops added later
+HELLO_ACK { "negotiated_ver": u8, "subc_ops": ["..."], "subc_capabilities": ["..."] }
 ```
-Version below `MIN_SUPPORTED_VERSION` → a channel-0 `ERROR { code, message }` (the unified error body, §4.8), not registered. Duplicate active `module_id` is rejected (route-hijack guard); stale registrations are released on GOODBYE or connection-drop.
+No channel is allocated at HELLO — route channels exist only after `route.bind` (§4.9). Version below `MIN_SUPPORTED_VERSION` → a channel-0 `ERROR { code, message }` (the unified error body, §4.8), not registered. Duplicate active `module_id` is rejected (route-hijack guard); stale registrations are released on GOODBYE or connection-drop. A HELLO whose manifest declares **no routable provider role** registers for supervision/liveness only and never becomes a forwarding target (a subc-supervised *consumer* — e.g. the MCP gateway — cannot hijack a provider's slot).
 
-**(2) Session attach** — a *harness session* connects to be routed to a module. It carries the triple + its config; subc resolves the canonical `ProjectRootId`, then **relays the attach to the module — a vetoed request/response, not a local ack** (the module owns config reconciliation, §4.7):
+**(2) Session attach = `route.open`** — a *client* (harness session, or the MCP gateway) opens a route to a specific provider. It carries an explicit `RouteTarget` + `BindIdentity` + config; subc canonicalizes `project_root` (via `cortexkit-paths`, at this boundary — single-owner, §4.9), validates the target against the registry, then **relays `route.bind` to the module — a vetoed request/response, not a local ack** (the module owns config reconciliation, §4.7):
 ```jsonc
-ATTACH { "project_root": "/abs/path", "harness": "opencode"|"pi"|..., "session_id": "ses_...",
-         "config": { /* opaque, provenance-tagged user+project tiers, §4.7 */ } }
+// client → subc  (subc-control::ClientControlRequest)
+{ "op": "route.open",
+  "target":   { "kind": "tool_provider"|"management_surface"|"internal_service", "module_id": "aft" /*, "service_id" for internal_service */ },
+  "identity": { "project_root": "/abs/path", "harness": "opencode"|"pi"|"mcp:claude-code"|..., "session": "ses_..." },
+  "config":   [ /* opaque, ordered provenance-tagged tiers, §4.7 */ ] }
+// subc → module  (subc-protocol::ModuleControlRequest::RouteBind{ route_channel, target, identity, config })
+// module → subc  RouteBindAck{}  (ack-only; rejection rides the FrameType::Error lane)
 ```
-- **Accept** → subc binds a **route channel** to `(connection, project_root, harness, session)` and acks. The channel is now the per-frame handle (§4.1).
-- **`config_divergence`** → subc returns a channel-0 `ERROR { code:"config_divergence", message:<diff> }`, binds nothing. (A later harness whose canonical RootConfig diverges from a warm root's, §4.7.)
+- **Accept** (`RouteBindAck`) → subc binds a **route channel** and replies `route.open → { route_channel }`. The channel is now the per-frame handle (§4.1).
+- **Reject** → the module sends an `ErrorBody{code,message}` on the `FrameType::Error` lane; subc relays it **verbatim** to the client's `route.open` corr (e.g. `config_divergence` carries its key-diff intact so the user can fix `aft.jsonc`). subc binds nothing.
+- **Resolution errors** (subc-side): `unknown_module` (no such id) / `target_unavailable` (registered but down/disabled/wrong-role) / `route_limit` (per-client channel exhaustion).
 
-The triple binds to the channel **once** here; data frames thereafter are `channel + corr + opaque body`. See §4.9 for the single-AFT routing model this attach feeds.
+`BindIdentity` is per-route context, **not** a routing key — the same triple may open N routes across providers; subc does not dedup it. Data frames thereafter are `channel + corr + opaque body`. See §4.9 for the multi-provider routing model this feeds.
 
 ### 4.3 Capability registration — the module manifest
 
@@ -226,7 +235,7 @@ The frame that carries every message in §4.1–4.7 on the local subc↔module l
    4      1    ver       u8      envelope version
    5      1    type      u8      REQUEST/RESPONSE/PUSH/STREAM_DATA/STREAM_END/ERROR/CANCEL/PING/PONG/HELLO/HELLO_ACK/GOODBYE
    6      1    flags     u8      bit0 BINARY (bulk-lane raw body) · bits1-2 PRIORITY (passive/interactive/background) · bit3 LAST (stream-final) · 4-7 reserved
-   7      2    channel   u16     route handle; bound once at session-attach to (project_root,harness,session) (§4.2/§4.9); 0 = subc itself
+    7      2    channel   u16     route handle; bound at route.open, rewritten per-hop (client-local ↔ module-local, §4.9); 0 = subc control plane
    9      8    corr      u64     correlation id; CANCEL carries the target call's corr
   17 → body
 ```
@@ -251,17 +260,18 @@ So any reader of any version can always: read 5 bytes → learn `ver` → look u
 
 ---
 
-### 4.9 Single-process routing & the session-attach data plane
+### 4.9 Multi-provider routing & the session-attach data plane
 
-The routing model under one-AFT-process (§2.1), source-verified with AFT:
+The routing model (§2.1), source-verified with AFT, generalized to many clients × many providers:
 
-- **Route by module-kind to one pid; the module self-demuxes.** subc does not run a per-root process pool. All AFT traffic goes to the one AFT process; AFT picks the right internal `ProjectActor` by `project_root`. subc still resolves the canonical `ProjectRootId` at attach — for its own lease/scheduler (§4.6) and PUSH routing — **not** to select an instance.
-- **The triple binds to a channel once, at attach.** Per-frame routing is `channel → connection` (1:1); the `(project_root, harness, session)` triple rides the §4.2 ATTACH, never per-frame. This is what keeps the 17-byte envelope unchanged under the harness/root/session fan-out.
-- **Bidirectional channel-0 relay.** `attach-relay` (subc→module: channel bound to the triple — also the module's *ensure-or-create-`ProjectActor`* signal; first attach warms a cold root, later attaches bind to the warm actor) and `detach-relay` (subc→module: channel gone on GOODBYE/connection-drop — decrements the actor's session refcount, feeds idle-evict).
-- **PUSH fan-out is the module's, not subc's.** subc stays a pure `channel → connection` router. Unsolicited PUSH (bash completion, watcher `status_changed`, bash_watch) is targeted by the module: request-triggered PUSH echoes the originating channel; a root-wide `status_changed` fans out to **all** channels bound to that root (the module's `root → [channels]` index *is* its `ProjectActor` session set — zero new state). Keeping all PUSH-target choice in one owner avoids fragmenting channel-gone policy.
-- **Channel-gone = two converging signals → one module policy.** The proactive `detach-relay` (authoritative) and a reactive per-send channel-gone outcome (subc best-effort drops a PUSH handed to a dead connection during the emit-before-detach race). The module applies one per-frame-type policy: **queue-for-replay** (completion/watch — disk/DB-durable, keyed by `(harness,session)`, survives detach **and** actor-evict **and** process-restart) vs **drop/coalesce** (status). subc just delivers a replayed PUSH on the new channel after re-attach.
+- **Route by module-kind to one pid; the module self-demuxes.** subc does not run a per-root process pool. All AFT traffic goes to the one AFT process; AFT picks the right internal `ProjectActor` by `project_root`. subc resolves the canonical `ProjectRootId` at `route.open` — for its own lease/scheduler (§4.6) and PUSH routing — **not** to select an instance.
+- **Independent channel spaces + rewrite (the multi-provider model).** A route has **two** channel numbers: a client-local one (unique per client connection) and a module-local one (unique per module endpoint). subc rewrites the envelope `channel` on every forwarded data frame (client→module → module-local; module→client → client-local), preserving `corr` and splicing the body untouched. This is what lets one client (the MCP gateway) hold routes to AFT + MC + future providers without channel collision, and many clients share one provider — neither side's channel namespace constrains the other. (subc replaced the single-`active_module` slot with a registry keyed by `module_id`.) Per-provider **generation** invalidates only that module's routes on its restart.
+- **Channel-0 relay + teardown.** `route.bind` (subc→module: binds the module-local channel to the target + `BindIdentity` — also the module's *ensure-or-create-`ProjectActor`* signal; first bind warms a cold root, later binds bind to the warm actor). Route teardown is the **`GOODBYE` frame** (pure-header) in **both** directions — there is no JSON detach op. A non-zero-channel `GOODBYE` is terminal + idempotent: release the binding, free the flow-control credit, drop late frames, fail pending corrs. On **module death/disable**, subc emits a `GOODBYE` to each affected client on its client-local channel and tears down its own forwarding state (so a client learns its routes died without polling).
+- **PUSH fan-out is the module's, not subc's.** subc stays a pure rewriting router. Unsolicited PUSH (bash completion, watcher `status_changed`, bash_watch) is targeted by the module: request-triggered PUSH echoes the originating channel; a root-wide `status_changed` fans out to **all** channels bound to that root (the module's `root → [channels]` index *is* its `ProjectActor` session set — zero new state). subc rewrites each PUSH's channel to the client-local value on the way out.
+- **Liveness/status without forwarding.** subc caches the module's `route.status` push per route (client-keyed) and answers `route.poll` (status|liveness) **locally** — a poll produces **zero** frames to the module (keeps passive polls off the module's synchronous path). Liveness derives from subc's own supervision state.
+- **Channel-gone = two converging signals → one module policy.** The proactive `GOODBYE` relay (authoritative) and a reactive per-send channel-gone outcome (subc best-effort drops a PUSH handed to a dead connection during the emit-before-detach race). The module applies one per-frame-type policy: **queue-for-replay** (completion/watch — disk/DB-durable, keyed by `(harness,session)`, survives detach **and** actor-evict **and** process-restart) vs **drop/coalesce** (status). subc just delivers a replayed PUSH on the new channel after re-attach.
 - **RepoId is the module's, not shared.** subc keys everything per-path (`ProjectRootId`); a per-repo notion (git common-dir) lives module-side and only matters if a real per-repo coordinated resource ever emerges (not v1).
-- **Path-identity is shared by construction.** The `ProjectRootId` canonicalization is a small published, dependency-light, cortexkit-neutral crate (`cortexkit-paths`) that subc *and* AFT call — byte-identical canonicalization, not two algorithms reconciled by test vectors. Workspace-root walk-up is harness-owned (shared in the plugin bridge so OC+Pi can't diverge); subc/AFT only realpath-canonicalize the received root (authoritatively, so cross-language TS realpath parity is not load-bearing — walk-up parity is).
+- **Path-identity is shared by construction.** The `ProjectRootId` canonicalization is a small published, dependency-light, cortexkit-neutral crate (`cortexkit-paths`) that subc *and* AFT call — byte-identical canonicalization, not two algorithms reconciled by test vectors. **subc owns canonicalization at the `route.open`→`route.bind` boundary** (it canonicalizes before relaying; the module consumes the result as-is, never re-canonicalizing — single-owner prevents a double-canonicalize divergence on symlinked/case-folded paths). Workspace-root walk-up is harness-owned (shared in the plugin bridge so OC+Pi can't diverge).
 
 ### 4.10 Spawn-mode & connect-failure contract (subc → spawned child)
 
@@ -316,11 +326,11 @@ The contract is **locked**. Epic 2 implemented the subc side of it; everything b
 |---|---|
 | Sink-based async backend + per-connection writer task | **built** (streaming/PUSH-capable) |
 | Per-connection backpressure (bounded outbound queue) | **built** |
-| Forwarding data plane (session-attach → `ForwardBackend` → bidirectional channel demux; PUSH; detach-relay) | **built** (Epic 1 close) |
+| Forwarding data plane (`route.open` → `ForwardBackend` → multi-provider channel rewrite; PUSH; GOODBYE teardown both ways; module-death→client GOODBYE) | **built** (Epic 1 + control-protocol P1–P4) |
 | Concurrent in-flight dispatch + out-of-order responses (corr carried, never assumed ordered) | **built + proven** (2.1/2.2 — `ForwardBackend` returns without awaiting; per-connection tasks; module-reader demux. Cross-session: fast call unblocked while a 500ms call runs) |
 | CANCEL (pure-header, dumb-forward — module owns abort/terminal) | **built + proven** (2.3) |
 | Per-channel flow-control window (un-acked cap), sized by declared `concurrency` | **built + proven** (2.4 — `ChannelFlow` credit counter, type-byte only; `serial→1` enforced) |
-| Liveness/status answered from subc cache (passive poll never forwarded) | **built + proven** (2.5 — channel-0 local; kills the #117 passive-poll-behind-scan; status shapes subc-core-local pending AFT co-sign) |
+| Liveness/status answered from subc cache (passive poll never forwarded) | **built + proven** (2.5 + v0.4 — `route.poll` answered locally, zero frames to the module; kills the #117 passive-poll-behind-scan; `route.status` cache client-keyed; AFT co-signed) |
 | Within-root parallelism (slow read doesn't block quick reads on one root) | **Leg-2-gated** (2.6 — AFT's reader-writer executor; §6.4) |
 
 **Per-mode FIFO (FR16):** ordering is per-module, declared via manifest `concurrency`: `serial` = one in-flight, strict order (now **enforced** by the flow-control window 2.4 — subc never sends a 2nd request before the 1st's terminal); `module_managed` = concurrent in-flight across channels, per-channel FIFO submission preserved within a channel (module schedules internally) — AFT's mode; `stateless_parallel` = fully parallel, no ordering.
@@ -367,6 +377,8 @@ Every foreseeable module expressed purely as `{provides, consumes, scheduled_tas
 
 Nothing requires a core change. The claim holds **until a module needs a plane that does not exist** — the only event that touches core, and the one we keep additive via the transport-agnostic body.
 
+This is no longer just an argument — it is an **executable test**. `crates/subc-core/tests/closure.rs` stands up five foreseeable archetypes (MC management-surface, embedding, LLM-runner with a `selection` objective, a bus pub/sub provider, federation), routes each via `route.open` + opaque route-channel payloads, and asserts they integrate with **zero new `FrameType` and zero new subc-understood control op** — every domain body opaque-forwarded byte-identically, and the negative guardrail (an unknown channel-0 op → `unknown_control_op`) holding. The golden-JSON drift vectors (`tests/golden/`) pin every wire shape so the TS mirror can't silently diverge.
+
 ---
 
 ## 8. Open forks (carried)
@@ -375,6 +387,6 @@ Genuinely open (all later-plane / cross-team, none blocking v1 tool-plane):
 1. **Canonical normalized shape** (proxy plane) — the exact representation codecs and the transform target (OpenCode parts-based MessageLike is a candidate).
 2. **Conformance-gate corpus** (proxy plane) — recorded real provider payloads + assertions for codec certification.
 3. **Session/message-data owner** (mgmt plane) — what serves the dashboard's session/message view in a harness-agnostic, remote world (pending MC-Alfonso).
-4. **`cortexkit-paths` repo home** — own-repo/`cortexkit-commons` vs subc-monorepo workspace member (cross-project topology; Ufuk's call). Doesn't block — AFT depends on the published crate, not the source location.
+4. **Route-channel tool-call contract + structured-result→MCP `content[]` mapping** (subc-mcp↔provider) — the opaque body shape the MCP gateway sends providers, and how AFT's structured/text results map onto MCP `content[]`. v1 = `{name, arguments, progress_token?}` → `{content:[{type:"text",text}], isError}` (single text block + isError); co-signed with AFT at their attach wiring (some AFT surfaces — search/inspect/callgraph — already emit agent-facing text; edit/read are JSON → decide single-block vs summary+data split per-surface against real shapes).
 
-**Resolved since (were open forks):** framing → locked 17-byte length-prefix envelope (§4.8); single-process-vs-per-root → **single AFT process**, singleton module (§2.1, §4.9); AFT concurrency-refactor shape → in-process `ProjectActor` extraction (Leg 1) + `RefCell`→`Arc` (Leg 2), sized by AFT's substrate inventory v3 (§6.2/§6.4).
+**Resolved since (were open forks):** framing → locked 17-byte length-prefix envelope (§4.8); single-process-vs-per-root → **single AFT process**, singleton module (§2.1, §4.9); AFT concurrency-refactor shape → in-process `ProjectActor` extraction (Leg 1) + `RefCell`→`Arc` (Leg 2), sized by AFT's substrate inventory v3 (§6.2/§6.4); **channel-0 control protocol** → v0.4 direction-split tagged enums, `subc-control` (client wire) vs `subc-protocol` (module wire) crate split, multi-provider `route.open{RouteTarget}` routing, capability negotiation, `supervisor.*` ([`docs/subc-control-protocol.md`](./subc-control-protocol.md), AFT co-signed); **`cortexkit-paths` repo home** → published from the `cortexkit/commons` monorepo, consumed by subc + AFT as a pinned crates.io dep; **cross-machine topology** → subc↔subc **federation** (every machine runs its own subc + local modules loopback-only; WAN quarantined to a future subc-supervised InterSUBC module), not scattered remote modules.

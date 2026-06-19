@@ -1,0 +1,20 @@
+{
+  "config": [
+    {
+      "doc": "{ // jsonc owned by AFT\n  \"semantic\": true\n}",
+      "source": "/tmp/subc/project/aft.jsonc",
+      "tier": "project"
+    }
+  ],
+  "identity": {
+    "harness": "opencode",
+    "project_root": "/tmp/subc/project",
+    "session": "session-0001"
+  },
+  "op": "route.open",
+  "target": {
+    "kind": "internal_service",
+    "module_id": "llm-runner",
+    "service_id": "llm"
+  }
+}

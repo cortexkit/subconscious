@@ -1,0 +1,5 @@
+{
+  "kind": "internal_service",
+  "module_id": "llm-runner",
+  "service_id": "llm"
+}

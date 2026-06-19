@@ -82,18 +82,8 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-forwarding";
-    let events_path = server.stub_events_path("attach-forwarding");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [(
-                "FAKE_AFT_EVENTS_PATH",
-                events_path.to_string_lossy().into_owned(),
-            )],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "attach-forwarding").await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 101, "ses-forwarding").await;
@@ -155,18 +145,8 @@ async fn non_tool_provider_hello_registers_without_hijacking_active_forwarding_m
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let provider_id = "fake-aft-role-aware-provider";
-    let events_path = server.stub_events_path("role-aware-provider");
-    let provider = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            provider_id,
-            [(
-                "FAKE_AFT_EVENTS_PATH",
-                events_path.to_string_lossy().into_owned(),
-            )],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, provider_id, Duration::from_secs(1)).await;
+    let (provider, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, provider_id, "role-aware-provider").await;
 
     let consumer_id = "subc-mcp-consumer-role-aware";
     let mut consumer = connect_authed_client(&server.connection_file_path)
@@ -208,21 +188,14 @@ async fn route_poll_produces_zero_module_frames() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-cache";
-    let events_path = server.stub_events_path("status-cache");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-                ("FAKE_AFT_STATUS".to_string(), "indexing".to_string()),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "status-cache",
+        [("FAKE_AFT_STATUS", "indexing")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 111, "ses-status-cache").await;
@@ -262,23 +235,18 @@ async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-busy-local-poll";
-    let events_path = server.stub_events_path("busy-local-poll");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                ("FAKE_AFT_STATUS".to_string(), "scanning".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "busy-local-poll",
+        [
+            ("FAKE_AFT_CONCURRENCY", "serial"),
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+            ("FAKE_AFT_STATUS", "scanning"),
+        ],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 121, "ses-busy-local-poll").await;
@@ -352,8 +320,7 @@ async fn route_poll_status_cache_miss_returns_none() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-miss";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 131, "ses-status-miss").await;
@@ -378,21 +345,14 @@ async fn status_cache_is_evicted_when_client_detaches() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-eviction";
-    let events_path = server.stub_events_path("status-eviction");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-                ("FAKE_AFT_STATUS".to_string(), "evict-me".to_string()),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "status-eviction",
+        [("FAKE_AFT_STATUS", "evict-me")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut first, first_ack) = attach_client(&server, &project, 141, "ses-status-evict-1").await;
@@ -451,8 +411,7 @@ async fn liveness_poll_returns_false_after_module_connection_is_gone() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-liveness-gone";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 151, "ses-liveness-gone").await;
@@ -478,14 +437,13 @@ async fn single_client_receives_unsolicited_push_and_response_on_bound_route() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-push-single";
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [("FAKE_AFT_PUSH_ON_REQUEST", "1")],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_PUSH_ON_REQUEST", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 151, "ses-push-single").await;
@@ -510,18 +468,8 @@ async fn client_drop_sends_route_goodbye_and_removes_binding() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-detach";
-    let events_path = server.stub_events_path("detach");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [(
-                "FAKE_AFT_EVENTS_PATH",
-                events_path.to_string_lossy().into_owned(),
-            )],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "detach").await;
 
     let project = TestProject::new();
     let (client, ack) = attach_client(&server, &project, 201, "ses-detach").await;
@@ -556,8 +504,7 @@ async fn supervisor_list_enumerates_supervised_modules() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-supervisor-list";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
     wait_for_status(&module, Duration::from_secs(1), |status| {
         status.state == ModuleState::Running && status.enabled && status.live
     })
@@ -603,8 +550,7 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-supervisor-restart";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
     let generation_before = server.registry.generation().unwrap();
 
     let project = TestProject::new();
@@ -649,8 +595,7 @@ async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns()
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-supervisor-enabled";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -744,18 +689,8 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-route-goodbye";
-    let events_path = server.stub_events_path("route-goodbye");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [(
-                "FAKE_AFT_EVENTS_PATH",
-                events_path.to_string_lossy().into_owned(),
-            )],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "route-goodbye").await;
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -852,21 +787,14 @@ async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-stale-route";
-    let events_path = server.stub_events_path("stale-route");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                (
-                    "FAKE_AFT_EVENTS_PATH",
-                    events_path.to_string_lossy().into_owned(),
-                ),
-                ("FAKE_AFT_EMIT_AFTER_DETACH", "1".to_string()),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "stale-route",
+        [("FAKE_AFT_EMIT_AFTER_DETACH", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (client, ack) = attach_client(&server, &project, 301, "ses-stale-route").await;
@@ -914,14 +842,13 @@ async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_bind
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-reject";
-    let rejecting = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [("FAKE_AFT_REJECT_ATTACH", "1")],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let rejecting = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_REJECT_ATTACH", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -939,8 +866,7 @@ async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_bind
     rejecting.stop().await.unwrap();
     wait_for_registration_absent(&server.registry, module_id, Duration::from_secs(1)).await;
 
-    let accepting = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let accepting = spawn_stub(&server, &supervisor, module_id).await;
     let (mut accepted_client, ack) = attach_client(&server, &project, 402, "ses-accept").await;
     assert!(ack.route_channel > 0);
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 1);
@@ -967,8 +893,7 @@ async fn two_clients_attach_same_module_and_round_trip_independently() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-two-clients";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     let project = TestProject::new();
     let (mut first, first_ack) = attach_client(&server, &project, 501, "ses-one").await;
@@ -1011,14 +936,13 @@ async fn cross_session_slow_call_does_not_block_fast_call() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cross-session-delay";
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [("FAKE_AFT_DELAY_FROM_BODY", "1")],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut slow_client, slow_ack) = attach_client(&server, &project, 525, "ses-cross-slow").await;
@@ -1086,21 +1010,14 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-same-channel-oood";
-    let events_path = server.stub_events_path("same-channel-oood");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "same-channel-oood",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 631, "ses-same-channel-oood").await;
@@ -1168,21 +1085,14 @@ async fn cancel_before_response_for_cancellable_request_returns_cancelled_error(
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cancel-before";
-    let events_path = server.stub_events_path("cancel-before");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "cancel-before",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 801, "ses-cancel-before").await;
@@ -1235,21 +1145,14 @@ async fn cancel_after_response_is_idempotent_noop() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cancel-after";
-    let events_path = server.stub_events_path("cancel-after");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "cancel-after",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 811, "ses-cancel-after").await;
@@ -1295,21 +1198,14 @@ async fn double_cancel_emits_exactly_one_cancelled_error() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-double-cancel";
-    let events_path = server.stub_events_path("double-cancel");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "double-cancel",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 821, "ses-double-cancel").await;
@@ -1353,21 +1249,14 @@ async fn cancel_for_uncancellable_delayed_request_allows_normal_response() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-uncancellable";
-    let events_path = server.stub_events_path("uncancellable");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "uncancellable",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 831, "ses-uncancellable").await;
@@ -1415,8 +1304,7 @@ async fn unknown_channel_cancel_returns_unknown_channel_error_and_survives() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-unknown-cancel";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 841, "ses-unknown-cancel").await;
@@ -1460,14 +1348,13 @@ async fn multi_client_fanout_pushes_route_to_each_bound_client() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-push-fanout";
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [("FAKE_AFT_FANOUT_ON_REQUEST", "1")],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_FANOUT_ON_REQUEST", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut first, first_ack) = attach_client(&server, &project, 551, "ses-fanout-one").await;
@@ -1497,8 +1384,7 @@ async fn single_client_pipelined_requests_preserve_corr_fifo_order() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-fifo";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 601, "ses-fifo").await;
@@ -1535,22 +1421,17 @@ async fn serial_flow_control_window_holds_second_request_until_terminal() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-serial-flow";
-    let events_path = server.stub_events_path("serial-flow");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "serial-flow",
+        [
+            ("FAKE_AFT_CONCURRENCY", "serial"),
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+        ],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 901, "ses-serial-flow").await;
@@ -1628,22 +1509,17 @@ async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal()
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cancel-flow";
-    let events_path = server.stub_events_path("cancel-flow");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "cancel-flow",
+        [
+            ("FAKE_AFT_CONCURRENCY", "serial"),
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+        ],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 911, "ses-cancel-flow").await;
@@ -1724,23 +1600,18 @@ async fn flow_control_over_release_guard_does_not_grow_serial_window() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-over-release";
-    let events_path = server.stub_events_path("over-release");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                ("FAKE_AFT_DOUBLE_TERMINAL".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "over-release",
+        [
+            ("FAKE_AFT_CONCURRENCY", "serial"),
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+            ("FAKE_AFT_DOUBLE_TERMINAL", "1"),
+        ],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 921, "ses-over-release").await;
@@ -1823,22 +1694,17 @@ async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-flow-teardown";
-    let events_path = server.stub_events_path("flow-teardown");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_CONCURRENCY".to_string(), "serial".to_string()),
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "flow-teardown",
+        [
+            ("FAKE_AFT_CONCURRENCY", "serial"),
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+        ],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 931, "ses-flow-teardown").await;
@@ -1888,14 +1754,13 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 4, Duration::from_millis(20));
     let module_id = "fake-aft-generation";
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [("FAKE_AFT_CRASH_AFTER_MS", "1500")],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "1500")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut client, old_ack) = attach_client(&server, &project, 701, "ses-old-generation").await;
@@ -1955,30 +1820,10 @@ async fn multi_provider_one_client_two_providers_rewrites_independent_channel_sp
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_a = "fake-aft-mp-one-client-a";
     let module_b = "fake-aft-mp-one-client-b";
-    let events_a = server.stub_events_path("mp-one-client-a");
-    let events_b = server.stub_events_path("mp-one-client-b");
-    let provider_a = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_a,
-            [(
-                "FAKE_AFT_EVENTS_PATH",
-                events_a.to_string_lossy().into_owned(),
-            )],
-        ))
-        .unwrap();
-    let provider_b = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_b,
-            [(
-                "FAKE_AFT_EVENTS_PATH",
-                events_b.to_string_lossy().into_owned(),
-            )],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_a, Duration::from_secs(1)).await;
-    wait_for_registration(&server.registry, module_b, Duration::from_secs(1)).await;
+    let (provider_a, events_a) =
+        spawn_stub_with_events_path(&server, &supervisor, module_a, "mp-one-client-a").await;
+    let (provider_b, events_b) =
+        spawn_stub_with_events_path(&server, &supervisor, module_b, "mp-one-client-b").await;
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -2036,18 +1881,8 @@ async fn multi_provider_two_clients_one_provider_get_distinct_module_channels() 
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-mp-two-clients";
-    let events_path = server.stub_events_path("mp-two-clients");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [(
-                "FAKE_AFT_EVENTS_PATH",
-                events_path.to_string_lossy().into_owned(),
-            )],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "mp-two-clients").await;
 
     let project = TestProject::new();
     let (mut first, first_ack) = attach_client(&server, &project, 1011, "ses-mp-two-one").await;
@@ -2102,36 +1937,22 @@ async fn multi_provider_status_cache_translates_same_module_channel_to_client_ro
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_a = "fake-aft-mp-status-a";
     let module_b = "fake-aft-mp-status-b";
-    let events_a = server.stub_events_path("mp-status-a");
-    let events_b = server.stub_events_path("mp-status-b");
-    let provider_a = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_a,
-            [
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_a.to_string_lossy().into_owned(),
-                ),
-                ("FAKE_AFT_STATUS".to_string(), "status-a".to_string()),
-            ],
-        ))
-        .unwrap();
-    let provider_b = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_b,
-            [
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_b.to_string_lossy().into_owned(),
-                ),
-                ("FAKE_AFT_STATUS".to_string(), "status-b".to_string()),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_a, Duration::from_secs(1)).await;
-    wait_for_registration(&server.registry, module_b, Duration::from_secs(1)).await;
+    let (provider_a, events_a) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_a,
+        "mp-status-a",
+        [("FAKE_AFT_STATUS", "status-a")],
+    )
+    .await;
+    let (provider_b, events_b) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_b,
+        "mp-status-b",
+        [("FAKE_AFT_STATUS", "status-b")],
+    )
+    .await;
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -2173,21 +1994,14 @@ async fn multi_provider_cancel_rewrites_divergent_client_and_module_channels() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-mp-cancel";
-    let events_path = server.stub_events_path("mp-cancel");
-    let module = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_id,
-            [
-                ("FAKE_AFT_DELAY_FROM_BODY".to_string(), "1".to_string()),
-                (
-                    "FAKE_AFT_EVENTS_PATH".to_string(),
-                    events_path.to_string_lossy().into_owned(),
-                ),
-            ],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "mp-cancel",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (_first, _first_ack) = attach_client(&server, &project, 1031, "ses-cancel-primer").await;
@@ -2240,16 +2054,14 @@ async fn multi_provider_generation_invalidation_goodbyes_restarted_provider_only
     let supervisor = supervisor(&server, 4, Duration::from_millis(20));
     let module_a = "fake-aft-mp-generation-a";
     let module_b = "fake-aft-mp-generation-b";
-    let provider_a = supervisor.spawn(stub_spec(&server, module_a)).unwrap();
-    let provider_b = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            module_b,
-            [("FAKE_AFT_CRASH_AFTER_MS", "800")],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, module_a, Duration::from_secs(1)).await;
-    wait_for_registration(&server.registry, module_b, Duration::from_secs(1)).await;
+    let provider_a = spawn_stub(&server, &supervisor, module_a).await;
+    let provider_b = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_b,
+        [("FAKE_AFT_CRASH_AFTER_MS", "800")],
+    )
+    .await;
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -2293,8 +2105,7 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-mp-death";
-    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     let project = TestProject::new();
     let (mut first, first_ack) = attach_client(&server, &project, 1051, "ses-death-one").await;
@@ -2350,14 +2161,13 @@ async fn multi_provider_route_open_error_mapping_unknown_unavailable_and_verbati
     assert_eq!(unavailable.code, "target_unavailable");
 
     let rejecting_id = "fake-aft-mp-reject";
-    let rejecting = supervisor
-        .spawn(stub_spec_with_env(
-            &server,
-            rejecting_id,
-            [("FAKE_AFT_REJECT_ATTACH", "1")],
-        ))
-        .unwrap();
-    wait_for_registration(&server.registry, rejecting_id, Duration::from_secs(1)).await;
+    let rejecting = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        rejecting_id,
+        [("FAKE_AFT_REJECT_ATTACH", "1")],
+    )
+    .await;
     let rejected =
         attach_error_on_stream(&mut client, &project, 1064, "ses-reject", rejecting_id).await;
     assert_eq!(rejected.code, "config_divergence");
@@ -2870,6 +2680,76 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
     .with_handle(server.supervisor_handle.clone())
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.connection_file_path.clone())
+}
+
+async fn spawn_stub(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+) -> SupervisedModule {
+    let module = supervisor.spawn(stub_spec(server, module_id)).unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    module
+}
+
+async fn spawn_stub_with_env<K, V, I>(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+    extra_env: I,
+) -> SupervisedModule
+where
+    K: Into<String>,
+    V: Into<String>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let module = supervisor
+        .spawn(stub_spec_with_env(server, module_id, extra_env))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    module
+}
+
+async fn spawn_stub_with_events_path(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+    label: &str,
+) -> (SupervisedModule, PathBuf) {
+    spawn_stub_with_events(
+        server,
+        supervisor,
+        module_id,
+        label,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .await
+}
+
+async fn spawn_stub_with_events<K, V, I>(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+    label: &str,
+    extra_env: I,
+) -> (SupervisedModule, PathBuf)
+where
+    K: Into<String>,
+    V: Into<String>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let events_path = server.stub_events_path(label);
+    let mut env = vec![(
+        "FAKE_AFT_EVENTS_PATH".to_string(),
+        events_path.to_string_lossy().into_owned(),
+    )];
+    env.extend(
+        extra_env
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into())),
+    );
+    let module = spawn_stub_with_env(server, supervisor, module_id, env).await;
+    (module, events_path)
 }
 
 fn stub_spec(server: &TestServer, module_id: &str) -> ModuleSpec {

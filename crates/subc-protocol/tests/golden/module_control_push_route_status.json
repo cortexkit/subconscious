@@ -1,0 +1,5 @@
+{
+  "op": "route.status",
+  "route_channel": 42,
+  "status": "indexing"
+}

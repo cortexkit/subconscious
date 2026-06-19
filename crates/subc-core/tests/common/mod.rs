@@ -14,7 +14,7 @@ use std::{
 
 use subc_core::{
     serve_listener, ControlHandler, ForwardingTable, ModuleProcessLiveness, Registry, Router,
-    ServerAuth,
+    ServerAuth, SupervisorHandle,
 };
 use subc_transport::{
     authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
@@ -51,19 +51,28 @@ impl Drop for TestDaemon {
 }
 
 pub async fn start_test_daemon(name: &str) -> TestDaemon {
-    start_test_daemon_inner(name, None).await
+    start_test_daemon_inner(name, None, None).await
 }
 
 pub async fn start_test_daemon_with_process_liveness(
     name: &str,
     process_liveness: Arc<dyn ModuleProcessLiveness>,
 ) -> TestDaemon {
-    start_test_daemon_inner(name, Some(process_liveness)).await
+    start_test_daemon_inner(name, Some(process_liveness), None).await
+}
+
+pub async fn start_test_daemon_with_process_liveness_and_supervisor(
+    name: &str,
+    process_liveness: Arc<dyn ModuleProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
+) -> TestDaemon {
+    start_test_daemon_inner(name, Some(process_liveness), Some(supervisor_handle)).await
 }
 
 async fn start_test_daemon_inner(
     name: &str,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
+    supervisor_handle: Option<SupervisorHandle>,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -87,6 +96,9 @@ async fn start_test_daemon_inner(
     let mut handler = ControlHandler::new(Arc::clone(&registry));
     if let Some(process_liveness) = process_liveness {
         handler = handler.with_process_liveness(process_liveness);
+    }
+    if let Some(supervisor_handle) = supervisor_handle {
+        handler = handler.with_supervisor(supervisor_handle);
     }
     let control = Arc::new(handler);
     let forwarding = control.forwarding();

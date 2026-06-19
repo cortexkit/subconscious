@@ -179,6 +179,7 @@ async fn send_hello(
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest: manifest(module_id, concurrency),
         protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
     })
     .map_err(StubError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, HELLO_CORR, body)

@@ -101,12 +101,15 @@ pub struct ErrorBody {
 pub struct ModuleHelloBody {
     pub manifest: manifest::ModuleManifest,
     pub protocol_ver: u8,
+    #[serde(default)]
+    pub control_ops: Option<Vec<String>>,
 }
 
 /// subc-to-module `HELLO_ACK` body used during module registration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModuleHelloAckBody {
     pub negotiated_ver: u8,
+    pub subc_ops: Vec<String>,
     pub subc_capabilities: Vec<String>,
 }
 

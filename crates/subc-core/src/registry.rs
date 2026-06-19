@@ -7,12 +7,6 @@ use std::{
 
 use subc_protocol::manifest::ModuleManifest;
 
-/// First dynamically allocated module data-plane channel.
-///
-/// Channel 0 is reserved for subc's control plane; module registrations receive
-/// one non-zero channel for their v1 `(component, session)` routes.
-pub const FIRST_MODULE_CHANNEL: u16 = 1;
-
 /// Per-connection identity assigned by [`crate::Router`] while serving a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(u64);
@@ -44,12 +38,11 @@ pub enum ChannelState {
 pub struct ModuleRegistration {
     pub manifest: ModuleManifest,
     pub negotiated_ver: u8,
-    pub channels: Vec<u16>,
     pub state: ChannelState,
     pub connection_id: ConnectionId,
 }
 
-/// Control-plane registry for module manifests and channel ownership.
+/// Control-plane registry for module manifests and supervision ownership.
 ///
 /// Duplicate active `module_id`s are rejected rather than replaced. Rejection is
 /// the safer v1 behavior because replacing a still-connected module could hijack
@@ -60,28 +53,14 @@ pub struct Registry {
     inner: Mutex<RegistryInner>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct RegistryInner {
     modules: HashMap<String, ModuleRegistration>,
-    channels: HashMap<u16, String>,
-    next_channel: u16,
     generation: u64,
 }
 
-impl Default for RegistryInner {
-    fn default() -> Self {
-        Self {
-            modules: HashMap::new(),
-            channels: HashMap::new(),
-            next_channel: FIRST_MODULE_CHANNEL,
-            generation: 0,
-        }
-    }
-}
-
 impl Registry {
-    /// Register a module manifest, negotiate a single v1 route channel, and mark
-    /// the registration active once allocation succeeds.
+    /// Register a module manifest and mark the registration active.
     pub fn register(
         &self,
         manifest: ModuleManifest,
@@ -94,16 +73,13 @@ impl Registry {
             return Err(RegistryError::DuplicateModuleId { module_id });
         }
 
-        let channel = inner.allocate_channel()?;
         let registration = ModuleRegistration {
             manifest,
             negotiated_ver,
-            channels: vec![channel],
             state: ChannelState::Active,
             connection_id,
         };
 
-        inner.channels.insert(channel, module_id.clone());
         inner.modules.insert(module_id, registration.clone());
         inner.bump_generation();
         Ok(registration)
@@ -113,23 +89,7 @@ impl Registry {
         Ok(self.lock_inner()?.modules.get(module_id).cloned())
     }
 
-    pub fn module_for_channel(
-        &self,
-        channel: u16,
-    ) -> Result<Option<ModuleRegistration>, RegistryError> {
-        let inner = self.lock_inner()?;
-        Ok(inner
-            .channels
-            .get(&channel)
-            .and_then(|module_id| inner.modules.get(module_id))
-            .cloned())
-    }
-
-    pub fn is_channel_active(&self, channel: u16) -> Result<bool, RegistryError> {
-        Ok(self.module_for_channel(channel)?.is_some())
-    }
-
-    pub fn active_module_count(&self) -> Result<usize, RegistryError> {
+    pub fn active_registration_count(&self) -> Result<usize, RegistryError> {
         Ok(self.lock_inner()?.modules.len())
     }
 
@@ -169,32 +129,8 @@ impl Registry {
 }
 
 impl RegistryInner {
-    fn allocate_channel(&mut self) -> Result<u16, RegistryError> {
-        // Worst case under full allocation scans every non-zero u16 channel once
-        // before reporting exhaustion.
-        let mut candidate = self.next_channel;
-        for _ in FIRST_MODULE_CHANNEL..=u16::MAX {
-            if candidate == 0 {
-                candidate = FIRST_MODULE_CHANNEL;
-            }
-            if !self.channels.contains_key(&candidate) {
-                self.next_channel = candidate.wrapping_add(1);
-                if self.next_channel == 0 {
-                    self.next_channel = FIRST_MODULE_CHANNEL;
-                }
-                return Ok(candidate);
-            }
-            candidate = candidate.wrapping_add(1);
-        }
-
-        Err(RegistryError::ChannelExhausted)
-    }
-
     fn close_module(&mut self, module_id: &str) -> Option<ModuleRegistration> {
         let mut registration = self.modules.remove(module_id)?;
-        for channel in &registration.channels {
-            self.channels.remove(channel);
-        }
         registration.state = ChannelState::Closed;
         self.bump_generation();
         Some(registration)
@@ -208,7 +144,6 @@ impl RegistryInner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
     DuplicateModuleId { module_id: String },
-    ChannelExhausted,
     Poisoned,
 }
 
@@ -218,7 +153,6 @@ impl fmt::Display for RegistryError {
             Self::DuplicateModuleId { module_id } => {
                 write!(f, "module_id '{module_id}' is already registered")
             }
-            Self::ChannelExhausted => write!(f, "no module channels are available"),
             Self::Poisoned => write!(f, "registry lock was poisoned"),
         }
     }

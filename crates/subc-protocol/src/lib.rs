@@ -107,7 +107,6 @@ pub struct ModuleHelloBody {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModuleHelloAckBody {
     pub negotiated_ver: u8,
-    pub channels: Vec<u16>,
     pub subc_capabilities: Vec<String>,
 }
 

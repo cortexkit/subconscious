@@ -273,13 +273,10 @@ name = "subc-core"
 version = "0.0.0"
 dependencies = [
  "cortexkit-paths",
- "getrandom",
- "hmac",
  "serde",
  "serde_json",
- "sha2",
  "subc-protocol",
- "subtle",
+ "subc-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -291,6 +288,19 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "subc-transport"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
 ]
 
 [[package]]

@@ -6,7 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod bootstrap;
+pub mod connection_file;
 pub mod control;
 pub mod forwarding;
 mod frame;

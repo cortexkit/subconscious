@@ -1,64 +1,36 @@
-use std::{
-    fs,
-    path::PathBuf,
-    process,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use subc_core::{
-    serve_listener, ControlHandler, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy,
-    Router, SupervisedModule, Supervisor, SUBC_SOCKET_ENV,
+    ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SupervisedModule, Supervisor,
 };
-use tokio::{
-    net::UnixListener,
-    task::JoinHandle,
-    time::{sleep, Instant},
-};
+use tokio::time::{sleep, Instant};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod common;
+use common::TestDaemon;
 
 struct TestServer {
-    registry: Arc<Registry>,
-    socket_path: PathBuf,
-    temp_dir: PathBuf,
-    task: JoinHandle<Result<(), subc_core::ServerError>>,
+    daemon: TestDaemon,
 }
 
 impl TestServer {
-    fn start() -> Self {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).unwrap();
-        let socket_path = temp_dir.join("s.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-
-        let registry = Arc::new(Registry::default());
-        let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
-        let router = Arc::new(Router::with_control_handler(control));
-        let task = tokio::spawn(serve_listener(listener, router));
-
+    async fn start() -> Self {
         Self {
-            registry,
-            socket_path,
-            temp_dir,
-            task,
+            daemon: TestDaemon::start("supervision-server").await,
         }
     }
 }
 
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.task.abort();
-        let _ = fs::remove_dir_all(&self.temp_dir);
+impl Deref for TestServer {
+    type Target = TestDaemon;
+
+    fn deref(&self) -> &Self::Target {
+        &self.daemon
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_registers_stub_and_reports_running() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-spawn";
     let module = supervisor.spawn(stub_spec(&server, module_id, [])).unwrap();
@@ -80,7 +52,7 @@ async fn spawn_registers_stub_and_reports_running() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_restarts_and_reregisters_stub() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 5, Duration::from_millis(20));
     let module_id = "fake-aft-restart";
     let module = supervisor
@@ -106,7 +78,7 @@ async fn crash_restarts_and_reregisters_stub() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_cap_marks_module_failed_without_infinite_loop() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let max_restarts = 2;
     let supervisor = supervisor(&server, max_restarts, Duration::from_millis(10));
     let module_id = "fake-aft-cap";
@@ -130,7 +102,7 @@ async fn restart_cap_marks_module_failed_without_infinite_loop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_stops_child_and_releases_registration() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-drain";
     let module = supervisor.spawn(stub_spec(&server, module_id, [])).unwrap();
@@ -155,7 +127,7 @@ async fn drain_stops_child_and_releases_registration() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_requires_process_alive_and_active_registration() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-live";
     let module = supervisor.spawn(stub_spec(&server, module_id, [])).unwrap();
@@ -188,20 +160,15 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         RestartPolicy::new(max_restarts, backoff),
     )
     .with_drain_timeout(Duration::from_millis(25))
+    .with_connection_file_path(server.connection_file_path.clone())
 }
 
 fn stub_spec<'a>(
-    server: &TestServer,
+    _server: &TestServer,
     module_id: &str,
     extra_env: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> ModuleSpec {
-    let mut env = vec![
-        (
-            SUBC_SOCKET_ENV.to_string(),
-            server.socket_path.to_string_lossy().into_owned(),
-        ),
-        ("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()),
-    ];
+    let mut env = vec![("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())];
     env.extend(
         extra_env
             .into_iter()
@@ -252,9 +219,4 @@ async fn wait_for_status(
         }
         sleep(Duration::from_millis(10)).await;
     }
-}
-
-fn unique_temp_dir() -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("sc-{}-{nonce}", process::id()))
 }

@@ -1,6 +1,6 @@
 //! subc daemon core.
 //!
-//! This crate owns the local socket transport and the thin splice-router core:
+//! This crate owns the loopback TCP transport and the thin splice-router core:
 //! routing decisions are made from the 17-byte envelope header, while message
 //! bodies are carried as opaque bytes and are never deserialized by the router.
 
@@ -33,9 +33,12 @@ pub use router::{
     Backend, EchoBackend, ForwardBackend, FrameSink, RouteCtx, Router, RouterConnection,
     RouterError,
 };
-pub use server::{handle_connection, serve_listener, serve_uds, ConnectionError, ServerError};
+pub use server::{
+    handle_connection, serve_listener, serve_listeners, ConnectionError, ServerAuth, ServerError,
+    DEFAULT_AUTH_DEADLINE, DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS,
+};
 pub use status::{LivenessReply, PassivePoll, PollOp, StatusReply, StatusUpdate};
 pub use supervise::{
     ExitKind, ExitReport, ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError,
-    SupervisedModule, Supervisor, SUBC_SOCKET_ENV,
+    SupervisedModule, Supervisor, SUBC_ARG,
 };

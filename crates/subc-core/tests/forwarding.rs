@@ -1,5 +1,6 @@
 use std::{
     fs,
+    ops::Deref,
     path::{Path, PathBuf},
     process,
     sync::{
@@ -11,49 +12,31 @@ use std::{
 
 use serde_json::Value;
 use subc_core::{
-    read_frame, serve_listener, write_frame, AttachAck, AttachRequest, ConfigTier, ControlHandler,
-    ForwardingTable, Frame, LivenessReply, ModuleSpec, ModuleState, ModuleStatus, PassivePoll,
-    PollOp, Registry, RestartPolicy, Router, StatusReply, SupervisedModule, Supervisor,
-    SUBC_SOCKET_ENV,
+    read_frame, write_frame, AttachAck, AttachRequest, ConfigTier, ForwardingTable, Frame,
+    LivenessReply, ModuleSpec, ModuleState, ModuleStatus, PassivePoll, PollOp, Registry,
+    RestartPolicy, StatusReply, SupervisedModule, Supervisor,
 };
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
 use tokio::{
-    io::AsyncWriteExt,
-    net::{UnixListener, UnixStream},
-    task::JoinHandle,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
     time::{sleep, timeout, Instant},
 };
+
+mod common;
+use common::{connect_authed_client, TestDaemon};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct TestServer {
-    registry: Arc<Registry>,
-    forwarding: Arc<ForwardingTable>,
-    socket_path: PathBuf,
-    temp_dir: PathBuf,
-    task: JoinHandle<Result<(), subc_core::ServerError>>,
+    daemon: TestDaemon,
 }
 
 impl TestServer {
-    fn start() -> Self {
-        let temp_dir = unique_temp_dir("forwarding-server");
-        fs::create_dir_all(&temp_dir).unwrap();
-        let socket_path = temp_dir.join("s.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-
-        let registry = Arc::new(Registry::default());
-        let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
-        let forwarding = control.forwarding();
-        let router = Arc::new(Router::with_control_handler(control));
-        let task = tokio::spawn(serve_listener(listener, router));
-
+    async fn start() -> Self {
         Self {
-            registry,
-            forwarding,
-            socket_path,
-            temp_dir,
-            task,
+            daemon: TestDaemon::start("forwarding-server").await,
         }
     }
 
@@ -62,16 +45,17 @@ impl TestServer {
     }
 }
 
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.task.abort();
-        let _ = fs::remove_dir_all(&self.temp_dir);
+impl Deref for TestServer {
+    type Target = TestDaemon;
+
+    fn deref(&self) -> &Self::Target {
+        &self.daemon
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attach_then_forward_request_round_trips_through_stub() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-forwarding";
     let events_path = server.stub_events_path("attach-forwarding");
@@ -127,7 +111,7 @@ async fn attach_then_forward_request_round_trips_through_stub() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_poll_returns_cached_status_without_forwarding_to_stub() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-cache";
     let events_path = server.stub_events_path("status-cache");
@@ -181,7 +165,7 @@ async fn status_poll_returns_cached_status_without_forwarding_to_stub() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-busy-local-poll";
     let events_path = server.stub_events_path("busy-local-poll");
@@ -271,7 +255,7 @@ async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_poll_cache_miss_returns_status_unavailable() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-miss";
     let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
@@ -298,7 +282,7 @@ async fn status_poll_cache_miss_returns_status_unavailable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_cache_is_evicted_when_client_detaches() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-eviction";
     let events_path = server.stub_events_path("status-eviction");
@@ -377,7 +361,7 @@ async fn status_cache_is_evicted_when_client_detaches() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_poll_returns_false_after_module_connection_is_gone() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-liveness-gone";
     let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
@@ -401,7 +385,7 @@ async fn liveness_poll_returns_false_after_module_connection_is_gone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_client_receives_unsolicited_push_and_response_on_bound_route() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-push-single";
     let module = supervisor
@@ -433,7 +417,7 @@ async fn single_client_receives_unsolicited_push_and_response_on_bound_route() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_drop_sends_detach_relay_and_removes_binding() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-detach";
     let events_path = server.stub_events_path("detach");
@@ -479,7 +463,7 @@ async fn client_drop_sends_detach_relay_and_removes_binding() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-stale-route";
     let events_path = server.stub_events_path("stale-route");
@@ -541,7 +525,7 @@ async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejecting_attach_returns_config_divergence_without_committing_binding_then_accepts_later()
 {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-reject";
     let rejecting = supervisor
@@ -554,7 +538,9 @@ async fn rejecting_attach_returns_config_divergence_without_committing_binding_t
     wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
 
     let project = TestProject::new();
-    let mut client = UnixStream::connect(&server.socket_path).await.unwrap();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
     let error = attach_error_on_stream(&mut client, &project, 401, "ses-reject").await;
     assert_eq!(error.code, "config_divergence");
     assert!(error.message.contains("FAKE_AFT_REJECT_ATTACH"));
@@ -589,7 +575,7 @@ async fn rejecting_attach_returns_config_divergence_without_committing_binding_t
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_clients_attach_same_module_and_round_trip_independently() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-two-clients";
     let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
@@ -634,7 +620,7 @@ async fn two_clients_attach_same_module_and_round_trip_independently() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_session_slow_call_does_not_block_fast_call() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cross-session-delay";
     let module = supervisor
@@ -711,7 +697,7 @@ async fn cross_session_slow_call_does_not_block_fast_call() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_channel_responses_return_out_of_order_by_corr() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-same-channel-oood";
     let events_path = server.stub_events_path("same-channel-oood");
@@ -793,7 +779,7 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_before_response_for_cancellable_request_returns_cancelled_error() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cancel-before";
     let events_path = server.stub_events_path("cancel-before");
@@ -860,7 +846,7 @@ async fn cancel_before_response_for_cancellable_request_returns_cancelled_error(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_after_response_is_idempotent_noop() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cancel-after";
     let events_path = server.stub_events_path("cancel-after");
@@ -920,7 +906,7 @@ async fn cancel_after_response_is_idempotent_noop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn double_cancel_emits_exactly_one_cancelled_error() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-double-cancel";
     let events_path = server.stub_events_path("double-cancel");
@@ -978,7 +964,7 @@ async fn double_cancel_emits_exactly_one_cancelled_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_for_uncancellable_delayed_request_allows_normal_response() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-uncancellable";
     let events_path = server.stub_events_path("uncancellable");
@@ -1040,7 +1026,7 @@ async fn cancel_for_uncancellable_delayed_request_allows_normal_response() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_channel_cancel_returns_unknown_channel_error_and_survives() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-unknown-cancel";
     let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
@@ -1085,7 +1071,7 @@ async fn unknown_channel_cancel_returns_unknown_channel_error_and_survives() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_client_fanout_pushes_route_to_each_bound_client() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-push-fanout";
     let module = supervisor
@@ -1123,7 +1109,7 @@ async fn multi_client_fanout_pushes_route_to_each_bound_client() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_client_pipelined_requests_preserve_corr_fifo_order() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-fifo";
     let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
@@ -1161,7 +1147,7 @@ async fn single_client_pipelined_requests_preserve_corr_fifo_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serial_flow_control_window_holds_second_request_until_terminal() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-serial-flow";
     let events_path = server.stub_events_path("serial-flow");
@@ -1254,7 +1240,7 @@ async fn serial_flow_control_window_holds_second_request_until_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-cancel-flow";
     let events_path = server.stub_events_path("cancel-flow");
@@ -1350,7 +1336,7 @@ async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flow_control_over_release_guard_does_not_grow_serial_window() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-over-release";
     let events_path = server.stub_events_path("over-release");
@@ -1449,7 +1435,7 @@ async fn flow_control_over_release_guard_does_not_grow_serial_window() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-flow-teardown";
     let events_path = server.stub_events_path("flow-teardown");
@@ -1510,7 +1496,7 @@ async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succeeds() {
-    let server = TestServer::start();
+    let server = TestServer::start().await;
     let supervisor = supervisor(&server, 4, Duration::from_millis(20));
     let module_id = "fake-aft-generation";
     let module = supervisor
@@ -1575,18 +1561,23 @@ async fn attach_client(
     project: &TestProject,
     corr: u64,
     session: &str,
-) -> (UnixStream, AttachAck) {
-    let mut client = UnixStream::connect(&server.socket_path).await.unwrap();
+) -> (TcpStream, AttachAck) {
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
     let ack = attach_on_stream(&mut client, project, corr, session).await;
     (client, ack)
 }
 
-async fn attach_on_stream(
-    client: &mut UnixStream,
+async fn attach_on_stream<S>(
+    client: &mut S,
     project: &TestProject,
     corr: u64,
     session: &str,
-) -> AttachAck {
+) -> AttachAck
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     write_frame(
         client,
         &attach_frame(corr, attach_request(project, session)),
@@ -1602,12 +1593,15 @@ async fn attach_on_stream(
     serde_json::from_slice(&ack_frame.body).unwrap()
 }
 
-async fn attach_error_on_stream(
-    client: &mut UnixStream,
+async fn attach_error_on_stream<S>(
+    client: &mut S,
     project: &TestProject,
     corr: u64,
     session: &str,
-) -> ErrorBody {
+) -> ErrorBody
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     write_frame(
         client,
         &attach_frame(corr, attach_request(project, session)),
@@ -1700,7 +1694,10 @@ fn passive_poll_frame(corr: u64, op: PollOp, route_channel: u16) -> Frame {
     .unwrap()
 }
 
-async fn poll_liveness(stream: &mut UnixStream, corr: u64, route_channel: u16) -> Frame {
+async fn poll_liveness<S>(stream: &mut S, corr: u64, route_channel: u16) -> Frame
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     write_frame(
         stream,
         &passive_poll_frame(corr, PollOp::Liveness, route_channel),
@@ -1711,12 +1708,15 @@ async fn poll_liveness(stream: &mut UnixStream, corr: u64, route_channel: u16) -
     read_frame_timeout(stream).await
 }
 
-async fn read_until_push_and_response(
-    stream: &mut UnixStream,
+async fn read_until_push_and_response<S>(
+    stream: &mut S,
     route_channel: u16,
     response_corr: u64,
     response_body: &[u8],
-) -> (Frame, Frame) {
+) -> (Frame, Frame)
+where
+    S: AsyncRead + Unpin,
+{
     let mut push = None;
     let mut response = None;
 
@@ -1742,7 +1742,10 @@ async fn read_until_push_and_response(
     )
 }
 
-async fn read_push(stream: &mut UnixStream, route_channel: u16) -> Frame {
+async fn read_push<S>(stream: &mut S, route_channel: u16) -> Frame
+where
+    S: AsyncRead + Unpin,
+{
     let frame = read_frame_timeout(stream).await;
     assert_push(&frame, route_channel);
     frame
@@ -1787,7 +1790,10 @@ fn assert_error(frame: &Frame, route_channel: u16, corr: u64, code: &str) -> Err
     body
 }
 
-async fn read_frame_timeout(stream: &mut UnixStream) -> Frame {
+async fn read_frame_timeout<S>(stream: &mut S) -> Frame
+where
+    S: AsyncRead + Unpin,
+{
     timeout(READ_TIMEOUT, async {
         read_frame(stream)
             .await
@@ -1798,7 +1804,10 @@ async fn read_frame_timeout(stream: &mut UnixStream) -> Frame {
     .expect("timed out waiting for frame")
 }
 
-async fn read_frame_timeout_for(stream: &mut UnixStream, wait: Duration) -> Frame {
+async fn read_frame_timeout_for<S>(stream: &mut S, wait: Duration) -> Frame
+where
+    S: AsyncRead + Unpin,
+{
     timeout(wait, async {
         read_frame(stream)
             .await
@@ -1809,7 +1818,10 @@ async fn read_frame_timeout_for(stream: &mut UnixStream, wait: Duration) -> Fram
     .expect("timed out waiting for frame")
 }
 
-async fn assert_no_frame_within(stream: &mut UnixStream, wait: Duration) {
+async fn assert_no_frame_within<S>(stream: &mut S, wait: Duration)
+where
+    S: AsyncRead + Unpin,
+{
     match timeout(wait, read_frame(stream)).await {
         Err(_) => {}
         Ok(Ok(Some(frame))) => panic!("unexpected frame within {wait:?}: {frame:?}"),
@@ -1824,25 +1836,20 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         RestartPolicy::new(max_restarts, backoff),
     )
     .with_drain_timeout(Duration::from_millis(25))
+    .with_connection_file_path(server.connection_file_path.clone())
 }
 
 fn stub_spec(server: &TestServer, module_id: &str) -> ModuleSpec {
     stub_spec_with_env(server, module_id, std::iter::empty::<(&str, &str)>())
 }
 
-fn stub_spec_with_env<K, V, I>(server: &TestServer, module_id: &str, extra_env: I) -> ModuleSpec
+fn stub_spec_with_env<K, V, I>(_server: &TestServer, module_id: &str, extra_env: I) -> ModuleSpec
 where
     K: Into<String>,
     V: Into<String>,
     I: IntoIterator<Item = (K, V)>,
 {
-    let mut env = vec![
-        (
-            SUBC_SOCKET_ENV.to_string(),
-            server.socket_path.to_string_lossy().into_owned(),
-        ),
-        ("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()),
-    ];
+    let mut env = vec![("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())];
     env.extend(
         extra_env
             .into_iter()
@@ -1994,7 +2001,10 @@ where
         .unwrap_or_else(|| panic!("stub event missing from {events:?}"))
 }
 
-async fn read_frame_or_close_timeout(stream: &mut UnixStream, wait: Duration) -> Option<Frame> {
+async fn read_frame_or_close_timeout<S>(stream: &mut S, wait: Duration) -> Option<Frame>
+where
+    S: AsyncRead + Unpin,
+{
     timeout(wait, read_frame(stream))
         .await
         .expect("timed out waiting for frame or clean close")

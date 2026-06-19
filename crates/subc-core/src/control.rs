@@ -1,20 +1,21 @@
 use std::{fmt, sync::Arc};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use subc_control::{AttachAck, AttachRequest, LivenessReply, PassivePoll, PollOp, StatusReply};
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
-    ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
+    session::{AttachRelay, AttachRelayResponse, DetachRelay},
+    ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, StatusUpdate,
+    PROTOCOL_VERSION,
 };
 use tracing::{debug, warn};
 
 use crate::{
     forwarding::{
-        AttachAck, AttachRelay, AttachRelayOutcome, AttachRelayResponse, AttachRequest,
-        DetachRelay, ForwardingError, ForwardingTable, ModuleEndpointId, ReleasedRoute,
+        AttachRelayOutcome, ForwardingError, ForwardingTable, ModuleEndpointId, ReleasedRoute,
     },
     registry::{ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
-    status::{LivenessReply, PassivePoll, PollOp, StatusReply, StatusUpdate},
     supervise::ModuleProcessLiveness,
     Frame, ProjectRootId,
 };
@@ -30,19 +31,6 @@ const CAP_MANIFEST_REGISTRATION: &str = "manifest_registration_v1";
 const CAP_CHANNEL_LIFECYCLE: &str = "channel_lifecycle_v1";
 const CAP_PING_PONG: &str = "ping_pong_v1";
 const CAP_SESSION_ATTACH: &str = "session_attach_v1";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HelloBody {
-    pub manifest: ModuleManifest,
-    pub protocol_ver: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HelloAckBody {
-    pub negotiated_ver: u8,
-    pub channels: Vec<u16>,
-    pub subc_capabilities: Vec<String>,
-}
 
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
@@ -267,7 +255,7 @@ impl ControlHandler {
             corr = frame.header.corr,
             "handling HELLO"
         );
-        let hello = match serde_json::from_slice::<HelloBody>(&frame.body) {
+        let hello = match serde_json::from_slice::<ModuleHelloBody>(&frame.body) {
             Ok(hello) => hello,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -352,7 +340,7 @@ impl ControlHandler {
             }
         }
 
-        let ack = HelloAckBody {
+        let ack = ModuleHelloAckBody {
             negotiated_ver,
             channels: registration.channels,
             subc_capabilities: self.subc_capabilities.as_ref().to_vec(),
@@ -912,7 +900,7 @@ mod tests {
     }
 
     fn hello_frame(module_id: &str, protocol_ver: u8, corr: u64) -> Frame {
-        let body = serde_json::to_vec(&HelloBody {
+        let body = serde_json::to_vec(&ModuleHelloBody {
             manifest: manifest(module_id, protocol_ver),
             protocol_ver,
         })
@@ -942,7 +930,7 @@ mod tests {
         )
     }
 
-    fn parse_ack(frame: &Frame) -> HelloAckBody {
+    fn parse_ack(frame: &Frame) -> ModuleHelloAckBody {
         serde_json::from_slice(&frame.body).unwrap()
     }
 

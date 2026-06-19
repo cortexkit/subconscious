@@ -12,18 +12,18 @@ use std::{
 };
 
 use serde_json::Value;
+use subc_control::{AttachAck, AttachRequest, LivenessReply, PassivePoll, PollOp, StatusReply};
 use subc_core::{
-    read_frame, write_frame, AttachAck, AttachRequest, ConfigTier, ForwardingTable, Frame,
-    HelloAckBody, HelloBody, LivenessReply, ModuleSpec, ModuleState, ModuleStatus, PassivePoll,
-    PollOp, Registry, RestartPolicy, StatusReply, SupervisedModule, Supervisor,
-    SupervisorProcessLiveness,
+    read_frame, write_frame, ForwardingTable, Frame, ModuleSpec, ModuleState, ModuleStatus,
+    Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorProcessLiveness,
 };
 use subc_protocol::{
     manifest::{
         Bindings, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope, ModuleManifest,
         StorageBinding, StorageKind, StorageScope, TrustTier,
     },
-    ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
+    session::ConfigTier,
+    ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -1828,7 +1828,7 @@ fn consumer_manifest(module_id: &str) -> ModuleManifest {
 
 fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
     let protocol_ver = manifest.protocol_ver;
-    let body = serde_json::to_vec(&HelloBody {
+    let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver,
     })
@@ -1847,7 +1847,7 @@ async fn register_manifest_on_stream<S>(
     stream: &mut S,
     manifest: ModuleManifest,
     corr: u64,
-) -> HelloAckBody
+) -> ModuleHelloAckBody
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

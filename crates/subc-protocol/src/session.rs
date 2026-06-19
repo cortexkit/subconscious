@@ -14,7 +14,7 @@
 //!
 //! Config is forwarded as an ordered, provenance-tagged tier list. subc treats
 //! every config document as opaque text and preserves `tier`, `source`, and
-//! `doc` exactly from [`AttachRequest`] to [`AttachRelay`]; it never parses,
+//! `doc` exactly from the client attach request to [`AttachRelay`]; it never parses,
 //! merges, partitions, or relabels config in transit.
 //!
 //! [`ErrorBody`]: crate::ErrorBody
@@ -45,23 +45,6 @@ pub struct ConfigTier {
     pub doc: String,
 }
 
-/// Client-originated channel-0 control RPC body for binding a harness session
-/// to a module route.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AttachRequest {
-    pub project_root: PathBuf,
-    pub harness: String,
-    pub session: String,
-    /// Ordered config tiers; precedence is list order, with later tiers winning.
-    pub config: Vec<ConfigTier>,
-}
-
-/// subc's channel-0 response body for an accepted session attach.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AttachAck {
-    pub route_channel: u16,
-}
-
 /// subc-to-module channel-0 control RPC body asking the singleton module to bind
 /// a route channel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -70,7 +53,7 @@ pub struct AttachRelay {
     pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
-    /// Ordered config tiers forwarded from [`AttachRequest`] unchanged; subc
+    /// Ordered config tiers forwarded from the client attach request unchanged; subc
     /// never merges, partitions, parses, or relabels config.
     pub config: Vec<ConfigTier>,
 }

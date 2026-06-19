@@ -12,7 +12,10 @@ use std::{
     time::Duration,
 };
 
-use subc_core::{serve_listener, ControlHandler, ForwardingTable, Registry, Router, ServerAuth};
+use subc_core::{
+    serve_listener, ControlHandler, ForwardingTable, ModuleProcessLiveness, Registry, Router,
+    ServerAuth,
+};
 use subc_transport::{
     authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
     SCHEMA_VERSION,
@@ -48,6 +51,20 @@ impl Drop for TestDaemon {
 }
 
 pub async fn start_test_daemon(name: &str) -> TestDaemon {
+    start_test_daemon_inner(name, None).await
+}
+
+pub async fn start_test_daemon_with_process_liveness(
+    name: &str,
+    process_liveness: Arc<dyn ModuleProcessLiveness>,
+) -> TestDaemon {
+    start_test_daemon_inner(name, Some(process_liveness)).await
+}
+
+async fn start_test_daemon_inner(
+    name: &str,
+    process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
+) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     fs::create_dir_all(&temp_dir).unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -67,7 +84,11 @@ pub async fn start_test_daemon(name: &str) -> TestDaemon {
     write_atomic(&connection_file_path, &conn).unwrap();
 
     let registry = Arc::new(Registry::default());
-    let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
+    let mut handler = ControlHandler::new(Arc::clone(&registry));
+    if let Some(process_liveness) = process_liveness {
+        handler = handler.with_process_liveness(process_liveness);
+    }
+    let control = Arc::new(handler);
     let forwarding = control.forwarding();
     let router = Arc::new(Router::with_control_handler(control));
     let auth = ServerAuth::new(conn.key, conn.daemon_id, conn.daemon_ver);

@@ -1,0 +1,5 @@
+{
+  "kind": "status",
+  "op": "route.poll",
+  "route_channel": 42
+}

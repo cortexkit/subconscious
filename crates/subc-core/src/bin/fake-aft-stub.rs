@@ -18,7 +18,9 @@ use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        InternalTransport, ManagementOperation, ManagementOperationKind, ObservabilityKind,
+        ObservabilitySurface, PipelineAppliesTo, PipelineStageKind, ProviderRole, StorageBinding,
+        StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
     ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
@@ -42,6 +44,8 @@ const FAKE_AFT_DELAY_FROM_BODY_ENV: &str = "FAKE_AFT_DELAY_FROM_BODY";
 const FAKE_AFT_CONCURRENCY_ENV: &str = "FAKE_AFT_CONCURRENCY";
 const FAKE_AFT_DOUBLE_TERMINAL_ENV: &str = "FAKE_AFT_DOUBLE_TERMINAL";
 const FAKE_AFT_STATUS_ENV: &str = "FAKE_AFT_STATUS";
+const FAKE_AFT_ROLE_ENV: &str = "FAKE_AFT_ROLE";
+const FAKE_AFT_SERVICE_ID_ENV: &str = "FAKE_AFT_SERVICE_ID";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
@@ -124,7 +128,13 @@ where
 {
     let mut state = StubState::default();
 
-    send_hello(&writer, &config.module_id, config.concurrency.clone()).await?;
+    send_hello(
+        &writer,
+        &config.module_id,
+        config.role.clone(),
+        config.concurrency.clone(),
+    )
+    .await?;
     expect_hello_ack(read_half).await?;
 
     if let Some(crash_after) = config.crash_after {
@@ -174,10 +184,11 @@ where
 async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     module_id: &str,
+    role: StubRole,
     concurrency: Concurrency,
 ) -> Result<(), StubError> {
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: manifest(module_id, concurrency),
+        manifest: manifest(module_id, role, concurrency),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
     })
@@ -722,23 +733,17 @@ fn append_json_line(path: &Path, event: Value) -> Result<(), StubError> {
     writeln!(file, "{event}").map_err(StubError::Io)
 }
 
-fn manifest(module_id: &str, concurrency: Concurrency) -> subc_protocol::manifest::ModuleManifest {
+fn manifest(
+    module_id: &str,
+    role: StubRole,
+    concurrency: Concurrency,
+) -> subc_protocol::manifest::ModuleManifest {
     subc_protocol::manifest::ModuleManifest {
         module_id: module_id.to_string(),
         module_version: "0.0.0-fake".to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "fake_read".to_string(),
-                mutates: false,
-                schema: json!({"type": "object"}),
-            }],
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency,
-            emits_push: true,
-            sub_supervises: true,
-        }],
+        provides: vec![provider_role(role, concurrency)],
         consumes: Vec::new(),
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
@@ -761,6 +766,62 @@ fn manifest(module_id: &str, concurrency: Concurrency) -> subc_protocol::manifes
     }
 }
 
+fn provider_role(role: StubRole, concurrency: Concurrency) -> ProviderRole {
+    match role {
+        StubRole::ToolProvider => ProviderRole::ToolProvider {
+            tools: vec![Tool {
+                name: "fake_read".to_string(),
+                mutates: false,
+                schema: json!({"type": "object"}),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency,
+            emits_push: true,
+            sub_supervises: true,
+        },
+        StubRole::ManagementSurface => ProviderRole::ManagementSurface {
+            operations: vec![
+                ManagementOperation {
+                    name: "memory.list".to_string(),
+                    kind: ManagementOperationKind::Query,
+                },
+                ManagementOperation {
+                    name: "bus.publish".to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                },
+            ],
+            config_schema: json!({"type": "object"}),
+            observability: vec![ObservabilitySurface {
+                name: "fake.snapshot".to_string(),
+                kind: ObservabilityKind::Snapshot,
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        },
+        StubRole::InternalService { service_id } => ProviderRole::InternalService {
+            service_id,
+            transport: InternalTransport::Bulk,
+            agent_facing: true,
+            operations: vec![
+                "embed".to_string(),
+                "ann_query".to_string(),
+                "llm.complete".to_string(),
+                "peer.forward".to_string(),
+            ],
+        },
+        StubRole::PipelineStage => ProviderRole::PipelineStage {
+            stage: PipelineStageKind::Transform,
+            applies_to: PipelineAppliesTo {
+                provider: "*".to_string(),
+                model: "*".to_string(),
+            },
+            interface: "fake-pipeline-v1".to_string(),
+            declares_frozen_floor: true,
+            needs_signals: vec!["route.status".to_string()],
+            conformance_class: "fixture".to_string(),
+        },
+    }
+}
+
 fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
@@ -777,6 +838,7 @@ struct StubConfig {
     fanout_on_request: bool,
     delay_from_body: bool,
     concurrency: Concurrency,
+    role: StubRole,
     double_terminal: bool,
     status: Option<String>,
 }
@@ -812,6 +874,7 @@ impl StubConfig {
             .transpose()?;
         let events_path = env::var_os(FAKE_AFT_EVENTS_PATH_ENV).map(PathBuf::from);
         let concurrency = concurrency_from_env()?;
+        let role = role_from_env()?;
         let status = env::var(FAKE_AFT_STATUS_ENV).ok().map(|raw| {
             if raw.is_empty() {
                 "idle".to_string()
@@ -831,6 +894,7 @@ impl StubConfig {
             fanout_on_request: env_flag(FAKE_AFT_FANOUT_ON_REQUEST_ENV),
             delay_from_body: env_flag(FAKE_AFT_DELAY_FROM_BODY_ENV),
             concurrency,
+            role,
             double_terminal: env_flag(FAKE_AFT_DOUBLE_TERMINAL_ENV),
             status,
         })
@@ -873,6 +937,33 @@ fn concurrency_from_env() -> Result<Concurrency, StubError> {
     }
 }
 
+#[derive(Debug, Clone)]
+enum StubRole {
+    ToolProvider,
+    ManagementSurface,
+    InternalService { service_id: String },
+    PipelineStage,
+}
+
+fn role_from_env() -> Result<StubRole, StubError> {
+    let raw = env::var(FAKE_AFT_ROLE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "tool_provider".to_string());
+    match raw.as_str() {
+        "tool_provider" => Ok(StubRole::ToolProvider),
+        "management_surface" => Ok(StubRole::ManagementSurface),
+        "internal_service" => Ok(StubRole::InternalService {
+            service_id: env::var(FAKE_AFT_SERVICE_ID_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "internal".to_string()),
+        }),
+        "pipeline_stage" => Ok(StubRole::PipelineStage),
+        _ => Err(StubError::InvalidRole { raw }),
+    }
+}
+
 fn env_flag(key: &str) -> bool {
     matches!(
         env::var(key).ok().as_deref(),
@@ -892,6 +983,9 @@ enum StubError {
         source: std::num::ParseIntError,
     },
     InvalidConcurrency {
+        raw: String,
+    },
+    InvalidRole {
         raw: String,
     },
     ConnectionFile {
@@ -944,6 +1038,10 @@ impl fmt::Display for StubError {
             Self::InvalidConcurrency { raw } => write!(
                 f,
                 "invalid {FAKE_AFT_CONCURRENCY_ENV} value '{raw}': expected serial, module_managed, or stateless_parallel"
+            ),
+            Self::InvalidRole { raw } => write!(
+                f,
+                "invalid {FAKE_AFT_ROLE_ENV} value '{raw}': expected tool_provider, management_surface, internal_service, or pipeline_stage"
             ),
             Self::ConnectionFile { path, source } => write!(
                 f,
@@ -1008,6 +1106,7 @@ impl Error for StubError {
             | Self::NoEndpoint { .. }
             | Self::InvalidEndpoint { .. }
             | Self::InvalidConcurrency { .. }
+            | Self::InvalidRole { .. }
             | Self::WriterClosed
             | Self::InFlightPoisoned
             | Self::ConnectionClosedBeforeHelloAck

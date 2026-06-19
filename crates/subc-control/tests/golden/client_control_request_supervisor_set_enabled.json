@@ -1,0 +1,5 @@
+{
+  "enabled": false,
+  "module_id": "aft-tools",
+  "op": "supervisor.set_enabled"
+}

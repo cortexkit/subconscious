@@ -1,0 +1,16 @@
+{
+  "capabilities": [
+    "manifest_registration_v1"
+  ],
+  "op": "server.describe",
+  "protocol_ver": 1,
+  "subc_ops": [
+    "server.describe",
+    "catalog.list",
+    "route.open",
+    "route.poll",
+    "supervisor.list",
+    "supervisor.restart",
+    "supervisor.set_enabled"
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "subc-mcp"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "subc MCP integration skeleton: thin stdio shim and two-faced module (no MCP yet)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subc-protocol = { path = "../subc-protocol" }
+subc-transport = { path = "../subc-transport" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "process"] }
+
+[dev-dependencies]
+subc-core = { path = "../subc-core" }

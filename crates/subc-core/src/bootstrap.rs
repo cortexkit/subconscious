@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use subc_transport::{
@@ -27,6 +27,8 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_SUBC_PORT: u16 = 8757;
 pub const SUBC_PORT_ENV: &str = "SUBC_PORT";
@@ -609,6 +611,7 @@ mod tests {
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

@@ -33,10 +33,13 @@ async fn spawn_registers_stub_and_reports_running() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-spawn";
-    let module = supervisor.spawn(stub_spec(&server, module_id, [])).unwrap();
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
-    let registration =
-        wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let registration = server
+        .registry
+        .get_module(module_id)
+        .unwrap()
+        .expect("spawn_stub waits for registration");
     assert_eq!(registration.manifest.module_id, module_id);
 
     let status = wait_for_status(&module, Duration::from_secs(1), |status| {
@@ -55,15 +58,13 @@ async fn crash_restarts_and_reregisters_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 5, Duration::from_millis(20));
     let module_id = "fake-aft-restart";
-    let module = supervisor
-        .spawn(stub_spec(
-            &server,
-            module_id,
-            [("FAKE_AFT_CRASH_AFTER_MS", "250")],
-        ))
-        .unwrap();
-
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "250")],
+    )
+    .await;
 
     let status = wait_for_status(&module, Duration::from_secs(3), |status| {
         status.restart_count >= 1 && status.state == ModuleState::Running && status.live
@@ -105,9 +106,7 @@ async fn drain_stops_child_and_releases_registration() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-drain";
-    let module = supervisor.spawn(stub_spec(&server, module_id, [])).unwrap();
-
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
     module.drain().await.unwrap();
 
@@ -125,10 +124,13 @@ async fn liveness_requires_process_alive_and_active_registration() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-live";
-    let module = supervisor.spawn(stub_spec(&server, module_id, [])).unwrap();
+    let module = spawn_stub(&server, &supervisor, module_id).await;
 
-    let registration =
-        wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let registration = server
+        .registry
+        .get_module(module_id)
+        .unwrap()
+        .expect("spawn_stub waits for registration");
     let live = module.status().unwrap();
     assert_eq!(live.state, ModuleState::Running);
     assert!(live.process_alive);
@@ -156,6 +158,33 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
     )
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.connection_file_path.clone())
+}
+
+async fn spawn_stub(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+) -> SupervisedModule {
+    spawn_stub_with_env(
+        server,
+        supervisor,
+        module_id,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .await
+}
+
+async fn spawn_stub_with_env<'a>(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+    extra_env: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> SupervisedModule {
+    let module = supervisor
+        .spawn(stub_spec(server, module_id, extra_env))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    module
 }
 
 fn stub_spec<'a>(

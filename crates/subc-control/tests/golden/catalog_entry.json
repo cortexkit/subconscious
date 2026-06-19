@@ -1,0 +1,75 @@
+{
+  "control_ops": [
+    "route.bind",
+    "route.status"
+  ],
+  "module_id": "aft-tools",
+  "roles": [
+    {
+      "concurrency": "module_managed",
+      "emits_push": true,
+      "identity_scope": [
+        "project",
+        "session"
+      ],
+      "role": "tool_provider",
+      "sub_supervises": true,
+      "tools": [
+        {
+          "mutates": false,
+          "name": "memory.read",
+          "schema": {
+            "required": [
+              "id"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "applies_to": {
+        "model": "claude",
+        "provider": "anthropic"
+      },
+      "conformance_class": "lossless",
+      "declares_frozen_floor": true,
+      "interface": "proxy-transform-v1",
+      "needs_signals": [
+        "route.status"
+      ],
+      "role": "pipeline_stage",
+      "stage": "transform"
+    },
+    {
+      "config_schema": {
+        "type": "object"
+      },
+      "identity_scope": [
+        "project"
+      ],
+      "observability": [
+        {
+          "kind": "snapshot",
+          "name": "memory.stats"
+        }
+      ],
+      "operations": [
+        {
+          "kind": "query",
+          "name": "memory.list"
+        }
+      ],
+      "role": "management_surface"
+    },
+    {
+      "agent_facing": true,
+      "operations": [
+        "llm.complete"
+      ],
+      "role": "internal_service",
+      "service_id": "llm",
+      "transport": "bulk"
+    }
+  ]
+}

@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use crate::{
     server::{serve_listeners, ServerAuth, ServerError},
-    Router,
+    ControlHandler, Router, SupervisorProcessLiveness,
 };
 use std::sync::Arc;
 
@@ -116,7 +116,10 @@ pub async fn run() -> Result<(), BootstrapError> {
                 endpoints = ?bound.connection_info.endpoints,
                 "subc daemon starting"
             );
-            let router = Arc::new(Router::with_default_self_handler());
+            let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+            let control =
+                Arc::new(ControlHandler::default().with_process_liveness(process_liveness));
+            let router = Arc::new(Router::with_control_handler(control));
             let auth = ServerAuth::new(
                 bound.connection_info.key.clone(),
                 bound.connection_info.daemon_id,

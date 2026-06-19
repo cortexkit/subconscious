@@ -12,7 +12,7 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_control::{AttachAck, AttachRequest, LivenessReply, PassivePoll, PollOp, StatusReply};
+use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_core::{
     read_frame, write_frame, ForwardingTable, Frame, ModuleSpec, ModuleState, ModuleStatus,
     Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorProcessLiveness,
@@ -20,10 +20,11 @@ use subc_core::{
 use subc_protocol::{
     manifest::{
         Bindings, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope, ModuleManifest,
-        StorageBinding, StorageKind, StorageScope, TrustTier,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::ConfigTier,
-    ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
+    RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -68,7 +69,7 @@ impl Deref for TestServer {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attach_then_forward_request_round_trips_through_stub() {
+async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-forwarding";
@@ -91,6 +92,23 @@ async fn attach_then_forward_request_round_trips_through_stub() {
         event["kind"] == "attach"
     })
     .await;
+    assert_eq!(
+        attach_event["target"]["kind"].as_str(),
+        Some("tool_provider")
+    );
+    assert_eq!(
+        attach_event["target"]["module_id"].as_str(),
+        Some(module_id)
+    );
+    let canonical_project = fs::canonicalize(&project.path).unwrap();
+    assert_eq!(
+        attach_event["identity"]["project_root"].as_str(),
+        Some(canonical_project.to_str().unwrap())
+    );
+    assert_eq!(
+        attach_event["identity"]["session"].as_str(),
+        Some("ses-forwarding")
+    );
     let forwarded_config: Vec<ConfigTier> =
         serde_json::from_value(attach_event["config"].clone()).unwrap();
     assert_eq!(forwarded_config, attach_config(&project, "ses-forwarding"));
@@ -179,7 +197,7 @@ async fn non_tool_provider_hello_registers_without_hijacking_active_forwarding_m
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn status_poll_returns_cached_status_without_forwarding_to_stub() {
+async fn route_poll_produces_zero_module_frames() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-cache";
@@ -211,7 +229,7 @@ async fn status_poll_returns_cached_status_without_forwarding_to_stub() {
     let poll_corr = 112;
     write_frame(
         &mut client,
-        &passive_poll_frame(poll_corr, PollOp::Status, ack.route_channel),
+        &route_poll_frame(poll_corr, PollKind::Status, ack.route_channel),
     )
     .await
     .unwrap();
@@ -284,13 +302,13 @@ async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
     let polls_sent = Instant::now();
     write_frame(
         &mut client,
-        &passive_poll_frame(status_corr, PollOp::Status, ack.route_channel),
+        &route_poll_frame(status_corr, PollKind::Status, ack.route_channel),
     )
     .await
     .unwrap();
     write_frame(
         &mut client,
-        &passive_poll_frame(liveness_corr, PollOp::Liveness, ack.route_channel),
+        &route_poll_frame(liveness_corr, PollKind::Liveness, ack.route_channel),
     )
     .await
     .unwrap();
@@ -323,7 +341,7 @@ async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn status_poll_cache_miss_returns_status_unavailable() {
+async fn route_poll_status_cache_miss_returns_none() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-status-miss";
@@ -336,15 +354,14 @@ async fn status_poll_cache_miss_returns_status_unavailable() {
     let poll_corr = 132;
     write_frame(
         &mut client,
-        &passive_poll_frame(poll_corr, PollOp::Status, ack.route_channel),
+        &route_poll_frame(poll_corr, PollKind::Status, ack.route_channel),
     )
     .await
     .unwrap();
     client.flush().await.unwrap();
 
-    let error = read_frame_timeout(&mut client).await;
-    let body = assert_error(&error, 0, poll_corr, "status_unavailable");
-    assert!(body.message.contains(&ack.route_channel.to_string()));
+    let response = read_frame_timeout(&mut client).await;
+    assert_status_none_reply(&response, poll_corr);
 
     module.stop().await.unwrap();
 }
@@ -380,7 +397,7 @@ async fn status_cache_is_evicted_when_client_detaches() {
 
     write_frame(
         &mut first,
-        &passive_poll_frame(142, PollOp::Status, first_ack.route_channel),
+        &route_poll_frame(142, PollKind::Status, first_ack.route_channel),
     )
     .await
     .unwrap();
@@ -407,17 +424,17 @@ async fn status_cache_is_evicted_when_client_detaches() {
 
     write_frame(
         &mut second,
-        &passive_poll_frame(144, PollOp::Status, first_ack.route_channel),
+        &route_poll_frame(144, PollKind::Status, first_ack.route_channel),
     )
     .await
     .unwrap();
     second.flush().await.unwrap();
-    let old_route_error = read_frame_timeout(&mut second).await;
-    assert_error(&old_route_error, 0, 144, "status_unavailable");
+    let old_route_status = read_frame_timeout(&mut second).await;
+    assert_status_none_reply(&old_route_status, 144);
 
     write_frame(
         &mut second,
-        &passive_poll_frame(145, PollOp::Status, second_ack.route_channel),
+        &route_poll_frame(145, PollKind::Status, second_ack.route_channel),
     )
     .await
     .unwrap();
@@ -485,7 +502,7 @@ async fn single_client_receives_unsolicited_push_and_response_on_bound_route() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_drop_sends_detach_relay_and_removes_binding() {
+async fn client_drop_sends_route_goodbye_and_removes_binding() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-detach";
@@ -552,8 +569,8 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
     let mut client = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
-    let first_ack = attach_on_stream(&mut client, &project, 601, "ses-route-a").await;
-    let second_ack = attach_on_stream(&mut client, &project, 602, "ses-route-b").await;
+    let first_ack = attach_on_stream(&mut client, &project, 601, "ses-route-a", module_id).await;
+    let second_ack = attach_on_stream(&mut client, &project, 602, "ses-route-b", module_id).await;
     assert_ne!(first_ack.route_channel, second_ack.route_channel);
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 2);
 
@@ -703,8 +720,8 @@ async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rejecting_attach_returns_config_divergence_without_committing_binding_then_accepts_later()
-{
+async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_binding_then_accepts_later(
+) {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-reject";
@@ -721,9 +738,12 @@ async fn rejecting_attach_returns_config_divergence_without_committing_binding_t
     let mut client = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
-    let error = attach_error_on_stream(&mut client, &project, 401, "ses-reject").await;
+    let error = attach_error_on_stream(&mut client, &project, 401, "ses-reject", module_id).await;
     assert_eq!(error.code, "config_divergence");
-    assert!(error.message.contains("FAKE_AFT_REJECT_ATTACH"));
+    assert_eq!(
+        error.message,
+        "fake AFT rejected route.bind by FAKE_AFT_REJECT_ATTACH"
+    );
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
     drop(client);
 
@@ -1712,11 +1732,12 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
     let body: ErrorBody = serde_json::from_slice(&stale_error.body).unwrap();
     assert!(matches!(
         body.code.as_str(),
-        "unknown_channel" | "module_unavailable"
+        "unknown_channel" | "target_unavailable"
     ));
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
 
-    let fresh_ack = attach_on_stream(&mut client, &project, 703, "ses-new-generation").await;
+    let fresh_ack =
+        attach_on_stream(&mut client, &project, 703, "ses-new-generation", module_id).await;
     assert!(fresh_ack.route_channel > 0);
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 1);
     let payload = br#"{"jsonrpc":"2.0","id":"new"}"#;
@@ -1736,16 +1757,22 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
     module.stop().await.unwrap();
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RouteOpenAck {
+    route_channel: u16,
+}
+
 async fn attach_client(
     server: &TestServer,
     project: &TestProject,
     corr: u64,
     session: &str,
-) -> (TcpStream, AttachAck) {
+) -> (TcpStream, RouteOpenAck) {
+    let module_id = active_tool_provider_module_id(&server.registry);
     let mut client = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
-    let ack = attach_on_stream(&mut client, project, corr, session).await;
+    let ack = attach_on_stream(&mut client, project, corr, session, &module_id).await;
     (client, ack)
 }
 
@@ -1754,13 +1781,14 @@ async fn attach_on_stream<S>(
     project: &TestProject,
     corr: u64,
     session: &str,
-) -> AttachAck
+    module_id: &str,
+) -> RouteOpenAck
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     write_frame(
         client,
-        &attach_frame(corr, attach_request(project, session)),
+        &attach_frame(corr, attach_request(project, session, module_id)),
     )
     .await
     .unwrap();
@@ -1770,7 +1798,10 @@ where
     assert_eq!(ack_frame.header.ty, FrameType::Response);
     assert_eq!(ack_frame.header.channel, 0);
     assert_eq!(ack_frame.header.corr, corr);
-    serde_json::from_slice(&ack_frame.body).unwrap()
+    match serde_json::from_slice(&ack_frame.body).unwrap() {
+        ClientControlResponse::RouteOpen { route_channel } => RouteOpenAck { route_channel },
+        other => panic!("unexpected route.open response: {other:?}"),
+    }
 }
 
 async fn attach_error_on_stream<S>(
@@ -1778,13 +1809,14 @@ async fn attach_error_on_stream<S>(
     project: &TestProject,
     corr: u64,
     session: &str,
+    module_id: &str,
 ) -> ErrorBody
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     write_frame(
         client,
-        &attach_frame(corr, attach_request(project, session)),
+        &attach_frame(corr, attach_request(project, session, module_id)),
     )
     .await
     .unwrap();
@@ -1795,6 +1827,21 @@ where
     assert_eq!(error_frame.header.channel, 0);
     assert_eq!(error_frame.header.corr, corr);
     serde_json::from_slice(&error_frame.body).unwrap()
+}
+
+fn active_tool_provider_module_id(registry: &Registry) -> String {
+    let (_generation, modules) = registry.list_modules().unwrap();
+    modules
+        .into_iter()
+        .find(|registration| {
+            registration
+                .manifest
+                .provides
+                .iter()
+                .any(|role| matches!(role, ProviderRole::ToolProvider { .. }))
+        })
+        .map(|registration| registration.manifest.module_id)
+        .expect("test should have a registered tool provider")
 }
 
 fn consumer_manifest(module_id: &str) -> ModuleManifest {
@@ -1863,11 +1910,16 @@ where
     serde_json::from_slice(&ack_frame.body).unwrap()
 }
 
-fn attach_request(project: &TestProject, session: &str) -> AttachRequest {
-    AttachRequest {
-        project_root: project.path.clone(),
-        harness: "opencode".to_string(),
-        session: session.to_string(),
+fn attach_request(project: &TestProject, session: &str, module_id: &str) -> ClientControlRequest {
+    ClientControlRequest::RouteOpen {
+        target: RouteTarget::ToolProvider {
+            module_id: module_id.to_string(),
+        },
+        identity: BindIdentity {
+            project_root: project.path.clone(),
+            harness: "opencode".to_string(),
+            session: session.to_string(),
+        },
         config: attach_config(project, session),
     }
 }
@@ -1891,7 +1943,7 @@ fn attach_config(project: &TestProject, session: &str) -> Vec<ConfigTier> {
     ]
 }
 
-fn attach_frame(corr: u64, attach: AttachRequest) -> Frame {
+fn attach_frame(corr: u64, attach: ClientControlRequest) -> Frame {
     let body = serde_json::to_vec(&attach).unwrap();
     Frame::build(
         FrameType::Request,
@@ -1942,8 +1994,12 @@ fn cancel_frame(channel: u16, corr: u64) -> Frame {
     frame
 }
 
-fn passive_poll_frame(corr: u64, op: PollOp, route_channel: u16) -> Frame {
-    let body = serde_json::to_vec(&PassivePoll { op, route_channel }).unwrap();
+fn route_poll_frame(corr: u64, kind: PollKind, route_channel: u16) -> Frame {
+    let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
+        route_channel,
+        kind,
+    })
+    .unwrap();
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
@@ -1960,7 +2016,7 @@ where
 {
     write_frame(
         stream,
-        &passive_poll_frame(corr, PollOp::Liveness, route_channel),
+        &route_poll_frame(corr, PollKind::Liveness, route_channel),
     )
     .await
     .unwrap();
@@ -2029,16 +2085,39 @@ fn assert_status_reply(frame: &Frame, corr: u64, expected_status: &str) {
     assert_eq!(frame.header.ty, FrameType::Response);
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
-    let body: StatusReply = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(body.status, expected_status);
+    match serde_json::from_slice(&frame.body).unwrap() {
+        ClientControlResponse::RoutePoll {
+            status: Some(status),
+            live: None,
+        } => assert_eq!(status, expected_status),
+        other => panic!("unexpected route.poll status response: {other:?}"),
+    }
+}
+
+fn assert_status_none_reply(frame: &Frame, corr: u64) {
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    match serde_json::from_slice(&frame.body).unwrap() {
+        ClientControlResponse::RoutePoll {
+            status: None,
+            live: None,
+        } => {}
+        other => panic!("unexpected route.poll missing-status response: {other:?}"),
+    }
 }
 
 fn assert_liveness_reply(frame: &Frame, corr: u64, expected_live: bool) {
     assert_eq!(frame.header.ty, FrameType::Response);
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
-    let body: LivenessReply = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(body.live, expected_live);
+    match serde_json::from_slice(&frame.body).unwrap() {
+        ClientControlResponse::RoutePoll {
+            status: None,
+            live: Some(live),
+        } => assert_eq!(live, expected_live),
+        other => panic!("unexpected route.poll liveness response: {other:?}"),
+    }
 }
 
 fn assert_error(frame: &Frame, route_channel: u16, corr: u64, code: &str) -> ErrorBody {

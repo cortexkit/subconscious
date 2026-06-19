@@ -1,29 +1,21 @@
-//! Session-attach data-plane wire contract.
+//! Session route control wire contract.
 //!
 //! subc has two distinct channel-0 handshakes. Module registration is the
 //! module-to-subc `HELLO`/`HELLO_ACK` handshake that registers the manifest and
-//! liveness. Session attach is the client-to-subc-to-module request/response
-//! handshake that binds one `(project_root, harness, session)` triple to a
-//! route channel.
-//!
-//! Session attach is vetoed by the module: subc relays an [`AttachRelay`] to
-//! the singleton module, commits the route only after an accepted
-//! [`AttachRelayResponse`], and returns module rejection as an [`ErrorBody`]
-//! `ERROR` frame. The triple binds once at attach time; subsequent data-plane
-//! frames carry only the envelope `channel` and opaque body bytes.
+//! liveness. Route bind is the client-to-subc-to-module request/response
+//! handshake that binds one client route to a module route channel.
 //!
 //! Config is forwarded as an ordered, provenance-tagged tier list. subc treats
 //! every config document as opaque text and preserves `tier`, `source`, and
-//! `doc` exactly from the client attach request to [`AttachRelay`]; it never parses,
-//! merges, partitions, or relabels config in transit.
-//!
-//! [`ErrorBody`]: crate::ErrorBody
-
-use std::path::PathBuf;
+//! `doc` exactly from the client `route.open` request to the module
+//! `route.bind`; it never parses, merges, partitions, or relabels config in
+//! transit.
 
 use serde::{Deserialize, Serialize};
 
-/// One provenance-tagged config tier supplied during session attach.
+use crate::{BindIdentity, RouteTarget};
+
+/// One provenance-tagged config tier supplied during route open.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigTier {
     /// Trust label for this tier.
@@ -45,32 +37,33 @@ pub struct ConfigTier {
     pub doc: String,
 }
 
-/// subc-to-module channel-0 control RPC body asking the singleton module to bind
-/// a route channel.
+/// subc-to-module channel-0 control RPC body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AttachRelay {
-    pub route_channel: u16,
-    pub project_root: PathBuf,
-    pub harness: String,
-    pub session: String,
-    /// Ordered config tiers forwarded from the client attach request unchanged; subc
-    /// never merges, partitions, parses, or relabels config.
-    pub config: Vec<ConfigTier>,
+#[serde(tag = "op")]
+pub enum ModuleControlRequest {
+    #[serde(rename = "route.bind")]
+    RouteBind {
+        route_channel: u16,
+        target: RouteTarget,
+        identity: BindIdentity,
+        #[serde(default)]
+        config: Vec<ConfigTier>,
+    },
 }
 
-/// Module response body for an accepted attach relay.
-///
-/// A rejected attach is returned as an [`ErrorBody`] `ERROR` frame.
-///
-/// [`ErrorBody`]: crate::ErrorBody
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AttachRelayResponse {
-    pub accept: bool,
+/// Module-to-subc channel-0 response body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op")]
+pub enum ModuleControlResponse {
+    /// ACK-only success. Rejections use the `FrameType::Error` lane.
+    #[serde(rename = "route.bind")]
+    RouteBindAck {},
 }
 
-/// subc-to-module channel-0 control RPC body telling the module a route channel
-/// is gone after client `GOODBYE` or client drop.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DetachRelay {
-    pub route_channel: u16,
+/// Module-to-subc channel-0 push body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op")]
+pub enum ModuleControlPush {
+    #[serde(rename = "route.status")]
+    RouteStatus { route_channel: u16, status: String },
 }

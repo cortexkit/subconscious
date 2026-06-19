@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
@@ -46,6 +47,11 @@ const FAKE_AFT_DOUBLE_TERMINAL_ENV: &str = "FAKE_AFT_DOUBLE_TERMINAL";
 const FAKE_AFT_STATUS_ENV: &str = "FAKE_AFT_STATUS";
 const FAKE_AFT_ROLE_ENV: &str = "FAKE_AFT_ROLE";
 const FAKE_AFT_SERVICE_ID_ENV: &str = "FAKE_AFT_SERVICE_ID";
+const FAKE_AFT_TOOLCALL_PROGRESS_ENV: &str = "FAKE_AFT_TOOLCALL_PROGRESS";
+const FAKE_AFT_TOOLCALL_DELAY_MS_ENV: &str = "FAKE_AFT_TOOLCALL_DELAY_MS";
+const FAKE_AFT_TOOLCALL_RESULT_ENV: &str = "FAKE_AFT_TOOLCALL_RESULT";
+const FAKE_AFT_TOOLCALL_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_ERROR";
+const FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_SUBC_ERROR";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
@@ -274,6 +280,7 @@ async fn handle_frame(
                     "kind": "request_received",
                     "channel": frame.header.channel,
                     "corr": frame.header.corr,
+                    "body_json": serde_json::from_slice::<Value>(&frame.body).ok(),
                 }),
             )?;
             let behavior = request_behavior(config, &frame.body);
@@ -385,6 +392,17 @@ async fn handle_data_request(
     )
     .await?;
 
+    if config.toolcall_progress && parse_tool_call(&frame.body).is_some() {
+        emit_tool_call_progress(
+            &writer,
+            &config,
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.corr,
+        )
+        .await?;
+    }
+
     if !delay.is_zero() {
         sleep(delay).await;
     }
@@ -410,6 +428,17 @@ async fn handle_cancellable_data_request(
         &fanout_channels,
     )
     .await?;
+
+    if config.toolcall_progress && parse_tool_call(&frame.body).is_some() {
+        emit_tool_call_progress(
+            &writer,
+            &config,
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.corr,
+        )
+        .await?;
+    }
 
     tokio::select! {
         _ = sleep(delay) => {}
@@ -452,13 +481,33 @@ async fn emit_response(
 ) -> Result<(), StubError> {
     let channel = frame.header.channel;
     let corr = frame.header.corr;
+    let body = if let Some(tool_call) = parse_tool_call(&frame.body) {
+        record_event(
+            config,
+            json!({
+                "kind": "tool_call",
+                "channel": channel,
+                "corr": corr,
+                "name": tool_call.name.clone(),
+                "arguments": tool_call.arguments.clone(),
+                "progress_token": tool_call.progress_token.clone(),
+            }),
+        )?;
+        if config.toolcall_subc_error {
+            return emit_tool_call_subc_error(writer, config, frame.header.ver, channel, corr)
+                .await;
+        }
+        tool_call_response_body(config, &tool_call)?
+    } else {
+        frame.body
+    };
     let response = Frame::build_with_version(
         frame.header.ver,
         FrameType::Response,
         frame.header.flags,
         channel,
         corr,
-        frame.body,
+        body,
     )
     .map_err(StubError::FrameBuild)?;
     send_outbound(writer, response.clone()).await?;
@@ -641,6 +690,96 @@ async fn send_push(
     send_outbound(writer, push).await
 }
 
+async fn emit_tool_call_progress(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+    version: u8,
+    channel: u16,
+    corr: u64,
+) -> Result<(), StubError> {
+    let body = serde_json::to_vec(&json!({
+        "progress": 1.0,
+        "total": 2.0,
+        "message": "fake-aft progress",
+    }))
+    .map_err(StubError::Json)?;
+    let push = Frame::build_with_version(
+        version,
+        FrameType::Push,
+        Flags::new(false, Priority::Passive, true),
+        channel,
+        corr,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
+    send_outbound(writer, push).await?;
+    record_event(
+        config,
+        json!({
+            "kind": "tool_progress",
+            "channel": channel,
+            "corr": corr,
+        }),
+    )
+}
+
+async fn emit_tool_call_subc_error(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+    version: u8,
+    channel: u16,
+    corr: u64,
+) -> Result<(), StubError> {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: "target_unavailable".to_string(),
+        message: "fake AFT injected subc-level tool-call failure".to_string(),
+    })
+    .map_err(StubError::Json)?;
+    let frame = Frame::build_with_version(
+        version,
+        FrameType::Error,
+        Flags::new(false, Priority::Passive, false),
+        channel,
+        corr,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
+    send_outbound(writer, frame.clone()).await?;
+    record_terminal(config, "error", Some("target_unavailable"), channel, corr)?;
+    if config.double_terminal {
+        send_outbound(writer, frame).await?;
+        record_terminal(config, "error", Some("target_unavailable"), channel, corr)?;
+    }
+    Ok(())
+}
+
+fn tool_call_response_body(
+    config: &StubConfig,
+    tool_call: &ToolCallRouteRequest,
+) -> Result<Vec<u8>, StubError> {
+    let is_error = config.toolcall_error;
+    let text = config.toolcall_result.clone().unwrap_or_else(|| {
+        if is_error {
+            format!("fake-aft tool error: {}", tool_call.name)
+        } else {
+            format!(
+                "fake-aft tool {} called with {}",
+                tool_call.name, tool_call.arguments
+            )
+        }
+    });
+    serde_json::to_vec(&json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text,
+            }
+        ],
+        "isError": is_error,
+    }))
+    .map_err(StubError::Json)
+}
+
 async fn emit_status_update(
     writer: &mpsc::Sender<Frame>,
     config: &StubConfig,
@@ -681,7 +820,33 @@ struct RequestBehavior {
     cancellable: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ToolCallRouteRequest {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+    #[serde(default)]
+    progress_token: Option<Value>,
+}
+
 fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
+    if let Some(tool_call) = parse_tool_call(body) {
+        let delay = if config.toolcall_delay.is_zero() {
+            tool_call
+                .arguments
+                .get("delay_ms")
+                .and_then(Value::as_u64)
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::ZERO)
+        } else {
+            config.toolcall_delay
+        };
+        return RequestBehavior {
+            delay,
+            cancellable: true,
+        };
+    }
+
     if !config.delay_from_body {
         return RequestBehavior {
             delay: Duration::ZERO,
@@ -705,6 +870,14 @@ fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
         delay: Duration::from_millis(delay_ms),
         cancellable: !uncancellable,
     }
+}
+
+fn parse_tool_call(body: &[u8]) -> Option<ToolCallRouteRequest> {
+    let parsed = serde_json::from_slice::<ToolCallRouteRequest>(body).ok()?;
+    if parsed.name.trim().is_empty() || !parsed.arguments.is_object() {
+        return None;
+    }
+    Some(parsed)
 }
 
 fn lock_in_flight(
@@ -841,6 +1014,11 @@ struct StubConfig {
     role: StubRole,
     double_terminal: bool,
     status: Option<String>,
+    toolcall_progress: bool,
+    toolcall_delay: Duration,
+    toolcall_result: Option<String>,
+    toolcall_error: bool,
+    toolcall_subc_error: bool,
 }
 
 struct StubState {
@@ -882,6 +1060,15 @@ impl StubConfig {
                 raw
             }
         });
+        let toolcall_delay = env::var(FAKE_AFT_TOOLCALL_DELAY_MS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .map(Duration::from_millis)
+                    .map_err(|source| StubError::InvalidToolcallDelay { raw, source })
+            })
+            .transpose()?
+            .unwrap_or(Duration::ZERO);
 
         Ok(Self {
             connection_file_path,
@@ -897,6 +1084,13 @@ impl StubConfig {
             role,
             double_terminal: env_flag(FAKE_AFT_DOUBLE_TERMINAL_ENV),
             status,
+            toolcall_progress: env_flag(FAKE_AFT_TOOLCALL_PROGRESS_ENV),
+            toolcall_delay,
+            toolcall_result: env::var(FAKE_AFT_TOOLCALL_RESULT_ENV)
+                .ok()
+                .filter(|value| !value.is_empty()),
+            toolcall_error: env_flag(FAKE_AFT_TOOLCALL_ERROR_ENV),
+            toolcall_subc_error: env_flag(FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV),
         })
     }
 }
@@ -982,6 +1176,10 @@ enum StubError {
         raw: String,
         source: std::num::ParseIntError,
     },
+    InvalidToolcallDelay {
+        raw: String,
+        source: std::num::ParseIntError,
+    },
     InvalidConcurrency {
         raw: String,
     },
@@ -1034,6 +1232,10 @@ impl fmt::Display for StubError {
             Self::InvalidCrashAfter { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_CRASH_AFTER_MS_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidToolcallDelay { raw, source } => write!(
+                f,
+                "invalid {FAKE_AFT_TOOLCALL_DELAY_MS_ENV} value '{raw}': {source}"
             ),
             Self::InvalidConcurrency { raw } => write!(
                 f,
@@ -1092,6 +1294,7 @@ impl Error for StubError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidCrashAfter { source, .. } => Some(source),
+            Self::InvalidToolcallDelay { source, .. } => Some(source),
             Self::ConnectionFile { source, .. } => Some(source),
             Self::Connect { source, .. } => Some(source),
             Self::Auth { source, .. } => Some(source),

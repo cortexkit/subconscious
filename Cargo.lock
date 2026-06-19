@@ -283,6 +283,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-mcp"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-core",
+ "subc-protocol",
+ "subc-transport",
+ "tokio",
+]
+
+[[package]]
 name = "subc-protocol"
 version = "0.1.0"
 dependencies = [

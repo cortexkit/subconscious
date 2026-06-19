@@ -78,6 +78,21 @@ pub enum ModuleState {
     Draining,
     Stopped,
     Failed,
+    Disabled,
+}
+
+impl fmt::Display for ModuleState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Restarting => "restarting",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Disabled => "disabled",
+        })
+    }
 }
 
 /// Supervisor classification of a child-process exit.
@@ -101,6 +116,7 @@ pub struct ExitReport {
 pub struct ModuleStatus {
     pub module_id: String,
     pub state: ModuleState,
+    pub enabled: bool,
     pub process_alive: bool,
     pub registration_active: bool,
     pub live: bool,
@@ -112,6 +128,7 @@ pub struct ModuleStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SupervisorSnapshot {
     state: ModuleState,
+    enabled: bool,
     process_alive: bool,
     restart_count: u32,
     pid: Option<u32>,
@@ -122,6 +139,7 @@ impl SupervisorSnapshot {
     fn starting() -> Self {
         Self {
             state: ModuleState::Starting,
+            enabled: true,
             process_alive: false,
             restart_count: 0,
             pid: None,
@@ -194,6 +212,44 @@ struct SupervisorRuntimeConfig {
     connection_file_path: Option<PathBuf>,
 }
 
+/// Shared daemon lookup table for supervised module handles.
+#[derive(Debug, Clone, Default)]
+pub struct SupervisorHandle {
+    modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
+}
+
+impl SupervisorHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&self, module: SupervisedModule) -> Option<SupervisedModule> {
+        let mut modules = self
+            .modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        modules.insert(module.module_id().to_string(), module)
+    }
+
+    pub fn get(&self, module_id: &str) -> Option<SupervisedModule> {
+        let modules = self
+            .modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        modules.get(module_id).cloned()
+    }
+
+    pub fn list(&self) -> Vec<SupervisedModule> {
+        let modules = self
+            .modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut modules = modules.values().cloned().collect::<Vec<_>>();
+        modules.sort_by(|left, right| left.module_id().cmp(right.module_id()));
+        modules
+    }
+}
+
 /// Process supervisor for subc-owned singleton modules.
 #[derive(Debug, Clone)]
 pub struct Supervisor {
@@ -202,6 +258,7 @@ pub struct Supervisor {
     drain_timeout: Duration,
     connection_file_path: Option<PathBuf>,
     process_liveness: Arc<SupervisorProcessLiveness>,
+    supervisor_handle: Option<SupervisorHandle>,
 }
 
 impl Supervisor {
@@ -212,6 +269,7 @@ impl Supervisor {
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             connection_file_path: None,
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
+            supervisor_handle: None,
         }
     }
 
@@ -230,6 +288,11 @@ impl Supervisor {
 
     pub fn with_connection_file_path(mut self, connection_file_path: impl Into<PathBuf>) -> Self {
         self.connection_file_path = Some(connection_file_path.into());
+        self
+    }
+
+    pub fn with_handle(mut self, supervisor_handle: SupervisorHandle) -> Self {
+        self.supervisor_handle = Some(supervisor_handle);
         self
     }
 
@@ -267,13 +330,19 @@ impl Supervisor {
             rx,
         ));
 
-        Ok(SupervisedModule {
-            module_id: spec.module_id,
-            registry: Arc::clone(&self.registry),
-            snapshot,
-            commands: tx,
-            monitor,
-        })
+        let module = SupervisedModule {
+            inner: Arc::new(SupervisedModuleInner {
+                module_id: spec.module_id,
+                registry: Arc::clone(&self.registry),
+                snapshot,
+                commands: tx,
+                monitor: Mutex::new(Some(monitor)),
+            }),
+        };
+        if let Some(supervisor_handle) = &self.supervisor_handle {
+            supervisor_handle.insert(module.clone());
+        }
+        Ok(module)
     }
 }
 
@@ -284,18 +353,23 @@ impl Default for Supervisor {
 }
 
 /// Handle to one supervised child process.
+#[derive(Clone)]
 pub struct SupervisedModule {
+    inner: Arc<SupervisedModuleInner>,
+}
+
+struct SupervisedModuleInner {
     module_id: String,
     registry: Arc<Registry>,
     snapshot: SharedSnapshot,
     commands: mpsc::Sender<SupervisorCommand>,
-    monitor: JoinHandle<()>,
+    monitor: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl fmt::Debug for SupervisedModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SupervisedModule")
-            .field("module_id", &self.module_id)
+            .field("module_id", &self.inner.module_id)
             .field("status", &self.status())
             .finish_non_exhaustive()
     }
@@ -303,26 +377,30 @@ impl fmt::Debug for SupervisedModule {
 
 impl SupervisedModule {
     pub fn module_id(&self) -> &str {
-        &self.module_id
+        &self.inner.module_id
     }
 
     pub fn state(&self) -> Result<ModuleState, SuperviseError> {
-        Ok(lock_snapshot(&self.snapshot)?.state)
+        Ok(lock_snapshot(&self.inner.snapshot)?.state)
     }
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
-        let snapshot = lock_snapshot(&self.snapshot)?.clone();
+        let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
         let registration_active = self
+            .inner
             .registry
-            .get_module(&self.module_id)
+            .get_module(&self.inner.module_id)
             .map_err(SuperviseError::Registry)?
             .is_some();
-        let live =
-            snapshot.state == ModuleState::Running && snapshot.process_alive && registration_active;
+        let live = snapshot.enabled
+            && snapshot.state == ModuleState::Running
+            && snapshot.process_alive
+            && registration_active;
 
         Ok(ModuleStatus {
-            module_id: self.module_id.clone(),
+            module_id: self.inner.module_id.clone(),
             state: snapshot.state,
+            enabled: snapshot.enabled,
             process_alive: snapshot.process_alive,
             registration_active,
             live,
@@ -348,32 +426,69 @@ impl SupervisedModule {
             ModuleState::Starting
             | ModuleState::Running
             | ModuleState::Restarting
-            | ModuleState::Draining => {}
+            | ModuleState::Draining
+            | ModuleState::Disabled => {}
         }
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
+        self.inner
+            .commands
             .send(SupervisorCommand::Drain { reply: reply_tx })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
-                module_id: self.module_id.clone(),
+                module_id: self.inner.module_id.clone(),
             })?;
         reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
-            module_id: self.module_id.clone(),
+            module_id: self.inner.module_id.clone(),
+        })?
+    }
+
+    pub async fn restart(&self) -> Result<(), SuperviseError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::Restart { reply: reply_tx })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?
+    }
+
+    pub async fn set_enabled(&self, enabled: bool) -> Result<bool, SuperviseError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::SetEnabled {
+                enabled,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
         })?
     }
 }
 
-impl Drop for SupervisedModule {
+impl Drop for SupervisedModuleInner {
     fn drop(&mut self) {
-        if !self.monitor.is_finished() {
+        let Ok(mut monitor) = self.monitor.lock() else {
+            return;
+        };
+        if let Some(monitor) = monitor.as_ref().filter(|monitor| !monitor.is_finished()) {
             let _ = update_snapshot(&self.snapshot, Some(&self.module_id), |state| {
                 state.state = ModuleState::Stopped;
                 state.process_alive = false;
                 state.pid = None;
             });
-            self.monitor.abort();
+            monitor.abort();
         }
+        let _ = monitor.take();
     }
 }
 
@@ -381,6 +496,13 @@ impl Drop for SupervisedModule {
 enum SupervisorCommand {
     Drain {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
+    },
+    Restart {
+        reply: oneshot::Sender<Result<(), SuperviseError>>,
+    },
+    SetEnabled {
+        enabled: bool,
+        reply: oneshot::Sender<Result<bool, SuperviseError>>,
     },
 }
 
@@ -473,92 +595,103 @@ async fn supervise_loop(
     registry: Arc<Registry>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     snapshot: SharedSnapshot,
-    mut child: Child,
+    child: Child,
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
+    let mut child = Some(child);
     loop {
-        tokio::select! {
-            wait_result = child.wait() => {
-                let exit_report = match wait_result {
-                    Ok(status) => classify_exit(&status),
-                    Err(err) => {
-                        fail_snapshot(&snapshot, Some(&spec.module_id), None);
-                        untrack_if_registration_released(
-                            &process_liveness,
-                            &registry,
-                            &spec.module_id,
-                            &snapshot,
-                        );
-                        error!(module_id = %spec.module_id, error = %err, "failed to wait for supervised module");
-                        return;
-                    }
-                };
-
-                match on_child_exit(
-                    &spec,
-                    runtime.restart_policy,
-                    &registry,
-                    &snapshot,
-                    exit_report,
-                ).await {
-                    NextAction::Stop { registration_released } => {
-                        if registration_released {
-                            process_liveness.untrack_if_current(&spec.module_id, &snapshot);
-                        }
-                        return;
-                    }
-                    NextAction::Restart => {
-                        sleep(runtime.restart_policy.backoff).await;
-                        if let Err(err) = wait_for_registration_release(
-                            &registry,
-                            &spec.module_id,
-                            REGISTRY_RELEASE_TIMEOUT,
-                        ).await {
+        if child.is_some() {
+            let active_child = child.as_mut().expect("child checked above");
+            tokio::select! {
+                wait_result = active_child.wait() => {
+                    let exit_report = match wait_result {
+                        Ok(status) => classify_exit(&status),
+                        Err(err) => {
                             fail_snapshot(&snapshot, Some(&spec.module_id), None);
-                            error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
+                            untrack_if_registration_released(
+                                &process_liveness,
+                                &registry,
+                                &spec.module_id,
+                                &snapshot,
+                            );
+                            error!(module_id = %spec.module_id, error = %err, "failed to wait for supervised module");
                             return;
                         }
+                    };
 
-                        match spawn_child(&spec, runtime.connection_file_path.as_deref()) {
-                            Ok(next_child) => {
-                                child = next_child;
-                                if let Err(err) = set_running(&snapshot, child.id()) {
-                                    error!(module_id = %spec.module_id, error = %err, "failed to update supervisor state after restart");
-                                    return;
-                                }
-                                debug!(module_id = %spec.module_id, "supervised module restarted");
-                            }
-                            Err(err) => {
-                                fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                    match on_child_exit(
+                        &spec,
+                        runtime.restart_policy,
+                        &registry,
+                        &snapshot,
+                        exit_report,
+                    ).await {
+                        NextAction::Stop { registration_released } => {
+                            if registration_released {
                                 process_liveness.untrack_if_current(&spec.module_id, &snapshot);
-                                error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
+                            }
+                            return;
+                        }
+                        NextAction::Restart => {
+                            sleep(runtime.restart_policy.backoff).await;
+                            if let Err(err) = wait_for_registration_release(
+                                &registry,
+                                &spec.module_id,
+                                REGISTRY_RELEASE_TIMEOUT,
+                            ).await {
+                                fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                                error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
                                 return;
                             }
+
+                            match spawn_and_mark_running(&spec, &runtime, &snapshot) {
+                                Ok(next_child) => {
+                                    child = Some(next_child);
+                                    debug!(module_id = %spec.module_id, "supervised module restarted after crash");
+                                }
+                                Err(err) => {
+                                    fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                                    process_liveness.untrack_if_current(&spec.module_id, &snapshot);
+                                    error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
+                                    return;
+                                }
+                            }
                         }
+                    }
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    if !handle_supervisor_command(
+                        command,
+                        &spec,
+                        &runtime,
+                        &registry,
+                        &process_liveness,
+                        &snapshot,
+                        &mut child,
+                    ).await {
+                        return;
                     }
                 }
             }
-            command = commands.recv() => {
-                let Some(command) = command else {
-                    return;
-                };
-                match command {
-                    SupervisorCommand::Drain { reply } => {
-                        let result = drain_child(
-                            &spec.module_id,
-                            &registry,
-                            &snapshot,
-                            &mut child,
-                            runtime.drain_timeout,
-                        ).await;
-                        let registration_released = result.is_ok();
-                        let _ = reply.send(result);
-                        if registration_released {
-                            process_liveness.untrack_if_current(&spec.module_id, &snapshot);
-                        }
-                        return;
-                    }
-                }
+        } else {
+            let Some(command) = commands.recv().await else {
+                return;
+            };
+            if !handle_supervisor_command(
+                command,
+                &spec,
+                &runtime,
+                &registry,
+                &process_liveness,
+                &snapshot,
+                &mut child,
+            )
+            .await
+            {
+                return;
             }
         }
     }
@@ -567,6 +700,137 @@ async fn supervise_loop(
 enum NextAction {
     Stop { registration_released: bool },
     Restart,
+}
+
+async fn handle_supervisor_command(
+    command: SupervisorCommand,
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+) -> bool {
+    match command {
+        SupervisorCommand::Drain { reply } => {
+            let result = drain_optional_child(
+                &spec.module_id,
+                registry,
+                snapshot,
+                child,
+                runtime.drain_timeout,
+                ModuleState::Stopped,
+                None,
+            )
+            .await;
+            let registration_released = result.is_ok();
+            let _ = reply.send(result);
+            if registration_released {
+                process_liveness.untrack_if_current(&spec.module_id, snapshot);
+            }
+            false
+        }
+        SupervisorCommand::Restart { reply } => {
+            let result =
+                restart_child(spec, runtime, registry, process_liveness, snapshot, child).await;
+            let _ = reply.send(result);
+            true
+        }
+        SupervisorCommand::SetEnabled { enabled, reply } => {
+            let result = set_child_enabled(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                enabled,
+            )
+            .await;
+            let _ = reply.send(result);
+            true
+        }
+    }
+}
+
+async fn restart_child(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+) -> Result<(), SuperviseError> {
+    if child.is_some() {
+        drain_optional_child(
+            &spec.module_id,
+            registry,
+            snapshot,
+            child,
+            runtime.drain_timeout,
+            ModuleState::Restarting,
+            Some(true),
+        )
+        .await?;
+    } else {
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.enabled = true;
+            state.state = ModuleState::Restarting;
+            state.process_alive = false;
+            state.pid = None;
+        })?;
+        wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
+    }
+
+    sleep(runtime.restart_policy.backoff).await;
+    process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+    let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
+    *child = Some(next_child);
+    debug!(module_id = %spec.module_id, "supervised module restarted by operator request");
+    Ok(())
+}
+
+async fn set_child_enabled(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+    enabled: bool,
+) -> Result<bool, SuperviseError> {
+    let current_enabled = lock_snapshot(snapshot)?.enabled;
+    if current_enabled == enabled {
+        return Ok(false);
+    }
+
+    if enabled {
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.enabled = true;
+            state.state = ModuleState::Starting;
+            state.process_alive = false;
+            state.pid = None;
+        })?;
+        wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
+        process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+        let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
+        *child = Some(next_child);
+        debug!(module_id = %spec.module_id, "supervised module enabled");
+        Ok(true)
+    } else {
+        drain_optional_child(
+            &spec.module_id,
+            registry,
+            snapshot,
+            child,
+            runtime.drain_timeout,
+            ModuleState::Disabled,
+            Some(false),
+        )
+        .await?;
+        debug!(module_id = %spec.module_id, "supervised module disabled");
+        Ok(true)
+    }
 }
 
 async fn on_child_exit(
@@ -609,7 +873,9 @@ async fn on_child_exit(
                 state.process_alive = false;
                 state.pid = None;
                 state.last_exit = Some(exit_report);
-                if state.restart_count >= policy.max_restarts {
+                if !state.enabled {
+                    state.state = ModuleState::Disabled;
+                } else if state.restart_count >= policy.max_restarts {
                     state.state = ModuleState::Failed;
                 } else {
                     state.restart_count += 1;
@@ -681,15 +947,63 @@ fn spawn_child(
     })
 }
 
-async fn drain_child(
+fn spawn_and_mark_running(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+) -> Result<Child, SuperviseError> {
+    let child = spawn_child(spec, runtime.connection_file_path.as_deref())?;
+    set_running(snapshot, child.id())?;
+    Ok(child)
+}
+
+async fn drain_optional_child(
     module_id: &str,
     registry: &Registry,
     snapshot: &SharedSnapshot,
-    child: &mut Child,
+    child: &mut Option<Child>,
     drain_timeout: Duration,
+    final_state: ModuleState,
+    enabled: Option<bool>,
+) -> Result<(), SuperviseError> {
+    if let Some(child) = child.take() {
+        drain_child_to_state(
+            module_id,
+            registry,
+            snapshot,
+            child,
+            drain_timeout,
+            final_state,
+            enabled,
+        )
+        .await
+    } else {
+        update_snapshot(snapshot, Some(module_id), |state| {
+            state.state = final_state;
+            if let Some(enabled) = enabled {
+                state.enabled = enabled;
+            }
+            state.process_alive = false;
+            state.pid = None;
+        })?;
+        wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
+    }
+}
+
+async fn drain_child_to_state(
+    module_id: &str,
+    registry: &Registry,
+    snapshot: &SharedSnapshot,
+    mut child: Child,
+    drain_timeout: Duration,
+    final_state: ModuleState,
+    enabled: Option<bool>,
 ) -> Result<(), SuperviseError> {
     update_snapshot(snapshot, Some(module_id), |state| {
         state.state = ModuleState::Draining;
+        if let Some(enabled) = enabled {
+            state.enabled = enabled;
+        }
     })?;
 
     let exit_report = match timeout(drain_timeout, child.wait()).await {
@@ -715,7 +1029,10 @@ async fn drain_child(
     };
 
     update_snapshot(snapshot, Some(module_id), |state| {
-        state.state = ModuleState::Stopped;
+        state.state = final_state;
+        if let Some(enabled) = enabled {
+            state.enabled = enabled;
+        }
         state.process_alive = false;
         state.pid = None;
         state.last_exit = Some(exit_report);
@@ -777,6 +1094,7 @@ fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 fn set_running(snapshot: &SharedSnapshot, pid: Option<u32>) -> Result<(), SuperviseError> {
     update_snapshot(snapshot, None, |state| {
         state.state = ModuleState::Running;
+        state.enabled = true;
         state.process_alive = true;
         state.pid = pid;
     })

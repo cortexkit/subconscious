@@ -15,7 +15,8 @@ use serde_json::Value;
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_core::{
     read_frame, write_frame, ForwardingTable, Frame, ModuleSpec, ModuleState, ModuleStatus,
-    Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorProcessLiveness,
+    Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle,
+    SupervisorProcessLiveness,
 };
 use subc_protocol::{
     manifest::{
@@ -33,7 +34,9 @@ use tokio::{
 };
 
 mod common;
-use common::{connect_authed_client, start_test_daemon_with_process_liveness, TestDaemon};
+use common::{
+    connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
+};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -41,17 +44,23 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 struct TestServer {
     daemon: TestDaemon,
     process_liveness: Arc<SupervisorProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
 }
 
 impl TestServer {
     async fn start() -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
-        let daemon =
-            start_test_daemon_with_process_liveness("forwarding-server", process_liveness.clone())
-                .await;
+        let supervisor_handle = SupervisorHandle::new();
+        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
+            "forwarding-server",
+            process_liveness.clone(),
+            supervisor_handle.clone(),
+        )
+        .await;
         Self {
             daemon,
             process_liveness,
+            supervisor_handle,
         }
     }
 
@@ -540,6 +549,194 @@ async fn client_drop_sends_route_goodbye_and_removes_binding() {
         .unwrap());
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_list_enumerates_supervised_modules() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-supervisor-list";
+    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    wait_for_status(&module, Duration::from_secs(1), |status| {
+        status.state == ModuleState::Running && status.enabled && status.live
+    })
+    .await;
+
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &control_request_frame(301, ClientControlRequest::SupervisorList {}),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let frame = read_frame_timeout(&mut client).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, 301);
+    match serde_json::from_slice(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorList {
+            generation,
+            modules,
+        } => {
+            assert_eq!(generation, server.registry.generation().unwrap());
+            let entry = modules
+                .iter()
+                .find(|entry| entry.module_id == module_id)
+                .expect("supervisor.list should include spawned module");
+            assert_eq!(entry.state, "running");
+            assert!(entry.enabled);
+            assert!(entry.live);
+        }
+        other => panic!("unexpected supervisor.list response: {other:?}"),
+    }
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-supervisor-restart";
+    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    let generation_before = server.registry.generation().unwrap();
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut client,
+        &project,
+        311,
+        "ses-supervisor-restart",
+        module_id,
+    )
+    .await;
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 1);
+
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            312,
+            ClientControlRequest::SupervisorRestart {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let applied =
+        read_supervisor_ack_and_goodbye(&mut client, 312, module_id, ack.route_channel).await;
+    assert!(applied);
+    wait_for_binding_count(&server.forwarding, 0, Duration::from_secs(1)).await;
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    assert!(server.registry.generation().unwrap() > generation_before);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-supervisor-enabled";
+    let module = supervisor.spawn(stub_spec(&server, module_id)).unwrap();
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut client,
+        &project,
+        321,
+        "ses-supervisor-disable",
+        module_id,
+    )
+    .await;
+
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            322,
+            ClientControlRequest::SupervisorSetEnabled {
+                module_id: module_id.to_string(),
+                enabled: false,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let applied =
+        read_supervisor_ack_and_goodbye(&mut client, 322, module_id, ack.route_channel).await;
+    assert!(applied);
+    wait_for_registration_absent(&server.registry, module_id, Duration::from_secs(1)).await;
+    wait_for_binding_count(&server.forwarding, 0, Duration::from_secs(1)).await;
+    wait_for_status(&module, Duration::from_secs(1), |status| {
+        status.state == ModuleState::Disabled && !status.enabled && !status.live
+    })
+    .await;
+
+    let error = attach_error_on_stream(&mut client, &project, 323, "ses-disabled", module_id).await;
+    assert_eq!(error.code, "target_unavailable");
+
+    let applied = supervisor_ack_on_stream(
+        &mut client,
+        324,
+        ClientControlRequest::SupervisorSetEnabled {
+            module_id: module_id.to_string(),
+            enabled: true,
+        },
+        module_id,
+    )
+    .await;
+    assert!(applied);
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    wait_for_status(&module, Duration::from_secs(1), |status| {
+        status.state == ModuleState::Running && status.enabled && status.live
+    })
+    .await;
+
+    let second = attach_on_stream(&mut client, &project, 325, "ses-reenabled", module_id).await;
+    assert!(second.route_channel > 0);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_ops_unknown_module_returns_unknown_module() {
+    let server = TestServer::start().await;
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            331,
+            ClientControlRequest::SupervisorRestart {
+                module_id: "missing-supervised-module".to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let frame = read_frame_timeout(&mut client).await;
+    assert_error(&frame, 0, 331, "unknown_module");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2295,6 +2492,7 @@ fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver,
+        control_ops: None,
     })
     .unwrap();
     Frame::build(
@@ -2409,6 +2607,83 @@ fn cancel_frame(channel: u16, corr: u64) -> Frame {
     assert_eq!(frame.header.len, 0);
     assert!(frame.body.is_empty());
     frame
+}
+
+fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
+    let body = serde_json::to_vec(&request).unwrap();
+    Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
+}
+
+async fn supervisor_ack_on_stream<S>(
+    stream: &mut S,
+    corr: u64,
+    request: ClientControlRequest,
+    module_id: &str,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(stream, &control_request_frame(corr, request))
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_frame_timeout(stream).await;
+    assert_supervisor_ack(&frame, corr, module_id)
+}
+
+async fn read_supervisor_ack_and_goodbye<S>(
+    stream: &mut S,
+    corr: u64,
+    module_id: &str,
+    route_channel: u16,
+) -> bool
+where
+    S: AsyncRead + Unpin,
+{
+    let mut applied = None;
+    let mut goodbye_seen = false;
+    for _ in 0..2 {
+        let frame = read_frame_timeout(stream).await;
+        if frame.header.channel == 0 && frame.header.corr == corr {
+            applied = Some(assert_supervisor_ack(&frame, corr, module_id));
+        } else if frame.header.ty == FrameType::Goodbye && frame.header.channel == route_channel {
+            assert_eq!(frame.header.corr, 0);
+            assert!(frame.body.is_empty());
+            goodbye_seen = true;
+        } else {
+            panic!(
+                "unexpected frame while waiting for supervisor ACK and route GOODBYE: {frame:?}"
+            );
+        }
+    }
+    assert!(
+        goodbye_seen,
+        "supervisor side-effect should emit route GOODBYE"
+    );
+    applied.expect("missing supervisor ACK")
+}
+
+fn assert_supervisor_ack(frame: &Frame, corr: u64, module_id: &str) -> bool {
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    match serde_json::from_slice(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorAck {
+            module_id: actual,
+            applied,
+        } => {
+            assert_eq!(actual, module_id);
+            applied
+        }
+        other => panic!("unexpected supervisor ACK response: {other:?}"),
+    }
 }
 
 fn route_poll_frame(corr: u64, kind: PollKind, route_channel: u16) -> Frame {
@@ -2592,6 +2867,7 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         RestartPolicy::new(max_restarts, backoff),
     )
     .with_process_liveness(Arc::clone(&server.process_liveness))
+    .with_handle(server.supervisor_handle.clone())
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.connection_file_path.clone())
 }

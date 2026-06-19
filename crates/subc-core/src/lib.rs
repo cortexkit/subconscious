@@ -33,6 +33,6 @@ pub use server::{
 };
 pub use supervise::{
     ExitKind, ExitReport, ModuleProcessLiveness, ModuleSpec, ModuleState, ModuleStatus,
-    RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorProcessLiveness,
-    SUBC_ARG,
+    RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorHandle,
+    SupervisorProcessLiveness, SUBC_ARG,
 };

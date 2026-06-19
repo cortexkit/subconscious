@@ -1,18 +1,18 @@
 use std::{fmt, sync::Arc};
 
 use serde::Serialize;
-use subc_control::{AttachAck, AttachRequest, LivenessReply, PassivePoll, PollOp, StatusReply};
+use subc_control::{ops, CatalogEntry, ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
-    session::{AttachRelay, AttachRelayResponse, DetachRelay},
-    ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, StatusUpdate,
-    PROTOCOL_VERSION,
+    session::{ConfigTier, ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
+    RouteTarget, PROTOCOL_VERSION,
 };
 use tracing::{debug, warn};
 
 use crate::{
     forwarding::{
-        AttachRelayOutcome, ForwardingError, ForwardingTable, ModuleEndpointId, ReleasedRoute,
+        ForwardingError, ForwardingTable, ModuleEndpointId, ReleasedRoute, RouteBindRelayOutcome,
     },
     registry::{ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
@@ -31,6 +31,15 @@ const CAP_MANIFEST_REGISTRATION: &str = "manifest_registration_v1";
 const CAP_CHANNEL_LIFECYCLE: &str = "channel_lifecycle_v1";
 const CAP_PING_PONG: &str = "ping_pong_v1";
 const CAP_SESSION_ATTACH: &str = "session_attach_v1";
+
+const SUBC_CONTROL_OPS: &[&str] = &[
+    ops::SERVER_DESCRIBE,
+    ops::CATALOG_LIST,
+    ops::ROUTE_OPEN,
+    ops::ROUTE_POLL,
+];
+
+const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
@@ -134,10 +143,26 @@ impl ControlHandler {
                         "module-originated channel-0 REQUEST is not supported",
                     )?]);
                 }
-                if let Ok(poll) = serde_json::from_slice::<PassivePoll>(&frame.body) {
-                    return self.handle_passive_poll(ctx, frame, poll);
-                }
-                self.handle_attach(ctx, frame).await
+
+                let request = match serde_json::from_slice::<ClientControlRequest>(&frame.body) {
+                    Ok(request) => request,
+                    Err(err) if is_unknown_control_op_error(&err) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "unknown_control_op",
+                            format!("unknown client control op: {err}"),
+                        )?])
+                    }
+                    Err(err) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "invalid_control_body",
+                            format!("malformed client control body: {err}"),
+                        )?])
+                    }
+                };
+                self.handle_client_control_request(ctx, frame, request)
+                    .await
             }
             FrameType::Push => {
                 let Some(endpoint) = self
@@ -176,7 +201,7 @@ impl ControlHandler {
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
         let registrations = self.registry.deregister_connection(connection_id);
         if let Ok(released_routes) = self.forwarding.cleanup_connection(connection_id) {
-            self.emit_detach_relays(released_routes);
+            self.emit_route_goodbyes(released_routes);
         }
         registrations
     }
@@ -197,39 +222,26 @@ impl ControlHandler {
         else {
             return Ok(false);
         };
-        self.emit_detach_relays(vec![released_route]);
+        self.emit_route_goodbyes(vec![released_route]);
         Ok(true)
     }
 
-    fn emit_detach_relays(&self, released_routes: Vec<ReleasedRoute>) {
+    fn emit_route_goodbyes(&self, released_routes: Vec<ReleasedRoute>) {
         for released in released_routes {
-            let body = match serde_json::to_vec(&DetachRelay {
-                route_channel: released.route_channel,
-            }) {
-                Ok(body) => body,
-                Err(err) => {
-                    warn!(
-                        route_channel = released.route_channel,
-                        error = %err,
-                        "failed to encode detach-relay"
-                    );
-                    continue;
-                }
-            };
             let frame = match Frame::build_with_version(
                 released.negotiated_ver,
-                FrameType::Request,
+                FrameType::Goodbye,
                 control_flags(),
+                released.route_channel,
                 0,
-                0,
-                body,
+                Vec::new(),
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
                     warn!(
                         route_channel = released.route_channel,
                         error = %err,
-                        "failed to build detach-relay frame"
+                        "failed to build route GOODBYE frame"
                     );
                     continue;
                 }
@@ -238,7 +250,7 @@ impl ControlHandler {
                 warn!(
                     route_channel = released.route_channel,
                     error = %err,
-                    "best-effort detach-relay was not delivered"
+                    "best-effort route GOODBYE was not delivered to module"
                 );
             }
         }
@@ -320,7 +332,7 @@ impl ControlHandler {
                 }
             };
 
-        if manifest_provides_tools(&registration.manifest) {
+        if manifest_provides_routable_role(&registration.manifest) {
             if let Some(sink) = sink {
                 let concurrency = manifest_concurrency(&registration.manifest);
                 if let Err(err) = self.forwarding.register_module_connection(
@@ -364,24 +376,136 @@ impl ControlHandler {
         .map_err(RouterError::FrameBuild)?])
     }
 
-    async fn handle_attach(&self, ctx: &RouteCtx, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+    async fn handle_client_control_request(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        request: ClientControlRequest,
+    ) -> Result<Vec<Frame>, RouterError> {
+        match request {
+            ClientControlRequest::ServerDescribe {} => self.handle_server_describe(frame),
+            ClientControlRequest::CatalogList { module_id } => {
+                self.handle_catalog_list(frame, module_id)
+            }
+            ClientControlRequest::RouteOpen {
+                target,
+                identity,
+                config,
+            } => {
+                self.handle_route_open(ctx, frame, target, identity, config)
+                    .await
+            }
+            ClientControlRequest::RoutePoll {
+                route_channel,
+                kind,
+            } => self.handle_route_poll(ctx, frame, route_channel, kind),
+        }
+    }
+
+    fn handle_server_describe(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        let response = ClientControlResponse::ServerDescribe {
+            protocol_ver: PROTOCOL_VERSION,
+            subc_ops: subc_ops(),
+            capabilities: self.subc_capabilities.as_ref().to_vec(),
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::ServerDescribe",
+        )?])
+    }
+
+    fn handle_catalog_list(
+        &self,
+        frame: Frame,
+        module_id: Option<String>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let (generation, modules) = self.registry.list_modules().map_err(|err| {
+            RouterError::backend(0, frame.header.corr, format!("registry error: {err}"))
+        })?;
+        let entries = modules
+            .into_iter()
+            .filter(|registration| {
+                module_id
+                    .as_deref()
+                    .map(|wanted| registration.manifest.module_id == wanted)
+                    .unwrap_or(true)
+            })
+            .map(|registration| {
+                let roles = registration.manifest.provides;
+                let control_ops = if roles.iter().any(is_routable_role) {
+                    module_baseline_control_ops()
+                } else {
+                    Vec::new()
+                };
+                CatalogEntry {
+                    module_id: registration.manifest.module_id,
+                    roles,
+                    control_ops,
+                }
+            })
+            .collect();
+        let response = ClientControlResponse::CatalogList {
+            generation,
+            modules: entries,
+            subc_ops: subc_ops(),
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::CatalogList",
+        )?])
+    }
+
+    async fn handle_route_open(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        target: RouteTarget,
+        mut identity: BindIdentity,
+        config: Vec<ConfigTier>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let target_module_id = target_module_id(&target).to_string();
         debug!(
             connection_id = ctx.connection_id.get(),
             corr = frame.header.corr,
-            "handling session attach"
+            module_id = %target_module_id,
+            "handling route.open"
         );
-        let attach = match serde_json::from_slice::<AttachRequest>(&frame.body) {
-            Ok(attach) => attach,
-            Err(err) => {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    "invalid_attach_request",
-                    format!("malformed AttachRequest body: {err}"),
-                )?])
-            }
+
+        let Some(registration) = self
+            .registry
+            .get_module(&target_module_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{target_module_id}' is not registered"),
+            )?]);
         };
 
-        let project_root = match ProjectRootId::from_path(&attach.project_root) {
+        if !target_has_required_role(&target, &registration.manifest.provides) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "target_unavailable",
+                format!("module_id '{target_module_id}' does not provide the requested target"),
+            )?]);
+        }
+
+        let active_module_id = self
+            .forwarding
+            .active_module_id()
+            .map_err(RouterError::Forwarding)?;
+        if active_module_id.as_deref() != Some(target_module_id.as_str()) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "target_unavailable",
+                format!("module_id '{target_module_id}' is not the active provider"),
+            )?]);
+        }
+
+        let project_root = match ProjectRootId::from_path(&identity.project_root) {
             Ok(project_root) => project_root,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -391,8 +515,12 @@ impl ControlHandler {
                 )?])
             }
         };
+        identity.project_root = project_root.as_path().to_path_buf();
 
-        let pending = match self.forwarding.begin_attach_relay() {
+        let pending = match self
+            .forwarding
+            .begin_route_bind_relay_for(&target_module_id)
+        {
             Ok(pending) => pending,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -406,18 +534,17 @@ impl ControlHandler {
         let route_channel = pending.route_channel;
         let relay_corr = pending.corr;
 
-        let relay = AttachRelay {
+        let relay = ModuleControlRequest::RouteBind {
             route_channel,
-            project_root: project_root.as_path().to_path_buf(),
-            harness: attach.harness,
-            session: attach.session,
-            config: attach.config,
+            target,
+            identity,
+            config,
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(
                 0,
                 frame.header.corr,
-                format!("failed to encode AttachRelay: {err}"),
+                format!("failed to encode route.bind request: {err}"),
             )
         })?;
         let relay_frame = Frame::build_with_version(
@@ -437,13 +564,13 @@ impl ControlHandler {
                 .release_reserved_route(endpoint, route_channel);
             return Ok(vec![control_error_frame(
                 &frame,
-                "module_unavailable",
+                "target_unavailable",
                 err.to_string(),
             )?]);
         }
 
         match pending.receiver.await {
-            Ok(AttachRelayOutcome::Accepted) => {
+            Ok(RouteBindRelayOutcome::Accepted) => {
                 if let Err(err) = self.forwarding.commit_route(
                     ctx.connection_id,
                     ctx.egress.clone(),
@@ -459,36 +586,26 @@ impl ControlHandler {
                         err.to_string(),
                     )?]);
                 }
-                let body = serde_json::to_vec(&AttachAck { route_channel }).map_err(|err| {
-                    RouterError::backend(
-                        0,
-                        frame.header.corr,
-                        format!("failed to encode AttachAck: {err}"),
-                    )
-                })?;
-                Ok(vec![Frame::build_with_version(
-                    response_version(&frame),
-                    FrameType::Response,
-                    control_flags(),
-                    0,
-                    frame.header.corr,
-                    body,
-                )
-                .map_err(RouterError::FrameBuild)?])
+                let response = ClientControlResponse::RouteOpen { route_channel };
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &response,
+                    "ClientControlResponse::RouteOpen",
+                )?])
             }
-            Ok(AttachRelayOutcome::Rejected(body)) => {
+            Ok(RouteBindRelayOutcome::Rejected(body)) => {
                 let _ = self
                     .forwarding
                     .release_reserved_route(endpoint, route_channel);
                 Ok(vec![control_error_body_frame(&frame, body)?])
             }
-            Ok(AttachRelayOutcome::ModuleGone(message)) => {
+            Ok(RouteBindRelayOutcome::ModuleGone(message)) => {
                 let _ = self
                     .forwarding
                     .release_reserved_route(endpoint, route_channel);
                 Ok(vec![control_error_frame(
                     &frame,
-                    "module_unavailable",
+                    "target_unavailable",
                     message,
                 )?])
             }
@@ -498,8 +615,8 @@ impl ControlHandler {
                     .release_reserved_route(endpoint, route_channel);
                 Ok(vec![control_error_frame(
                     &frame,
-                    "module_unavailable",
-                    "attach relay waiter was canceled before the module responded",
+                    "target_unavailable",
+                    "route.bind relay waiter was canceled before the module responded",
                 )?])
             }
         }
@@ -510,37 +627,45 @@ impl ControlHandler {
         endpoint: ModuleEndpointId,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
-        let update = match serde_json::from_slice::<StatusUpdate>(&frame.body) {
+        let update = match serde_json::from_slice::<ModuleControlPush>(&frame.body) {
             Ok(update) => update,
             Err(err) => {
                 return Ok(vec![control_error_frame(
                     &frame,
-                    "invalid_status_update",
-                    format!("malformed StatusUpdate body: {err}"),
+                    "invalid_control_body",
+                    format!("malformed module control push body: {err}"),
                 )?])
             }
         };
 
-        self.forwarding
-            .cache_status(endpoint, update.route_channel, update.status)
-            .map_err(RouterError::Forwarding)?;
+        match update {
+            ModuleControlPush::RouteStatus {
+                route_channel,
+                status,
+            } => {
+                self.forwarding
+                    .cache_status(endpoint, route_channel, status)
+                    .map_err(RouterError::Forwarding)?;
+            }
+        }
         Ok(Vec::new())
     }
 
-    fn handle_passive_poll(
+    fn handle_route_poll(
         &self,
         ctx: &RouteCtx,
         frame: Frame,
-        poll: PassivePoll,
+        route_channel: u16,
+        kind: PollKind,
     ) -> Result<Vec<Frame>, RouterError> {
-        match poll.op {
-            PollOp::Liveness => {
+        let response = match kind {
+            PollKind::Liveness => {
                 let route_bound_to_active_module = self
                     .forwarding
-                    .client_route_is_bound_to_active_module(ctx.connection_id, poll.route_channel)
+                    .client_route_is_bound_to_active_module(ctx.connection_id, route_channel)
                     .map_err(RouterError::Forwarding)?;
                 let process_running = if route_bound_to_active_module {
-                    self.process_running_for_route(ctx.connection_id, poll.route_channel)
+                    self.process_running_for_route(ctx.connection_id, route_channel)
                         .map_err(|message| {
                             RouterError::backend(frame.header.channel, frame.header.corr, message)
                         })?
@@ -548,36 +673,33 @@ impl ControlHandler {
                     false
                 };
                 let live = route_bound_to_active_module && process_running;
-                Ok(vec![control_response_body_frame(
-                    &frame,
-                    &LivenessReply { live },
-                    "LivenessReply",
-                )?])
+                ClientControlResponse::RoutePoll {
+                    status: None,
+                    live: Some(live),
+                }
             }
-            PollOp::Status => {
-                let Some(endpoint) = self
+            PollKind::Status => {
+                let status = if let Some(endpoint) = self
                     .forwarding
-                    .client_route_endpoint(ctx.connection_id, poll.route_channel)
+                    .client_route_endpoint(ctx.connection_id, route_channel)
                     .map_err(RouterError::Forwarding)?
-                else {
-                    return Ok(vec![status_unavailable_frame(&frame, poll.route_channel)?]);
+                {
+                    self.forwarding
+                        .get_status(endpoint, route_channel)
+                        .map_err(RouterError::Forwarding)?
+                } else {
+                    None
                 };
 
-                let Some(status) = self
-                    .forwarding
-                    .get_status(endpoint, poll.route_channel)
-                    .map_err(RouterError::Forwarding)?
-                else {
-                    return Ok(vec![status_unavailable_frame(&frame, poll.route_channel)?]);
-                };
-
-                Ok(vec![control_response_body_frame(
-                    &frame,
-                    &StatusReply { status },
-                    "StatusReply",
-                )?])
+                ClientControlResponse::RoutePoll { status, live: None }
             }
-        }
+        };
+
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::RoutePoll",
+        )?])
     }
 
     fn process_running_for_route(
@@ -627,23 +749,15 @@ impl ControlHandler {
     ) -> Result<Vec<Frame>, RouterError> {
         let outcome = match frame.header.ty {
             FrameType::Response => {
-                let body = match serde_json::from_slice::<AttachRelayResponse>(&frame.body) {
-                    Ok(body) => body,
+                match serde_json::from_slice::<ModuleControlResponse>(&frame.body) {
+                    Ok(ModuleControlResponse::RouteBindAck {}) => RouteBindRelayOutcome::Accepted,
                     Err(err) => {
                         return Ok(vec![control_error_frame(
                             &frame,
-                            "invalid_attach_relay_response",
-                            format!("malformed AttachRelay response body: {err}"),
+                            "invalid_control_body",
+                            format!("malformed route.bind response body: {err}"),
                         )?])
                     }
-                };
-                if body.accept {
-                    AttachRelayOutcome::Accepted
-                } else {
-                    AttachRelayOutcome::Rejected(ErrorBody {
-                        code: "config_divergence".to_string(),
-                        message: "module rejected AttachRelay".to_string(),
-                    })
                 }
             }
             FrameType::Error => {
@@ -652,12 +766,12 @@ impl ControlHandler {
                     Err(err) => {
                         return Ok(vec![control_error_frame(
                             &frame,
-                            "invalid_attach_relay_error",
-                            format!("malformed AttachRelay ERROR body: {err}"),
+                            "invalid_control_body",
+                            format!("malformed route.bind ERROR body: {err}"),
                         )?])
                     }
                 };
-                AttachRelayOutcome::Rejected(body)
+                RouteBindRelayOutcome::Rejected(body)
             }
             ty => {
                 return Ok(vec![control_error_frame(
@@ -684,7 +798,7 @@ impl ControlHandler {
             .forwarding
             .cleanup_connection(connection_id)
             .map_err(RouterError::Forwarding)?;
-        self.emit_detach_relays(released_routes);
+        self.emit_route_goodbyes(released_routes);
         Ok(Vec::new())
     }
 }
@@ -695,11 +809,58 @@ impl Default for ControlHandler {
     }
 }
 
-fn manifest_provides_tools(manifest: &ModuleManifest) -> bool {
-    manifest
-        .provides
+fn subc_ops() -> Vec<String> {
+    SUBC_CONTROL_OPS
         .iter()
-        .any(|role| matches!(role, ProviderRole::ToolProvider { .. }))
+        .map(|op| (*op).to_string())
+        .collect()
+}
+
+fn module_baseline_control_ops() -> Vec<String> {
+    MODULE_BASELINE_CONTROL_OPS
+        .iter()
+        .map(|op| (*op).to_string())
+        .collect()
+}
+
+fn target_module_id(target: &RouteTarget) -> &str {
+    match target {
+        RouteTarget::ToolProvider { module_id }
+        | RouteTarget::ManagementSurface { module_id }
+        | RouteTarget::InternalService { module_id, .. } => module_id,
+    }
+}
+
+fn target_has_required_role(target: &RouteTarget, roles: &[ProviderRole]) -> bool {
+    roles.iter().any(|role| match (target, role) {
+        (RouteTarget::ToolProvider { .. }, ProviderRole::ToolProvider { .. }) => true,
+        (RouteTarget::ManagementSurface { .. }, ProviderRole::ManagementSurface { .. }) => true,
+        (
+            RouteTarget::InternalService { service_id, .. },
+            ProviderRole::InternalService {
+                service_id: provided,
+                ..
+            },
+        ) => service_id == provided,
+        _ => false,
+    })
+}
+
+fn is_routable_role(role: &ProviderRole) -> bool {
+    matches!(
+        role,
+        ProviderRole::ToolProvider { .. }
+            | ProviderRole::ManagementSurface { .. }
+            | ProviderRole::InternalService { .. }
+    )
+}
+
+fn is_unknown_control_op_error(err: &serde_json::Error) -> bool {
+    err.to_string().contains("unknown variant")
+}
+
+fn manifest_provides_routable_role(manifest: &ModuleManifest) -> bool {
+    manifest.provides.iter().any(is_routable_role)
 }
 
 fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {
@@ -794,20 +955,12 @@ fn control_response_body_frame<T: Serialize>(
     .map_err(RouterError::FrameBuild)
 }
 
-fn status_unavailable_frame(frame: &Frame, route_channel: u16) -> Result<Frame, RouterError> {
-    control_error_frame(
-        frame,
-        "status_unavailable",
-        format!("status unavailable for route channel {route_channel}"),
-    )
-}
-
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
-        ForwardingError::NoModuleConnection => "module_unavailable",
+        ForwardingError::NoModuleConnection => "target_unavailable",
+        ForwardingError::RouteChannelExhausted => "route_limit",
         ForwardingError::StaleModuleEndpoint
         | ForwardingError::UnknownReservation { .. }
-        | ForwardingError::RouteChannelExhausted
         | ForwardingError::RelayCorrelationExhausted
         | ForwardingError::Poisoned => "forwarding_error",
     }
@@ -938,13 +1091,27 @@ mod tests {
         serde_json::from_slice(&frame.body).unwrap()
     }
 
-    fn parse_liveness(frame: &Frame) -> LivenessReply {
+    fn parse_route_poll(frame: &Frame) -> ClientControlResponse {
         serde_json::from_slice(&frame.body).unwrap()
     }
 
-    fn passive_poll_frame(corr: u64, op: PollOp, route_channel: u16) -> Frame {
-        let body = serde_json::to_vec(&PassivePoll { op, route_channel }).unwrap();
+    fn route_poll_frame(corr: u64, kind: PollKind, route_channel: u16) -> Frame {
+        let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
+            route_channel,
+            kind,
+        })
+        .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+    }
+
+    fn assert_route_poll_liveness(frame: &Frame, expected_live: bool) {
+        match parse_route_poll(frame) {
+            ClientControlResponse::RoutePoll {
+                status: None,
+                live: Some(live),
+            } => assert_eq!(live, expected_live),
+            other => panic!("unexpected route.poll response: {other:?}"),
+        }
     }
 
     fn bind_liveness_route(
@@ -971,13 +1138,13 @@ mod tests {
                 FrameSink::new(module_tx),
             )
             .unwrap();
-        let pending = forwarding.begin_attach_relay().unwrap();
+        let pending = forwarding.begin_route_bind_relay_for(module_id).unwrap();
         assert_eq!(pending.endpoint, endpoint);
         forwarding
             .complete_pending_relay(
                 module_connection,
                 pending.corr,
-                AttachRelayOutcome::Accepted,
+                RouteBindRelayOutcome::Accepted,
             )
             .unwrap();
         let (client_ctx, _client_rx) = route_ctx(client_connection);
@@ -1106,22 +1273,18 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_process_liveness(process_liveness);
         let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-dead");
-        let poll = PassivePoll {
-            op: PollOp::Liveness,
-            route_channel,
-        };
-
         let responses = handler
-            .handle_passive_poll(
+            .handle_route_poll(
                 &ctx,
-                passive_poll_frame(41, PollOp::Liveness, route_channel),
-                poll,
+                route_poll_frame(41, PollKind::Liveness, route_channel),
+                route_channel,
+                PollKind::Liveness,
             )
             .unwrap();
 
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].header.ty, FrameType::Response);
-        assert!(!parse_liveness(&responses[0]).live);
+        assert_route_poll_liveness(&responses[0], false);
     }
 
     #[test]
@@ -1131,20 +1294,16 @@ mod tests {
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-bound-only");
-        let poll = PassivePoll {
-            op: PollOp::Liveness,
-            route_channel,
-        };
-
         let responses = handler
-            .handle_passive_poll(
+            .handle_route_poll(
                 &ctx,
-                passive_poll_frame(42, PollOp::Liveness, route_channel),
-                poll,
+                route_poll_frame(42, PollKind::Liveness, route_channel),
+                route_channel,
+                PollKind::Liveness,
             )
             .unwrap();
 
-        assert!(parse_liveness(&responses[0]).live);
+        assert_route_poll_liveness(&responses[0], true);
     }
 
     #[test]
@@ -1156,20 +1315,37 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_process_liveness(process_liveness);
         let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-untracked");
-        let poll = PassivePoll {
-            op: PollOp::Liveness,
-            route_channel,
-        };
-
         let responses = handler
-            .handle_passive_poll(
+            .handle_route_poll(
                 &ctx,
-                passive_poll_frame(43, PollOp::Liveness, route_channel),
-                poll,
+                route_poll_frame(43, PollKind::Liveness, route_channel),
+                route_channel,
+                PollKind::Liveness,
             )
             .unwrap();
 
-        assert!(parse_liveness(&responses[0]).live);
+        assert_route_poll_liveness(&responses[0], true);
+    }
+
+    #[tokio::test]
+    async fn unknown_op_returns_unknown_control_op() {
+        let handler = ControlHandler::default();
+        let (ctx, _rx) = route_ctx(ConnectionId::new(77));
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            55,
+            br#"{"op":"route.nope","route_channel":1}"#.to_vec(),
+        )
+        .unwrap();
+
+        let response = handler.handle_control_frame(&ctx, request).await.unwrap();
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        assert_eq!(response[0].header.corr, 55);
+        assert_eq!(parse_error(&response[0])["code"], "unknown_control_op");
     }
 
     #[tokio::test]

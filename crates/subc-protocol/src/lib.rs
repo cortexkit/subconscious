@@ -111,13 +111,6 @@ pub struct ModuleHelloAckBody {
     pub subc_capabilities: Vec<String>,
 }
 
-/// Module-to-subc channel-0 `Push` body that refreshes the latest status for a route.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StatusUpdate {
-    pub route_channel: u16,
-    pub status: String,
-}
-
 /// Frame kind (`type` byte at offset 5).
 ///
 /// `CANCEL`, `PING`, `PONG`, and `GOODBYE` are pure-header frames (`len == 0`);

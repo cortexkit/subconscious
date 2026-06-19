@@ -11,3 +11,5 @@
 /.opencode
 /.agents
 /_bmad
+# Planning/decision artifacts kept LOCAL for now (Ufuk: not in the shared repo)
+/_bmad-output

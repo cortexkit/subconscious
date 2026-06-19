@@ -319,6 +319,25 @@ impl ForwardingTable {
             .map(|route| route.endpoint))
     }
 
+    pub(crate) fn client_route_module_id(
+        &self,
+        client_connection_id: ConnectionId,
+        route_channel: u16,
+    ) -> Result<Option<String>, ForwardingError> {
+        let inner = self.lock_inner()?;
+        let Some(route) = inner
+            .client_to_module
+            .get(&(client_connection_id, route_channel))
+        else {
+            return Ok(None);
+        };
+        Ok(inner
+            .active_module
+            .as_ref()
+            .filter(|module| module.endpoint == route.endpoint)
+            .map(|module| module.module_id.clone()))
+    }
+
     pub(crate) fn client_route_is_bound_to_active_module(
         &self,
         client_connection_id: ConnectionId,

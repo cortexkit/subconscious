@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     fmt, io,
     path::PathBuf,
@@ -131,6 +132,61 @@ impl SupervisorSnapshot {
 
 type SharedSnapshot = Arc<Mutex<SupervisorSnapshot>>;
 
+/// Narrow process-liveness signal published by supervisors and consumed by passive liveness polls.
+pub trait ModuleProcessLiveness: Send + Sync {
+    fn process_live(&self, module_id: &str) -> Option<bool>;
+}
+
+/// Shared process-liveness registry keyed by supervised `module_id`.
+#[derive(Debug, Clone, Default)]
+pub struct SupervisorProcessLiveness {
+    snapshots: Arc<Mutex<HashMap<String, SharedSnapshot>>>,
+}
+
+impl SupervisorProcessLiveness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn track(&self, module_id: String, snapshot: SharedSnapshot) {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots.insert(module_id, snapshot);
+    }
+
+    fn untrack_if_current(&self, module_id: &str, snapshot: &SharedSnapshot) {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let is_current = snapshots
+            .get(module_id)
+            .map(|tracked| Arc::ptr_eq(tracked, snapshot))
+            .unwrap_or(false);
+        if is_current {
+            snapshots.remove(module_id);
+        }
+    }
+}
+
+impl ModuleProcessLiveness for SupervisorProcessLiveness {
+    fn process_live(&self, module_id: &str) -> Option<bool> {
+        let snapshot = {
+            let snapshots = self
+                .snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snapshots.get(module_id).cloned()
+        }?;
+        let snapshot = snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(snapshot.state == ModuleState::Running && snapshot.process_alive)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
     restart_policy: RestartPolicy,
@@ -145,6 +201,7 @@ pub struct Supervisor {
     restart_policy: RestartPolicy,
     drain_timeout: Duration,
     connection_file_path: Option<PathBuf>,
+    process_liveness: Arc<SupervisorProcessLiveness>,
 }
 
 impl Supervisor {
@@ -154,11 +211,20 @@ impl Supervisor {
             restart_policy,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             connection_file_path: None,
+            process_liveness: Arc::new(SupervisorProcessLiveness::default()),
         }
     }
 
     pub fn with_drain_timeout(mut self, drain_timeout: Duration) -> Self {
         self.drain_timeout = drain_timeout;
+        self
+    }
+
+    pub fn with_process_liveness(
+        mut self,
+        process_liveness: Arc<SupervisorProcessLiveness>,
+    ) -> Self {
+        self.process_liveness = process_liveness;
         self
     }
 
@@ -187,12 +253,15 @@ impl Supervisor {
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let child = spawn_child(&spec, runtime.connection_file_path.as_deref())?;
         set_running(&snapshot, child.id())?;
+        self.process_liveness
+            .track(spec.module_id.clone(), Arc::clone(&snapshot));
 
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
             runtime,
             Arc::clone(&self.registry),
+            Arc::clone(&self.process_liveness),
             Arc::clone(&snapshot),
             child,
             rx,
@@ -298,6 +367,11 @@ impl SupervisedModule {
 impl Drop for SupervisedModule {
     fn drop(&mut self) {
         if !self.monitor.is_finished() {
+            let _ = update_snapshot(&self.snapshot, Some(&self.module_id), |state| {
+                state.state = ModuleState::Stopped;
+                state.process_alive = false;
+                state.pid = None;
+            });
             self.monitor.abort();
         }
     }
@@ -397,6 +471,7 @@ async fn supervise_loop(
     spec: ModuleSpec,
     runtime: SupervisorRuntimeConfig,
     registry: Arc<Registry>,
+    process_liveness: Arc<SupervisorProcessLiveness>,
     snapshot: SharedSnapshot,
     mut child: Child,
     mut commands: mpsc::Receiver<SupervisorCommand>,
@@ -408,6 +483,12 @@ async fn supervise_loop(
                     Ok(status) => classify_exit(&status),
                     Err(err) => {
                         fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                        untrack_if_registration_released(
+                            &process_liveness,
+                            &registry,
+                            &spec.module_id,
+                            &snapshot,
+                        );
                         error!(module_id = %spec.module_id, error = %err, "failed to wait for supervised module");
                         return;
                     }
@@ -420,7 +501,12 @@ async fn supervise_loop(
                     &snapshot,
                     exit_report,
                 ).await {
-                    NextAction::Stop => return,
+                    NextAction::Stop { registration_released } => {
+                        if registration_released {
+                            process_liveness.untrack_if_current(&spec.module_id, &snapshot);
+                        }
+                        return;
+                    }
                     NextAction::Restart => {
                         sleep(runtime.restart_policy.backoff).await;
                         if let Err(err) = wait_for_registration_release(
@@ -444,6 +530,7 @@ async fn supervise_loop(
                             }
                             Err(err) => {
                                 fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                                process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                                 error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
                                 return;
                             }
@@ -464,7 +551,11 @@ async fn supervise_loop(
                             &mut child,
                             runtime.drain_timeout,
                         ).await;
+                        let registration_released = result.is_ok();
                         let _ = reply.send(result);
+                        if registration_released {
+                            process_liveness.untrack_if_current(&spec.module_id, &snapshot);
+                        }
                         return;
                     }
                 }
@@ -474,7 +565,7 @@ async fn supervise_loop(
 }
 
 enum NextAction {
-    Stop,
+    Stop { registration_released: bool },
     Restart,
 }
 
@@ -495,13 +586,22 @@ async fn on_child_exit(
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record clean module exit");
             }
-            if let Err(err) =
-                wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT)
-                    .await
+            let registration_released = match wait_for_registration_release(
+                registry,
+                &spec.module_id,
+                REGISTRY_RELEASE_TIMEOUT,
+            )
+            .await
             {
-                warn!(module_id = %spec.module_id, error = %err, "registration still active after clean exit");
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(module_id = %spec.module_id, error = %err, "registration still active after clean exit");
+                    false
+                }
+            };
+            NextAction::Stop {
+                registration_released,
             }
-            NextAction::Stop
         }
         ExitKind::Crash => {
             let mut should_restart = false;
@@ -518,23 +618,46 @@ async fn on_child_exit(
                 }
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record crashed module exit");
-                return NextAction::Stop;
+                return NextAction::Stop {
+                    registration_released: false,
+                };
             }
 
             if should_restart {
                 NextAction::Restart
             } else {
-                if let Err(err) = wait_for_registration_release(
+                let registration_released = match wait_for_registration_release(
                     registry,
                     &spec.module_id,
                     REGISTRY_RELEASE_TIMEOUT,
                 )
                 .await
                 {
-                    warn!(module_id = %spec.module_id, error = %err, "registration still active after failed module");
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(module_id = %spec.module_id, error = %err, "registration still active after failed module");
+                        false
+                    }
+                };
+                NextAction::Stop {
+                    registration_released,
                 }
-                NextAction::Stop
             }
+        }
+    }
+}
+
+fn untrack_if_registration_released(
+    process_liveness: &SupervisorProcessLiveness,
+    registry: &Registry,
+    module_id: &str,
+    snapshot: &SharedSnapshot,
+) {
+    match registry.get_module(module_id) {
+        Ok(None) => process_liveness.untrack_if_current(module_id, snapshot),
+        Ok(Some(_)) => {}
+        Err(err) => {
+            warn!(module_id, error = %err, "could not determine whether supervisor liveness can be untracked");
         }
     }
 }

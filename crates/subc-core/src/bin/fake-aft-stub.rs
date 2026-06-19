@@ -4,8 +4,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
     error::Error,
+    ffi::OsString,
     fmt, fs,
     io::{self, Write as _},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -13,8 +15,10 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_core::{
+    auth::{authenticate_client, AuthError},
+    connection_file::{self, ConnectionFileError},
     read_frame, write_frame, AttachRelay, AttachRelayResponse, DetachRelay, Frame, HelloAckBody,
-    HelloBody, StatusUpdate, SUBC_SOCKET_ENV,
+    HelloBody, StatusUpdate,
 };
 use subc_protocol::{
     manifest::{
@@ -25,7 +29,7 @@ use subc_protocol::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
-    net::UnixStream,
+    net::TcpStream,
     sync::{mpsc, oneshot},
     time::sleep,
 };
@@ -55,12 +59,7 @@ async fn main() -> Result<(), StubError> {
 }
 
 async fn run(config: StubConfig) -> Result<(), StubError> {
-    let stream = UnixStream::connect(&config.socket_path)
-        .await
-        .map_err(|source| StubError::Connect {
-            path: config.socket_path.clone(),
-            source,
-        })?;
+    let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(STUB_EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
@@ -75,6 +74,47 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
         (Ok(()), Ok(Err(writer_err))) => Err(StubError::FrameIo(writer_err)),
         (Ok(()), Err(join_err)) => Err(join_err),
     }
+}
+
+async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, StubError> {
+    // follow-up (4.3): future reconnect loops must call this helper for every
+    // reconnect so key rotation is observed by re-reading the connection file.
+    let conn = connection_file::read(connection_file_path).map_err(|source| {
+        StubError::ConnectionFile {
+            path: connection_file_path.to_path_buf(),
+            source,
+        }
+    })?;
+    let endpoint = conn
+        .endpoints
+        .first()
+        .ok_or_else(|| StubError::NoEndpoint {
+            path: connection_file_path.to_path_buf(),
+        })?;
+    let endpoint_label = format!("{}:{}", endpoint.host, endpoint.port);
+    let ip = endpoint
+        .host
+        .parse::<IpAddr>()
+        .map_err(|_| StubError::InvalidEndpoint {
+            path: connection_file_path.to_path_buf(),
+            endpoint: endpoint_label.clone(),
+        })?;
+    let addr = SocketAddr::new(ip, endpoint.port);
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|source| StubError::Connect {
+            path: connection_file_path.to_path_buf(),
+            endpoint: endpoint_label.clone(),
+            source,
+        })?;
+    authenticate_client(&mut stream, &conn, Duration::from_secs(2))
+        .await
+        .map_err(|source| StubError::Auth {
+            path: connection_file_path.to_path_buf(),
+            endpoint: endpoint_label,
+            source,
+        })?;
+    Ok(stream)
 }
 
 async fn module_loop<R>(
@@ -709,7 +749,7 @@ fn control_flags() -> Flags {
 
 #[derive(Debug, Clone)]
 struct StubConfig {
-    socket_path: PathBuf,
+    connection_file_path: PathBuf,
     module_id: String,
     crash_after: Option<Duration>,
     reject_attach: bool,
@@ -739,11 +779,7 @@ impl Default for StubState {
 
 impl StubConfig {
     fn from_env() -> Result<Self, StubError> {
-        let socket_path = env::var_os(SUBC_SOCKET_ENV)
-            .ok_or(StubError::MissingEnv {
-                key: SUBC_SOCKET_ENV,
-            })
-            .map(PathBuf::from)?;
+        let connection_file_path = parse_subc_arg(env::args_os().skip(1))?;
         let module_id = env::var(FAKE_AFT_MODULE_ID_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -767,7 +803,7 @@ impl StubConfig {
         });
 
         Ok(Self {
-            socket_path,
+            connection_file_path,
             module_id,
             crash_after,
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
@@ -781,6 +817,30 @@ impl StubConfig {
             status,
         })
     }
+}
+
+fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, StubError> {
+    let mut args = args.into_iter();
+    let mut connection_file_path = None;
+    while let Some(arg) = args.next() {
+        if arg == "--subc" {
+            let value = args.next().ok_or(StubError::MissingSubcValue)?;
+            connection_file_path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if let Some(raw) = arg.to_str().and_then(|arg| arg.strip_prefix("--subc=")) {
+            if raw.is_empty() {
+                return Err(StubError::MissingSubcValue);
+            }
+            connection_file_path = Some(PathBuf::from(raw));
+            continue;
+        }
+
+        return Err(StubError::UnexpectedArg { arg });
+    }
+
+    connection_file_path.ok_or(StubError::MissingSubcArg)
 }
 
 fn concurrency_from_env() -> Result<Concurrency, StubError> {
@@ -804,8 +864,10 @@ fn env_flag(key: &str) -> bool {
 
 #[derive(Debug)]
 enum StubError {
-    MissingEnv {
-        key: &'static str,
+    MissingSubcArg,
+    MissingSubcValue,
+    UnexpectedArg {
+        arg: OsString,
     },
     InvalidCrashAfter {
         raw: String,
@@ -814,9 +876,26 @@ enum StubError {
     InvalidConcurrency {
         raw: String,
     },
+    ConnectionFile {
+        path: PathBuf,
+        source: ConnectionFileError,
+    },
+    NoEndpoint {
+        path: PathBuf,
+    },
+    InvalidEndpoint {
+        path: PathBuf,
+        endpoint: String,
+    },
     Connect {
         path: PathBuf,
+        endpoint: String,
         source: io::Error,
+    },
+    Auth {
+        path: PathBuf,
+        endpoint: String,
+        source: AuthError,
     },
     Io(io::Error),
     FrameIo(subc_core::FrameIoError),
@@ -837,7 +916,9 @@ enum StubError {
 impl fmt::Display for StubError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingEnv { key } => write!(f, "missing required env var {key}"),
+            Self::MissingSubcArg => write!(f, "missing required --subc <connection-file-path> argument"),
+            Self::MissingSubcValue => write!(f, "--subc requires a connection-file path value"),
+            Self::UnexpectedArg { arg } => write!(f, "unexpected argument {:?}", arg),
             Self::InvalidCrashAfter { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_CRASH_AFTER_MS_ENV} value '{raw}': {source}"
@@ -846,13 +927,31 @@ impl fmt::Display for StubError {
                 f,
                 "invalid {FAKE_AFT_CONCURRENCY_ENV} value '{raw}': expected serial, module_managed, or stateless_parallel"
             ),
-            Self::Connect { path, source } => {
-                write!(
-                    f,
-                    "failed to connect to subc socket '{}': {source}",
-                    path.display()
-                )
-            }
+            Self::ConnectionFile { path, source } => write!(
+                f,
+                "failed to read subc connection file '{}': {source}",
+                path.display()
+            ),
+            Self::NoEndpoint { path } => write!(
+                f,
+                "subc connection file '{}' has no endpoints",
+                path.display()
+            ),
+            Self::InvalidEndpoint { path, endpoint } => write!(
+                f,
+                "subc connection file '{}' contains invalid endpoint {endpoint}",
+                path.display()
+            ),
+            Self::Connect { path, endpoint, source } => write!(
+                f,
+                "failed to connect to subc endpoint {endpoint} from '{}': {source}",
+                path.display()
+            ),
+            Self::Auth { path, endpoint, source } => write!(
+                f,
+                "failed to authenticate to subc endpoint {endpoint} from '{}': {source}",
+                path.display()
+            ),
             Self::Io(err) => write!(f, "I/O error: {err}"),
             Self::FrameIo(err) => write!(f, "frame I/O error: {err}"),
             Self::FrameBuild(err) => write!(f, "frame build error: {err}"),
@@ -877,12 +976,19 @@ impl Error for StubError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidCrashAfter { source, .. } => Some(source),
-            Self::Connect { source, .. } | Self::Io(source) => Some(source),
+            Self::ConnectionFile { source, .. } => Some(source),
+            Self::Connect { source, .. } => Some(source),
+            Self::Auth { source, .. } => Some(source),
+            Self::Io(source) => Some(source),
             Self::FrameIo(err) => Some(err),
             Self::FrameBuild(err) => Some(err),
             Self::Json(err) => Some(err),
             Self::WriterTask(err) => Some(err),
-            Self::MissingEnv { .. }
+            Self::MissingSubcArg
+            | Self::MissingSubcValue
+            | Self::UnexpectedArg { .. }
+            | Self::NoEndpoint { .. }
+            | Self::InvalidEndpoint { .. }
             | Self::InvalidConcurrency { .. }
             | Self::WriterClosed
             | Self::InFlightPoisoned

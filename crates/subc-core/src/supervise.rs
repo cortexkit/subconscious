@@ -17,13 +17,12 @@ use tracing::{debug, error, warn};
 
 use crate::{registry::RegistryError, Registry};
 
-/// Environment variable convention used by supervised modules to find subc.
+/// Command-line flag used by supervised modules to find subc.
 ///
-/// subc owns the Unix listener. A supervised child process connects back to that
-/// already-bound socket and registers itself with a channel-0 `HELLO`. The
-/// supervisor passes the socket path to children through this environment
-/// variable; callers add `(SUBC_SOCKET_ENV, socket_path)` to [`ModuleSpec::env`].
-pub const SUBC_SOCKET_ENV: &str = "SUBC_SOCKET";
+/// subc launches module-mode children as `<module> --subc <connection-file-path>`.
+/// The path points at the TCP+key connection file; it is not an ambient signal and
+/// is never inherited by standalone children.
+pub const SUBC_ARG: &str = "--subc";
 
 const DEFAULT_MAX_RESTARTS: u32 = 3;
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
@@ -132,12 +131,20 @@ impl SupervisorSnapshot {
 
 type SharedSnapshot = Arc<Mutex<SupervisorSnapshot>>;
 
+#[derive(Debug, Clone)]
+struct SupervisorRuntimeConfig {
+    restart_policy: RestartPolicy,
+    drain_timeout: Duration,
+    connection_file_path: Option<PathBuf>,
+}
+
 /// Process supervisor for subc-owned singleton modules.
 #[derive(Debug, Clone)]
 pub struct Supervisor {
     registry: Arc<Registry>,
     restart_policy: RestartPolicy,
     drain_timeout: Duration,
+    connection_file_path: Option<PathBuf>,
 }
 
 impl Supervisor {
@@ -146,6 +153,7 @@ impl Supervisor {
             registry,
             restart_policy,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            connection_file_path: None,
         }
     }
 
@@ -154,11 +162,16 @@ impl Supervisor {
         self
     }
 
+    pub fn with_connection_file_path(mut self, connection_file_path: impl Into<PathBuf>) -> Self {
+        self.connection_file_path = Some(connection_file_path.into());
+        self
+    }
+
     /// Spawn `spec.program` and start monitoring it.
     ///
-    /// The child is expected to read [`SUBC_SOCKET_ENV`], connect back to subc's
-    /// already-running listener, and register with channel-0 `HELLO` using
-    /// `spec.module_id` as its manifest id.
+    /// The child is expected to parse `--subc <connection-file-path>`, read the
+    /// TCP+key connection file, authenticate to the already-running listener, and
+    /// register with channel-0 `HELLO` using `spec.module_id` as its manifest id.
     pub fn spawn(&self, spec: ModuleSpec) -> Result<SupervisedModule, SuperviseError> {
         if spec.module_id.trim().is_empty() {
             return Err(SuperviseError::InvalidSpec {
@@ -166,15 +179,19 @@ impl Supervisor {
             });
         }
 
+        let runtime = SupervisorRuntimeConfig {
+            restart_policy: self.restart_policy,
+            drain_timeout: self.drain_timeout,
+            connection_file_path: self.connection_file_path.clone(),
+        };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let child = spawn_child(&spec)?;
+        let child = spawn_child(&spec, runtime.connection_file_path.as_deref())?;
         set_running(&snapshot, child.id())?;
 
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
-            self.restart_policy,
-            self.drain_timeout,
+            runtime,
             Arc::clone(&self.registry),
             Arc::clone(&snapshot),
             child,
@@ -378,8 +395,7 @@ impl Error for SuperviseError {
 
 async fn supervise_loop(
     spec: ModuleSpec,
-    policy: RestartPolicy,
-    drain_timeout: Duration,
+    runtime: SupervisorRuntimeConfig,
     registry: Arc<Registry>,
     snapshot: SharedSnapshot,
     mut child: Child,
@@ -399,14 +415,14 @@ async fn supervise_loop(
 
                 match on_child_exit(
                     &spec,
-                    policy,
+                    runtime.restart_policy,
                     &registry,
                     &snapshot,
                     exit_report,
                 ).await {
                     NextAction::Stop => return,
                     NextAction::Restart => {
-                        sleep(policy.backoff).await;
+                        sleep(runtime.restart_policy.backoff).await;
                         if let Err(err) = wait_for_registration_release(
                             &registry,
                             &spec.module_id,
@@ -417,7 +433,7 @@ async fn supervise_loop(
                             return;
                         }
 
-                        match spawn_child(&spec) {
+                        match spawn_child(&spec, runtime.connection_file_path.as_deref()) {
                             Ok(next_child) => {
                                 child = next_child;
                                 if let Err(err) = set_running(&snapshot, child.id()) {
@@ -446,7 +462,7 @@ async fn supervise_loop(
                             &registry,
                             &snapshot,
                             &mut child,
-                            drain_timeout,
+                            runtime.drain_timeout,
                         ).await;
                         let _ = reply.send(result);
                         return;
@@ -523,9 +539,15 @@ async fn on_child_exit(
     }
 }
 
-fn spawn_child(spec: &ModuleSpec) -> Result<Child, SuperviseError> {
+fn spawn_child(
+    spec: &ModuleSpec,
+    connection_file_path: Option<&std::path::Path>,
+) -> Result<Child, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
+    if let Some(connection_file_path) = connection_file_path {
+        command.arg(SUBC_ARG).arg(connection_file_path);
+    }
     for (key, value) in &spec.env {
         command.env(key, value);
     }

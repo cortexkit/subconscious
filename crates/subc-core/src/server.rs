@@ -1,5 +1,6 @@
 use std::{error::Error, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 
+use subc_transport::{authenticate_server, AuthError, DAEMON_ID_LEN};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpListener,
@@ -8,8 +9,6 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
-    auth::{authenticate_server, AuthError},
-    connection_file::DAEMON_ID_LEN,
     read_frame,
     router::{FrameSink, RouteCtx, Router},
     write_frame, FrameIoError, RouterError,
@@ -360,12 +359,9 @@ mod tests {
     };
     use tokio::io::{duplex, AsyncWriteExt};
 
-    use crate::{
-        auth::authenticate_client,
-        connection_file::{ConnectionInfo, Endpoint, SCHEMA_VERSION},
-        frame_io::ReadStage,
-        ControlHandler, EchoBackend, Frame, Registry,
-    };
+    use subc_transport::{authenticate_client, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+
+    use crate::{frame_io::ReadStage, ControlHandler, EchoBackend, Frame, Registry};
 
     const TEST_DEADLINE: Duration = Duration::from_secs(2);
     const TEST_DAEMON_VER: &str = "test-subc-server";

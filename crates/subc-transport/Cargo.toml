@@ -1,0 +1,21 @@
+[package]
+name = "subc-transport"
+version = "0.1.0"
+edition = "2021"
+publish = true
+description = "subc loopback-TCP + key transport: pre-envelope auth handshake and connection-file discovery."
+license = "MIT"
+# Intended repository URL for first crates.io publish; pending Ufuk confirmation before publishing.
+repository = "https://github.com/cortexkit/subconscious"
+
+[dependencies]
+getrandom = "0.2"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }

@@ -9,6 +9,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use subc_transport::{
+    authenticate_client, connection_file, generate_daemon_id, generate_key, write_atomic,
+    AuthError, ConnectionFileError, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     time::{sleep, timeout},
@@ -16,11 +20,6 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
-    auth::{authenticate_client, AuthError},
-    connection_file::{
-        self, generate_daemon_id, generate_key, write_atomic, ConnectionFileError, ConnectionInfo,
-        Endpoint, SCHEMA_VERSION,
-    },
     server::{serve_listeners, ServerAuth, ServerError},
     Router,
 };

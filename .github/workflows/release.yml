@@ -1,0 +1,74 @@
+name: Release
+
+# Per-crate release. Tag format: `<crate>-v<version>` (e.g. subc-transport-v0.1.0).
+# Each PUBLISHABLE crate (subc-protocol, subc-transport) versions and publishes
+# independently — they are leaf crates with no inter-crate publish-order
+# dependency. subc-core is publish=false (the daemon, never published).
+on:
+  push:
+    tags:
+      - "*-v*"
+
+concurrency:
+  # Include SHA so a retag at a different commit gets its own group and won't
+  # block behind a stuck queued run.
+  group: release-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Same 3-OS fmt/clippy/test matrix as PR-time CI. Reused (not copied) so a
+  # release can never ship code that wouldn't pass CI — including the
+  # cross-platform transport tests.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Parse `<crate>-v<version>` from the tag and assert the crate's
+      # Cargo.toml version matches — guards against tagging a stale version.
+      - name: Resolve crate + version from tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^(.+)-v([0-9].*)$ ]]; then
+            echo "::error::Tag '$TAG' must be '<crate>-v<version>', e.g. subc-transport-v0.1.0"
+            exit 1
+          fi
+          CRATE="${BASH_REMATCH[1]}"
+          VERSION="${BASH_REMATCH[2]}"
+          MANIFEST="crates/${CRATE}/Cargo.toml"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::No crate '${CRATE}' at ${MANIFEST}"
+            exit 1
+          fi
+          CARGO_VERSION=$(grep '^version' "$MANIFEST" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag wants ${VERSION} but ${MANIFEST} has ${CARGO_VERSION}"
+            exit 1
+          fi
+          echo "crate=$CRATE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${CRATE} v${VERSION}"
+
+      # Idempotent: a retag of the same version (recovery re-run) treats
+      # "already exists" as success instead of failing the release.
+      - name: Publish
+        run: |
+          CRATE="${{ steps.tag.outputs.crate }}"
+          cargo publish --package "$CRATE" \
+            || { ec=$?; cargo publish --package "$CRATE" --dry-run 2>&1 | grep -q "already exists" && echo "already published; treating as success" || exit $ec; }
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

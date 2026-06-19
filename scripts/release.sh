@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# release.sh — tag and push a per-crate subconscious release.
+#
+# Usage:
+#   ./scripts/release.sh <crate> <version> [--dry]
+#   e.g. ./scripts/release.sh subc-transport 0.1.0
+#
+# Publishable crates: subc-protocol, subc-transport (subc-core is publish=false).
+# On the pushed tag, CI (release.yml) takes over: verify (3-OS fmt/clippy/test)
+# → cargo publish to crates.io.
+
+CRATE="${1:-}"
+VERSION="${2:-}"
+DRY="${3:-}"
+
+if [[ -z "$CRATE" || -z "$VERSION" ]]; then
+  echo "Usage: ./scripts/release.sh <crate> <version> [--dry]"
+  echo "  e.g. ./scripts/release.sh subc-transport 0.1.0"
+  exit 1
+fi
+
+MANIFEST="crates/$CRATE/Cargo.toml"
+if [[ ! -f "$MANIFEST" ]]; then
+  echo "Error: no crate '$CRATE' at $MANIFEST"
+  exit 1
+fi
+
+if [[ "$CRATE" == "subc-core" ]]; then
+  echo "Error: subc-core is publish=false and is never released to crates.io"
+  exit 1
+fi
+
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+  echo "Error: '$VERSION' is not valid semver (expected X.Y.Z)"
+  exit 1
+fi
+
+TAG="$CRATE-v$VERSION"
+CURRENT_HEAD=$(git rev-parse HEAD)
+
+# Resumable release: if the tag already exists at HEAD, just (re)push it.
+if git show-ref --verify --quiet "refs/tags/$TAG"; then
+  tag_commit=$(git rev-list -n 1 "$TAG")
+  if [[ "$tag_commit" == "$CURRENT_HEAD" ]]; then
+    echo "→ Tag '$TAG' already at HEAD; resuming push."
+    [[ "$DRY" == "--dry" ]] && { echo "[DRY] would push $TAG"; exit 0; }
+    git push origin "$TAG"
+    exit 0
+  fi
+  echo "Error: tag '$TAG' exists but points at $tag_commit, not HEAD ($CURRENT_HEAD)"
+  echo "       Refusing to reuse a release tag from a different commit."
+  exit 1
+fi
+
+# Clean tree required (so the tagged commit is exactly what's reviewed).
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Error: working tree not clean — commit or stash first"
+  git status --short
+  exit 1
+fi
+
+# Sync the crate's Cargo.toml version to $VERSION if it differs.
+CARGO_VERSION=$(grep '^version' "$MANIFEST" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
+NEEDS_BUMP=0
+if [[ "$CARGO_VERSION" != "$VERSION" ]]; then
+  NEEDS_BUMP=1
+  echo "→ $MANIFEST: $CARGO_VERSION → $VERSION"
+fi
+
+# Pre-tag checks (the same gates CI will run, fail-fast locally first).
+echo "→ Pre-release checks (fmt, clippy, publish dry-run)..."
+if [[ "$NEEDS_BUMP" == "1" && "$DRY" != "--dry" ]]; then
+  sed -i.bak -E "0,/^version *= *\"[^\"]+\"/s//version = \"$VERSION\"/" "$MANIFEST"
+  rm -f "$MANIFEST.bak"
+fi
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo publish --package "$CRATE" --dry-run
+
+if [[ "$DRY" == "--dry" ]]; then
+  echo "[DRY] checks passed; would commit (if bumped) + tag $TAG + push."
+  exit 0
+fi
+
+if [[ "$NEEDS_BUMP" == "1" ]]; then
+  git add "$MANIFEST"
+  git commit -m "release: $TAG"
+fi
+
+git tag -a "$TAG" -m "Release $TAG"
+git push origin HEAD
+git push origin "$TAG"
+echo "  ✓ Pushed $TAG — CI will verify (3-OS) then publish $CRATE v$VERSION to crates.io"

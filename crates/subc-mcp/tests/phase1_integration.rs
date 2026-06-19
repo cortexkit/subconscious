@@ -2,7 +2,8 @@
 
 use std::{
     env, fs,
-    io::{self, ErrorKind},
+    future::Future,
+    io::ErrorKind,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process,
@@ -13,18 +14,28 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
+use rmcp::{
+    model::{
+        CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
+        JsonObject, ProgressNotificationParam,
+    },
+    service::{
+        MaybeSendFuture, NotificationContext, PeerRequestOptions, RunningService, ServiceError,
+    },
+    ClientHandler, RoleClient, ServiceExt,
+};
+use serde_json::{json, Value};
 use subc_core::{
     serve_listener, ControlHandler, ModuleProcessLiveness, ModuleSpec, Registry, RestartPolicy,
-    Router, ServerAuth, Supervisor, SupervisorProcessLiveness,
+    Router, ServerAuth, SupervisedModule, Supervisor, SupervisorProcessLiveness,
 };
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     process::{Child, ChildStdin, ChildStdout, Command},
+    sync::{Mutex as TokioMutex, Notify},
     task::JoinHandle,
     time::{sleep, timeout, Instant},
 };
@@ -56,7 +67,7 @@ impl TestServer {
     async fn start() -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
         let daemon = start_test_daemon_with_process_liveness(
-            "subc-mcp-phase1",
+            "subc-mcp-phase2b",
             Arc::clone(&process_liveness),
         )
         .await;
@@ -88,82 +99,305 @@ impl Drop for TestProject {
 struct ShimProcess {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: ChildStdout,
+    stdout: Option<ChildStdout>,
 }
 
 impl ShimProcess {
-    fn close_stdin(&mut self) {
-        drop(self.stdin.take());
+    async fn serve_mcp_client<H>(&mut self, handler: H) -> RunningService<RoleClient, H>
+    where
+        H: ClientHandler,
+    {
+        let stdout = self.stdout.take().expect("shim stdout should be available");
+        let stdin = self.stdin.take().expect("shim stdin should be available");
+        handler
+            .serve((stdout, stdin))
+            .await
+            .expect("rmcp client should initialize through subc-mcp shim")
+    }
+}
+
+#[derive(Clone)]
+struct TestMcpClient {
+    progress: Arc<TokioMutex<Vec<ProgressNotificationParam>>>,
+    progress_notify: Arc<Notify>,
+}
+
+impl TestMcpClient {
+    fn new() -> Self {
+        Self {
+            progress: Arc::new(TokioMutex::new(Vec::new())),
+            progress_notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl ClientHandler for TestMcpClient {
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        let progress = Arc::clone(&self.progress);
+        let notify = Arc::clone(&self.progress_notify);
+        async move {
+            progress.lock().await.push(params);
+            notify.notify_waiters();
+        }
+    }
+}
+
+struct McpHarness {
+    _server: TestServer,
+    _project: TestProject,
+    provider: SupervisedModule,
+    module: Child,
+    shim: ShimProcess,
+    client: RunningService<RoleClient, TestMcpClient>,
+    client_handler: TestMcpClient,
+    events_path: PathBuf,
+}
+
+impl McpHarness {
+    async fn start(label: &str, provider_env: &[(&str, &str)]) -> Self {
+        let server = TestServer::start().await;
+        let events_path = server
+            .daemon
+            .temp_dir
+            .join(format!("{label}-fake-aft-events.jsonl"));
+
+        let provider = supervisor(&server)
+            .spawn(stub_spec("fake-aft", &events_path, provider_env))
+            .unwrap();
+        wait_for_registration(&server.daemon.registry, "fake-aft", READ_TIMEOUT).await;
+
+        let module_connection_file = server
+            .daemon
+            .temp_dir
+            .join(format!("{label}-subc-mcp.json"));
+        let mut module = spawn_module(&server.daemon.connection_file_path, &module_connection_file);
+        wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
+
+        let project = TestProject::new(label);
+        let mut shim = spawn_shim(&module_connection_file, &project.path);
+        let client_handler = TestMcpClient::new();
+        let client = shim.serve_mcp_client(client_handler.clone()).await;
+
+        Self {
+            _server: server,
+            _project: project,
+            provider,
+            module,
+            shim,
+            client,
+            client_handler,
+            events_path,
+        }
+    }
+
+    async fn shutdown(self) {
+        let Self {
+            _server,
+            _project,
+            provider,
+            mut module,
+            mut shim,
+            client,
+            ..
+        } = self;
+        let _ = client.cancel().await;
+        let _ = timeout(Duration::from_secs(2), shim.child.wait()).await;
+        if module.try_wait().unwrap().is_none() {
+            let _ = module.start_kill();
+            let _ = timeout(Duration::from_secs(2), module.wait()).await;
+        }
+        provider.stop().await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn phase1_shim_module_round_trips_detaches_and_survives() {
-    let server = TestServer::start().await;
-    let events_path = server.daemon.temp_dir.join("fake-aft-events.jsonl");
+async fn mcp_initialize_advertises_tools_capability() {
+    let harness = McpHarness::start("mcp-init", &[]).await;
 
-    let provider = supervisor(&server)
-        .spawn(stub_spec("fake-aft", &events_path))
+    let server_info = harness
+        .client
+        .peer()
+        .peer_info()
+        .expect("client should store initialize result");
+    assert!(
+        server_info.capabilities.tools.is_some(),
+        "subc-mcp should advertise the MCP tools capability"
+    );
+    assert_eq!(server_info.server_info.name, "subc-mcp");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tools_list_returns_stub_manifest_tools() {
+    let harness = McpHarness::start("mcp-list", &[]).await;
+
+    let tools = harness.client.peer().list_tools(None).await.unwrap();
+    assert_eq!(tools.tools.len(), 1);
+    let tool = &tools.tools[0];
+    assert_eq!(tool.name, "fake_read");
+    assert_eq!(
+        tool.input_schema.get("type"),
+        Some(&Value::String("object".to_owned()))
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tools_call_returns_result_and_stub_receives_route_body() {
+    let harness = McpHarness::start("mcp-call", &[]).await;
+
+    let mut args = JsonObject::new();
+    args.insert("value".to_owned(), json!("hello"));
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("fake_read").with_arguments(args))
+        .await
         .unwrap();
-    wait_for_registration(&server.daemon.registry, "fake-aft", READ_TIMEOUT).await;
-
-    let module_connection_file = server.daemon.temp_dir.join("subc-mcp-connection.json");
-    let mut module = spawn_module(&server.daemon.connection_file_path, &module_connection_file);
-    wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
-
-    let project = TestProject::new("subc-mcp-project");
-    let mut shim = spawn_shim(&module_connection_file, &project.path);
-    let response = shim_round_trip(&mut shim, b"phase1-roundtrip").await;
-    assert_eq!(
-        response, b"phase1-roundtrip",
-        "shim stdout should carry the fake-aft-stub echo response"
+    assert_eq!(result.is_error, Some(false));
+    assert!(
+        result_text(&result).contains("fake-aft tool fake_read called with"),
+        "unexpected tool result: {result:?}"
     );
 
-    let attach = wait_for_stub_event(&events_path, READ_TIMEOUT, |event| {
-        event.get("kind") == Some(&Value::String("attach".to_owned()))
-    })
-    .await;
-    let route_channel = attach
-        .get("route_channel")
-        .and_then(Value::as_u64)
-        .expect("attach event should include route_channel");
-    assert!(route_channel > 0, "attach should allocate a non-zero route");
-
-    shim.close_stdin();
-    let detach = wait_for_stub_event(&events_path, READ_TIMEOUT, |event| {
-        event.get("kind") == Some(&Value::String("detach".to_owned()))
-            && event.get("route_channel").and_then(Value::as_u64) == Some(route_channel)
+    let event = wait_for_stub_event(&harness.events_path, READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("tool_call".to_owned()))
     })
     .await;
     assert_eq!(
-        detach.get("route_channel").and_then(Value::as_u64),
-        Some(route_channel),
-        "closing the shim should send per-route GOODBYE and detach the same route"
+        event.get("name"),
+        Some(&Value::String("fake_read".to_owned()))
     );
-    wait_for_shim_exit(shim).await;
-
+    assert_eq!(event.pointer("/arguments/value"), Some(&json!("hello")));
     assert!(
-        module.try_wait().unwrap().is_none(),
-        "subc-mcp module should survive the first shim disconnect"
+        event
+            .get("progress_token")
+            .is_some_and(|token| !token.is_null()),
+        "rmcp should supply a progress token and subc-mcp should forward it in the v1 route contract"
     );
 
-    let mut second_shim = spawn_shim(&module_connection_file, &project.path);
-    let second_response = shim_round_trip(&mut second_shim, b"phase1-second-roundtrip").await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tools_call_forwards_progress_notifications() {
+    let harness = McpHarness::start(
+        "mcp-progress",
+        &[
+            ("FAKE_AFT_TOOLCALL_PROGRESS", "1"),
+            ("FAKE_AFT_TOOLCALL_DELAY_MS", "100"),
+        ],
+    )
+    .await;
+
+    let peer = harness.client.peer().clone();
+    let call = tokio::spawn(async move {
+        peer.call_tool(CallToolRequestParams::new("fake_read"))
+            .await
+    });
+
+    timeout(
+        READ_TIMEOUT,
+        harness.client_handler.progress_notify.notified(),
+    )
+    .await
+    .expect("timed out waiting for progress before tool result");
+    let progress = harness.client_handler.progress.lock().await.clone();
+    assert!(
+        !progress.is_empty(),
+        "client should receive progress notifications"
+    );
+    assert_eq!(progress[0].progress, 1.0);
+    assert_eq!(progress[0].total, Some(2.0));
+
+    let result = call.await.unwrap().unwrap();
+    assert_eq!(result.is_error, Some(false));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tools_call_cancel_sends_route_cancel() {
+    let harness = McpHarness::start("mcp-cancel", &[("FAKE_AFT_TOOLCALL_DELAY_MS", "1000")]).await;
+
+    let peer = harness.client.peer().clone();
+    let handle = peer
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                "fake_read",
+            ))),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    let request_id = handle.id.clone();
+    peer.notify_cancelled(CancelledNotificationParam {
+        request_id,
+        reason: Some("test cancellation".to_owned()),
+    })
+    .await
+    .unwrap();
+
+    let err = handle.await_response().await.unwrap_err();
+    assert!(
+        matches!(err, ServiceError::Cancelled { .. }),
+        "client should observe a cancelled MCP request, got {err:?}"
+    );
+
+    let cancel = wait_for_stub_event(&harness.events_path, READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("cancel".to_owned()))
+            && event.get("claimed") == Some(&Value::Bool(true))
+    })
+    .await;
     assert_eq!(
-        second_response, b"phase1-second-roundtrip",
-        "a second shim should still round-trip through the same live module"
+        cancel.get("kind"),
+        Some(&Value::String("cancel".to_owned()))
     );
-    second_shim.close_stdin();
-    wait_for_shim_exit(second_shim).await;
 
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
+    let tool_error_harness =
+        McpHarness::start("mcp-tool-error", &[("FAKE_AFT_TOOLCALL_ERROR", "1")]).await;
+    let tool_error = tool_error_harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("fake_read"))
+        .await
+        .unwrap();
+    assert_eq!(tool_error.is_error, Some(true));
     assert!(
-        module.try_wait().unwrap().is_none(),
-        "subc-mcp module exited after serving the second shim"
+        result_text(&tool_error).contains("fake-aft tool error"),
+        "tool execution failures should be successful MCP responses carrying isError=true"
     );
+    tool_error_harness.shutdown().await;
 
-    module.start_kill().unwrap();
-    let _ = timeout(READ_TIMEOUT, module.wait()).await;
-    provider.stop().await.unwrap();
+    let subc_error_harness =
+        McpHarness::start("mcp-subc-error", &[("FAKE_AFT_TOOLCALL_SUBC_ERROR", "1")]).await;
+    let subc_error = subc_error_harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("fake_read"))
+        .await
+        .unwrap_err();
+    match subc_error {
+        ServiceError::McpError(error) => {
+            assert!(
+                error.message.contains("target_unavailable"),
+                "subc-level failures should surface as JSON-RPC errors, got {error:?}"
+            );
+        }
+        other => panic!("expected JSON-RPC MCP error for subc-level failure, got {other:?}"),
+    }
+    subc_error_harness.shutdown().await;
 }
 
 async fn start_test_daemon_with_process_liveness(
@@ -215,19 +449,25 @@ fn supervisor(server: &TestServer) -> Supervisor {
     .with_connection_file_path(server.daemon.connection_file_path.clone())
 }
 
-fn stub_spec(module_id: &str, events_path: &Path) -> ModuleSpec {
+fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) -> ModuleSpec {
     let (program, args) = fake_aft_stub_command();
+    let mut env = vec![
+        ("FAKE_AFT_MODULE_ID".to_owned(), module_id.to_owned()),
+        (
+            "FAKE_AFT_EVENTS_PATH".to_owned(),
+            events_path.display().to_string(),
+        ),
+    ];
+    env.extend(
+        extra_env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    );
     ModuleSpec {
         module_id: module_id.to_owned(),
         program,
         args,
-        env: vec![
-            ("FAKE_AFT_MODULE_ID".to_owned(), module_id.to_owned()),
-            (
-                "FAKE_AFT_EVENTS_PATH".to_owned(),
-                events_path.display().to_string(),
-            ),
-        ],
+        env,
     }
 }
 
@@ -239,7 +479,7 @@ fn fake_aft_stub_command() -> (PathBuf, Vec<String>) {
     if let Ok(current_exe) = env::current_exe() {
         if let Some(target_debug) = current_exe.parent().and_then(Path::parent) {
             let candidate = target_debug.join(format!("fake-aft-stub{}", env::consts::EXE_SUFFIX));
-            if candidate.exists() {
+            if candidate_is_fresh(&candidate) {
                 return (candidate, Vec::new());
             }
         }
@@ -259,6 +499,21 @@ fn fake_aft_stub_command() -> (PathBuf, Vec<String>) {
             "--".to_owned(),
         ],
     )
+}
+
+fn candidate_is_fresh(candidate: &Path) -> bool {
+    let Ok(candidate_modified) = fs::metadata(candidate).and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("subc-mcp should live under crates/")
+        .join("subc-core/src/bin/fake-aft-stub.rs");
+    let Ok(source_modified) = fs::metadata(source).and_then(|metadata| metadata.modified()) else {
+        return true;
+    };
+    candidate_modified >= source_modified
 }
 
 fn spawn_module(subc_connection_file: &Path, module_connection_file: &Path) -> Child {
@@ -311,22 +566,8 @@ fn spawn_shim(module_connection_file: &Path, project_root: &Path) -> ShimProcess
     ShimProcess {
         child,
         stdin: Some(stdin),
-        stdout,
+        stdout: Some(stdout),
     }
-}
-
-async fn shim_round_trip(shim: &mut ShimProcess, payload: &[u8]) -> Vec<u8> {
-    let stdin = shim.stdin.as_mut().expect("shim stdin should be open");
-    write_len_prefixed(stdin, payload).await.unwrap();
-    read_len_prefixed_timeout(&mut shim.stdout).await
-}
-
-async fn wait_for_shim_exit(mut shim: ShimProcess) {
-    let status = timeout(READ_TIMEOUT, shim.child.wait())
-        .await
-        .expect("shim did not exit after stdin closed")
-        .expect("failed to wait for shim exit");
-    assert!(status.success(), "shim exited unsuccessfully: {status}");
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {
@@ -396,33 +637,13 @@ fn stub_events(path: &Path) -> Result<Vec<Value>, String> {
     }
 }
 
-async fn write_len_prefixed<W>(writer: &mut W, bytes: &[u8]) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let len = u32::try_from(bytes.len()).expect("test payload should fit in u32");
-    writer.write_all(&len.to_le_bytes()).await?;
-    writer.write_all(bytes).await?;
-    writer.flush().await
-}
-
-async fn read_len_prefixed_timeout<R>(reader: &mut R) -> Vec<u8>
-where
-    R: AsyncRead + Unpin,
-{
-    timeout(READ_TIMEOUT, async {
-        let mut len_bytes = [0u8; 4];
-        reader.read_exact(&mut len_bytes).await?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        let mut bytes = vec![0u8; len];
-        if len > 0 {
-            reader.read_exact(&mut bytes).await?;
-        }
-        io::Result::Ok(bytes)
-    })
-    .await
-    .expect("timed out reading shim stdout frame")
-    .expect("failed to read shim stdout frame")
+fn result_text(result: &rmcp::model::CallToolResult) -> &str {
+    result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .map(|text| text.text.as_str())
+        .expect("tool result should contain text content")
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

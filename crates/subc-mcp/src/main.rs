@@ -16,12 +16,24 @@ use std::{
     time::Duration,
 };
 
+use rmcp::{
+    model::{
+        CallToolRequestParams, CallToolResult, ErrorCode, ErrorData, Implementation, JsonObject,
+        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+        ServerCapabilities, ServerInfo, Tool as McpTool, ToolAnnotations,
+    },
+    service::RequestContext,
+    transport::async_rw::AsyncRwTransport,
+    RoleServer, ServerHandler,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
-    decode_header, manifest::ProviderRole, session::ConfigTier, BindIdentity, EnvelopeHeader,
-    ErrorBody, Flags, FrameType, Priority, RouteTarget, HEADER_LEN, MAX_FRAME_BODY_LEN,
-    PROTOCOL_VERSION,
+    decode_header,
+    manifest::{ProviderRole, Tool as ManifestTool},
+    session::ConfigTier,
+    BindIdentity, EnvelopeHeader, ErrorBody, Flags, FrameType, Priority, RouteTarget, HEADER_LEN,
+    MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
 };
 use subc_transport::{
     authenticate_client, authenticate_server, connection_file, generate_daemon_id, generate_key,
@@ -30,7 +42,7 @@ use subc_transport::{
 use tokio::{
     io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, Mutex},
     time,
 };
 
@@ -38,15 +50,16 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const SUBC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHIM_SCHEMA_VERSION: u32 = 1;
 const MAX_SHIM_CONTROL_MESSAGE_LEN: u32 = 64 * 1024;
-const MAX_PHASE1_MESSAGE_LEN: u32 = MAX_FRAME_BODY_LEN;
 const MODULE_CONNECTION_FILE_NAME: &str = "subc-mcp-connection.json";
 const DEFAULT_HARNESS: &str = "mcp:generic";
+const PENDING_FRAME_BUFFER: usize = 8;
 
 const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [--harness <name>]\n  subc-mcp module --subc <subc-connection-file> [--connection-file <path>]";
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, BoxError>;
 type PendingKey = (u16, u64);
+type PendingTx = mpsc::Sender<EnvelopeFrame>;
 
 #[tokio::main]
 async fn main() {
@@ -105,6 +118,18 @@ struct EnvelopeFrame {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct AttachedSession {
+    route_channel: u16,
+    tools: Vec<ManifestTool>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedToolProvider {
+    module_id: String,
+    tools: Vec<ManifestTool>,
+}
+
 impl EnvelopeFrame {
     fn build(ty: FrameType, flags: Flags, channel: u16, corr: u64, body: Vec<u8>) -> Result<Self> {
         if ty.is_pure_header() && !body.is_empty() {
@@ -143,7 +168,7 @@ impl EnvelopeFrame {
 #[derive(Clone)]
 struct SubcClient {
     tx: mpsc::Sender<EnvelopeFrame>,
-    pending: Arc<Mutex<HashMap<PendingKey, oneshot::Sender<EnvelopeFrame>>>>,
+    pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
     next_corr: Arc<AtomicU64>,
 }
 
@@ -174,9 +199,9 @@ impl SubcClient {
             .map_err(|err| other_error(format!("subc writer is closed: {err}")))
     }
 
-    async fn request(&self, frame: EnvelopeFrame, wait: Duration) -> Result<EnvelopeFrame> {
+    async fn request_frames(&self, frame: EnvelopeFrame) -> Result<mpsc::Receiver<EnvelopeFrame>> {
         let key = (frame.header.channel, frame.header.corr);
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER);
         {
             let mut pending = self.pending.lock().await;
             if pending.insert(key, reply_tx).is_some() {
@@ -192,12 +217,33 @@ impl SubcClient {
             return Err(other_error(format!("subc writer is closed: {err}")));
         }
 
-        match time::timeout(wait, reply_rx).await {
-            Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(_closed)) => Err(other_error(format!(
-                "subc connection closed before response for channel {} corr {}",
-                key.0, key.1
-            ))),
+        Ok(reply_rx)
+    }
+
+    async fn abandon_request(&self, channel: u16, corr: u64) {
+        self.pending.lock().await.remove(&(channel, corr));
+    }
+
+    async fn request(&self, frame: EnvelopeFrame, wait: Duration) -> Result<EnvelopeFrame> {
+        let key = (frame.header.channel, frame.header.corr);
+        let mut reply_rx = self.request_frames(frame).await?;
+
+        match time::timeout(wait, async {
+            loop {
+                let Some(frame) = reply_rx.recv().await else {
+                    return Err(other_error(format!(
+                        "subc connection closed before response for channel {} corr {}",
+                        key.0, key.1
+                    )));
+                };
+                if is_terminal_frame_type(frame.header.ty) {
+                    return Ok(frame);
+                }
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
             Err(_elapsed) => {
                 self.pending.lock().await.remove(&key);
                 Err(other_error(format!(
@@ -428,29 +474,37 @@ async fn handle_shim_connection(
     )
     .await?;
 
-    let route_channel = attach_session(&subc, &hello).await?;
+    let attached = attach_session(&subc, &hello).await?;
+    let route_channel = attached.route_channel;
 
-    // PHASE 2: replace this handler with rmcp serve_server over the raw stream.
-    let loop_result = phase1_length_prefixed_loop(&mut stream, &subc, route_channel).await;
+    let handler = SubcMcpServer {
+        subc: subc.clone(),
+        route_channel,
+        tools: attached.tools,
+    };
+    let (read_half, write_half) = stream.into_split();
+    let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
+    let serve_result = serve_mcp_server(handler, transport).await;
     let goodbye_result = send_route_goodbye(&subc, route_channel).await;
-    let _ = stream.shutdown().await;
 
-    match (loop_result, goodbye_result) {
+    match (serve_result, goodbye_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error),
-        (Err(loop_error), Err(goodbye_error)) => Err(other_error(format!(
-            "phase-1 shim loop failed: {loop_error}; additionally failed to send route goodbye: {goodbye_error}"
+        (Err(serve_error), Err(goodbye_error)) => Err(other_error(format!(
+            "rmcp shim server failed: {serve_error}; additionally failed to send route goodbye: {goodbye_error}"
         ))),
     }
 }
 
-async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<u16> {
+async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<AttachedSession> {
     let catalog = catalog_list(subc).await?;
-    let module_id = select_tool_provider(&catalog)?;
+    let selected = select_tool_provider(&catalog)?;
     let session = generated_session_id(&hello.shim_session_id)?;
     let request = ClientControlRequest::RouteOpen {
-        target: RouteTarget::ToolProvider { module_id },
+        target: RouteTarget::ToolProvider {
+            module_id: selected.module_id,
+        },
         identity: BindIdentity {
             project_root: hello.project_root.clone(),
             harness: hello.harness.clone(),
@@ -466,7 +520,10 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<u16> {
     match response.header.ty {
         FrameType::Response if response.header.channel == 0 => {
             match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
-                ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+                ClientControlResponse::RouteOpen { route_channel } => Ok(AttachedSession {
+                    route_channel,
+                    tools: selected.tools,
+                }),
                 other => Err(other_error(format!(
                     "unexpected route.open response body: {other:?}"
                 ))),
@@ -504,54 +561,276 @@ async fn catalog_list(subc: &SubcClient) -> Result<Vec<CatalogEntry>> {
     }
 }
 
-fn select_tool_provider(modules: &[CatalogEntry]) -> Result<String> {
-    modules
-        .iter()
-        .find(|entry| {
-            entry
-                .roles
-                .iter()
-                .any(|role| matches!(role, ProviderRole::ToolProvider { .. }))
-        })
-        .map(|entry| entry.module_id.clone())
-        .ok_or_else(|| other_error("catalog.list returned no tool_provider module"))
-}
-
-async fn phase1_length_prefixed_loop(
-    stream: &mut TcpStream,
-    subc: &SubcClient,
-    route_channel: u16,
-) -> Result<()> {
-    loop {
-        let Some(payload) = read_len_prefixed_bytes(stream, MAX_PHASE1_MESSAGE_LEN).await? else {
-            return Ok(());
-        };
-
-        let corr = subc.next_corr();
-        let frame = EnvelopeFrame::build(
-            FrameType::Request,
-            data_flags(),
-            route_channel,
-            corr,
-            payload,
-        )?;
-        let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
-        match response.header.ty {
-            FrameType::Response if response.header.channel == route_channel => {
-                write_len_prefixed_bytes(stream, &response.body, MAX_PHASE1_MESSAGE_LEN).await?;
-                stream.flush().await?;
-            }
-            FrameType::Error => {
-                return Err(error_response("subc route request failed", &response.body))
-            }
-            ty => {
-                return Err(other_error(format!(
-                    "unexpected route response frame {ty:?} on channel {} corr {}",
-                    response.header.channel, response.header.corr
-                )));
+fn select_tool_provider(modules: &[CatalogEntry]) -> Result<SelectedToolProvider> {
+    for entry in modules {
+        for role in &entry.roles {
+            if let ProviderRole::ToolProvider { tools, .. } = role {
+                return Ok(SelectedToolProvider {
+                    module_id: entry.module_id.clone(),
+                    tools: tools.clone(),
+                });
             }
         }
     }
+
+    Err(other_error("catalog.list returned no tool_provider module"))
+}
+
+#[derive(Clone)]
+struct SubcMcpServer {
+    subc: SubcClient,
+    route_channel: u16,
+    tools: Vec<ManifestTool>,
+}
+
+/// v1 subc-mcp ↔ provider tool-call request contract carried as an opaque
+/// subc route-channel `REQUEST` body. AFT must mirror this at the real-provider
+/// handshake; subc itself never parses this payload.
+#[derive(Debug, Serialize)]
+struct RouteToolCallRequest {
+    name: String,
+    arguments: JsonObject,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_token: Option<ProgressToken>,
+}
+
+/// v1 subc-mcp ↔ provider progress contract carried as an opaque route-channel
+/// `PUSH` body before the terminal response for the same correlation id.
+#[derive(Debug, Deserialize)]
+struct RouteToolProgress {
+    progress: f64,
+    #[serde(default)]
+    total: Option<f64>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl ServerHandler for SubcMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: self.tools.iter().map(mcp_tool_from_manifest).collect(),
+            ..Default::default()
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<McpTool> {
+        self.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .map(mcp_tool_from_manifest)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.call_tool_over_route(request, context).await
+    }
+}
+
+impl SubcMcpServer {
+    async fn call_tool_over_route(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        if self.get_tool(&request.name).is_none() {
+            return Err(ErrorData::invalid_params(
+                format!("unknown tool '{}'", request.name),
+                None,
+            ));
+        }
+
+        let progress_token = context.meta.get_progress_token();
+        let body = RouteToolCallRequest {
+            name: request.name.to_string(),
+            arguments: request.arguments.unwrap_or_default(),
+            progress_token: progress_token.clone(),
+        };
+        let body = serde_json::to_vec(&body).map_err(mcp_internal_error)?;
+        let corr = self.subc.next_corr();
+        let frame = EnvelopeFrame::build(
+            FrameType::Request,
+            data_flags(),
+            self.route_channel,
+            corr,
+            body,
+        )
+        .map_err(mcp_internal_error)?;
+        let mut frames = self
+            .subc
+            .request_frames(frame)
+            .await
+            .map_err(mcp_internal_error)?;
+
+        loop {
+            tokio::select! {
+                _ = context.ct.cancelled() => {
+                    let cancel_result = self.send_route_cancel(corr).await;
+                    self.subc.abandon_request(self.route_channel, corr).await;
+                    cancel_result.map_err(mcp_internal_error)?;
+                    return Err(ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        "tool call cancelled by MCP client",
+                        None,
+                    ));
+                }
+                frame = frames.recv() => {
+                    let Some(frame) = frame else {
+                        return Err(ErrorData::internal_error(
+                            format!(
+                                "subc connection closed before terminal tool response on channel {} corr {}",
+                                self.route_channel, corr
+                            ),
+                            None,
+                        ));
+                    };
+
+                    match frame.header.ty {
+                        FrameType::Push if frame.header.channel == self.route_channel => {
+                            forward_progress(&context, progress_token.clone(), &frame.body).await?;
+                        }
+                        FrameType::Response if frame.header.channel == self.route_channel => {
+                            return serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
+                                ErrorData::internal_error(
+                                    format!("provider returned malformed tool result: {source}"),
+                                    None,
+                                )
+                            });
+                        }
+                        FrameType::Error => {
+                            return Err(subc_error_to_mcp("subc route tool call failed", &frame.body));
+                        }
+                        ty => {
+                            return Err(ErrorData::internal_error(
+                                format!(
+                                    "unexpected route frame {ty:?} on channel {} corr {}",
+                                    frame.header.channel, frame.header.corr
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_route_cancel(&self, corr: u64) -> Result<()> {
+        let frame = EnvelopeFrame::build(
+            FrameType::Cancel,
+            data_flags(),
+            self.route_channel,
+            corr,
+            Vec::new(),
+        )?;
+        self.subc.send(frame).await
+    }
+}
+
+async fn serve_mcp_server<R, W>(
+    handler: SubcMcpServer,
+    transport: AsyncRwTransport<RoleServer, R, W>,
+) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let running = rmcp::serve_server(handler, transport)
+        .await
+        .map_err(|source| other_error(format!("failed to initialize rmcp server: {source}")))?;
+    running
+        .waiting()
+        .await
+        .map(|_reason| ())
+        .map_err(|source| other_error(format!("rmcp server task failed: {source}")))
+}
+
+fn mcp_tool_from_manifest(tool: &ManifestTool) -> McpTool {
+    let description = format!("subc tool {}", tool.name);
+    McpTool::new(
+        tool.name.clone(),
+        description,
+        Arc::new(schema_value_to_object(&tool.schema)),
+    )
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(!tool.mutates)
+            .destructive(tool.mutates),
+    )
+}
+
+fn schema_value_to_object(value: &serde_json::Value) -> JsonObject {
+    match value {
+        serde_json::Value::Object(object) => object.clone(),
+        other => {
+            let mut object = JsonObject::new();
+            object.insert(
+                "type".to_owned(),
+                serde_json::Value::String("object".to_owned()),
+            );
+            object.insert("x-subc-schema".to_owned(), other.clone());
+            object
+        }
+    }
+}
+
+async fn forward_progress(
+    context: &RequestContext<RoleServer>,
+    progress_token: Option<ProgressToken>,
+    body: &[u8],
+) -> std::result::Result<(), ErrorData> {
+    let Some(progress_token) = progress_token else {
+        return Ok(());
+    };
+    let progress = serde_json::from_slice::<RouteToolProgress>(body).map_err(|source| {
+        ErrorData::internal_error(
+            format!("provider returned malformed progress: {source}"),
+            None,
+        )
+    })?;
+    let mut notification = ProgressNotificationParam::new(progress_token, progress.progress);
+    if let Some(total) = progress.total {
+        notification = notification.with_total(total);
+    }
+    if let Some(message) = progress.message {
+        notification = notification.with_message(message);
+    }
+    context
+        .peer
+        .notify_progress(notification)
+        .await
+        .map_err(mcp_internal_error)
+}
+
+fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
+    match serde_json::from_slice::<ErrorBody>(body) {
+        Ok(error) => ErrorData::internal_error(
+            format!("{prefix}: {}: {}", error.code, error.message),
+            Some(serde_json::json!({ "subc_code": error.code })),
+        ),
+        Err(source) => ErrorData::internal_error(
+            format!(
+                "{prefix}: invalid error body ({} bytes): {source}",
+                body.len()
+            ),
+            None,
+        ),
+    }
+}
+
+fn mcp_internal_error(error: impl std::fmt::Display) -> ErrorData {
+    ErrorData::internal_error(error.to_string(), None)
 }
 
 async fn send_route_goodbye(subc: &SubcClient, route_channel: u16) -> Result<()> {
@@ -565,10 +844,8 @@ async fn send_route_goodbye(subc: &SubcClient, route_channel: u16) -> Result<()>
     subc.send(frame).await
 }
 
-async fn subc_reader_loop<R>(
-    mut read_half: R,
-    pending: Arc<Mutex<HashMap<PendingKey, oneshot::Sender<EnvelopeFrame>>>>,
-) where
+async fn subc_reader_loop<R>(mut read_half: R, pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>)
+where
     R: AsyncRead + Unpin,
 {
     loop {
@@ -583,9 +860,16 @@ async fn subc_reader_loop<R>(
                 }
 
                 let key = (frame.header.channel, frame.header.corr);
-                let reply = pending.lock().await.remove(&key);
+                let terminal = is_terminal_frame_type(frame.header.ty);
+                let reply = if terminal {
+                    pending.lock().await.remove(&key)
+                } else {
+                    pending.lock().await.get(&key).cloned()
+                };
                 if let Some(reply) = reply {
-                    let _ = reply.send(frame);
+                    if reply.send(frame).await.is_err() && !terminal {
+                        pending.lock().await.remove(&key);
+                    }
                 } else {
                     eprintln!(
                         "subc-mcp module: dropping unsolicited subc frame type={:?} channel={} corr={}",
@@ -605,6 +889,13 @@ async fn subc_reader_loop<R>(
     }
 
     pending.lock().await.clear();
+}
+
+fn is_terminal_frame_type(frame_type: FrameType) -> bool {
+    matches!(
+        frame_type,
+        FrameType::Response | FrameType::Error | FrameType::StreamEnd
+    )
 }
 
 async fn subc_writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::Receiver<EnvelopeFrame>) {
@@ -986,9 +1277,9 @@ mod tests {
     #[tokio::test]
     async fn client_ignores_unknown_channel_zero_push() {
         let (mut server, client) = tokio::io::duplex(4096);
-        let pending: Arc<Mutex<HashMap<PendingKey, oneshot::Sender<EnvelopeFrame>>>> =
+        let pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, mut reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER);
         pending.lock().await.insert((0, 42), reply_tx);
 
         let reader_pending = Arc::clone(&pending);
@@ -1024,7 +1315,7 @@ mod tests {
         write_envelope_frame(&mut server, &response).await.unwrap();
         server.flush().await.unwrap();
 
-        let delivered = time::timeout(Duration::from_secs(1), reply_rx)
+        let delivered = time::timeout(Duration::from_secs(1), reply_rx.recv())
             .await
             .unwrap()
             .unwrap();

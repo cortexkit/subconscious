@@ -8,10 +8,12 @@ description = "subc MCP integration skeleton: thin stdio shim and two-faced modu
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmcp = { version = "1.7", default-features = false, features = ["server", "transport-async-rw"] }
 subc-control = { path = "../subc-control" }
 subc-protocol = { path = "../subc-protocol" }
 subc-transport = { path = "../subc-transport" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "process"] }
 
 [dev-dependencies]
+rmcp = { version = "1.7", default-features = false, features = ["client", "transport-async-rw"] }
 subc-core = { path = "../subc-core" }

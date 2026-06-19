@@ -1,0 +1,251 @@
+use std::{fmt::Debug, fs, path::PathBuf};
+
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
+use subc_control::{
+    CatalogEntry, ClientControlRequest, ClientControlResponse, PollKind, SupervisorEntry,
+};
+use subc_protocol::{
+    manifest::{
+        Concurrency, IdentityScope, InternalTransport, ManagementOperation,
+        ManagementOperationKind, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
+        PipelineStageKind, ProviderRole, Tool,
+    },
+    session::ConfigTier,
+    BindIdentity, RouteTarget, PROTOCOL_VERSION,
+};
+
+// Drift-prevention contract (§10): UPDATE_GOLDEN=1 rewrites the committed JSON
+// when a wire-shape change is intentional and the TS mirror is updated too.
+#[test]
+fn control_wire_shapes_match_golden_json_and_round_trip() {
+    for (name, request) in client_control_requests() {
+        assert_golden(name, &request);
+    }
+    for (name, response) in client_control_responses() {
+        assert_golden(name, &response);
+    }
+    assert_golden("catalog_entry", &catalog_entry());
+    assert_golden("supervisor_entry", &supervisor_entry());
+    assert_golden("poll_kind_status", &PollKind::Status);
+    assert_golden("poll_kind_liveness", &PollKind::Liveness);
+}
+
+fn assert_golden<T>(name: &str, value: &T)
+where
+    T: Serialize + DeserializeOwned + PartialEq + Debug,
+{
+    let actual = serde_json::to_value(value).unwrap();
+    let path = golden_path(name);
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&actual).unwrap()),
+        )
+        .unwrap();
+    }
+
+    let expected: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "golden JSON drift for {name}; rerun with UPDATE_GOLDEN=1 only after updating the TS mirror"
+    );
+    let decoded: T = serde_json::from_value(expected).unwrap();
+    assert_eq!(
+        &decoded, value,
+        "golden JSON no longer decodes to canonical Rust {name}"
+    );
+}
+
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join(format!("{name}.json"))
+}
+
+fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
+    vec![
+        (
+            "client_control_request_server_describe",
+            ClientControlRequest::ServerDescribe {},
+        ),
+        (
+            "client_control_request_catalog_list",
+            ClientControlRequest::CatalogList {
+                module_id: Some("aft-tools".to_string()),
+            },
+        ),
+        (
+            "client_control_request_route_open",
+            ClientControlRequest::RouteOpen {
+                target: RouteTarget::InternalService {
+                    module_id: "llm-runner".to_string(),
+                    service_id: "llm".to_string(),
+                },
+                identity: bind_identity(),
+                config: vec![config_tier()],
+            },
+        ),
+        (
+            "client_control_request_route_poll",
+            ClientControlRequest::RoutePoll {
+                route_channel: 42,
+                kind: PollKind::Status,
+            },
+        ),
+        (
+            "client_control_request_supervisor_list",
+            ClientControlRequest::SupervisorList {},
+        ),
+        (
+            "client_control_request_supervisor_restart",
+            ClientControlRequest::SupervisorRestart {
+                module_id: "aft-tools".to_string(),
+            },
+        ),
+        (
+            "client_control_request_supervisor_set_enabled",
+            ClientControlRequest::SupervisorSetEnabled {
+                module_id: "aft-tools".to_string(),
+                enabled: false,
+            },
+        ),
+    ]
+}
+
+fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
+    vec![
+        (
+            "client_control_response_server_describe",
+            ClientControlResponse::ServerDescribe {
+                protocol_ver: PROTOCOL_VERSION,
+                subc_ops: thin_core_ops(),
+                capabilities: vec!["manifest_registration_v1".to_string()],
+            },
+        ),
+        (
+            "client_control_response_catalog_list",
+            ClientControlResponse::CatalogList {
+                generation: 7,
+                modules: vec![catalog_entry()],
+                subc_ops: thin_core_ops(),
+            },
+        ),
+        (
+            "client_control_response_route_open",
+            ClientControlResponse::RouteOpen { route_channel: 42 },
+        ),
+        (
+            "client_control_response_route_poll",
+            ClientControlResponse::RoutePoll {
+                status: Some("indexing".to_string()),
+                live: None,
+            },
+        ),
+        (
+            "client_control_response_supervisor_list",
+            ClientControlResponse::SupervisorList {
+                generation: 7,
+                modules: vec![supervisor_entry()],
+            },
+        ),
+        (
+            "client_control_response_supervisor_ack",
+            ClientControlResponse::SupervisorAck {
+                module_id: "aft-tools".to_string(),
+                applied: true,
+            },
+        ),
+    ]
+}
+
+fn thin_core_ops() -> Vec<String> {
+    vec![
+        "server.describe".to_string(),
+        "catalog.list".to_string(),
+        "route.open".to_string(),
+        "route.poll".to_string(),
+        "supervisor.list".to_string(),
+        "supervisor.restart".to_string(),
+        "supervisor.set_enabled".to_string(),
+    ]
+}
+
+fn bind_identity() -> BindIdentity {
+    BindIdentity {
+        project_root: PathBuf::from("/tmp/subc/project"),
+        harness: "opencode".to_string(),
+        session: "session-0001".to_string(),
+    }
+}
+
+fn config_tier() -> ConfigTier {
+    ConfigTier {
+        tier: "project".to_string(),
+        source: "/tmp/subc/project/aft.jsonc".to_string(),
+        doc: "{ // jsonc owned by AFT\n  \"semantic\": true\n}".to_string(),
+    }
+}
+
+fn catalog_entry() -> CatalogEntry {
+    CatalogEntry {
+        module_id: "aft-tools".to_string(),
+        roles: provider_roles(),
+        control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
+    }
+}
+
+fn supervisor_entry() -> SupervisorEntry {
+    SupervisorEntry {
+        module_id: "aft-tools".to_string(),
+        state: "running".to_string(),
+        enabled: true,
+        live: true,
+    }
+}
+
+fn provider_roles() -> Vec<ProviderRole> {
+    vec![
+        ProviderRole::ToolProvider {
+            tools: vec![Tool {
+                name: "memory.read".to_string(),
+                mutates: false,
+                schema: serde_json::json!({"type": "object", "required": ["id"]}),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: true,
+            sub_supervises: true,
+        },
+        ProviderRole::PipelineStage {
+            stage: PipelineStageKind::Transform,
+            applies_to: PipelineAppliesTo {
+                provider: "anthropic".to_string(),
+                model: "claude".to_string(),
+            },
+            interface: "proxy-transform-v1".to_string(),
+            declares_frozen_floor: true,
+            needs_signals: vec!["route.status".to_string()],
+            conformance_class: "lossless".to_string(),
+        },
+        ProviderRole::ManagementSurface {
+            operations: vec![ManagementOperation {
+                name: "memory.list".to_string(),
+                kind: ManagementOperationKind::Query,
+            }],
+            config_schema: serde_json::json!({"type": "object"}),
+            observability: vec![ObservabilitySurface {
+                name: "memory.stats".to_string(),
+                kind: ObservabilityKind::Snapshot,
+            }],
+            identity_scope: vec![IdentityScope::Project],
+        },
+        ProviderRole::InternalService {
+            service_id: "llm".to_string(),
+            transport: InternalTransport::Bulk,
+            agent_facing: true,
+            operations: vec!["llm.complete".to_string()],
+        },
+    ]
+}

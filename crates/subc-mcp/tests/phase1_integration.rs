@@ -348,30 +348,51 @@ where
     F: Fn(&Value) -> bool,
 {
     let deadline = Instant::now() + wait;
+    let mut last_parse_error = None;
     loop {
-        for event in stub_events(path) {
-            if matches(&event) {
-                return event;
+        match stub_events(path) {
+            Ok(events) => {
+                for event in events {
+                    if matches(&event) {
+                        return event;
+                    }
+                }
             }
+            Err(err) => last_parse_error = Some(err),
         }
-        assert!(
-            Instant::now() < deadline,
-            "stub event did not appear within {wait:?}; events: {:?}",
-            stub_events(path)
-        );
+        if Instant::now() >= deadline {
+            let events = stub_events(path)
+                .map(|events| format!("{events:?}"))
+                .unwrap_or_else(|err| format!("unparseable ({err})"));
+            panic!(
+                "stub event did not appear within {wait:?}; events: {events}; last parse error: {last_parse_error:?}"
+            );
+        }
         sleep(Duration::from_millis(10)).await;
     }
 }
 
-fn stub_events(path: &Path) -> Vec<Value> {
+fn stub_events(path: &Path) -> Result<Vec<Value>, String> {
     match fs::read_to_string(path) {
         Ok(contents) => contents
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).unwrap())
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str(line).map_err(|err| {
+                    format!(
+                        "failed to parse stub event line {} in {}: {err}",
+                        index + 1,
+                        path.display()
+                    )
+                })
+            })
             .collect(),
-        Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
-        Err(err) => panic!("failed to read stub events {}: {err}", path.display()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(format!(
+            "failed to read stub events {}: {err}",
+            path.display()
+        )),
     }
 }
 

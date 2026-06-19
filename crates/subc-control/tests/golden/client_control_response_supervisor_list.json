@@ -1,0 +1,12 @@
+{
+  "generation": 7,
+  "modules": [
+    {
+      "enabled": true,
+      "live": true,
+      "module_id": "aft-tools",
+      "state": "running"
+    }
+  ],
+  "op": "supervisor.list"
+}

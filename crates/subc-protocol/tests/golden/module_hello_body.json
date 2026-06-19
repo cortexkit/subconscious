@@ -1,0 +1,63 @@
+{
+  "control_ops": [
+    "route.bind",
+    "route.status"
+  ],
+  "manifest": {
+    "bindings": {
+      "config": {
+        "expansion": {},
+        "source": "subc_mediated",
+        "tiers": [
+          "user",
+          "project"
+        ]
+      },
+      "identity": {
+        "optional": [
+          "session"
+        ],
+        "requires": [
+          "project"
+        ]
+      },
+      "storage": {
+        "kind": "sqlite",
+        "owns_schema": true,
+        "scope": "project"
+      },
+      "vault_grants": []
+    },
+    "consumes": [],
+    "module_id": "aft-tools",
+    "module_version": "1.2.3",
+    "protocol_ver": 1,
+    "provides": [
+      {
+        "concurrency": "module_managed",
+        "emits_push": true,
+        "identity_scope": [
+          "project",
+          "session"
+        ],
+        "role": "tool_provider",
+        "sub_supervises": true,
+        "tools": [
+          {
+            "mutates": false,
+            "name": "memory.read",
+            "schema": {
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      }
+    ],
+    "scheduled_tasks": [],
+    "trust_tier": "first_party"
+  },
+  "protocol_ver": 1
+}

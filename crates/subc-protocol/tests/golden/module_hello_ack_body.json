@@ -1,0 +1,12 @@
+{
+  "negotiated_ver": 1,
+  "subc_capabilities": [
+    "manifest_registration_v1"
+  ],
+  "subc_ops": [
+    "server.describe",
+    "catalog.list",
+    "route.open",
+    "route.poll"
+  ]
+}

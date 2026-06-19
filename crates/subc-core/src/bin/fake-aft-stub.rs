@@ -15,8 +15,6 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_core::{
-    auth::{authenticate_client, AuthError},
-    connection_file::{self, ConnectionFileError},
     read_frame, write_frame, AttachRelay, AttachRelayResponse, DetachRelay, Frame, HelloAckBody,
     HelloBody, StatusUpdate,
 };
@@ -27,6 +25,7 @@ use subc_protocol::{
     },
     ErrorBody, Flags, FrameType, Priority, PROTOCOL_VERSION,
 };
+use subc_transport::{authenticate_client, connection_file, AuthError, ConnectionFileError};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,

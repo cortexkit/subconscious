@@ -499,7 +499,7 @@ mod tests {
 
         let err = server.await.unwrap().unwrap_err();
         assert!(matches!(err, ConnectionError::Auth(_)));
-        assert_eq!(registry.active_module_count().unwrap(), 0);
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
     }
 
     #[tokio::test]

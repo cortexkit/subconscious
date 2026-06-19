@@ -196,6 +196,36 @@ impl Router {
             .is_some();
 
         if is_module_connection {
+            if frame.header.ty == FrameType::Goodbye {
+                if let Some(target) = self
+                    .forwarding
+                    .release_module_route(ctx.connection_id, channel)
+                    .map_err(RouterError::Forwarding)?
+                {
+                    debug!(
+                        connection_id = ctx.connection_id.get(),
+                        module_channel = channel,
+                        client_channel = target.channel,
+                        corr,
+                        "forwarding module route GOODBYE to client"
+                    );
+                    let mut goodbye = frame;
+                    goodbye.header.channel = target.channel;
+                    target
+                        .sink
+                        .send(goodbye)
+                        .await
+                        .map_err(|err| RouterError::backend(channel, corr, err.to_string()))?;
+                    return Ok(());
+                }
+
+                warn!(
+                    connection_id = ctx.connection_id.get(),
+                    channel, corr, "dropping module GOODBYE for released route channel"
+                );
+                return Ok(());
+            }
+
             if let Some(route) = self
                 .forwarding
                 .module_route(ctx.connection_id, channel)
@@ -203,7 +233,8 @@ impl Router {
             {
                 debug!(
                     connection_id = ctx.connection_id.get(),
-                    channel,
+                    module_channel = channel,
+                    client_channel = route.client_channel,
                     corr,
                     frame_type = ?frame.header.ty,
                     "forwarding module data-plane frame to client"
@@ -211,7 +242,13 @@ impl Router {
                 if is_terminal_frame(frame.header.ty) {
                     route.flow.release();
                 }
-                route.sink.send(frame).await?;
+                let mut frame = frame;
+                frame.header.channel = route.client_channel;
+                route
+                    .sink
+                    .send(frame)
+                    .await
+                    .map_err(|err| RouterError::backend(channel, corr, err.to_string()))?;
                 return Ok(());
             }
 
@@ -228,26 +265,10 @@ impl Router {
         }
 
         if frame.header.ty == FrameType::Goodbye {
-            if self
+            let _ = self
                 .control
-                .handle_route_goodbye(ctx.connection_id, channel)?
-            {
-                return Ok(());
-            }
-
-            let err = RouterError::UnknownChannel { channel, corr };
-            if let Some(error_frame) = err.to_error_frame() {
-                warn!(
-                    connection_id = ctx.connection_id.get(),
-                    channel,
-                    corr,
-                    error = %err,
-                    "unknown route GOODBYE channel; emitted ERROR frame"
-                );
-                ctx.egress.send(error_frame).await?;
-                return Ok(());
-            }
-            return Err(err);
+                .handle_route_goodbye(ctx.connection_id, channel)?;
+            return Ok(());
         }
 
         if self
@@ -370,7 +391,13 @@ impl ForwardBackend {
             })?;
         }
 
-        let result = route.sink.send(frame).await;
+        let mut frame = frame;
+        frame.header.channel = route.module_channel;
+        let result = route
+            .sink
+            .send(frame)
+            .await
+            .map_err(|err| RouterError::backend(channel, corr, err.to_string()));
         if acquired_credit && result.is_err() {
             route.flow.release();
         }

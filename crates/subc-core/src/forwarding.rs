@@ -27,25 +27,43 @@ pub struct ModuleEndpointId {
     pub generation: u64,
 }
 
+/// Client-local route key. A route channel is unique only within one client connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ClientRouteKey {
+    pub connection_id: ConnectionId,
+    pub channel: u16,
+}
+
+/// Module-local route key. A route channel is unique only within one live module endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ModuleRouteKey {
+    pub endpoint: ModuleEndpointId,
+    pub channel: u16,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ModuleRoute {
     pub endpoint: ModuleEndpointId,
     pub sink: FrameSink,
     pub negotiated_ver: u8,
+    pub module_channel: u16,
     pub flow: Arc<ChannelFlow>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClientRoute {
+    pub connection_id: ConnectionId,
     pub sink: FrameSink,
+    pub negotiated_ver: u8,
+    pub client_channel: u16,
     pub flow: Arc<ChannelFlow>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ReleasedRoute {
-    pub route_channel: u16,
-    pub module_sink: FrameSink,
+pub(crate) struct GoodbyeTarget {
+    pub sink: FrameSink,
     pub negotiated_ver: u8,
+    pub channel: u16,
 }
 
 #[derive(Debug)]
@@ -53,7 +71,9 @@ pub(crate) struct PendingRouteBindRelay {
     pub endpoint: ModuleEndpointId,
     pub module_sink: FrameSink,
     pub negotiated_ver: u8,
-    pub route_channel: u16,
+    pub client_connection_id: ConnectionId,
+    pub client_channel: u16,
+    pub module_channel: u16,
     pub corr: u64,
     pub receiver: oneshot::Receiver<RouteBindRelayOutcome>,
 }
@@ -67,7 +87,6 @@ pub(crate) enum RouteBindRelayOutcome {
 
 #[derive(Debug, Clone)]
 struct ModuleConnection {
-    module_id: String,
     endpoint: ModuleEndpointId,
     sink: FrameSink,
     negotiated_ver: u8,
@@ -76,14 +95,19 @@ struct ModuleConnection {
 
 #[derive(Debug, Default)]
 struct ForwardingInner {
-    active_module: Option<ModuleConnection>,
+    modules_by_id: HashMap<String, ModuleConnection>,
+    endpoint_by_connection: HashMap<ConnectionId, ModuleEndpointId>,
+    module_id_by_endpoint: HashMap<ModuleEndpointId, String>,
     next_generation: u64,
-    next_route_channel: u16,
     next_relay_corr: u64,
-    reserved_routes: HashSet<(ModuleEndpointId, u16)>,
-    client_to_module: HashMap<(ConnectionId, u16), ModuleRoute>,
-    module_to_client: HashMap<(ModuleEndpointId, u16), ClientRoute>,
-    status: HashMap<(ModuleEndpointId, u16), String>,
+    reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
+    reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
+    used_module_channels: HashSet<ModuleRouteKey>,
+    next_client_channel: HashMap<ConnectionId, u16>,
+    next_module_channel: HashMap<ModuleEndpointId, u16>,
+    client_to_module: HashMap<ClientRouteKey, ModuleRoute>,
+    module_to_client: HashMap<ModuleRouteKey, ClientRoute>,
+    status: HashMap<ClientRouteKey, String>,
     pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<RouteBindRelayOutcome>>,
 }
 
@@ -103,56 +127,79 @@ impl ForwardingTable {
         sink: FrameSink,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         let mut inner = self.lock_inner()?;
+        if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
+            let _ = remove_module_connection_locked(&mut inner, old_endpoint);
+        }
+
         inner.next_generation = inner.next_generation.checked_add(1).unwrap_or(1);
         let endpoint = ModuleEndpointId {
             connection_id,
             generation: inner.next_generation,
         };
-        inner.active_module = Some(ModuleConnection {
-            module_id,
-            endpoint,
-            sink,
-            negotiated_ver,
-            concurrency,
-        });
-        if inner.next_route_channel == 0 {
-            inner.next_route_channel = 1;
-        }
+        inner.endpoint_by_connection.insert(connection_id, endpoint);
+        inner
+            .module_id_by_endpoint
+            .insert(endpoint, module_id.clone());
+        inner.next_module_channel.insert(endpoint, 1);
         if inner.next_relay_corr == 0 {
             inner.next_relay_corr = 1;
         }
+        inner.modules_by_id.insert(
+            module_id.clone(),
+            ModuleConnection {
+                endpoint,
+                sink,
+                negotiated_ver,
+                concurrency,
+            },
+        );
         Ok(endpoint)
     }
 
     pub(crate) fn begin_route_bind_relay_for(
         &self,
+        client_connection_id: ConnectionId,
         module_id: &str,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
-        self.begin_route_bind_relay_inner(module_id)
+        self.begin_route_bind_relay_inner(client_connection_id, module_id)
     }
 
     fn begin_route_bind_relay_inner(
         &self,
+        client_connection_id: ConnectionId,
         expected_module_id: &str,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.lock_inner()?;
         let module = inner
-            .active_module
-            .clone()
-            .filter(|module| module.module_id == expected_module_id)
+            .modules_by_id
+            .get(expected_module_id)
+            .cloned()
             .ok_or(ForwardingError::NoModuleConnection)?;
-        let route_channel = inner.allocate_route_channel(module.endpoint)?;
+        let client_channel = inner.allocate_client_channel(client_connection_id)?;
+        let module_channel = inner.allocate_module_channel(module.endpoint)?;
         let corr = inner.allocate_relay_corr(module.endpoint)?;
+
+        let client_key = ClientRouteKey {
+            connection_id: client_connection_id,
+            channel: client_channel,
+        };
+        let module_key = ModuleRouteKey {
+            endpoint: module.endpoint,
+            channel: module_channel,
+        };
         let (sender, receiver) = oneshot::channel();
-        inner
-            .reserved_routes
-            .insert((module.endpoint, route_channel));
+        inner.reserved_client.insert(client_key, module_key);
+        inner.reserved_module.insert(module_key, client_key);
+        inner.used_module_channels.insert(module_key);
         inner.pending_relays.insert((module.endpoint, corr), sender);
+
         Ok(PendingRouteBindRelay {
             endpoint: module.endpoint,
             module_sink: module.sink,
             negotiated_ver: module.negotiated_ver,
-            route_channel,
+            client_connection_id,
+            client_channel,
+            module_channel,
             corr,
             receiver,
         })
@@ -162,42 +209,63 @@ impl ForwardingTable {
         &self,
         client_connection_id: ConnectionId,
         client_sink: FrameSink,
+        client_negotiated_ver: u8,
         endpoint: ModuleEndpointId,
-        route_channel: u16,
+        client_channel: u16,
+        module_channel: u16,
     ) -> Result<(), ForwardingError> {
         let mut inner = self.lock_inner()?;
-        if !matches!(inner.active_module.as_ref(), Some(module) if module.endpoint == endpoint) {
+        if !inner.module_id_by_endpoint.contains_key(&endpoint) {
             return Err(ForwardingError::StaleModuleEndpoint);
         }
-        if !inner.reserved_routes.remove(&(endpoint, route_channel)) {
-            return Err(ForwardingError::UnknownReservation { route_channel });
+
+        let client_key = ClientRouteKey {
+            connection_id: client_connection_id,
+            channel: client_channel,
+        };
+        let module_key = ModuleRouteKey {
+            endpoint,
+            channel: module_channel,
+        };
+        if inner.reserved_client.remove(&client_key) != Some(module_key)
+            || inner.reserved_module.remove(&module_key) != Some(client_key)
+        {
+            return Err(ForwardingError::UnknownReservation {
+                client_channel,
+                module_channel,
+            });
         }
 
-        let (module_sink, negotiated_ver, window) = inner
-            .active_module
-            .as_ref()
-            .map(|module| {
-                (
-                    module.sink.clone(),
-                    module.negotiated_ver,
-                    window_for(&module.concurrency),
-                )
-            })
-            .ok_or(ForwardingError::NoModuleConnection)?;
-        let flow = Arc::new(ChannelFlow::new(window));
+        let module_id = inner
+            .module_id_by_endpoint
+            .get(&endpoint)
+            .cloned()
+            .ok_or(ForwardingError::StaleModuleEndpoint)?;
+        let module = inner
+            .modules_by_id
+            .get(&module_id)
+            .filter(|module| module.endpoint == endpoint)
+            .cloned()
+            .ok_or(ForwardingError::StaleModuleEndpoint)?;
+
+        let flow = Arc::new(ChannelFlow::new(window_for(&module.concurrency)));
         inner.client_to_module.insert(
-            (client_connection_id, route_channel),
+            client_key,
             ModuleRoute {
                 endpoint,
-                sink: module_sink,
-                negotiated_ver,
+                sink: module.sink,
+                negotiated_ver: module.negotiated_ver,
+                module_channel,
                 flow: Arc::clone(&flow),
             },
         );
         inner.module_to_client.insert(
-            (endpoint, route_channel),
+            module_key,
             ClientRoute {
+                connection_id: client_connection_id,
                 sink: client_sink,
+                negotiated_ver: client_negotiated_ver,
+                client_channel,
                 flow,
             },
         );
@@ -206,25 +274,60 @@ impl ForwardingTable {
 
     pub(crate) fn release_reserved_route(
         &self,
+        client_connection_id: ConnectionId,
+        client_channel: u16,
         endpoint: ModuleEndpointId,
-        route_channel: u16,
+        module_channel: u16,
     ) -> Result<(), ForwardingError> {
         let mut inner = self.lock_inner()?;
-        inner.reserved_routes.remove(&(endpoint, route_channel));
-        inner.status.remove(&(endpoint, route_channel));
+        release_reserved_route_locked(
+            &mut inner,
+            ClientRouteKey {
+                connection_id: client_connection_id,
+                channel: client_channel,
+            },
+            ModuleRouteKey {
+                endpoint,
+                channel: module_channel,
+            },
+        );
         Ok(())
     }
 
     pub(crate) fn release_client_route(
         &self,
         client_connection_id: ConnectionId,
-        route_channel: u16,
-    ) -> Result<Option<ReleasedRoute>, ForwardingError> {
+        client_channel: u16,
+    ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
         let mut inner = self.lock_inner()?;
         Ok(release_client_route_locked(
             &mut inner,
-            client_connection_id,
-            route_channel,
+            ClientRouteKey {
+                connection_id: client_connection_id,
+                channel: client_channel,
+            },
+        ))
+    }
+
+    pub(crate) fn release_module_route(
+        &self,
+        module_connection_id: ConnectionId,
+        module_channel: u16,
+    ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
+        let mut inner = self.lock_inner()?;
+        let Some(endpoint) = inner
+            .endpoint_by_connection
+            .get(&module_connection_id)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        Ok(release_module_route_locked(
+            &mut inner,
+            ModuleRouteKey {
+                endpoint,
+                channel: module_channel,
+            },
         ))
     }
 
@@ -244,7 +347,7 @@ impl ForwardingTable {
         outcome: RouteBindRelayOutcome,
     ) -> Result<bool, ForwardingError> {
         let mut inner = self.lock_inner()?;
-        let Some(endpoint) = endpoint_for_connection(&inner, connection_id) else {
+        let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
             return Ok(false);
         };
         let Some(sender) = inner.pending_relays.remove(&(endpoint, corr)) else {
@@ -258,67 +361,89 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Option<ModuleEndpointId>, ForwardingError> {
-        let inner = self.lock_inner()?;
-        Ok(endpoint_for_connection(&inner, connection_id))
-    }
-
-    pub(crate) fn active_module_id(&self) -> Result<Option<String>, ForwardingError> {
         Ok(self
             .lock_inner()?
-            .active_module
-            .as_ref()
-            .map(|module| module.module_id.clone()))
+            .endpoint_by_connection
+            .get(&connection_id)
+            .copied())
+    }
+
+    pub(crate) fn has_live_module_connection(
+        &self,
+        module_id: &str,
+    ) -> Result<bool, ForwardingError> {
+        Ok(self.lock_inner()?.modules_by_id.contains_key(module_id))
     }
 
     pub(crate) fn client_route(
         &self,
         client_connection_id: ConnectionId,
-        route_channel: u16,
+        client_channel: u16,
     ) -> Result<Option<ModuleRoute>, ForwardingError> {
         Ok(self
             .lock_inner()?
             .client_to_module
-            .get(&(client_connection_id, route_channel))
+            .get(&ClientRouteKey {
+                connection_id: client_connection_id,
+                channel: client_channel,
+            })
             .cloned())
     }
 
     pub(crate) fn module_route(
         &self,
         module_connection_id: ConnectionId,
-        route_channel: u16,
+        module_channel: u16,
     ) -> Result<Option<ClientRoute>, ForwardingError> {
         let inner = self.lock_inner()?;
-        let Some(endpoint) = endpoint_for_connection(&inner, module_connection_id) else {
+        let Some(endpoint) = inner
+            .endpoint_by_connection
+            .get(&module_connection_id)
+            .copied()
+        else {
             return Ok(None);
         };
         Ok(inner
             .module_to_client
-            .get(&(endpoint, route_channel))
+            .get(&ModuleRouteKey {
+                endpoint,
+                channel: module_channel,
+            })
             .cloned())
     }
 
     pub(crate) fn cache_status(
         &self,
         endpoint: ModuleEndpointId,
-        route_channel: u16,
+        module_channel: u16,
         status: String,
     ) -> Result<(), ForwardingError> {
         let mut inner = self.lock_inner()?;
-        if !matches!(inner.active_module.as_ref(), Some(module) if module.endpoint == endpoint) {
+        if !inner.module_id_by_endpoint.contains_key(&endpoint) {
             return Err(ForwardingError::StaleModuleEndpoint);
         }
 
-        let route_key = (endpoint, route_channel);
-        if inner.module_to_client.contains_key(&route_key)
-            || inner.reserved_routes.contains(&route_key)
-        {
-            inner.status.insert(route_key, status);
+        let module_key = ModuleRouteKey {
+            endpoint,
+            channel: module_channel,
+        };
+        let client_key = inner
+            .module_to_client
+            .get(&module_key)
+            .map(|route| ClientRouteKey {
+                connection_id: route.connection_id,
+                channel: route.client_channel,
+            })
+            .or_else(|| inner.reserved_module.get(&module_key).copied());
+
+        if let Some(client_key) = client_key {
+            inner.status.insert(client_key, status);
         } else {
             warn!(
-                route_channel,
+                module_channel,
                 generation = endpoint.generation,
                 connection_id = endpoint.connection_id.get(),
-                "dropping status update for unbound route channel"
+                "dropping status update for unbound module route channel"
             );
         }
         Ok(())
@@ -326,63 +451,47 @@ impl ForwardingTable {
 
     pub(crate) fn get_status(
         &self,
-        endpoint: ModuleEndpointId,
-        route_channel: u16,
+        client_connection_id: ConnectionId,
+        client_channel: u16,
     ) -> Result<Option<String>, ForwardingError> {
         Ok(self
             .lock_inner()?
             .status
-            .get(&(endpoint, route_channel))
+            .get(&ClientRouteKey {
+                connection_id: client_connection_id,
+                channel: client_channel,
+            })
             .cloned())
-    }
-
-    pub(crate) fn client_route_endpoint(
-        &self,
-        client_connection_id: ConnectionId,
-        route_channel: u16,
-    ) -> Result<Option<ModuleEndpointId>, ForwardingError> {
-        Ok(self
-            .lock_inner()?
-            .client_to_module
-            .get(&(client_connection_id, route_channel))
-            .map(|route| route.endpoint))
     }
 
     pub(crate) fn client_route_module_id(
         &self,
         client_connection_id: ConnectionId,
-        route_channel: u16,
+        client_channel: u16,
     ) -> Result<Option<String>, ForwardingError> {
         let inner = self.lock_inner()?;
-        let Some(route) = inner
-            .client_to_module
-            .get(&(client_connection_id, route_channel))
-        else {
+        let Some(route) = inner.client_to_module.get(&ClientRouteKey {
+            connection_id: client_connection_id,
+            channel: client_channel,
+        }) else {
             return Ok(None);
         };
-        Ok(inner
-            .active_module
-            .as_ref()
-            .filter(|module| module.endpoint == route.endpoint)
-            .map(|module| module.module_id.clone()))
+        Ok(inner.module_id_by_endpoint.get(&route.endpoint).cloned())
     }
 
-    pub(crate) fn client_route_is_bound_to_active_module(
+    pub(crate) fn client_route_is_bound_to_live_module(
         &self,
         client_connection_id: ConnectionId,
-        route_channel: u16,
+        client_channel: u16,
     ) -> Result<bool, ForwardingError> {
         let inner = self.lock_inner()?;
-        let Some(route) = inner
-            .client_to_module
-            .get(&(client_connection_id, route_channel))
-        else {
+        let Some(route) = inner.client_to_module.get(&ClientRouteKey {
+            connection_id: client_connection_id,
+            channel: client_channel,
+        }) else {
             return Ok(false);
         };
-        Ok(matches!(
-            inner.active_module.as_ref(),
-            Some(module) if module.endpoint == route.endpoint
-        ))
+        Ok(inner.module_id_by_endpoint.contains_key(&route.endpoint))
     }
 
     pub fn active_binding_count(&self) -> Result<usize, ForwardingError> {
@@ -394,76 +503,55 @@ impl ForwardingTable {
         Ok(inner
             .client_to_module
             .keys()
-            .any(|(_, bound_channel)| *bound_channel == route_channel))
+            .any(|key| key.channel == route_channel))
     }
 
     pub(crate) fn cleanup_connection(
         &self,
         connection_id: ConnectionId,
-    ) -> Result<Vec<ReleasedRoute>, ForwardingError> {
+    ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
         let mut inner = self.lock_inner()?;
-        if let Some(module) = inner
-            .active_module
-            .as_ref()
-            .filter(|module| module.endpoint.connection_id == connection_id)
-            .cloned()
-        {
-            inner.active_module = None;
-            inner
-                .reserved_routes
-                .retain(|(endpoint, _)| *endpoint != module.endpoint);
-            let removed_flows: Vec<_> = inner
-                .client_to_module
-                .values()
-                .filter(|route| route.endpoint == module.endpoint)
-                .map(|route| Arc::clone(&route.flow))
-                .collect();
-            for flow in removed_flows {
-                flow.close();
-            }
-            inner
-                .client_to_module
-                .retain(|_, route| route.endpoint != module.endpoint);
-            inner
-                .module_to_client
-                .retain(|(endpoint, _), _| *endpoint != module.endpoint);
-            inner
-                .status
-                .retain(|(endpoint, _), _| *endpoint != module.endpoint);
-
-            let pending_keys: Vec<_> = inner
-                .pending_relays
-                .keys()
-                .filter(|(endpoint, _)| *endpoint == module.endpoint)
-                .copied()
-                .collect();
-            let pending: Vec<_> = pending_keys
-                .into_iter()
-                .filter_map(|key| inner.pending_relays.remove(&key))
-                .collect();
-            for sender in pending {
-                let _ = sender.send(RouteBindRelayOutcome::ModuleGone(format!(
-                    "module '{}' connection closed during attach relay",
-                    module.module_id
-                )));
-            }
-            return Ok(Vec::new());
+        if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
+            return Ok(remove_module_connection_locked(&mut inner, endpoint));
         }
 
-        let route_channels: Vec<u16> = inner
+        let client_keys: Vec<ClientRouteKey> = inner
             .client_to_module
             .keys()
-            .filter(|(client_id, _)| *client_id == connection_id)
-            .map(|(_, route_channel)| *route_channel)
+            .filter(|key| key.connection_id == connection_id)
+            .copied()
             .collect();
-        let mut released = Vec::with_capacity(route_channels.len());
-        for route_channel in route_channels {
-            if let Some(route) =
-                release_client_route_locked(&mut inner, connection_id, route_channel)
-            {
+        let mut released = Vec::with_capacity(client_keys.len());
+        for client_key in client_keys {
+            if let Some(route) = release_client_route_locked(&mut inner, client_key) {
                 released.push(route);
             }
         }
+
+        let reserved_client_keys: Vec<ClientRouteKey> = inner
+            .reserved_client
+            .keys()
+            .filter(|key| key.connection_id == connection_id)
+            .copied()
+            .collect();
+        for client_key in reserved_client_keys {
+            if let Some(module_key) = inner.reserved_client.get(&client_key).copied() {
+                let module_target = inner
+                    .module_id_by_endpoint
+                    .get(&module_key.endpoint)
+                    .and_then(|module_id| inner.modules_by_id.get(module_id))
+                    .map(|module| GoodbyeTarget {
+                        sink: module.sink.clone(),
+                        negotiated_ver: module.negotiated_ver,
+                        channel: module_key.channel,
+                    });
+                release_reserved_route_locked(&mut inner, client_key, module_key);
+                if let Some(module_target) = module_target {
+                    released.push(module_target);
+                }
+            }
+        }
+
         Ok(released)
     }
 
@@ -473,27 +561,61 @@ impl ForwardingTable {
 }
 
 impl ForwardingInner {
-    fn allocate_route_channel(
+    fn allocate_client_channel(
         &mut self,
-        endpoint: ModuleEndpointId,
+        connection_id: ConnectionId,
     ) -> Result<u16, ForwardingError> {
-        let mut candidate = self.next_route_channel.max(1);
+        let mut candidate = self
+            .next_client_channel
+            .get(&connection_id)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
         for _ in 1..=u16::MAX {
             if candidate == 0 {
                 candidate = 1;
             }
-            if !self.reserved_routes.contains(&(endpoint, candidate))
-                && !self.module_to_client.contains_key(&(endpoint, candidate))
+            let key = ClientRouteKey {
+                connection_id,
+                channel: candidate,
+            };
+            if !self.reserved_client.contains_key(&key) && !self.client_to_module.contains_key(&key)
             {
-                self.next_route_channel = candidate.wrapping_add(1);
-                if self.next_route_channel == 0 {
-                    self.next_route_channel = 1;
-                }
+                let next = next_channel(candidate);
+                self.next_client_channel.insert(connection_id, next);
                 return Ok(candidate);
             }
             candidate = candidate.wrapping_add(1);
         }
-        Err(ForwardingError::RouteChannelExhausted)
+        Err(ForwardingError::ClientRouteChannelExhausted { connection_id })
+    }
+
+    fn allocate_module_channel(
+        &mut self,
+        endpoint: ModuleEndpointId,
+    ) -> Result<u16, ForwardingError> {
+        let mut candidate = self
+            .next_module_channel
+            .get(&endpoint)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        for _ in 1..=u16::MAX {
+            if candidate == 0 {
+                candidate = 1;
+            }
+            let key = ModuleRouteKey {
+                endpoint,
+                channel: candidate,
+            };
+            if !self.used_module_channels.contains(&key) {
+                let next = next_channel(candidate);
+                self.next_module_channel.insert(endpoint, next);
+                return Ok(candidate);
+            }
+            candidate = candidate.wrapping_add(1);
+        }
+        Err(ForwardingError::ModuleRouteChannelExhausted { endpoint })
     }
 
     fn allocate_relay_corr(&mut self, endpoint: ModuleEndpointId) -> Result<u64, ForwardingError> {
@@ -515,35 +637,122 @@ impl ForwardingInner {
     }
 }
 
-fn endpoint_for_connection(
-    inner: &ForwardingInner,
-    connection_id: ConnectionId,
-) -> Option<ModuleEndpointId> {
-    inner
-        .active_module
-        .as_ref()
-        .filter(|module| module.endpoint.connection_id == connection_id)
-        .map(|module| module.endpoint)
+fn next_channel(channel: u16) -> u16 {
+    let next = channel.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
+fn release_reserved_route_locked(
+    inner: &mut ForwardingInner,
+    client_key: ClientRouteKey,
+    module_key: ModuleRouteKey,
+) {
+    if inner.reserved_client.get(&client_key).copied() == Some(module_key) {
+        inner.reserved_client.remove(&client_key);
+    }
+    if inner.reserved_module.get(&module_key).copied() == Some(client_key) {
+        inner.reserved_module.remove(&module_key);
+    }
+    inner.status.remove(&client_key);
 }
 
 fn release_client_route_locked(
     inner: &mut ForwardingInner,
-    client_connection_id: ConnectionId,
-    route_channel: u16,
-) -> Option<ReleasedRoute> {
-    let route = inner
-        .client_to_module
-        .remove(&(client_connection_id, route_channel))?;
+    client_key: ClientRouteKey,
+) -> Option<GoodbyeTarget> {
+    let route = inner.client_to_module.remove(&client_key)?;
     route.flow.close();
-    inner
-        .module_to_client
-        .remove(&(route.endpoint, route_channel));
-    inner.status.remove(&(route.endpoint, route_channel));
-    Some(ReleasedRoute {
-        route_channel,
-        module_sink: route.sink,
+    inner.module_to_client.remove(&ModuleRouteKey {
+        endpoint: route.endpoint,
+        channel: route.module_channel,
+    });
+    inner.status.remove(&client_key);
+    Some(GoodbyeTarget {
+        sink: route.sink,
         negotiated_ver: route.negotiated_ver,
+        channel: route.module_channel,
     })
+}
+
+fn release_module_route_locked(
+    inner: &mut ForwardingInner,
+    module_key: ModuleRouteKey,
+) -> Option<GoodbyeTarget> {
+    let route = inner.module_to_client.remove(&module_key)?;
+    route.flow.close();
+    let client_key = ClientRouteKey {
+        connection_id: route.connection_id,
+        channel: route.client_channel,
+    };
+    inner.client_to_module.remove(&client_key);
+    inner.status.remove(&client_key);
+    Some(GoodbyeTarget {
+        sink: route.sink,
+        negotiated_ver: route.negotiated_ver,
+        channel: route.client_channel,
+    })
+}
+
+fn remove_module_connection_locked(
+    inner: &mut ForwardingInner,
+    endpoint: ModuleEndpointId,
+) -> Vec<GoodbyeTarget> {
+    let module_id = inner.module_id_by_endpoint.remove(&endpoint);
+    if let Some(module_id) = module_id.as_ref() {
+        inner.modules_by_id.remove(module_id);
+    }
+    inner.endpoint_by_connection.remove(&endpoint.connection_id);
+    inner.next_module_channel.remove(&endpoint);
+    inner
+        .used_module_channels
+        .retain(|module_key| module_key.endpoint != endpoint);
+
+    let reserved_module_keys: Vec<ModuleRouteKey> = inner
+        .reserved_module
+        .keys()
+        .filter(|module_key| module_key.endpoint == endpoint)
+        .copied()
+        .collect();
+    for module_key in reserved_module_keys {
+        if let Some(client_key) = inner.reserved_module.get(&module_key).copied() {
+            release_reserved_route_locked(inner, client_key, module_key);
+        }
+    }
+
+    let pending_keys: Vec<_> = inner
+        .pending_relays
+        .keys()
+        .filter(|(pending_endpoint, _)| *pending_endpoint == endpoint)
+        .copied()
+        .collect();
+    let pending: Vec<_> = pending_keys
+        .into_iter()
+        .filter_map(|key| inner.pending_relays.remove(&key))
+        .collect();
+    for sender in pending {
+        let module_label = module_id.as_deref().unwrap_or("unknown");
+        let _ = sender.send(RouteBindRelayOutcome::ModuleGone(format!(
+            "module '{module_label}' connection closed during route.bind relay"
+        )));
+    }
+
+    let module_keys: Vec<ModuleRouteKey> = inner
+        .module_to_client
+        .keys()
+        .filter(|module_key| module_key.endpoint == endpoint)
+        .copied()
+        .collect();
+    let mut released = Vec::with_capacity(module_keys.len());
+    for module_key in module_keys {
+        if let Some(target) = release_module_route_locked(inner, module_key) {
+            released.push(target);
+        }
+    }
+    released
 }
 
 /// Per-channel request-credit accounting shared by the client and module route halves.
@@ -613,8 +822,16 @@ fn window_for(concurrency: &Concurrency) -> usize {
 pub enum ForwardingError {
     NoModuleConnection,
     StaleModuleEndpoint,
-    UnknownReservation { route_channel: u16 },
-    RouteChannelExhausted,
+    UnknownReservation {
+        client_channel: u16,
+        module_channel: u16,
+    },
+    ClientRouteChannelExhausted {
+        connection_id: ConnectionId,
+    },
+    ModuleRouteChannelExhausted {
+        endpoint: ModuleEndpointId,
+    },
     RelayCorrelationExhausted,
     Poisoned,
 }
@@ -624,12 +841,26 @@ impl fmt::Display for ForwardingError {
         match self {
             Self::NoModuleConnection => write!(f, "no module connection is registered"),
             Self::StaleModuleEndpoint => write!(f, "module connection generation is stale"),
-            Self::UnknownReservation { route_channel } => {
-                write!(f, "route channel {route_channel} was not reserved")
-            }
-            Self::RouteChannelExhausted => write!(f, "no route channels are available"),
+            Self::UnknownReservation {
+                client_channel,
+                module_channel,
+            } => write!(
+                f,
+                "route reservation client channel {client_channel} / module channel {module_channel} was not found"
+            ),
+            Self::ClientRouteChannelExhausted { connection_id } => write!(
+                f,
+                "no client route channels are available for connection {}",
+                connection_id.get()
+            ),
+            Self::ModuleRouteChannelExhausted { endpoint } => write!(
+                f,
+                "no module route channels are available for endpoint generation {} on connection {}",
+                endpoint.generation,
+                endpoint.connection_id.get()
+            ),
             Self::RelayCorrelationExhausted => {
-                write!(f, "no attach-relay correlation ids are available")
+                write!(f, "no route.bind relay correlation ids are available")
             }
             Self::Poisoned => write!(f, "forwarding table lock was poisoned"),
         }
@@ -637,3 +868,57 @@ impl fmt::Display for ForwardingError {
 }
 
 impl Error for ForwardingError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn multi_provider_route_limit_reports_per_client_exhaustion_without_affecting_second_client() {
+        let forwarding = ForwardingTable::default();
+        let module_connection = ConnectionId::new(10);
+        let exhausted_client = ConnectionId::new(20);
+        let second_client = ConnectionId::new(30);
+        let (module_tx, _module_rx) = mpsc::channel(1);
+        let endpoint = forwarding
+            .register_module_connection(
+                module_connection,
+                "route-limit-provider".to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+
+        {
+            let mut inner = forwarding.inner.lock().unwrap();
+            for channel in 1..=u16::MAX {
+                inner.reserved_client.insert(
+                    ClientRouteKey {
+                        connection_id: exhausted_client,
+                        channel,
+                    },
+                    ModuleRouteKey {
+                        endpoint,
+                        channel: 1,
+                    },
+                );
+            }
+        }
+
+        let err = forwarding
+            .begin_route_bind_relay_for(exhausted_client, "route-limit-provider")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardingError::ClientRouteChannelExhausted { connection_id }
+                if connection_id == exhausted_client
+        ));
+
+        let pending = forwarding
+            .begin_route_bind_relay_for(second_client, "route-limit-provider")
+            .unwrap();
+        assert_eq!(pending.client_channel, 1);
+    }
+}

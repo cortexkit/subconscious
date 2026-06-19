@@ -107,12 +107,7 @@ async fn drain_stops_child_and_releases_registration() {
     let module_id = "fake-aft-drain";
     let module = supervisor.spawn(stub_spec(&server, module_id, [])).unwrap();
 
-    let registration =
-        wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
-    assert!(server
-        .registry
-        .is_channel_active(registration.channels[0])
-        .unwrap());
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
 
     module.drain().await.unwrap();
 

@@ -12,9 +12,9 @@ use tracing::{debug, warn};
 
 use crate::{
     forwarding::{
-        ForwardingError, ForwardingTable, ModuleEndpointId, ReleasedRoute, RouteBindRelayOutcome,
+        ForwardingError, ForwardingTable, GoodbyeTarget, ModuleEndpointId, RouteBindRelayOutcome,
     },
-    registry::{ConnectionId, Registry, RegistryError},
+    registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
     supervise::ModuleProcessLiveness,
     Frame, ProjectRootId,
@@ -226,31 +226,31 @@ impl ControlHandler {
         Ok(true)
     }
 
-    fn emit_route_goodbyes(&self, released_routes: Vec<ReleasedRoute>) {
+    fn emit_route_goodbyes(&self, released_routes: Vec<GoodbyeTarget>) {
         for released in released_routes {
             let frame = match Frame::build_with_version(
                 released.negotiated_ver,
                 FrameType::Goodbye,
                 control_flags(),
-                released.route_channel,
+                released.channel,
                 0,
                 Vec::new(),
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
                     warn!(
-                        route_channel = released.route_channel,
+                        route_channel = released.channel,
                         error = %err,
                         "failed to build route GOODBYE frame"
                     );
                     continue;
                 }
             };
-            if let Err(err) = released.module_sink.try_send(frame) {
+            if let Err(err) = released.sink.try_send(frame) {
                 warn!(
-                    route_channel = released.route_channel,
+                    route_channel = released.channel,
                     error = %err,
-                    "best-effort route GOODBYE was not delivered to module"
+                    "best-effort route GOODBYE was not delivered to peer"
                 );
             }
         }
@@ -354,7 +354,6 @@ impl ControlHandler {
 
         let ack = ModuleHelloAckBody {
             negotiated_ver,
-            channels: registration.channels,
             subc_capabilities: self.subc_capabilities.as_ref().to_vec(),
         };
         let body = serde_json::to_vec(&ack).map_err(|err| {
@@ -493,15 +492,36 @@ impl ControlHandler {
             )?]);
         }
 
-        let active_module_id = self
-            .forwarding
-            .active_module_id()
-            .map_err(RouterError::Forwarding)?;
-        if active_module_id.as_deref() != Some(target_module_id.as_str()) {
+        if registration.state != ChannelState::Active {
             return Ok(vec![control_error_frame(
                 &frame,
                 "target_unavailable",
-                format!("module_id '{target_module_id}' is not the active provider"),
+                format!("module_id '{target_module_id}' is not active"),
+            )?]);
+        }
+
+        if self
+            .process_liveness
+            .as_ref()
+            .and_then(|process_liveness| process_liveness.process_live(&target_module_id))
+            == Some(false)
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "target_unavailable",
+                format!("module_id '{target_module_id}' is not live"),
+            )?]);
+        }
+
+        if !self
+            .forwarding
+            .has_live_module_connection(&target_module_id)
+            .map_err(RouterError::Forwarding)?
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "target_unavailable",
+                format!("module_id '{target_module_id}' has no live forwarding connection"),
             )?]);
         }
 
@@ -519,7 +539,7 @@ impl ControlHandler {
 
         let pending = match self
             .forwarding
-            .begin_route_bind_relay_for(&target_module_id)
+            .begin_route_bind_relay_for(ctx.connection_id, &target_module_id)
         {
             Ok(pending) => pending,
             Err(err) => {
@@ -531,11 +551,13 @@ impl ControlHandler {
             }
         };
         let endpoint = pending.endpoint;
-        let route_channel = pending.route_channel;
+        let client_connection_id = pending.client_connection_id;
+        let client_channel = pending.client_channel;
+        let module_channel = pending.module_channel;
         let relay_corr = pending.corr;
 
         let relay = ModuleControlRequest::RouteBind {
-            route_channel,
+            route_channel: module_channel,
             target,
             identity,
             config,
@@ -559,9 +581,12 @@ impl ControlHandler {
 
         if let Err(err) = pending.module_sink.send(relay_frame).await {
             let _ = self.forwarding.cancel_pending_relay(endpoint, relay_corr);
-            let _ = self
-                .forwarding
-                .release_reserved_route(endpoint, route_channel);
+            let _ = self.forwarding.release_reserved_route(
+                client_connection_id,
+                client_channel,
+                endpoint,
+                module_channel,
+            );
             return Ok(vec![control_error_frame(
                 &frame,
                 "target_unavailable",
@@ -574,19 +599,26 @@ impl ControlHandler {
                 if let Err(err) = self.forwarding.commit_route(
                     ctx.connection_id,
                     ctx.egress.clone(),
+                    response_version(&frame),
                     endpoint,
-                    route_channel,
+                    client_channel,
+                    module_channel,
                 ) {
-                    let _ = self
-                        .forwarding
-                        .release_reserved_route(endpoint, route_channel);
+                    let _ = self.forwarding.release_reserved_route(
+                        client_connection_id,
+                        client_channel,
+                        endpoint,
+                        module_channel,
+                    );
                     return Ok(vec![control_error_frame(
                         &frame,
                         forwarding_error_code(&err),
                         err.to_string(),
                     )?]);
                 }
-                let response = ClientControlResponse::RouteOpen { route_channel };
+                let response = ClientControlResponse::RouteOpen {
+                    route_channel: client_channel,
+                };
                 Ok(vec![control_response_body_frame(
                     &frame,
                     &response,
@@ -594,15 +626,21 @@ impl ControlHandler {
                 )?])
             }
             Ok(RouteBindRelayOutcome::Rejected(body)) => {
-                let _ = self
-                    .forwarding
-                    .release_reserved_route(endpoint, route_channel);
+                let _ = self.forwarding.release_reserved_route(
+                    client_connection_id,
+                    client_channel,
+                    endpoint,
+                    module_channel,
+                );
                 Ok(vec![control_error_body_frame(&frame, body)?])
             }
             Ok(RouteBindRelayOutcome::ModuleGone(message)) => {
-                let _ = self
-                    .forwarding
-                    .release_reserved_route(endpoint, route_channel);
+                let _ = self.forwarding.release_reserved_route(
+                    client_connection_id,
+                    client_channel,
+                    endpoint,
+                    module_channel,
+                );
                 Ok(vec![control_error_frame(
                     &frame,
                     "target_unavailable",
@@ -610,9 +648,12 @@ impl ControlHandler {
                 )?])
             }
             Err(_) => {
-                let _ = self
-                    .forwarding
-                    .release_reserved_route(endpoint, route_channel);
+                let _ = self.forwarding.release_reserved_route(
+                    client_connection_id,
+                    client_channel,
+                    endpoint,
+                    module_channel,
+                );
                 Ok(vec![control_error_frame(
                     &frame,
                     "target_unavailable",
@@ -660,11 +701,11 @@ impl ControlHandler {
     ) -> Result<Vec<Frame>, RouterError> {
         let response = match kind {
             PollKind::Liveness => {
-                let route_bound_to_active_module = self
+                let route_bound_to_live_module = self
                     .forwarding
-                    .client_route_is_bound_to_active_module(ctx.connection_id, route_channel)
+                    .client_route_is_bound_to_live_module(ctx.connection_id, route_channel)
                     .map_err(RouterError::Forwarding)?;
-                let process_running = if route_bound_to_active_module {
+                let process_running = if route_bound_to_live_module {
                     self.process_running_for_route(ctx.connection_id, route_channel)
                         .map_err(|message| {
                             RouterError::backend(frame.header.channel, frame.header.corr, message)
@@ -672,24 +713,17 @@ impl ControlHandler {
                 } else {
                     false
                 };
-                let live = route_bound_to_active_module && process_running;
+                let live = route_bound_to_live_module && process_running;
                 ClientControlResponse::RoutePoll {
                     status: None,
                     live: Some(live),
                 }
             }
             PollKind::Status => {
-                let status = if let Some(endpoint) = self
+                let status = self
                     .forwarding
-                    .client_route_endpoint(ctx.connection_id, route_channel)
-                    .map_err(RouterError::Forwarding)?
-                {
-                    self.forwarding
-                        .get_status(endpoint, route_channel)
-                        .map_err(RouterError::Forwarding)?
-                } else {
-                    None
-                };
+                    .get_status(ctx.connection_id, route_channel)
+                    .map_err(RouterError::Forwarding)?;
 
                 ClientControlResponse::RoutePoll { status, live: None }
             }
@@ -721,18 +755,6 @@ impl ControlHandler {
         connection_id: ConnectionId,
         route_channel: u16,
     ) -> Result<Option<String>, String> {
-        if let Some(registration) =
-            self.registry
-                .module_for_channel(route_channel)
-                .map_err(|err| {
-                    format!(
-                        "registry error resolving module for route channel {route_channel}: {err}"
-                    )
-                })?
-        {
-            return Ok(Some(registration.manifest.module_id));
-        }
-
         self.forwarding
             .client_route_module_id(connection_id, route_channel)
             .map_err(|err| {
@@ -958,11 +980,14 @@ fn control_response_body_frame<T: Serialize>(
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
         ForwardingError::NoModuleConnection => "target_unavailable",
-        ForwardingError::RouteChannelExhausted => "route_limit",
-        ForwardingError::StaleModuleEndpoint
-        | ForwardingError::UnknownReservation { .. }
-        | ForwardingError::RelayCorrelationExhausted
-        | ForwardingError::Poisoned => "forwarding_error",
+        ForwardingError::ClientRouteChannelExhausted { .. }
+        | ForwardingError::ModuleRouteChannelExhausted { .. } => "route_limit",
+        ForwardingError::StaleModuleEndpoint | ForwardingError::UnknownReservation { .. } => {
+            "target_unavailable"
+        }
+        ForwardingError::RelayCorrelationExhausted | ForwardingError::Poisoned => {
+            "forwarding_error"
+        }
     }
 }
 
@@ -1138,7 +1163,9 @@ mod tests {
                 FrameSink::new(module_tx),
             )
             .unwrap();
-        let pending = forwarding.begin_route_bind_relay_for(module_id).unwrap();
+        let pending = forwarding
+            .begin_route_bind_relay_for(client_connection, module_id)
+            .unwrap();
         assert_eq!(pending.endpoint, endpoint);
         forwarding
             .complete_pending_relay(
@@ -1152,11 +1179,13 @@ mod tests {
             .commit_route(
                 client_connection,
                 client_ctx.egress.clone(),
+                PROTOCOL_VERSION,
                 endpoint,
-                pending.route_channel,
+                pending.client_channel,
+                pending.module_channel,
             )
             .unwrap();
-        (client_ctx, pending.route_channel)
+        (client_ctx, pending.client_channel)
     }
 
     struct FakeProcessLiveness {
@@ -1170,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_registers_manifest_and_returns_ack_with_active_channel() {
+    fn hello_registers_manifest_and_returns_ack() {
         let registry = Arc::new(Registry::default());
         let handler = ControlHandler::new(Arc::clone(&registry));
         let conn = ConnectionId::new(1);
@@ -1185,15 +1214,12 @@ mod tests {
         assert_eq!(responses[0].header.corr, 7);
         let ack = parse_ack(&responses[0]);
         assert_eq!(ack.negotiated_ver, PROTOCOL_VERSION);
-        assert_eq!(ack.channels.len(), 1);
-        assert!(ack.channels[0] > 0);
         assert!(ack
             .subc_capabilities
             .contains(&CAP_MANIFEST_REGISTRATION.to_string()));
 
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.negotiated_ver, PROTOCOL_VERSION);
-        assert_eq!(registration.channels, ack.channels);
         assert_eq!(registration.state, ChannelState::Active);
         assert_eq!(registration.connection_id, conn);
     }
@@ -1212,7 +1238,7 @@ mod tests {
         let error = parse_error(&responses[0]);
         assert_eq!(error["code"], "version_unsupported");
         assert!(registry.get_module("aft").unwrap().is_none());
-        assert_eq!(registry.active_module_count().unwrap(), 0);
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
     }
 
     #[test]
@@ -1243,13 +1269,12 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let handler = ControlHandler::new(Arc::clone(&registry));
 
-        let first = handler
+        handler
             .handle_control(
                 ConnectionId::new(1),
                 hello_frame("aft", PROTOCOL_VERSION, 1),
             )
             .unwrap();
-        let first_ack = parse_ack(&first[0]);
         let duplicate = handler
             .handle_control(
                 ConnectionId::new(2),
@@ -1261,7 +1286,6 @@ mod tests {
         assert_eq!(parse_error(&duplicate[0])["code"], "duplicate_module_id");
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.connection_id, ConnectionId::new(1));
-        assert_eq!(registration.channels, first_ack.channels);
     }
 
     #[test]
@@ -1361,14 +1385,14 @@ mod tests {
             .await
             .unwrap();
         let response = rx.recv().await.unwrap();
-        let channel = parse_ack(&response).channels[0];
-        assert!(registry.is_channel_active(channel).unwrap());
+        let ack = parse_ack(&response);
+        assert_eq!(ack.negotiated_ver, PROTOCOL_VERSION);
+        let channel = 1;
 
         let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 0, 12, Vec::new()).unwrap();
         router.route_for_connection(&ctx, goodbye).await.unwrap();
         assert!(rx.try_recv().is_err());
         assert!(registry.get_module("aft").unwrap().is_none());
-        assert!(!registry.is_channel_active(channel).unwrap());
 
         router
             .route_for_connection(&ctx, channel_request(channel, 13))
@@ -1380,7 +1404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_router_connection_releases_orphaned_channels() {
+    async fn dropping_router_connection_releases_registration() {
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
         let router = Router::with_control_handler(control);
@@ -1392,15 +1416,14 @@ mod tests {
             .await
             .unwrap();
         let response = rx.recv().await.unwrap();
-        let channel = parse_ack(&response).channels[0];
-        assert!(registry.is_channel_active(channel).unwrap());
+        let ack = parse_ack(&response);
+        assert_eq!(ack.negotiated_ver, PROTOCOL_VERSION);
         assert!(registry.get_module("aft").unwrap().is_some());
 
         drop(connection);
 
         assert!(registry.get_module("aft").unwrap().is_none());
-        assert!(!registry.is_channel_active(channel).unwrap());
-        assert_eq!(registry.active_module_count().unwrap(), 0);
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
     time::Duration,
 };
@@ -28,16 +28,16 @@ use rmcp::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
+use subc_jsonc::jsonc_to_json;
 use subc_protocol::{
-    decode_header,
     manifest::{
         Bindings, ConfigBinding, ConfigSource, ConsumerRole, IdentityBinding, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool as ManifestTool, TrustTier,
     },
     session::ConfigTier,
-    BindIdentity, EnvelopeHeader, ErrorBody, Flags, Frame as SubcFrame, FrameType,
-    ModuleHelloAckBody, ModuleHelloBody, Priority, RouteTarget, HEADER_LEN, MAX_FRAME_BODY_LEN,
-    PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
+    BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
+    ModuleHelloBody, Priority, RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
+    SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
     authenticate_client, authenticate_server, connection_file, generate_daemon_id, generate_key,
@@ -68,7 +68,7 @@ const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [
 type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, BoxError>;
 type PendingKey = (u16, u64);
-type PendingTx = mpsc::Sender<EnvelopeFrame>;
+type PendingTx = mpsc::Sender<SubcFrame>;
 
 #[derive(Debug, Clone)]
 enum SubcEvent {
@@ -125,12 +125,6 @@ struct ShimHello {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShimHelloAck {
     schema: u32,
-}
-
-#[derive(Debug, Clone)]
-struct EnvelopeFrame {
-    header: EnvelopeHeader,
-    body: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,44 +238,9 @@ enum MaybeSet<T> {
     Value(T),
 }
 
-impl EnvelopeFrame {
-    fn build(ty: FrameType, flags: Flags, channel: u16, corr: u64, body: Vec<u8>) -> Result<Self> {
-        if ty.is_pure_header() && !body.is_empty() {
-            return Err(other_error(format!(
-                "pure-header frame {ty:?} cannot carry {} body bytes",
-                body.len()
-            )));
-        }
-        let len = u32::try_from(body.len())
-            .map_err(|_| other_error(format!("frame body too large: {} bytes", body.len())))?;
-        if len > MAX_FRAME_BODY_LEN {
-            return Err(other_error(format!(
-                "frame body too large: {len} bytes (max {MAX_FRAME_BODY_LEN})"
-            )));
-        }
-
-        Ok(Self {
-            header: EnvelopeHeader {
-                len,
-                ver: PROTOCOL_VERSION,
-                ty,
-                flags,
-                channel,
-                corr,
-            },
-            body,
-        })
-    }
-
-    fn from_wire(header: EnvelopeHeader, body: Vec<u8>) -> Self {
-        debug_assert_eq!(header.len as usize, body.len());
-        Self { header, body }
-    }
-}
-
 #[derive(Clone)]
 struct SubcClient {
-    tx: mpsc::Sender<EnvelopeFrame>,
+    tx: mpsc::Sender<SubcFrame>,
     pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
     events: broadcast::Sender<SubcEvent>,
     next_corr: Arc<AtomicU64>,
@@ -351,14 +310,14 @@ impl SubcClient {
         });
     }
 
-    async fn send(&self, frame: EnvelopeFrame) -> Result<()> {
+    async fn send(&self, frame: SubcFrame) -> Result<()> {
         self.tx
             .send(frame)
             .await
             .map_err(|err| other_error(format!("subc writer is closed: {err}")))
     }
 
-    async fn request_frames(&self, frame: EnvelopeFrame) -> Result<mpsc::Receiver<EnvelopeFrame>> {
+    async fn request_frames(&self, frame: SubcFrame) -> Result<mpsc::Receiver<SubcFrame>> {
         let key = (frame.header.channel, frame.header.corr);
         let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER);
         {
@@ -383,7 +342,7 @@ impl SubcClient {
         self.pending.lock().await.remove(&(channel, corr));
     }
 
-    async fn request(&self, frame: EnvelopeFrame, wait: Duration) -> Result<EnvelopeFrame> {
+    async fn request(&self, frame: SubcFrame, wait: Duration) -> Result<SubcFrame> {
         let key = (frame.header.channel, frame.header.corr);
         let mut reply_rx = self.request_frames(frame).await?;
 
@@ -592,7 +551,7 @@ async fn send_supervision_hello_if_configured(stream: &mut TcpStream) -> Result<
             "failed to encode supervision HELLO for module_id={module_id}: {source}"
         ))
     })?;
-    let frame = SubcFrame::build(
+    let frame = build_frame(
         FrameType::Hello,
         control_flags(),
         0,
@@ -764,17 +723,20 @@ async fn handle_shim_connection(
 
     let attached = attach_session(&subc, &hello).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let reconcile_gate = Arc::new(Mutex::new(()));
 
     let handler = SubcMcpServer {
         subc: subc.clone(),
         state: Arc::clone(&attached.state),
         lifecycle_started: Arc::new(AtomicBool::new(false)),
         shutdown: shutdown_rx,
+        reconcile_gate: Arc::clone(&reconcile_gate),
     };
     let (read_half, write_half) = stream.into_split();
     let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
     let serve_result = serve_mcp_server(handler, transport).await;
     let _ = shutdown_tx.send(true);
+    let _reconcile_guard = reconcile_gate.lock().await;
     let goodbye_result = send_route_goodbyes(&subc, attached.state.route_channels()).await;
 
     match (serve_result, goodbye_result) {
@@ -821,7 +783,7 @@ async fn catalog_list(subc: &SubcClient) -> Result<CatalogSnapshot> {
     let request = ClientControlRequest::CatalogList { module_id: None };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr();
-    let frame = EnvelopeFrame::build(FrameType::Request, control_flags(), 0, corr, body)?;
+    let frame = build_frame(FrameType::Request, control_flags(), 0, corr, body)?;
     let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
 
     match response.header.ty {
@@ -863,7 +825,7 @@ async fn open_provider_route(
     };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr();
-    let frame = EnvelopeFrame::build(FrameType::Request, control_flags(), 0, corr, body)?;
+    let frame = build_frame(FrameType::Request, control_flags(), 0, corr, body)?;
     let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
 
     match response.header.ty {
@@ -991,6 +953,22 @@ fn session_inner_from_desired(
 }
 
 impl SessionState {
+    fn read_inner(&self) -> RwLockReadGuard<'_, SessionInner> {
+        self.inner.read().unwrap_or_else(|poisoned| {
+            eprintln!("subc-mcp module: warning: recovering from poisoned session-state read lock");
+            poisoned.into_inner()
+        })
+    }
+
+    fn write_inner(&self) -> RwLockWriteGuard<'_, SessionInner> {
+        self.inner.write().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "subc-mcp module: warning: recovering from poisoned session-state write lock"
+            );
+            poisoned.into_inner()
+        })
+    }
+
     fn new(config: ConfigSnapshot, identity: BindIdentity, inner: SessionInner) -> Self {
         Self {
             config,
@@ -1000,17 +978,11 @@ impl SessionState {
     }
 
     fn exposed_tools(&self) -> Vec<ManifestTool> {
-        self.inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .tools
-            .clone()
+        self.read_inner().tools.clone()
     }
 
     fn get_tool(&self, name: &str) -> Option<ManifestTool> {
-        self.inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.read_inner()
             .tools
             .iter()
             .find(|tool| tool.name == name)
@@ -1018,19 +990,12 @@ impl SessionState {
     }
 
     fn binding(&self, name: &str) -> Option<ToolBinding> {
-        self.inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .bindings
-            .get(name)
-            .cloned()
+        self.read_inner().bindings.get(name).cloned()
     }
 
     fn route_channels(&self) -> Vec<u16> {
         let mut channels = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .read_inner()
             .routes
             .values()
             .copied()
@@ -1041,25 +1006,15 @@ impl SessionState {
     }
 
     fn catalog_generation(&self) -> u64 {
-        self.inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .catalog_generation
+        self.read_inner().catalog_generation
     }
 
     fn route_snapshot(&self) -> HashMap<String, u16> {
-        self.inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .routes
-            .clone()
+        self.read_inner().routes.clone()
     }
 
     fn remove_route(&self, route_channel: u16) -> bool {
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self.write_inner();
         let old_tools = inner.tools.clone();
         let removed_modules = inner
             .routes
@@ -1083,10 +1038,7 @@ impl SessionState {
     }
 
     fn replace_inner(&self, next: SessionInner) -> bool {
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self.write_inner();
         let changed = inner.tools != next.tools;
         *inner = next;
         changed
@@ -1265,109 +1217,6 @@ where
     })
 }
 
-fn jsonc_to_json(doc: &str) -> std::result::Result<String, String> {
-    let mut out = String::with_capacity(doc.len());
-    let mut chars = doc.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => {
-                in_string = true;
-                out.push(ch);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                let _ = chars.next();
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                let _ = chars.next();
-                let mut closed = false;
-                let mut prev = '\0';
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        out.push('\n');
-                    }
-                    if prev == '*' && next == '/' {
-                        closed = true;
-                        break;
-                    }
-                    prev = next;
-                }
-                if !closed {
-                    return Err("unterminated block comment".to_owned());
-                }
-            }
-            _ => out.push(ch),
-        }
-    }
-
-    if in_string {
-        return Err("unterminated string".to_owned());
-    }
-
-    Ok(remove_json_trailing_commas(&out))
-}
-
-fn remove_json_trailing_commas(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-            out.push(ch);
-            continue;
-        }
-
-        if ch == ',' {
-            let mut lookahead = chars.clone();
-            while matches!(lookahead.peek(), Some(next) if next.is_whitespace()) {
-                let _ = lookahead.next();
-            }
-            if matches!(lookahead.peek(), Some('}' | ']')) {
-                continue;
-            }
-        }
-
-        out.push(ch);
-    }
-
-    out
-}
-
 async fn reconcile_session_from_catalog(
     subc: &SubcClient,
     state: &SessionState,
@@ -1388,22 +1237,37 @@ async fn reconcile_session_from_catalog(
         .collect::<Vec<_>>();
 
     let mut routes = HashMap::new();
+    let mut opened_routes = Vec::new();
     for provider in &desired.providers {
         if let Some(route_channel) = existing_routes.get(&provider.module_id) {
             routes.insert(provider.module_id.clone(), *route_channel);
             continue;
         }
-        let route_channel = open_provider_route(
+        let route_channel = match open_provider_route(
             subc,
             &provider.module_id,
             &state.identity,
             &state.config.tiers,
         )
-        .await?;
+        .await
+        {
+            Ok(route_channel) => route_channel,
+            Err(error) => {
+                let _ = send_route_goodbyes(subc, opened_routes).await;
+                return Err(error);
+            }
+        };
+        opened_routes.push(route_channel);
         routes.insert(provider.module_id.clone(), route_channel);
     }
 
-    let inner = session_inner_from_desired(catalog.generation, desired, routes)?;
+    let inner = match session_inner_from_desired(catalog.generation, desired, routes) {
+        Ok(inner) => inner,
+        Err(error) => {
+            let _ = send_route_goodbyes(subc, opened_routes).await;
+            return Err(error);
+        }
+    };
     let changed = state.replace_inner(inner);
     if !removed_routes.is_empty() {
         let _ = send_route_goodbyes(subc, removed_routes).await;
@@ -1417,6 +1281,7 @@ async fn session_lifecycle(
     mut events: broadcast::Receiver<SubcEvent>,
     peer: Peer<RoleServer>,
     mut shutdown: watch::Receiver<bool>,
+    reconcile_gate: Arc<Mutex<()>>,
 ) {
     loop {
         tokio::select! {
@@ -1438,7 +1303,17 @@ async fn session_lifecycle(
                         }
                         match catalog_list(&subc).await {
                             Ok(catalog) => {
-                                match reconcile_session_from_catalog(&subc, &state, catalog).await {
+                                if *shutdown.borrow() {
+                                    break;
+                                }
+                                let reconciliation = {
+                                    let _reconcile_guard = reconcile_gate.lock().await;
+                                    if *shutdown.borrow() {
+                                        break;
+                                    }
+                                    reconcile_session_from_catalog(&subc, &state, catalog).await
+                                };
+                                match reconciliation {
                                     Ok(true) => {
                                         if !notify_tool_list_changed(&peer).await {
                                             break;
@@ -1458,7 +1333,17 @@ async fn session_lifecycle(
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         match catalog_list(&subc).await {
                             Ok(catalog) => {
-                                match reconcile_session_from_catalog(&subc, &state, catalog).await {
+                                if *shutdown.borrow() {
+                                    break;
+                                }
+                                let reconciliation = {
+                                    let _reconcile_guard = reconcile_gate.lock().await;
+                                    if *shutdown.borrow() {
+                                        break;
+                                    }
+                                    reconcile_session_from_catalog(&subc, &state, catalog).await
+                                };
+                                match reconciliation {
                                     Ok(true) => {
                                         if !notify_tool_list_changed(&peer).await {
                                             break;
@@ -1498,6 +1383,7 @@ struct SubcMcpServer {
     state: Arc<SessionState>,
     lifecycle_started: Arc<AtomicBool>,
     shutdown: watch::Receiver<bool>,
+    reconcile_gate: Arc<Mutex<()>>,
 }
 
 /// v1 subc-mcp ↔ provider tool-call request contract carried as an opaque
@@ -1581,7 +1467,15 @@ impl ServerHandler for SubcMcpServer {
         let events = self.subc.subscribe_events();
         let peer = context.peer.clone();
         let shutdown = self.shutdown.clone();
-        tokio::spawn(session_lifecycle(subc, state, events, peer, shutdown));
+        let reconcile_gate = Arc::clone(&self.reconcile_gate);
+        tokio::spawn(session_lifecycle(
+            subc,
+            state,
+            events,
+            peer,
+            shutdown,
+            reconcile_gate,
+        ));
     }
 }
 
@@ -1607,9 +1501,8 @@ impl SubcMcpServer {
         };
         let body = serde_json::to_vec(&body).map_err(mcp_internal_error)?;
         let corr = self.subc.next_corr();
-        let frame =
-            EnvelopeFrame::build(FrameType::Request, data_flags(), route_channel, corr, body)
-                .map_err(mcp_internal_error)?;
+        let frame = build_frame(FrameType::Request, data_flags(), route_channel, corr, body)
+            .map_err(mcp_internal_error)?;
         let mut frames = self
             .subc
             .request_frames(frame)
@@ -1650,7 +1543,7 @@ impl SubcMcpServer {
                                 )
                             });
                         }
-                        FrameType::Error => {
+                        FrameType::Error if frame.header.channel == route_channel => {
                             return Err(subc_error_to_mcp("subc route tool call failed", &frame.body));
                         }
                         ty => {
@@ -1669,7 +1562,7 @@ impl SubcMcpServer {
     }
 
     async fn send_route_cancel(&self, route_channel: u16, corr: u64) -> Result<()> {
-        let frame = EnvelopeFrame::build(
+        let frame = build_frame(
             FrameType::Cancel,
             data_flags(),
             route_channel,
@@ -1776,7 +1669,7 @@ fn mcp_internal_error(error: impl std::fmt::Display) -> ErrorData {
 }
 
 async fn send_route_goodbye(subc: &SubcClient, route_channel: u16) -> Result<()> {
-    let frame = EnvelopeFrame::build(
+    let frame = build_frame(
         FrameType::Goodbye,
         data_flags(),
         route_channel,
@@ -1812,7 +1705,7 @@ async fn subc_reader_loop<R>(
     R: AsyncRead + Unpin,
 {
     loop {
-        match read_envelope_frame(&mut read_half).await {
+        match read_frame(&mut read_half).await {
             Ok(Some(frame)) => {
                 if frame.header.ty == FrameType::Push && frame.header.channel == 0 {
                     eprintln!(
@@ -1894,8 +1787,7 @@ async fn fail_pending_on_route(
                 Vec::new()
             }
         };
-        let frame = match EnvelopeFrame::build(FrameType::Error, data_flags(), channel, corr, body)
-        {
+        let frame = match build_frame(FrameType::Error, data_flags(), channel, corr, body) {
             Ok(frame) => frame,
             Err(error) => {
                 eprintln!("subc-mcp module: failed to build route GOODBYE error: {error}");
@@ -1913,15 +1805,15 @@ fn is_terminal_frame_type(frame_type: FrameType) -> bool {
     )
 }
 
-async fn subc_writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::Receiver<EnvelopeFrame>) {
+async fn subc_writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::Receiver<SubcFrame>) {
     let mut writer = BufWriter::new(&mut write_half);
     while let Some(frame) = rx.recv().await {
-        if let Err(error) = write_envelope_frame(&mut writer, &frame).await {
+        if let Err(error) = write_frame(&mut writer, &frame).await {
             eprintln!("subc-mcp module: subc write failed: {error}");
             return;
         }
         while let Ok(frame) = rx.try_recv() {
-            if let Err(error) = write_envelope_frame(&mut writer, &frame).await {
+            if let Err(error) = write_frame(&mut writer, &frame).await {
                 eprintln!("subc-mcp module: subc write failed: {error}");
                 return;
             }
@@ -1984,6 +1876,12 @@ async fn connect_authenticated(connection_file_path: &Path) -> Result<TcpStream>
             connection_file_path.display()
         ))
     })?;
+    if !ip.is_loopback() {
+        return Err(other_error(format!(
+            "connection file {} endpoint {endpoint_label} is not a loopback address",
+            connection_file_path.display()
+        )));
+    }
     let mut stream = TcpStream::connect(SocketAddr::new(ip, endpoint.port))
         .await
         .map_err(|source| {
@@ -2112,8 +2010,31 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+fn build_frame(
+    ty: FrameType,
+    flags: Flags,
+    channel: u16,
+    corr: u64,
+    body: Vec<u8>,
+) -> Result<SubcFrame> {
+    if ty.is_pure_header() && !body.is_empty() {
+        return Err(other_error(format!(
+            "pure-header frame {ty:?} cannot carry {} body bytes",
+            body.len()
+        )));
+    }
+    if body.len() > MAX_FRAME_BODY_LEN as usize {
+        return Err(other_error(format!(
+            "frame body too large: {} bytes (max {MAX_FRAME_BODY_LEN})",
+            body.len()
+        )));
+    }
+    SubcFrame::build(ty, flags, channel, corr, body)
+        .map_err(|source| other_error(format!("failed to build frame: {source}")))
+}
+
 fn control_flags() -> Flags {
-    Flags::new(false, Priority::Interactive, false)
+    Flags::new(false, Priority::Passive, false)
 }
 
 fn data_flags() -> Flags {
@@ -2180,49 +2101,6 @@ where
     writer.write_all(&len.to_le_bytes()).await?;
     if !bytes.is_empty() {
         writer.write_all(bytes).await?;
-    }
-    Ok(())
-}
-
-async fn read_envelope_frame<R>(reader: &mut R) -> Result<Option<EnvelopeFrame>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header_bytes = [0u8; HEADER_LEN];
-    if !read_exact_or_clean_eof(reader, &mut header_bytes).await? {
-        return Ok(None);
-    }
-    let header = decode_header(&header_bytes)
-        .map_err(|source| other_error(format!("failed to decode envelope header: {source}")))?;
-    if header.len > MAX_FRAME_BODY_LEN {
-        return Err(other_error(format!(
-            "envelope body too large: {} bytes (max {MAX_FRAME_BODY_LEN})",
-            header.len
-        )));
-    }
-
-    let mut body = vec![0u8; header.len as usize];
-    if !body.is_empty() {
-        read_exact_or_unexpected_eof(reader, &mut body).await?;
-    }
-    Ok(Some(EnvelopeFrame::from_wire(header, body)))
-}
-
-async fn write_envelope_frame<W>(writer: &mut W, frame: &EnvelopeFrame) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    if frame.header.len as usize != frame.body.len() {
-        return Err(other_error(format!(
-            "frame body length mismatch: header says {}, body has {} bytes",
-            frame.header.len,
-            frame.body.len()
-        )));
-    }
-
-    writer.write_all(&frame.header.encode()).await?;
-    if !frame.body.is_empty() {
-        writer.write_all(&frame.body).await?;
     }
     Ok(())
 }
@@ -2303,7 +2181,7 @@ mod tests {
             subc_reader_loop(client, reader_pending, events).await;
         });
 
-        let push = EnvelopeFrame::build(
+        let push = build_frame(
             FrameType::Push,
             control_flags(),
             0,
@@ -2311,7 +2189,7 @@ mod tests {
             br#"{"op":"catalog.changed","generation":2}"#.to_vec(),
         )
         .unwrap();
-        write_envelope_frame(&mut server, &push).await.unwrap();
+        write_frame(&mut server, &push).await.unwrap();
         server.flush().await.unwrap();
 
         time::sleep(Duration::from_millis(25)).await;
@@ -2320,7 +2198,7 @@ mod tests {
             "unknown channel-0 Push must not satisfy a pending request"
         );
 
-        let response = EnvelopeFrame::build(
+        let response = build_frame(
             FrameType::Response,
             control_flags(),
             0,
@@ -2328,7 +2206,7 @@ mod tests {
             br#"{"op":"route.open","route_channel":7}"#.to_vec(),
         )
         .unwrap();
-        write_envelope_frame(&mut server, &response).await.unwrap();
+        write_frame(&mut server, &response).await.unwrap();
         server.flush().await.unwrap();
 
         let delivered = time::timeout(Duration::from_secs(1), reply_rx.recv())
@@ -2341,5 +2219,30 @@ mod tests {
 
         drop(server);
         reader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_non_loopback_connection_file_endpoint() {
+        let daemon_id = generate_daemon_id().unwrap();
+        let path = env::temp_dir().join(format!("subc-mcp-non-loopback-{}.json", hex(&daemon_id)));
+        let info = ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            endpoints: vec![Endpoint {
+                host: "0.0.0.0".to_owned(),
+                port: 0,
+            }],
+            key: vec![0x42; subc_transport::KEY_LEN],
+            daemon_id,
+            pid: process::id(),
+            daemon_ver: "test".to_owned(),
+        };
+
+        connection_file::write_atomic(&path, &info).unwrap();
+        let err = connect_authenticated(&path).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not a loopback address"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

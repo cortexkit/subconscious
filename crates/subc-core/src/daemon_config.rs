@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use subc_jsonc::jsonc_to_json;
 
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
@@ -151,109 +152,6 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
 
 fn default_enabled() -> bool {
     true
-}
-
-fn jsonc_to_json(doc: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(doc.len());
-    let mut chars = doc.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => {
-                in_string = true;
-                out.push(ch);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                let _ = chars.next();
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                let _ = chars.next();
-                let mut closed = false;
-                let mut prev = '\0';
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        out.push('\n');
-                    }
-                    if prev == '*' && next == '/' {
-                        closed = true;
-                        break;
-                    }
-                    prev = next;
-                }
-                if !closed {
-                    return Err("unterminated block comment".to_owned());
-                }
-            }
-            _ => out.push(ch),
-        }
-    }
-
-    if in_string {
-        return Err("unterminated string".to_owned());
-    }
-
-    Ok(remove_json_trailing_commas(&out))
-}
-
-fn remove_json_trailing_commas(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-            out.push(ch);
-            continue;
-        }
-
-        if ch == ',' {
-            let mut lookahead = chars.clone();
-            while matches!(lookahead.peek(), Some(next) if next.is_whitespace()) {
-                let _ = lookahead.next();
-            }
-            if matches!(lookahead.peek(), Some('}' | ']')) {
-                continue;
-            }
-        }
-
-        out.push(ch);
-    }
-
-    out
 }
 
 fn non_empty_os_var(key: &str) -> Option<OsString> {

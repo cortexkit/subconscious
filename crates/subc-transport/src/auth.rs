@@ -132,8 +132,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     validate_key(key)?;
+    let deadline_at = time::Instant::now() + deadline;
 
-    let hello: ClientHello = read_message(stream, AuthStage::ClientHello, deadline).await?;
+    let hello: ClientHello = read_message(
+        stream,
+        AuthStage::ClientHello,
+        remaining_deadline(deadline_at, AuthStage::ClientHello, deadline)?,
+    )
+    .await?;
     let server_nonce = random_nonce()?;
     let server_proof = compute_proof(
         key,
@@ -152,11 +158,16 @@ where
             daemon_ver: daemon_ver.to_owned(),
             server_proof,
         },
-        deadline,
+        remaining_deadline(deadline_at, AuthStage::ServerProof, deadline)?,
     )
     .await?;
 
-    let client_auth: ClientAuth = read_message(stream, AuthStage::ClientAuth, deadline).await?;
+    let client_auth: ClientAuth = read_message(
+        stream,
+        AuthStage::ClientAuth,
+        remaining_deadline(deadline_at, AuthStage::ClientAuth, deadline)?,
+    )
+    .await?;
     let expected_client_auth = compute_proof(
         key,
         CLIENT_AUTH_DOMAIN,
@@ -169,6 +180,19 @@ where
     }
 
     Ok(Authenticated { role: hello.role })
+}
+
+fn remaining_deadline(
+    deadline_at: time::Instant,
+    stage: AuthStage,
+    deadline: Duration,
+) -> Result<Duration, AuthError> {
+    let remaining = deadline_at.saturating_duration_since(time::Instant::now());
+    if remaining.is_zero() {
+        Err(AuthError::Timeout { stage, deadline })
+    } else {
+        Ok(remaining)
+    }
 }
 
 pub async fn authenticate_client<S>(
@@ -458,5 +482,100 @@ impl Error for AuthError {
             | Self::DaemonIdMismatch
             | Self::InvalidClientAuth => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream},
+        task::yield_now,
+        time::advance,
+    };
+
+    const TEST_DAEMON_VER: &str = "subc-auth-test-1";
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticate_server_deadline_is_absolute_across_handshake() {
+        let key = vec![0x5a; MIN_KEY_LEN];
+        let daemon_id = [0x6b; DAEMON_ID_LEN];
+        let deadline = Duration::from_millis(100);
+        let stage_delay = Duration::from_millis(60);
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            authenticate_server(&mut server, &key, &daemon_id, TEST_DAEMON_VER, deadline).await
+        });
+
+        yield_now().await;
+        assert!(!server_task.is_finished());
+
+        advance(stage_delay).await;
+        write_auth_json(
+            &mut client,
+            &ClientHello {
+                client_nonce: [0x11; NONCE_LEN],
+                role: DEFAULT_CLIENT_ROLE.to_owned(),
+            },
+        )
+        .await;
+        yield_now().await;
+
+        let server_proof: ServerProof = read_auth_json(&mut client).await;
+        assert_eq!(server_proof.daemon_id, daemon_id);
+        assert_eq!(server_proof.daemon_ver, TEST_DAEMON_VER);
+        assert!(!server_task.is_finished());
+
+        advance(stage_delay).await;
+        yield_now().await;
+        assert!(server_task.is_finished());
+
+        let err = server_task
+            .await
+            .expect("server task should join")
+            .expect_err("server handshake should time out once the total deadline elapses");
+        assert!(matches!(
+            err,
+            AuthError::Timeout {
+                stage: AuthStage::ClientAuth,
+                ..
+            }
+        ));
+    }
+
+    async fn read_auth_json<T>(stream: &mut DuplexStream) -> T
+    where
+        T: DeserializeOwned,
+    {
+        let mut len_bytes = [0u8; 4];
+        stream
+            .read_exact(&mut len_bytes)
+            .await
+            .expect("read auth length");
+        let len = u32::from_le_bytes(len_bytes);
+        assert!(
+            len <= MAX_AUTH_MESSAGE_LEN,
+            "test helper received auth message over cap"
+        );
+        let mut body = vec![0u8; len as usize];
+        stream.read_exact(&mut body).await.expect("read auth body");
+        serde_json::from_slice(&body).expect("decode auth json")
+    }
+
+    async fn write_auth_json<T>(stream: &mut DuplexStream, value: &T)
+    where
+        T: Serialize,
+    {
+        let body = serde_json::to_vec(value).expect("encode auth json");
+        assert!(
+            body.len() <= MAX_AUTH_MESSAGE_LEN as usize,
+            "test helper auth message over cap"
+        );
+        stream
+            .write_all(&(body.len() as u32).to_le_bytes())
+            .await
+            .expect("write auth length");
+        stream.write_all(&body).await.expect("write auth body");
     }
 }

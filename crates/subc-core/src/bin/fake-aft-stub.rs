@@ -52,6 +52,7 @@ const FAKE_AFT_TOOLCALL_DELAY_MS_ENV: &str = "FAKE_AFT_TOOLCALL_DELAY_MS";
 const FAKE_AFT_TOOLCALL_RESULT_ENV: &str = "FAKE_AFT_TOOLCALL_RESULT";
 const FAKE_AFT_TOOLCALL_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_ERROR";
 const FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_SUBC_ERROR";
+const FAKE_AFT_TOOLS_ENV: &str = "FAKE_AFT_TOOLS";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
@@ -134,13 +135,7 @@ where
 {
     let mut state = StubState::default();
 
-    send_hello(
-        &writer,
-        &config.module_id,
-        config.role.clone(),
-        config.concurrency.clone(),
-    )
-    .await?;
+    send_hello(&writer, &config).await?;
     expect_hello_ack(read_half).await?;
 
     if let Some(crash_after) = config.crash_after {
@@ -187,14 +182,14 @@ where
     Ok(())
 }
 
-async fn send_hello(
-    writer: &mpsc::Sender<Frame>,
-    module_id: &str,
-    role: StubRole,
-    concurrency: Concurrency,
-) -> Result<(), StubError> {
+async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result<(), StubError> {
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: manifest(module_id, role, concurrency),
+        manifest: manifest(
+            &config.module_id,
+            config.role.clone(),
+            config.concurrency.clone(),
+            &config.tools,
+        ),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
     })
@@ -910,13 +905,14 @@ fn manifest(
     module_id: &str,
     role: StubRole,
     concurrency: Concurrency,
+    tools: &[String],
 ) -> subc_protocol::manifest::ModuleManifest {
     subc_protocol::manifest::ModuleManifest {
         module_id: module_id.to_string(),
         module_version: "0.0.0-fake".to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
-        provides: vec![provider_role(role, concurrency)],
+        provides: vec![provider_role(role, concurrency, tools)],
         consumes: Vec::new(),
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
@@ -939,14 +935,17 @@ fn manifest(
     }
 }
 
-fn provider_role(role: StubRole, concurrency: Concurrency) -> ProviderRole {
+fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> ProviderRole {
     match role {
         StubRole::ToolProvider => ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "fake_read".to_string(),
-                mutates: false,
-                schema: json!({"type": "object"}),
-            }],
+            tools: tools
+                .iter()
+                .map(|name| Tool {
+                    name: name.clone(),
+                    mutates: false,
+                    schema: json!({"type": "object"}),
+                })
+                .collect(),
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
             concurrency,
             emits_push: true,
@@ -1019,6 +1018,7 @@ struct StubConfig {
     toolcall_result: Option<String>,
     toolcall_error: bool,
     toolcall_subc_error: bool,
+    tools: Vec<String>,
 }
 
 struct StubState {
@@ -1069,6 +1069,17 @@ impl StubConfig {
             })
             .transpose()?
             .unwrap_or(Duration::ZERO);
+        let tools = env::var(FAKE_AFT_TOOLS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tools| !tools.is_empty())
+            .unwrap_or_else(|| vec!["fake_read".to_string()]);
 
         Ok(Self {
             connection_file_path,
@@ -1091,6 +1102,7 @@ impl StubConfig {
                 .filter(|value| !value.is_empty()),
             toolcall_error: env_flag(FAKE_AFT_TOOLCALL_ERROR_ENV),
             toolcall_subc_error: env_flag(FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV),
+            tools,
         })
     }
 }

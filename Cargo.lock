@@ -627,11 +627,19 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-control",
+ "subc-jsonc",
  "subc-protocol",
  "subc-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "subc-jsonc"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -643,6 +651,7 @@ dependencies = [
  "serde_json",
  "subc-control",
  "subc-core",
+ "subc-jsonc",
  "subc-protocol",
  "subc-transport",
  "tokio",

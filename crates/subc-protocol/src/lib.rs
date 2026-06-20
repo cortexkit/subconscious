@@ -77,6 +77,10 @@ pub enum RouteTarget {
 /// Envelope protocol version this build speaks.
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Env var subc sets on each supervised child telling it the module_id it is
+/// supervised under, so it can register under that id.
+pub const SUBC_MODULE_ID_ENV: &str = "SUBC_MODULE_ID";
+
 /// Fixed header length for `PROTOCOL_VERSION` 1.
 pub const HEADER_LEN: usize = 17;
 

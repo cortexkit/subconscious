@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     error::Error,
     ffi::{OsStr, OsString},
@@ -30,14 +30,18 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     decode_header,
-    manifest::{ProviderRole, Tool as ManifestTool},
+    manifest::{
+        Bindings, ConfigBinding, ConfigSource, ConsumerRole, IdentityBinding, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool as ManifestTool, TrustTier,
+    },
     session::ConfigTier,
-    BindIdentity, EnvelopeHeader, ErrorBody, Flags, FrameType, Priority, RouteTarget, HEADER_LEN,
-    MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
+    BindIdentity, EnvelopeHeader, ErrorBody, Flags, Frame as SubcFrame, FrameType,
+    ModuleHelloAckBody, ModuleHelloBody, Priority, RouteTarget, HEADER_LEN, MAX_FRAME_BODY_LEN,
+    PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
     authenticate_client, authenticate_server, connection_file, generate_daemon_id, generate_key,
-    ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    read_frame, write_frame, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
     io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
@@ -55,6 +59,7 @@ const DEFAULT_HARNESS: &str = "mcp:generic";
 const PENDING_FRAME_BUFFER: usize = 8;
 const SUBC_EVENT_BUFFER: usize = 64;
 const CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SUPERVISION_HELLO_CORR: u64 = 1;
 const MCP_CONFIG_RELATIVE_PATH: &str = "cortexkit/mcp.jsonc";
 const PROJECT_MCP_CONFIG_RELATIVE_PATH: &str = ".cortexkit/mcp.jsonc";
 
@@ -526,7 +531,8 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 }
 
 async fn run_module(args: ModuleArgs) -> Result<()> {
-    let subc_stream = connect_authenticated(&args.subc_connection_file).await?;
+    let mut subc_stream = connect_authenticated(&args.subc_connection_file).await?;
+    send_supervision_hello_if_configured(&mut subc_stream).await?;
     let subc = SubcClient::start(subc_stream);
 
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -556,6 +562,134 @@ async fn run_module(args: ModuleArgs) -> Result<()> {
                 eprintln!("subc-mcp module: shim connection failed: {error}");
             }
         });
+    }
+}
+
+async fn send_supervision_hello_if_configured(stream: &mut TcpStream) -> Result<()> {
+    let module_id = match env::var(SUBC_MODULE_ID_ENV) {
+        Ok(module_id) if !module_id.trim().is_empty() => module_id,
+        Ok(_) => {
+            return Err(other_error(format!(
+                "{SUBC_MODULE_ID_ENV} must not be empty when set"
+            )))
+        }
+        Err(env::VarError::NotPresent) => return Ok(()),
+        Err(env::VarError::NotUnicode(value)) => {
+            return Err(other_error(format!(
+                "{SUBC_MODULE_ID_ENV} must be valid UTF-8, got '{}'",
+                value.to_string_lossy()
+            )))
+        }
+    };
+
+    let body = serde_json::to_vec(&ModuleHelloBody {
+        manifest: supervision_manifest(module_id.clone()),
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+    })
+    .map_err(|source| {
+        other_error(format!(
+            "failed to encode supervision HELLO for module_id={module_id}: {source}"
+        ))
+    })?;
+    let frame = SubcFrame::build(
+        FrameType::Hello,
+        control_flags(),
+        0,
+        SUPERVISION_HELLO_CORR,
+        body,
+    )
+    .map_err(|source| {
+        other_error(format!(
+            "failed to build supervision HELLO for module_id={module_id}: {source}"
+        ))
+    })?;
+
+    write_frame(stream, &frame).await.map_err(|source| {
+        other_error(format!(
+            "failed to write supervision HELLO for module_id={module_id}: {source}"
+        ))
+    })?;
+    stream.flush().await.map_err(|source| {
+        other_error(format!(
+            "failed to flush supervision HELLO for module_id={module_id}: {source}"
+        ))
+    })?;
+
+    let Some(frame) = read_frame(stream).await.map_err(|source| {
+        other_error(format!(
+            "failed to read supervision HELLO_ACK for module_id={module_id}: {source}"
+        ))
+    })?
+    else {
+        return Err(other_error(format!(
+            "subc closed before supervision HELLO_ACK for module_id={module_id}"
+        )));
+    };
+
+    match frame.header.ty {
+        FrameType::HelloAck => {
+            let _ack: ModuleHelloAckBody =
+                serde_json::from_slice(&frame.body).map_err(|source| {
+                    other_error(format!(
+                    "failed to decode supervision HELLO_ACK for module_id={module_id}: {source}"
+                ))
+                })?;
+            eprintln!("subc-mcp module: registered for supervision module_id={module_id}");
+            Ok(())
+        }
+        FrameType::Error => {
+            let body: ErrorBody = serde_json::from_slice(&frame.body).map_err(|source| {
+                other_error(format!(
+                    "subc rejected supervision HELLO for module_id={module_id} with malformed ERROR body: {source}"
+                ))
+            })?;
+            Err(other_error(format!(
+                "subc rejected supervision HELLO for module_id={module_id}: {}: {}",
+                body.code, body.message
+            )))
+        }
+        ty => Err(other_error(format!(
+            "unexpected supervision HELLO_ACK frame type for module_id={module_id}: {ty:?}"
+        ))),
+    }
+}
+
+fn supervision_manifest(module_id: String) -> ModuleManifest {
+    ModuleManifest {
+        module_id,
+        module_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: Vec::new(),
+        consumes: vec![ConsumerRole::ToolClient { of: Vec::new() }],
+        scheduled_tasks: Vec::new(),
+        bindings: supervision_bindings(),
+    }
+}
+
+fn supervision_bindings() -> Bindings {
+    // Manifest v1 requires concrete binding records. subc-mcp is only a
+    // gateway/consumer here: it owns no subc-mediated schema, secrets, config,
+    // or identity grant for the supervision registration itself; per-call
+    // config/identity arrives later through route.open. Keep every grant empty
+    // and explicitly decline storage schema ownership.
+    Bindings {
+        storage: StorageBinding {
+            kind: StorageKind::Sqlite,
+            scope: StorageScope::Project,
+            owns_schema: false,
+        },
+        config: ConfigBinding {
+            source: ConfigSource::SubcMediated,
+            tiers: Vec::new(),
+            expansion: BTreeMap::new(),
+        },
+        vault_grants: Vec::new(),
+        identity: IdentityBinding {
+            requires: Vec::new(),
+            optional: Vec::new(),
+        },
     }
 }
 

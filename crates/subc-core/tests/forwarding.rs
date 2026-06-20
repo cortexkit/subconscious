@@ -15,8 +15,8 @@ use std::{
 use serde_json::Value;
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_core::{
-    read_frame, write_frame, ForwardingTable, Frame, ModuleSpec, ModuleState, ModuleStatus,
-    Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle,
+    read_frame, write_frame, ExitKind, ForwardingTable, Frame, ModuleSpec, ModuleState,
+    ModuleStatus, Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
 use subc_protocol::{
@@ -578,6 +578,15 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
     assert!(applied);
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+    assert_eq!(status.restart_count, 0);
+    assert_eq!(
+        status.last_exit.as_ref().map(|exit| exit.kind),
+        Some(ExitKind::Clean)
+    );
     assert!(server.registry.generation().unwrap() > generation_before);
 
     module.stop().await.unwrap();
@@ -989,10 +998,14 @@ async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns()
     assert!(applied);
     wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
-    wait_for_status(&module, SETUP_TIMEOUT, |status| {
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
         status.state == ModuleState::Disabled && !status.enabled && !status.live
     })
     .await;
+    assert_eq!(
+        status.last_exit.as_ref().map(|exit| exit.kind),
+        Some(ExitKind::Clean)
+    );
 
     let error = attach_error_on_stream(&mut client, &project, 323, "ses-disabled", module_id).await;
     assert_eq!(error.code, "target_unavailable");

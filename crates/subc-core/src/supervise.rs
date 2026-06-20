@@ -4,13 +4,13 @@ use std::{
     fmt, io,
     path::PathBuf,
     process::ExitStatus,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use tokio::{
     process::{Child, Command},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout, Instant},
 };
@@ -36,6 +36,20 @@ const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
+
+fn registration_release_events() -> &'static watch::Sender<u64> {
+    static EVENTS: OnceLock<watch::Sender<u64>> = OnceLock::new();
+    EVENTS.get_or_init(|| {
+        let (sender, _receiver) = watch::channel(0);
+        sender
+    })
+}
+
+pub(crate) fn notify_registration_release() {
+    let events = registration_release_events();
+    let next_generation = (*events.borrow()).wrapping_add(1);
+    events.send_replace(next_generation);
+}
 
 /// How to launch one singleton module process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,6 +897,8 @@ async fn restart_child(
     snapshot: &SharedSnapshot,
     child: &mut Option<Child>,
 ) -> Result<(), SuperviseError> {
+    begin_forwarding_drain_if_configured(spec, runtime, snapshot, None, "restart").await?;
+
     if child.is_some() {
         drain_optional_child(
             &spec.module_id,
@@ -904,6 +920,7 @@ async fn restart_child(
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
     }
 
+    reset_restart_count(snapshot, &spec.module_id)?;
     sleep(runtime.restart_policy.backoff).await;
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
@@ -920,40 +937,7 @@ async fn reload_child(
     snapshot: &SharedSnapshot,
     child: &mut Option<Child>,
 ) -> Result<(), SuperviseError> {
-    let Some(forwarding) = runtime.forwarding.as_ref() else {
-        return Err(SuperviseError::ReloadUnavailable {
-            module_id: spec.module_id.clone(),
-            reason: "supervisor was not configured with a forwarding table".to_string(),
-        });
-    };
-
-    // Admission gate first: route.open/commit and route REQUEST admission are closed
-    // before the first quiescence check, so the outstanding count can only fall.
-    let drain_target = forwarding
-        .begin_module_drain(&spec.module_id)
-        .map_err(SuperviseError::Forwarding)?;
-    update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.enabled = true;
-        state.state = ModuleState::Draining;
-    })?;
-
-    if let Some(target) = drain_target.as_ref() {
-        if !wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
-            .await?
-        {
-            warn!(
-                module_id = %spec.module_id,
-                waited = ?runtime.drain_timeout,
-                "reload drain timed out before request quiescence; forcing teardown"
-            );
-        }
-
-        let released_routes = forwarding
-            .release_module_endpoint_routes(target.endpoint)
-            .map_err(SuperviseError::Forwarding)?;
-        send_route_goodbyes(forwarding, released_routes);
-        send_module_goodbye(&spec.module_id, forwarding, target);
-    }
+    begin_forwarding_drain(spec, runtime, snapshot, Some(true), "reload").await?;
 
     if child.is_some() {
         drain_optional_child(
@@ -976,6 +960,7 @@ async fn reload_child(
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
     }
 
+    reset_restart_count(snapshot, &spec.module_id)?;
     sleep(runtime.restart_policy.backoff).await;
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
@@ -1085,12 +1070,15 @@ async fn set_child_enabled(
             state.pid = None;
         })?;
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
+        reset_restart_count(snapshot, &spec.module_id)?;
         process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
         let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
         *child = Some(next_child);
         debug!(module_id = %spec.module_id, "supervised module enabled");
         Ok(true)
     } else {
+        begin_forwarding_drain_if_configured(spec, runtime, snapshot, Some(false), "disable")
+            .await?;
         drain_optional_child(
             &spec.module_id,
             registry,
@@ -1277,7 +1265,7 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
                 warn!(
                     route_channel = released.channel,
                     error = %err,
-                    "failed to build reload route GOODBYE frame"
+                    "failed to build supervisor drain route GOODBYE frame"
                 );
                 continue;
             }
@@ -1288,14 +1276,14 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
                     target_connection_id = released.connection_id.get(),
                     route_channel = released.channel,
                     error = %err,
-                    "reload route GOODBYE was not delivered to client; closing target connection"
+                    "supervisor drain route GOODBYE was not delivered to client; closing target connection"
                 );
                 forwarding.request_connection_close(
                     released.connection_id,
                     CloseReason::new(
                         "route_goodbye_delivery_failed",
                         format!(
-                            "failed to enqueue reload route GOODBYE for channel {}: {err}",
+                            "failed to enqueue supervisor drain route GOODBYE for channel {}: {err}",
                             released.channel
                         ),
                     ),
@@ -1305,7 +1293,7 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
                     target_connection_id = released.connection_id.get(),
                     route_channel = released.channel,
                     error = %err,
-                    "reload route GOODBYE to module dropped under backpressure; not closing shared module connection"
+                    "supervisor drain route GOODBYE to module dropped under backpressure; not closing shared module connection"
                 );
             }
         }
@@ -1326,7 +1314,7 @@ fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &M
             warn!(
                 module_id,
                 error = %err,
-                "failed to build reload module GOODBYE frame"
+                "failed to build supervisor drain module GOODBYE frame"
             );
             return;
         }
@@ -1336,16 +1324,88 @@ fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &M
             module_id,
             target_connection_id = target.endpoint.connection_id.get(),
             error = %err,
-            "reload module GOODBYE was not delivered to peer; closing module connection"
+            "supervisor drain module GOODBYE was not delivered to peer; closing module connection"
         );
         forwarding.request_connection_close(
             target.endpoint.connection_id,
             CloseReason::new(
                 "module_goodbye_delivery_failed",
-                format!("failed to enqueue reload module GOODBYE for module '{module_id}': {err}"),
+                format!("failed to enqueue supervisor drain module GOODBYE for module '{module_id}': {err}"),
             ),
         );
     }
+}
+
+async fn begin_forwarding_drain(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    enabled: Option<bool>,
+    operation: &'static str,
+) -> Result<(), SuperviseError> {
+    let Some(forwarding) = runtime.forwarding.as_ref() else {
+        return Err(SuperviseError::ReloadUnavailable {
+            module_id: spec.module_id.clone(),
+            reason: "supervisor was not configured with a forwarding table".to_string(),
+        });
+    };
+
+    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, operation).await
+}
+
+async fn begin_forwarding_drain_if_configured(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    enabled: Option<bool>,
+    operation: &'static str,
+) -> Result<(), SuperviseError> {
+    let Some(forwarding) = runtime.forwarding.as_ref() else {
+        return Ok(());
+    };
+
+    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, operation).await
+}
+
+async fn begin_forwarding_drain_with(
+    forwarding: &ForwardingTable,
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    enabled: Option<bool>,
+    operation: &'static str,
+) -> Result<(), SuperviseError> {
+    // Admission gate first: route.open/commit and route REQUEST admission are closed
+    // before the first quiescence check, so the outstanding count can only fall.
+    let drain_target = forwarding
+        .begin_module_drain(&spec.module_id)
+        .map_err(SuperviseError::Forwarding)?;
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.state = ModuleState::Draining;
+        if let Some(enabled) = enabled {
+            state.enabled = enabled;
+        }
+    })?;
+
+    if let Some(target) = drain_target.as_ref() {
+        if !wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
+            .await?
+        {
+            warn!(
+                module_id = %spec.module_id,
+                waited = ?runtime.drain_timeout,
+                "{operation} drain timed out before request quiescence; forcing teardown"
+            );
+        }
+
+        let released_routes = forwarding
+            .release_module_endpoint_routes(target.endpoint)
+            .map_err(SuperviseError::Forwarding)?;
+        send_route_goodbyes(forwarding, released_routes);
+        send_module_goodbye(&spec.module_id, forwarding, target);
+    }
+
+    Ok(())
 }
 
 async fn wait_for_registration_after_reload(
@@ -1601,7 +1661,9 @@ async fn wait_for_registration_release(
     wait: Duration,
 ) -> Result<(), SuperviseError> {
     let deadline = Instant::now() + wait;
+    let mut release_events = registration_release_events().subscribe();
     loop {
+        let _observed_generation = *release_events.borrow_and_update();
         if registry
             .get_module(module_id)
             .map_err(SuperviseError::Registry)?
@@ -1610,14 +1672,24 @@ async fn wait_for_registration_release(
             return Ok(());
         }
 
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(SuperviseError::RegistrationStillActive {
                 module_id: module_id.to_string(),
                 waited: wait,
             });
         }
 
-        sleep(REGISTRY_RELEASE_POLL).await;
+        let remaining = deadline.saturating_duration_since(now);
+        match timeout(remaining, release_events.changed()).await {
+            Ok(Ok(())) | Ok(Err(_)) => {}
+            Err(_) => {
+                return Err(SuperviseError::RegistrationStillActive {
+                    module_id: module_id.to_string(),
+                    waited: wait,
+                })
+            }
+        }
     }
 }
 
@@ -1643,6 +1715,12 @@ fn exit_signal(status: &ExitStatus) -> Option<i32> {
 #[cfg(not(unix))]
 fn exit_signal(_status: &ExitStatus) -> Option<i32> {
     None
+}
+
+fn reset_restart_count(snapshot: &SharedSnapshot, module_id: &str) -> Result<(), SuperviseError> {
+    update_snapshot(snapshot, Some(module_id), |state| {
+        state.restart_count = 0;
+    })
 }
 
 fn set_running(snapshot: &SharedSnapshot, pid: Option<u32>) -> Result<(), SuperviseError> {

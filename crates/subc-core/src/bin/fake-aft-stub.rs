@@ -37,6 +37,9 @@ use tokio::{
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
 const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
+const FAKE_AFT_FAIL_REGISTRATION_ENV: &str = "FAKE_AFT_FAIL_REGISTRATION";
+const FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH_ENV: &str =
+    "FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH";
 const FAKE_AFT_EVENTS_PATH_ENV: &str = "FAKE_AFT_EVENTS_PATH";
 const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";
@@ -67,6 +70,10 @@ async fn main() -> Result<(), StubError> {
 }
 
 async fn run(config: StubConfig) -> Result<(), StubError> {
+    if config.fail_registration {
+        std::process::exit(2);
+    }
+
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(STUB_EGRESS_BUFFER);
@@ -1004,6 +1011,7 @@ struct StubConfig {
     module_id: String,
     crash_after: Option<Duration>,
     reject_attach: bool,
+    fail_registration: bool,
     events_path: Option<PathBuf>,
     emit_after_detach: bool,
     push_on_request: bool,
@@ -1080,12 +1088,15 @@ impl StubConfig {
             })
             .filter(|tools| !tools.is_empty())
             .unwrap_or_else(|| vec!["fake_read".to_string()]);
+        let fail_registration =
+            env_flag(FAKE_AFT_FAIL_REGISTRATION_ENV) || fail_registration_after_first()?;
 
         Ok(Self {
             connection_file_path,
             module_id,
             crash_after,
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
+            fail_registration,
             events_path,
             emit_after_detach: env_flag(FAKE_AFT_EMIT_AFTER_DETACH_ENV),
             push_on_request: env_flag(FAKE_AFT_PUSH_ON_REQUEST_ENV),
@@ -1175,6 +1186,22 @@ fn env_flag(key: &str) -> bool {
         env::var(key).ok().as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
     )
+}
+
+fn fail_registration_after_first() -> Result<bool, StubError> {
+    let Some(path) =
+        env::var_os(FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH_ENV).map(PathBuf::from)
+    else {
+        return Ok(false);
+    };
+    if path.exists() {
+        return Ok(true);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(StubError::Io)?;
+    }
+    fs::write(&path, b"first registration consumed\n").map_err(StubError::Io)?;
+    Ok(false)
 }
 
 #[derive(Debug)]

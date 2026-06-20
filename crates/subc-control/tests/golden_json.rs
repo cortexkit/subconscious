@@ -105,6 +105,12 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             },
         ),
         (
+            "client_control_request_supervisor_reload",
+            ClientControlRequest::SupervisorReload {
+                module_id: "aft-tools".to_string(),
+            },
+        ),
+        (
             "client_control_request_supervisor_set_enabled",
             ClientControlRequest::SupervisorSetEnabled {
                 module_id: "aft-tools".to_string(),
@@ -168,6 +174,7 @@ fn thin_core_ops() -> Vec<String> {
         "route.poll".to_string(),
         "supervisor.list".to_string(),
         "supervisor.restart".to_string(),
+        "supervisor.reload".to_string(),
         "supervisor.set_enabled".to_string(),
     ]
 }

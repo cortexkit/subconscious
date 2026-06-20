@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use serde::Serialize;
 use subc_control::{
@@ -10,11 +10,13 @@ use subc_protocol::{
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::{
     forwarding::{
-        ForwardingError, ForwardingTable, GoodbyeTarget, ModuleEndpointId, RouteBindRelayOutcome,
+        CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleEndpointId,
+        RouteBindRelayOutcome,
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
@@ -46,6 +48,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
 ];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
+const ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
@@ -66,6 +69,63 @@ impl fmt::Debug for ControlHandler {
             .field("supervisor", &self.supervisor)
             .field("subc_capabilities", &self.subc_capabilities)
             .finish()
+    }
+}
+
+struct RouteBindReservationGuard {
+    forwarding: Arc<ForwardingTable>,
+    endpoint: ModuleEndpointId,
+    client_connection_id: ConnectionId,
+    client_channel: u16,
+    module_channel: u16,
+    relay_corr: u64,
+    armed: bool,
+}
+
+impl RouteBindReservationGuard {
+    fn new(
+        forwarding: Arc<ForwardingTable>,
+        endpoint: ModuleEndpointId,
+        client_connection_id: ConnectionId,
+        client_channel: u16,
+        module_channel: u16,
+        relay_corr: u64,
+    ) -> Self {
+        Self {
+            forwarding,
+            endpoint,
+            client_connection_id,
+            client_channel,
+            module_channel,
+            relay_corr,
+            armed: true,
+        }
+    }
+
+    fn release_and_disarm(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self
+            .forwarding
+            .cancel_pending_relay(self.endpoint, self.relay_corr);
+        let _ = self.forwarding.release_reserved_route(
+            self.client_connection_id,
+            self.client_channel,
+            self.endpoint,
+            self.module_channel,
+        );
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RouteBindReservationGuard {
+    fn drop(&mut self) {
+        self.release_and_disarm();
     }
 }
 
@@ -258,9 +318,20 @@ impl ControlHandler {
             };
             if let Err(err) = released.sink.try_send(frame) {
                 warn!(
+                    target_connection_id = released.connection_id.get(),
                     route_channel = released.channel,
                     error = %err,
-                    "best-effort route GOODBYE was not delivered to peer"
+                    "route GOODBYE was not delivered to peer; closing target connection"
+                );
+                self.forwarding.request_connection_close(
+                    released.connection_id,
+                    CloseReason::new(
+                        "route_goodbye_delivery_failed",
+                        format!(
+                            "failed to enqueue route GOODBYE for channel {}: {err}",
+                            released.channel
+                        ),
+                    ),
                 );
             }
         }
@@ -606,11 +677,24 @@ impl ControlHandler {
                 )?])
             }
         };
-        let endpoint = pending.endpoint;
-        let client_connection_id = pending.client_connection_id;
-        let client_channel = pending.client_channel;
-        let module_channel = pending.module_channel;
-        let relay_corr = pending.corr;
+        let crate::forwarding::PendingRouteBindRelay {
+            endpoint,
+            module_sink,
+            negotiated_ver,
+            client_connection_id,
+            client_channel,
+            module_channel,
+            corr: relay_corr,
+            receiver,
+        } = pending;
+        let mut reservation = RouteBindReservationGuard::new(
+            Arc::clone(&self.forwarding),
+            endpoint,
+            client_connection_id,
+            client_channel,
+            module_channel,
+            relay_corr,
+        );
 
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
@@ -626,7 +710,7 @@ impl ControlHandler {
             )
         })?;
         let relay_frame = Frame::build_with_version(
-            pending.negotiated_ver,
+            negotiated_ver,
             FrameType::Request,
             control_flags(),
             0,
@@ -635,14 +719,8 @@ impl ControlHandler {
         )
         .map_err(RouterError::FrameBuild)?;
 
-        if let Err(err) = pending.module_sink.send(relay_frame).await {
-            let _ = self.forwarding.cancel_pending_relay(endpoint, relay_corr);
-            let _ = self.forwarding.release_reserved_route(
-                client_connection_id,
-                client_channel,
-                endpoint,
-                module_channel,
-            );
+        if let Err(err) = module_sink.send(relay_frame).await {
+            reservation.release_and_disarm();
             return Ok(vec![control_error_frame(
                 &frame,
                 "target_unavailable",
@@ -650,8 +728,8 @@ impl ControlHandler {
             )?]);
         }
 
-        match pending.receiver.await {
-            Ok(RouteBindRelayOutcome::Accepted) => {
+        match timeout(ROUTE_BIND_RELAY_TIMEOUT, receiver).await {
+            Ok(Ok(RouteBindRelayOutcome::Accepted)) => {
                 if let Err(err) = self.forwarding.commit_route(
                     ctx.connection_id,
                     ctx.egress.clone(),
@@ -660,18 +738,14 @@ impl ControlHandler {
                     client_channel,
                     module_channel,
                 ) {
-                    let _ = self.forwarding.release_reserved_route(
-                        client_connection_id,
-                        client_channel,
-                        endpoint,
-                        module_channel,
-                    );
+                    reservation.release_and_disarm();
                     return Ok(vec![control_error_frame(
                         &frame,
                         forwarding_error_code(&err),
                         err.to_string(),
                     )?]);
                 }
+                reservation.disarm();
                 let response = ClientControlResponse::RouteOpen {
                     route_channel: client_channel,
                 };
@@ -681,39 +755,35 @@ impl ControlHandler {
                     "ClientControlResponse::RouteOpen",
                 )?])
             }
-            Ok(RouteBindRelayOutcome::Rejected(body)) => {
-                let _ = self.forwarding.release_reserved_route(
-                    client_connection_id,
-                    client_channel,
-                    endpoint,
-                    module_channel,
-                );
+            Ok(Ok(RouteBindRelayOutcome::Rejected(body))) => {
+                reservation.release_and_disarm();
                 Ok(vec![control_error_body_frame(&frame, body)?])
             }
-            Ok(RouteBindRelayOutcome::ModuleGone(message)) => {
-                let _ = self.forwarding.release_reserved_route(
-                    client_connection_id,
-                    client_channel,
-                    endpoint,
-                    module_channel,
-                );
+            Ok(Ok(RouteBindRelayOutcome::ModuleGone(message))) => {
+                reservation.release_and_disarm();
                 Ok(vec![control_error_frame(
                     &frame,
                     "target_unavailable",
                     message,
                 )?])
             }
-            Err(_) => {
-                let _ = self.forwarding.release_reserved_route(
-                    client_connection_id,
-                    client_channel,
-                    endpoint,
-                    module_channel,
-                );
+            Ok(Err(_)) => {
+                reservation.release_and_disarm();
                 Ok(vec![control_error_frame(
                     &frame,
                     "target_unavailable",
                     "route.bind relay waiter was canceled before the module responded",
+                )?])
+            }
+            Err(_) => {
+                reservation.release_and_disarm();
+                Ok(vec![control_error_frame(
+                    &frame,
+                    "module_timeout",
+                    format!(
+                        "module_id '{target_module_id}' did not answer route.bind within {:?}",
+                        ROUTE_BIND_RELAY_TIMEOUT
+                    ),
                 )?])
             }
         }
@@ -1007,32 +1077,34 @@ impl ControlHandler {
         connection_id: ConnectionId,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
+        let mut secondary_error = None;
         let outcome = match frame.header.ty {
             FrameType::Response => {
                 match serde_json::from_slice::<ModuleControlResponse>(&frame.body) {
                     Ok(ModuleControlResponse::RouteBindAck {}) => RouteBindRelayOutcome::Accepted,
                     Err(err) => {
-                        return Ok(vec![control_error_frame(
+                        let message = format!("malformed route.bind response body: {err}");
+                        secondary_error = Some(control_error_frame(
                             &frame,
                             "invalid_control_body",
-                            format!("malformed route.bind response body: {err}"),
-                        )?])
+                            message.clone(),
+                        )?);
+                        RouteBindRelayOutcome::ModuleGone(message)
                     }
                 }
             }
-            FrameType::Error => {
-                let body = match serde_json::from_slice::<ErrorBody>(&frame.body) {
-                    Ok(body) => body,
-                    Err(err) => {
-                        return Ok(vec![control_error_frame(
-                            &frame,
-                            "invalid_control_body",
-                            format!("malformed route.bind ERROR body: {err}"),
-                        )?])
-                    }
-                };
-                RouteBindRelayOutcome::Rejected(body)
-            }
+            FrameType::Error => match serde_json::from_slice::<ErrorBody>(&frame.body) {
+                Ok(body) => RouteBindRelayOutcome::Rejected(body),
+                Err(err) => {
+                    let message = format!("malformed route.bind ERROR body: {err}");
+                    secondary_error = Some(control_error_frame(
+                        &frame,
+                        "invalid_control_body",
+                        message.clone(),
+                    )?);
+                    RouteBindRelayOutcome::ModuleGone(message)
+                }
+            },
             ty => {
                 return Ok(vec![control_error_frame(
                     &frame,
@@ -1042,11 +1114,19 @@ impl ControlHandler {
             }
         };
 
-        let _ = self
+        let settled = self
             .forwarding
             .complete_pending_relay(connection_id, frame.header.corr, outcome)
             .map_err(RouterError::Forwarding)?;
-        Ok(Vec::new())
+        if !settled {
+            debug!(
+                connection_id = connection_id.get(),
+                corr = frame.header.corr,
+                frame_type = ?frame.header.ty,
+                "dropping late or unknown route.bind relay response"
+            );
+        }
+        Ok(secondary_error.into_iter().collect())
     }
 
     fn handle_goodbye(&self, connection_id: ConnectionId) -> Result<Vec<Frame>, RouterError> {

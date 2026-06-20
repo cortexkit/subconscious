@@ -37,6 +37,8 @@ use tokio::{
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
 const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
+const FAKE_AFT_BIND_NEVER_REPLY_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY";
+const FAKE_AFT_MALFORMED_BIND_REPLY_ENV: &str = "FAKE_AFT_MALFORMED_BIND_REPLY";
 const FAKE_AFT_FAIL_REGISTRATION_ENV: &str = "FAKE_AFT_FAIL_REGISTRATION";
 const FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH_ENV: &str =
     "FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH";
@@ -597,6 +599,41 @@ async fn handle_control_request(
                     "config": relay_config,
                 }),
             )?;
+            if config.bind_never_reply {
+                record_event(
+                    config,
+                    json!({
+                        "kind": "attach_never_reply",
+                        "route_channel": route_channel,
+                        "corr": frame.header.corr,
+                    }),
+                )?;
+                return Ok(());
+            }
+
+            if let Some(reply) = config.malformed_bind_reply {
+                let response = Frame::build_with_version(
+                    frame.header.ver,
+                    reply.frame_type(),
+                    control_flags(),
+                    0,
+                    frame.header.corr,
+                    b"{malformed route.bind reply".to_vec(),
+                )
+                .map_err(StubError::FrameBuild)?;
+                send_outbound(writer, response).await?;
+                record_event(
+                    config,
+                    json!({
+                        "kind": "attach_malformed_reply",
+                        "route_channel": route_channel,
+                        "corr": frame.header.corr,
+                        "reply": reply.as_str(),
+                    }),
+                )?;
+                return Ok(());
+            }
+
             if config.reject_attach {
                 let body = serde_json::to_vec(&ErrorBody {
                     code: "config_divergence".to_string(),
@@ -1005,12 +1042,36 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MalformedBindReply {
+    Response,
+    Error,
+}
+
+impl MalformedBindReply {
+    fn frame_type(self) -> FrameType {
+        match self {
+            Self::Response => FrameType::Response,
+            Self::Error => FrameType::Error,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Response => "response",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StubConfig {
     connection_file_path: PathBuf,
     module_id: String,
     crash_after: Option<Duration>,
     reject_attach: bool,
+    bind_never_reply: bool,
+    malformed_bind_reply: Option<MalformedBindReply>,
     fail_registration: bool,
     events_path: Option<PathBuf>,
     emit_after_detach: bool,
@@ -1096,6 +1157,8 @@ impl StubConfig {
             module_id,
             crash_after,
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
+            bind_never_reply: env_flag(FAKE_AFT_BIND_NEVER_REPLY_ENV),
+            malformed_bind_reply: malformed_bind_reply_from_env()?,
             fail_registration,
             events_path,
             emit_after_detach: env_flag(FAKE_AFT_EMIT_AFTER_DETACH_ENV),
@@ -1181,6 +1244,21 @@ fn role_from_env() -> Result<StubRole, StubError> {
     }
 }
 
+fn malformed_bind_reply_from_env() -> Result<Option<MalformedBindReply>, StubError> {
+    let Some(raw) = env::var(FAKE_AFT_MALFORMED_BIND_REPLY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "response" => Ok(Some(MalformedBindReply::Response)),
+        "error" => Ok(Some(MalformedBindReply::Error)),
+        "0" | "false" | "off" | "none" => Ok(None),
+        _ => Err(StubError::InvalidMalformedBindReply { raw }),
+    }
+}
+
 fn env_flag(key: &str) -> bool {
     matches!(
         env::var(key).ok().as_deref(),
@@ -1223,6 +1301,9 @@ enum StubError {
         raw: String,
     },
     InvalidRole {
+        raw: String,
+    },
+    InvalidMalformedBindReply {
         raw: String,
     },
     ConnectionFile {
@@ -1283,6 +1364,10 @@ impl fmt::Display for StubError {
             Self::InvalidRole { raw } => write!(
                 f,
                 "invalid {FAKE_AFT_ROLE_ENV} value '{raw}': expected tool_provider, management_surface, internal_service, or pipeline_stage"
+            ),
+            Self::InvalidMalformedBindReply { raw } => write!(
+                f,
+                "invalid {FAKE_AFT_MALFORMED_BIND_REPLY_ENV} value '{raw}': expected response, error, or none"
             ),
             Self::ConnectionFile { path, source } => write!(
                 f,
@@ -1349,6 +1434,7 @@ impl Error for StubError {
             | Self::InvalidEndpoint { .. }
             | Self::InvalidConcurrency { .. }
             | Self::InvalidRole { .. }
+            | Self::InvalidMalformedBindReply { .. }
             | Self::WriterClosed
             | Self::InFlightPoisoned
             | Self::ConnectionClosedBeforeHelloAck

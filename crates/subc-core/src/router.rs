@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::{
     control::ControlHandler,
-    forwarding::{ForwardingError, ForwardingTable},
+    forwarding::{CloseReason, ConnectionCloseReceiver, ForwardingError, ForwardingTable},
     registry::ConnectionId,
     Frame, FrameBuildError,
 };
@@ -158,9 +158,13 @@ impl Router {
     /// any control-plane registrations owned by the connection.
     pub fn begin_connection(&self) -> RouterConnection {
         let raw = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let id = ConnectionId::new(raw);
+        let close_receiver = self.forwarding.register_connection_close(id);
         RouterConnection {
-            id: ConnectionId::new(raw),
+            id,
             control_handler: Arc::clone(&self.control),
+            forwarding: Arc::clone(&self.forwarding),
+            close_receiver: Some(close_receiver),
         }
     }
 
@@ -211,11 +215,27 @@ impl Router {
                     );
                     let mut goodbye = frame;
                     goodbye.header.channel = target.channel;
-                    target
-                        .sink
-                        .send(goodbye)
-                        .await
-                        .map_err(|err| RouterError::backend(channel, corr, err.to_string()))?;
+                    if let Err(err) = target.sink.try_send(goodbye) {
+                        warn!(
+                            connection_id = ctx.connection_id.get(),
+                            target_connection_id = target.connection_id.get(),
+                            module_channel = channel,
+                            client_channel = target.channel,
+                            corr,
+                            error = %err,
+                            "route GOODBYE delivery failed; closing target client connection"
+                        );
+                        self.forwarding.request_connection_close(
+                            target.connection_id,
+                            CloseReason::new(
+                                "route_goodbye_delivery_failed",
+                                format!(
+                                    "failed to enqueue route GOODBYE for client channel {}: {err}",
+                                    target.channel
+                                ),
+                            ),
+                        );
+                    }
                     return Ok(());
                 }
 
@@ -242,17 +262,34 @@ impl Router {
                 let releases_credit = is_terminal_frame(frame.header.ty);
                 let mut frame = frame;
                 frame.header.channel = route.client_channel;
-                let result = route
-                    .sink
-                    .send(frame)
-                    .await
-                    .map_err(|err| RouterError::backend(channel, corr, err.to_string()));
+                if let Err(err) = route.sink.try_send(frame) {
+                    debug!(
+                        connection_id = ctx.connection_id.get(),
+                        target_connection_id = route.connection_id.get(),
+                        module_channel = channel,
+                        client_channel = route.client_channel,
+                        corr,
+                        error = %err,
+                        "module-to-client delivery failed; closing target client connection"
+                    );
+                    self.forwarding.request_connection_close(
+                        route.connection_id,
+                        CloseReason::new(
+                            "module_to_client_delivery_failed",
+                            format!(
+                                "failed to enqueue module frame for client channel {} corr {corr}: {err}",
+                                route.client_channel
+                            ),
+                        ),
+                    );
+                    return Ok(());
+                }
                 if releases_credit {
                     // Release only after the terminal is enqueued to the client sink so
-                    // reload quiescence cannot let a route GOODBYE overtake it.
+                    // reload quiescence cannot let a route GOODBYE overtake it. If enqueue
+                    // failed, the forced client cleanup closes the flow instead.
                     route.flow.release();
                 }
-                result?;
                 return Ok(());
             }
 
@@ -329,16 +366,25 @@ impl Default for Router {
 pub struct RouterConnection {
     id: ConnectionId,
     control_handler: Arc<ControlHandler>,
+    forwarding: Arc<ForwardingTable>,
+    close_receiver: Option<ConnectionCloseReceiver>,
 }
 
 impl RouterConnection {
     pub fn id(&self) -> ConnectionId {
         self.id
     }
+
+    pub(crate) fn take_close_receiver(&mut self) -> ConnectionCloseReceiver {
+        self.close_receiver
+            .take()
+            .expect("connection close receiver can only be taken once")
+    }
 }
 
 impl Drop for RouterConnection {
     fn drop(&mut self) {
+        self.forwarding.unregister_connection_close(self.id);
         // GOODBYE (explicit) and connection-drop cleanup both call the same
         // idempotent deregistration path.
         let _ = self.control_handler.cleanup_connection(self.id);
@@ -577,7 +623,8 @@ impl Error for RouterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
+    use std::{sync::Arc, time::Duration};
+    use subc_protocol::{manifest::Concurrency, ErrorBody, Flags, FrameType, Priority};
     use tokio::sync::mpsc;
 
     fn request(channel: u16, corr: u64, body: &[u8]) -> Frame {
@@ -665,6 +712,142 @@ mod tests {
         assert_eq!(response.header.channel, 0);
         assert_eq!(response.header.corr, 77);
         assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_module_to_client_sink_requests_client_close_without_erroring_module() {
+        let forwarding = Arc::new(ForwardingTable::default());
+        let control = Arc::new(ControlHandler::with_forwarding(
+            Arc::new(crate::Registry::default()),
+            Arc::clone(&forwarding),
+        ));
+        let router = Router::with_control_handler(control);
+        let module_connection = ConnectionId::new(10);
+        let client_connection = ConnectionId::new(20);
+        let mut close_receiver = forwarding.register_connection_close(client_connection);
+        let (module_tx, _module_rx) = mpsc::channel(1);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                "full-sink-provider".to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let pending = forwarding
+            .begin_route_bind_relay_for(client_connection, "full-sink-provider")
+            .unwrap();
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        client_tx.try_send(ping(700)).unwrap();
+        forwarding
+            .commit_route(
+                client_connection,
+                FrameSink::new(client_tx),
+                1,
+                pending.endpoint,
+                pending.client_channel,
+                pending.module_channel,
+            )
+            .unwrap();
+
+        let (module_egress_tx, _module_egress_rx) = mpsc::channel(1);
+        let module_ctx = RouteCtx {
+            connection_id: module_connection,
+            egress: FrameSink::new(module_egress_tx),
+        };
+        let terminal = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, true),
+            pending.module_channel,
+            701,
+            b"terminal".to_vec(),
+        )
+        .unwrap();
+
+        router
+            .route_for_connection(&module_ctx, terminal)
+            .await
+            .unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(1), &mut close_receiver)
+            .await
+            .expect("close request should be sent for the full client sink")
+            .expect("close sender should include a reason");
+        assert!(
+            reason
+                .to_string()
+                .contains("module_to_client_delivery_failed"),
+            "unexpected close reason: {reason}"
+        );
+        assert_eq!(client_rx.try_recv().unwrap().header.corr, 700);
+        assert!(client_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_route_goodbye_sink_requests_target_close_without_erroring_module() {
+        let forwarding = Arc::new(ForwardingTable::default());
+        let control = Arc::new(ControlHandler::with_forwarding(
+            Arc::new(crate::Registry::default()),
+            Arc::clone(&forwarding),
+        ));
+        let router = Router::with_control_handler(control);
+        let module_connection = ConnectionId::new(30);
+        let client_connection = ConnectionId::new(40);
+        let mut close_receiver = forwarding.register_connection_close(client_connection);
+        let (module_tx, _module_rx) = mpsc::channel(1);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                "goodbye-full-provider".to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let pending = forwarding
+            .begin_route_bind_relay_for(client_connection, "goodbye-full-provider")
+            .unwrap();
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        client_tx.try_send(ping(800)).unwrap();
+        forwarding
+            .commit_route(
+                client_connection,
+                FrameSink::new(client_tx),
+                1,
+                pending.endpoint,
+                pending.client_channel,
+                pending.module_channel,
+            )
+            .unwrap();
+
+        let (module_egress_tx, _module_egress_rx) = mpsc::channel(1);
+        let module_ctx = RouteCtx {
+            connection_id: module_connection,
+            egress: FrameSink::new(module_egress_tx),
+        };
+        let goodbye = Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Passive, true),
+            pending.module_channel,
+            801,
+            Vec::new(),
+        )
+        .unwrap();
+
+        router
+            .route_for_connection(&module_ctx, goodbye)
+            .await
+            .unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(1), &mut close_receiver)
+            .await
+            .expect("close request should be sent for the full GOODBYE sink")
+            .expect("close sender should include a reason");
+        assert!(
+            reason.to_string().contains("route_goodbye_delivery_failed"),
+            "unexpected close reason: {reason}"
+        );
+        assert_eq!(client_rx.try_recv().unwrap().header.corr, 800);
+        assert!(client_rx.try_recv().is_err());
     }
 
     #[test]

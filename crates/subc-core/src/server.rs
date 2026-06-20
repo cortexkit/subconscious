@@ -6,10 +6,12 @@ use tokio::{
     net::TcpListener,
     sync::{mpsc, Semaphore},
     task::JoinHandle,
+    time::timeout,
 };
 use tracing::{debug, warn};
 
 use crate::{
+    forwarding::{CloseReason, ConnectionCloseReceiver},
     read_frame,
     router::{FrameSink, RouteCtx, Router},
     write_frame, FrameIoError, RouterError,
@@ -18,6 +20,7 @@ use crate::{
 pub const CONNECTION_EGRESS_BUFFER: usize = 64;
 pub const DEFAULT_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 pub const DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS: usize = 32;
+const CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Authentication material and DoS bounds applied before a TCP connection may
 /// reach the frame router.
@@ -148,6 +151,12 @@ impl Drop for AbortTasksOnDrop {
     }
 }
 
+#[derive(Debug)]
+enum ConnectionLoopExit {
+    PeerClosed,
+    CloseRequested(CloseReason),
+}
+
 /// Run the authenticated frame read -> route loop for one connection.
 ///
 /// Every accepted TCP connection must complete the key-auth prelude before any
@@ -182,8 +191,9 @@ where
     .map_err(ConnectionError::Auth)?;
     drop(permit);
 
-    let connection = router.begin_connection();
+    let mut connection = router.begin_connection();
     let connection_id = connection.id();
+    let close_receiver = connection.take_close_receiver();
     debug!(
         connection_id = connection_id.get(),
         "subc authenticated connection opened"
@@ -191,7 +201,7 @@ where
 
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<crate::Frame>(CONNECTION_EGRESS_BUFFER);
-    let writer = tokio::spawn(drain_writer(write_half, rx));
+    let mut writer = tokio::spawn(drain_writer(write_half, rx));
 
     let egress = FrameSink::new(tx);
     let ctx = RouteCtx {
@@ -199,41 +209,103 @@ where
         egress: egress.clone(),
     };
 
-    let loop_result = connection_loop(&mut read_half, &router, &ctx).await;
+    let loop_result = connection_loop(&mut read_half, &router, &ctx, close_receiver).await;
 
     drop(ctx);
     drop(egress);
     drop(connection);
 
-    let writer_result = writer.await.map_err(ConnectionError::WriterTask);
-    let result = match (loop_result, writer_result) {
-        (Err(loop_err), Ok(Ok(()))) => Err(loop_err),
-        (Err(loop_err), Ok(Err(writer_err))) => {
-            warn!(
-                connection_id = connection_id.get(),
-                writer_error = %writer_err,
-                "writer failed while closing after connection error"
-            );
-            Err(loop_err)
+    let close_reason = match &loop_result {
+        Ok(ConnectionLoopExit::CloseRequested(reason)) => Some(reason.to_string()),
+        Ok(ConnectionLoopExit::PeerClosed) | Err(_) => None,
+    };
+    let writer_result = if close_reason.is_some() {
+        match timeout(CLOSE_DRAIN_GRACE, &mut writer).await {
+            Ok(result) => Some(result.map_err(ConnectionError::WriterTask)),
+            Err(_) => {
+                warn!(
+                    connection_id = connection_id.get(),
+                    grace = ?CLOSE_DRAIN_GRACE,
+                    "connection writer did not drain after close request; aborting writer task"
+                );
+                writer.abort();
+                let _ = writer.await;
+                None
+            }
         }
-        (Err(loop_err), Err(join_err)) => {
-            warn!(
-                connection_id = connection_id.get(),
-                join_error = %join_err,
-                "writer task join failed while closing after connection error"
-            );
-            Err(loop_err)
+    } else {
+        Some(writer.await.map_err(ConnectionError::WriterTask))
+    };
+
+    let result = if let Some(reason) = close_reason.as_deref() {
+        match writer_result {
+            Some(Ok(Ok(()))) | None => Ok(()),
+            Some(Ok(Err(writer_err))) => {
+                debug!(
+                    connection_id = connection_id.get(),
+                    close_reason = reason,
+                    writer_error = %writer_err,
+                    "writer failed after requested connection close"
+                );
+                Ok(())
+            }
+            Some(Err(join_err)) => {
+                warn!(
+                    connection_id = connection_id.get(),
+                    close_reason = reason,
+                    join_error = %join_err,
+                    "writer task join failed after requested connection close"
+                );
+                Ok(())
+            }
         }
-        (Ok(()), Ok(Ok(()))) => Ok(()),
-        (Ok(()), Ok(Err(writer_err))) => Err(ConnectionError::FrameIo(writer_err)),
-        (Ok(()), Err(join_err)) => Err(join_err),
+    } else {
+        let writer_result =
+            writer_result.expect("writer result is present without a close request");
+        match (loop_result, writer_result) {
+            (Err(loop_err), Ok(Ok(()))) => Err(loop_err),
+            (Err(loop_err), Ok(Err(writer_err))) => {
+                warn!(
+                    connection_id = connection_id.get(),
+                    writer_error = %writer_err,
+                    "writer failed while closing after connection error"
+                );
+                Err(loop_err)
+            }
+            (Err(loop_err), Err(join_err)) => {
+                warn!(
+                    connection_id = connection_id.get(),
+                    join_error = %join_err,
+                    "writer task join failed while closing after connection error"
+                );
+                Err(loop_err)
+            }
+            (Ok(ConnectionLoopExit::PeerClosed), Ok(Ok(()))) => Ok(()),
+            (Ok(ConnectionLoopExit::PeerClosed), Ok(Err(writer_err))) => {
+                Err(ConnectionError::FrameIo(writer_err))
+            }
+            (Ok(ConnectionLoopExit::PeerClosed), Err(join_err)) => Err(join_err),
+            (Ok(ConnectionLoopExit::CloseRequested(_)), _) => {
+                unreachable!("close requests are handled before normal writer result matching")
+            }
+        }
     };
 
     match &result {
-        Ok(()) => debug!(
-            connection_id = connection_id.get(),
-            "subc connection closed"
-        ),
+        Ok(()) => {
+            if let Some(reason) = close_reason.as_deref() {
+                debug!(
+                    connection_id = connection_id.get(),
+                    close_reason = reason,
+                    "subc connection closed by request"
+                );
+            } else {
+                debug!(
+                    connection_id = connection_id.get(),
+                    "subc connection closed"
+                );
+            }
+        }
         Err(err) => debug!(
             connection_id = connection_id.get(),
             error = %err,
@@ -248,29 +320,45 @@ async fn connection_loop<R>(
     read_half: &mut R,
     router: &Router,
     ctx: &RouteCtx,
-) -> Result<(), ConnectionError>
+    mut close_receiver: ConnectionCloseReceiver,
+) -> Result<ConnectionLoopExit, ConnectionError>
 where
     R: AsyncRead + Unpin,
 {
     loop {
-        let Some(frame) = read_frame(read_half)
-            .await
-            .map_err(ConnectionError::FrameIo)?
-        else {
-            return Ok(());
+        let frame = tokio::select! {
+            close = &mut close_receiver => {
+                return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+            }
+            read = read_frame(read_half) => {
+                match read.map_err(ConnectionError::FrameIo)? {
+                    Some(frame) => frame,
+                    None => return Ok(ConnectionLoopExit::PeerClosed),
+                }
+            }
         };
 
-        if let Err(err) = router.route_for_connection(ctx, frame).await {
+        let route_result = tokio::select! {
+            close = &mut close_receiver => {
+                return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+            }
+            result = router.route_for_connection(ctx, frame) => result,
+        };
+
+        if let Err(err) = route_result {
             if let Some(error_frame) = err.to_error_frame() {
                 warn!(
                     connection_id = ctx.connection_id.get(),
                     error = %err,
                     "routing failure recovered with ERROR frame"
                 );
-                ctx.egress
-                    .send(error_frame)
-                    .await
-                    .map_err(ConnectionError::Router)?;
+                let send_result = tokio::select! {
+                    close = &mut close_receiver => {
+                        return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+                    }
+                    result = ctx.egress.send(error_frame) => result,
+                };
+                send_result.map_err(ConnectionError::Router)?;
             } else {
                 debug!(
                     connection_id = ctx.connection_id.get(),
@@ -281,6 +369,17 @@ where
             }
         }
     }
+}
+
+fn close_reason(
+    result: Result<CloseReason, tokio::sync::oneshot::error::RecvError>,
+) -> CloseReason {
+    result.unwrap_or_else(|_| {
+        CloseReason::new(
+            "close_registry_dropped",
+            "connection close registration was dropped without a reason",
+        )
+    })
 }
 
 async fn drain_writer<W>(

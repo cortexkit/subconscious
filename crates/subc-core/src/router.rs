@@ -216,25 +216,37 @@ impl Router {
                     let mut goodbye = frame;
                     goodbye.header.channel = target.channel;
                     if let Err(err) = target.sink.try_send(goodbye) {
-                        warn!(
-                            connection_id = ctx.connection_id.get(),
-                            target_connection_id = target.connection_id.get(),
-                            module_channel = channel,
-                            client_channel = target.channel,
-                            corr,
-                            error = %err,
-                            "route GOODBYE delivery failed; closing target client connection"
-                        );
-                        self.forwarding.request_connection_close(
-                            target.connection_id,
-                            CloseReason::new(
-                                "route_goodbye_delivery_failed",
-                                format!(
-                                    "failed to enqueue route GOODBYE for client channel {}: {err}",
-                                    target.channel
+                        if target.close_on_delivery_failure() {
+                            warn!(
+                                connection_id = ctx.connection_id.get(),
+                                target_connection_id = target.connection_id.get(),
+                                module_channel = channel,
+                                client_channel = target.channel,
+                                corr,
+                                error = %err,
+                                "route GOODBYE delivery failed; closing target client connection"
+                            );
+                            self.forwarding.request_connection_close(
+                                target.connection_id,
+                                CloseReason::new(
+                                    "route_goodbye_delivery_failed",
+                                    format!(
+                                        "failed to enqueue route GOODBYE for client channel {}: {err}",
+                                        target.channel
+                                    ),
                                 ),
-                            ),
-                        );
+                            );
+                        } else {
+                            warn!(
+                                connection_id = ctx.connection_id.get(),
+                                target_connection_id = target.connection_id.get(),
+                                module_channel = channel,
+                                client_channel = target.channel,
+                                corr,
+                                error = %err,
+                                "route GOODBYE to module dropped under backpressure; not closing shared module connection"
+                            );
+                        }
                     }
                     return Ok(());
                 }

@@ -317,22 +317,31 @@ impl ControlHandler {
                 }
             };
             if let Err(err) = released.sink.try_send(frame) {
-                warn!(
-                    target_connection_id = released.connection_id.get(),
-                    route_channel = released.channel,
-                    error = %err,
-                    "route GOODBYE was not delivered to peer; closing target connection"
-                );
-                self.forwarding.request_connection_close(
-                    released.connection_id,
-                    CloseReason::new(
-                        "route_goodbye_delivery_failed",
-                        format!(
-                            "failed to enqueue route GOODBYE for channel {}: {err}",
-                            released.channel
+                if released.close_on_delivery_failure() {
+                    warn!(
+                        target_connection_id = released.connection_id.get(),
+                        route_channel = released.channel,
+                        error = %err,
+                        "route GOODBYE was not delivered to client; closing target connection"
+                    );
+                    self.forwarding.request_connection_close(
+                        released.connection_id,
+                        CloseReason::new(
+                            "route_goodbye_delivery_failed",
+                            format!(
+                                "failed to enqueue route GOODBYE for channel {}: {err}",
+                                released.channel
+                            ),
                         ),
-                    ),
-                );
+                    );
+                } else {
+                    warn!(
+                        target_connection_id = released.connection_id.get(),
+                        route_channel = released.channel,
+                        error = %err,
+                        "route GOODBYE to module dropped under backpressure; not closing shared module connection"
+                    );
+                }
             }
         }
     }

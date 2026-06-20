@@ -62,12 +62,46 @@ pub(crate) struct ClientRoute {
     pub flow: Arc<ChannelFlow>,
 }
 
+/// Which kind of peer a route GOODBYE is being delivered to. This decides what
+/// happens when the GOODBYE cannot be enqueued (egress full/closed):
+/// - `Client`: escalate to closing that client connection (a socket close is a
+///   stronger teardown signal, and a full client egress means it is the slow
+///   client we would drop anyway — finding #6).
+/// - `Module`: best-effort DROP, never close. A client-disconnect notifies the
+///   SHARED module that one client's route is gone; closing the module on its
+///   egress backpressure would tear down every co-tenant client (the exact
+///   cross-tenant blast radius #3/#6 exist to prevent — and was observed when a
+///   flooding dead client filled BOTH its own and the module's egress, so its
+///   route-gone GOODBYE to the module failed and closed the shared connection).
+///   subc has already removed the route from its forwarding state and drops
+///   stale module frames for the released channel (see router.rs), so subc's
+///   own routing is correct. The residual: under SUSTAINED module-egress
+///   backpressure a module-targeted route-gone notification can be lost, which a
+///   module using it for client-refcounting (e.g. AFT's detach accounting) would
+///   miss. Reliable module-targeted control delivery without a cross-tenant
+///   close is a follow-up (a dedicated module control lane), not a gating fix;
+///   never-close is the invariant that matters here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoodbyeTargetKind {
+    Client,
+    Module,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GoodbyeTarget {
     pub connection_id: ConnectionId,
     pub sink: FrameSink,
     pub negotiated_ver: u8,
     pub channel: u16,
+    pub kind: GoodbyeTargetKind,
+}
+
+impl GoodbyeTarget {
+    /// True only when an undeliverable GOODBYE should escalate to closing the
+    /// target connection. Never escalate for module recipients.
+    pub(crate) fn close_on_delivery_failure(&self) -> bool {
+        matches!(self.kind, GoodbyeTargetKind::Client)
+    }
 }
 
 #[derive(Debug)]
@@ -730,11 +764,15 @@ impl ForwardingTable {
                     .module_id_by_endpoint
                     .get(&module_key.endpoint)
                     .and_then(|module_id| inner.modules_by_id.get(module_id))
+                    // Reserved (pre-commit) route torn down on client disconnect:
+                    // tells the SHARED module to drop the reservation → Module kind
+                    // (best-effort drop; never close the module).
                     .map(|module| GoodbyeTarget {
                         connection_id: module.endpoint.connection_id,
                         sink: module.sink.clone(),
                         negotiated_ver: module.negotiated_ver,
                         channel: module_key.channel,
+                        kind: GoodbyeTargetKind::Module,
                     });
                 release_reserved_route_locked(&mut inner, client_key, module_key);
                 if let Some(module_target) = module_target {
@@ -874,11 +912,14 @@ fn release_client_route_locked(
         channel: route.module_channel,
     });
     inner.status.remove(&client_key);
+    // Notifies the SHARED module that this client's route is gone → Module kind
+    // (best-effort drop on backpressure; never close the module).
     Some(GoodbyeTarget {
         connection_id: route.endpoint.connection_id,
         sink: route.sink,
         negotiated_ver: route.negotiated_ver,
         channel: route.module_channel,
+        kind: GoodbyeTargetKind::Module,
     })
 }
 
@@ -894,11 +935,14 @@ fn release_module_route_locked(
     };
     inner.client_to_module.remove(&client_key);
     inner.status.remove(&client_key);
+    // Notifies the CLIENT that its route is gone (module-side teardown) → Client
+    // kind (escalate to closing the client on backpressure, finding #6).
     Some(GoodbyeTarget {
         connection_id: route.connection_id,
         sink: route.sink,
         negotiated_ver: route.negotiated_ver,
         channel: route.client_channel,
+        kind: GoodbyeTargetKind::Client,
     })
 }
 

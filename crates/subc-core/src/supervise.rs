@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 use subc_protocol::{Flags, FrameType, Priority, SUBC_MODULE_ID_ENV};
 
 use crate::{
-    forwarding::{ForwardingError, ForwardingTable, GoodbyeTarget, ModuleDrainTarget},
+    forwarding::{CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleDrainTarget},
     registry::RegistryError,
     Frame, Registry,
 };
@@ -951,8 +951,8 @@ async fn reload_child(
         let released_routes = forwarding
             .release_module_endpoint_routes(target.endpoint)
             .map_err(SuperviseError::Forwarding)?;
-        send_route_goodbyes(released_routes);
-        send_module_goodbye(&spec.module_id, target);
+        send_route_goodbyes(forwarding, released_routes);
+        send_module_goodbye(&spec.module_id, forwarding, target);
     }
 
     if child.is_some() {
@@ -1262,7 +1262,7 @@ async fn wait_for_forwarding_quiescence(
     }
 }
 
-fn send_route_goodbyes(released_routes: Vec<GoodbyeTarget>) {
+fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<GoodbyeTarget>) {
     for released in released_routes {
         let frame = match Frame::build_with_version(
             released.negotiated_ver,
@@ -1284,15 +1284,26 @@ fn send_route_goodbyes(released_routes: Vec<GoodbyeTarget>) {
         };
         if let Err(err) = released.sink.try_send(frame) {
             warn!(
+                target_connection_id = released.connection_id.get(),
                 route_channel = released.channel,
                 error = %err,
-                "best-effort reload route GOODBYE was not delivered to peer"
+                "reload route GOODBYE was not delivered to peer; closing target connection"
+            );
+            forwarding.request_connection_close(
+                released.connection_id,
+                CloseReason::new(
+                    "route_goodbye_delivery_failed",
+                    format!(
+                        "failed to enqueue reload route GOODBYE for channel {}: {err}",
+                        released.channel
+                    ),
+                ),
             );
         }
     }
 }
 
-fn send_module_goodbye(module_id: &str, target: &ModuleDrainTarget) {
+fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &ModuleDrainTarget) {
     let frame = match Frame::build_with_version(
         target.negotiated_ver,
         FrameType::Goodbye,
@@ -1314,8 +1325,16 @@ fn send_module_goodbye(module_id: &str, target: &ModuleDrainTarget) {
     if let Err(err) = target.sink.try_send(frame) {
         warn!(
             module_id,
+            target_connection_id = target.endpoint.connection_id.get(),
             error = %err,
-            "best-effort reload module GOODBYE was not delivered to peer"
+            "reload module GOODBYE was not delivered to peer; closing module connection"
+        );
+        forwarding.request_connection_close(
+            target.endpoint.connection_id,
+            CloseReason::new(
+                "module_goodbye_delivery_failed",
+                format!("failed to enqueue reload module GOODBYE for module '{module_id}': {err}"),
+            ),
         );
     }
 }

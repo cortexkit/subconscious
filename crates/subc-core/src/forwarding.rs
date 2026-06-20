@@ -10,7 +10,7 @@ use std::{
 
 use subc_protocol::{manifest::Concurrency, ErrorBody};
 use tokio::sync::{oneshot, Semaphore};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{registry::ConnectionId, router::FrameSink};
 
@@ -64,6 +64,7 @@ pub(crate) struct ClientRoute {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GoodbyeTarget {
+    pub connection_id: ConnectionId,
     pub sink: FrameSink,
     pub negotiated_ver: u8,
     pub channel: u16,
@@ -113,7 +114,6 @@ struct ForwardingInner {
     next_relay_corr: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
     reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
-    used_module_channels: HashSet<ModuleRouteKey>,
     next_client_channel: HashMap<ConnectionId, u16>,
     next_module_channel: HashMap<ModuleEndpointId, u16>,
     client_to_module: HashMap<ClientRouteKey, ModuleRoute>,
@@ -122,13 +122,81 @@ struct ForwardingInner {
     pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<RouteBindRelayOutcome>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CloseReason {
+    code: &'static str,
+    message: String,
+}
+
+impl CloseReason {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
+
 /// Dynamic forwarding state shared by the control plane and data-plane router.
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
     inner: Mutex<ForwardingInner>,
+    close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
 }
 
 impl ForwardingTable {
+    pub(crate) fn register_connection_close(
+        &self,
+        connection_id: ConnectionId,
+    ) -> ConnectionCloseReceiver {
+        let (sender, receiver) = oneshot::channel();
+        let replaced = self
+            .lock_close_registry()
+            .insert(connection_id, sender)
+            .is_some();
+        if replaced {
+            warn!(
+                connection_id = connection_id.get(),
+                "replaced existing connection close registration"
+            );
+        }
+        receiver
+    }
+
+    pub(crate) fn unregister_connection_close(&self, connection_id: ConnectionId) {
+        self.lock_close_registry().remove(&connection_id);
+    }
+
+    pub(crate) fn request_connection_close(
+        &self,
+        connection_id: ConnectionId,
+        reason: CloseReason,
+    ) {
+        let sender = self.lock_close_registry().remove(&connection_id);
+        if let Some(sender) = sender {
+            debug!(
+                connection_id = connection_id.get(),
+                close_reason = %reason,
+                "requesting connection close"
+            );
+            let _ = sender.send(reason);
+        } else {
+            debug!(
+                connection_id = connection_id.get(),
+                close_reason = %reason,
+                "connection close request ignored for inactive connection"
+            );
+        }
+    }
+
     pub fn register_module_connection(
         &self,
         connection_id: ConnectionId,
@@ -206,7 +274,6 @@ impl ForwardingTable {
         let (sender, receiver) = oneshot::channel();
         inner.reserved_client.insert(client_key, module_key);
         inner.reserved_module.insert(module_key, client_key);
-        inner.used_module_channels.insert(module_key);
         inner.pending_relays.insert((module.endpoint, corr), sender);
 
         Ok(PendingRouteBindRelay {
@@ -664,6 +731,7 @@ impl ForwardingTable {
                     .get(&module_key.endpoint)
                     .and_then(|module_id| inner.modules_by_id.get(module_id))
                     .map(|module| GoodbyeTarget {
+                        connection_id: module.endpoint.connection_id,
                         sink: module.sink.clone(),
                         negotiated_ver: module.negotiated_ver,
                         channel: module_key.channel,
@@ -680,6 +748,14 @@ impl ForwardingTable {
 
     fn lock_inner(&self) -> Result<MutexGuard<'_, ForwardingInner>, ForwardingError> {
         self.inner.lock().map_err(|_| ForwardingError::Poisoned)
+    }
+
+    fn lock_close_registry(
+        &self,
+    ) -> MutexGuard<'_, HashMap<ConnectionId, oneshot::Sender<CloseReason>>> {
+        self.close_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -731,7 +807,11 @@ impl ForwardingInner {
                 endpoint,
                 channel: candidate,
             };
-            if !self.used_module_channels.contains(&key) {
+            // Released module channels are eligible for reuse within this endpoint generation.
+            // A buggy live module emitting frames for an old route after reuse can still
+            // misdeliver; a per-route epoch/tombstone design is a separate protocol change.
+            if !self.reserved_module.contains_key(&key) && !self.module_to_client.contains_key(&key)
+            {
                 let next = next_channel(candidate);
                 self.next_module_channel.insert(endpoint, next);
                 return Ok(candidate);
@@ -795,6 +875,7 @@ fn release_client_route_locked(
     });
     inner.status.remove(&client_key);
     Some(GoodbyeTarget {
+        connection_id: route.endpoint.connection_id,
         sink: route.sink,
         negotiated_ver: route.negotiated_ver,
         channel: route.module_channel,
@@ -814,6 +895,7 @@ fn release_module_route_locked(
     inner.client_to_module.remove(&client_key);
     inner.status.remove(&client_key);
     Some(GoodbyeTarget {
+        connection_id: route.connection_id,
         sink: route.sink,
         negotiated_ver: route.negotiated_ver,
         channel: route.client_channel,
@@ -831,10 +913,6 @@ fn remove_module_connection_locked(
     }
     inner.endpoint_by_connection.remove(&endpoint.connection_id);
     inner.next_module_channel.remove(&endpoint);
-    inner
-        .used_module_channels
-        .retain(|module_key| module_key.endpoint != endpoint);
-
     let reserved_module_keys: Vec<ModuleRouteKey> = inner
         .reserved_module
         .keys()
@@ -1074,5 +1152,45 @@ mod tests {
             .begin_route_bind_relay_for(second_client, "route-limit-provider")
             .unwrap();
         assert_eq!(pending.client_channel, 1);
+    }
+
+    #[test]
+    fn released_module_channels_are_reused_after_wrap_without_slot_leak() {
+        let forwarding = ForwardingTable::default();
+        let module_connection = ConnectionId::new(40);
+        let client = ConnectionId::new(50);
+        let (module_tx, _module_rx) = mpsc::channel(1);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                "slot-reuse-provider".to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+
+        let mut wrapped_channel = None;
+        for index in 0..=usize::from(u16::MAX) {
+            let pending = forwarding
+                .begin_route_bind_relay_for(client, "slot-reuse-provider")
+                .unwrap();
+            if index == usize::from(u16::MAX) {
+                wrapped_channel = Some(pending.module_channel);
+            }
+            forwarding
+                .cancel_pending_relay(pending.endpoint, pending.corr)
+                .unwrap();
+            forwarding
+                .release_reserved_route(
+                    pending.client_connection_id,
+                    pending.client_channel,
+                    pending.endpoint,
+                    pending.module_channel,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(wrapped_channel, Some(1));
     }
 }

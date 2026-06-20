@@ -78,6 +78,38 @@ async fn crash_restarts_and_reregisters_stub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_restart_resets_restart_count() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 5, Duration::from_millis(20));
+    let module_id = "fake-aft-operator-reset";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "250")],
+    )
+    .await;
+
+    let crashed = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.restart_count >= 1 && status.state == ModuleState::Running && status.live
+    })
+    .await;
+    assert!(crashed.restart_count >= 1);
+
+    module.restart().await.unwrap();
+
+    let restarted = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.restart_count == 0 && status.state == ModuleState::Running && status.live
+    })
+    .await;
+    assert_eq!(restarted.restart_count, 0);
+    assert!(restarted.process_alive);
+    assert!(restarted.registration_active);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_cap_marks_module_failed_without_infinite_loop() {
     let server = TestServer::start().await;
     let max_restarts = 2;

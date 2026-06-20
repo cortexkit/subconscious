@@ -16,7 +16,7 @@ use tokio::{
 };
 use tracing::{debug, error, warn};
 
-use subc_protocol::{Flags, FrameType, Priority};
+use subc_protocol::{Flags, FrameType, Priority, SUBC_MODULE_ID_ENV};
 
 use crate::{
     forwarding::{ForwardingError, ForwardingTable, GoodbyeTarget, ModuleDrainTarget},
@@ -1213,6 +1213,7 @@ fn spawn_child(
     for (key, value) in &spec.env {
         command.env(key, value);
     }
+    command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
     command.kill_on_drop(true);
     command.spawn().map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),

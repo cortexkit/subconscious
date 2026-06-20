@@ -1,9 +1,15 @@
+//! Async envelope frame I/O over the authenticated stream.
+//!
+//! `read_frame`/`write_frame` are the post-handshake continuation of
+//! [`authenticate_client`](crate::authenticate_client)/`authenticate_server` on
+//! the same socket: once the connection is authenticated, both peers exchange
+//! [`Frame`]s (the 17-byte envelope header + opaque body). The framing codec is
+//! shared by subc-core and modules (AFT) so the wire cannot drift.
+
 use std::{error::Error, fmt, io};
 
-use subc_protocol::{decode_header, DecodeError, HEADER_LEN, MAX_FRAME_BODY_LEN};
+use subc_protocol::{decode_header, DecodeError, Frame, HEADER_LEN, MAX_FRAME_BODY_LEN};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-use crate::Frame;
 
 /// Which part of a frame was being read when EOF arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

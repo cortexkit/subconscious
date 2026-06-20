@@ -1,6 +1,13 @@
+//! The complete wire frame: the decoded envelope header plus its opaque body.
+//!
+//! `Frame` is the natural companion to [`EnvelopeHeader`](crate::EnvelopeHeader)
+//! — a header and the `len` opaque body bytes that follow it. It is pure data
+//! (no async, no tokio); the async read/write loop lives in `subc-transport`,
+//! the crate that owns the authenticated stream.
+
 use std::{error::Error, fmt};
 
-use subc_protocol::{EnvelopeHeader, Flags, FrameType, PROTOCOL_VERSION};
+use crate::{EnvelopeHeader, Flags, FrameType, PROTOCOL_VERSION};
 
 /// A complete wire frame: the decoded envelope header plus its opaque body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +54,11 @@ impl Frame {
         })
     }
 
-    pub(crate) fn from_wire(header: EnvelopeHeader, body: Vec<u8>) -> Self {
+    /// Assemble a frame from an already-decoded header and its body bytes.
+    ///
+    /// Callers must ensure `header.len == body.len()`; frame readers obtain the
+    /// body by reading exactly `header.len` bytes, so this holds by construction.
+    pub fn from_wire(header: EnvelopeHeader, body: Vec<u8>) -> Self {
         debug_assert_eq!(header.len as usize, body.len());
         Self { header, body }
     }

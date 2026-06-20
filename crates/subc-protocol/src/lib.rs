@@ -33,8 +33,11 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod frame;
 pub mod manifest;
 pub mod session;
+
+pub use frame::{Frame, FrameBuildError};
 
 /// Per-route bind identity shared by client-facing and module-facing control.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

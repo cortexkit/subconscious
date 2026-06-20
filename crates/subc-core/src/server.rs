@@ -361,7 +361,7 @@ mod tests {
 
     use subc_transport::{authenticate_client, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 
-    use crate::{frame_io::ReadStage, ControlHandler, EchoBackend, Frame, Registry};
+    use crate::{ControlHandler, EchoBackend, Frame, ReadStage, Registry};
 
     const TEST_DEADLINE: Duration = Duration::from_secs(2);
     const TEST_DAEMON_VER: &str = "test-subc-server";

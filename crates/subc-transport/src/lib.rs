@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod connection_file;
+pub mod frame_io;
 
 pub use auth::{
     authenticate_client, authenticate_server, compute_proof, AuthError, AuthStage, Authenticated,
@@ -17,3 +18,4 @@ pub use connection_file::{
     generate_daemon_id, generate_key, read, write_atomic, ConnectionFileError, ConnectionInfo,
     Endpoint, DAEMON_ID_LEN, KEY_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
 };
+pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};

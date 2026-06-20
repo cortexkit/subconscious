@@ -41,6 +41,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::ROUTE_POLL,
     ops::SUPERVISOR_LIST,
     ops::SUPERVISOR_RESTART,
+    ops::SUPERVISOR_RELOAD,
     ops::SUPERVISOR_SET_ENABLED,
 ];
 
@@ -423,6 +424,9 @@ impl ControlHandler {
             ClientControlRequest::SupervisorRestart { module_id } => {
                 self.handle_supervisor_restart(frame, module_id).await
             }
+            ClientControlRequest::SupervisorReload { module_id } => {
+                self.handle_supervisor_reload(frame, module_id).await
+            }
             ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
                 self.handle_supervisor_set_enabled(frame, module_id, enabled)
                     .await
@@ -531,6 +535,18 @@ impl ControlHandler {
                 &frame,
                 "target_unavailable",
                 format!("module_id '{target_module_id}' is not active"),
+            )?]);
+        }
+
+        if self
+            .forwarding
+            .module_is_draining(&target_module_id)
+            .map_err(RouterError::Forwarding)?
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "module_reloading",
+                format!("module_id '{target_module_id}' is reloading"),
             )?]);
         }
 
@@ -757,6 +773,38 @@ impl ControlHandler {
                 &frame,
                 "target_unavailable",
                 format!("failed to restart module_id '{module_id}': {err}"),
+            )?]);
+        }
+
+        let response = ClientControlResponse::SupervisorAck {
+            module_id,
+            applied: true,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorAck",
+        )?])
+    }
+
+    async fn handle_supervisor_reload(
+        &self,
+        frame: Frame,
+        module_id: String,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(module) = self.supervisor.get(&module_id) else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{module_id}' is not supervised"),
+            )?]);
+        };
+
+        if let Err(err) = module.reload().await {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reload_failed",
+                format!("failed to reload module_id '{module_id}': {err}"),
             )?]);
         }
 
@@ -1191,6 +1239,7 @@ fn control_response_body_frame<T: Serialize>(
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
         ForwardingError::NoModuleConnection => "target_unavailable",
+        ForwardingError::ModuleReloading { .. } => "module_reloading",
         ForwardingError::ClientRouteChannelExhausted { .. }
         | ForwardingError::ModuleRouteChannelExhausted { .. } => "route_limit",
         ForwardingError::StaleModuleEndpoint | ForwardingError::UnknownReservation { .. } => {

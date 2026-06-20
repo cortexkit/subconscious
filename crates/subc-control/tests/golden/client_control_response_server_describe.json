@@ -11,6 +11,7 @@
     "route.poll",
     "supervisor.list",
     "supervisor.restart",
+    "supervisor.reload",
     "supervisor.set_enabled"
   ]
 }

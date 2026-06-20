@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
 };
 
 use subc_protocol::{manifest::Concurrency, ErrorBody};
@@ -79,6 +82,13 @@ pub(crate) struct PendingRouteBindRelay {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ModuleDrainTarget {
+    pub endpoint: ModuleEndpointId,
+    pub sink: FrameSink,
+    pub negotiated_ver: u8,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum RouteBindRelayOutcome {
     Accepted,
     Rejected(ErrorBody),
@@ -98,6 +108,7 @@ struct ForwardingInner {
     modules_by_id: HashMap<String, ModuleConnection>,
     endpoint_by_connection: HashMap<ConnectionId, ModuleEndpointId>,
     module_id_by_endpoint: HashMap<ModuleEndpointId, String>,
+    draining_endpoints: HashSet<ModuleEndpointId>,
     next_generation: u64,
     next_relay_corr: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
@@ -175,6 +186,11 @@ impl ForwardingTable {
             .get(expected_module_id)
             .cloned()
             .ok_or(ForwardingError::NoModuleConnection)?;
+        if inner.draining_endpoints.contains(&module.endpoint) {
+            return Err(ForwardingError::ModuleReloading {
+                module_id: expected_module_id.to_string(),
+            });
+        }
         let client_channel = inner.allocate_client_channel(client_connection_id)?;
         let module_channel = inner.allocate_module_channel(module.endpoint)?;
         let corr = inner.allocate_relay_corr(module.endpoint)?;
@@ -215,8 +231,13 @@ impl ForwardingTable {
         module_channel: u16,
     ) -> Result<(), ForwardingError> {
         let mut inner = self.lock_inner()?;
-        if !inner.module_id_by_endpoint.contains_key(&endpoint) {
-            return Err(ForwardingError::StaleModuleEndpoint);
+        let module_id = inner
+            .module_id_by_endpoint
+            .get(&endpoint)
+            .cloned()
+            .ok_or(ForwardingError::StaleModuleEndpoint)?;
+        if inner.draining_endpoints.contains(&endpoint) {
+            return Err(ForwardingError::ModuleReloading { module_id });
         }
 
         let client_key = ClientRouteKey {
@@ -236,11 +257,6 @@ impl ForwardingTable {
             });
         }
 
-        let module_id = inner
-            .module_id_by_endpoint
-            .get(&endpoint)
-            .cloned()
-            .ok_or(ForwardingError::StaleModuleEndpoint)?;
         let module = inner
             .modules_by_id
             .get(&module_id)
@@ -506,6 +522,113 @@ impl ForwardingTable {
             .any(|key| key.channel == route_channel))
     }
 
+    pub(crate) fn begin_module_drain(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<ModuleDrainTarget>, ForwardingError> {
+        let mut inner = self.lock_inner()?;
+        let Some(module) = inner.modules_by_id.get(module_id).cloned() else {
+            return Ok(None);
+        };
+        let endpoint = module.endpoint;
+        inner.draining_endpoints.insert(endpoint);
+
+        let flows = inner
+            .client_to_module
+            .values()
+            .filter(|route| route.endpoint == endpoint)
+            .map(|route| Arc::clone(&route.flow))
+            .collect::<Vec<_>>();
+        for flow in flows {
+            flow.close();
+        }
+
+        let pending_keys = inner
+            .pending_relays
+            .keys()
+            .filter(|(pending_endpoint, _)| *pending_endpoint == endpoint)
+            .copied()
+            .collect::<Vec<_>>();
+        let pending = pending_keys
+            .into_iter()
+            .filter_map(|key| inner.pending_relays.remove(&key))
+            .collect::<Vec<_>>();
+
+        let reserved_module_keys = inner
+            .reserved_module
+            .keys()
+            .filter(|module_key| module_key.endpoint == endpoint)
+            .copied()
+            .collect::<Vec<_>>();
+        for module_key in reserved_module_keys {
+            if let Some(client_key) = inner.reserved_module.get(&module_key).copied() {
+                release_reserved_route_locked(&mut inner, client_key, module_key);
+            }
+        }
+
+        let error = ErrorBody {
+            code: "module_reloading".to_string(),
+            message: format!("module_id '{module_id}' is reloading"),
+        };
+        for sender in pending {
+            let _ = sender.send(RouteBindRelayOutcome::Rejected(error.clone()));
+        }
+
+        Ok(Some(ModuleDrainTarget {
+            endpoint,
+            sink: module.sink,
+            negotiated_ver: module.negotiated_ver,
+        }))
+    }
+
+    pub(crate) fn endpoint_in_flight_count(
+        &self,
+        endpoint: ModuleEndpointId,
+    ) -> Result<usize, ForwardingError> {
+        let inner = self.lock_inner()?;
+        Ok(inner
+            .client_to_module
+            .values()
+            .filter(|route| route.endpoint == endpoint)
+            .map(|route| route.flow.in_flight())
+            .sum())
+    }
+
+    pub(crate) fn endpoint_is_draining(
+        &self,
+        endpoint: ModuleEndpointId,
+    ) -> Result<bool, ForwardingError> {
+        Ok(self.lock_inner()?.draining_endpoints.contains(&endpoint))
+    }
+
+    pub(crate) fn module_is_draining(&self, module_id: &str) -> Result<bool, ForwardingError> {
+        let inner = self.lock_inner()?;
+        Ok(inner
+            .modules_by_id
+            .get(module_id)
+            .is_some_and(|module| inner.draining_endpoints.contains(&module.endpoint)))
+    }
+
+    pub(crate) fn release_module_endpoint_routes(
+        &self,
+        endpoint: ModuleEndpointId,
+    ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
+        let mut inner = self.lock_inner()?;
+        let module_keys = inner
+            .module_to_client
+            .keys()
+            .filter(|module_key| module_key.endpoint == endpoint)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut released = Vec::with_capacity(module_keys.len());
+        for module_key in module_keys {
+            if let Some(target) = release_module_route_locked(&mut inner, module_key) {
+                released.push(target);
+            }
+        }
+        Ok(released)
+    }
+
     pub(crate) fn cleanup_connection(
         &self,
         connection_id: ConnectionId,
@@ -701,6 +824,7 @@ fn remove_module_connection_locked(
     inner: &mut ForwardingInner,
     endpoint: ModuleEndpointId,
 ) -> Vec<GoodbyeTarget> {
+    inner.draining_endpoints.remove(&endpoint);
     let module_id = inner.module_id_by_endpoint.remove(&endpoint);
     if let Some(module_id) = module_id.as_ref() {
         inner.modules_by_id.remove(module_id);
@@ -760,6 +884,7 @@ fn remove_module_connection_locked(
 pub(crate) struct ChannelFlow {
     sem: Semaphore,
     window: usize,
+    in_flight: AtomicUsize,
 }
 
 impl ChannelFlow {
@@ -768,30 +893,53 @@ impl ChannelFlow {
         Self {
             sem: Semaphore::new(window),
             window,
+            in_flight: AtomicUsize::new(0),
         }
     }
 
     pub(crate) async fn acquire(&self) -> Result<(), ChannelFlowClosed> {
         let permit = self.sem.acquire().await.map_err(|_| ChannelFlowClosed)?;
         // Credits are returned by terminal frames on the module->client path, not
-        // by this task's RAII lifetime.
+        // by this task's RAII lifetime. Track the outstanding count separately so
+        // a reload drain can close admission while still observing old requests.
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
         permit.forget();
         Ok(())
     }
 
     pub(crate) fn release(&self) {
-        let available = self.sem.available_permits();
-        if available < self.window {
-            self.sem.add_permits(1);
-        } else {
-            // Protocol-conforming modules emit exactly one terminal per request.
-            // This guard is a best-effort safety net against window growth, not a
-            // security boundary against malicious peers.
-            warn!(
-                window = self.window,
-                available, "flow-control over-release ignored"
-            );
+        let mut observed = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if observed == 0 {
+                // Protocol-conforming modules emit exactly one terminal per request.
+                // This guard is a best-effort safety net against window growth, not a
+                // security boundary against malicious peers.
+                warn!(
+                    window = self.window,
+                    available = self.sem.available_permits(),
+                    "flow-control over-release ignored"
+                );
+                return;
+            }
+            match self.in_flight.compare_exchange_weak(
+                observed,
+                observed - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if !self.sem.is_closed() {
+                        self.sem.add_permits(1);
+                    }
+                    return;
+                }
+                Err(next) => observed = next,
+            }
         }
+    }
+
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
     }
 
     pub(crate) fn close(&self) {
@@ -821,6 +969,9 @@ fn window_for(concurrency: &Concurrency) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardingError {
     NoModuleConnection,
+    ModuleReloading {
+        module_id: String,
+    },
     StaleModuleEndpoint,
     UnknownReservation {
         client_channel: u16,
@@ -840,6 +991,9 @@ impl fmt::Display for ForwardingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoModuleConnection => write!(f, "no module connection is registered"),
+            Self::ModuleReloading { module_id } => {
+                write!(f, "module_id '{module_id}' is reloading")
+            }
             Self::StaleModuleEndpoint => write!(f, "module connection generation is stale"),
             Self::UnknownReservation {
                 client_channel,

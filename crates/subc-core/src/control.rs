@@ -10,7 +10,7 @@ use subc_protocol::{
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     forwarding::{
@@ -362,6 +362,15 @@ impl ControlHandler {
                 }
             }
         }
+
+        info!(
+            module_id = %registration.manifest.module_id,
+            module_version = %registration.manifest.module_version,
+            negotiated_ver,
+            routable_provider = manifest_provides_routable_role(&registration.manifest),
+            connection_id = connection_id.get(),
+            "module registered"
+        );
 
         let ack = ModuleHelloAckBody {
             negotiated_ver,

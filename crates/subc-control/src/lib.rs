@@ -26,6 +26,7 @@ pub mod ops {
     pub const ROUTE_POLL: &str = "route.poll";
     pub const SUPERVISOR_LIST: &str = "supervisor.list";
     pub const SUPERVISOR_RESTART: &str = "supervisor.restart";
+    pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
     pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
 }
 
@@ -53,6 +54,8 @@ pub enum ClientControlRequest {
     SupervisorList {},
     #[serde(rename = "supervisor.restart")]
     SupervisorRestart { module_id: String },
+    #[serde(rename = "supervisor.reload")]
+    SupervisorReload { module_id: String },
     #[serde(rename = "supervisor.set_enabled")]
     SupervisorSetEnabled { module_id: String, enabled: bool },
 }

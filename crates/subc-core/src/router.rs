@@ -239,16 +239,20 @@ impl Router {
                     frame_type = ?frame.header.ty,
                     "forwarding module data-plane frame to client"
                 );
-                if is_terminal_frame(frame.header.ty) {
-                    route.flow.release();
-                }
+                let releases_credit = is_terminal_frame(frame.header.ty);
                 let mut frame = frame;
                 frame.header.channel = route.client_channel;
-                route
+                let result = route
                     .sink
                     .send(frame)
                     .await
-                    .map_err(|err| RouterError::backend(channel, corr, err.to_string()))?;
+                    .map_err(|err| RouterError::backend(channel, corr, err.to_string()));
+                if releases_credit {
+                    // Release only after the terminal is enqueued to the client sink so
+                    // reload quiescence cannot let a route GOODBYE overtake it.
+                    route.flow.release();
+                }
+                result?;
                 return Ok(());
             }
 
@@ -386,9 +390,25 @@ impl ForwardBackend {
         // the original request's credit is freed only by the module's terminal frame.
         let acquired_credit = frame_type == FrameType::Request;
         if acquired_credit {
-            route.flow.acquire().await.map_err(|err| {
-                RouterError::backend(channel, corr, format!("{err} for route channel {channel}"))
-            })?;
+            if let Err(err) = route.flow.acquire().await {
+                if self
+                    .forwarding
+                    .endpoint_is_draining(route.endpoint)
+                    .map_err(RouterError::Forwarding)?
+                {
+                    return Err(RouterError::route_error(
+                        channel,
+                        corr,
+                        "module_reloading",
+                        format!("module endpoint for route channel {channel} is reloading"),
+                    ));
+                }
+                return Err(RouterError::backend(
+                    channel,
+                    corr,
+                    format!("{err} for route channel {channel}"),
+                ));
+            }
         }
 
         let mut frame = frame;
@@ -429,6 +449,12 @@ pub enum RouterError {
         corr: u64,
         message: String,
     },
+    RouteError {
+        channel: u16,
+        corr: u64,
+        code: String,
+        message: String,
+    },
     FrameBuild(FrameBuildError),
     Forwarding(ForwardingError),
 }
@@ -438,6 +464,20 @@ impl RouterError {
         Self::Backend {
             channel,
             corr,
+            message: message.into(),
+        }
+    }
+
+    pub fn route_error(
+        channel: u16,
+        corr: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::RouteError {
+            channel,
+            corr,
+            code: code.into(),
             message: message.into(),
         }
     }
@@ -456,6 +496,12 @@ impl RouterError {
                 corr,
                 message,
             } => error_frame(*channel, *corr, "backend_error", message.clone()),
+            Self::RouteError {
+                channel,
+                corr,
+                code,
+                message,
+            } => error_frame(*channel, *corr, code, message.clone()),
             Self::ReservedChannelZero
             | Self::DuplicateChannel { .. }
             | Self::FrameBuild(_)
@@ -499,6 +545,15 @@ impl fmt::Display for RouterError {
                 f,
                 "backend error on channel {channel} corr {corr}: {message}"
             ),
+            Self::RouteError {
+                channel,
+                corr,
+                code,
+                message,
+            } => write!(
+                f,
+                "route error {code} on channel {channel} corr {corr}: {message}"
+            ),
             Self::FrameBuild(err) => write!(f, "failed to build routed frame: {err}"),
             Self::Forwarding(err) => write!(f, "forwarding error: {err}"),
         }
@@ -513,7 +568,8 @@ impl Error for RouterError {
             Self::ReservedChannelZero
             | Self::DuplicateChannel { .. }
             | Self::UnknownChannel { .. }
-            | Self::Backend { .. } => None,
+            | Self::Backend { .. }
+            | Self::RouteError { .. } => None,
         }
     }
 }

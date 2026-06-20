@@ -597,6 +597,347 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(250),
+    );
+    let module_id = "fake-aft-supervisor-reload-happy";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
+    let generation_before = server.registry.generation().unwrap();
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        401,
+        "ses-reload-happy",
+        module_id,
+    )
+    .await;
+    let slow_corr = 402;
+    let slow_payload = br#"{"delay_ms":50,"jsonrpc":"2.0","id":"reload-happy"}"#;
+    write_frame(
+        &mut route_client,
+        &data_request(ack.route_channel, slow_corr, slow_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            403,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+
+    let response = read_frame_timeout(&mut route_client).await;
+    assert_response(&response, ack.route_channel, slow_corr, slow_payload);
+    let goodbye = read_frame_timeout(&mut route_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 403, module_id).await;
+    assert!(applied);
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    assert!(server.registry.generation().unwrap() > generation_before);
+
+    let mut fresh_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let fresh_ack = attach_on_stream(
+        &mut fresh_client,
+        &project,
+        404,
+        "ses-reload-fresh",
+        module_id,
+    )
+    .await;
+    let fresh_payload = br#"{"jsonrpc":"2.0","id":"after-reload"}"#;
+    write_frame(
+        &mut fresh_client,
+        &data_request(fresh_ack.route_channel, 405, fresh_payload),
+    )
+    .await
+    .unwrap();
+    fresh_client.flush().await.unwrap();
+    let fresh_response = read_frame_timeout(&mut fresh_client).await;
+    assert_response(&fresh_response, fresh_ack.route_channel, 405, fresh_payload);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_reload_rejects_new_work_during_drain() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(300),
+    );
+    let module_id = "fake-aft-supervisor-reload-rejects";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "reload-rejects",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        411,
+        "ses-reload-rejects",
+        module_id,
+    )
+    .await;
+    let slow_corr = 412;
+    let slow_payload = br#"{"delay_ms":150,"jsonrpc":"2.0","id":"reload-rejects"}"#;
+    write_frame(
+        &mut route_client,
+        &data_request(ack.route_channel, slow_corr, slow_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, slow_corr)
+    })
+    .await;
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            413,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+    wait_for_status(&module, Duration::from_secs(1), |status| {
+        status.state == ModuleState::Draining
+    })
+    .await;
+
+    let mut open_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let route_open_error = attach_error_on_stream(
+        &mut open_client,
+        &project,
+        414,
+        "ses-reload-rejected-open",
+        module_id,
+    )
+    .await;
+    assert_eq!(route_open_error.code, "module_reloading");
+
+    let rejected_corr = 415;
+    let rejected_payload = br#"{"jsonrpc":"2.0","id":"should-reject"}"#;
+    write_frame(
+        &mut route_client,
+        &data_request(ack.route_channel, rejected_corr, rejected_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    let rejected = read_frame_timeout(&mut route_client).await;
+    assert_error(
+        &rejected,
+        ack.route_channel,
+        rejected_corr,
+        "module_reloading",
+    );
+
+    let response = read_frame_timeout(&mut route_client).await;
+    assert_response(&response, ack.route_channel, slow_corr, slow_payload);
+    let goodbye = read_frame_timeout(&mut route_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 413, module_id).await;
+    assert!(applied);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(25),
+    );
+    let module_id = "fake-aft-supervisor-reload-timeout";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "reload-timeout",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        421,
+        "ses-reload-timeout",
+        module_id,
+    )
+    .await;
+    let held_corr = 422;
+    let held_payload =
+        br#"{"delay_ms":500,"uncancellable":true,"jsonrpc":"2.0","id":"reload-timeout"}"#;
+    write_frame(
+        &mut route_client,
+        &data_request(ack.route_channel, held_corr, held_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
+        event_is_request_received(event, ack.route_channel, held_corr)
+    })
+    .await;
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            423,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+
+    let goodbye = read_frame_timeout(&mut route_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 423, module_id).await;
+    assert!(applied);
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_reload_new_binary_failure_returns_reload_failed_and_counts_crash_cap() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(100),
+    );
+    let module_id = "fake-aft-supervisor-reload-fails";
+    let marker = server.temp_dir.join("fail-registration-after-first.marker");
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [(
+            "FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH",
+            marker.to_str().unwrap(),
+        )],
+    )
+    .await;
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            431,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+    let err = read_control_error_on_stream(&mut control_client, 431, "reload_failed").await;
+    assert!(err.message.contains("new child exited before registering"));
+    wait_for_registration_absent(&server.registry, module_id, Duration::from_secs(1)).await;
+    let status = wait_for_status(&module, Duration::from_secs(2), |status| {
+        status.state == ModuleState::Failed && !status.registration_active
+    })
+    .await;
+    assert_eq!(status.restart_count, 1);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_reload_unknown_module_returns_unknown_module() {
+    let server = TestServer::start().await;
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            441,
+            ClientControlRequest::SupervisorReload {
+                module_id: "missing-supervised-module".to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+    read_control_error_on_stream(&mut control_client, 441, "unknown_module").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
@@ -2454,6 +2795,27 @@ where
     assert_supervisor_ack(&frame, corr, module_id)
 }
 
+async fn read_supervisor_ack_on_stream<S>(stream: &mut S, corr: u64, module_id: &str) -> bool
+where
+    S: AsyncRead + Unpin,
+{
+    let frame = read_frame_timeout(stream).await;
+    assert_supervisor_ack(&frame, corr, module_id)
+}
+
+async fn read_control_error_on_stream<S>(stream: &mut S, corr: u64, code: &str) -> ErrorBody
+where
+    S: AsyncRead + Unpin,
+{
+    let frame = read_frame_timeout(stream).await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body.code, code);
+    body
+}
+
 async fn read_supervisor_ack_and_goodbye<S>(
     stream: &mut S,
     corr: u64,
@@ -2678,13 +3040,23 @@ where
 }
 
 fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supervisor {
+    supervisor_with_drain_timeout(server, max_restarts, backoff, Duration::from_millis(25))
+}
+
+fn supervisor_with_drain_timeout(
+    server: &TestServer,
+    max_restarts: u32,
+    backoff: Duration,
+    drain_timeout: Duration,
+) -> Supervisor {
     Supervisor::new(
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, backoff),
     )
     .with_process_liveness(Arc::clone(&server.process_liveness))
+    .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
-    .with_drain_timeout(Duration::from_millis(25))
+    .with_drain_timeout(drain_timeout)
     .with_connection_file_path(server.connection_file_path.clone())
 }
 

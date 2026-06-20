@@ -16,7 +16,13 @@ use tokio::{
 };
 use tracing::{debug, error, warn};
 
-use crate::{registry::RegistryError, Registry};
+use subc_protocol::{Flags, FrameType, Priority};
+
+use crate::{
+    forwarding::{ForwardingError, ForwardingTable, GoodbyeTarget, ModuleDrainTarget},
+    registry::RegistryError,
+    Frame, Registry,
+};
 
 /// Command-line flag used by supervised modules to find subc.
 ///
@@ -210,6 +216,7 @@ struct SupervisorRuntimeConfig {
     restart_policy: RestartPolicy,
     drain_timeout: Duration,
     connection_file_path: Option<PathBuf>,
+    forwarding: Option<Arc<ForwardingTable>>,
 }
 
 /// Shared daemon lookup table for supervised module handles.
@@ -257,6 +264,7 @@ pub struct Supervisor {
     restart_policy: RestartPolicy,
     drain_timeout: Duration,
     connection_file_path: Option<PathBuf>,
+    forwarding: Option<Arc<ForwardingTable>>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: Option<SupervisorHandle>,
 }
@@ -268,6 +276,7 @@ impl Supervisor {
             restart_policy,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             connection_file_path: None,
+            forwarding: None,
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
             supervisor_handle: None,
         }
@@ -288,6 +297,11 @@ impl Supervisor {
 
     pub fn with_connection_file_path(mut self, connection_file_path: impl Into<PathBuf>) -> Self {
         self.connection_file_path = Some(connection_file_path.into());
+        self
+    }
+
+    pub fn with_forwarding(mut self, forwarding: Arc<ForwardingTable>) -> Self {
+        self.forwarding = Some(forwarding);
         self
     }
 
@@ -312,6 +326,7 @@ impl Supervisor {
             restart_policy: self.restart_policy,
             drain_timeout: self.drain_timeout,
             connection_file_path: self.connection_file_path.clone(),
+            forwarding: self.forwarding.clone(),
         };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let child = spawn_child(&spec, runtime.connection_file_path.as_deref())?;
@@ -411,11 +426,6 @@ impl SupervisedModule {
     }
 
     /// Drain the module and stop monitoring it.
-    ///
-    /// v1 does not yet own a per-module forwarding sink, so graceful drain is
-    /// represented as a typed `Draining` state followed by a bounded wait for the
-    /// child to exit on its own; if it does not, subc kills the process and waits
-    /// for the registry to release the dropped socket registration.
     pub async fn drain(&self) -> Result<(), SuperviseError> {
         self.stop().await
     }
@@ -448,6 +458,20 @@ impl SupervisedModule {
         self.inner
             .commands
             .send(SupervisorCommand::Restart { reply: reply_tx })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?
+    }
+
+    pub async fn reload(&self) -> Result<(), SuperviseError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::Reload { reply: reply_tx })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -500,6 +524,9 @@ enum SupervisorCommand {
     Restart {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
+    Reload {
+        reply: oneshot::Sender<Result<(), SuperviseError>>,
+    },
     SetEnabled {
         enabled: bool,
         reply: oneshot::Sender<Result<bool, SuperviseError>>,
@@ -523,7 +550,16 @@ pub enum SuperviseError {
         module_id: String,
         source: io::Error,
     },
+    Forwarding(ForwardingError),
     Registry(RegistryError),
+    ReloadUnavailable {
+        module_id: String,
+        reason: String,
+    },
+    ReloadFailed {
+        module_id: String,
+        reason: String,
+    },
     RegistrationStillActive {
         module_id: String,
         waited: Duration,
@@ -553,7 +589,14 @@ impl fmt::Display for SuperviseError {
             Self::Kill { module_id, source } => {
                 write!(f, "failed to kill module '{module_id}': {source}")
             }
+            Self::Forwarding(err) => write!(f, "forwarding error: {err}"),
             Self::Registry(err) => write!(f, "registry error: {err}"),
+            Self::ReloadUnavailable { module_id, reason } => {
+                write!(f, "reload unavailable for module '{module_id}': {reason}")
+            }
+            Self::ReloadFailed { module_id, reason } => {
+                write!(f, "reload failed for module '{module_id}': {reason}")
+            }
             Self::RegistrationStillActive { module_id, waited } => write!(
                 f,
                 "module '{module_id}' registration remained active after waiting {waited:?}"
@@ -580,8 +623,11 @@ impl Error for SuperviseError {
             Self::Spawn { source, .. } | Self::Wait { source, .. } | Self::Kill { source, .. } => {
                 Some(source)
             }
+            Self::Forwarding(err) => Some(err),
             Self::Registry(err) => Some(err),
             Self::InvalidSpec { .. }
+            | Self::ReloadUnavailable { .. }
+            | Self::ReloadFailed { .. }
             | Self::RegistrationStillActive { .. }
             | Self::StatePoisoned { .. }
             | Self::CommandClosed { .. } => None,
@@ -736,6 +782,12 @@ async fn handle_supervisor_command(
             let _ = reply.send(result);
             true
         }
+        SupervisorCommand::Reload { reply } => {
+            let result =
+                reload_child(spec, runtime, registry, process_liveness, snapshot, child).await;
+            let _ = reply.send(result);
+            true
+        }
         SupervisorCommand::SetEnabled { enabled, reply } => {
             let result = set_child_enabled(
                 spec,
@@ -788,6 +840,157 @@ async fn restart_child(
     *child = Some(next_child);
     debug!(module_id = %spec.module_id, "supervised module restarted by operator request");
     Ok(())
+}
+
+async fn reload_child(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+) -> Result<(), SuperviseError> {
+    let Some(forwarding) = runtime.forwarding.as_ref() else {
+        return Err(SuperviseError::ReloadUnavailable {
+            module_id: spec.module_id.clone(),
+            reason: "supervisor was not configured with a forwarding table".to_string(),
+        });
+    };
+
+    // Admission gate first: route.open/commit and route REQUEST admission are closed
+    // before the first quiescence check, so the outstanding count can only fall.
+    let drain_target = forwarding
+        .begin_module_drain(&spec.module_id)
+        .map_err(SuperviseError::Forwarding)?;
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.enabled = true;
+        state.state = ModuleState::Draining;
+    })?;
+
+    if let Some(target) = drain_target.as_ref() {
+        if !wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
+            .await?
+        {
+            warn!(
+                module_id = %spec.module_id,
+                waited = ?runtime.drain_timeout,
+                "reload drain timed out before request quiescence; forcing teardown"
+            );
+        }
+
+        let released_routes = forwarding
+            .release_module_endpoint_routes(target.endpoint)
+            .map_err(SuperviseError::Forwarding)?;
+        send_route_goodbyes(released_routes);
+        send_module_goodbye(&spec.module_id, target);
+    }
+
+    if child.is_some() {
+        drain_optional_child(
+            &spec.module_id,
+            registry,
+            snapshot,
+            child,
+            runtime.drain_timeout,
+            ModuleState::Restarting,
+            Some(true),
+        )
+        .await?;
+    } else {
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.enabled = true;
+            state.state = ModuleState::Restarting;
+            state.process_alive = false;
+            state.pid = None;
+        })?;
+        wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
+    }
+
+    sleep(runtime.restart_policy.backoff).await;
+    process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+    let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
+        Ok(next_child) => next_child,
+        Err(err) => {
+            return handle_reload_spawn_failure(
+                spec,
+                runtime,
+                process_liveness,
+                snapshot,
+                child,
+                format!("new child failed to spawn: {err}"),
+            )
+            .await;
+        }
+    };
+    *child = Some(next_child);
+
+    let wait_outcome = {
+        let active_child = child.as_mut().expect("new reload child was just stored");
+        wait_for_registration_after_reload(
+            registry,
+            &spec.module_id,
+            active_child,
+            REGISTRY_RELEASE_TIMEOUT,
+        )
+        .await?
+    };
+
+    match wait_outcome {
+        RegistrationWaitOutcome::Registered => {
+            debug!(module_id = %spec.module_id, "supervised module reloaded and registered");
+            Ok(())
+        }
+        RegistrationWaitOutcome::Exited(exit_report) => {
+            *child = None;
+            handle_reload_child_registration_failure(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                ReloadRegistrationFailure {
+                    exit_report: registration_failure_exit_report(exit_report),
+                    reason: "new child exited before registering".to_string(),
+                },
+            )
+            .await
+        }
+        RegistrationWaitOutcome::TimedOut => {
+            let mut timed_out_child = child
+                .take()
+                .expect("timed-out reload child is still running");
+            timed_out_child
+                .start_kill()
+                .map_err(|source| SuperviseError::Kill {
+                    module_id: spec.module_id.clone(),
+                    source,
+                })?;
+            let status = timed_out_child
+                .wait()
+                .await
+                .map_err(|source| SuperviseError::Wait {
+                    module_id: spec.module_id.clone(),
+                    source,
+                })?;
+            handle_reload_child_registration_failure(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                ReloadRegistrationFailure {
+                    exit_report: registration_failure_exit_report(classify_exit(&status)),
+                    reason: format!(
+                        "new child did not register within {:?}",
+                        REGISTRY_RELEASE_TIMEOUT
+                    ),
+                },
+            )
+            .await
+        }
+    }
 }
 
 async fn set_child_enabled(
@@ -955,6 +1158,258 @@ fn spawn_and_mark_running(
     let child = spawn_child(spec, runtime.connection_file_path.as_deref())?;
     set_running(snapshot, child.id())?;
     Ok(child)
+}
+
+enum RegistrationWaitOutcome {
+    Registered,
+    Exited(ExitReport),
+    TimedOut,
+}
+
+struct ReloadRegistrationFailure {
+    exit_report: ExitReport,
+    reason: String,
+}
+
+async fn wait_for_forwarding_quiescence(
+    forwarding: &ForwardingTable,
+    endpoint: crate::ModuleEndpointId,
+    wait: Duration,
+) -> Result<bool, SuperviseError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let in_flight = forwarding
+            .endpoint_in_flight_count(endpoint)
+            .map_err(SuperviseError::Forwarding)?;
+        if in_flight == 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        sleep(REGISTRY_RELEASE_POLL).await;
+    }
+}
+
+fn send_route_goodbyes(released_routes: Vec<GoodbyeTarget>) {
+    for released in released_routes {
+        let frame = match Frame::build_with_version(
+            released.negotiated_ver,
+            FrameType::Goodbye,
+            control_flags(),
+            released.channel,
+            0,
+            Vec::new(),
+        ) {
+            Ok(frame) => frame,
+            Err(err) => {
+                warn!(
+                    route_channel = released.channel,
+                    error = %err,
+                    "failed to build reload route GOODBYE frame"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = released.sink.try_send(frame) {
+            warn!(
+                route_channel = released.channel,
+                error = %err,
+                "best-effort reload route GOODBYE was not delivered to peer"
+            );
+        }
+    }
+}
+
+fn send_module_goodbye(module_id: &str, target: &ModuleDrainTarget) {
+    let frame = match Frame::build_with_version(
+        target.negotiated_ver,
+        FrameType::Goodbye,
+        control_flags(),
+        0,
+        0,
+        Vec::new(),
+    ) {
+        Ok(frame) => frame,
+        Err(err) => {
+            warn!(
+                module_id,
+                error = %err,
+                "failed to build reload module GOODBYE frame"
+            );
+            return;
+        }
+    };
+    if let Err(err) = target.sink.try_send(frame) {
+        warn!(
+            module_id,
+            error = %err,
+            "best-effort reload module GOODBYE was not delivered to peer"
+        );
+    }
+}
+
+async fn wait_for_registration_after_reload(
+    registry: &Registry,
+    module_id: &str,
+    child: &mut Child,
+    wait: Duration,
+) -> Result<RegistrationWaitOutcome, SuperviseError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if registry
+            .get_module(module_id)
+            .map_err(SuperviseError::Registry)?
+            .is_some()
+        {
+            return Ok(RegistrationWaitOutcome::Registered);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(RegistrationWaitOutcome::TimedOut);
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let poll = remaining.min(REGISTRY_RELEASE_POLL);
+
+        tokio::select! {
+            wait_result = child.wait() => {
+                let status = wait_result.map_err(|source| SuperviseError::Wait {
+                    module_id: module_id.to_string(),
+                    source,
+                })?;
+                return Ok(RegistrationWaitOutcome::Exited(classify_exit(&status)));
+            }
+            _ = sleep(poll) => {}
+        }
+    }
+}
+
+fn registration_failure_exit_report(mut exit_report: ExitReport) -> ExitReport {
+    // A replacement process that exits before HELLO did not provide service, even
+    // if it used status 0. Count it against the restart cap as a new-binary failure.
+    exit_report.kind = ExitKind::Crash;
+    exit_report
+}
+
+async fn handle_reload_child_registration_failure(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+    failure: ReloadRegistrationFailure,
+) -> Result<(), SuperviseError> {
+    let ReloadRegistrationFailure {
+        exit_report,
+        reason,
+    } = failure;
+    match on_child_exit(
+        spec,
+        runtime.restart_policy,
+        registry,
+        snapshot,
+        exit_report,
+    )
+    .await
+    {
+        NextAction::Stop {
+            registration_released,
+        } => {
+            if registration_released {
+                process_liveness.untrack_if_current(&spec.module_id, snapshot);
+            }
+        }
+        NextAction::Restart => {
+            sleep(runtime.restart_policy.backoff).await;
+            if let Err(err) =
+                wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT)
+                    .await
+            {
+                fail_snapshot(snapshot, Some(&spec.module_id), None);
+                process_liveness.untrack_if_current(&spec.module_id, snapshot);
+                return Err(SuperviseError::ReloadFailed {
+                    module_id: spec.module_id.clone(),
+                    reason: format!(
+                        "{reason}; registration did not release before policy retry: {err}"
+                    ),
+                });
+            }
+            process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+            match spawn_and_mark_running(spec, runtime, snapshot) {
+                Ok(next_child) => {
+                    *child = Some(next_child);
+                }
+                Err(err) => {
+                    fail_snapshot(snapshot, Some(&spec.module_id), None);
+                    process_liveness.untrack_if_current(&spec.module_id, snapshot);
+                    return Err(SuperviseError::ReloadFailed {
+                        module_id: spec.module_id.clone(),
+                        reason: format!("{reason}; policy retry spawn failed: {err}"),
+                    });
+                }
+            }
+        }
+    }
+
+    Err(SuperviseError::ReloadFailed {
+        module_id: spec.module_id.clone(),
+        reason,
+    })
+}
+
+async fn handle_reload_spawn_failure(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+    reason: String,
+) -> Result<(), SuperviseError> {
+    let mut should_retry = false;
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.process_alive = false;
+        state.pid = None;
+        if !state.enabled {
+            state.state = ModuleState::Disabled;
+        } else if state.restart_count >= runtime.restart_policy.max_restarts {
+            state.state = ModuleState::Failed;
+        } else {
+            state.restart_count += 1;
+            state.state = ModuleState::Restarting;
+            should_retry = true;
+        }
+    })?;
+
+    if should_retry {
+        sleep(runtime.restart_policy.backoff).await;
+        process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+        match spawn_and_mark_running(spec, runtime, snapshot) {
+            Ok(next_child) => {
+                *child = Some(next_child);
+            }
+            Err(err) => {
+                fail_snapshot(snapshot, Some(&spec.module_id), None);
+                process_liveness.untrack_if_current(&spec.module_id, snapshot);
+                return Err(SuperviseError::ReloadFailed {
+                    module_id: spec.module_id.clone(),
+                    reason: format!("{reason}; policy retry spawn failed: {err}"),
+                });
+            }
+        }
+    } else {
+        process_liveness.untrack_if_current(&spec.module_id, snapshot);
+    }
+
+    Err(SuperviseError::ReloadFailed {
+        module_id: spec.module_id.clone(),
+        reason,
+    })
+}
+
+fn control_flags() -> Flags {
+    Flags::new(false, Priority::Passive, false)
 }
 
 async fn drain_optional_child(

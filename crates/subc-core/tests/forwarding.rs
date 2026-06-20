@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    net::Shutdown,
     ops::Deref,
     path::{Path, PathBuf},
     process,
@@ -1245,6 +1246,228 @@ async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_bind
     assert_eq!(response.body, payload);
 
     accepting.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_timeout_releases_reservation_and_later_open_succeeds() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-bind-timeout";
+    let timing_out = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let error = attach_error_on_stream_with_wait(
+        &mut client,
+        &project,
+        451,
+        "ses-bind-timeout",
+        module_id,
+        SETUP_TIMEOUT,
+    )
+    .await;
+    assert_eq!(error.code, "module_timeout");
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+
+    timing_out.stop().await.unwrap();
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let healthy = spawn_stub(&server, &supervisor, module_id).await;
+    let ack = attach_on_stream(
+        &mut client,
+        &project,
+        452,
+        "ses-bind-timeout-healthy",
+        module_id,
+    )
+    .await;
+    assert!(ack.route_channel > 0);
+    wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
+
+    healthy.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_route_bind_reply_settles_and_later_open_succeeds() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-bind-malformed";
+    let malformed = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_MALFORMED_BIND_REPLY", "response")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let error =
+        attach_error_on_stream(&mut client, &project, 461, "ses-bind-malformed", module_id).await;
+    assert_eq!(error.code, "target_unavailable");
+    assert!(
+        error.message.contains("malformed route.bind response body"),
+        "unexpected malformed route.bind error: {error:?}"
+    );
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+
+    malformed.stop().await.unwrap();
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let healthy = spawn_stub(&server, &supervisor, module_id).await;
+    let ack = attach_on_stream(
+        &mut client,
+        &project,
+        462,
+        "ses-bind-malformed-healthy",
+        module_id,
+    )
+    .await;
+    assert!(ack.route_channel > 0);
+    wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
+
+    healthy.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_delivery_failure_closes_dead_client_without_erroring_module_or_cotenant() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-dead-client";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "dead-client").await;
+
+    let project = TestProject::new();
+    let (first, first_ack) = attach_client(&server, &project, 471, "ses-dead-client-a").await;
+    let (mut second, second_ack) = attach_client(&server, &project, 472, "ses-dead-client-b").await;
+    wait_for_binding_count(&server.forwarding, 2, SETUP_TIMEOUT).await;
+
+    let first_std = first.into_std().unwrap();
+    first_std.shutdown(Shutdown::Read).unwrap();
+    let mut first = TcpStream::from_std(first_std).unwrap();
+    let dead_payload = vec![b'x'; 256 * 1024];
+    for offset in 0..16_u64 {
+        if write_frame(
+            &mut first,
+            &data_request(first_ack.route_channel, 473 + offset, &dead_payload),
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+        if first.flush().await.is_err() {
+            break;
+        }
+    }
+
+    wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
+
+    let payload = br#"{"jsonrpc":"2.0","id":"cotenant"}"#;
+    write_frame(
+        &mut second,
+        &data_request(second_ack.route_channel, 490, payload),
+    )
+    .await
+    .unwrap();
+    second.flush().await.unwrap();
+    let response = read_frame_timeout_for(&mut second, SETUP_TIMEOUT).await;
+    assert_response(&response, second_ack.route_channel, 490, payload);
+
+    let errors: Vec<_> = stub_events(&events_path)
+        .into_iter()
+        .filter(|event| event.get("kind").and_then(Value::as_str) == Some("error"))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "unexpected module ERROR frames after dead-client delivery failure: {errors:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backpressured_client_does_not_hol_block_cotenant_and_is_cleaned_up() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-hol-backpressure";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CONCURRENCY", "stateless_parallel")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let (mut clogged, clogged_ack) = attach_client(&server, &project, 481, "ses-hol-a").await;
+    let (mut cotenant, cotenant_ack) = attach_client(&server, &project, 482, "ses-hol-b").await;
+    wait_for_binding_count(&server.forwarding, 2, SETUP_TIMEOUT).await;
+
+    let flood_payload = vec![b'z'; 512 * 1024];
+    let flood = tokio::spawn(async move {
+        for offset in 0..256_u64 {
+            if write_frame(
+                &mut clogged,
+                &data_request(clogged_ack.route_channel, 20_000 + offset, &flood_payload),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+            if clogged.flush().await.is_err() {
+                break;
+            }
+        }
+        clogged
+    });
+
+    let cotenant_payload = br#"{"jsonrpc":"2.0","id":"not-blocked"}"#;
+    for offset in 0..4_u64 {
+        write_frame(
+            &mut cotenant,
+            &data_request(
+                cotenant_ack.route_channel,
+                21_000 + offset,
+                cotenant_payload,
+            ),
+        )
+        .await
+        .unwrap();
+        cotenant.flush().await.unwrap();
+        let response = read_frame_timeout_for(&mut cotenant, SETUP_TIMEOUT).await;
+        assert_response(
+            &response,
+            cotenant_ack.route_channel,
+            21_000 + offset,
+            cotenant_payload,
+        );
+    }
+
+    wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
+    flood.abort();
+
+    let payload = br#"{"jsonrpc":"2.0","id":"survives"}"#;
+    write_frame(
+        &mut cotenant,
+        &data_request(cotenant_ack.route_channel, 21_100, payload),
+    )
+    .await
+    .unwrap();
+    cotenant.flush().await.unwrap();
+    let response = read_frame_timeout_for(&mut cotenant, SETUP_TIMEOUT).await;
+    assert_response(&response, cotenant_ack.route_channel, 21_100, payload);
+
+    module.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2594,6 +2817,32 @@ where
     client.flush().await.unwrap();
 
     let error_frame = read_frame_timeout(client).await;
+    assert_eq!(error_frame.header.ty, FrameType::Error);
+    assert_eq!(error_frame.header.channel, 0);
+    assert_eq!(error_frame.header.corr, corr);
+    serde_json::from_slice(&error_frame.body).unwrap()
+}
+
+async fn attach_error_on_stream_with_wait<S>(
+    client: &mut S,
+    project: &TestProject,
+    corr: u64,
+    session: &str,
+    module_id: &str,
+    wait: Duration,
+) -> ErrorBody
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(
+        client,
+        &attach_frame(corr, attach_request(project, session, module_id)),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let error_frame = read_frame_timeout_for(client, wait).await;
     assert_eq!(error_frame.header.ty, FrameType::Error);
     assert_eq!(error_frame.header.channel, 0);
     assert_eq!(error_frame.header.corr, corr);

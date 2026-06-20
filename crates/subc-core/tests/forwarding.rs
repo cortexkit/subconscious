@@ -212,17 +212,11 @@ async fn route_poll_produces_zero_module_frames() {
     .await;
     assert_eq!(status_event["status"].as_str(), Some("indexing"));
 
-    let poll_corr = 112;
-    write_frame(
-        &mut client,
-        &route_poll_frame(poll_corr, PollKind::Status, ack.route_channel),
-    )
-    .await
-    .unwrap();
-    client.flush().await.unwrap();
-
-    let response = read_frame_timeout(&mut client).await;
-    assert_status_reply(&response, poll_corr, "indexing");
+    // Poll until subc has cached the status (see wait_for_cached_status: the
+    // stub-side status_published event does not guarantee subc received+cached
+    // the PUSH yet). Every poll is answered locally — asserted below by the
+    // absence of forwarded module frames.
+    wait_for_cached_status(&mut client, ack.route_channel, "indexing", 112).await;
 
     let events = stub_events(&events_path);
     assert!(
@@ -256,12 +250,10 @@ async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 121, "ses-busy-local-poll").await;
-    wait_for_stub_event(&events_path, Duration::from_secs(1), |event| {
-        event["kind"] == "status_published"
-            && event["route_channel"].as_u64() == Some(u64::from(ack.route_channel))
-            && event["status"] == "scanning"
-    })
-    .await;
+    // Warm the status cache BEFORE the measured window so the later timed poll is
+    // guaranteed a cache hit (the stub-side status_published event does not prove
+    // subc cached it yet). These warm-up polls are outside the latency measurement.
+    wait_for_cached_status(&mut client, ack.route_channel, "scanning", 130).await;
 
     let data_corr = 122;
     let status_corr = 123;
@@ -368,15 +360,7 @@ async fn status_cache_is_evicted_when_client_detaches() {
     })
     .await;
 
-    write_frame(
-        &mut first,
-        &route_poll_frame(142, PollKind::Status, first_ack.route_channel),
-    )
-    .await
-    .unwrap();
-    first.flush().await.unwrap();
-    let first_status = read_frame_timeout(&mut first).await;
-    assert_status_reply(&first_status, 142, "evict-me");
+    wait_for_cached_status(&mut first, first_ack.route_channel, "evict-me", 142).await;
 
     drop(first);
     wait_for_binding_count(&server.forwarding, 0, Duration::from_secs(1)).await;
@@ -399,15 +383,7 @@ async fn status_cache_is_evicted_when_client_detaches() {
     })
     .await;
 
-    write_frame(
-        &mut second,
-        &route_poll_frame(145, PollKind::Status, second_ack.route_channel),
-    )
-    .await
-    .unwrap();
-    second.flush().await.unwrap();
-    let second_status = read_frame_timeout(&mut second).await;
-    assert_status_reply(&second_status, 145, "evict-me");
+    wait_for_cached_status(&mut second, second_ack.route_channel, "evict-me", 145).await;
 
     module.stop().await.unwrap();
 }
@@ -2316,21 +2292,8 @@ async fn multi_provider_status_cache_translates_same_module_channel_to_client_ro
     })
     .await;
 
-    write_frame(
-        &mut client,
-        &route_poll_frame(1023, PollKind::Status, ack_a.route_channel),
-    )
-    .await
-    .unwrap();
-    write_frame(
-        &mut client,
-        &route_poll_frame(1024, PollKind::Status, ack_b.route_channel),
-    )
-    .await
-    .unwrap();
-    client.flush().await.unwrap();
-    assert_status_reply(&read_frame_timeout(&mut client).await, 1023, "status-a");
-    assert_status_reply(&read_frame_timeout(&mut client).await, 1024, "status-b");
+    wait_for_cached_status(&mut client, ack_a.route_channel, "status-a", 1023).await;
+    wait_for_cached_status(&mut client, ack_b.route_channel, "status-b", 1100).await;
 
     provider_a.stop().await.unwrap();
     provider_b.stop().await.unwrap();
@@ -2949,6 +2912,62 @@ fn assert_response(frame: &Frame, route_channel: u16, corr: u64, body: &[u8]) {
     assert_eq!(frame.header.channel, route_channel);
     assert_eq!(frame.header.corr, corr);
     assert_eq!(frame.body, body);
+}
+
+/// Poll `route.poll{Status}` until subc reports the expected cached status,
+/// bounded by a timeout. subc caches a module's status only once its
+/// `route.status` PUSH has crossed the socket — the stub-side `status_published`
+/// event does NOT prove subc has received it yet, so an immediate poll can
+/// legitimately see `None` (see `route_poll_status_cache_miss_returns_none`).
+/// A real client re-polls; this helper encodes that. Every poll is answered
+/// locally by subc (zero module frames), so callers can still assert the module
+/// observed no poll corrs afterward. `base_corr` and the next 31 corrs are used.
+async fn wait_for_cached_status<S>(
+    client: &mut S,
+    route_channel: u16,
+    expected_status: &str,
+    base_corr: u64,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut attempt = 0u64;
+    loop {
+        let poll_corr = base_corr + attempt;
+        write_frame(
+            client,
+            &route_poll_frame(poll_corr, PollKind::Status, route_channel),
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+
+        let frame = read_frame_timeout(client).await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        assert_eq!(frame.header.channel, 0);
+        assert_eq!(frame.header.corr, poll_corr);
+        match serde_json::from_slice(&frame.body).unwrap() {
+            ClientControlResponse::RoutePoll {
+                status: Some(status),
+                live: None,
+            } => {
+                assert_eq!(status, expected_status);
+                return;
+            }
+            ClientControlResponse::RoutePoll {
+                status: None,
+                live: None,
+            } => {
+                assert!(
+                    Instant::now() < deadline,
+                    "route.poll status cache was never populated with {expected_status:?} within the timeout"
+                );
+                sleep(Duration::from_millis(20)).await;
+                attempt += 1;
+            }
+            other => panic!("unexpected route.poll status response: {other:?}"),
+        }
+    }
 }
 
 fn assert_status_reply(frame: &Frame, corr: u64, expected_status: &str) {

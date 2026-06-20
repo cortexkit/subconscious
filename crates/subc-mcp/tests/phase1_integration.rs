@@ -26,15 +26,22 @@ use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
 };
 use serde_json::{json, Value};
+use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, SupervisorEntry};
 use subc_core::{
-    serve_listener, ControlHandler, ModuleProcessLiveness, ModuleSpec, Registry, RestartPolicy,
-    Router, ServerAuth, SupervisedModule, Supervisor, SupervisorProcessLiveness,
+    read_frame, serve_listener, write_frame, ControlHandler, ForwardingTable, Frame,
+    ModuleProcessLiveness, ModuleSpec, Registry, RestartPolicy, Router, ServerAuth,
+    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
+};
+use subc_protocol::{
+    session::ConfigTier, BindIdentity, ErrorBody, Flags, FrameType, Priority, RouteTarget,
 };
 use subc_transport::{
-    generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
+    SCHEMA_VERSION,
 };
 use tokio::{
-    net::TcpListener,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex as TokioMutex,
     task::JoinHandle,
@@ -43,10 +50,12 @@ use tokio::{
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TEST_DAEMON_VER: &str = "test-subc-mcp";
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = SETUP_TIMEOUT;
 
 struct TestDaemon {
     registry: Arc<Registry>,
+    forwarding: Arc<ForwardingTable>,
     connection_file_path: PathBuf,
     temp_dir: PathBuf,
     task: JoinHandle<Result<(), subc_core::ServerError>>,
@@ -62,19 +71,23 @@ impl Drop for TestDaemon {
 struct TestServer {
     daemon: TestDaemon,
     process_liveness: Arc<SupervisorProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
 }
 
 impl TestServer {
     async fn start() -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
-        let daemon = start_test_daemon_with_process_liveness(
+        let supervisor_handle = SupervisorHandle::new();
+        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
             "subc-mcp-phase2b",
             Arc::clone(&process_liveness),
+            supervisor_handle.clone(),
         )
         .await;
         Self {
             daemon,
             process_liveness,
+            supervisor_handle,
         }
     }
 }
@@ -848,6 +861,98 @@ async fn mcp_catalog_poller_adds_new_provider_and_notifies() {
     harness.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_route() {
+    let server = TestServer::start().await;
+    let provider_events_path = server
+        .daemon
+        .temp_dir
+        .join("supervised-mcp-aft-events.jsonl");
+    let provider = supervisor(&server)
+        .spawn(stub_spec(
+            "aft",
+            &provider_events_path,
+            &[("FAKE_AFT_TOOLS", "read")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.daemon.registry, "aft", SETUP_TIMEOUT).await;
+
+    let xdg_config_home = server.daemon.temp_dir.join("supervised-mcp-xdg-config");
+    fs::create_dir_all(&xdg_config_home).unwrap();
+    let module_connection_file = server.daemon.temp_dir.join("supervised-mcp-module.json");
+    let mcp = supervisor(&server)
+        .spawn(mcp_module_spec(
+            "mcp",
+            &module_connection_file,
+            &xdg_config_home,
+        ))
+        .unwrap();
+
+    let entry = wait_for_supervisor_entry(
+        &server.daemon.connection_file_path,
+        "mcp",
+        |entry| entry.state == "running" && entry.enabled && entry.live,
+        SETUP_TIMEOUT,
+    )
+    .await;
+    assert_eq!(entry.module_id, "mcp");
+
+    let catalog = catalog_modules(&server.daemon.connection_file_path, Some("mcp"), 2_000).await;
+    assert_eq!(catalog.len(), 1, "mcp should be registered in the catalog");
+    assert!(
+        catalog[0].roles.is_empty(),
+        "mcp supervision registration must not advertise routable roles: {:?}",
+        catalog[0].roles
+    );
+
+    let mut client =
+        wait_for_control_client(&server.daemon.connection_file_path, SETUP_TIMEOUT).await;
+    let err = control_error_on_stream(
+        &mut client,
+        2_001,
+        ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: "mcp".to_string(),
+            },
+            identity: route_identity("mcp", 2_001),
+            config: route_config(),
+        },
+    )
+    .await;
+    assert_eq!(err.code, "target_unavailable");
+    assert!(
+        err.message
+            .contains("does not provide the requested target"),
+        "unexpected route.open error for non-routable mcp: {err:?}"
+    );
+
+    let route_channel = open_route(&mut client, "aft", 2_002).await;
+    write_frame(
+        &mut client,
+        &data_request(
+            route_channel,
+            2_003,
+            br#"{ "name": "read", "arguments": { "path": "demo" } }"#,
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.channel, route_channel);
+    assert_eq!(response.header.corr, 2_003);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    let text = body["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("fake-aft tool read called"),
+        "aft provider should still serve tool calls after mcp registers: {body:?}"
+    );
+
+    mcp.stop().await.unwrap();
+    provider.stop().await.unwrap();
+}
+
 async fn list_tool_names(harness: &McpHarness) -> Vec<String> {
     let mut names = harness
         .client
@@ -935,9 +1040,10 @@ async fn expect_shim_attach_failure(
     }
 }
 
-async fn start_test_daemon_with_process_liveness(
+async fn start_test_daemon_with_process_liveness_and_supervisor(
     name: &str,
     process_liveness: Arc<SupervisorProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -959,15 +1065,17 @@ async fn start_test_daemon_with_process_liveness(
 
     let registry = Arc::new(Registry::default());
     let process_liveness: Arc<dyn ModuleProcessLiveness> = process_liveness;
-    let control = Arc::new(
-        ControlHandler::new(Arc::clone(&registry)).with_process_liveness(process_liveness),
-    );
-    let router = Arc::new(Router::with_control_handler(control));
+    let control = ControlHandler::new(Arc::clone(&registry))
+        .with_process_liveness(process_liveness)
+        .with_supervisor(supervisor_handle);
+    let forwarding = control.forwarding();
+    let router = Arc::new(Router::with_control_handler(Arc::new(control)));
     let auth = ServerAuth::new(conn.key, conn.daemon_id, conn.daemon_ver);
     let task = tokio::spawn(serve_listener(listener, router, auth));
 
     TestDaemon {
         registry,
+        forwarding,
         connection_file_path,
         temp_dir,
         task,
@@ -980,6 +1088,8 @@ fn supervisor(server: &TestServer) -> Supervisor {
         RestartPolicy::new(0, Duration::ZERO),
     )
     .with_process_liveness(Arc::clone(&server.process_liveness))
+    .with_forwarding(Arc::clone(&server.daemon.forwarding))
+    .with_handle(server.supervisor_handle.clone())
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.daemon.connection_file_path.clone())
 }
@@ -1003,6 +1113,26 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
         program,
         args,
         env,
+    }
+}
+
+fn mcp_module_spec(
+    module_id: &str,
+    module_connection_file: &Path,
+    xdg_config_home: &Path,
+) -> ModuleSpec {
+    ModuleSpec {
+        module_id: module_id.to_owned(),
+        program: PathBuf::from(env!("CARGO_BIN_EXE_subc-mcp")),
+        args: vec![
+            "module".to_string(),
+            "--connection-file".to_string(),
+            module_connection_file.display().to_string(),
+        ],
+        env: vec![(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg_config_home.display().to_string(),
+        )],
     }
 }
 
@@ -1139,6 +1269,219 @@ async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Durat
         );
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn wait_for_supervisor_entry(
+    path: &Path,
+    module_id: &str,
+    predicate: impl Fn(&SupervisorEntry) -> bool,
+    wait: Duration,
+) -> SupervisorEntry {
+    let deadline = Instant::now() + wait;
+    let mut corr = 10_000;
+    loop {
+        let modules = supervisor_modules(path, corr).await;
+        if let Some(entry) = modules
+            .into_iter()
+            .find(|entry| entry.module_id == module_id && predicate(entry))
+        {
+            return entry;
+        }
+        if Instant::now() >= deadline {
+            let modules = supervisor_modules(path, corr + 100_000).await;
+            panic!(
+                "module {module_id} did not reach expected supervisor state within {wait:?}; modules: {modules:?}"
+            );
+        }
+        corr += 1;
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn supervisor_modules(path: &Path, corr: u64) -> Vec<SupervisorEntry> {
+    let mut client = wait_for_control_client(path, SETUP_TIMEOUT).await;
+    match control_rpc_on_stream(&mut client, corr, ClientControlRequest::SupervisorList {}).await {
+        ClientControlResponse::SupervisorList { modules, .. } => modules,
+        other => panic!("unexpected supervisor.list response: {other:?}"),
+    }
+}
+
+async fn catalog_modules(path: &Path, module_id: Option<&str>, corr: u64) -> Vec<CatalogEntry> {
+    let mut client = wait_for_control_client(path, SETUP_TIMEOUT).await;
+    match control_rpc_on_stream(
+        &mut client,
+        corr,
+        ClientControlRequest::CatalogList {
+            module_id: module_id.map(ToOwned::to_owned),
+        },
+    )
+    .await
+    {
+        ClientControlResponse::CatalogList { modules, .. } => modules,
+        other => panic!("unexpected catalog.list response: {other:?}"),
+    }
+}
+
+async fn wait_for_control_client(path: &Path, wait: Duration) -> TcpStream {
+    let deadline = Instant::now() + wait;
+    loop {
+        match connect_control_client(path).await {
+            Ok(client) => return client,
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(err) => panic!("daemon did not accept authenticated client within {wait:?}: {err}"),
+        }
+    }
+}
+
+async fn connect_control_client(path: &Path) -> Result<TcpStream, String> {
+    let conn = subc_transport::read(path).map_err(|source| source.to_string())?;
+    let endpoint = conn
+        .endpoints
+        .first()
+        .ok_or_else(|| format!("{} has no endpoints", path.display()))?;
+    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .map_err(|source| source.to_string())?;
+    authenticate_client(&mut stream, &conn, Duration::from_secs(2))
+        .await
+        .map_err(|source| source.to_string())?;
+    Ok(stream)
+}
+
+async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> u16
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match control_rpc_on_stream(
+        stream,
+        corr,
+        ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            identity: route_identity(module_id, corr),
+            config: route_config(),
+        },
+    )
+    .await
+    {
+        ClientControlResponse::RouteOpen { route_channel } => route_channel,
+        other => panic!("unexpected route.open response: {other:?}"),
+    }
+}
+
+async fn control_rpc_on_stream<S>(
+    stream: &mut S,
+    corr: u64,
+    request: ClientControlRequest,
+) -> ClientControlResponse
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = control_frame_on_stream(stream, corr, request).await;
+    match frame.header.ty {
+        FrameType::Response => serde_json::from_slice(&frame.body).unwrap(),
+        FrameType::Error => panic!(
+            "control RPC returned error: {:?}",
+            serde_json::from_slice::<Value>(&frame.body).unwrap()
+        ),
+        ty => panic!("unexpected control RPC frame type: {ty:?}"),
+    }
+}
+
+async fn control_error_on_stream<S>(
+    stream: &mut S,
+    corr: u64,
+    request: ClientControlRequest,
+) -> ErrorBody
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = control_frame_on_stream(stream, corr, request).await;
+    match frame.header.ty {
+        FrameType::Error => serde_json::from_slice(&frame.body).unwrap(),
+        FrameType::Response => panic!(
+            "control RPC unexpectedly succeeded: {:?}",
+            serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap()
+        ),
+        ty => panic!("unexpected control RPC frame type: {ty:?}"),
+    }
+}
+
+async fn control_frame_on_stream<S>(
+    stream: &mut S,
+    corr: u64,
+    request: ClientControlRequest,
+) -> Frame
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(stream, &control_request_frame(corr, request))
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_frame_timeout(stream).await;
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    frame
+}
+
+fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
+    let body = serde_json::to_vec(&request).unwrap();
+    Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
+}
+
+fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
+    Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        corr,
+        body.to_vec(),
+    )
+    .unwrap()
+}
+
+async fn read_frame_timeout<S>(stream: &mut S) -> Frame
+where
+    S: AsyncRead + Unpin,
+{
+    timeout(READ_TIMEOUT, async {
+        read_frame(stream)
+            .await
+            .unwrap()
+            .expect("connection should stay open")
+    })
+    .await
+    .expect("timed out waiting for frame")
+}
+
+fn route_identity(label: &str, corr: u64) -> BindIdentity {
+    let project_root = unique_temp_dir(&format!("mcp-route-{label}-{corr}"));
+    fs::create_dir_all(&project_root).unwrap();
+    BindIdentity {
+        project_root,
+        harness: "subc-mcp-test".to_string(),
+        session: format!("session-{corr}"),
+    }
+}
+
+fn route_config() -> Vec<ConfigTier> {
+    vec![ConfigTier {
+        tier: "project".to_string(),
+        source: "subc-mcp-test".to_string(),
+        doc: "{}".to_string(),
+    }]
 }
 
 async fn wait_for_stub_event<F>(path: &Path, wait: Duration, matches: F) -> Value

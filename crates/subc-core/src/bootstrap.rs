@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use fs4::{FileExt, TryLockError};
 use subc_transport::{
     authenticate_client, connection_file, generate_daemon_id, generate_key, write_atomic,
     AuthError, ConnectionFileError, ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -466,7 +467,8 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 struct StartLock {
-    path: PathBuf,
+    // Keep the locked file handle alive for the duration of bootstrap; closing
+    // it releases the advisory lock while leaving the stable path in place.
     _file: fs::File,
 }
 
@@ -474,12 +476,16 @@ impl StartLock {
     async fn acquire(connection_file_path: &Path) -> Result<Self, BootstrapError> {
         let path = start_lock_path(connection_file_path);
         for _ in 0..START_LOCK_RETRIES {
-            match open_owner_only_lock(&path) {
-                Ok(file) => return Ok(Self { path, _file: file }),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    sleep(START_LOCK_RETRY_DELAY).await;
-                }
+            let file = match open_owner_only_lock(&path) {
+                Ok(file) => file,
                 Err(source) => return Err(BootstrapError::StartLockCreate { path, source }),
+            };
+            match FileExt::try_lock(&file) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) => sleep(START_LOCK_RETRY_DELAY).await,
+                Err(TryLockError::Error(source)) => {
+                    return Err(BootstrapError::StartLockCreate { path, source });
+                }
             }
         }
 
@@ -490,15 +496,9 @@ impl StartLock {
     }
 }
 
-impl Drop for StartLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 fn open_owner_only_lock(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -924,6 +924,48 @@ mod tests {
 
         drop(bound.listeners);
         let _ = foreign_task.await;
+        cleanup_connection_file_path(&path);
+    }
+
+    #[tokio::test]
+    async fn stale_start_lock_file_is_reclaimable() {
+        let path = temp_connection_file_path("start-lock-stale-file");
+        let lock_path = start_lock_path(&path);
+        drop(open_owner_only_lock(&lock_path).unwrap());
+        assert!(lock_path.is_file());
+
+        let lock = StartLock::acquire(&path).await.unwrap();
+        assert!(lock_path.is_file());
+
+        drop(lock);
+        assert!(lock_path.is_file());
+        cleanup_connection_file_path(&path);
+    }
+
+    #[tokio::test]
+    async fn held_start_lock_blocks_second_acquire_until_release() {
+        let path = temp_connection_file_path("start-lock-held");
+        let lock_path = start_lock_path(&path);
+        let first = StartLock::acquire(&path).await.unwrap();
+
+        let err = match StartLock::acquire(&path).await {
+            Ok(_) => panic!("second acquire while held must stay busy"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            BootstrapError::StartLockBusy {
+                ref path,
+                attempts: START_LOCK_RETRIES,
+            } if path == &lock_path
+        ));
+
+        drop(first);
+
+        let second = StartLock::acquire(&path)
+            .await
+            .expect("released advisory lock should be reclaimable");
+        drop(second);
         cleanup_connection_file_path(&path);
     }
 

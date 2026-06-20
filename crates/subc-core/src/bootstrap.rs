@@ -467,8 +467,9 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 struct StartLock {
-    path: PathBuf,
-    file: Option<fs::File>,
+    // Keep the locked file handle alive for the duration of bootstrap; closing
+    // it releases the advisory lock while leaving the stable path in place.
+    _file: fs::File,
 }
 
 impl StartLock {
@@ -480,12 +481,7 @@ impl StartLock {
                 Err(source) => return Err(BootstrapError::StartLockCreate { path, source }),
             };
             match FileExt::try_lock(&file) {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        file: Some(file),
-                    })
-                }
+                Ok(()) => return Ok(Self { _file: file }),
                 Err(TryLockError::WouldBlock) => sleep(START_LOCK_RETRY_DELAY).await,
                 Err(TryLockError::Error(source)) => {
                     return Err(BootstrapError::StartLockCreate { path, source });
@@ -497,13 +493,6 @@ impl StartLock {
             path,
             attempts: START_LOCK_RETRIES,
         })
-    }
-}
-
-impl Drop for StartLock {
-    fn drop(&mut self) {
-        drop(self.file.take());
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -943,11 +932,13 @@ mod tests {
         let path = temp_connection_file_path("start-lock-stale-file");
         let lock_path = start_lock_path(&path);
         drop(open_owner_only_lock(&lock_path).unwrap());
+        assert!(lock_path.is_file());
 
         let lock = StartLock::acquire(&path).await.unwrap();
-        assert_eq!(lock.path, lock_path);
+        assert!(lock_path.is_file());
 
         drop(lock);
+        assert!(lock_path.is_file());
         cleanup_connection_file_path(&path);
     }
 

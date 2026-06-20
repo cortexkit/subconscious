@@ -1342,34 +1342,54 @@ async fn module_delivery_failure_closes_dead_client_without_erroring_module_or_c
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-dead-client";
-    let (module, events_path) =
-        spawn_stub_with_events_path(&server, &supervisor, module_id, "dead-client").await;
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "dead-client",
+        [("FAKE_AFT_CONCURRENCY", "stateless_parallel")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (first, first_ack) = attach_client(&server, &project, 471, "ses-dead-client-a").await;
     let (mut second, second_ack) = attach_client(&server, &project, 472, "ses-dead-client-b").await;
     wait_for_binding_count(&server.forwarding, 2, SETUP_TIMEOUT).await;
 
+    // Make the client's read half dead so module->client delivery fails, but keep
+    // its write half open so subc keeps reading its requests (this exercises the
+    // module-delivery-failure close path, not the read-EOF teardown path).
     let first_std = first.into_std().unwrap();
     first_std.shutdown(Shutdown::Read).unwrap();
-    let mut first = TcpStream::from_std(first_std).unwrap();
-    let dead_payload = vec![b'x'; 256 * 1024];
-    for offset in 0..16_u64 {
-        if write_frame(
-            &mut first,
-            &data_request(first_ack.route_channel, 473 + offset, &dead_payload),
-        )
-        .await
-        .is_err()
-        {
-            break;
+    let first = TcpStream::from_std(first_std).unwrap();
+    // Flood far more responses than the 64-slot client egress can hold so the
+    // module->client try_send deterministically hits Full and triggers the
+    // dead-client close on EVERY platform. A small burst only worked on
+    // macOS/Windows (where Shutdown::Read also surfaces as a write error/Closed);
+    // on Linux a half-read-dead peer neither errors the write nor fills a 64-slot
+    // queue with too few frames, so the close never fired. stateless_parallel
+    // lifts the admission window so all flooded requests are in flight at once.
+    let dead_payload = vec![b'x'; 512 * 1024];
+    let flood = tokio::spawn(async move {
+        let mut first = first;
+        for offset in 0..256_u64 {
+            if write_frame(
+                &mut first,
+                &data_request(first_ack.route_channel, 473 + offset, &dead_payload),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+            if first.flush().await.is_err() {
+                break;
+            }
         }
-        if first.flush().await.is_err() {
-            break;
-        }
-    }
+    });
 
     wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
+    flood.abort();
 
     let payload = br#"{"jsonrpc":"2.0","id":"cotenant"}"#;
     write_frame(

@@ -1,0 +1,9 @@
+[package]
+name = "subc-jsonc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Shared JSONC-to-JSON normalization for internal subc config readers."
+
+[dev-dependencies]
+serde_json = "1"

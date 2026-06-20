@@ -183,7 +183,10 @@ async fn spawn_stub_with_env<'a>(
     let module = supervisor
         .spawn(stub_spec(server, module_id, extra_env))
         .unwrap();
-    wait_for_registration(&server.registry, module_id, Duration::from_secs(1)).await;
+    // Generous setup hang-guard (deadlock detector, not a latency bound): a
+    // spawn/connect/auth/register constellation under heavy parallel CI load
+    // must not trip it. See forwarding.rs SETUP_TIMEOUT.
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(10)).await;
     module
 }
 

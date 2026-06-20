@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     error::Error,
     ffi::{OsStr, OsString},
@@ -10,8 +10,8 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, RwLock,
     },
     time::Duration,
 };
@@ -22,11 +22,11 @@ use rmcp::{
         ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
         ServerCapabilities, ServerInfo, Tool as McpTool, ToolAnnotations,
     },
-    service::RequestContext,
+    service::{NotificationContext, Peer, RequestContext},
     transport::async_rw::AsyncRwTransport,
     RoleServer, ServerHandler,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     decode_header,
@@ -42,7 +42,7 @@ use subc_transport::{
 use tokio::{
     io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
-    sync::{mpsc, Mutex},
+    sync::{broadcast, mpsc, watch, Mutex},
     time,
 };
 
@@ -53,6 +53,10 @@ const MAX_SHIM_CONTROL_MESSAGE_LEN: u32 = 64 * 1024;
 const MODULE_CONNECTION_FILE_NAME: &str = "subc-mcp-connection.json";
 const DEFAULT_HARNESS: &str = "mcp:generic";
 const PENDING_FRAME_BUFFER: usize = 8;
+const SUBC_EVENT_BUFFER: usize = 64;
+const CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MCP_CONFIG_RELATIVE_PATH: &str = "cortexkit/mcp.jsonc";
+const PROJECT_MCP_CONFIG_RELATIVE_PATH: &str = ".cortexkit/mcp.jsonc";
 
 const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [--harness <name>]\n  subc-mcp module --subc <subc-connection-file> [--connection-file <path>]";
 
@@ -60,6 +64,12 @@ type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, BoxError>;
 type PendingKey = (u16, u64);
 type PendingTx = mpsc::Sender<EnvelopeFrame>;
+
+#[derive(Debug, Clone)]
+enum SubcEvent {
+    RouteGoodbye { route_channel: u16 },
+    CatalogChanged { generation: u64 },
+}
 
 #[tokio::main]
 async fn main() {
@@ -120,14 +130,113 @@ struct EnvelopeFrame {
 
 #[derive(Debug, Clone)]
 struct AttachedSession {
-    route_channel: u16,
-    tools: Vec<ManifestTool>,
+    state: Arc<SessionState>,
 }
 
 #[derive(Debug, Clone)]
-struct SelectedToolProvider {
-    module_id: String,
+struct CatalogSnapshot {
+    generation: u64,
+    modules: Vec<CatalogEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GatewayConfig {
+    providers: HashMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderConfig {
+    enabled: Option<bool>,
+    namespace: Option<String>,
+    tools: ToolConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolConfig {
+    default_enabled: Option<bool>,
+    overrides: HashMap<String, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigSnapshot {
+    effective: GatewayConfig,
+    tiers: Vec<ConfigTier>,
+}
+
+#[derive(Debug)]
+struct SessionState {
+    config: ConfigSnapshot,
+    identity: BindIdentity,
+    inner: RwLock<SessionInner>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionInner {
+    catalog_generation: u64,
+    routes: HashMap<String, u16>,
     tools: Vec<ManifestTool>,
+    bindings: HashMap<String, ToolBinding>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolBinding {
+    module_id: String,
+    route_channel: u16,
+    bare_tool_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct DesiredSession {
+    providers: Vec<DesiredProvider>,
+}
+
+#[derive(Debug, Clone)]
+struct DesiredProvider {
+    module_id: String,
+    tools: Vec<DesiredTool>,
+}
+
+#[derive(Debug, Clone)]
+struct DesiredTool {
+    bare_tool: ManifestTool,
+    exposed_tool: ManifestTool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGatewayConfig {
+    version: u8,
+    #[serde(default)]
+    providers: HashMap<String, RawProviderConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawProviderConfig {
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    enabled: MaybeSet<bool>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    namespace: MaybeSet<String>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    tools: MaybeSet<RawToolConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawToolConfig {
+    #[serde(
+        default,
+        rename = "defaultEnabled",
+        deserialize_with = "deserialize_maybe_set"
+    )]
+    default_enabled: MaybeSet<bool>,
+    #[serde(default)]
+    overrides: HashMap<String, Option<bool>>,
+}
+
+#[derive(Debug, Clone, Default)]
+enum MaybeSet<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
 }
 
 impl EnvelopeFrame {
@@ -169,7 +278,9 @@ impl EnvelopeFrame {
 struct SubcClient {
     tx: mpsc::Sender<EnvelopeFrame>,
     pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
+    events: broadcast::Sender<SubcEvent>,
     next_corr: Arc<AtomicU64>,
+    catalog_poller_started: Arc<AtomicBool>,
 }
 
 impl SubcClient {
@@ -177,19 +288,62 @@ impl SubcClient {
         let (read_half, write_half) = stream.into_split();
         let (tx, rx) = mpsc::channel(128);
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
 
-        tokio::spawn(subc_reader_loop(read_half, Arc::clone(&pending)));
+        tokio::spawn(subc_reader_loop(
+            read_half,
+            Arc::clone(&pending),
+            events.clone(),
+        ));
         tokio::spawn(subc_writer_loop(write_half, rx));
 
         Self {
             tx,
             pending,
+            events,
             next_corr: Arc::new(AtomicU64::new(1)),
+            catalog_poller_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn next_corr(&self) -> u64 {
         self.next_corr.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<SubcEvent> {
+        self.events.subscribe()
+    }
+
+    fn ensure_catalog_poller(&self) {
+        if self
+            .catalog_poller_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let subc = self.clone();
+        tokio::spawn(async move {
+            let mut last_generation = None;
+            let mut interval = time::interval(CATALOG_POLL_INTERVAL);
+            loop {
+                interval.tick().await;
+                match catalog_list(&subc).await {
+                    Ok(snapshot) => {
+                        if last_generation != Some(snapshot.generation) {
+                            last_generation = Some(snapshot.generation);
+                            let _ = subc.events.send(SubcEvent::CatalogChanged {
+                                generation: snapshot.generation,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("subc-mcp module: catalog poll failed: {error}");
+                    }
+                }
+            }
+        });
     }
 
     async fn send(&self, frame: EnvelopeFrame) -> Result<()> {
@@ -475,69 +629,61 @@ async fn handle_shim_connection(
     .await?;
 
     let attached = attach_session(&subc, &hello).await?;
-    let route_channel = attached.route_channel;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let handler = SubcMcpServer {
         subc: subc.clone(),
-        route_channel,
-        tools: attached.tools,
+        state: Arc::clone(&attached.state),
+        lifecycle_started: Arc::new(AtomicBool::new(false)),
+        shutdown: shutdown_rx,
     };
     let (read_half, write_half) = stream.into_split();
     let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
     let serve_result = serve_mcp_server(handler, transport).await;
-    let goodbye_result = send_route_goodbye(&subc, route_channel).await;
+    let _ = shutdown_tx.send(true);
+    let goodbye_result = send_route_goodbyes(&subc, attached.state.route_channels()).await;
 
     match (serve_result, goodbye_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error),
         (Err(serve_error), Err(goodbye_error)) => Err(other_error(format!(
-            "rmcp shim server failed: {serve_error}; additionally failed to send route goodbye: {goodbye_error}"
+            "rmcp shim server failed: {serve_error}; additionally failed to send route goodbyes: {goodbye_error}"
         ))),
     }
 }
 
 async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<AttachedSession> {
+    let config = read_gateway_config(&hello.project_root)?;
     let catalog = catalog_list(subc).await?;
-    let selected = select_tool_provider(&catalog)?;
-    let session = generated_session_id(&hello.shim_session_id)?;
-    let request = ClientControlRequest::RouteOpen {
-        target: RouteTarget::ToolProvider {
-            module_id: selected.module_id,
-        },
-        identity: BindIdentity {
-            project_root: hello.project_root.clone(),
-            harness: hello.harness.clone(),
-            session,
-        },
-        config: Vec::<ConfigTier>::new(),
+    let desired = desired_session_from_catalog(&config.effective, &catalog.modules)?;
+    let identity = BindIdentity {
+        project_root: hello.project_root.clone(),
+        harness: hello.harness.clone(),
+        session: generated_session_id(&hello.shim_session_id)?,
     };
-    let body = serde_json::to_vec(&request)?;
-    let corr = subc.next_corr();
-    let frame = EnvelopeFrame::build(FrameType::Request, control_flags(), 0, corr, body)?;
-    let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
 
-    match response.header.ty {
-        FrameType::Response if response.header.channel == 0 => {
-            match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
-                ClientControlResponse::RouteOpen { route_channel } => Ok(AttachedSession {
-                    route_channel,
-                    tools: selected.tools,
-                }),
-                other => Err(other_error(format!(
-                    "unexpected route.open response body: {other:?}"
-                ))),
+    let mut routes = HashMap::new();
+    for provider in &desired.providers {
+        match open_provider_route(subc, &provider.module_id, &identity, &config.tiers).await {
+            Ok(route_channel) => {
+                routes.insert(provider.module_id.clone(), route_channel);
+            }
+            Err(error) => {
+                let opened_routes = routes.values().copied().collect::<Vec<_>>();
+                let _ = send_route_goodbyes(subc, opened_routes).await;
+                return Err(error);
             }
         }
-        FrameType::Error => Err(error_response("subc rejected route.open", &response.body)),
-        ty => Err(other_error(format!(
-            "unexpected route.open response frame {ty:?} on channel {} corr {}",
-            response.header.channel, response.header.corr
-        ))),
     }
+
+    let inner = session_inner_from_desired(catalog.generation, desired, routes)?;
+    Ok(AttachedSession {
+        state: Arc::new(SessionState::new(config, identity, inner)),
+    })
 }
 
-async fn catalog_list(subc: &SubcClient) -> Result<Vec<CatalogEntry>> {
+async fn catalog_list(subc: &SubcClient) -> Result<CatalogSnapshot> {
     let request = ClientControlRequest::CatalogList { module_id: None };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr();
@@ -547,7 +693,14 @@ async fn catalog_list(subc: &SubcClient) -> Result<Vec<CatalogEntry>> {
     match response.header.ty {
         FrameType::Response if response.header.channel == 0 => {
             match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
-                ClientControlResponse::CatalogList { modules, .. } => Ok(modules),
+                ClientControlResponse::CatalogList {
+                    generation,
+                    modules,
+                    ..
+                } => Ok(CatalogSnapshot {
+                    generation,
+                    modules,
+                }),
                 other => Err(other_error(format!(
                     "unexpected catalog.list response body: {other:?}"
                 ))),
@@ -561,31 +714,663 @@ async fn catalog_list(subc: &SubcClient) -> Result<Vec<CatalogEntry>> {
     }
 }
 
-fn select_tool_provider(modules: &[CatalogEntry]) -> Result<SelectedToolProvider> {
+async fn open_provider_route(
+    subc: &SubcClient,
+    module_id: &str,
+    identity: &BindIdentity,
+    config: &[ConfigTier],
+) -> Result<u16> {
+    let request = ClientControlRequest::RouteOpen {
+        target: RouteTarget::ToolProvider {
+            module_id: module_id.to_owned(),
+        },
+        identity: identity.clone(),
+        config: config.to_vec(),
+    };
+    let body = serde_json::to_vec(&request)?;
+    let corr = subc.next_corr();
+    let frame = EnvelopeFrame::build(FrameType::Request, control_flags(), 0, corr, body)?;
+    let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
+
+    match response.header.ty {
+        FrameType::Response if response.header.channel == 0 => {
+            match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
+                ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+                other => Err(other_error(format!(
+                    "unexpected route.open response body: {other:?}"
+                ))),
+            }
+        }
+        FrameType::Error => Err(error_response(
+            &format!("subc rejected route.open for provider '{module_id}'"),
+            &response.body,
+        )),
+        ty => Err(other_error(format!(
+            "unexpected route.open response frame {ty:?} on channel {} corr {}",
+            response.header.channel, response.header.corr
+        ))),
+    }
+}
+
+fn desired_session_from_catalog(
+    config: &GatewayConfig,
+    modules: &[CatalogEntry],
+) -> Result<DesiredSession> {
+    let mut providers = Vec::new();
+    let mut exposed_names = HashMap::<String, (String, String)>::new();
+
     for entry in modules {
+        let mut manifest_tools = Vec::new();
         for role in &entry.roles {
             if let ProviderRole::ToolProvider { tools, .. } = role {
-                return Ok(SelectedToolProvider {
-                    module_id: entry.module_id.clone(),
-                    tools: tools.clone(),
-                });
+                manifest_tools.extend(tools.iter().cloned());
             }
+        }
+        if manifest_tools.is_empty() || !config.provider_enabled(&entry.module_id) {
+            continue;
+        }
+
+        let namespace = config.provider_namespace(&entry.module_id);
+        validate_mcp_name_component("provider namespace", &namespace).map_err(|message| {
+            other_error(format!(
+                "provider '{}' has invalid namespace '{namespace}': {message}; set providers.{}.namespace to an MCP-safe value",
+                entry.module_id, entry.module_id
+            ))
+        })?;
+
+        let mut tools = Vec::new();
+        for tool in manifest_tools {
+            validate_mcp_name_component("tool name", &tool.name).map_err(|message| {
+                other_error(format!(
+                    "provider '{}' manifest has invalid tool name '{}': {message}",
+                    entry.module_id, tool.name
+                ))
+            })?;
+            if !config.tool_enabled(&entry.module_id, &tool.name) {
+                continue;
+            }
+
+            let exposed_name = format!("{namespace}_{}", tool.name);
+            if let Some((other_module, other_bare)) = exposed_names.insert(
+                exposed_name.clone(),
+                (entry.module_id.clone(), tool.name.clone()),
+            ) {
+                return Err(other_error(format!(
+                    "MCP tool name collision for '{exposed_name}': {}.{} and {}.{}",
+                    other_module, other_bare, entry.module_id, tool.name
+                )));
+            }
+
+            let mut exposed_tool = tool.clone();
+            exposed_tool.name = exposed_name;
+            tools.push(DesiredTool {
+                bare_tool: tool,
+                exposed_tool,
+            });
+        }
+
+        providers.push(DesiredProvider {
+            module_id: entry.module_id.clone(),
+            tools,
+        });
+    }
+
+    Ok(DesiredSession { providers })
+}
+
+fn session_inner_from_desired(
+    catalog_generation: u64,
+    desired: DesiredSession,
+    routes: HashMap<String, u16>,
+) -> Result<SessionInner> {
+    let mut tools = Vec::new();
+    let mut bindings = HashMap::new();
+
+    for provider in desired.providers {
+        let route_channel = *routes.get(&provider.module_id).ok_or_else(|| {
+            other_error(format!(
+                "missing route channel for enabled provider '{}'",
+                provider.module_id
+            ))
+        })?;
+        for desired_tool in provider.tools {
+            let exposed_name = desired_tool.exposed_tool.name.clone();
+            bindings.insert(
+                exposed_name.clone(),
+                ToolBinding {
+                    module_id: provider.module_id.clone(),
+                    route_channel,
+                    bare_tool_name: desired_tool.bare_tool.name,
+                },
+            );
+            tools.push(desired_tool.exposed_tool);
         }
     }
 
-    Err(other_error("catalog.list returned no tool_provider module"))
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(SessionInner {
+        catalog_generation,
+        routes,
+        tools,
+        bindings,
+    })
+}
+
+impl SessionState {
+    fn new(config: ConfigSnapshot, identity: BindIdentity, inner: SessionInner) -> Self {
+        Self {
+            config,
+            identity,
+            inner: RwLock::new(inner),
+        }
+    }
+
+    fn exposed_tools(&self) -> Vec<ManifestTool> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tools
+            .clone()
+    }
+
+    fn get_tool(&self, name: &str) -> Option<ManifestTool> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .cloned()
+    }
+
+    fn binding(&self, name: &str) -> Option<ToolBinding> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bindings
+            .get(name)
+            .cloned()
+    }
+
+    fn route_channels(&self) -> Vec<u16> {
+        let mut channels = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .routes
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        channels.sort_unstable();
+        channels.dedup();
+        channels
+    }
+
+    fn catalog_generation(&self) -> u64 {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .catalog_generation
+    }
+
+    fn route_snapshot(&self) -> HashMap<String, u16> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .routes
+            .clone()
+    }
+
+    fn remove_route(&self, route_channel: u16) -> bool {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_tools = inner.tools.clone();
+        let removed_modules = inner
+            .routes
+            .iter()
+            .filter(|(_, channel)| **channel == route_channel)
+            .map(|(module_id, _)| module_id.clone())
+            .collect::<HashSet<_>>();
+        if removed_modules.is_empty() {
+            return false;
+        }
+
+        inner
+            .routes
+            .retain(|module_id, _| !removed_modules.contains(module_id));
+        inner
+            .bindings
+            .retain(|_, binding| !removed_modules.contains(&binding.module_id));
+        let live_names = inner.bindings.keys().cloned().collect::<HashSet<_>>();
+        inner.tools.retain(|tool| live_names.contains(&tool.name));
+        old_tools != inner.tools
+    }
+
+    fn replace_inner(&self, next: SessionInner) -> bool {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = inner.tools != next.tools;
+        *inner = next;
+        changed
+    }
+}
+
+impl GatewayConfig {
+    fn provider_enabled(&self, module_id: &str) -> bool {
+        self.providers
+            .get(module_id)
+            .and_then(|provider| provider.enabled)
+            .unwrap_or(true)
+    }
+
+    fn provider_namespace(&self, module_id: &str) -> String {
+        self.providers
+            .get(module_id)
+            .and_then(|provider| provider.namespace.clone())
+            .unwrap_or_else(|| module_id.to_owned())
+    }
+
+    fn tool_enabled(&self, module_id: &str, tool_name: &str) -> bool {
+        let Some(provider) = self.providers.get(module_id) else {
+            return true;
+        };
+        provider
+            .tools
+            .overrides
+            .get(tool_name)
+            .copied()
+            .unwrap_or_else(|| provider.tools.default_enabled.unwrap_or(true))
+    }
+}
+
+fn validate_mcp_name_component(kind: &str, value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{kind} must not be empty"));
+    }
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} must contain only ASCII letters, digits, '_' or '-'"
+        ))
+    }
+}
+
+fn read_gateway_config(project_root: &Path) -> Result<ConfigSnapshot> {
+    let mut effective = GatewayConfig::default();
+    let mut tiers = Vec::new();
+    let config_files = [
+        ("user", user_mcp_config_path()),
+        (
+            "project",
+            project_root.join(PROJECT_MCP_CONFIG_RELATIVE_PATH),
+        ),
+    ];
+
+    for (tier, path) in config_files {
+        let doc = match fs::read_to_string(&path) {
+            Ok(doc) => doc,
+            Err(err) if err.kind() == stdio::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(other_error(format!(
+                    "failed to read {tier} MCP config {}: {err}",
+                    path.display()
+                )))
+            }
+        };
+        let raw = parse_gateway_config_doc(&doc, &path)?;
+        merge_gateway_config(&mut effective, raw);
+        tiers.push(ConfigTier {
+            tier: tier.to_owned(),
+            source: absolute_config_source(&path),
+            doc,
+        });
+    }
+
+    Ok(ConfigSnapshot { effective, tiers })
+}
+
+fn user_mcp_config_path() -> PathBuf {
+    if let Some(config_home) = non_empty_os_var("XDG_CONFIG_HOME") {
+        return PathBuf::from(config_home).join(MCP_CONFIG_RELATIVE_PATH);
+    }
+    if let Some(home) = non_empty_os_var("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join(MCP_CONFIG_RELATIVE_PATH);
+    }
+    PathBuf::from(".config").join(MCP_CONFIG_RELATIVE_PATH)
+}
+
+fn absolute_config_source(path: &Path) -> String {
+    if path.is_absolute() {
+        path.display().to_string()
+    } else {
+        env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string()
+    }
+}
+
+fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> {
+    let json = jsonc_to_json(doc).map_err(|message| {
+        other_error(format!(
+            "invalid JSONC in MCP config {}: {message}",
+            path.display()
+        ))
+    })?;
+    let raw: RawGatewayConfig = serde_json::from_str(&json).map_err(|source| {
+        other_error(format!("invalid MCP config {}: {source}", path.display()))
+    })?;
+    if raw.version != 1 {
+        return Err(other_error(format!(
+            "invalid MCP config {}: version {} is unsupported (expected 1)",
+            path.display(),
+            raw.version
+        )));
+    }
+    Ok(raw)
+}
+
+fn merge_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayConfig) {
+    for (module_id, raw_provider) in raw.providers {
+        let provider = effective.providers.entry(module_id).or_default();
+        match raw_provider.enabled {
+            MaybeSet::Missing => {}
+            MaybeSet::Null => provider.enabled = None,
+            MaybeSet::Value(enabled) => provider.enabled = Some(enabled),
+        }
+        match raw_provider.namespace {
+            MaybeSet::Missing => {}
+            MaybeSet::Null => provider.namespace = None,
+            MaybeSet::Value(namespace) => provider.namespace = Some(namespace),
+        }
+        match raw_provider.tools {
+            MaybeSet::Missing => {}
+            MaybeSet::Null => provider.tools = ToolConfig::default(),
+            MaybeSet::Value(tools) => merge_tool_config(&mut provider.tools, tools),
+        }
+    }
+}
+
+fn merge_tool_config(effective: &mut ToolConfig, raw: RawToolConfig) {
+    match raw.default_enabled {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.default_enabled = None,
+        MaybeSet::Value(default_enabled) => effective.default_enabled = Some(default_enabled),
+    }
+    for (tool_name, override_value) in raw.overrides {
+        match override_value {
+            Some(enabled) => {
+                effective.overrides.insert(tool_name, enabled);
+            }
+            None => {
+                effective.overrides.remove(&tool_name);
+            }
+        }
+    }
+}
+
+fn deserialize_maybe_set<'de, D, T>(deserializer: D) -> std::result::Result<MaybeSet<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|value| match value {
+        Some(value) => MaybeSet::Value(value),
+        None => MaybeSet::Null,
+    })
+}
+
+fn jsonc_to_json(doc: &str) -> std::result::Result<String, String> {
+    let mut out = String::with_capacity(doc.len());
+    let mut chars = doc.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                let _ = chars.next();
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                let _ = chars.next();
+                let mut closed = false;
+                let mut prev = '\0';
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                    }
+                    if prev == '*' && next == '/' {
+                        closed = true;
+                        break;
+                    }
+                    prev = next;
+                }
+                if !closed {
+                    return Err("unterminated block comment".to_owned());
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    if in_string {
+        return Err("unterminated string".to_owned());
+    }
+
+    Ok(remove_json_trailing_commas(&out))
+}
+
+fn remove_json_trailing_commas(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            continue;
+        }
+
+        if ch == ',' {
+            let mut lookahead = chars.clone();
+            while matches!(lookahead.peek(), Some(next) if next.is_whitespace()) {
+                let _ = lookahead.next();
+            }
+            if matches!(lookahead.peek(), Some('}' | ']')) {
+                continue;
+            }
+        }
+
+        out.push(ch);
+    }
+
+    out
+}
+
+async fn reconcile_session_from_catalog(
+    subc: &SubcClient,
+    state: &SessionState,
+    catalog: CatalogSnapshot,
+) -> Result<bool> {
+    let desired = desired_session_from_catalog(&state.config.effective, &catalog.modules)?;
+    let existing_routes = state.route_snapshot();
+    let desired_modules = desired
+        .providers
+        .iter()
+        .map(|provider| provider.module_id.clone())
+        .collect::<HashSet<_>>();
+    let removed_routes = existing_routes
+        .iter()
+        .filter_map(|(module_id, channel)| {
+            (!desired_modules.contains(module_id)).then_some(*channel)
+        })
+        .collect::<Vec<_>>();
+
+    let mut routes = HashMap::new();
+    for provider in &desired.providers {
+        if let Some(route_channel) = existing_routes.get(&provider.module_id) {
+            routes.insert(provider.module_id.clone(), *route_channel);
+            continue;
+        }
+        let route_channel = open_provider_route(
+            subc,
+            &provider.module_id,
+            &state.identity,
+            &state.config.tiers,
+        )
+        .await?;
+        routes.insert(provider.module_id.clone(), route_channel);
+    }
+
+    let inner = session_inner_from_desired(catalog.generation, desired, routes)?;
+    let changed = state.replace_inner(inner);
+    if !removed_routes.is_empty() {
+        let _ = send_route_goodbyes(subc, removed_routes).await;
+    }
+    Ok(changed)
+}
+
+async fn session_lifecycle(
+    subc: SubcClient,
+    state: Arc<SessionState>,
+    mut events: broadcast::Receiver<SubcEvent>,
+    peer: Peer<RoleServer>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(SubcEvent::RouteGoodbye { route_channel }) => {
+                        if state.remove_route(route_channel) && !notify_tool_list_changed(&peer).await {
+                            break;
+                        }
+                    }
+                    Ok(SubcEvent::CatalogChanged { generation }) => {
+                        if generation == state.catalog_generation() {
+                            continue;
+                        }
+                        match catalog_list(&subc).await {
+                            Ok(catalog) => {
+                                match reconcile_session_from_catalog(&subc, &state, catalog).await {
+                                    Ok(true) => {
+                                        if !notify_tool_list_changed(&peer).await {
+                                            break;
+                                        }
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        eprintln!("subc-mcp module: keeping previous MCP tool snapshot after catalog reconciliation failed: {error}");
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("subc-mcp module: failed to refresh catalog after generation {generation}: {error}");
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        match catalog_list(&subc).await {
+                            Ok(catalog) => {
+                                match reconcile_session_from_catalog(&subc, &state, catalog).await {
+                                    Ok(true) => {
+                                        if !notify_tool_list_changed(&peer).await {
+                                            break;
+                                        }
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        eprintln!("subc-mcp module: keeping previous MCP tool snapshot after lagged catalog reconciliation failed: {error}");
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("subc-mcp module: failed to refresh catalog after lagged events: {error}");
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn notify_tool_list_changed(peer: &Peer<RoleServer>) -> bool {
+    match peer.notify_tool_list_changed().await {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("subc-mcp module: failed to notify MCP tools/list_changed: {error}");
+            false
+        }
+    }
 }
 
 #[derive(Clone)]
 struct SubcMcpServer {
     subc: SubcClient,
-    route_channel: u16,
-    tools: Vec<ManifestTool>,
+    state: Arc<SessionState>,
+    lifecycle_started: Arc<AtomicBool>,
+    shutdown: watch::Receiver<bool>,
 }
 
 /// v1 subc-mcp ↔ provider tool-call request contract carried as an opaque
-/// subc route-channel `REQUEST` body. AFT must mirror this at the real-provider
-/// handshake; subc itself never parses this payload.
+/// subc route-channel `REQUEST` body. `name` is the provider's bare manifest
+/// tool name and `arguments` is the exact MCP request object. `Tool.schema` in
+/// the manifest is the agent-facing schema the provider accepts; the gateway
+/// never translates arguments.
 #[derive(Debug, Serialize)]
 struct RouteToolCallRequest {
     name: String,
@@ -607,8 +1392,13 @@ struct RouteToolProgress {
 
 impl ServerHandler for SubcMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
     }
 
     async fn list_tools(
@@ -617,15 +1407,20 @@ impl ServerHandler for SubcMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
-            tools: self.tools.iter().map(mcp_tool_from_manifest).collect(),
+            tools: self
+                .state
+                .exposed_tools()
+                .iter()
+                .map(mcp_tool_from_manifest)
+                .collect(),
             ..Default::default()
         })
     }
 
     fn get_tool(&self, name: &str) -> Option<McpTool> {
-        self.tools
-            .iter()
-            .find(|tool| tool.name == name)
+        self.state
+            .get_tool(name)
+            .as_ref()
             .map(mcp_tool_from_manifest)
     }
 
@@ -636,6 +1431,24 @@ impl ServerHandler for SubcMcpServer {
     ) -> std::result::Result<CallToolResult, ErrorData> {
         self.call_tool_over_route(request, context).await
     }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if self
+            .lifecycle_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        self.subc.ensure_catalog_poller();
+        let subc = self.subc.clone();
+        let state = Arc::clone(&self.state);
+        let events = self.subc.subscribe_events();
+        let peer = context.peer.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(session_lifecycle(subc, state, events, peer, shutdown));
+    }
 }
 
 impl SubcMcpServer {
@@ -644,29 +1457,25 @@ impl SubcMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
-        if self.get_tool(&request.name).is_none() {
+        let Some(binding) = self.state.binding(&request.name) else {
             return Err(ErrorData::invalid_params(
                 format!("unknown tool '{}'", request.name),
                 None,
             ));
-        }
+        };
 
+        let route_channel = binding.route_channel;
         let progress_token = context.meta.get_progress_token();
         let body = RouteToolCallRequest {
-            name: request.name.to_string(),
+            name: binding.bare_tool_name,
             arguments: request.arguments.unwrap_or_default(),
             progress_token: progress_token.clone(),
         };
         let body = serde_json::to_vec(&body).map_err(mcp_internal_error)?;
         let corr = self.subc.next_corr();
-        let frame = EnvelopeFrame::build(
-            FrameType::Request,
-            data_flags(),
-            self.route_channel,
-            corr,
-            body,
-        )
-        .map_err(mcp_internal_error)?;
+        let frame =
+            EnvelopeFrame::build(FrameType::Request, data_flags(), route_channel, corr, body)
+                .map_err(mcp_internal_error)?;
         let mut frames = self
             .subc
             .request_frames(frame)
@@ -676,8 +1485,8 @@ impl SubcMcpServer {
         loop {
             tokio::select! {
                 _ = context.ct.cancelled() => {
-                    let cancel_result = self.send_route_cancel(corr).await;
-                    self.subc.abandon_request(self.route_channel, corr).await;
+                    let cancel_result = self.send_route_cancel(route_channel, corr).await;
+                    self.subc.abandon_request(route_channel, corr).await;
                     cancel_result.map_err(mcp_internal_error)?;
                     return Err(ErrorData::new(
                         ErrorCode::INTERNAL_ERROR,
@@ -689,18 +1498,17 @@ impl SubcMcpServer {
                     let Some(frame) = frame else {
                         return Err(ErrorData::internal_error(
                             format!(
-                                "subc connection closed before terminal tool response on channel {} corr {}",
-                                self.route_channel, corr
+                                "subc route {route_channel} closed before terminal tool response for corr {corr}",
                             ),
                             None,
                         ));
                     };
 
                     match frame.header.ty {
-                        FrameType::Push if frame.header.channel == self.route_channel => {
+                        FrameType::Push if frame.header.channel == route_channel => {
                             forward_progress(&context, progress_token.clone(), &frame.body).await?;
                         }
-                        FrameType::Response if frame.header.channel == self.route_channel => {
+                        FrameType::Response if frame.header.channel == route_channel => {
                             return serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
                                 ErrorData::internal_error(
                                     format!("provider returned malformed tool result: {source}"),
@@ -726,11 +1534,11 @@ impl SubcMcpServer {
         }
     }
 
-    async fn send_route_cancel(&self, corr: u64) -> Result<()> {
+    async fn send_route_cancel(&self, route_channel: u16, corr: u64) -> Result<()> {
         let frame = EnvelopeFrame::build(
             FrameType::Cancel,
             data_flags(),
-            self.route_channel,
+            route_channel,
             corr,
             Vec::new(),
         )?;
@@ -844,8 +1652,29 @@ async fn send_route_goodbye(subc: &SubcClient, route_channel: u16) -> Result<()>
     subc.send(frame).await
 }
 
-async fn subc_reader_loop<R>(mut read_half: R, pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>)
-where
+async fn send_route_goodbyes(subc: &SubcClient, route_channels: Vec<u16>) -> Result<()> {
+    let mut errors = Vec::new();
+    for route_channel in route_channels {
+        if let Err(error) = send_route_goodbye(subc, route_channel).await {
+            errors.push(format!("channel {route_channel}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(other_error(format!(
+            "failed to send route GOODBYE for {} route(s): {}",
+            errors.len(),
+            errors.join("; ")
+        )))
+    }
+}
+
+async fn subc_reader_loop<R>(
+    mut read_half: R,
+    pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
+    events: broadcast::Sender<SubcEvent>,
+) where
     R: AsyncRead + Unpin,
 {
     loop {
@@ -856,6 +1685,19 @@ where
                         "subc-mcp module: ignoring unrecognized channel-0 Push corr={}",
                         frame.header.corr
                     );
+                    continue;
+                }
+
+                if frame.header.ty == FrameType::Goodbye && frame.header.channel != 0 {
+                    fail_pending_on_route(
+                        &pending,
+                        frame.header.channel,
+                        "subc route closed by provider GOODBYE",
+                    )
+                    .await;
+                    let _ = events.send(SubcEvent::RouteGoodbye {
+                        route_channel: frame.header.channel,
+                    });
                     continue;
                 }
 
@@ -889,6 +1731,45 @@ where
     }
 
     pending.lock().await.clear();
+}
+
+async fn fail_pending_on_route(
+    pending: &Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
+    route_channel: u16,
+    message: &str,
+) {
+    let replies = {
+        let mut pending = pending.lock().await;
+        let keys = pending
+            .keys()
+            .filter_map(|(channel, corr)| (*channel == route_channel).then_some((*channel, *corr)))
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| pending.remove(&key).map(|reply| (key, reply)))
+            .collect::<Vec<_>>()
+    };
+
+    for ((channel, corr), reply) in replies {
+        let body = match serde_json::to_vec(&ErrorBody {
+            code: "target_unavailable".to_owned(),
+            message: message.to_owned(),
+        }) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("subc-mcp module: failed to encode route GOODBYE error: {error}");
+                Vec::new()
+            }
+        };
+        let frame = match EnvelopeFrame::build(FrameType::Error, data_flags(), channel, corr, body)
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!("subc-mcp module: failed to build route GOODBYE error: {error}");
+                continue;
+            }
+        };
+        let _ = reply.send(frame).await;
+    }
 }
 
 fn is_terminal_frame_type(frame_type: FrameType) -> bool {
@@ -1284,7 +2165,8 @@ mod tests {
 
         let reader_pending = Arc::clone(&pending);
         let reader = tokio::spawn(async move {
-            subc_reader_loop(client, reader_pending).await;
+            let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
+            subc_reader_loop(client, reader_pending, events).await;
         });
 
         let push = EnvelopeFrame::build(

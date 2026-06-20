@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     future::Future,
     io::ErrorKind,
@@ -8,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -120,6 +121,8 @@ impl ShimProcess {
 struct TestMcpClient {
     progress: Arc<TokioMutex<Vec<ProgressNotificationParam>>>,
     progress_notify: Arc<Notify>,
+    tool_list_changed_count: Arc<AtomicUsize>,
+    tool_list_changed_notify: Arc<Notify>,
 }
 
 impl TestMcpClient {
@@ -127,6 +130,8 @@ impl TestMcpClient {
         Self {
             progress: Arc::new(TokioMutex::new(Vec::new())),
             progress_notify: Arc::new(Notify::new()),
+            tool_list_changed_count: Arc::new(AtomicUsize::new(0)),
+            tool_list_changed_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -144,61 +149,156 @@ impl ClientHandler for TestMcpClient {
             notify.notify_waiters();
         }
     }
+
+    fn on_tool_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        self.tool_list_changed_count.fetch_add(1, Ordering::SeqCst);
+        self.tool_list_changed_notify.notify_waiters();
+        std::future::ready(())
+    }
+}
+
+struct StubProvider<'a> {
+    module_id: &'a str,
+    env: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> StubProvider<'a> {
+    fn new(module_id: &'a str, env: &[(&'a str, &'a str)]) -> Self {
+        Self {
+            module_id,
+            env: env.to_vec(),
+        }
+    }
 }
 
 struct McpHarness {
-    _server: TestServer,
+    server: TestServer,
     _project: TestProject,
-    provider: SupervisedModule,
+    providers: BTreeMap<String, SupervisedModule>,
     module: Child,
     shim: ShimProcess,
     client: RunningService<RoleClient, TestMcpClient>,
     client_handler: TestMcpClient,
     events_path: PathBuf,
+    provider_events: BTreeMap<String, PathBuf>,
 }
 
 impl McpHarness {
     async fn start(label: &str, provider_env: &[(&str, &str)]) -> Self {
-        let server = TestServer::start().await;
-        let events_path = server
-            .daemon
-            .temp_dir
-            .join(format!("{label}-fake-aft-events.jsonl"));
+        Self::start_configured(
+            label,
+            vec![StubProvider::new("fake-aft", provider_env)],
+            None,
+            None,
+        )
+        .await
+    }
 
-        let provider = supervisor(&server)
-            .spawn(stub_spec("fake-aft", &events_path, provider_env))
-            .unwrap();
-        wait_for_registration(&server.daemon.registry, "fake-aft", READ_TIMEOUT).await;
+    async fn start_configured(
+        label: &str,
+        provider_specs: Vec<StubProvider<'_>>,
+        user_config: Option<&str>,
+        project_config: Option<&str>,
+    ) -> Self {
+        let server = TestServer::start().await;
+        let mut providers = BTreeMap::new();
+        let mut provider_events = BTreeMap::new();
+
+        for provider_spec in provider_specs {
+            let events_path = server
+                .daemon
+                .temp_dir
+                .join(format!("{label}-{}-events.jsonl", provider_spec.module_id));
+            let provider = supervisor(&server)
+                .spawn(stub_spec(
+                    provider_spec.module_id,
+                    &events_path,
+                    &provider_spec.env,
+                ))
+                .unwrap();
+            wait_for_registration(
+                &server.daemon.registry,
+                provider_spec.module_id,
+                READ_TIMEOUT,
+            )
+            .await;
+            provider_events.insert(provider_spec.module_id.to_owned(), events_path);
+            providers.insert(provider_spec.module_id.to_owned(), provider);
+        }
+
+        let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
+        fs::create_dir_all(&user_config_home).unwrap();
+        if let Some(user_config) = user_config {
+            write_user_mcp_config(&user_config_home, user_config);
+        }
 
         let module_connection_file = server
             .daemon
             .temp_dir
             .join(format!("{label}-subc-mcp.json"));
-        let mut module = spawn_module(&server.daemon.connection_file_path, &module_connection_file);
+        let mut module = spawn_module(
+            &server.daemon.connection_file_path,
+            &module_connection_file,
+            &user_config_home,
+        );
         wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
 
         let project = TestProject::new(label);
-        let mut shim = spawn_shim(&module_connection_file, &project.path);
+        if let Some(project_config) = project_config {
+            write_project_mcp_config(&project.path, project_config);
+        }
+
+        let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
         let client_handler = TestMcpClient::new();
         let client = shim.serve_mcp_client(client_handler.clone()).await;
+        let events_path = provider_events
+            .values()
+            .next()
+            .cloned()
+            .expect("test harness should have at least one provider");
 
         Self {
-            _server: server,
+            server,
             _project: project,
-            provider,
+            providers,
             module,
             shim,
             client,
             client_handler,
             events_path,
+            provider_events,
         }
+    }
+
+    fn provider_events_path(&self, module_id: &str) -> &Path {
+        self.provider_events
+            .get(module_id)
+            .unwrap_or_else(|| panic!("missing provider events path for {module_id}"))
+    }
+
+    async fn spawn_provider(&mut self, module_id: &str, provider_env: &[(&str, &str)]) {
+        let events_path = self
+            .server
+            .daemon
+            .temp_dir
+            .join(format!("dynamic-{module_id}-events.jsonl"));
+        let provider = supervisor(&self.server)
+            .spawn(stub_spec(module_id, &events_path, provider_env))
+            .unwrap();
+        wait_for_registration(&self.server.daemon.registry, module_id, READ_TIMEOUT).await;
+        self.provider_events
+            .insert(module_id.to_owned(), events_path);
+        self.providers.insert(module_id.to_owned(), provider);
     }
 
     async fn shutdown(self) {
         let Self {
-            _server,
+            server: _server,
             _project,
-            provider,
+            providers,
             mut module,
             mut shim,
             client,
@@ -210,7 +310,9 @@ impl McpHarness {
             let _ = module.start_kill();
             let _ = timeout(Duration::from_secs(2), module.wait()).await;
         }
-        provider.stop().await.unwrap();
+        for provider in providers.into_values() {
+            provider.stop().await.unwrap();
+        }
     }
 }
 
@@ -223,10 +325,12 @@ async fn mcp_initialize_advertises_tools_capability() {
         .peer()
         .peer_info()
         .expect("client should store initialize result");
-    assert!(
-        server_info.capabilities.tools.is_some(),
-        "subc-mcp should advertise the MCP tools capability"
-    );
+    let tools_capability = server_info
+        .capabilities
+        .tools
+        .as_ref()
+        .expect("subc-mcp should advertise the MCP tools capability");
+    assert_eq!(tools_capability.list_changed, Some(true));
     assert_eq!(server_info.server_info.name, "subc-mcp");
 
     harness.shutdown().await;
@@ -239,7 +343,7 @@ async fn mcp_tools_list_returns_stub_manifest_tools() {
     let tools = harness.client.peer().list_tools(None).await.unwrap();
     assert_eq!(tools.tools.len(), 1);
     let tool = &tools.tools[0];
-    assert_eq!(tool.name, "fake_read");
+    assert_eq!(tool.name, "fake-aft_fake_read");
     assert_eq!(
         tool.input_schema.get("type"),
         Some(&Value::String("object".to_owned()))
@@ -257,7 +361,7 @@ async fn mcp_tools_call_returns_result_and_stub_receives_route_body() {
     let result = harness
         .client
         .peer()
-        .call_tool(CallToolRequestParams::new("fake_read").with_arguments(args))
+        .call_tool(CallToolRequestParams::new("fake-aft_fake_read").with_arguments(args))
         .await
         .unwrap();
     assert_eq!(result.is_error, Some(false));
@@ -298,7 +402,7 @@ async fn mcp_tools_call_forwards_progress_notifications() {
 
     let peer = harness.client.peer().clone();
     let call = tokio::spawn(async move {
-        peer.call_tool(CallToolRequestParams::new("fake_read"))
+        peer.call_tool(CallToolRequestParams::new("fake-aft_fake_read"))
             .await
     });
 
@@ -330,7 +434,7 @@ async fn mcp_tools_call_cancel_sends_route_cancel() {
     let handle = peer
         .send_cancellable_request(
             ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
-                "fake_read",
+                "fake-aft_fake_read",
             ))),
             PeerRequestOptions::no_options(),
         )
@@ -370,7 +474,7 @@ async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
     let tool_error = tool_error_harness
         .client
         .peer()
-        .call_tool(CallToolRequestParams::new("fake_read"))
+        .call_tool(CallToolRequestParams::new("fake-aft_fake_read"))
         .await
         .unwrap();
     assert_eq!(tool_error.is_error, Some(true));
@@ -385,7 +489,7 @@ async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
     let subc_error = subc_error_harness
         .client
         .peer()
-        .call_tool(CallToolRequestParams::new("fake_read"))
+        .call_tool(CallToolRequestParams::new("fake-aft_fake_read"))
         .await
         .unwrap_err();
     match subc_error {
@@ -398,6 +502,411 @@ async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
         other => panic!("expected JSON-RPC MCP error for subc-level failure, got {other:?}"),
     }
     subc_error_harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_multi_provider_aggregation_routes_by_namespace_map() {
+    let harness = McpHarness::start_configured(
+        "mcp-multi-provider",
+        vec![
+            StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read,write")]),
+            StubProvider::new("mc", &[("FAKE_AFT_TOOLS", "memory")]),
+        ],
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "aft_write", "mc_memory"]
+    );
+
+    let mut args = JsonObject::new();
+    args.insert("key".to_owned(), json!("alpha"));
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("mc_memory").with_arguments(args))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+
+    let mc_event = wait_for_stub_event(harness.provider_events_path("mc"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("tool_call".to_owned()))
+    })
+    .await;
+    assert_eq!(
+        mc_event.get("name"),
+        Some(&Value::String("memory".to_owned()))
+    );
+    assert_eq!(mc_event.pointer("/arguments/key"), Some(&json!("alpha")));
+    assert!(
+        stub_events(harness.provider_events_path("aft"))
+            .unwrap()
+            .into_iter()
+            .all(|event| event.get("kind") != Some(&Value::String("tool_call".to_owned()))),
+        "mc_memory should not route to aft"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_project_config_disables_provider_and_tool() {
+    let project_config = r#"
+    {
+      // project config owns the user-visible exposure plane
+      "version": 1,
+      "providers": {
+        "mc": { "enabled": false },
+        "aft": { "tools": { "overrides": { "bash": false } } }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-config-disable",
+        vec![
+            StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read,bash,write")]),
+            StubProvider::new("mc", &[("FAKE_AFT_TOOLS", "memory")]),
+        ],
+        None,
+        Some(project_config),
+    )
+    .await;
+
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "aft_write"]
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_project_config_allowlist_mode_exposes_only_overrides() {
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": {
+          "tools": {
+            "defaultEnabled": false,
+            "overrides": { "read": true }
+          }
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-config-allowlist",
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "read,bash,write")],
+        )],
+        None,
+        Some(project_config),
+    )
+    .await;
+
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_two_tier_config_project_overrides_user_and_null_deletes_override() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": {
+          "tools": { "overrides": { "read": false, "write": false } }
+        }
+      }
+    }
+    "#;
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": {
+          "tools": { "overrides": { "read": true, "write": null } }
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-config-merge",
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "read,write")],
+        )],
+        Some(user_config),
+        Some(project_config),
+    )
+    .await;
+
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "aft_write"]
+    );
+    let attach = wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("attach".to_owned()))
+    })
+    .await;
+    let tiers = attach
+        .get("config")
+        .and_then(Value::as_array)
+        .expect("route.bind should receive raw config tiers");
+    assert_eq!(tiers.len(), 2);
+    assert_eq!(
+        tiers[0].get("tier"),
+        Some(&Value::String("user".to_owned()))
+    );
+    assert_eq!(
+        tiers[1].get("tier"),
+        Some(&Value::String("project".to_owned()))
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_namespace_override_changes_exposed_prefix() {
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": { "namespace": "tools" }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-namespace",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        None,
+        Some(project_config),
+    )
+    .await;
+
+    assert_eq!(list_tool_names(&harness).await, vec!["tools_read"]);
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("tools_read"))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+    let event = wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("tool_call".to_owned()))
+    })
+    .await;
+    assert_eq!(event.get("name"), Some(&Value::String("read".to_owned())));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_namespace_collision_fails_attach_closed() {
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": { "namespace": "dup" },
+        "mc": { "namespace": "dup" }
+      }
+    }
+    "#;
+    expect_shim_attach_failure(
+        "mcp-collision",
+        vec![
+            StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")]),
+            StubProvider::new("mc", &[("FAKE_AFT_TOOLS", "read")]),
+        ],
+        None,
+        Some(project_config),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_invalid_config_fails_attach_closed() {
+    expect_shim_attach_failure(
+        "mcp-invalid-config",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        None,
+        Some(r#"{ "providers": { "aft": {} } }"#),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_provider_goodbye_removes_tools_notifies_and_fails_inflight_call() {
+    let harness = McpHarness::start_configured(
+        "mcp-provider-goodbye",
+        vec![
+            StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")]),
+            StubProvider::new(
+                "mc",
+                &[
+                    ("FAKE_AFT_TOOLS", "memory"),
+                    ("FAKE_AFT_TOOLCALL_DELAY_MS", "5000"),
+                ],
+            ),
+        ],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "mc_memory"]
+    );
+
+    let peer = harness.client.peer().clone();
+    let call = tokio::spawn(async move {
+        peer.call_tool(CallToolRequestParams::new("mc_memory"))
+            .await
+    });
+    let _event = wait_for_stub_event(harness.provider_events_path("mc"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("request_received".to_owned()))
+            && event.pointer("/body_json/name") == Some(&Value::String("memory".to_owned()))
+    })
+    .await;
+
+    harness.providers.get("mc").unwrap().stop().await.unwrap();
+    timeout(
+        READ_TIMEOUT,
+        harness.client_handler.tool_list_changed_notify.notified(),
+    )
+    .await
+    .expect("provider GOODBYE should emit tools/list_changed");
+
+    let err = call.await.unwrap().unwrap_err();
+    match err {
+        ServiceError::McpError(error) => assert!(
+            error.message.contains("target_unavailable"),
+            "in-flight provider call should fail cleanly, got {error:?}"
+        ),
+        other => panic!("expected MCP error for provider death, got {other:?}"),
+    }
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_catalog_poller_adds_new_provider_and_notifies() {
+    let mut harness = McpHarness::start_configured(
+        "mcp-catalog-add",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
+
+    harness
+        .spawn_provider("mc", &[("FAKE_AFT_TOOLS", "memory")])
+        .await;
+    timeout(
+        READ_TIMEOUT,
+        harness.client_handler.tool_list_changed_notify.notified(),
+    )
+    .await
+    .expect("catalog generation poll should emit tools/list_changed");
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "mc_memory"]
+    );
+
+    harness.shutdown().await;
+}
+
+async fn list_tool_names(harness: &McpHarness) -> Vec<String> {
+    let mut names = harness
+        .client
+        .peer()
+        .list_tools(None)
+        .await
+        .unwrap()
+        .tools
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+async fn expect_shim_attach_failure(
+    label: &str,
+    provider_specs: Vec<StubProvider<'_>>,
+    user_config: Option<&str>,
+    project_config: Option<&str>,
+) {
+    let server = TestServer::start().await;
+    let mut providers = Vec::new();
+    for provider_spec in provider_specs {
+        let events_path = server
+            .daemon
+            .temp_dir
+            .join(format!("{label}-{}-events.jsonl", provider_spec.module_id));
+        let provider = supervisor(&server)
+            .spawn(stub_spec(
+                provider_spec.module_id,
+                &events_path,
+                &provider_spec.env,
+            ))
+            .unwrap();
+        wait_for_registration(
+            &server.daemon.registry,
+            provider_spec.module_id,
+            READ_TIMEOUT,
+        )
+        .await;
+        providers.push(provider);
+    }
+
+    let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
+    fs::create_dir_all(&user_config_home).unwrap();
+    if let Some(user_config) = user_config {
+        write_user_mcp_config(&user_config_home, user_config);
+    }
+
+    let module_connection_file = server
+        .daemon
+        .temp_dir
+        .join(format!("{label}-subc-mcp.json"));
+    let mut module = spawn_module(
+        &server.daemon.connection_file_path,
+        &module_connection_file,
+        &user_config_home,
+    );
+    wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
+
+    let project = TestProject::new(label);
+    if let Some(project_config) = project_config {
+        write_project_mcp_config(&project.path, project_config);
+    }
+
+    let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
+    let stdout = shim.stdout.take().expect("shim stdout should be available");
+    let stdin = shim.stdin.take().expect("shim stdin should be available");
+    let result = timeout(READ_TIMEOUT, TestMcpClient::new().serve((stdout, stdin)))
+        .await
+        .expect("rmcp client should finish when attach fails");
+    if let Ok(service) = result {
+        let _ = service.cancel().await;
+        panic!("shim unexpectedly initialized despite fail-closed attach config");
+    }
+
+    let _ = timeout(Duration::from_secs(2), shim.child.wait()).await;
+    if module.try_wait().unwrap().is_none() {
+        let _ = module.start_kill();
+        let _ = timeout(Duration::from_secs(2), module.wait()).await;
+    }
+    for provider in providers {
+        provider.stop().await.unwrap();
+    }
 }
 
 async fn start_test_daemon_with_process_liveness(
@@ -516,7 +1025,11 @@ fn candidate_is_fresh(candidate: &Path) -> bool {
     candidate_modified >= source_modified
 }
 
-fn spawn_module(subc_connection_file: &Path, module_connection_file: &Path) -> Child {
+fn spawn_module(
+    subc_connection_file: &Path,
+    module_connection_file: &Path,
+    xdg_config_home: &Path,
+) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
     command
         .arg("module")
@@ -524,6 +1037,7 @@ fn spawn_module(subc_connection_file: &Path, module_connection_file: &Path) -> C
         .arg(subc_connection_file)
         .arg("--connection-file")
         .arg(module_connection_file)
+        .env("XDG_CONFIG_HOME", xdg_config_home)
         .kill_on_drop(true);
     command.spawn().unwrap()
 }
@@ -549,13 +1063,18 @@ async fn wait_for_module_connection_file(child: &mut Child, path: &Path, wait: D
     }
 }
 
-fn spawn_shim(module_connection_file: &Path, project_root: &Path) -> ShimProcess {
+fn spawn_shim(
+    module_connection_file: &Path,
+    project_root: &Path,
+    xdg_config_home: &Path,
+) -> ShimProcess {
     let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
     command
         .arg("shim")
         .arg("--module-connection-file")
         .arg(module_connection_file)
         .env("CLAUDE_PROJECT_DIR", project_root)
+        .env("XDG_CONFIG_HOME", xdg_config_home)
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
@@ -568,6 +1087,18 @@ fn spawn_shim(module_connection_file: &Path, project_root: &Path) -> ShimProcess
         stdin: Some(stdin),
         stdout: Some(stdout),
     }
+}
+
+fn write_project_mcp_config(project_root: &Path, doc: &str) {
+    let dir = project_root.join(".cortexkit");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("mcp.jsonc"), doc).unwrap();
+}
+
+fn write_user_mcp_config(xdg_config_home: &Path, doc: &str) {
+    let dir = xdg_config_home.join("cortexkit");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("mcp.jsonc"), doc).unwrap();
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {

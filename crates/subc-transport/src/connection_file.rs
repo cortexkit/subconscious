@@ -187,7 +187,17 @@ fn open_owner_only_new(path: &Path) -> io::Result<File> {
     }
     #[cfg(windows)]
     {
-        // follow-up: Windows ACL owner-only
+        // No explicit DACL is set: the connection file is published under the
+        // per-user profile (XDG_RUNTIME_DIR is unset on Windows, so
+        // connection_file_path() falls back to %TEMP% =
+        // %LOCALAPPDATA%\Temp). That directory's inherited ACL already grants
+        // access to only the owning user, SYSTEM, and Administrators — so the
+        // same-host, non-admin attacker (the threat 0600 guards against on the
+        // world-readable Unix /tmp) cannot read the key here. Administrators can
+        // read any file (SeBackup/SeTakeOwnership) on either platform and are
+        // out of scope for a same-host secret. Revisit an explicit owner-only
+        // SECURITY_DESCRIPTOR only if the connection file ever moves off the
+        // per-user profile directory.
     }
     options.open(path)
 }

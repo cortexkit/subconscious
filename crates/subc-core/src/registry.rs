@@ -61,16 +61,6 @@ struct RegistryInner {
 }
 
 impl Registry {
-    /// Register a module manifest and mark the registration active.
-    pub fn register(
-        &self,
-        manifest: ModuleManifest,
-        negotiated_ver: u8,
-        connection_id: ConnectionId,
-    ) -> Result<ModuleRegistration, RegistryError> {
-        self.register_with_control_ops(manifest, negotiated_ver, connection_id, Vec::new())
-    }
-
     /// Register a module manifest with the module's effective granted control op set.
     pub fn register_with_control_ops(
         &self,

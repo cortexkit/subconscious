@@ -101,10 +101,6 @@ impl ControlHandler {
         self
     }
 
-    pub fn registry(&self) -> Arc<Registry> {
-        Arc::clone(&self.registry)
-    }
-
     pub fn forwarding(&self) -> Arc<ForwardingTable> {
         Arc::clone(&self.forwarding)
     }

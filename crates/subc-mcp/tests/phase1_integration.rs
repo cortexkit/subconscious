@@ -36,7 +36,7 @@ use subc_transport::{
 use tokio::{
     net::TcpListener,
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex as TokioMutex, Notify},
+    sync::Mutex as TokioMutex,
     task::JoinHandle,
     time::{sleep, timeout, Instant},
 };
@@ -120,18 +120,37 @@ impl ShimProcess {
 #[derive(Clone)]
 struct TestMcpClient {
     progress: Arc<TokioMutex<Vec<ProgressNotificationParam>>>,
-    progress_notify: Arc<Notify>,
+    progress_count: Arc<AtomicUsize>,
     tool_list_changed_count: Arc<AtomicUsize>,
-    tool_list_changed_notify: Arc<Notify>,
 }
 
 impl TestMcpClient {
     fn new() -> Self {
         Self {
             progress: Arc::new(TokioMutex::new(Vec::new())),
-            progress_notify: Arc::new(Notify::new()),
+            progress_count: Arc::new(AtomicUsize::new(0)),
             tool_list_changed_count: Arc::new(AtomicUsize::new(0)),
-            tool_list_changed_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Wait until `counter` advances past `baseline`, bounded by READ_TIMEOUT.
+    ///
+    /// Notifications are level-triggered counters (not edge-triggered `Notify`)
+    /// so a notification delivered before this poll begins is never lost — the
+    /// race that made the edge-triggered waits flake on Windows under load.
+    async fn wait_for_counter(counter: &AtomicUsize, baseline: usize, label: &str) {
+        let deadline = Instant::now() + READ_TIMEOUT;
+        loop {
+            if counter.load(Ordering::SeqCst) > baseline {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {label} (count still {}, baseline {baseline})",
+                    counter.load(Ordering::SeqCst)
+                );
+            }
+            sleep(Duration::from_millis(20)).await;
         }
     }
 }
@@ -143,10 +162,10 @@ impl ClientHandler for TestMcpClient {
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
         let progress = Arc::clone(&self.progress);
-        let notify = Arc::clone(&self.progress_notify);
+        let count = Arc::clone(&self.progress_count);
         async move {
             progress.lock().await.push(params);
-            notify.notify_waiters();
+            count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -155,7 +174,6 @@ impl ClientHandler for TestMcpClient {
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
         self.tool_list_changed_count.fetch_add(1, Ordering::SeqCst);
-        self.tool_list_changed_notify.notify_waiters();
         std::future::ready(())
     }
 }
@@ -406,12 +424,12 @@ async fn mcp_tools_call_forwards_progress_notifications() {
             .await
     });
 
-    timeout(
-        READ_TIMEOUT,
-        harness.client_handler.progress_notify.notified(),
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.progress_count,
+        0,
+        "progress notification before tool result",
     )
-    .await
-    .expect("timed out waiting for progress before tool result");
+    .await;
     let progress = harness.client_handler.progress.lock().await.clone();
     assert!(
         !progress.is_empty(),
@@ -448,11 +466,19 @@ async fn mcp_tools_call_cancel_sends_route_cancel() {
     .await
     .unwrap();
 
+    // The call resolves via one of two valid race outcomes: the client's local
+    // cancellation completes first (ServiceError::Cancelled), or the gateway's
+    // cancel-error response arrives first (McpError "tool call cancelled by MCP
+    // client"). Both mean the call was cancelled; the durable proof that the
+    // CANCEL actually reached the provider over the route is the stub event below.
     let err = handle.await_response().await.unwrap_err();
-    assert!(
-        matches!(err, ServiceError::Cancelled { .. }),
-        "client should observe a cancelled MCP request, got {err:?}"
-    );
+    match &err {
+        ServiceError::Cancelled { .. } => {}
+        ServiceError::McpError(error) if error.message.contains("cancelled") => {}
+        other => panic!(
+            "client should observe a cancelled MCP request (Cancelled or a cancelled McpError), got {other:?}"
+        ),
+    }
 
     let cancel = wait_for_stub_event(&harness.events_path, READ_TIMEOUT, |event| {
         event.get("kind") == Some(&Value::String("cancel".to_owned()))
@@ -774,12 +800,12 @@ async fn mcp_provider_goodbye_removes_tools_notifies_and_fails_inflight_call() {
     .await;
 
     harness.providers.get("mc").unwrap().stop().await.unwrap();
-    timeout(
-        READ_TIMEOUT,
-        harness.client_handler.tool_list_changed_notify.notified(),
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        0,
+        "tools/list_changed after provider GOODBYE",
     )
-    .await
-    .expect("provider GOODBYE should emit tools/list_changed");
+    .await;
 
     let err = call.await.unwrap().unwrap_err();
     match err {
@@ -808,12 +834,12 @@ async fn mcp_catalog_poller_adds_new_provider_and_notifies() {
     harness
         .spawn_provider("mc", &[("FAKE_AFT_TOOLS", "memory")])
         .await;
-    timeout(
-        READ_TIMEOUT,
-        harness.client_handler.tool_list_changed_notify.notified(),
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        0,
+        "tools/list_changed after catalog generation poll",
     )
-    .await
-    .expect("catalog generation poll should emit tools/list_changed");
+    .await;
     assert_eq!(
         list_tool_names(&harness).await,
         vec!["aft_read", "mc_memory"]

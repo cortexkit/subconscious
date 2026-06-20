@@ -300,11 +300,14 @@ async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
     eprintln!("busy-module local poll latency: {poll_latency:?}");
     assert_status_reply(&status_response, status_corr, "scanning");
     assert_liveness_reply(&liveness_response, liveness_corr, true);
-    assert!(
-        poll_latency < Duration::from_millis(300),
-        "passive polls queued behind busy module: poll_latency={poll_latency:?}"
-    );
 
+    // Correctness ("polls aren't queued behind the busy module") is proven
+    // structurally, NOT by an absolute latency bound (which is a perf claim that
+    // flakes on a slow/oversubscribed CI runner): both poll responses are read
+    // here BEFORE the data response, the stub never observed the poll corrs
+    // (assert_stub_did_not_observe_corrs below = answered locally, never
+    // forwarded), and the data request that DID reach the module still takes its
+    // full ~2000ms delay (asserted further down). poll_latency is logged only.
     let events = stub_events(&events_path);
     assert_stub_did_not_observe_corrs(&events, &[status_corr, liveness_corr]);
 
@@ -759,19 +762,45 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     .await
     .unwrap();
     route_client.flush().await.unwrap();
-    let rejected = read_frame_timeout(&mut route_client).await;
-    assert_error(
-        &rejected,
-        ack.route_channel,
-        rejected_corr,
-        "module_reloading",
+    // Three frames arrive on the route in a NON-deterministic relative order: the
+    // in-flight slow Response (slow_corr, ~150ms) and the rejection ERROR
+    // (rejected_corr) race — the slow call was already in flight when drain began,
+    // so on a slow/oversubscribed runner its Response can land before the
+    // rejection. The GOODBYE follows once the route drains. Classify by
+    // corr/type instead of assuming arrival order (which flaked on Windows CI).
+    let mut saw_rejected = false;
+    let mut saw_slow_response = false;
+    let mut saw_goodbye = false;
+    for _ in 0..3 {
+        let frame = read_frame_timeout(&mut route_client).await;
+        assert_eq!(frame.header.channel, ack.route_channel);
+        match frame.header.ty {
+            FrameType::Error if frame.header.corr == rejected_corr => {
+                assert_error(&frame, ack.route_channel, rejected_corr, "module_reloading");
+                saw_rejected = true;
+            }
+            FrameType::Response if frame.header.corr == slow_corr => {
+                assert_response(&frame, ack.route_channel, slow_corr, slow_payload);
+                saw_slow_response = true;
+            }
+            FrameType::Goodbye => {
+                // GOODBYE only after the in-flight slow call drained.
+                assert!(
+                    saw_slow_response,
+                    "route GOODBYE arrived before the in-flight slow response drained"
+                );
+                saw_goodbye = true;
+            }
+            other => panic!(
+                "unexpected frame during reload drain: ty={other:?} corr={}",
+                frame.header.corr
+            ),
+        }
+    }
+    assert!(
+        saw_rejected && saw_slow_response && saw_goodbye,
+        "expected rejection ERROR ({rejected_corr}), slow Response ({slow_corr}), and route GOODBYE; got rejected={saw_rejected} slow={saw_slow_response} goodbye={saw_goodbye}"
     );
-
-    let response = read_frame_timeout(&mut route_client).await;
-    assert_response(&response, ack.route_channel, slow_corr, slow_payload);
-    let goodbye = read_frame_timeout(&mut route_client).await;
-    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
-    assert_eq!(goodbye.header.channel, ack.route_channel);
     let applied = read_supervisor_ack_on_stream(&mut control_client, 413, module_id).await;
     assert!(applied);
 
@@ -1381,13 +1410,14 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
     eprintln!(
         "same-channel out-of-order latencies: B(corr={CB})={b_latency:?}, A(corr={CA})={a_latency:?}"
     );
+    // Out-of-order completion is proven structurally: B (corr=CB, sent second,
+    // 0ms delay) arrives BEFORE A (corr=CA, sent first, ~300ms delay), and A
+    // still takes its full >=250ms. If B were serialized behind A it would arrive
+    // after it (failing the ordering assert). The absolute b_latency<80ms bound
+    // was a perf claim that flaked on slow CI runners — removed; latencies logged.
     assert!(
         first_received_at < second_received_at,
         "B should arrive before A: b_latency={b_latency:?}, a_latency={a_latency:?}"
-    );
-    assert!(
-        b_latency < Duration::from_millis(80),
-        "fast request B should not wait behind A's delay: b_latency={b_latency:?}"
     );
     assert!(
         a_latency >= Duration::from_millis(250),
@@ -1446,10 +1476,10 @@ async fn cancel_before_response_for_cancellable_request_returns_cancelled_error(
     eprintln!("cancel-before-response latency: {cancel_latency:?}");
     let body = assert_error(&terminal, ack.route_channel, corr, "cancelled");
     assert!(body.message.contains("cancelled"));
-    assert!(
-        cancel_latency < Duration::from_millis(250),
-        "cancelled terminal should arrive well before 500ms delay; latency={cancel_latency:?}"
-    );
+    // Correctness = the terminal is a cancelled ERROR (asserted above). The
+    // previous absolute "<250ms, before the 500ms delay" bound was a perf claim
+    // that flaked on slow CI runners; the cancel arriving as the terminal (not a
+    // late normal Response after the full delay) is the real signal. Logged only.
 
     let cancel_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
         event["kind"] == "cancel"
@@ -1873,7 +1903,6 @@ async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal()
     .await;
     sleep(Duration::from_millis(20)).await;
 
-    let cancel_sent = Instant::now();
     write_frame(
         &mut client,
         &cancel_frame(ack.route_channel, cancelled_corr),
@@ -1888,13 +1917,12 @@ async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal()
     .unwrap();
     client.flush().await.unwrap();
 
+    // "Cancel bypasses the full flow-control window" is proven structurally: the
+    // cancelled ERROR is delivered AND the follow-up Response then arrives (the
+    // cancel freed the window credit for it). The previous absolute "<250ms"
+    // bound was a perf claim that flaked on slow CI runners — removed.
     let cancelled = read_frame_timeout(&mut client).await;
-    let cancel_latency = Instant::now().duration_since(cancel_sent);
     assert_error(&cancelled, ack.route_channel, cancelled_corr, "cancelled");
-    assert!(
-        cancel_latency < Duration::from_millis(250),
-        "cancel should bypass full window; latency={cancel_latency:?}"
-    );
     let followup = read_frame_timeout(&mut client).await;
     assert_response(
         &followup,

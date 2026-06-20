@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub mod control;
+pub mod daemon_config;
 pub mod forwarding;
 pub mod identity;
 pub mod registry;

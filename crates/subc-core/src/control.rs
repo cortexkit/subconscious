@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CatalogEntry, ClientControlRequest, ClientControlResponse, PollKind, SupervisorEntry,
 };
@@ -166,6 +166,17 @@ impl ControlHandler {
         Arc::clone(&self.forwarding)
     }
 
+    fn deregister_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        let registrations = self.registry.deregister_connection(connection_id)?;
+        if !registrations.is_empty() {
+            crate::supervise::notify_registration_release();
+        }
+        Ok(registrations)
+    }
+
     /// Test-only compatibility entry point for unit control handling that does not have a socket sink.
     ///
     /// The real server path uses [`Self::handle_control_frame`] so module HELLO registration can
@@ -214,16 +225,16 @@ impl ControlHandler {
                     )?]);
                 }
 
-                let request = match serde_json::from_slice::<ClientControlRequest>(&frame.body) {
+                let request = match parse_client_control_request(&frame.body) {
                     Ok(request) => request,
-                    Err(err) if is_unknown_control_op_error(&err) => {
+                    Err((err, ClientControlRequestBodyError::UnknownOp)) => {
                         return Ok(vec![control_error_frame(
                             &frame,
                             "unknown_control_op",
                             format!("unknown client control op: {err}"),
                         )?])
                     }
-                    Err(err) => {
+                    Err((err, ClientControlRequestBodyError::InvalidBody)) => {
                         return Ok(vec![control_error_frame(
                             &frame,
                             "invalid_control_body",
@@ -269,7 +280,7 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
-        let registrations = self.registry.deregister_connection(connection_id);
+        let registrations = self.deregister_connection(connection_id);
         if let Ok(released_routes) = self.forwarding.cleanup_connection(connection_id) {
             self.emit_route_goodbyes(released_routes);
         }
@@ -434,7 +445,7 @@ impl ControlHandler {
                     concurrency,
                     sink,
                 ) {
-                    let _ = self.registry.deregister_connection(connection_id);
+                    let _ = self.deregister_connection(connection_id);
                     return Ok(vec![control_error_frame(
                         &frame,
                         forwarding_error_code(&err),
@@ -1140,8 +1151,7 @@ impl ControlHandler {
 
     fn handle_goodbye(&self, connection_id: ConnectionId) -> Result<Vec<Frame>, RouterError> {
         debug!(connection_id = connection_id.get(), "handling GOODBYE");
-        self.registry
-            .deregister_connection(connection_id)
+        self.deregister_connection(connection_id)
             .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
         let released_routes = self
             .forwarding
@@ -1225,14 +1235,44 @@ fn is_routable_role(role: &ProviderRole) -> bool {
     )
 }
 
-fn is_unknown_control_op_error(err: &serde_json::Error) -> bool {
-    err.to_string().contains("unknown variant")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientControlRequestBodyError {
+    UnknownOp,
+    InvalidBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientControlRequestOpProbe {
+    op: String,
+}
+
+fn parse_client_control_request(
+    body: &[u8],
+) -> Result<ClientControlRequest, (serde_json::Error, ClientControlRequestBodyError)> {
+    serde_json::from_slice::<ClientControlRequest>(body).map_err(|err| {
+        let classification = match serde_json::from_slice::<ClientControlRequestOpProbe>(body) {
+            Ok(probe) if SUBC_CONTROL_OPS.contains(&probe.op.as_str()) => {
+                ClientControlRequestBodyError::InvalidBody
+            }
+            Ok(_) => ClientControlRequestBodyError::UnknownOp,
+            Err(_) => ClientControlRequestBodyError::InvalidBody,
+        };
+        (err, classification)
+    })
 }
 
 fn manifest_provides_routable_role(manifest: &ModuleManifest) -> bool {
     manifest.provides.iter().any(is_routable_role)
 }
 
+/// Returns the routable-provider concurrency subc should enforce for this manifest.
+///
+/// Today only `ProviderRole::ToolProvider` carries an explicit manifest
+/// concurrency. `ManagementSurface` and `InternalService` modules therefore
+/// still fall back to `Concurrency::ModuleManaged`, which maps to subc's
+/// current default 32-credit per-route window, and there is no manifest-level
+/// override for those roles yet. A per-role concurrency field is deferred until
+/// such a module exists.
 fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {
     manifest
         .provides
@@ -1798,6 +1838,30 @@ mod tests {
         assert_eq!(response[0].header.ty, FrameType::Error);
         assert_eq!(response[0].header.corr, 55);
         assert_eq!(parse_error(&response[0])["code"], "unknown_control_op");
+    }
+
+    #[tokio::test]
+    async fn malformed_control_bodies_return_invalid_control_body() {
+        let handler = ControlHandler::default();
+        let (ctx, _rx) = route_ctx(ConnectionId::new(78));
+
+        for (corr, body) in [
+            (56, br#"{"route_channel":1}"#.as_slice()),
+            (57, br#"{"op":17,"route_channel":1}"#.as_slice()),
+            (
+                58,
+                br#"{"op":"route.poll","route_channel":"bad","kind":"status"}"#.as_slice(),
+            ),
+        ] {
+            let request =
+                Frame::build(FrameType::Request, control_flags(), 0, corr, body.to_vec()).unwrap();
+            let response = handler.handle_control_frame(&ctx, request).await.unwrap();
+
+            assert_eq!(response.len(), 1);
+            assert_eq!(response[0].header.ty, FrameType::Error);
+            assert_eq!(response[0].header.corr, corr);
+            assert_eq!(parse_error(&response[0])["code"], "invalid_control_body");
+        }
     }
 
     #[tokio::test]

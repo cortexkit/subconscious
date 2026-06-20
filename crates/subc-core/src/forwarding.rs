@@ -780,6 +780,7 @@ impl ForwardingTable {
                 }
             }
         }
+        inner.next_client_channel.remove(&connection_id);
 
         Ok(released)
     }
@@ -1236,5 +1237,27 @@ mod tests {
         }
 
         assert_eq!(wrapped_channel, Some(1));
+    }
+
+    #[test]
+    fn cleanup_connection_prunes_stale_next_client_channel_cursor() {
+        let forwarding = ForwardingTable::default();
+        let client = ConnectionId::new(60);
+        forwarding
+            .inner
+            .lock()
+            .unwrap()
+            .next_client_channel
+            .insert(client, 41);
+
+        let released = forwarding.cleanup_connection(client).unwrap();
+
+        assert!(released.is_empty());
+        assert!(!forwarding
+            .inner
+            .lock()
+            .unwrap()
+            .next_client_channel
+            .contains_key(&client));
     }
 }

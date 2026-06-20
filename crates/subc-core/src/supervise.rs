@@ -143,9 +143,21 @@ struct SupervisorSnapshot {
 
 impl SupervisorSnapshot {
     fn starting() -> Self {
+        Self::new(ModuleState::Starting, true)
+    }
+
+    fn disabled() -> Self {
+        Self::new(ModuleState::Disabled, false)
+    }
+
+    fn failed() -> Self {
+        Self::new(ModuleState::Failed, true)
+    }
+
+    fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
-            state: ModuleState::Starting,
-            enabled: true,
+            state,
+            enabled,
             process_alive: false,
             restart_count: 0,
             pid: None,
@@ -316,24 +328,73 @@ impl Supervisor {
     /// TCP+key connection file, authenticate to the already-running listener, and
     /// register with channel-0 `HELLO` using `spec.module_id` as its manifest id.
     pub fn spawn(&self, spec: ModuleSpec) -> Result<SupervisedModule, SuperviseError> {
-        if spec.module_id.trim().is_empty() {
-            return Err(SuperviseError::InvalidSpec {
-                reason: "module_id must not be empty".to_string(),
-            });
-        }
+        validate_spec(&spec)?;
 
-        let runtime = SupervisorRuntimeConfig {
-            restart_policy: self.restart_policy,
-            drain_timeout: self.drain_timeout,
-            connection_file_path: self.connection_file_path.clone(),
-            forwarding: self.forwarding.clone(),
-        };
+        let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let child = spawn_child(&spec, runtime.connection_file_path.as_deref())?;
         set_running(&snapshot, child.id())?;
         self.process_liveness
             .track(spec.module_id.clone(), Arc::clone(&snapshot));
 
+        Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
+    }
+
+    /// Start supervising a module declared in daemon configuration.
+    ///
+    /// Unlike [`Self::spawn`], this records disabled modules and immediate spawn
+    /// failures in the supervisor handle so operator-facing `supervisor.list`
+    /// reflects every configured module while daemon startup continues.
+    pub fn supervise_configured(
+        &self,
+        spec: ModuleSpec,
+        enabled: bool,
+    ) -> Result<SupervisedModule, SuperviseError> {
+        validate_spec(&spec)?;
+
+        let runtime = self.runtime_config();
+        if !enabled {
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
+            return Ok(self.supervised_module(spec, runtime, snapshot, None));
+        }
+
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        match spawn_child(&spec, runtime.connection_file_path.as_deref()) {
+            Ok(child) => {
+                set_running(&snapshot, child.id())?;
+                self.process_liveness
+                    .track(spec.module_id.clone(), Arc::clone(&snapshot));
+                Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
+            }
+            Err(err) => {
+                error!(
+                    module_id = %spec.module_id,
+                    program = %spec.program.display(),
+                    error = %err,
+                    "configured module failed to spawn; marking failed and continuing"
+                );
+                let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::failed()));
+                Ok(self.supervised_module(spec, runtime, snapshot, None))
+            }
+        }
+    }
+
+    fn runtime_config(&self) -> SupervisorRuntimeConfig {
+        SupervisorRuntimeConfig {
+            restart_policy: self.restart_policy,
+            drain_timeout: self.drain_timeout,
+            connection_file_path: self.connection_file_path.clone(),
+            forwarding: self.forwarding.clone(),
+        }
+    }
+
+    fn supervised_module(
+        &self,
+        spec: ModuleSpec,
+        runtime: SupervisorRuntimeConfig,
+        snapshot: SharedSnapshot,
+        child: Option<Child>,
+    ) -> SupervisedModule {
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
@@ -357,7 +418,7 @@ impl Supervisor {
         if let Some(supervisor_handle) = &self.supervisor_handle {
             supervisor_handle.insert(module.clone());
         }
-        Ok(module)
+        module
     }
 }
 
@@ -635,16 +696,25 @@ impl Error for SuperviseError {
     }
 }
 
+fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
+    if spec.module_id.trim().is_empty() {
+        return Err(SuperviseError::InvalidSpec {
+            reason: "module_id must not be empty".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 async fn supervise_loop(
     spec: ModuleSpec,
     runtime: SupervisorRuntimeConfig,
     registry: Arc<Registry>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     snapshot: SharedSnapshot,
-    child: Child,
+    mut child: Option<Child>,
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
-    let mut child = Some(child);
     loop {
         if child.is_some() {
             let active_child = child.as_mut().expect("child checked above");

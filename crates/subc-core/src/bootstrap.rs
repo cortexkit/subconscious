@@ -15,13 +15,16 @@ use subc_transport::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    task::{JoinError, JoinHandle},
     time::{sleep, timeout},
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
+    daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
-    ControlHandler, Router, SupervisorHandle, SupervisorProcessLiveness,
+    ControlHandler, ForwardingTable, ModuleSpec, Registry, RestartPolicy, Router, Supervisor,
+    SupervisorHandle, SupervisorProcessLiveness,
 };
 use std::sync::Arc;
 
@@ -47,6 +50,7 @@ pub struct BootstrapConfig {
     pub connection_file_path: PathBuf,
     pub port: u16,
     pub daemon_ver: String,
+    configured_modules: Vec<ConfiguredModule>,
 }
 
 impl BootstrapConfig {
@@ -55,17 +59,64 @@ impl BootstrapConfig {
             connection_file_path: connection_file_path.into(),
             port,
             daemon_ver: DAEMON_VERSION.to_owned(),
+            configured_modules: Vec::new(),
         }
     }
 
     pub fn from_env() -> Result<Self, BootstrapError> {
+        Self::from_env_with_daemon_config_path(daemon_config::default_config_path())
+    }
+
+    pub fn from_env_with_daemon_config_path(
+        daemon_config_path: impl AsRef<Path>,
+    ) -> Result<Self, BootstrapError> {
+        let daemon_config =
+            daemon_config::load(daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+        let config_port = daemon_config.as_ref().and_then(|config| config.port);
+        let configured_modules = daemon_config
+            .map(|config| config.modules)
+            .unwrap_or_default();
+
         let port = match env::var(SUBC_PORT_ENV) {
-            Ok(raw) if !raw.trim().is_empty() => raw
-                .parse::<u16>()
-                .map_err(|source| BootstrapError::InvalidPort { raw, source })?,
-            Ok(_) | Err(_) => DEFAULT_SUBC_PORT,
+            Ok(raw) if !raw.trim().is_empty() => {
+                let port = raw
+                    .parse::<u16>()
+                    .map_err(|source| BootstrapError::InvalidPort { raw, source })?;
+                if let Some(config_port) = config_port {
+                    info!(
+                        env = SUBC_PORT_ENV,
+                        env_port = port,
+                        config_port,
+                        "SUBC_PORT overrides daemon config port"
+                    );
+                }
+                port
+            }
+            Ok(_) | Err(_) => config_port.unwrap_or(DEFAULT_SUBC_PORT),
         };
-        Ok(Self::new(connection_file_path(), port))
+
+        Ok(Self::new(connection_file_path(), port).with_configured_modules(configured_modules))
+    }
+
+    pub fn with_daemon_config_path(
+        self,
+        daemon_config_path: impl AsRef<Path>,
+    ) -> Result<Self, BootstrapError> {
+        let configured_modules = daemon_config::load(daemon_config_path)
+            .map_err(BootstrapError::DaemonConfig)?
+            .map(|config| config.modules)
+            .unwrap_or_default();
+        Ok(self.with_configured_modules(configured_modules))
+    }
+
+    pub fn with_configured_modules(
+        mut self,
+        modules: impl IntoIterator<Item = ConfiguredModule>,
+    ) -> Self {
+        self.configured_modules = modules.into_iter().collect();
+        self.configured_modules
+            .sort_by(|left, right| left.module_id.cmp(&right.module_id));
+        self
     }
 }
 
@@ -106,36 +157,90 @@ pub fn connection_file_path() -> PathBuf {
 /// existing connection file, this returns `Ok(())` after logging and the caller
 /// exits with status 0.
 pub async fn run() -> Result<(), BootstrapError> {
-    let config = BootstrapConfig::from_env()?;
+    run_with_config(BootstrapConfig::from_env()?).await
+}
+
+pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
+    let configured_modules = config.configured_modules.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
             Ok(())
         }
-        Outcome::Bound(bound) => {
-            info!(
-                connection_file = %bound.connection_file_path.display(),
-                endpoints = ?bound.connection_info.endpoints,
-                "subc daemon starting"
-            );
-            let process_liveness = Arc::new(SupervisorProcessLiveness::new());
-            let supervisor_handle = SupervisorHandle::new();
-            let control = Arc::new(
-                ControlHandler::default()
-                    .with_process_liveness(process_liveness)
-                    .with_supervisor(supervisor_handle),
-            );
-            let router = Arc::new(Router::with_control_handler(control));
-            let auth = ServerAuth::new(
-                bound.connection_info.key.clone(),
-                bound.connection_info.daemon_id,
-                bound.connection_info.daemon_ver.clone(),
-            );
-            serve_listeners(bound.listeners, router, auth)
-                .await
-                .map_err(BootstrapError::Serve)
+        Outcome::Bound(bound) => serve_bound_daemon(bound, configured_modules).await,
+    }
+}
+
+pub async fn run_with_daemon_config_path(
+    config: BootstrapConfig,
+    daemon_config_path: impl AsRef<Path>,
+) -> Result<(), BootstrapError> {
+    run_with_config(config.with_daemon_config_path(daemon_config_path)?).await
+}
+
+async fn serve_bound_daemon(
+    bound: BoundDaemon,
+    configured_modules: Vec<ConfiguredModule>,
+) -> Result<(), BootstrapError> {
+    info!(
+        connection_file = %bound.connection_file_path.display(),
+        endpoints = ?bound.connection_info.endpoints,
+        configured_modules = configured_modules.len(),
+        "subc daemon starting"
+    );
+
+    let registry = Arc::new(Registry::default());
+    let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+    let supervisor_handle = SupervisorHandle::new();
+    let control = Arc::new(
+        ControlHandler::with_forwarding(
+            Arc::clone(&registry),
+            Arc::new(ForwardingTable::default()),
+        )
+        .with_process_liveness(process_liveness.clone())
+        .with_supervisor(supervisor_handle.clone()),
+    );
+    let forwarding = control.forwarding();
+    let router = Arc::new(Router::with_control_handler(control));
+    let auth = ServerAuth::new(
+        bound.connection_info.key.clone(),
+        bound.connection_info.daemon_id,
+        bound.connection_info.daemon_ver.clone(),
+    );
+    let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+        .with_process_liveness(process_liveness)
+        .with_forwarding(forwarding)
+        .with_handle(supervisor_handle)
+        .with_connection_file_path(bound.connection_file_path.clone());
+
+    let mut serve_task =
+        AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
+    tokio::task::yield_now().await;
+
+    for configured in configured_modules {
+        let enabled = configured.enabled;
+        let module_id = configured.module_id.clone();
+        let spec = ModuleSpec {
+            module_id: configured.module_id,
+            program: configured.program,
+            args: configured.args,
+            env: configured.env,
+        };
+        match supervisor.supervise_configured(spec, enabled) {
+            Ok(_) => {
+                info!(module_id = %module_id, enabled, "configured module supervised");
+            }
+            Err(err) => {
+                error!(module_id = %module_id, error = %err, "failed to supervise configured module; continuing daemon startup");
+            }
         }
     }
+
+    serve_task
+        .join()
+        .await
+        .map_err(BootstrapError::ServeJoin)?
+        .map_err(BootstrapError::Serve)
 }
 
 /// Find an existing daemon or atomically bind loopback TCP for this daemon.
@@ -338,6 +443,28 @@ fn ipv6_loopback_unavailable(err: &io::Error) -> bool {
     ) || matches!(err.raw_os_error(), Some(47) | Some(49) | Some(97))
 }
 
+struct AbortOnDrop<T> {
+    handle: JoinHandle<T>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self { handle }
+    }
+
+    async fn join(&mut self) -> Result<T, JoinError> {
+        (&mut self.handle).await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+    }
+}
+
 struct StartLock {
     path: PathBuf,
     _file: fs::File,
@@ -494,7 +621,9 @@ pub enum BootstrapError {
         host: String,
         source: io::Error,
     },
+    DaemonConfig(DaemonConfigError),
     Serve(ServerError),
+    ServeJoin(tokio::task::JoinError),
 }
 
 impl fmt::Display for BootstrapError {
@@ -545,7 +674,9 @@ impl fmt::Display for BootstrapError {
             Self::LocalAddr { host, source } => {
                 write!(f, "failed to read local address for {host}: {source}")
             }
+            Self::DaemonConfig(err) => write!(f, "failed to load daemon config: {err}"),
             Self::Serve(err) => write!(f, "daemon server failed: {err}"),
+            Self::ServeJoin(err) => write!(f, "daemon server task failed: {err}"),
         }
     }
 }
@@ -561,7 +692,9 @@ impl Error for BootstrapError {
             | Self::RemoveStale { source, .. }
             | Self::Bind { source, .. }
             | Self::LocalAddr { source, .. } => Some(source),
+            Self::DaemonConfig(err) => Some(err),
             Self::Serve(err) => Some(err),
+            Self::ServeJoin(err) => Some(err),
             Self::StartLockBusy { .. } => None,
         }
     }
@@ -707,13 +840,36 @@ mod tests {
     }
 
     #[test]
-    fn configured_port_uses_default_and_env_override() {
+    fn configured_port_uses_default_config_and_env_override() {
         let _env_lock = ENV_LOCK.lock().unwrap();
+        let config_path =
+            temp_connection_file_path("daemon-config-port").with_file_name("subc.jsonc");
+
         let _port = EnvGuard::unset(SUBC_PORT_ENV);
-        assert_eq!(BootstrapConfig::from_env().unwrap().port, DEFAULT_SUBC_PORT);
+        assert_eq!(
+            BootstrapConfig::from_env_with_daemon_config_path(&config_path)
+                .unwrap()
+                .port,
+            DEFAULT_SUBC_PORT
+        );
+
+        fs::write(&config_path, r#"{ "version": 1, "port": 8123 }"#).unwrap();
+        assert_eq!(
+            BootstrapConfig::from_env_with_daemon_config_path(&config_path)
+                .unwrap()
+                .port,
+            8123
+        );
 
         let _port = EnvGuard::set_str(SUBC_PORT_ENV, "9012");
-        assert_eq!(BootstrapConfig::from_env().unwrap().port, 9012);
+        assert_eq!(
+            BootstrapConfig::from_env_with_daemon_config_path(&config_path)
+                .unwrap()
+                .port,
+            9012
+        );
+
+        cleanup_connection_file_path(&config_path);
     }
 
     #[tokio::test]

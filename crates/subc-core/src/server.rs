@@ -5,6 +5,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpListener,
     sync::{mpsc, Semaphore},
+    task::JoinHandle,
 };
 use tracing::{debug, warn};
 
@@ -111,18 +112,40 @@ pub async fn serve_listeners(
     }
 
     let (tx, mut rx) = mpsc::channel(listeners.len());
+    let mut accept_tasks = AbortTasksOnDrop::default();
     for listener in listeners {
         let router = Arc::clone(&router);
         let auth = auth.clone();
         let tx = tx.clone();
-        tokio::spawn(async move {
+        accept_tasks.push(tokio::spawn(async move {
             let result = serve_listener(listener, router, auth).await;
             let _ = tx.send(result).await;
-        });
+        }));
     }
     drop(tx);
 
     rx.recv().await.unwrap_or(Ok(()))
+}
+
+#[derive(Default)]
+struct AbortTasksOnDrop {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl AbortTasksOnDrop {
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+}
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            if !handle.is_finished() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 /// Run the authenticated frame read -> route loop for one connection.

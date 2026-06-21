@@ -77,10 +77,17 @@ pub(crate) struct ClientRoute {
 ///   stale module frames for the released channel (see router.rs), so subc's
 ///   own routing is correct. The residual: under SUSTAINED module-egress
 ///   backpressure a module-targeted route-gone notification can be lost, which a
-///   module using it for client-refcounting (e.g. AFT's detach accounting) would
-///   miss. Reliable module-targeted control delivery without a cross-tenant
-///   close is a follow-up (a dedicated module control lane), not a gating fix;
-///   never-close is the invariant that matters here.
+///   module using it for client-refcounting (e.g. AFT's session accounting)
+///   would miss. This is INTENTIONALLY ACCEPTED, not a gap. A consuming module
+///   must bound stale bindings with its own idle-activity reaper (last-touched
+///   TTL) independent of route-gone signals — AFT confirmed this and locked it
+///   as a Phase 4 acceptance criterion, so a lost GOODBYE degrades to "the
+///   binding stays warm until its idle TTL" (bounded wasted resources), never an
+///   unbounded leak; disk-durable replay is unaffected. A dedicated reliable
+///   module control lane was evaluated (Oracle bg_87eda7f1) and deliberately NOT
+///   built: it would add starvation-avoidance machinery to the thin core for a
+///   bounded warm-resource window that is not a correctness issue. never-close
+///   is the invariant that matters here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GoodbyeTargetKind {
     Client,

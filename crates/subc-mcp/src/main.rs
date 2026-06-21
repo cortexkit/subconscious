@@ -78,15 +78,27 @@ enum SubcEvent {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run_from_env().await {
-        eprintln!("subc-mcp: {error}");
-        let mut source = error.source();
-        while let Some(err) = source {
-            eprintln!("  caused by: {err}");
-            source = err.source();
+    let code = match run_from_env().await {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("subc-mcp: {error}");
+            let mut source = error.source();
+            while let Some(err) = source {
+                eprintln!("  caused by: {err}");
+                source = err.source();
+            }
+            1
         }
-        process::exit(1);
-    }
+    };
+    // Terminate via an explicit exit instead of returning into the tokio runtime's
+    // drop. The shim pipes the host's stdin through `tokio::io::stdin()`, which is
+    // backed by an UNCANCELLABLE blocking-read thread parked on fd 0; when the
+    // socket side closes first (e.g. the module rejects the attach), the async body
+    // finishes but runtime shutdown would block forever waiting for that stranded
+    // stdin thread, so the process would not exit until the host closed stdin. A
+    // host waiting for a response never closes stdin, so fail-closed would hang the
+    // host. stdout is already flushed in `pipe_stdio` before this point.
+    process::exit(code);
 }
 
 async fn run_from_env() -> Result<()> {

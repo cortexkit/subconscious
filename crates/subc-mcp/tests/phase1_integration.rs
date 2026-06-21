@@ -1020,17 +1020,28 @@ async fn expect_shim_attach_failure(
     }
 
     let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
-    let stdout = shim.stdout.take().expect("shim stdout should be available");
-    let stdin = shim.stdin.take().expect("shim stdin should be available");
-    let result = timeout(READ_TIMEOUT, TestMcpClient::new().serve((stdout, stdin)))
+    // Fail-closed contract: when the module rejects the attach it drops the shim's
+    // transport socket, so the shim's socket->stdout copy hits EOF and the shim
+    // process must exit, closing its stdout. A real MCP host observes fail-closed
+    // through that child-process / stdio lifecycle, so assert the production signal
+    // directly: the shim EXITS, promptly and cleanly.
+    //
+    // The earlier check instead waited for an in-process rmcp client's serve() to
+    // resolve, which hung to the timeout under load: the shim saw the socket EOF in
+    // well under a millisecond but did NOT exit, because tokio::io::stdin()'s
+    // uncancellable blocking-read thread stranded runtime shutdown until the client
+    // dropped the shim's stdin at the timeout. The product fix (explicit
+    // process::exit in main) makes the shim exit on socket EOF; this assertion
+    // guards that fix.
+    let exit = timeout(SETUP_TIMEOUT, shim.child.wait())
         .await
-        .expect("rmcp client should finish when attach fails");
-    if let Ok(service) = result {
-        let _ = service.cancel().await;
-        panic!("shim unexpectedly initialized despite fail-closed attach config");
-    }
+        .expect("shim must exit promptly when attach fails (it did not within SETUP_TIMEOUT)")
+        .expect("waiting for the shim child to exit failed");
+    assert!(
+        exit.success(),
+        "shim should exit cleanly on fail-closed attach (socket EOF), got {exit:?}"
+    );
 
-    let _ = timeout(Duration::from_secs(2), shim.child.wait()).await;
     if module.try_wait().unwrap().is_none() {
         let _ = module.start_kill();
         let _ = timeout(Duration::from_secs(2), module.wait()).await;

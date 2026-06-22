@@ -33,17 +33,24 @@ use subc_core::{
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{
-    session::ConfigTier, BindIdentity, ErrorBody, Flags, FrameType, Priority, RouteTarget,
+    manifest::{
+        Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
+        Tool as ProviderTool, TrustTier,
+    },
+    session::{ConfigTier, ModuleControlRequest, ModuleControlResponse},
+    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
+    RouteTarget, PROTOCOL_VERSION,
 };
 use subc_transport::{
-    authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
-    SCHEMA_VERSION,
+    authenticate_client, authenticate_server, generate_daemon_id, generate_key, write_atomic,
+    ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex as TokioMutex,
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::{oneshot, Mutex as TokioMutex},
     task::JoinHandle,
     time::{sleep, timeout, Instant},
 };
@@ -52,6 +59,10 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TEST_DAEMON_VER: &str = "test-subc-mcp";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = SETUP_TIMEOUT;
+const QUIET_TIMEOUT: Duration = Duration::from_millis(750);
+const NO_HANG_TIMEOUT: Duration = Duration::from_secs(2);
+const TEST_SHIM_SCHEMA_VERSION: u32 = 1;
+const TEST_MAX_SHIM_CONTROL_MESSAGE_LEN: u32 = 64 * 1024;
 
 struct TestDaemon {
     registry: Arc<Registry>,
@@ -114,6 +125,7 @@ struct ShimProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
 }
 
 impl ShimProcess {
@@ -202,6 +214,142 @@ impl<'a> StubProvider<'a> {
             module_id,
             env: env.to_vec(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RawProviderBehavior {
+    MalformedProgress,
+    MalformedResult,
+}
+
+struct RawProvider {
+    module_id: String,
+    tool_name: String,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl RawProvider {
+    async fn start(
+        connection_file_path: &Path,
+        module_id: &str,
+        tool_name: &str,
+        behavior: RawProviderBehavior,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let connection_file_path = connection_file_path.to_path_buf();
+        let module_id_owned = module_id.to_owned();
+        let tool_name_owned = tool_name.to_owned();
+        let task_module_id = module_id_owned.clone();
+        let task_tool_name = tool_name_owned.clone();
+        let task = tokio::spawn(async move {
+            run_raw_provider(
+                &connection_file_path,
+                &task_module_id,
+                &task_tool_name,
+                behavior,
+                shutdown_rx,
+            )
+            .await;
+        });
+        Self {
+            module_id: module_id_owned,
+            tool_name: tool_name_owned,
+            shutdown_tx: Some(shutdown_tx),
+            task,
+        }
+    }
+
+    fn exposed_tool_name(&self) -> String {
+        format!("{}_{}", self.module_id, self.tool_name)
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        match timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(joined) => {
+                let _ = joined;
+            }
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+            }
+        }
+    }
+}
+
+struct RawProviderHarness {
+    _server: TestServer,
+    _project: TestProject,
+    raw_provider: RawProvider,
+    module: Child,
+    shim: ShimProcess,
+    client: RunningService<RoleClient, TestMcpClient>,
+}
+
+impl RawProviderHarness {
+    async fn start(label: &str, behavior: RawProviderBehavior) -> Self {
+        let server = TestServer::start().await;
+        let raw_provider = RawProvider::start(
+            &server.daemon.connection_file_path,
+            "raw",
+            "probe",
+            behavior,
+        )
+        .await;
+        wait_for_registration(&server.daemon.registry, "raw", READ_TIMEOUT).await;
+
+        let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
+        fs::create_dir_all(&user_config_home).unwrap();
+
+        let module_connection_file = server
+            .daemon
+            .temp_dir
+            .join(format!("{label}-subc-mcp.json"));
+        let mut module = spawn_module(
+            &server.daemon.connection_file_path,
+            &module_connection_file,
+            &user_config_home,
+        );
+        wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
+
+        let project = TestProject::new(label);
+        let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
+        let client = shim.serve_mcp_client(TestMcpClient::new()).await;
+
+        Self {
+            _server: server,
+            _project: project,
+            raw_provider,
+            module,
+            shim,
+            client,
+        }
+    }
+
+    fn tool_name(&self) -> String {
+        self.raw_provider.exposed_tool_name()
+    }
+
+    async fn shutdown(self) {
+        let Self {
+            _server,
+            _project,
+            raw_provider,
+            mut module,
+            mut shim,
+            client,
+        } = self;
+        let _ = client.cancel().await;
+        let _ = timeout(Duration::from_secs(2), shim.child.wait()).await;
+        if module.try_wait().unwrap().is_none() {
+            let _ = module.start_kill();
+            let _ = timeout(Duration::from_secs(2), module.wait()).await;
+        }
+        raw_provider.shutdown().await;
     }
 }
 
@@ -544,6 +692,109 @@ async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
 }
 
 #[tokio::test]
+async fn mcp_unknown_tool_returns_invalid_params_without_provider_call() {
+    let harness = McpHarness::start("mcp-unknown-tool", &[]).await;
+    let err = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("fake-aft_missing"))
+        .await
+        .unwrap_err();
+
+    match err {
+        ServiceError::McpError(error) => {
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message, "unknown tool 'fake-aft_missing'");
+        }
+        other => panic!("expected invalid-params MCP error for unknown tool, got {other:?}"),
+    }
+    assert_no_stub_event_within(harness.provider_events_path("fake-aft"), QUIET_TIMEOUT, |event| {
+        matches!(event.get("kind"), Some(Value::String(kind)) if kind == "tool_call" || kind == "request_received")
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_malformed_progress_frame_resolves_request_to_error_without_hang() {
+    let harness = RawProviderHarness::start(
+        "mcp-malformed-progress",
+        RawProviderBehavior::MalformedProgress,
+    )
+    .await;
+    assert_eq!(
+        list_tool_names_on_peer(harness.client.peer()).await,
+        vec![harness.tool_name()]
+    );
+
+    let result = timeout(
+        NO_HANG_TIMEOUT,
+        harness
+            .client
+            .peer()
+            .call_tool(CallToolRequestParams::new(harness.tool_name())),
+    )
+    .await
+    .expect("malformed progress request should resolve without hanging")
+    .unwrap_err();
+
+    match result {
+        ServiceError::McpError(error) => {
+            assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert!(
+                error
+                    .message
+                    .contains("provider returned malformed progress"),
+                "unexpected malformed-progress error: {error:?}"
+            );
+        }
+        other => panic!("expected MCP internal error for malformed progress, got {other:?}"),
+    }
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_malformed_terminal_response_resolves_request_to_error_without_hang() {
+    let harness =
+        RawProviderHarness::start("mcp-malformed-result", RawProviderBehavior::MalformedResult)
+            .await;
+    assert_eq!(
+        list_tool_names_on_peer(harness.client.peer()).await,
+        vec![harness.tool_name()]
+    );
+
+    let result = timeout(
+        NO_HANG_TIMEOUT,
+        harness
+            .client
+            .peer()
+            .call_tool(CallToolRequestParams::new(harness.tool_name())),
+    )
+    .await
+    .expect("malformed terminal response should resolve without hanging")
+    .unwrap_err();
+
+    match result {
+        ServiceError::McpError(error) => {
+            assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert!(
+                error
+                    .message
+                    .contains("provider returned malformed tool result"),
+                "unexpected malformed-terminal error: {error:?}"
+            );
+        }
+        other => {
+            panic!("expected MCP internal error for malformed terminal response, got {other:?}")
+        }
+    }
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn mcp_multi_provider_aggregation_routes_by_namespace_map() {
     let harness = McpHarness::start_configured(
         "mcp-multi-provider",
@@ -587,6 +838,50 @@ async fn mcp_multi_provider_aggregation_routes_by_namespace_map() {
             .all(|event| event.get("kind") != Some(&Value::String("tool_call".to_owned()))),
         "mc_memory should not route to aft"
     );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_client_disconnect_goodbyes_all_provider_routes() {
+    let mut harness = McpHarness::start_configured(
+        "mcp-client-disconnect",
+        vec![
+            StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")]),
+            StubProvider::new("mc", &[("FAKE_AFT_TOOLS", "memory")]),
+        ],
+        None,
+        None,
+    )
+    .await;
+    wait_for_binding_count(&harness.server.daemon.forwarding, 2, READ_TIMEOUT).await;
+
+    let aft_attach =
+        wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
+            event.get("kind") == Some(&Value::String("attach".to_owned()))
+        })
+        .await;
+    let mc_attach =
+        wait_for_stub_event(harness.provider_events_path("mc"), READ_TIMEOUT, |event| {
+            event.get("kind") == Some(&Value::String("attach".to_owned()))
+        })
+        .await;
+
+    let _ = harness.client.close().await.unwrap();
+
+    let aft_channel = aft_attach["route_channel"].as_u64().unwrap();
+    let mc_channel = mc_attach["route_channel"].as_u64().unwrap();
+    wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("detach".to_owned()))
+            && event.get("route_channel") == Some(&Value::from(aft_channel))
+    })
+    .await;
+    wait_for_stub_event(harness.provider_events_path("mc"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("detach".to_owned()))
+            && event.get("route_channel") == Some(&Value::from(mc_channel))
+    })
+    .await;
+    wait_for_binding_count(&harness.server.daemon.forwarding, 0, READ_TIMEOUT).await;
 
     harness.shutdown().await;
 }
@@ -710,6 +1005,57 @@ async fn mcp_two_tier_config_project_overrides_user_and_null_deletes_override() 
 }
 
 #[tokio::test]
+async fn mcp_provider_level_null_resets_restore_defaults() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": {
+          "enabled": false,
+          "namespace": "renamed",
+          "tools": { "default_enabled": false }
+        }
+      }
+    }
+    "#;
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": {
+          "enabled": null,
+          "namespace": null,
+          "tools": null
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-provider-null-reset",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        Some(user_config),
+        Some(project_config),
+    )
+    .await;
+
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("aft_read"))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+    let event = wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("tool_call".to_owned()))
+    })
+    .await;
+    assert_eq!(event.get("name"), Some(&Value::String("read".to_owned())));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn mcp_namespace_override_changes_exposed_prefix() {
     let project_config = r#"
     {
@@ -742,6 +1088,36 @@ async fn mcp_namespace_override_changes_exposed_prefix() {
     assert_eq!(event.get("name"), Some(&Value::String("read".to_owned())));
 
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_invalid_namespace_fails_attach_closed() {
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": { "namespace": "bad namespace" }
+      }
+    }
+    "#;
+    expect_shim_attach_failure(
+        "mcp-invalid-namespace",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        None,
+        Some(project_config),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_invalid_tool_name_fails_attach_closed() {
+    expect_shim_attach_failure(
+        "mcp-invalid-tool-name",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "bad tool")])],
+        None,
+        None,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -861,6 +1237,137 @@ async fn mcp_catalog_poller_adds_new_provider_and_notifies() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_cleans_opened_routes() {
+    let label = "mcp-catalog-failure";
+    let server = TestServer::start().await;
+    let mut providers = BTreeMap::new();
+    let mut provider_events = BTreeMap::new();
+
+    let aft_events_path = server
+        .daemon
+        .temp_dir
+        .join(format!("{label}-aft-events.jsonl"));
+    let aft = supervisor(&server)
+        .spawn(stub_spec(
+            "aft",
+            &aft_events_path,
+            &[("FAKE_AFT_TOOLS", "read")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.daemon.registry, "aft", READ_TIMEOUT).await;
+    providers.insert("aft".to_owned(), aft);
+    provider_events.insert("aft".to_owned(), aft_events_path.clone());
+
+    let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
+    fs::create_dir_all(&user_config_home).unwrap();
+    let module_connection_file = server
+        .daemon
+        .temp_dir
+        .join(format!("{label}-subc-mcp.json"));
+    let mut module = spawn_module(
+        &server.daemon.connection_file_path,
+        &module_connection_file,
+        &user_config_home,
+    );
+    wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
+
+    let project = TestProject::new(label);
+    let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
+    let _aft_attach = wait_for_stub_event(&aft_events_path, READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("attach".to_owned()))
+    })
+    .await;
+    wait_for_binding_count(&server.daemon.forwarding, 1, READ_TIMEOUT).await;
+
+    let bee_events_path = server
+        .daemon
+        .temp_dir
+        .join(format!("{label}-bee-events.jsonl"));
+    let bee = supervisor(&server)
+        .spawn(stub_spec(
+            "bee",
+            &bee_events_path,
+            &[("FAKE_AFT_TOOLS", "memory")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.daemon.registry, "bee", READ_TIMEOUT).await;
+    providers.insert("bee".to_owned(), bee);
+    provider_events.insert("bee".to_owned(), bee_events_path.clone());
+
+    let zed_events_path = server
+        .daemon
+        .temp_dir
+        .join(format!("{label}-zed-events.jsonl"));
+    let zed = supervisor(&server)
+        .spawn(stub_spec(
+            "zed",
+            &zed_events_path,
+            &[
+                ("FAKE_AFT_TOOLS", "search"),
+                ("FAKE_AFT_REJECT_ATTACH", "1"),
+            ],
+        ))
+        .unwrap();
+    wait_for_registration(&server.daemon.registry, "zed", READ_TIMEOUT).await;
+    providers.insert("zed".to_owned(), zed);
+    provider_events.insert("zed".to_owned(), zed_events_path.clone());
+
+    let client_handler = TestMcpClient::new();
+    let client = shim.serve_mcp_client(client_handler.clone()).await;
+    let harness = McpHarness {
+        server,
+        _project: project,
+        providers,
+        module,
+        shim,
+        client,
+        client_handler,
+        events_path: aft_events_path.clone(),
+        provider_events,
+    };
+
+    let bee_attach =
+        wait_for_stub_event(harness.provider_events_path("bee"), READ_TIMEOUT, |event| {
+            event.get("kind") == Some(&Value::String("attach".to_owned()))
+        })
+        .await;
+    wait_for_stub_event(harness.provider_events_path("zed"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("attach".to_owned()))
+            && event.get("reject") == Some(&Value::Bool(true))
+    })
+    .await;
+    let bee_channel = bee_attach["route_channel"].as_u64().unwrap();
+    wait_for_stub_event(harness.provider_events_path("bee"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("detach".to_owned()))
+            && event.get("route_channel") == Some(&Value::from(bee_channel))
+    })
+    .await;
+    wait_for_binding_count(&harness.server.daemon.forwarding, 1, READ_TIMEOUT).await;
+    assert_counter_stays(
+        &harness.client_handler.tool_list_changed_count,
+        0,
+        "tools/list_changed after failed catalog reconciliation",
+        QUIET_TIMEOUT,
+    )
+    .await;
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
+
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("aft_read"))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+    assert!(
+        result_text(&result).contains("fake-aft tool read called"),
+        "existing tool should remain callable after failed reconciliation: {result:?}"
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_route() {
     let server = TestServer::start().await;
@@ -953,10 +1460,170 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
     provider.stop().await.unwrap();
 }
 
+#[tokio::test]
+async fn mcp_shim_rejects_unsupported_hello_ack_schema() {
+    let bad_schema = TEST_SHIM_SCHEMA_VERSION + 1;
+    let module_server = TestProject::new("mcp-bad-ack-module-server");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let key = generate_key().unwrap();
+    let daemon_id = generate_daemon_id().unwrap();
+    let connection_file_path = module_server.path.join("subc-mcp-module.json");
+    write_atomic(
+        &connection_file_path,
+        &ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            endpoints: vec![Endpoint {
+                host: Ipv4Addr::LOCALHOST.to_string(),
+                port,
+            }],
+            key: key.clone(),
+            daemon_id,
+            pid: process::id(),
+            daemon_ver: TEST_DAEMON_VER.to_owned(),
+        },
+    )
+    .unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        authenticate_server(
+            &mut stream,
+            &key,
+            &daemon_id,
+            TEST_DAEMON_VER,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let hello =
+            read_len_prefixed_json::<_, Value>(&mut stream, TEST_MAX_SHIM_CONTROL_MESSAGE_LEN)
+                .await
+                .unwrap()
+                .expect("shim should send ShimHello before reading ShimHelloAck");
+        assert_eq!(
+            hello.get("schema"),
+            Some(&Value::from(TEST_SHIM_SCHEMA_VERSION))
+        );
+        write_len_prefixed_json(
+            &mut stream,
+            &json!({ "schema": bad_schema }),
+            TEST_MAX_SHIM_CONTROL_MESSAGE_LEN,
+        )
+        .await
+        .unwrap();
+    });
+
+    let project = TestProject::new("mcp-bad-ack-project");
+    let xdg_config_home = module_server.path.join("xdg-config");
+    fs::create_dir_all(&xdg_config_home).unwrap();
+    let mut shim = spawn_shim(&connection_file_path, &project.path, &xdg_config_home);
+
+    let exit = timeout(SETUP_TIMEOUT, shim.child.wait())
+        .await
+        .expect("shim should exit on unsupported ShimHelloAck schema")
+        .expect("waiting for shim exit failed");
+    assert!(
+        !exit.success(),
+        "shim should fail when the module replies with an unsupported ShimHelloAck schema"
+    );
+    let mut stderr = shim
+        .stderr
+        .take()
+        .expect("shim stderr should be available for schema mismatch assertions");
+    let stderr = read_child_stderr(&mut stderr).await;
+    assert!(
+        stderr.contains(&format!(
+            "unsupported ShimHelloAck schema {bad_schema} (expected {TEST_SHIM_SCHEMA_VERSION})"
+        )),
+        "shim stderr should report the typed schema mismatch, got: {stderr}"
+    );
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_module_rejects_unsupported_shim_hello_schema_without_opening_routes() {
+    let bad_schema = TEST_SHIM_SCHEMA_VERSION + 1;
+    let server = TestServer::start().await;
+    let provider_events_path = server
+        .daemon
+        .temp_dir
+        .join("mcp-bad-shim-hello-aft-events.jsonl");
+    let provider = supervisor(&server)
+        .spawn(stub_spec(
+            "aft",
+            &provider_events_path,
+            &[("FAKE_AFT_TOOLS", "read")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.daemon.registry, "aft", SETUP_TIMEOUT).await;
+
+    let xdg_config_home = server.daemon.temp_dir.join("mcp-bad-shim-hello-xdg-config");
+    fs::create_dir_all(&xdg_config_home).unwrap();
+    let module_connection_file = server
+        .daemon
+        .temp_dir
+        .join("mcp-bad-shim-hello-module.json");
+    let (mut module, mut module_stderr) = spawn_module_with_stderr(
+        &server.daemon.connection_file_path,
+        &module_connection_file,
+        &xdg_config_home,
+    );
+    wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
+
+    let project = TestProject::new("mcp-bad-shim-hello-project");
+    let mut stream = connect_control_client(&module_connection_file)
+        .await
+        .unwrap();
+    write_len_prefixed_json(
+        &mut stream,
+        &json!({
+            "schema": bad_schema,
+            "project_root": project.path,
+            "harness": "subc-mcp-test",
+            "shim_session_id": "shim-bad-schema"
+        }),
+        TEST_MAX_SHIM_CONTROL_MESSAGE_LEN,
+    )
+    .await
+    .unwrap();
+    let response =
+        read_len_prefixed_json::<_, Value>(&mut stream, TEST_MAX_SHIM_CONTROL_MESSAGE_LEN)
+            .await
+            .unwrap();
+    assert!(
+        response.is_none(),
+        "module should close the shim socket instead of replying to an unsupported ShimHello"
+    );
+    let stderr = wait_for_child_stderr_contains(
+        &mut module_stderr,
+        &format!("unsupported ShimHello schema {bad_schema} (expected {TEST_SHIM_SCHEMA_VERSION})"),
+        READ_TIMEOUT,
+    )
+    .await;
+    assert!(
+        stderr.contains("unsupported ShimHello schema"),
+        "module stderr should report the typed schema mismatch, got: {stderr}"
+    );
+    assert_no_stub_event_within(&provider_events_path, QUIET_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("attach".to_owned()))
+    })
+    .await;
+    wait_for_binding_count(&server.daemon.forwarding, 0, READ_TIMEOUT).await;
+
+    if module.try_wait().unwrap().is_none() {
+        let _ = module.start_kill();
+        let _ = timeout(Duration::from_secs(2), module.wait()).await;
+    }
+    provider.stop().await.unwrap();
+}
+
 async fn list_tool_names(harness: &McpHarness) -> Vec<String> {
-    let mut names = harness
-        .client
-        .peer()
+    list_tool_names_on_peer(harness.client.peer()).await
+}
+
+async fn list_tool_names_on_peer(peer: &rmcp::service::Peer<RoleClient>) -> Vec<String> {
+    let mut names = peer
         .list_tools(None)
         .await
         .unwrap()
@@ -1041,6 +1708,7 @@ async fn expect_shim_attach_failure(
         exit.success(),
         "shim should exit cleanly on fail-closed attach (socket EOF), got {exit:?}"
     );
+    wait_for_binding_count(&server.daemon.forwarding, 0, READ_TIMEOUT).await;
 
     if module.try_wait().unwrap().is_none() {
         let _ = module.start_kill();
@@ -1197,6 +1865,19 @@ fn spawn_module(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> Child {
+    let (child, _stderr) = spawn_module_with_stderr(
+        subc_connection_file,
+        module_connection_file,
+        xdg_config_home,
+    );
+    child
+}
+
+fn spawn_module_with_stderr(
+    subc_connection_file: &Path,
+    module_connection_file: &Path,
+    xdg_config_home: &Path,
+) -> (Child, ChildStderr) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
     command
         .arg("module")
@@ -1205,8 +1886,11 @@ fn spawn_module(
         .arg("--connection-file")
         .arg(module_connection_file)
         .env("XDG_CONFIG_HOME", xdg_config_home)
+        .stderr(process::Stdio::piped())
         .kill_on_drop(true);
-    command.spawn().unwrap()
+    let mut child = command.spawn().unwrap();
+    let stderr = child.stderr.take().expect("module stderr should be piped");
+    (child, stderr)
 }
 
 async fn wait_for_module_connection_file(child: &mut Child, path: &Path, wait: Duration) {
@@ -1249,10 +1933,12 @@ fn spawn_shim(
     let mut child = command.spawn().unwrap();
     let stdin = child.stdin.take().expect("shim stdin should be piped");
     let stdout = child.stdout.take().expect("shim stdout should be piped");
+    let stderr = child.stderr.take().expect("shim stderr should be piped");
     ShimProcess {
         child,
         stdin: Some(stdin),
         stdout: Some(stdout),
+        stderr: Some(stderr),
     }
 }
 
@@ -1545,6 +2231,293 @@ fn stub_events(path: &Path) -> Result<Vec<Value>, String> {
             "failed to read stub events {}: {err}",
             path.display()
         )),
+    }
+}
+
+async fn assert_no_stub_event_within<F>(path: &Path, wait: Duration, matches: F)
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + wait;
+    loop {
+        let events = stub_events(path).unwrap();
+        if let Some(event) = events.iter().find(|event| matches(event)) {
+            panic!("unexpected stub event within {wait:?}: {event:?}; events: {events:?}");
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_binding_count(forwarding: &ForwardingTable, expected: usize, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    loop {
+        let count = forwarding.active_binding_count().unwrap();
+        if count == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("forwarding binding count {count} did not become {expected} within {wait:?}");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn assert_counter_stays(counter: &AtomicUsize, baseline: usize, label: &str, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    loop {
+        let current = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            current, baseline,
+            "{label} changed unexpectedly: count is {current}, baseline {baseline}"
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn run_raw_provider(
+    connection_file_path: &Path,
+    module_id: &str,
+    tool_name: &str,
+    behavior: RawProviderBehavior,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    let mut stream = connect_control_client(connection_file_path)
+        .await
+        .expect("raw test provider should authenticate to the daemon");
+    let hello = ModuleHelloBody {
+        manifest: raw_provider_manifest(module_id, tool_name),
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+    };
+    let body = serde_json::to_vec(&hello).unwrap();
+    let frame = Frame::build(
+        FrameType::Hello,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        1,
+        body,
+    )
+    .unwrap();
+    write_frame(&mut stream, &frame).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let ack = read_frame_timeout(&mut stream).await;
+    assert_eq!(ack.header.ty, FrameType::HelloAck);
+    let _ack: ModuleHelloAckBody = serde_json::from_slice(&ack.body).unwrap();
+
+    let mut route_channel = None;
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => return,
+            frame = read_frame(&mut stream) => {
+                let Some(frame) = frame.unwrap() else {
+                    return;
+                };
+                match frame.header.ty {
+                    FrameType::Request if frame.header.channel == 0 => {
+                        let request: ModuleControlRequest = serde_json::from_slice(&frame.body).unwrap();
+                        match request {
+                            ModuleControlRequest::RouteBind { route_channel: next_route_channel, .. } => {
+                                route_channel = Some(next_route_channel);
+                                let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
+                                let response = Frame::build_with_version(
+                                    frame.header.ver,
+                                    FrameType::Response,
+                                    Flags::new(false, Priority::Passive, false),
+                                    0,
+                                    frame.header.corr,
+                                    body,
+                                )
+                                .unwrap();
+                                write_frame(&mut stream, &response).await.unwrap();
+                                stream.flush().await.unwrap();
+                            }
+                        }
+                    }
+                    FrameType::Request if Some(frame.header.channel) == route_channel => {
+                        match behavior {
+                            RawProviderBehavior::MalformedProgress => {
+                                let push = Frame::build_with_version(
+                                    frame.header.ver,
+                                    FrameType::Push,
+                                    Flags::new(false, Priority::Passive, true),
+                                    frame.header.channel,
+                                    frame.header.corr,
+                                    b"{malformed progress".to_vec(),
+                                )
+                                .unwrap();
+                                write_frame(&mut stream, &push).await.unwrap();
+                                stream.flush().await.unwrap();
+                            }
+                            RawProviderBehavior::MalformedResult => {
+                                let response = Frame::build_with_version(
+                                    frame.header.ver,
+                                    FrameType::Response,
+                                    frame.header.flags,
+                                    frame.header.channel,
+                                    frame.header.corr,
+                                    b"{malformed tool result".to_vec(),
+                                )
+                                .unwrap();
+                                write_frame(&mut stream, &response).await.unwrap();
+                                stream.flush().await.unwrap();
+                            }
+                        }
+                    }
+                    FrameType::Goodbye if frame.header.channel == 0 => return,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
+    ModuleManifest {
+        module_id: module_id.to_owned(),
+        module_version: "0.0.0-raw-test".to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: vec![ProviderRole::ToolProvider {
+            tools: vec![ProviderTool {
+                name: tool_name.to_owned(),
+                mutates: false,
+                schema: json!({"type": "object"}),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: true,
+            sub_supervises: true,
+        }],
+        consumes: Vec::new(),
+        scheduled_tasks: Vec::new(),
+        bindings: Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: true,
+            },
+            config: ConfigBinding {
+                source: ConfigSource::SubcMediated,
+                tiers: vec!["user".to_string(), "project".to_string()],
+                expansion: Default::default(),
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: vec![IdentityScope::Project],
+                optional: vec![IdentityScope::Session],
+            },
+        },
+    }
+}
+
+async fn read_len_prefixed_json<R, T>(reader: &mut R, max_len: u32) -> Result<Option<T>, String>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    let mut len_bytes = [0u8; 4];
+    match reader.read_exact(&mut len_bytes).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(format!("failed to read message length prefix: {err}")),
+    }
+    let len = u32::from_le_bytes(len_bytes);
+    if len > max_len {
+        return Err(format!(
+            "length-prefixed message too large: {len} bytes (max {max_len})"
+        ));
+    }
+    let mut bytes = vec![0u8; len as usize];
+    if !bytes.is_empty() {
+        reader
+            .read_exact(&mut bytes)
+            .await
+            .map_err(|err| format!("failed to read message body: {err}"))?;
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|err| format!("failed to decode JSON message: {err}"))
+}
+
+async fn write_len_prefixed_json<W, T>(
+    writer: &mut W,
+    value: &T,
+    max_len: u32,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    let bytes =
+        serde_json::to_vec(value).map_err(|err| format!("failed to encode JSON message: {err}"))?;
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        format!(
+            "length-prefixed message too large for u32: {} bytes",
+            bytes.len()
+        )
+    })?;
+    if len > max_len {
+        return Err(format!(
+            "length-prefixed message too large: {len} bytes (max {max_len})"
+        ));
+    }
+    writer
+        .write_all(&len.to_le_bytes())
+        .await
+        .map_err(|err| format!("failed to write message length prefix: {err}"))?;
+    if !bytes.is_empty() {
+        writer
+            .write_all(&bytes)
+            .await
+            .map_err(|err| format!("failed to write message body: {err}"))?;
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|err| format!("failed to flush JSON message: {err}"))
+}
+
+async fn read_child_stderr(stderr: &mut ChildStderr) -> String {
+    let mut bytes = Vec::new();
+    stderr.read_to_end(&mut bytes).await.unwrap();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+async fn wait_for_child_stderr_contains(
+    stderr: &mut ChildStderr,
+    needle: &str,
+    wait: Duration,
+) -> String {
+    let deadline = Instant::now() + wait;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.contains(needle) {
+            return text;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "stderr did not contain '{needle}' within {wait:?}; stderr so far: {text}"
+        );
+        let read = timeout(remaining, stderr.read(&mut chunk))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for stderr to contain '{needle}'; stderr so far: {text}")
+            })
+            .unwrap();
+        if read == 0 {
+            panic!("stderr closed before containing '{needle}'; stderr so far: {text}");
+        }
+        bytes.extend_from_slice(&chunk[..read]);
     }
 }
 

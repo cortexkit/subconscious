@@ -223,6 +223,119 @@ async fn oversize_pre_auth_message_is_rejected_before_body_allocation() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn malformed_client_hello_returns_json_decode() -> TestResult {
+    let (_dir, listener, _path, conn) = listener_with_connection_file("bad-client-hello").await?;
+    let server_conn = conn.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("accept malformed client hello");
+        authenticate_server(
+            &mut stream,
+            &server_conn.key,
+            &server_conn.daemon_id,
+            &server_conn.daemon_ver,
+            TEST_DEADLINE,
+        )
+        .await
+        .expect_err("malformed ClientHello JSON must fail")
+    });
+
+    let mut stream = connect_from_info(&conn).await?;
+    let body = b"{not valid json";
+    stream.write_all(&(body.len() as u32).to_le_bytes()).await?;
+    stream.write_all(body).await?;
+
+    let err = server.await?;
+    assert!(matches!(
+        err,
+        AuthError::JsonDecode {
+            stage: AuthStage::ClientHello,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_client_hello_returns_unexpected_eof() -> TestResult {
+    let (_dir, listener, _path, conn) =
+        listener_with_connection_file("truncated-client-hello").await?;
+    let server_conn = conn.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("accept truncated client hello");
+        authenticate_server(
+            &mut stream,
+            &server_conn.key,
+            &server_conn.daemon_id,
+            &server_conn.daemon_ver,
+            TEST_DEADLINE,
+        )
+        .await
+        .expect_err("truncated ClientHello body must fail")
+    });
+
+    let mut stream = connect_from_info(&conn).await?;
+    stream.write_all(&8u32.to_le_bytes()).await?;
+    stream.write_all(b"{\"x").await?;
+    drop(stream);
+
+    let err = server.await?;
+    assert!(matches!(
+        err,
+        AuthError::UnexpectedEof {
+            stage: AuthStage::ClientHello,
+            expected: 8,
+            actual: 3,
+        }
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_server_proof_aborts_without_client_auth() -> TestResult {
+    let (_dir, listener, _path, conn) = listener_with_connection_file("bad-server-proof").await?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept client");
+        let _hello: ClientHello = read_auth_json(&mut stream).await.expect("client hello");
+        let body = b"{malformed server proof";
+        stream
+            .write_all(&(body.len() as u32).to_le_bytes())
+            .await
+            .expect("write malformed ServerProof length");
+        stream
+            .write_all(body)
+            .await
+            .expect("write malformed ServerProof body");
+        assert_no_client_auth(&mut stream).await
+    });
+
+    let mut stream = connect_from_info(&conn).await?;
+    let err = authenticate_client(&mut stream, &conn, TEST_DEADLINE)
+        .await
+        .expect_err("malformed ServerProof JSON must fail");
+    assert!(matches!(
+        err,
+        AuthError::JsonDecode {
+            stage: AuthStage::ServerProof,
+            ..
+        }
+    ));
+    drop(stream);
+
+    let no_client_auth = server.await?;
+    assert!(matches!(
+        no_client_auth,
+        NoClientAuthObserved::Eof | NoClientAuthObserved::Timeout
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn key_rotation_rejects_old_connection_file_then_accepts_reread_file() -> TestResult {
     let dir = TestDir::new("rotation")?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;

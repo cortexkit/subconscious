@@ -709,6 +709,7 @@ mod tests {
     use super::*;
     use crate::server::ServerAuth;
     use std::sync::Mutex;
+    use subc_transport::MIN_KEY_LEN;
     use tokio::io::AsyncReadExt;
     use tokio::task::JoinHandle;
 
@@ -817,6 +818,20 @@ mod tests {
         }
     }
 
+    fn write_raw_owner_only_connection_file(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn assert_owner_only_connection_file(path: &Path) {
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
     #[test]
     fn connection_file_path_uses_xdg_runtime_dir_when_set() {
         let _env_lock = ENV_LOCK.lock().unwrap();
@@ -904,6 +919,101 @@ mod tests {
         assert_ne!(bound.connection_info.key, stale_info.key);
         drop(bound.listeners);
         cleanup_connection_file_path(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_singleton_reclaims_insecure_connection_file() {
+        let path = temp_connection_file_path("insecure-reclaim");
+        let stale = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let stale_port = stale.local_addr().unwrap().port();
+        drop(stale);
+        let stale_info = make_connection_info(stale_port);
+        write_atomic(&path, &stale_info).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        assert_ne!(bound.connection_info.key, stale_info.key);
+        assert_ne!(bound.connection_info.daemon_id, stale_info.daemon_id);
+        assert_owner_only_connection_file(&path);
+
+        drop(bound.listeners);
+        cleanup_connection_file_path(&path);
+    }
+
+    #[tokio::test]
+    async fn ensure_singleton_reclaims_non_loopback_connection_file() {
+        let path = temp_connection_file_path("non-loopback-reclaim");
+        let mut stale_info = make_connection_info(8757);
+        stale_info.endpoints = vec![Endpoint {
+            host: "192.0.2.10".to_owned(),
+            port: 8757,
+        }];
+        write_atomic(&path, &stale_info).unwrap();
+
+        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        assert_ne!(bound.connection_info.key, stale_info.key);
+        assert_ne!(bound.connection_info.daemon_id, stale_info.daemon_id);
+        assert!(bound
+            .connection_info
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.host.parse::<IpAddr>().unwrap().is_loopback()));
+        assert_owner_only_connection_file(&path);
+
+        drop(bound.listeners);
+        cleanup_connection_file_path(&path);
+    }
+
+    #[tokio::test]
+    async fn ensure_singleton_reclaims_invalid_connection_file_shapes() {
+        let mut unsupported_schema = make_connection_info(8757);
+        unsupported_schema.schema = SCHEMA_VERSION + 1;
+
+        let mut empty_endpoints = make_connection_info(8757);
+        empty_endpoints.endpoints.clear();
+
+        let mut short_key = make_connection_info(8757);
+        short_key.key = vec![0x5A; MIN_KEY_LEN - 1];
+
+        let cases = vec![
+            (
+                "unsupported-schema",
+                serde_json::to_vec(&unsupported_schema).unwrap(),
+                Some(unsupported_schema),
+            ),
+            (
+                "empty-endpoints",
+                serde_json::to_vec(&empty_endpoints).unwrap(),
+                Some(empty_endpoints),
+            ),
+            (
+                "short-key",
+                serde_json::to_vec(&short_key).unwrap(),
+                Some(short_key),
+            ),
+            ("invalid-json", b"{not valid connection json".to_vec(), None),
+        ];
+
+        for (label, contents, old_info) in cases {
+            let path = temp_connection_file_path(label);
+            write_raw_owner_only_connection_file(&path, &contents);
+
+            let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+            if let Some(old_info) = old_info {
+                assert_ne!(bound.connection_info.key, old_info.key, "{label}");
+                assert_ne!(
+                    bound.connection_info.daemon_id, old_info.daemon_id,
+                    "{label}"
+                );
+            }
+            assert!(bound.connection_info.key.len() >= MIN_KEY_LEN, "{label}");
+            assert_ne!(bound.connection_info.daemon_id, [0u8; 16], "{label}");
+            assert_owner_only_connection_file(&path);
+
+            drop(bound.listeners);
+            cleanup_connection_file_path(&path);
+        }
     }
 
     #[tokio::test]

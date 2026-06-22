@@ -79,6 +79,65 @@ async fn crash_restarts_and_reregisters_stub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_enabled_current_value_returns_false_without_state_mutation() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-enabled-idempotent";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+
+    let before = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+    let applied = module.set_enabled(true).await.unwrap();
+    assert!(
+        !applied,
+        "setting enabled=true on an enabled module is a no-op"
+    );
+
+    let after = module.status().unwrap();
+    assert_eq!(after.state, ModuleState::Running);
+    assert!(after.enabled);
+    assert!(after.live);
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after.restart_count, before.restart_count);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_without_forwarding_table_returns_reload_unavailable_without_state_mutation() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-reload-unavailable";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+
+    let before = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+    let err = module
+        .reload()
+        .await
+        .expect_err("reload without a forwarding table must be typed");
+    assert!(
+        matches!(err, SuperviseError::ReloadUnavailable { ref module_id, ref reason }
+            if module_id == "fake-aft-reload-unavailable"
+                && reason.contains("forwarding table")),
+        "expected ReloadUnavailable, got {err:?}"
+    );
+
+    let after = module.status().unwrap();
+    assert_eq!(after.state, ModuleState::Running);
+    assert!(after.enabled);
+    assert!(after.live);
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after.restart_count, before.restart_count);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_and_reload_are_rejected_for_a_disabled_module() {
     // restart/reload cycle a RUNNING module. A disabled module is intentionally
     // off, so these must be rejected (with a typed Disabled error) rather than

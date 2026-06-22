@@ -382,6 +382,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_unsupported_schema_empty_endpoints_and_short_key() {
+        let mut unsupported_schema = sample_info();
+        unsupported_schema.schema = SCHEMA_VERSION + 1;
+        let before = unsupported_schema.clone();
+        let err = unsupported_schema
+            .validate()
+            .expect_err("unsupported schema must be rejected");
+        assert!(matches!(
+            err,
+            ConnectionFileError::UnsupportedSchema {
+                schema,
+                supported: SCHEMA_VERSION,
+            } if schema == SCHEMA_VERSION + 1
+        ));
+        assert_eq!(unsupported_schema, before, "validate must not mutate input");
+
+        let mut empty_endpoints = sample_info();
+        empty_endpoints.endpoints.clear();
+        let before = empty_endpoints.clone();
+        let err = empty_endpoints
+            .validate()
+            .expect_err("empty endpoint list must be rejected");
+        assert!(matches!(
+            err,
+            ConnectionFileError::Invalid { ref reason }
+                if reason == "connection file must include at least one endpoint"
+        ));
+        assert_eq!(empty_endpoints, before, "validate must not mutate input");
+
+        let mut short_key = sample_info();
+        short_key.key = vec![0xAB; MIN_KEY_LEN - 1];
+        let before = short_key.clone();
+        let err = short_key
+            .validate()
+            .expect_err("short key must be rejected");
+        assert!(matches!(
+            err,
+            ConnectionFileError::KeyTooShort {
+                len,
+                min: MIN_KEY_LEN,
+            } if len == MIN_KEY_LEN - 1
+        ));
+        assert_eq!(short_key, before, "validate must not mutate input");
+    }
+
+    #[test]
     fn read_accepts_owner_only_file() {
         let path = unique_temp_path();
         write_atomic(&path, &sample_info()).expect("write owner-only file");

@@ -1839,7 +1839,8 @@ mod tests {
     fn unknown_module_push_op_is_ignored_but_malformed_known_op_errors() {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
-        let handler = ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         let module_connection = ConnectionId::new(301);
         let registration = registry
             .register_with_control_ops(
@@ -1870,7 +1871,10 @@ mod tests {
         )
         .unwrap();
         let out = handler.handle_status_update(endpoint, unknown).unwrap();
-        assert!(out.is_empty(), "unknown push op must be ignored, got {out:?}");
+        assert!(
+            out.is_empty(),
+            "unknown push op must be ignored, got {out:?}"
+        );
 
         // A malformed body for a KNOWN op is a real error worth surfacing.
         let malformed = Frame::build(
@@ -1891,7 +1895,8 @@ mod tests {
     fn hello_rejected_when_connection_already_owns_client_routes() {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
-        let handler = ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         // Commits a client route on connection 202 (bound to a module on conn 101).
         let _ = bind_liveness_route(&registry, &forwarding, "aft-module");
         let client_connection = ConnectionId::new(202);

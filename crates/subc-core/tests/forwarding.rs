@@ -3792,14 +3792,7 @@ async fn run_e2e_bench_cell(
         for route in 0..routes_per_client {
             let session = format!("bench-e2e-{client_index}-{route}");
             let corr = 10_000 + client_index as u64 * 100 + route as u64;
-            let ack = attach_on_stream(
-                &mut stream,
-                &project,
-                corr,
-                &session,
-                module_id,
-            )
-            .await;
+            let ack = attach_on_stream(&mut stream, &project, corr, &session, module_id).await;
             channels.push(ack.route_channel);
         }
         clients.push((client_index, stream, channels));

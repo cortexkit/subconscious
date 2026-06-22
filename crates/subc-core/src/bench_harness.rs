@@ -4,8 +4,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
+        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
+        Tool, TrustTier,
     },
     Flags, FrameType, Priority, PROTOCOL_VERSION,
 };
@@ -45,7 +46,7 @@ pub fn bench_tool_provider_manifest(module_id: &str) -> ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "read".to_string(),
-                mutates: false,
+                execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({"type": "object"}),
             }],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],

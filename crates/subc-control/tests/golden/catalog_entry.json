@@ -16,7 +16,7 @@
       "sub_supervises": true,
       "tools": [
         {
-          "mutates": false,
+          "execution_mode": "pure",
           "name": "memory.read",
           "schema": {
             "required": [

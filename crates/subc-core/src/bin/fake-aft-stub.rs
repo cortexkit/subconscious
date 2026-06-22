@@ -18,10 +18,10 @@ use serde_json::{json, Value};
 use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
-        InternalTransport, ManagementOperation, ManagementOperationKind, ObservabilityKind,
-        ObservabilitySurface, PipelineAppliesTo, PipelineStageKind, ProviderRole, StorageBinding,
-        StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
+        IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
+        ObservabilityKind, ObservabilitySurface, PipelineAppliesTo, PipelineStageKind,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
     ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
@@ -986,7 +986,7 @@ fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> 
                 .iter()
                 .map(|name| Tool {
                     name: name.clone(),
-                    mutates: false,
+                    execution_mode: ExecutionMode::Pure,
                     schema: json!({"type": "object"}),
                 })
                 .collect(),

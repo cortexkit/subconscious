@@ -1525,9 +1525,9 @@ mod tests {
     use serde_json::{json, Value};
     use subc_protocol::{
         manifest::{
-            Bindings, CircuitBreaker, Concurrency, ConfigBinding, ConfigSource, IdentityBinding,
-            IdentityScope, ModelPolicy, ProviderRole, ScheduledTask, StorageBinding, StorageKind,
-            StorageScope, TaskEligibility, Tool,
+            Bindings, CircuitBreaker, Concurrency, ConfigBinding, ConfigSource, ExecutionMode,
+            IdentityBinding, IdentityScope, ModelPolicy, ProviderRole, ScheduledTask,
+            StorageBinding, StorageKind, StorageScope, TaskEligibility, Tool,
         },
         FrameType,
     };
@@ -1545,7 +1545,7 @@ mod tests {
             provides: vec![ProviderRole::ToolProvider {
                 tools: vec![Tool {
                     name: "read".to_string(),
-                    mutates: false,
+                    execution_mode: ExecutionMode::Pure,
                     schema: json!({"type": "object"}),
                 }],
                 identity_scope: vec![IdentityScope::Project, IdentityScope::Session],

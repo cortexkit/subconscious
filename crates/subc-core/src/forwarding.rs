@@ -737,6 +737,27 @@ impl ForwardingTable {
         Ok(released)
     }
 
+    /// True if this connection already owns committed or reserved CLIENT routes.
+    /// A module registers (HELLO) before serving and never opens client routes, so
+    /// a connection that has client routes must not also become a module endpoint
+    /// — otherwise one connection holds both client and module state and cleanup
+    /// only releases one side.
+    pub(crate) fn connection_has_client_routes(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<bool, ForwardingError> {
+        let inner = self.lock_inner()?;
+        let has = inner
+            .client_to_module
+            .keys()
+            .any(|key| key.connection_id == connection_id)
+            || inner
+                .reserved_client
+                .keys()
+                .any(|key| key.connection_id == connection_id);
+        Ok(has)
+    }
+
     pub(crate) fn cleanup_connection(
         &self,
         connection_id: ConnectionId,

@@ -365,7 +365,11 @@ fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
         ConnectionFileError::JsonRead { .. }
         | ConnectionFileError::UnsupportedSchema { .. }
         | ConnectionFileError::Invalid { .. }
-        | ConnectionFileError::KeyTooShort { .. } => true,
+        | ConnectionFileError::KeyTooShort { .. }
+        // A live daemon always publishes the file owner-only (0600), so a file
+        // with insecure permissions is never a daemon we should defer to: treat it
+        // as stale and take over (which republishes a correct 0600 file).
+        | ConnectionFileError::InsecurePermissions { .. } => true,
         ConnectionFileError::MissingParent { .. }
         | ConnectionFileError::MissingFileName { .. }
         | ConnectionFileError::Io { .. }

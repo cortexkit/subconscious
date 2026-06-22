@@ -20,7 +20,7 @@ pub struct Endpoint {
     pub port: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub schema: u32,
     pub endpoints: Vec<Endpoint>,
@@ -28,6 +28,21 @@ pub struct ConnectionInfo {
     pub daemon_id: [u8; DAEMON_ID_LEN],
     pub pid: u32,
     pub daemon_ver: String,
+}
+
+// Hand-written so the transport key is never printed. A derived Debug would dump
+// the raw key bytes into any log or panic message that formats a ConnectionInfo.
+impl fmt::Debug for ConnectionInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionInfo")
+            .field("schema", &self.schema)
+            .field("endpoints", &self.endpoints)
+            .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
+            .field("daemon_id", &self.daemon_id)
+            .field("pid", &self.pid)
+            .field("daemon_ver", &self.daemon_ver)
+            .finish()
+    }
 }
 
 impl ConnectionInfo {
@@ -86,6 +101,10 @@ pub enum ConnectionFileError {
         len: usize,
         min: usize,
     },
+    InsecurePermissions {
+        path: PathBuf,
+        mode: u32,
+    },
 }
 
 pub fn write_atomic(
@@ -116,6 +135,10 @@ pub fn write_atomic(
 
 pub fn read(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
     let path = path.as_ref();
+    // Refuse to trust a key from a file other local users can read. The key is
+    // published owner-only (0600); if the on-disk file is group/world-accessible
+    // the secret has leaked and the daemon it points at can't be trusted.
+    verify_owner_only(path)?;
     let bytes = fs::read(path).map_err(|source| ConnectionFileError::Io {
         op: "read",
         path: path.to_path_buf(),
@@ -128,6 +151,34 @@ pub fn read(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileErro
         })?;
     info.validate()?;
     Ok(info)
+}
+
+#[cfg(unix)]
+fn verify_owner_only(path: &Path) -> Result<(), ConnectionFileError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(path).map_err(|source| ConnectionFileError::Io {
+        op: "stat",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mode = meta.permissions().mode();
+    // Any group or other permission bit means the key is exposed beyond the owner.
+    // A file owned by a different user that we can still read implies the same.
+    if mode & 0o077 != 0 {
+        return Err(ConnectionFileError::InsecurePermissions {
+            path: path.to_path_buf(),
+            mode: mode & 0o777,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_owner_only(_path: &Path) -> Result<(), ConnectionFileError> {
+    // On Windows the file inherits the per-user profile directory's ACL (owner,
+    // SYSTEM, Administrators only) at create time; see open_owner_only_new. There
+    // are no portable Unix mode bits to re-check on read here.
+    Ok(())
 }
 
 pub fn generate_key() -> Result<Vec<u8>, ConnectionFileError> {
@@ -261,6 +312,11 @@ impl fmt::Display for ConnectionFileError {
                 f,
                 "connection file key is too short: {len} bytes, need at least {min}"
             ),
+            Self::InsecurePermissions { path, mode } => write!(
+                f,
+                "connection file {} has insecure permissions {mode:#o}; expected owner-only 0600",
+                path.display()
+            ),
         }
     }
 }
@@ -275,7 +331,80 @@ impl Error for ConnectionFileError {
             | Self::MissingFileName { .. }
             | Self::UnsupportedSchema { .. }
             | Self::Invalid { .. }
-            | Self::KeyTooShort { .. } => None,
+            | Self::KeyTooShort { .. }
+            | Self::InsecurePermissions { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_info() -> ConnectionInfo {
+        ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 8799,
+            }],
+            key: vec![0xABu8; KEY_LEN],
+            daemon_id: [0x11u8; DAEMON_ID_LEN],
+            pid: 4242,
+            daemon_ver: "subc-test".to_owned(),
+        }
+    }
+
+    fn unique_temp_path() -> PathBuf {
+        let mut suffix = [0u8; 8];
+        getrandom::getrandom(&mut suffix).expect("random suffix");
+        let mut name = String::from("subc-connfile-test-");
+        for byte in suffix {
+            name.push_str(&format!("{byte:02x}"));
+        }
+        name.push_str(".json");
+        std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn debug_redacts_key_bytes() {
+        let info = sample_info();
+        let rendered = format!("{info:?}");
+        assert!(
+            rendered.contains("redacted"),
+            "Debug must mark the key as redacted: {rendered}"
+        );
+        // The raw key byte pattern (0xab) must not appear anywhere in the output.
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab, ab"),
+            "Debug must not leak raw key bytes: {rendered}"
+        );
+    }
+
+    #[test]
+    fn read_accepts_owner_only_file() {
+        let path = unique_temp_path();
+        write_atomic(&path, &sample_info()).expect("write owner-only file");
+        let read_back = read(&path).expect("owner-only file is readable");
+        assert_eq!(read_back, sample_info());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_group_or_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_temp_path();
+        write_atomic(&path, &sample_info()).expect("write owner-only file");
+        // Loosen permissions as if the key leaked to other local users.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("relax permissions");
+
+        let err = read(&path).expect_err("group/world-readable key file must be rejected");
+        assert!(
+            matches!(err, ConnectionFileError::InsecurePermissions { mode, .. } if mode == 0o644),
+            "expected InsecurePermissions, got {err:?}"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

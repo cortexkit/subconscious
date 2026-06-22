@@ -104,6 +104,45 @@ pub fn compute_proof(
     mac.finalize().into_bytes().into()
 }
 
+/// An absolute handshake deadline. Every per-stage read/write recomputes the time
+/// remaining until `at`, so the WHOLE handshake (length byte + body, across all
+/// stages, plus error teardown) is bounded by a single wall-clock budget. Passing
+/// a bare `Duration` to each step instead would let a slow peer spend the full
+/// budget on every length read AND every body read — multiplying the real bound.
+#[derive(Clone, Copy)]
+struct Deadline {
+    at: time::Instant,
+    total: Duration,
+}
+
+impl Deadline {
+    fn starting_now(total: Duration) -> Self {
+        Self {
+            at: time::Instant::now() + total,
+            total,
+        }
+    }
+
+    /// Time left until the deadline, or `Timeout` if it has already elapsed.
+    fn remaining(&self, stage: AuthStage) -> Result<Duration, AuthError> {
+        let remaining = self.at.saturating_duration_since(time::Instant::now());
+        if remaining.is_zero() {
+            Err(AuthError::Timeout {
+                stage,
+                deadline: self.total,
+            })
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    /// Time left until the deadline, clamped to zero — for best-effort teardown
+    /// that must not outlive the handshake budget.
+    fn remaining_or_zero(&self) -> Duration {
+        self.at.saturating_duration_since(time::Instant::now())
+    }
+}
+
 pub async fn authenticate_server<S>(
     stream: &mut S,
     key: &[u8],
@@ -114,9 +153,13 @@ pub async fn authenticate_server<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let deadline = Deadline::starting_now(deadline);
     let result = authenticate_server_inner(stream, key, daemon_id, daemon_ver, deadline).await;
     if result.is_err() {
-        let _ = time::timeout(deadline, stream.shutdown()).await;
+        // Bound teardown by the SAME absolute deadline so a failed handshake (and
+        // the unauthenticated-handshake slot it holds) is released promptly instead
+        // of waiting out another full budget.
+        let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
     }
     result
 }
@@ -126,20 +169,14 @@ async fn authenticate_server_inner<S>(
     key: &[u8],
     daemon_id: &[u8; DAEMON_ID_LEN],
     daemon_ver: &str,
-    deadline: Duration,
+    deadline: Deadline,
 ) -> Result<Authenticated, AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     validate_key(key)?;
-    let deadline_at = time::Instant::now() + deadline;
 
-    let hello: ClientHello = read_message(
-        stream,
-        AuthStage::ClientHello,
-        remaining_deadline(deadline_at, AuthStage::ClientHello, deadline)?,
-    )
-    .await?;
+    let hello: ClientHello = read_message(stream, AuthStage::ClientHello, deadline).await?;
     let server_nonce = random_nonce()?;
     let server_proof = compute_proof(
         key,
@@ -158,16 +195,11 @@ where
             daemon_ver: daemon_ver.to_owned(),
             server_proof,
         },
-        remaining_deadline(deadline_at, AuthStage::ServerProof, deadline)?,
+        deadline,
     )
     .await?;
 
-    let client_auth: ClientAuth = read_message(
-        stream,
-        AuthStage::ClientAuth,
-        remaining_deadline(deadline_at, AuthStage::ClientAuth, deadline)?,
-    )
-    .await?;
+    let client_auth: ClientAuth = read_message(stream, AuthStage::ClientAuth, deadline).await?;
     let expected_client_auth = compute_proof(
         key,
         CLIENT_AUTH_DOMAIN,
@@ -182,19 +214,6 @@ where
     Ok(Authenticated { role: hello.role })
 }
 
-fn remaining_deadline(
-    deadline_at: time::Instant,
-    stage: AuthStage,
-    deadline: Duration,
-) -> Result<Duration, AuthError> {
-    let remaining = deadline_at.saturating_duration_since(time::Instant::now());
-    if remaining.is_zero() {
-        Err(AuthError::Timeout { stage, deadline })
-    } else {
-        Ok(remaining)
-    }
-}
-
 pub async fn authenticate_client<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
@@ -203,9 +222,10 @@ pub async fn authenticate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let deadline = Deadline::starting_now(deadline);
     let result = authenticate_client_inner(stream, conn, deadline).await;
     if result.is_err() {
-        let _ = time::timeout(deadline, stream.shutdown()).await;
+        let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
     }
     result
 }
@@ -213,7 +233,7 @@ where
 async fn authenticate_client_inner<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
-    deadline: Duration,
+    deadline: Deadline,
 ) -> Result<(), AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -286,12 +306,14 @@ fn constant_time_eq(expected: &[u8; PROOF_LEN], actual: &[u8; PROOF_LEN]) -> boo
 async fn read_message<S, T>(
     stream: &mut S,
     stage: AuthStage,
-    deadline: Duration,
+    deadline: Deadline,
 ) -> Result<T, AuthError>
 where
     S: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    // Both the length read and the body read recompute the time remaining against
+    // the same absolute deadline, so the two together cannot exceed the budget.
     let mut len_bytes = [0u8; 4];
     read_exact_deadline(stream, &mut len_bytes, stage, deadline).await?;
     let len = u32::from_le_bytes(len_bytes);
@@ -314,7 +336,7 @@ async fn write_message<S, T>(
     stream: &mut S,
     stage: AuthStage,
     value: &T,
-    deadline: Duration,
+    deadline: Deadline,
 ) -> Result<(), AuthError>
 where
     S: AsyncWrite + Unpin,
@@ -343,13 +365,14 @@ async fn read_exact_deadline<S>(
     stream: &mut S,
     buf: &mut [u8],
     stage: AuthStage,
-    deadline: Duration,
+    deadline: Deadline,
 ) -> Result<(), AuthError>
 where
     S: AsyncRead + Unpin,
 {
+    let remaining = deadline.remaining(stage)?;
     let expected = buf.len();
-    with_timeout(stage, deadline, async {
+    with_timeout(stage, remaining, async {
         let mut actual = 0;
         while actual < expected {
             let read = stream.read(&mut buf[actual..]).await?;
@@ -363,7 +386,10 @@ where
     .await
     .map_err(|err| match err {
         DeadlineIoError::Io(source) => AuthError::Io { stage, source },
-        DeadlineIoError::Timeout => AuthError::Timeout { stage, deadline },
+        DeadlineIoError::Timeout => AuthError::Timeout {
+            stage,
+            deadline: deadline.total,
+        },
         DeadlineIoError::UnexpectedEof { actual } => AuthError::UnexpectedEof {
             stage,
             expected,
@@ -376,22 +402,31 @@ async fn write_all_deadline<S>(
     stream: &mut S,
     buf: &[u8],
     stage: AuthStage,
-    deadline: Duration,
+    deadline: Deadline,
 ) -> Result<(), AuthError>
 where
     S: AsyncWrite + Unpin,
 {
-    timeout_io(stage, deadline, stream.write_all(buf)).await
+    let remaining = deadline.remaining(stage)?;
+    timeout_io(stage, remaining, deadline.total, stream.write_all(buf)).await
 }
 
-async fn timeout_io<T, F>(stage: AuthStage, deadline: Duration, future: F) -> Result<T, AuthError>
+async fn timeout_io<T, F>(
+    stage: AuthStage,
+    remaining: Duration,
+    total: Duration,
+    future: F,
+) -> Result<T, AuthError>
 where
     F: Future<Output = io::Result<T>>,
 {
-    match time::timeout(deadline, future).await {
+    match time::timeout(remaining, future).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(source)) => Err(AuthError::Io { stage, source }),
-        Err(_) => Err(AuthError::Timeout { stage, deadline }),
+        Err(_) => Err(AuthError::Timeout {
+            stage,
+            deadline: total,
+        }),
     }
 }
 
@@ -488,6 +523,7 @@ impl Error for AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Endpoint;
     use tokio::{
         io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream},
         task::yield_now,
@@ -542,6 +578,135 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Write only the 4-byte length prefix of an auth message, withholding the
+    /// body — used to stall a peer mid-message so the within-stage deadline can be
+    /// exercised (the length read and body read must share one absolute budget).
+    async fn write_auth_len_only<T>(stream: &mut DuplexStream, value: &T)
+    where
+        T: Serialize,
+    {
+        let body = serde_json::to_vec(value).expect("encode auth json");
+        stream
+            .write_all(&(body.len() as u32).to_le_bytes())
+            .await
+            .expect("write auth length");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_deadline_spans_length_and_body_within_one_stage() {
+        // The bug this guards: applying the timeout independently to the length
+        // read and the body read lets a single stage consume ~2x the budget. Here
+        // the client sends the ClientHello length prefix late, then withholds the
+        // body until the absolute deadline has passed. With one shared deadline the
+        // server times out at the deadline; with per-read deadlines the body read
+        // would get a fresh full window and not time out yet.
+        let key = vec![0x5a; MIN_KEY_LEN];
+        let daemon_id = [0x6b; DAEMON_ID_LEN];
+        let deadline = Duration::from_millis(100);
+        let (mut client, mut server) = duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            authenticate_server(&mut server, &key, &daemon_id, TEST_DAEMON_VER, deadline).await
+        });
+
+        yield_now().await;
+        // Burn most of the budget, then send only the length prefix.
+        advance(Duration::from_millis(60)).await;
+        write_auth_len_only(
+            &mut client,
+            &ClientHello {
+                client_nonce: [0x11; NONCE_LEN],
+                role: DEFAULT_CLIENT_ROLE.to_owned(),
+            },
+        )
+        .await;
+        yield_now().await;
+        assert!(!server_task.is_finished());
+
+        // Cross the absolute deadline (60 + 50 > 100) without sending the body.
+        advance(Duration::from_millis(50)).await;
+        yield_now().await;
+        assert!(
+            server_task.is_finished(),
+            "body read must share the handshake deadline, not get a fresh window"
+        );
+        let err = server_task
+            .await
+            .expect("join")
+            .expect_err("must time out at ClientHello body");
+        assert!(matches!(
+            err,
+            AuthError::Timeout {
+                stage: AuthStage::ClientHello,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_deadline_is_absolute() {
+        // The client previously passed the full deadline to each stage with no
+        // absolute bound. Here the server stalls the ServerProof body past the
+        // deadline; the client must time out at the budget, not wait a fresh window.
+        let key = vec![0x5a; MIN_KEY_LEN];
+        let daemon_id = [0x6b; DAEMON_ID_LEN];
+        let deadline = Duration::from_millis(100);
+        let conn = ConnectionInfo {
+            schema: 1,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+            }],
+            key: key.clone(),
+            daemon_id,
+            pid: 1,
+            daemon_ver: TEST_DAEMON_VER.to_owned(),
+        };
+
+        let (mut server, mut client) = duplex(4096);
+        let client_task =
+            tokio::spawn(async move { authenticate_client(&mut client, &conn, deadline).await });
+
+        // Read the client's ClientHello so its write completes.
+        let _hello: ClientHello = read_auth_json(&mut server).await;
+        yield_now().await;
+        assert!(!client_task.is_finished());
+
+        // Send only the ServerProof length prefix, then stall the body past the
+        // absolute deadline.
+        advance(Duration::from_millis(60)).await;
+        let server_nonce = [0x22; NONCE_LEN];
+        let server_proof = compute_proof(
+            &key,
+            SERVER_PROOF_DOMAIN,
+            &[0u8; NONCE_LEN],
+            &server_nonce,
+            &daemon_id,
+        );
+        write_auth_len_only(
+            &mut server,
+            &ServerProof {
+                daemon_id,
+                server_nonce,
+                daemon_ver: TEST_DAEMON_VER.to_owned(),
+                server_proof,
+            },
+        )
+        .await;
+        yield_now().await;
+        advance(Duration::from_millis(50)).await;
+        yield_now().await;
+        assert!(
+            client_task.is_finished(),
+            "client must bound the whole handshake by one absolute deadline"
+        );
+        let err = client_task
+            .await
+            .expect("join")
+            .expect_err("client must time out");
+        assert!(matches!(err, AuthError::Timeout { .. }));
     }
 
     async fn read_auth_json<T>(stream: &mut DuplexStream) -> T

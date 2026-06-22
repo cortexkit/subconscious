@@ -166,15 +166,17 @@ impl ControlHandler {
         Arc::clone(&self.forwarding)
     }
 
+    /// Remove a connection's registry entries WITHOUT signalling the supervisor's
+    /// registration-release watch. The signal is what the supervisor waits on
+    /// before spawning a replacement, so it must only fire once forwarding
+    /// teardown is also done (see [`Self::cleanup_connection`] /
+    /// [`Self::handle_goodbye`]). Used directly only where there is no forwarding
+    /// state to tear down (a HELLO that failed before module registration).
     fn deregister_connection(
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
-        let registrations = self.registry.deregister_connection(connection_id)?;
-        if !registrations.is_empty() {
-            crate::supervise::notify_registration_release();
-        }
-        Ok(registrations)
+        self.registry.deregister_connection(connection_id)
     }
 
     /// Test-only compatibility entry point for unit control handling that does not have a socket sink.
@@ -284,6 +286,12 @@ impl ControlHandler {
         if let Ok(released_routes) = self.forwarding.cleanup_connection(connection_id) {
             self.emit_route_goodbyes(released_routes);
         }
+        // Signal the registration-release watch only now that BOTH registry and
+        // forwarding teardown are done, so a supervisor waiting to spawn a
+        // replacement never observes release while old routes still exist.
+        if matches!(&registrations, Ok(r) if !r.is_empty()) {
+            crate::supervise::notify_registration_release();
+        }
         registrations
     }
 
@@ -357,6 +365,50 @@ impl ControlHandler {
         }
     }
 
+    /// Best-effort GOODBYE to a module for a route channel subc reserved but then
+    /// abandoned (route.bind relay timed out, its waiter was cancelled, or subc's
+    /// own commit failed after the module had already accepted). Without this, a
+    /// module that accepts late keeps a binding subc has torn down, so a later
+    /// frame on that module channel could misdeliver if the channel is reused.
+    ///
+    /// Never closes the shared module connection on failure: a dropped notification
+    /// only wastes a bounded amount of warm module-side state, which the module's
+    /// own idle reaper reclaims. Only call this once the route.bind relay was
+    /// actually enqueued to the module — if the relay send itself failed, the
+    /// module never created a binding and there is nothing to tear down.
+    fn send_abandoned_route_bind_goodbye(
+        &self,
+        module_sink: &crate::FrameSink,
+        negotiated_ver: u8,
+        module_channel: u16,
+    ) {
+        let frame = match Frame::build_with_version(
+            negotiated_ver,
+            FrameType::Goodbye,
+            control_flags(),
+            module_channel,
+            0,
+            Vec::new(),
+        ) {
+            Ok(frame) => frame,
+            Err(err) => {
+                warn!(
+                    route_channel = module_channel,
+                    error = %err,
+                    "failed to build GOODBYE for abandoned route.bind"
+                );
+                return;
+            }
+        };
+        if let Err(err) = module_sink.try_send(frame) {
+            warn!(
+                route_channel = module_channel,
+                error = %err,
+                "GOODBYE for abandoned route.bind dropped; module idle reaper will reclaim the binding"
+            );
+        }
+    }
+
     fn handle_hello(
         &self,
         connection_id: ConnectionId,
@@ -409,6 +461,20 @@ impl ControlHandler {
             }
         };
 
+        // A connection that already opened client routes must not also register as
+        // a module: cleanup would then release only one side and leak the other.
+        if self
+            .forwarding
+            .connection_has_client_routes(connection_id)
+            .map_err(RouterError::Forwarding)?
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_hello",
+                "connection has open client routes and cannot also register as a module",
+            )?]);
+        }
+
         let control_ops = effective_module_control_ops(hello.control_ops);
         let registration = match self.registry.register_with_control_ops(
             hello.manifest,
@@ -445,7 +511,13 @@ impl ControlHandler {
                     concurrency,
                     sink,
                 ) {
-                    let _ = self.deregister_connection(connection_id);
+                    // Forwarding registration failed, so there is no forwarding
+                    // state to tear down; remove the registry entry and signal the
+                    // release watch directly (the no-forwarding case the helper's
+                    // doc-comment refers to).
+                    if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
+                        crate::supervise::notify_registration_release();
+                    }
                     return Ok(vec![control_error_frame(
                         &frame,
                         forwarding_error_code(&err),
@@ -758,6 +830,13 @@ impl ControlHandler {
                     client_channel,
                     module_channel,
                 ) {
+                    // The module already accepted (it holds a binding), but subc
+                    // could not commit locally. Tell the module to drop it.
+                    self.send_abandoned_route_bind_goodbye(
+                        &module_sink,
+                        negotiated_ver,
+                        module_channel,
+                    );
                     reservation.release_and_disarm();
                     return Ok(vec![control_error_frame(
                         &frame,
@@ -788,6 +867,14 @@ impl ControlHandler {
                 )?])
             }
             Ok(Err(_)) => {
+                // The relay was enqueued but its waiter was cancelled before the
+                // module answered; the module may still accept late, so tell it to
+                // drop any binding for this channel.
+                self.send_abandoned_route_bind_goodbye(
+                    &module_sink,
+                    negotiated_ver,
+                    module_channel,
+                );
                 reservation.release_and_disarm();
                 Ok(vec![control_error_frame(
                     &frame,
@@ -796,6 +883,13 @@ impl ControlHandler {
                 )?])
             }
             Err(_) => {
+                // Relay was enqueued but the module did not answer in time; it may
+                // still accept late, so tell it to drop any binding for this channel.
+                self.send_abandoned_route_bind_goodbye(
+                    &module_sink,
+                    negotiated_ver,
+                    module_channel,
+                );
                 reservation.release_and_disarm();
                 Ok(vec![control_error_frame(
                     &frame,
@@ -859,11 +953,16 @@ impl ControlHandler {
         };
 
         if let Err(err) = module.restart().await {
-            return Ok(vec![control_error_frame(
-                &frame,
-                "target_unavailable",
-                format!("failed to restart module_id '{module_id}': {err}"),
-            )?]);
+            let (code, message) = match err {
+                crate::supervise::SuperviseError::Disabled { .. } => {
+                    ("module_disabled", err.to_string())
+                }
+                _ => (
+                    "target_unavailable",
+                    format!("failed to restart module_id '{module_id}': {err}"),
+                ),
+            };
+            return Ok(vec![control_error_frame(&frame, code, message)?]);
         }
 
         let response = ClientControlResponse::SupervisorAck {
@@ -891,11 +990,16 @@ impl ControlHandler {
         };
 
         if let Err(err) = module.reload().await {
-            return Ok(vec![control_error_frame(
-                &frame,
-                "reload_failed",
-                format!("failed to reload module_id '{module_id}': {err}"),
-            )?]);
+            let (code, message) = match err {
+                crate::supervise::SuperviseError::Disabled { .. } => {
+                    ("module_disabled", err.to_string())
+                }
+                _ => (
+                    "reload_failed",
+                    format!("failed to reload module_id '{module_id}': {err}"),
+                ),
+            };
+            return Ok(vec![control_error_frame(&frame, code, message)?]);
         }
 
         let response = ClientControlResponse::SupervisorAck {
@@ -999,11 +1103,18 @@ impl ControlHandler {
         let update = match serde_json::from_slice::<ModuleControlPush>(&frame.body) {
             Ok(update) => update,
             Err(err) => {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    "invalid_control_body",
-                    format!("malformed module control push body: {err}"),
-                )?])
+                // Forward-compat: a newer module may push a channel-0 op this subc
+                // version doesn't know. The control contract says unknown push ops
+                // are IGNORED, never answered with an error. Only a malformed body
+                // for an op we DO know is a real error worth surfacing.
+                if is_known_module_push_op(&frame.body) {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "invalid_control_body",
+                        format!("malformed module control push body: {err}"),
+                    )?]);
+                }
+                return Ok(Vec::new());
             }
         };
 
@@ -1151,13 +1262,18 @@ impl ControlHandler {
 
     fn handle_goodbye(&self, connection_id: ConnectionId) -> Result<Vec<Frame>, RouterError> {
         debug!(connection_id = connection_id.get(), "handling GOODBYE");
-        self.deregister_connection(connection_id)
+        let registrations = self
+            .deregister_connection(connection_id)
             .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
         let released_routes = self
             .forwarding
             .cleanup_connection(connection_id)
             .map_err(RouterError::Forwarding)?;
         self.emit_route_goodbyes(released_routes);
+        // Notify only after forwarding teardown completes (see cleanup_connection).
+        if !registrations.is_empty() {
+            crate::supervise::notify_registration_release();
+        }
         Ok(Vec::new())
     }
 }
@@ -1242,15 +1358,25 @@ enum ClientControlRequestBodyError {
 }
 
 #[derive(Debug, Deserialize)]
-struct ClientControlRequestOpProbe {
+struct ControlOpProbe {
     op: String,
+}
+
+/// Channel-0 push ops this subc version understands. A push whose `op` is not in
+/// this set is treated as a forward-compat unknown and ignored rather than errored.
+const MODULE_PUSH_OPS: &[&str] = &["route.status"];
+
+fn is_known_module_push_op(body: &[u8]) -> bool {
+    serde_json::from_slice::<ControlOpProbe>(body)
+        .map(|probe| MODULE_PUSH_OPS.contains(&probe.op.as_str()))
+        .unwrap_or(false)
 }
 
 fn parse_client_control_request(
     body: &[u8],
 ) -> Result<ClientControlRequest, (serde_json::Error, ClientControlRequestBodyError)> {
     serde_json::from_slice::<ClientControlRequest>(body).map_err(|err| {
-        let classification = match serde_json::from_slice::<ClientControlRequestOpProbe>(body) {
+        let classification = match serde_json::from_slice::<ControlOpProbe>(body) {
             Ok(probe) if SUBC_CONTROL_OPS.contains(&probe.op.as_str()) => {
                 ClientControlRequestBodyError::InvalidBody
             }
@@ -1707,6 +1833,80 @@ mod tests {
         assert_eq!(error["code"], "version_unsupported");
         assert!(registry.get_module("aft").unwrap().is_none());
         assert_eq!(registry.active_registration_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn unknown_module_push_op_is_ignored_but_malformed_known_op_errors() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler = ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let module_connection = ConnectionId::new(301);
+        let registration = registry
+            .register_with_control_ops(
+                manifest("aft-push", PROTOCOL_VERSION),
+                PROTOCOL_VERSION,
+                module_connection,
+                module_baseline_control_ops(),
+            )
+            .unwrap();
+        let (module_tx, _module_rx) = mpsc::channel(8);
+        let endpoint = forwarding
+            .register_module_connection(
+                module_connection,
+                "aft-push".to_string(),
+                PROTOCOL_VERSION,
+                manifest_concurrency(&registration.manifest),
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+
+        // A push op this version does not know is ignored (forward-compat), not errored.
+        let unknown = Frame::build(
+            FrameType::Push,
+            control_flags(),
+            0,
+            5,
+            serde_json::to_vec(&json!({"op": "route.future.v2", "extra": 1})).unwrap(),
+        )
+        .unwrap();
+        let out = handler.handle_status_update(endpoint, unknown).unwrap();
+        assert!(out.is_empty(), "unknown push op must be ignored, got {out:?}");
+
+        // A malformed body for a KNOWN op is a real error worth surfacing.
+        let malformed = Frame::build(
+            FrameType::Push,
+            control_flags(),
+            0,
+            6,
+            serde_json::to_vec(&json!({"op": "route.status"})).unwrap(),
+        )
+        .unwrap();
+        let out = handler.handle_status_update(endpoint, malformed).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&out[0])["code"], "invalid_control_body");
+    }
+
+    #[test]
+    fn hello_rejected_when_connection_already_owns_client_routes() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler = ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        // Commits a client route on connection 202 (bound to a module on conn 101).
+        let _ = bind_liveness_route(&registry, &forwarding, "aft-module");
+        let client_connection = ConnectionId::new(202);
+
+        // That same connection now tries to register as a module: rejected, so one
+        // connection never holds both client-route and module-endpoint state.
+        let responses = handler
+            .handle_control(
+                client_connection,
+                hello_frame("aft-second", PROTOCOL_VERSION, 9),
+            )
+            .unwrap();
+        assert_eq!(responses[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&responses[0])["code"], "invalid_hello");
+        assert!(registry.get_module("aft-second").unwrap().is_none());
     }
 
     #[test]

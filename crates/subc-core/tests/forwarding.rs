@@ -1308,6 +1308,59 @@ async fn route_open_timeout_releases_reservation_and_later_open_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_timeout_sends_module_goodbye_for_abandoned_bind() {
+    // When route.open's relay was delivered to the module but the bind times out,
+    // subc must tell the module to drop any binding it may create late — otherwise
+    // a late-accepting module keeps a route subc has torn down. The stub records a
+    // `detach` event for every route GOODBYE it receives, so observing that event
+    // proves subc sent the abandoned-bind GOODBYE on the module channel.
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-bind-timeout-goodbye";
+    let (timing_out, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "bind-timeout-goodbye",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let error = attach_error_on_stream_with_wait(
+        &mut client,
+        &project,
+        471,
+        "ses-bind-timeout-goodbye",
+        module_id,
+        SETUP_TIMEOUT,
+    )
+    .await;
+    assert_eq!(error.code, "module_timeout");
+
+    // The module received the route.bind relay (attach), then a route GOODBYE
+    // (detach) for the SAME module channel once subc abandoned the bind.
+    let attach = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    let detach = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "detach"
+    })
+    .await;
+    assert_eq!(
+        attach["route_channel"], detach["route_channel"],
+        "abandoned-bind GOODBYE must target the same module channel the bind reserved"
+    );
+
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    timing_out.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_route_bind_reply_settles_and_later_open_succeeds() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));

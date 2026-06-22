@@ -1,7 +1,8 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use subc_core::{
-    ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SupervisedModule, Supervisor,
+    ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
+    SupervisedModule, Supervisor,
 };
 use tokio::time::{sleep, Instant};
 
@@ -73,6 +74,62 @@ async fn crash_restarts_and_reregisters_stub() {
     assert!(status.process_alive);
     assert!(status.registration_active);
     assert!(status.restart_count >= 1);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_and_reload_are_rejected_for_a_disabled_module() {
+    // restart/reload cycle a RUNNING module. A disabled module is intentionally
+    // off, so these must be rejected (with a typed Disabled error) rather than
+    // silently re-enabling and spawning it — that requires explicit set_enabled.
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 5, Duration::from_millis(20));
+    let module_id = "fake-aft-disabled-guard";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+
+    wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+
+    // Disable it, then confirm restart and reload both refuse.
+    let changed = module.set_enabled(false).await.unwrap();
+    assert!(changed, "module should transition from enabled to disabled");
+    wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Disabled && !status.process_alive
+    })
+    .await;
+
+    let restart_err = module
+        .restart()
+        .await
+        .expect_err("restart on a disabled module must be rejected");
+    assert!(
+        matches!(restart_err, SuperviseError::Disabled { .. }),
+        "expected Disabled, got {restart_err:?}"
+    );
+    let reload_err = module
+        .reload()
+        .await
+        .expect_err("reload on a disabled module must be rejected");
+    assert!(
+        matches!(reload_err, SuperviseError::Disabled { .. }),
+        "expected Disabled, got {reload_err:?}"
+    );
+
+    // It must still be disabled (the rejected commands did not start it).
+    let status = module.status().unwrap();
+    assert_eq!(status.state, ModuleState::Disabled);
+    assert!(!status.process_alive);
+
+    // Explicit enable still works and brings it back.
+    let reenabled = module.set_enabled(true).await.unwrap();
+    assert!(reenabled);
+    wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
 
     module.stop().await.unwrap();
 }

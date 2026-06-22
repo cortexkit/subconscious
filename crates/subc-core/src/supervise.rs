@@ -631,6 +631,13 @@ pub enum SuperviseError {
         module_id: String,
         reason: String,
     },
+    /// An operator restart/reload was requested for a module that is currently
+    /// disabled. Restart/reload cycle a *running* module; a disabled module must
+    /// be explicitly re-enabled (set_enabled(true)) rather than silently started
+    /// by a restart, so these commands are rejected instead of re-enabling it.
+    Disabled {
+        module_id: String,
+    },
     ReloadFailed {
         module_id: String,
         reason: String,
@@ -669,6 +676,12 @@ impl fmt::Display for SuperviseError {
             Self::ReloadUnavailable { module_id, reason } => {
                 write!(f, "reload unavailable for module '{module_id}': {reason}")
             }
+            Self::Disabled { module_id } => {
+                write!(
+                    f,
+                    "module '{module_id}' is disabled; enable it before restart or reload"
+                )
+            }
             Self::ReloadFailed { module_id, reason } => {
                 write!(f, "reload failed for module '{module_id}': {reason}")
             }
@@ -702,6 +715,7 @@ impl Error for SuperviseError {
             Self::Registry(err) => Some(err),
             Self::InvalidSpec { .. }
             | Self::ReloadUnavailable { .. }
+            | Self::Disabled { .. }
             | Self::ReloadFailed { .. }
             | Self::RegistrationStillActive { .. }
             | Self::StatePoisoned { .. }
@@ -897,6 +911,12 @@ async fn restart_child(
     snapshot: &SharedSnapshot,
     child: &mut Option<Child>,
 ) -> Result<(), SuperviseError> {
+    // Restart cycles a running module; it must not silently start a disabled one.
+    if !lock_snapshot(snapshot)?.enabled {
+        return Err(SuperviseError::Disabled {
+            module_id: spec.module_id.clone(),
+        });
+    }
     begin_forwarding_drain_if_configured(spec, runtime, snapshot, None, "restart").await?;
 
     if child.is_some() {
@@ -937,6 +957,12 @@ async fn reload_child(
     snapshot: &SharedSnapshot,
     child: &mut Option<Child>,
 ) -> Result<(), SuperviseError> {
+    // Reload cycles a running module; it must not silently start a disabled one.
+    if !lock_snapshot(snapshot)?.enabled {
+        return Err(SuperviseError::Disabled {
+            module_id: spec.module_id.clone(),
+        });
+    }
     begin_forwarding_drain(spec, runtime, snapshot, Some(true), "reload").await?;
 
     if child.is_some() {

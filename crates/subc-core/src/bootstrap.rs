@@ -825,11 +825,15 @@ mod tests {
     }
 
     fn assert_owner_only_connection_file(path: &Path) {
+        // `path` is only inspected on Unix (mode bits); on Windows the owner-only
+        // guarantee comes from the inherited %TEMP% ACL, nothing to assert here.
         #[cfg(unix)]
         {
             let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     #[test]

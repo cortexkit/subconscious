@@ -14,7 +14,10 @@ use tracing::{debug, warn};
 
 use crate::{
     control::ControlHandler,
-    forwarding::{CloseReason, ConnectionCloseReceiver, ForwardingError, ForwardingTable},
+    forwarding::{
+        CloseReason, ConnectionCloseReceiver, DataRoute, ForwardingError, ForwardingTable,
+        RouteBinding,
+    },
     registry::ConnectionId,
     Frame, FrameBuildError,
 };
@@ -106,7 +109,7 @@ pub struct Router {
     backends: HashMap<u16, Backend>,
     control: Arc<ControlHandler>,
     forwarding: Arc<ForwardingTable>,
-    forward_backend: Backend,
+    forward_backend: ForwardBackend,
     next_connection_id: AtomicU64,
 }
 
@@ -117,7 +120,7 @@ impl Router {
             backends: HashMap::new(),
             control,
             forwarding: Arc::clone(&forwarding),
-            forward_backend: Backend::Forward(ForwardBackend::new(forwarding)),
+            forward_backend: ForwardBackend::new(forwarding),
             // ConnectionId::LOCAL is 0; real socket ids start at 1 and never collide.
             next_connection_id: AtomicU64::new(1),
         }
@@ -193,152 +196,145 @@ impl Router {
             return Ok(());
         }
 
-        let is_module_connection = self
+        let data_route = self
             .forwarding
-            .module_endpoint_for_connection(ctx.connection_id)
-            .map_err(RouterError::Forwarding)?
-            .is_some();
+            .lookup_data_route(ctx.connection_id, channel)
+            .map_err(RouterError::Forwarding)?;
 
-        if is_module_connection {
-            if frame.header.ty == FrameType::Goodbye {
-                if let Some(target) = self
-                    .forwarding
-                    .release_module_route(ctx.connection_id, channel)
-                    .map_err(RouterError::Forwarding)?
-                {
+        match data_route {
+            DataRoute::Module(route) => {
+                if frame.header.ty == FrameType::Goodbye {
+                    if let Some(target) = self
+                        .forwarding
+                        .release_module_route(ctx.connection_id, channel)
+                        .map_err(RouterError::Forwarding)?
+                    {
+                        debug!(
+                            connection_id = ctx.connection_id.get(),
+                            module_channel = channel,
+                            client_channel = target.channel,
+                            corr,
+                            "forwarding module route GOODBYE to client"
+                        );
+                        let mut goodbye = frame;
+                        goodbye.header.channel = target.channel;
+                        if let Err(err) = target.sink.try_send(goodbye) {
+                            if target.close_on_delivery_failure() {
+                                warn!(
+                                    connection_id = ctx.connection_id.get(),
+                                    target_connection_id = target.connection_id.get(),
+                                    module_channel = channel,
+                                    client_channel = target.channel,
+                                    corr,
+                                    error = %err,
+                                    "route GOODBYE delivery failed; closing target client connection"
+                                );
+                                self.forwarding.request_connection_close(
+                                    target.connection_id,
+                                    CloseReason::new(
+                                        "route_goodbye_delivery_failed",
+                                        format!(
+                                            "failed to enqueue route GOODBYE for client channel {}: {err}",
+                                            target.channel
+                                        ),
+                                    ),
+                                );
+                            } else {
+                                warn!(
+                                    connection_id = ctx.connection_id.get(),
+                                    target_connection_id = target.connection_id.get(),
+                                    module_channel = channel,
+                                    client_channel = target.channel,
+                                    corr,
+                                    error = %err,
+                                    "route GOODBYE to module dropped under backpressure; not closing shared module connection"
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    warn!(
+                        connection_id = ctx.connection_id.get(),
+                        channel, corr, "dropping module GOODBYE for released route channel"
+                    );
+                    return Ok(());
+                }
+
+                if let Some(route) = route {
                     debug!(
                         connection_id = ctx.connection_id.get(),
                         module_channel = channel,
-                        client_channel = target.channel,
+                        client_channel = route.client_channel,
                         corr,
-                        "forwarding module route GOODBYE to client"
+                        frame_type = ?frame.header.ty,
+                        "forwarding module data-plane frame to client"
                     );
-                    let mut goodbye = frame;
-                    goodbye.header.channel = target.channel;
-                    if let Err(err) = target.sink.try_send(goodbye) {
-                        if target.close_on_delivery_failure() {
-                            warn!(
-                                connection_id = ctx.connection_id.get(),
-                                target_connection_id = target.connection_id.get(),
-                                module_channel = channel,
-                                client_channel = target.channel,
-                                corr,
-                                error = %err,
-                                "route GOODBYE delivery failed; closing target client connection"
-                            );
-                            self.forwarding.request_connection_close(
-                                target.connection_id,
-                                CloseReason::new(
-                                    "route_goodbye_delivery_failed",
-                                    format!(
-                                        "failed to enqueue route GOODBYE for client channel {}: {err}",
-                                        target.channel
-                                    ),
+                    let releases_credit = is_terminal_frame(frame.header.ty);
+                    let mut frame = frame;
+                    frame.header.channel = route.client_channel;
+                    if let Err(err) = route.client_sink.try_send(frame) {
+                        debug!(
+                            connection_id = ctx.connection_id.get(),
+                            target_connection_id = route.client_connection_id.get(),
+                            module_channel = channel,
+                            client_channel = route.client_channel,
+                            corr,
+                            error = %err,
+                            "module-to-client delivery failed; closing target client connection"
+                        );
+                        self.forwarding.request_connection_close(
+                            route.client_connection_id,
+                            CloseReason::new(
+                                "module_to_client_delivery_failed",
+                                format!(
+                                    "failed to enqueue module frame for client channel {} corr {corr}: {err}",
+                                    route.client_channel
                                 ),
-                            );
-                        } else {
-                            warn!(
-                                connection_id = ctx.connection_id.get(),
-                                target_connection_id = target.connection_id.get(),
-                                module_channel = channel,
-                                client_channel = target.channel,
-                                corr,
-                                error = %err,
-                                "route GOODBYE to module dropped under backpressure; not closing shared module connection"
-                            );
-                        }
+                            ),
+                        );
+                        return Ok(());
+                    }
+                    if releases_credit {
+                        // Release only after the terminal is enqueued to the client sink so
+                        // reload quiescence cannot let a route GOODBYE overtake it. If enqueue
+                        // failed, the forced client cleanup closes the flow instead.
+                        route.flow.release();
                     }
                     return Ok(());
                 }
 
+                // subc only drops stale route frames for released channels; re-sending a
+                // dropped PUSH after the module re-attaches is the module's responsibility,
+                // not the router's.
                 warn!(
                     connection_id = ctx.connection_id.get(),
-                    channel, corr, "dropping module GOODBYE for released route channel"
-                );
-                return Ok(());
-            }
-
-            if let Some(route) = self
-                .forwarding
-                .module_route(ctx.connection_id, channel)
-                .map_err(RouterError::Forwarding)?
-            {
-                debug!(
-                    connection_id = ctx.connection_id.get(),
-                    module_channel = channel,
-                    client_channel = route.client_channel,
+                    channel,
                     corr,
                     frame_type = ?frame.header.ty,
-                    "forwarding module data-plane frame to client"
+                    "dropping module data-plane frame for released route channel"
                 );
-                let releases_credit = is_terminal_frame(frame.header.ty);
-                let mut frame = frame;
-                frame.header.channel = route.client_channel;
-                if let Err(err) = route.sink.try_send(frame) {
-                    debug!(
-                        connection_id = ctx.connection_id.get(),
-                        target_connection_id = route.connection_id.get(),
-                        module_channel = channel,
-                        client_channel = route.client_channel,
-                        corr,
-                        error = %err,
-                        "module-to-client delivery failed; closing target client connection"
-                    );
-                    self.forwarding.request_connection_close(
-                        route.connection_id,
-                        CloseReason::new(
-                            "module_to_client_delivery_failed",
-                            format!(
-                                "failed to enqueue module frame for client channel {} corr {corr}: {err}",
-                                route.client_channel
-                            ),
-                        ),
-                    );
-                    return Ok(());
-                }
-                if releases_credit {
-                    // Release only after the terminal is enqueued to the client sink so
-                    // reload quiescence cannot let a route GOODBYE overtake it. If enqueue
-                    // failed, the forced client cleanup closes the flow instead.
-                    route.flow.release();
-                }
                 return Ok(());
             }
+            DataRoute::Client(route) => {
+                if frame.header.ty == FrameType::Goodbye {
+                    let _ = self
+                        .control
+                        .handle_route_goodbye(ctx.connection_id, channel)?;
+                    return Ok(());
+                }
 
-            // subc only drops stale route frames for released channels; re-sending a
-            // dropped PUSH after the module re-attaches is the module's responsibility,
-            // not the router's.
-            warn!(
-                connection_id = ctx.connection_id.get(),
-                channel,
-                corr,
-                frame_type = ?frame.header.ty,
-                "dropping module data-plane frame for released route channel"
-            );
-            return Ok(());
-        }
-
-        if frame.header.ty == FrameType::Goodbye {
-            let _ = self
-                .control
-                .handle_route_goodbye(ctx.connection_id, channel)?;
-            return Ok(());
-        }
-
-        if self
-            .forwarding
-            .client_route(ctx.connection_id, channel)
-            .map_err(RouterError::Forwarding)?
-            .is_some()
-        {
-            debug!(
-                connection_id = ctx.connection_id.get(),
-                channel,
-                corr,
-                frame_type = ?frame.header.ty,
-                "forwarding client data-plane frame to module"
-            );
-            return self.forward_backend.handle(ctx.clone(), frame).await;
+                if let Some(route) = route {
+                    debug!(
+                        connection_id = ctx.connection_id.get(),
+                        channel,
+                        corr,
+                        frame_type = ?frame.header.ty,
+                        "forwarding client data-plane frame to module"
+                    );
+                    return self.forward_backend.handle_bound(frame, route).await;
+                }
+            }
         }
 
         let Some(backend) = self.backends.get(&channel) else {
@@ -438,12 +434,27 @@ impl ForwardBackend {
     pub async fn handle(&self, ctx: RouteCtx, frame: Frame) -> Result<(), RouterError> {
         let channel = frame.header.channel;
         let corr = frame.header.corr;
-        let frame_type = frame.header.ty;
-        let route = self
+        let route = match self
             .forwarding
-            .client_route(ctx.connection_id, channel)
+            .lookup_data_route(ctx.connection_id, channel)
             .map_err(RouterError::Forwarding)?
-            .ok_or(RouterError::UnknownChannel { channel, corr })?;
+        {
+            DataRoute::Client(Some(route)) => route,
+            DataRoute::Client(None) | DataRoute::Module(_) => {
+                return Err(RouterError::UnknownChannel { channel, corr });
+            }
+        };
+        self.handle_bound(frame, route).await
+    }
+
+    pub(crate) async fn handle_bound(
+        &self,
+        frame: Frame,
+        route: Arc<RouteBinding>,
+    ) -> Result<(), RouterError> {
+        let channel = frame.header.channel;
+        let corr = frame.header.corr;
+        let frame_type = frame.header.ty;
 
         // CANCEL and other non-REQUEST frames bypass the request-credit window;
         // the original request's credit is freed only by the module's terminal frame.
@@ -452,7 +463,7 @@ impl ForwardBackend {
             if let Err(err) = route.flow.acquire().await {
                 if self
                     .forwarding
-                    .endpoint_is_draining(route.endpoint)
+                    .endpoint_is_draining(route.module_endpoint)
                     .map_err(RouterError::Forwarding)?
                 {
                     return Err(RouterError::route_error(
@@ -473,7 +484,7 @@ impl ForwardBackend {
         let mut frame = frame;
         frame.header.channel = route.module_channel;
         let result = route
-            .sink
+            .module_sink
             .send(frame)
             .await
             .map_err(|err| RouterError::backend(channel, corr, err.to_string()));

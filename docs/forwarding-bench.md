@@ -62,7 +62,57 @@ Captured on **aarch64**, **18 logical CPUs**, **2026-06-22** (release bench for 
 | 32      | 8      | 51.33  | 118.75 | 292.88  | 636259  |
 | 32      | 64     | 52.83  | 125.46 | 331.42  | 605272  |
 
-Tail latency grows sharply at **16-32** concurrent lock contenders (p99/p999), while median stays sub-microsecond to low tens of us.
+### Arm 1 — client forward (us, ops/s), AFTER (fusion + RouteBinding + RwLock)
+
+Captured on **aarch64**, **18 logical CPUs**, **2026-06-22** (same machine/command as BASELINE).
+
+| clients | routes | p50_us | p99_us | p999_us | ops/s   |
+|--------:|-------:|-------:|-------:|--------:|--------:|
+| 1       | 1      | 0.29   | 1.29   | 8.83    | 3188479 |
+| 1       | 8      | 0.17   | 1.67   | 10.04   | 3887647 |
+| 1       | 64     | 0.17   | 2.67   | 23.75   | 3361580 |
+| 2       | 1      | 0.42   | 10.67  | 23.08   | 2879148 |
+| 2       | 8      | 0.38   | 2.29   | 7.62    | 4559531 |
+| 2       | 64     | 0.33   | 4.00   | 20.83   | 4468899 |
+| 4       | 1      | 0.38   | 23.79  | 49.46   | 2647436 |
+| 4       | 8      | 0.50   | 6.75   | 19.17   | 5083938 |
+| 4       | 64     | 0.50   | 4.21   | 20.88   | 5710988 |
+| 8       | 1      | 0.42   | 43.75  | 94.71   | 2230209 |
+| 8       | 8      | 1.04   | 15.71  | 37.17   | 3974522 |
+| 8       | 64     | 1.04   | 34.04  | 56.00   | 2796636 |
+| 16      | 1      | 0.46   | 61.04  | 386.54  | 2092891 |
+| 16      | 8      | 1.62   | 54.50  | 81.21   | 1260014 |
+| 16      | 64     | 2.04   | 59.50  | 86.38   | 1194383 |
+| 32      | 1      | 0.42   | 103.54 | 1556.29 | 2245813 |
+| 32      | 8      | 41.00  | 91.17  | 123.04  | 809348  |
+| 32      | 64     | 43.29  | 93.33  | 125.33  | 766737  |
+
+### Arm 1 delta vs BASELINE
+
+After-vs-baseline deltas; negative latency is faster, positive throughput is higher. The refactor improves p99 in every cell and p999 in 16/18 cells; p50 regresses in low-contention cells where `RwLock`/`Arc` overhead dominates, but improves for the high-contention 16×{8,64} and 32×{8,64} cells.
+
+| clients | routes | p50_delta | p99_delta | p999_delta | ops_delta |
+|--------:|-------:|----------:|----------:|-----------:|----------:|
+| 1       | 1      | +262%     | -80%      | +0%        | -19%      |
+| 1       | 8      | +112%     | -77%      | -11%       | -5%       |
+| 1       | 64     | +42%      | -76%      | +31%       | +91%      |
+| 2       | 1      | +147%     | -39%      | -32%       | +94%      |
+| 2       | 8      | +81%      | -85%      | -72%       | +257%     |
+| 2       | 64     | +57%      | -75%      | -29%       | +236%     |
+| 4       | 1      | +124%     | -38%      | -33%       | +97%      |
+| 4       | 8      | +138%     | -77%      | -60%       | +280%     |
+| 4       | 64     | +100%     | -86%      | -55%       | +344%     |
+| 8       | 1      | +68%      | -47%      | -39%       | +98%      |
+| 8       | 8      | +215%     | -76%      | -69%       | +226%     |
+| 8       | 64     | +148%     | -42%      | -38%       | +154%     |
+| 16      | 1      | +59%      | -75%      | -47%       | +92%      |
+| 16      | 8      | -79%      | -37%      | -70%       | +50%      |
+| 16      | 64     | -72%      | -39%      | -65%       | +39%      |
+| 32      | 1      | +27%      | -77%      | -51%       | +106%     |
+| 32      | 8      | -20%      | -23%      | -58%       | +27%      |
+| 32      | 64     | -18%      | -26%      | -62%       | +27%      |
+
+In the baseline, tail latency grows sharply at **16-32** concurrent lock contenders (p99/p999), while median stays sub-microsecond to low tens of us.
 
 ### Arm 2 — loopback e2e (ms, calls/s)
 
@@ -82,4 +132,4 @@ End-to-end latency is dominated by socket I/O and stub process at these scales; 
 - `crates/subc-core/benches/forwarding_contention.rs` — arm1 driver.
 - `crates/subc-core/tests/forwarding.rs` — `forwarding_bench_e2e_arm2` (ignored).
 
-Post-refactor: re-run the same commands and add a **POST-REFACTOR** section beside the tables above.
+Post-refactor AFTER results are recorded above for Arm 1.

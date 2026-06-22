@@ -4,7 +4,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
 };
 
@@ -44,22 +44,24 @@ pub(crate) struct ModuleRouteKey {
     pub channel: u16,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ModuleRoute {
-    pub endpoint: ModuleEndpointId,
-    pub sink: FrameSink,
-    pub negotiated_ver: u8,
+#[derive(Debug)]
+pub(crate) struct RouteBinding {
+    pub client_connection_id: ConnectionId,
+    pub client_sink: FrameSink,
+    pub client_negotiated_ver: u8,
+    pub client_channel: u16,
+    pub module_id: String,
+    pub module_endpoint: ModuleEndpointId,
+    pub module_sink: FrameSink,
+    pub module_negotiated_ver: u8,
     pub module_channel: u16,
     pub flow: Arc<ChannelFlow>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ClientRoute {
-    pub connection_id: ConnectionId,
-    pub sink: FrameSink,
-    pub negotiated_ver: u8,
-    pub client_channel: u16,
-    pub flow: Arc<ChannelFlow>,
+pub(crate) enum DataRoute {
+    Client(Option<Arc<RouteBinding>>),
+    Module(Option<Arc<RouteBinding>>),
 }
 
 /// Which kind of peer a route GOODBYE is being delivered to. This decides what
@@ -157,8 +159,8 @@ struct ForwardingInner {
     reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
     next_client_channel: HashMap<ConnectionId, u16>,
     next_module_channel: HashMap<ModuleEndpointId, u16>,
-    client_to_module: HashMap<ClientRouteKey, ModuleRoute>,
-    module_to_client: HashMap<ModuleRouteKey, ClientRoute>,
+    client_to_module: HashMap<ClientRouteKey, Arc<RouteBinding>>,
+    module_to_client: HashMap<ModuleRouteKey, Arc<RouteBinding>>,
     status: HashMap<ClientRouteKey, String>,
     pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<RouteBindRelayOutcome>>,
 }
@@ -189,7 +191,7 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 /// Dynamic forwarding state shared by the control plane and data-plane router.
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
-    inner: Mutex<ForwardingInner>,
+    inner: RwLock<ForwardingInner>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
 }
 
@@ -246,7 +248,7 @@ impl ForwardingTable {
         concurrency: Concurrency,
         sink: FrameSink,
     ) -> Result<ModuleEndpointId, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             let _ = remove_module_connection_locked(&mut inner, old_endpoint);
         }
@@ -289,7 +291,7 @@ impl ForwardingTable {
         client_connection_id: ConnectionId,
         expected_module_id: &str,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         let module = inner
             .modules_by_id
             .get(expected_module_id)
@@ -338,7 +340,7 @@ impl ForwardingTable {
         client_channel: u16,
         module_channel: u16,
     ) -> Result<(), ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         let module_id = inner
             .module_id_by_endpoint
             .get(&endpoint)
@@ -372,27 +374,22 @@ impl ForwardingTable {
             .cloned()
             .ok_or(ForwardingError::StaleModuleEndpoint)?;
 
-        let flow = Arc::new(ChannelFlow::new(window_for(&module.concurrency)));
-        inner.client_to_module.insert(
-            client_key,
-            ModuleRoute {
-                endpoint,
-                sink: module.sink,
-                negotiated_ver: module.negotiated_ver,
-                module_channel,
-                flow: Arc::clone(&flow),
-            },
-        );
-        inner.module_to_client.insert(
-            module_key,
-            ClientRoute {
-                connection_id: client_connection_id,
-                sink: client_sink,
-                negotiated_ver: client_negotiated_ver,
-                client_channel,
-                flow,
-            },
-        );
+        let binding = Arc::new(RouteBinding {
+            client_connection_id,
+            client_sink,
+            client_negotiated_ver,
+            client_channel,
+            module_id,
+            module_endpoint: endpoint,
+            module_sink: module.sink,
+            module_negotiated_ver: module.negotiated_ver,
+            module_channel,
+            flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
+        });
+        inner
+            .client_to_module
+            .insert(client_key, Arc::clone(&binding));
+        inner.module_to_client.insert(module_key, binding);
         Ok(())
     }
 
@@ -403,7 +400,7 @@ impl ForwardingTable {
         endpoint: ModuleEndpointId,
         module_channel: u16,
     ) -> Result<(), ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         release_reserved_route_locked(
             &mut inner,
             ClientRouteKey {
@@ -423,7 +420,7 @@ impl ForwardingTable {
         client_connection_id: ConnectionId,
         client_channel: u16,
     ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         Ok(release_client_route_locked(
             &mut inner,
             ClientRouteKey {
@@ -438,7 +435,7 @@ impl ForwardingTable {
         module_connection_id: ConnectionId,
         module_channel: u16,
     ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         let Some(endpoint) = inner
             .endpoint_by_connection
             .get(&module_connection_id)
@@ -460,7 +457,7 @@ impl ForwardingTable {
         endpoint: ModuleEndpointId,
         corr: u64,
     ) -> Result<(), ForwardingError> {
-        self.lock_inner()?.pending_relays.remove(&(endpoint, corr));
+        self.write_inner()?.pending_relays.remove(&(endpoint, corr));
         Ok(())
     }
 
@@ -470,7 +467,7 @@ impl ForwardingTable {
         corr: u64,
         outcome: RouteBindRelayOutcome,
     ) -> Result<bool, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
             return Ok(false);
         };
@@ -486,7 +483,7 @@ impl ForwardingTable {
         connection_id: ConnectionId,
     ) -> Result<Option<ModuleEndpointId>, ForwardingError> {
         Ok(self
-            .lock_inner()?
+            .read_inner()?
             .endpoint_by_connection
             .get(&connection_id)
             .copied())
@@ -496,44 +493,33 @@ impl ForwardingTable {
         &self,
         module_id: &str,
     ) -> Result<bool, ForwardingError> {
-        Ok(self.lock_inner()?.modules_by_id.contains_key(module_id))
+        Ok(self.read_inner()?.modules_by_id.contains_key(module_id))
     }
 
-    pub(crate) fn client_route(
+    pub(crate) fn lookup_data_route(
         &self,
-        client_connection_id: ConnectionId,
-        client_channel: u16,
-    ) -> Result<Option<ModuleRoute>, ForwardingError> {
-        Ok(self
-            .lock_inner()?
-            .client_to_module
-            .get(&ClientRouteKey {
-                connection_id: client_connection_id,
-                channel: client_channel,
-            })
-            .cloned())
-    }
+        connection_id: ConnectionId,
+        channel: u16,
+    ) -> Result<DataRoute, ForwardingError> {
+        let inner = self.read_inner()?;
+        if let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() {
+            return Ok(DataRoute::Module(
+                inner
+                    .module_to_client
+                    .get(&ModuleRouteKey { endpoint, channel })
+                    .cloned(),
+            ));
+        }
 
-    pub(crate) fn module_route(
-        &self,
-        module_connection_id: ConnectionId,
-        module_channel: u16,
-    ) -> Result<Option<ClientRoute>, ForwardingError> {
-        let inner = self.lock_inner()?;
-        let Some(endpoint) = inner
-            .endpoint_by_connection
-            .get(&module_connection_id)
-            .copied()
-        else {
-            return Ok(None);
-        };
-        Ok(inner
-            .module_to_client
-            .get(&ModuleRouteKey {
-                endpoint,
-                channel: module_channel,
-            })
-            .cloned())
+        Ok(DataRoute::Client(
+            inner
+                .client_to_module
+                .get(&ClientRouteKey {
+                    connection_id,
+                    channel,
+                })
+                .cloned(),
+        ))
     }
 
     pub(crate) fn cache_status(
@@ -542,7 +528,7 @@ impl ForwardingTable {
         module_channel: u16,
         status: String,
     ) -> Result<(), ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         if !inner.module_id_by_endpoint.contains_key(&endpoint) {
             return Err(ForwardingError::StaleModuleEndpoint);
         }
@@ -555,7 +541,7 @@ impl ForwardingTable {
             .module_to_client
             .get(&module_key)
             .map(|route| ClientRouteKey {
-                connection_id: route.connection_id,
+                connection_id: route.client_connection_id,
                 channel: route.client_channel,
             })
             .or_else(|| inner.reserved_module.get(&module_key).copied());
@@ -579,7 +565,7 @@ impl ForwardingTable {
         client_channel: u16,
     ) -> Result<Option<String>, ForwardingError> {
         Ok(self
-            .lock_inner()?
+            .read_inner()?
             .status
             .get(&ClientRouteKey {
                 connection_id: client_connection_id,
@@ -593,14 +579,17 @@ impl ForwardingTable {
         client_connection_id: ConnectionId,
         client_channel: u16,
     ) -> Result<Option<String>, ForwardingError> {
-        let inner = self.lock_inner()?;
+        let inner = self.read_inner()?;
         let Some(route) = inner.client_to_module.get(&ClientRouteKey {
             connection_id: client_connection_id,
             channel: client_channel,
         }) else {
             return Ok(None);
         };
-        Ok(inner.module_id_by_endpoint.get(&route.endpoint).cloned())
+        Ok(inner
+            .module_id_by_endpoint
+            .contains_key(&route.module_endpoint)
+            .then(|| route.module_id.clone()))
     }
 
     pub(crate) fn client_route_is_bound_to_live_module(
@@ -608,22 +597,24 @@ impl ForwardingTable {
         client_connection_id: ConnectionId,
         client_channel: u16,
     ) -> Result<bool, ForwardingError> {
-        let inner = self.lock_inner()?;
+        let inner = self.read_inner()?;
         let Some(route) = inner.client_to_module.get(&ClientRouteKey {
             connection_id: client_connection_id,
             channel: client_channel,
         }) else {
             return Ok(false);
         };
-        Ok(inner.module_id_by_endpoint.contains_key(&route.endpoint))
+        Ok(inner
+            .module_id_by_endpoint
+            .contains_key(&route.module_endpoint))
     }
 
     pub fn active_binding_count(&self) -> Result<usize, ForwardingError> {
-        Ok(self.lock_inner()?.client_to_module.len())
+        Ok(self.read_inner()?.client_to_module.len())
     }
 
     pub fn has_route_channel(&self, route_channel: u16) -> Result<bool, ForwardingError> {
-        let inner = self.lock_inner()?;
+        let inner = self.read_inner()?;
         Ok(inner
             .client_to_module
             .keys()
@@ -634,7 +625,7 @@ impl ForwardingTable {
         &self,
         module_id: &str,
     ) -> Result<Option<ModuleDrainTarget>, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         let Some(module) = inner.modules_by_id.get(module_id).cloned() else {
             return Ok(None);
         };
@@ -644,7 +635,7 @@ impl ForwardingTable {
         let flows = inner
             .client_to_module
             .values()
-            .filter(|route| route.endpoint == endpoint)
+            .filter(|route| route.module_endpoint == endpoint)
             .map(|route| Arc::clone(&route.flow))
             .collect::<Vec<_>>();
         for flow in flows {
@@ -693,11 +684,11 @@ impl ForwardingTable {
         &self,
         endpoint: ModuleEndpointId,
     ) -> Result<usize, ForwardingError> {
-        let inner = self.lock_inner()?;
+        let inner = self.read_inner()?;
         Ok(inner
             .client_to_module
             .values()
-            .filter(|route| route.endpoint == endpoint)
+            .filter(|route| route.module_endpoint == endpoint)
             .map(|route| route.flow.in_flight())
             .sum())
     }
@@ -706,11 +697,11 @@ impl ForwardingTable {
         &self,
         endpoint: ModuleEndpointId,
     ) -> Result<bool, ForwardingError> {
-        Ok(self.lock_inner()?.draining_endpoints.contains(&endpoint))
+        Ok(self.read_inner()?.draining_endpoints.contains(&endpoint))
     }
 
     pub(crate) fn module_is_draining(&self, module_id: &str) -> Result<bool, ForwardingError> {
-        let inner = self.lock_inner()?;
+        let inner = self.read_inner()?;
         Ok(inner
             .modules_by_id
             .get(module_id)
@@ -721,7 +712,7 @@ impl ForwardingTable {
         &self,
         endpoint: ModuleEndpointId,
     ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         let module_keys = inner
             .module_to_client
             .keys()
@@ -746,7 +737,7 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
     ) -> Result<bool, ForwardingError> {
-        let inner = self.lock_inner()?;
+        let inner = self.read_inner()?;
         let has = inner
             .client_to_module
             .keys()
@@ -762,7 +753,7 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
-        let mut inner = self.lock_inner()?;
+        let mut inner = self.write_inner()?;
         if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             return Ok(remove_module_connection_locked(&mut inner, endpoint));
         }
@@ -813,8 +804,12 @@ impl ForwardingTable {
         Ok(released)
     }
 
-    fn lock_inner(&self) -> Result<MutexGuard<'_, ForwardingInner>, ForwardingError> {
-        self.inner.lock().map_err(|_| ForwardingError::Poisoned)
+    fn read_inner(&self) -> Result<RwLockReadGuard<'_, ForwardingInner>, ForwardingError> {
+        self.inner.read().map_err(|_| ForwardingError::Poisoned)
+    }
+
+    fn write_inner(&self) -> Result<RwLockWriteGuard<'_, ForwardingInner>, ForwardingError> {
+        self.inner.write().map_err(|_| ForwardingError::Poisoned)
     }
 
     fn lock_close_registry(
@@ -937,16 +932,16 @@ fn release_client_route_locked(
     let route = inner.client_to_module.remove(&client_key)?;
     route.flow.close();
     inner.module_to_client.remove(&ModuleRouteKey {
-        endpoint: route.endpoint,
+        endpoint: route.module_endpoint,
         channel: route.module_channel,
     });
     inner.status.remove(&client_key);
     // Notifies the SHARED module that this client's route is gone → Module kind
     // (best-effort drop on backpressure; never close the module).
     Some(GoodbyeTarget {
-        connection_id: route.endpoint.connection_id,
-        sink: route.sink,
-        negotiated_ver: route.negotiated_ver,
+        connection_id: route.module_endpoint.connection_id,
+        sink: route.module_sink.clone(),
+        negotiated_ver: route.module_negotiated_ver,
         channel: route.module_channel,
         kind: GoodbyeTargetKind::Module,
     })
@@ -959,7 +954,7 @@ fn release_module_route_locked(
     let route = inner.module_to_client.remove(&module_key)?;
     route.flow.close();
     let client_key = ClientRouteKey {
-        connection_id: route.connection_id,
+        connection_id: route.client_connection_id,
         channel: route.client_channel,
     };
     inner.client_to_module.remove(&client_key);
@@ -967,9 +962,9 @@ fn release_module_route_locked(
     // Notifies the CLIENT that its route is gone (module-side teardown) → Client
     // kind (escalate to closing the client on backpressure).
     Some(GoodbyeTarget {
-        connection_id: route.connection_id,
-        sink: route.sink,
-        negotiated_ver: route.negotiated_ver,
+        connection_id: route.client_connection_id,
+        sink: route.client_sink.clone(),
+        negotiated_ver: route.client_negotiated_ver,
         channel: route.client_channel,
         kind: GoodbyeTargetKind::Client,
     })
@@ -1197,7 +1192,7 @@ mod tests {
             .unwrap();
 
         {
-            let mut inner = forwarding.inner.lock().unwrap();
+            let mut inner = forwarding.inner.write().unwrap();
             for channel in 1..=u16::MAX {
                 inner.reserved_client.insert(
                     ClientRouteKey {
@@ -1273,7 +1268,7 @@ mod tests {
         let client = ConnectionId::new(60);
         forwarding
             .inner
-            .lock()
+            .write()
             .unwrap()
             .next_client_channel
             .insert(client, 41);
@@ -1283,7 +1278,7 @@ mod tests {
         assert!(released.is_empty());
         assert!(!forwarding
             .inner
-            .lock()
+            .read()
             .unwrap()
             .next_client_channel
             .contains_key(&client));

@@ -12,10 +12,10 @@ use subc_protocol::{
 use tokio::sync::mpsc;
 
 use crate::{
-    forwarding::RouteBindRelayOutcome,
+    forwarding::{DataRoute, RouteBindRelayOutcome},
     registry::ConnectionId,
     router::{ForwardBackend, FrameSink, RouteCtx, RouterError},
-    Frame, ForwardingTable, Registry,
+    ForwardingTable, Frame, Registry,
 };
 
 /// One committed client route used by concurrent bench workers.
@@ -101,7 +101,7 @@ pub fn bench_data_request_frame(client_channel: u16, corr: u64) -> Frame {
     .expect("bench frame")
 }
 
-/// Client→module forward path: pre-lookup + `ForwardBackend::handle` (production hot path).
+/// Client→module forward path: fused route lookup + bound backend (production hot path).
 pub async fn bench_client_forward_op(
     forwarding: &ForwardingTable,
     forward_backend: &ForwardBackend,
@@ -110,10 +110,16 @@ pub async fn bench_client_forward_op(
 ) -> Result<(), RouterError> {
     let frame = bench_data_request_frame(route.client_channel, corr);
     let channel = frame.header.channel;
-    let _ = forwarding
-        .client_route(route.connection_id, channel)
-        .map_err(RouterError::Forwarding)?;
-    forward_backend.handle(route.ctx.clone(), frame).await
+    let binding = match forwarding
+        .lookup_data_route(route.connection_id, channel)
+        .map_err(RouterError::Forwarding)?
+    {
+        DataRoute::Client(Some(binding)) => binding,
+        DataRoute::Client(None) | DataRoute::Module(_) => {
+            return Err(RouterError::UnknownChannel { channel, corr });
+        }
+    };
+    forward_backend.handle_bound(frame, binding).await
 }
 
 pub async fn build_bench_forwarding_setup(
@@ -173,9 +179,7 @@ pub async fn build_bench_forwarding_setup(
                 )
                 .expect("complete relay");
             let (ctx, mut client_rx) = bench_route_ctx(client_connection);
-            tokio::spawn(async move {
-                while client_rx.recv().await.is_some() {}
-            });
+            tokio::spawn(async move { while client_rx.recv().await.is_some() {} });
             forwarding
                 .commit_route(
                     client_connection,
@@ -218,11 +222,12 @@ async fn bench_module_echo_drain(
         let module_channel = frame.header.channel;
         let corr = frame.header.corr;
         let body = frame.body.clone();
-        let Some(route) = forwarding
-            .module_route(module_connection, module_channel)
-            .expect("module_route")
-        else {
-            continue;
+        let route = match forwarding
+            .lookup_data_route(module_connection, module_channel)
+            .expect("lookup_data_route")
+        {
+            DataRoute::Module(Some(route)) => route,
+            DataRoute::Module(None) | DataRoute::Client(_) => continue,
         };
         if let Ok(response) = Frame::build(
             FrameType::Response,
@@ -231,7 +236,7 @@ async fn bench_module_echo_drain(
             corr,
             body,
         ) {
-            let _ = route.sink.try_send(response);
+            let _ = route.client_sink.try_send(response);
             route.flow.release();
         }
     }

@@ -31,8 +31,9 @@ use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::{
     manifest::{
-        Bindings, ConfigBinding, ConfigSource, ConsumerRole, IdentityBinding, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool as ManifestTool, TrustTier,
+        Bindings, ConfigBinding, ConfigSource, ConsumerRole, ExecutionMode, IdentityBinding,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
+        Tool as ManifestTool, TrustTier,
     },
     session::ConfigTier,
     BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
@@ -1612,8 +1613,8 @@ fn mcp_tool_from_manifest(tool: &ManifestTool) -> McpTool {
     )
     .with_annotations(
         ToolAnnotations::new()
-            .read_only(!tool.mutates)
-            .destructive(tool.mutates),
+            .read_only(tool.execution_mode == ExecutionMode::Pure)
+            .destructive(tool.execution_mode != ExecutionMode::Pure),
     )
 }
 

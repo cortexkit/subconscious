@@ -67,14 +67,35 @@ pub enum ProviderRole {
     },
 }
 
+/// How a tool's side effects are fenced for durable at-most-once handling.
+///
+/// Classified on a tool's externally-observable effects, never inferred from
+/// the module's concurrency lane:
+/// - `Pure`: no observable side effect (reads, searches, cache warming) — safe
+///   to re-run after an indeterminate outcome.
+/// - `Mutating`: a fenceable external side effect such as a file write — a
+///   re-run risks a duplicate effect, so an indeterminate outcome must not
+///   auto-retry.
+/// - `Unfenceable`: a side effect that cannot be fenced or safely replayed,
+///   such as running a shell command — never auto-re-run on an indeterminate
+///   outcome.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Pure,
+    Mutating,
+    Unfenceable,
+}
+
 /// Tool-plane capability exposed by a `tool_provider`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Tool {
     pub name: String,
-    /// Observability/client metadata only. subc's thin core never acts on this
-    /// bit for routing, scheduling, or concurrency; the module's declared
+    /// How the tool's side effects are fenced for durable at-most-once handling.
+    /// Observability + durability metadata only; subc's thin core never acts on
+    /// this for routing, scheduling, or concurrency — the module's declared
     /// [`Concurrency`] contract governs delivery.
-    pub mutates: bool,
+    pub execution_mode: ExecutionMode,
     pub schema: Value,
 }
 
@@ -290,37 +311,37 @@ mod tests {
                 tools: vec![
                     Tool {
                         name: "read".to_string(),
-                        mutates: false,
+                        execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "grep".to_string(),
-                        mutates: false,
+                        execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "outline".to_string(),
-                        mutates: false,
+                        execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "semantic_search".to_string(),
-                        mutates: false,
+                        execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "edit".to_string(),
-                        mutates: true,
+                        execution_mode: ExecutionMode::Mutating,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "write".to_string(),
-                        mutates: true,
+                        execution_mode: ExecutionMode::Mutating,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "bash".to_string(),
-                        mutates: false,
+                        execution_mode: ExecutionMode::Unfenceable,
                         schema: json!({"type": "object"}),
                     },
                 ],
@@ -391,16 +412,16 @@ mod tests {
         assert_eq!(
             tools
                 .iter()
-                .map(|tool| (tool.name.as_str(), tool.mutates))
+                .map(|tool| (tool.name.as_str(), tool.execution_mode))
                 .collect::<Vec<_>>(),
             vec![
-                ("read", false),
-                ("grep", false),
-                ("outline", false),
-                ("semantic_search", false),
-                ("edit", true),
-                ("write", true),
-                ("bash", false),
+                ("read", ExecutionMode::Pure),
+                ("grep", ExecutionMode::Pure),
+                ("outline", ExecutionMode::Pure),
+                ("semantic_search", ExecutionMode::Pure),
+                ("edit", ExecutionMode::Mutating),
+                ("write", ExecutionMode::Mutating),
+                ("bash", ExecutionMode::Unfenceable),
             ]
         );
     }

@@ -4,8 +4,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
+        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
+        Tool, TrustTier,
     },
     session::{ConfigTier, ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, RouteTarget, PROTOCOL_VERSION,
@@ -153,7 +154,7 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "memory.read".to_string(),
-                mutates: false,
+                execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({"type": "object", "required": ["id"]}),
             }],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],

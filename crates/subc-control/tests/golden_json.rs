@@ -7,7 +7,7 @@ use subc_control::{
 };
 use subc_protocol::{
     manifest::{
-        Concurrency, IdentityScope, InternalTransport, ManagementOperation,
+        Concurrency, ExecutionMode, IdentityScope, InternalTransport, ManagementOperation,
         ManagementOperationKind, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
         PipelineStageKind, ProviderRole, Tool,
     },
@@ -217,7 +217,7 @@ fn provider_roles() -> Vec<ProviderRole> {
         ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "memory.read".to_string(),
-                mutates: false,
+                execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({"type": "object", "required": ["id"]}),
             }],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],

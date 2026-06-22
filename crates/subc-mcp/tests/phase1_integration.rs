@@ -34,8 +34,8 @@ use subc_core::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
+        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
+        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
         Tool as ProviderTool, TrustTier,
     },
     session::{ConfigTier, ModuleControlRequest, ModuleControlResponse},
@@ -2387,7 +2387,7 @@ fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![ProviderTool {
                 name: tool_name.to_owned(),
-                mutates: false,
+                execution_mode: ExecutionMode::Pure,
                 schema: json!({"type": "object"}),
             }],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],

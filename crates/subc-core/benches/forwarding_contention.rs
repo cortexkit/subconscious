@@ -1,4 +1,4 @@
-//! Forwarding-table contention baseline (current Mutex design).
+//! Forwarding-table contention benchmark (fusion + RouteBinding + RwLock).
 //!
 //! Run: `cargo bench -p subc-core --bench forwarding_contention --features bench-harness`
 
@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use subc_core::bench_harness::{bench_client_forward_op, build_bench_forwarding_setup, BenchClientRoute};
+use subc_core::bench_harness::{
+    bench_client_forward_op, build_bench_forwarding_setup, BenchClientRoute,
+};
 use tokio::runtime::Builder;
 
 const WARMUP_ITERS: u64 = 1_000;
@@ -25,15 +27,19 @@ struct LatencySnapshot {
 
 fn main() {
     let rt = Builder::new_multi_thread()
-        .worker_threads(std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .max(4))
+        .worker_threads(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .max(4),
+        )
         .enable_all()
         .build()
         .expect("tokio runtime");
 
-    println!("=== subc forwarding contention benchmark (BASELINE / current design) ===");
+    println!(
+        "=== subc forwarding contention benchmark (AFTER / fusion + RouteBinding + RwLock) ==="
+    );
     println!(
         "host: {} | logical CPUs: {}",
         std::env::consts::ARCH,
@@ -41,7 +47,7 @@ fn main() {
             .map(|n| n.get())
             .unwrap_or(0)
     );
-    println!("arm1: in-process client forward (Router pre-lookup + ForwardBackend)");
+    println!("arm1: in-process client forward (fused lookup + bound ForwardBackend)");
     println!("warmup={WARMUP_ITERS} measured={MEASURE_ITERS} per cell\n");
 
     println!(
@@ -86,19 +92,13 @@ async fn run_arm1_cell(num_clients: usize, routes_per_client: usize) -> LatencyS
             let mut corr = base.wrapping_mul(1_000_000);
             for _ in 0..WARMUP_ITERS {
                 let route = &routes[client_index * routes_per_client];
-                let _ = bench_client_forward_op(
-                    &forwarding,
-                    &forward_backend,
-                    route,
-                    corr,
-                )
-                .await;
+                let _ = bench_client_forward_op(&forwarding, &forward_backend, route, corr).await;
                 corr = corr.wrapping_add(1);
             }
             let wall_start = Instant::now();
             for _ in 0..MEASURE_ITERS {
-                let route_idx = client_index * routes_per_client
-                    + (corr as usize % routes_per_client);
+                let route_idx =
+                    client_index * routes_per_client + (corr as usize % routes_per_client);
                 let route = &routes[route_idx];
                 let t0 = Instant::now();
                 bench_client_forward_op(&forwarding, &forward_backend, route, corr)

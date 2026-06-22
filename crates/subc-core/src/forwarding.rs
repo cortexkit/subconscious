@@ -66,11 +66,11 @@ pub(crate) struct ClientRoute {
 /// happens when the GOODBYE cannot be enqueued (egress full/closed):
 /// - `Client`: escalate to closing that client connection (a socket close is a
 ///   stronger teardown signal, and a full client egress means it is the slow
-///   client we would drop anyway — finding #6).
+///   client we would drop anyway).
 /// - `Module`: best-effort DROP, never close. A client-disconnect notifies the
 ///   SHARED module that one client's route is gone; closing the module on its
 ///   egress backpressure would tear down every co-tenant client (the exact
-///   cross-tenant blast radius #3/#6 exist to prevent — and was observed when a
+///   cross-tenant blast radius this never-close rule exists to prevent — observed when a
 ///   flooding dead client filled BOTH its own and the module's egress, so its
 ///   route-gone GOODBYE to the module failed and closed the shared connection).
 ///   subc has already removed the route from its forwarding state and drops
@@ -80,11 +80,11 @@ pub(crate) struct ClientRoute {
 ///   module using it for client-refcounting (e.g. AFT's session accounting)
 ///   would miss. This is INTENTIONALLY ACCEPTED, not a gap. A consuming module
 ///   must bound stale bindings with its own idle-activity reaper (last-touched
-///   TTL) independent of route-gone signals — AFT confirmed this and locked it
-///   as a Phase 4 acceptance criterion, so a lost GOODBYE degrades to "the
+///   TTL) independent of route-gone signals — AFT does exactly this, so a lost
+///   GOODBYE degrades to "the
 ///   binding stays warm until its idle TTL" (bounded wasted resources), never an
 ///   unbounded leak; disk-durable replay is unaffected. A dedicated reliable
-///   module control lane was evaluated (Oracle bg_87eda7f1) and deliberately NOT
+///   module control lane was evaluated and deliberately NOT
 ///   built: it would add starvation-avoidance machinery to the thin core for a
 ///   bounded warm-resource window that is not a correctness issue. never-close
 ///   is the invariant that matters here.
@@ -944,7 +944,7 @@ fn release_module_route_locked(
     inner.client_to_module.remove(&client_key);
     inner.status.remove(&client_key);
     // Notifies the CLIENT that its route is gone (module-side teardown) → Client
-    // kind (escalate to closing the client on backpressure, finding #6).
+    // kind (escalate to closing the client on backpressure).
     Some(GoodbyeTarget {
         connection_id: route.connection_id,
         sink: route.sink,

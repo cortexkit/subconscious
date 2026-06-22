@@ -305,8 +305,9 @@ impl Router {
                 return Ok(());
             }
 
-            // follow-up: durable PUSH replay remains module-owned; subc only drops
-            // stale route frames for released channels.
+            // subc only drops stale route frames for released channels; re-sending a
+            // dropped PUSH after the module re-attaches is the module's responsibility,
+            // not the router's.
             warn!(
                 connection_id = ctx.connection_id.get(),
                 channel,

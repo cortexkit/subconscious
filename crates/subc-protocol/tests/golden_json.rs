@@ -11,7 +11,7 @@ use subc_protocol::{
     BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, RouteTarget, PROTOCOL_VERSION,
 };
 
-// Drift-prevention contract (§10): UPDATE_GOLDEN=1 rewrites the committed JSON
+// Drift-prevention contract: UPDATE_GOLDEN=1 rewrites the committed JSON
 // when a wire-shape change is intentional and the TS mirror is updated too.
 #[test]
 fn protocol_wire_shapes_match_golden_json_and_round_trip() {

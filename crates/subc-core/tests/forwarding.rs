@@ -3728,3 +3728,132 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("sc-{label}-{}-{nonce}", process::id()))
 }
+
+/// Arm 2 of the forwarding contention benchmark: loopback TCP + fake-aft-stub.
+/// Run: `cargo test -p subc-core forwarding_bench_e2e_arm2 -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "forwarding contention baseline; run with --ignored --nocapture"]
+async fn forwarding_bench_e2e_arm2() {
+    const WARMUP: u64 = 100;
+    const MEASURE: u64 = 1_000;
+    const PAYLOAD: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"read","params":{}}"#;
+    let client_sweep: &[(usize, usize)] = &[(1, 1), (8, 1), (32, 1), (8, 8), (32, 8)];
+
+    eprintln!("=== subc forwarding bench arm2 (BASELINE / loopback e2e) ===");
+    eprintln!(
+        "logical CPUs: {}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
+    );
+    eprintln!("warmup={WARMUP} measure={MEASURE} per client\n");
+    eprintln!(
+        "{:<8} {:<8} {:>10} {:>10} {:>14}",
+        "clients", "routes", "p50_ms", "p99_ms", "calls/s"
+    );
+    eprintln!("{}", "-".repeat(58));
+
+    for &(num_clients, routes_per_client) in client_sweep {
+        let snap =
+            run_e2e_bench_cell(num_clients, routes_per_client, WARMUP, MEASURE, PAYLOAD).await;
+        eprintln!(
+            "{:<8} {:<8} {:>10.3} {:>10.3} {:>14.0}",
+            num_clients, routes_per_client, snap.p50_ms, snap.p99_ms, snap.throughput
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct E2eLatencySnapshot {
+    p50_ms: f64,
+    p99_ms: f64,
+    throughput: f64,
+}
+
+async fn run_e2e_bench_cell(
+    num_clients: usize,
+    routes_per_client: usize,
+    warmup: u64,
+    measure: u64,
+    payload: &[u8],
+) -> E2eLatencySnapshot {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-bench-e2e";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+    let project = TestProject::new();
+
+    let mut clients = Vec::with_capacity(num_clients);
+    for client_index in 0..num_clients {
+        let mut stream = connect_authed_client(&server.connection_file_path)
+            .await
+            .unwrap();
+        let mut channels = Vec::with_capacity(routes_per_client);
+        for route in 0..routes_per_client {
+            let session = format!("bench-e2e-{client_index}-{route}");
+            let corr = 10_000 + client_index as u64 * 100 + route as u64;
+            let ack = attach_on_stream(
+                &mut stream,
+                &project,
+                corr,
+                &session,
+                module_id,
+            )
+            .await;
+            channels.push(ack.route_channel);
+        }
+        clients.push((client_index, stream, channels));
+    }
+
+    let wall_start = Instant::now();
+    let mut worker_handles = Vec::with_capacity(num_clients);
+    for (client_index, mut stream, channels) in clients {
+        let payload = payload.to_vec();
+        worker_handles.push(tokio::spawn(async move {
+            let mut latencies_ns = Vec::with_capacity(measure as usize);
+            let routes = channels.len();
+            let mut corr = client_index as u64 * 1_000_000;
+            for _ in 0..warmup {
+                let ch = channels[corr as usize % routes];
+                write_frame(&mut stream, &data_request(ch, corr, &payload))
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                let _ = read_frame_timeout(&mut stream).await;
+                corr = corr.wrapping_add(1);
+            }
+            for _ in 0..measure {
+                let ch = channels[corr as usize % routes];
+                let t0 = Instant::now();
+                write_frame(&mut stream, &data_request(ch, corr, &payload))
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                let response = read_frame_timeout(&mut stream).await;
+                assert_eq!(response.header.ty, FrameType::Response);
+                assert_eq!(response.body, payload);
+                latencies_ns.push(t0.elapsed().as_nanos() as u64);
+                corr = corr.wrapping_add(1);
+            }
+            latencies_ns
+        }));
+    }
+
+    let mut all = Vec::new();
+    for handle in worker_handles {
+        all.extend(handle.await.unwrap());
+    }
+    let wall = wall_start.elapsed();
+    all.sort_unstable();
+    let n = all.len();
+    let idx = |p: f64| ((p * (n as f64 - 1.0)).round() as usize).min(n.saturating_sub(1));
+    let to_ms = |v: u64| v as f64 / 1_000_000.0;
+    let total_calls = (num_clients as u64) * measure;
+    module.stop().await.unwrap();
+
+    E2eLatencySnapshot {
+        p50_ms: to_ms(all[idx(0.50)]),
+        p99_ms: to_ms(all[idx(0.99)]),
+        throughput: total_calls as f64 / wall.as_secs_f64(),
+    }
+}

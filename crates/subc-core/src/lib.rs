@@ -16,6 +16,9 @@ pub mod router;
 pub mod server;
 pub mod supervise;
 
+#[cfg(feature = "bench-harness")]
+pub mod bench_harness;
+
 pub use control::{ControlHandler, MIN_SUPPORTED_VERSION};
 pub use forwarding::{ForwardingError, ForwardingTable, ModuleEndpointId};
 // The frame codec now lives in its natural homes: the `Frame` data type in

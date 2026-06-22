@@ -5,6 +5,15 @@ edition = "2021"
 publish = false
 description = "subc daemon core: loopback TCP transport and opaque-byte splice router."
 
+[features]
+bench-harness = []
+
+[[bench]]
+name = "forwarding_contention"
+path = "benches/forwarding_contention.rs"
+harness = false
+required-features = ["bench-harness"]
+
 [dependencies]
 cortexkit-paths = "0.1"
 fs4 = "1"

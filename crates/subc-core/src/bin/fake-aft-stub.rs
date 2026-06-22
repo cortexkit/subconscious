@@ -94,8 +94,8 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
 }
 
 async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, StubError> {
-    // follow-up (4.3): future reconnect loops must call this helper for every
-    // reconnect so key rotation is observed by re-reading the connection file.
+    // Any future reconnect loop must call this helper for every reconnect, so key
+    // rotation is observed by re-reading the connection file each time.
     let conn = connection_file::read(connection_file_path).map_err(|source| {
         StubError::ConnectionFile {
             path: connection_file_path.to_path_buf(),
@@ -364,7 +364,7 @@ async fn handle_cancel(
     )?;
 
     if let Some(cancel_tx) = cancel_tx {
-        // Story 2.4 resolves the flow-control interaction: CANCEL bypasses
+        // Flow-control interaction: CANCEL bypasses
         // request credits; the request credit returns only on this terminal.
         let _ = cancel_tx.send(());
         emit_cancelled_error(

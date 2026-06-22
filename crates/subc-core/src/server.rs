@@ -479,7 +479,7 @@ mod tests {
     use subc_protocol::{
         DecodeError, ErrorBody, Flags, FrameType, Priority, HEADER_LEN, PROTOCOL_VERSION,
     };
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     use subc_transport::{authenticate_client, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 
@@ -507,6 +507,10 @@ mod tests {
     }
 
     fn test_auth() -> (ServerAuth, ConnectionInfo) {
+        test_auth_with_limit(4)
+    }
+
+    fn test_auth_with_limit(max_unauthenticated: usize) -> (ServerAuth, ConnectionInfo) {
         let key = vec![0x42; 32];
         let daemon_id = [0x24; 16];
         let conn = ConnectionInfo {
@@ -521,7 +525,13 @@ mod tests {
             daemon_ver: TEST_DAEMON_VER.to_owned(),
         };
         (
-            ServerAuth::with_limits(key, daemon_id, TEST_DAEMON_VER, TEST_DEADLINE, 4),
+            ServerAuth::with_limits(
+                key,
+                daemon_id,
+                TEST_DAEMON_VER,
+                TEST_DEADLINE,
+                max_unauthenticated,
+            ),
             conn,
         )
     }
@@ -622,6 +632,90 @@ mod tests {
         let err = server.await.unwrap().unwrap_err();
         assert!(matches!(err, ConnectionError::Auth(_)));
         assert_eq!(registry.active_registration_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_capacity_rejects_second_idle_peer() {
+        let (first_client, first_server_stream) = duplex(512);
+        let (mut second_client, second_server_stream) = duplex(512);
+        let (auth, conn) = test_auth_with_limit(1);
+        let registry = Arc::new(Registry::default());
+        let router = Arc::new(Router::with_control_handler(Arc::new(ControlHandler::new(
+            Arc::clone(&registry),
+        ))));
+
+        let first_server = tokio::spawn(handle_connection(
+            first_server_stream,
+            Arc::clone(&router),
+            auth.clone(),
+        ));
+
+        let second_server = tokio::spawn(handle_connection(
+            second_server_stream,
+            Arc::clone(&router),
+            auth.clone(),
+        ));
+        let second_err = tokio::time::timeout(Duration::from_secs(1), second_server)
+            .await
+            .expect("capacity reject should settle promptly")
+            .expect("second connection task should not panic")
+            .expect_err("second unauthenticated connection must be rejected");
+        assert!(matches!(
+            second_err,
+            ConnectionError::UnauthenticatedCapacity
+        ));
+        let mut closed = [0u8; 1];
+        assert_eq!(
+            second_client.read(&mut closed).await.unwrap(),
+            0,
+            "capacity-rejected peer should observe a closed stream"
+        );
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
+
+        drop(first_client);
+        let first_err = first_server
+            .await
+            .expect("first connection task should not panic")
+            .expect_err("idle pre-auth peer should fail auth when closed");
+        assert!(matches!(first_err, ConnectionError::Auth(_)));
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
+
+        let (mut authed_client, authed_server_stream) = duplex(2048);
+        let authed_server = tokio::spawn(handle_connection(
+            authed_server_stream,
+            Arc::clone(&router),
+            auth,
+        ));
+        authenticate(&mut authed_client, &conn).await;
+        let ping = Frame::build(
+            FrameType::Ping,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            77,
+            Vec::new(),
+        )
+        .unwrap();
+        crate::write_frame(&mut authed_client, &ping).await.unwrap();
+        let pong = crate::read_frame(&mut authed_client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong.header.ty, FrameType::Pong);
+        assert_eq!(pong.header.channel, 0);
+        assert_eq!(pong.header.corr, 77);
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
+
+        drop(authed_client);
+        authed_server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_listeners_with_no_listeners_returns_typed_error() {
+        let (auth, _conn) = test_auth();
+        let err = serve_listeners(Vec::new(), echo_router(), auth)
+            .await
+            .expect_err("empty listener set must fail loudly");
+        assert!(matches!(err, ServerError::NoListeners));
     }
 
     #[tokio::test]

@@ -21,8 +21,8 @@ use subc_core::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::ConfigTier,
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
@@ -195,6 +195,139 @@ async fn non_tool_provider_hello_registers_without_hijacking_active_forwarding_m
 
     drop(consumer);
     provider.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
+    let server = TestServer::start().await;
+
+    let module_id = "fake-aft-ch0-misuse";
+    let mut module = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    register_manifest_on_stream(&mut module, tool_provider_manifest(module_id), 501).await;
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+
+    write_frame(
+        &mut module,
+        &control_request_frame(502, ClientControlRequest::ServerDescribe {}),
+    )
+    .await
+    .unwrap();
+    module.flush().await.unwrap();
+    let module_error =
+        read_control_error_on_stream(&mut module, 502, "unsupported_control_frame").await;
+    assert!(module_error
+        .message
+        .contains("module-originated channel-0 REQUEST"));
+
+    let module_ping = Frame::build(
+        FrameType::Ping,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        503,
+        Vec::new(),
+    )
+    .unwrap();
+    write_frame(&mut module, &module_ping).await.unwrap();
+    module.flush().await.unwrap();
+    let module_pong = read_frame_timeout(&mut module).await;
+    assert_eq!(module_pong.header.ty, FrameType::Pong);
+    assert_eq!(module_pong.header.corr, 503);
+
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let client_push = Frame::build(
+        FrameType::Push,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        504,
+        b"client ch0 push".to_vec(),
+    )
+    .unwrap();
+    write_frame(&mut client, &client_push).await.unwrap();
+    client.flush().await.unwrap();
+    let client_error =
+        read_control_error_on_stream(&mut client, 504, "unsupported_control_frame").await;
+    assert!(client_error
+        .message
+        .contains("client-originated channel-0 PUSH"));
+
+    let client_ping = Frame::build(
+        FrameType::Ping,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        505,
+        Vec::new(),
+    )
+    .unwrap();
+    write_frame(&mut client, &client_ping).await.unwrap();
+    client.flush().await.unwrap();
+    let client_pong = read_frame_timeout(&mut client).await;
+    assert_eq!(client_pong.header.ty, FrameType::Pong);
+    assert_eq!(client_pong.header.corr, 505);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_invalid_manifest_is_rejected_without_registration() {
+    let server = TestServer::start().await;
+
+    let mismatched_id = "fake-aft-invalid-hello-protocol";
+    let mut mismatched = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let mismatched_manifest = tool_provider_manifest(mismatched_id);
+    write_frame(
+        &mut mismatched,
+        &hello_frame_with_protocol(mismatched_manifest, PROTOCOL_VERSION + 1, 511),
+    )
+    .await
+    .unwrap();
+    mismatched.flush().await.unwrap();
+    let protocol_error =
+        read_control_error_on_stream(&mut mismatched, 511, "invalid_manifest").await;
+    assert!(protocol_error.message.contains("does not match"));
+    assert_eq!(server.registry.active_registration_count().unwrap(), 0);
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let target_error = attach_error_on_stream(
+        &mut client,
+        &project,
+        513,
+        "ses-invalid-hello-protocol",
+        mismatched_id,
+    )
+    .await;
+    assert_eq!(target_error.code, "unknown_module");
+
+    let blank_id = "   ";
+    let mut blank = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut blank,
+        &hello_frame(tool_provider_manifest(blank_id), 512),
+    )
+    .await
+    .unwrap();
+    blank.flush().await.unwrap();
+    let blank_error = read_control_error_on_stream(&mut blank, 512, "invalid_manifest").await;
+    assert!(blank_error.message.contains("module_id must not be empty"));
+    assert_eq!(server.registry.active_registration_count().unwrap(), 0);
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    let blank_target_error = attach_error_on_stream(
+        &mut client,
+        &project,
+        514,
+        "ses-invalid-hello-blank",
+        blank_id,
+    )
+    .await;
+    assert_eq!(blank_target_error.code, "unknown_module");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -818,6 +951,198 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_supervisor_ops_remain_coherent() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(500),
+    );
+    let module_id = "fake-aft-supervisor-concurrent";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "supervisor-concurrent",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        431,
+        "ses-supervisor-concurrent",
+        module_id,
+    )
+    .await;
+    let slow_corr = 432;
+    let slow_payload = br#"{"delay_ms":100,"jsonrpc":"2.0","id":"supervisor-concurrent"}"#;
+    write_frame(
+        &mut route_client,
+        &data_request(ack.route_channel, slow_corr, slow_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event_is_request_received(event, ack.route_channel, slow_corr)
+    })
+    .await;
+
+    let mut reload_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let mut disable_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let mut restart_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+
+    let reload = async {
+        write_frame(
+            &mut reload_client,
+            &control_request_frame(
+                433,
+                ClientControlRequest::SupervisorReload {
+                    module_id: module_id.to_string(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        reload_client.flush().await.unwrap();
+        read_frame_timeout_for(&mut reload_client, SETUP_TIMEOUT).await
+    };
+    let disable = async {
+        write_frame(
+            &mut disable_client,
+            &control_request_frame(
+                434,
+                ClientControlRequest::SupervisorSetEnabled {
+                    module_id: module_id.to_string(),
+                    enabled: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        disable_client.flush().await.unwrap();
+        read_frame_timeout_for(&mut disable_client, SETUP_TIMEOUT).await
+    };
+    let restart = async {
+        write_frame(
+            &mut restart_client,
+            &control_request_frame(
+                435,
+                ClientControlRequest::SupervisorRestart {
+                    module_id: module_id.to_string(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        restart_client.flush().await.unwrap();
+        read_frame_timeout_for(&mut restart_client, SETUP_TIMEOUT).await
+    };
+    let (reload_frame, disable_frame, restart_frame) = tokio::join!(reload, disable, restart);
+
+    let mut saw_disable_ack = false;
+    for (frame, corr) in [
+        (reload_frame, 433_u64),
+        (disable_frame, 434_u64),
+        (restart_frame, 435_u64),
+    ] {
+        assert_eq!(frame.header.channel, 0);
+        assert_eq!(frame.header.corr, corr);
+        match frame.header.ty {
+            FrameType::Response => {
+                let response: ClientControlResponse = serde_json::from_slice(&frame.body).unwrap();
+                match response {
+                    ClientControlResponse::SupervisorAck {
+                        module_id: response_module_id,
+                        applied,
+                    } => {
+                        assert_eq!(response_module_id, module_id);
+                        if corr == 434 {
+                            assert!(applied, "disable should apply exactly once");
+                            saw_disable_ack = true;
+                        } else {
+                            assert!(applied, "reload/restart acks should report applied=true");
+                        }
+                    }
+                    other => panic!("unexpected supervisor response: {other:?}"),
+                }
+            }
+            FrameType::Error => {
+                assert_ne!(corr, 434, "disable must not fail: {frame:?}");
+                assert_error(&frame, 0, corr, "module_disabled");
+            }
+            other => panic!("unexpected supervisor control frame type: {other:?}"),
+        }
+    }
+    assert!(
+        saw_disable_ack,
+        "disable control response must not hang or disappear"
+    );
+
+    let mut saw_route_terminal = false;
+    let mut saw_goodbye = false;
+    for _ in 0..3 {
+        if saw_route_terminal && saw_goodbye {
+            break;
+        }
+        let frame = read_frame_timeout_for(&mut route_client, SETUP_TIMEOUT).await;
+        assert_eq!(frame.header.channel, ack.route_channel);
+        match frame.header.ty {
+            FrameType::Response if frame.header.corr == slow_corr => {
+                assert_response(&frame, ack.route_channel, slow_corr, slow_payload);
+                saw_route_terminal = true;
+            }
+            FrameType::Error if frame.header.corr == slow_corr => {
+                let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+                assert!(
+                    matches!(
+                        body.code.as_str(),
+                        "module_reloading" | "target_unavailable" | "module_disabled"
+                    ),
+                    "unexpected typed route error during supervisor race: {body:?}"
+                );
+                saw_route_terminal = true;
+            }
+            FrameType::Goodbye => {
+                saw_goodbye = true;
+            }
+            other => panic!(
+                "unexpected route frame during supervisor race: ty={other:?} corr={}",
+                frame.header.corr
+            ),
+        }
+    }
+    assert!(
+        saw_route_terminal && saw_goodbye,
+        "route client should observe a terminal response/error and GOODBYE; terminal={saw_route_terminal} goodbye={saw_goodbye}"
+    );
+
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let final_status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Disabled
+            && !status.enabled
+            && !status.process_alive
+            && !status.live
+    })
+    .await;
+    assert_eq!(final_status.pid, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
     let server = TestServer::start().await;
     let supervisor = supervisor_with_drain_timeout(
@@ -1034,6 +1359,94 @@ async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_supervisor_restart_reload_return_module_disabled_on_wire() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-supervisor-disabled-wire";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let disabled = supervisor_ack_on_stream(
+        &mut client,
+        341,
+        ClientControlRequest::SupervisorSetEnabled {
+            module_id: module_id.to_string(),
+            enabled: false,
+        },
+        module_id,
+    )
+    .await;
+    assert!(disabled);
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    let disabled_status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Disabled && !status.process_alive && !status.enabled
+    })
+    .await;
+    assert_eq!(disabled_status.pid, None);
+
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            342,
+            ClientControlRequest::SupervisorRestart {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    read_control_error_on_stream(&mut client, 342, "module_disabled").await;
+    let after_restart = module.status().unwrap();
+    assert_eq!(after_restart.state, ModuleState::Disabled);
+    assert!(!after_restart.process_alive);
+    assert_eq!(after_restart.pid, None);
+    assert_eq!(after_restart.restart_count, disabled_status.restart_count);
+
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            343,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    read_control_error_on_stream(&mut client, 343, "module_disabled").await;
+    let after_reload = module.status().unwrap();
+    assert_eq!(after_reload.state, ModuleState::Disabled);
+    assert!(!after_reload.process_alive);
+    assert_eq!(after_reload.pid, None);
+    assert_eq!(after_reload.restart_count, disabled_status.restart_count);
+
+    let disabled_again = supervisor_ack_on_stream(
+        &mut client,
+        344,
+        ClientControlRequest::SupervisorSetEnabled {
+            module_id: module_id.to_string(),
+            enabled: false,
+        },
+        module_id,
+    )
+    .await;
+    assert!(
+        !disabled_again,
+        "idempotent supervisor.set_enabled(false) should report applied=false"
+    );
+    let after_idempotent = module.status().unwrap();
+    assert_eq!(after_idempotent.state, ModuleState::Disabled);
+    assert!(!after_idempotent.process_alive);
+    assert_eq!(after_idempotent.pid, None);
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_ops_unknown_module_returns_unknown_module() {
     let server = TestServer::start().await;
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -1210,6 +1623,47 @@ async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_invalid_project_root_returns_error_without_provider_attach() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-invalid-project-root";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "invalid-project-root").await;
+
+    let project = TestProject::new();
+    let missing_root = project.path.join("definitely").join("missing");
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let request = ClientControlRequest::RouteOpen {
+        target: RouteTarget::ToolProvider {
+            module_id: module_id.to_string(),
+        },
+        identity: BindIdentity {
+            project_root: missing_root,
+            harness: "opencode".to_string(),
+            session: "ses-invalid-project-root".to_string(),
+        },
+        config: attach_config(&project, "ses-invalid-project-root"),
+    };
+    write_frame(&mut client, &control_request_frame(481, request))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let error = read_control_error_on_stream(&mut client, 481, "invalid_project_root").await;
+    assert!(!error.message.is_empty());
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    let events = stub_events(&events_path);
+    assert!(
+        events.iter().all(|event| event["kind"] != "attach"),
+        "invalid project_root must be rejected before route.bind attach; events: {events:?}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_binding_then_accepts_later(
 ) {
     let server = TestServer::start().await;
@@ -1259,6 +1713,116 @@ async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_bind
     assert_eq!(response.body, payload);
 
     accepting.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_drop_during_pending_route_open_releases_reservation() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-pending-client-drop";
+    let (pending, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "pending-client-drop",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &attach_frame(491, attach_request(&project, "ses-pending-drop", module_id)),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let attach = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    drop(client);
+
+    let detach = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "detach" && event["route_channel"] == attach["route_channel"]
+    })
+    .await;
+    assert_eq!(attach["route_channel"], detach["route_channel"]);
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+
+    pending.stop().await.unwrap();
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let healthy = spawn_stub(&server, &supervisor, module_id).await;
+    let mut later_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let later = attach_on_stream(
+        &mut later_client,
+        &project,
+        492,
+        "ses-pending-drop-later",
+        module_id,
+    )
+    .await;
+    assert!(later.route_channel > 0);
+    wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
+
+    healthy.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_death_during_route_bind_returns_target_unavailable() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-pending-module-death";
+    let (pending, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "pending-module-death",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &attach_frame(501, attach_request(&project, "ses-module-death", module_id)),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+
+    pending.stop().await.unwrap();
+    let error_frame = read_frame_timeout_for(&mut client, SETUP_TIMEOUT).await;
+    assert_error(&error_frame, 0, 501, "target_unavailable");
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+
+    let replacement = spawn_stub(&server, &supervisor, module_id).await;
+    let later = attach_on_stream(
+        &mut client,
+        &project,
+        502,
+        "ses-module-death-replacement",
+        module_id,
+    )
+    .await;
+    assert!(later.route_channel > 0);
+    wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
+
+    replacement.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2979,8 +3543,28 @@ fn consumer_manifest(module_id: &str) -> ModuleManifest {
     }
 }
 
+fn tool_provider_manifest(module_id: &str) -> ModuleManifest {
+    let mut manifest = consumer_manifest(module_id);
+    manifest.provides = vec![ProviderRole::ToolProvider {
+        tools: vec![Tool {
+            name: "read".to_string(),
+            mutates: false,
+            schema: serde_json::json!({"type": "object"}),
+        }],
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: true,
+        sub_supervises: true,
+    }];
+    manifest
+}
+
 fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
     let protocol_ver = manifest.protocol_ver;
+    hello_frame_with_protocol(manifest, protocol_ver, corr)
+}
+
+fn hello_frame_with_protocol(manifest: ModuleManifest, protocol_ver: u8, corr: u64) -> Frame {
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver,

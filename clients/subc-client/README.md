@@ -39,7 +39,11 @@ const routeChannel = await client.routeOpen(
   { project_root: process.cwd(), harness: "my-harness", session: "session-1" },
 );
 
-const result = await client.request(routeChannel, { method: "usage.get", params: {} });
+// request() resolves to the module's full Response body (the parsed JSON),
+// NOT an unwrapped field. A module decides its own response envelope; this one
+// wraps its array under `result`, so read `body.result`.
+const body = await client.request(routeChannel, { method: "usage.get", params: {} });
+const usage = body.result; // ProviderUsage[] for the ai-provider-quota module
 
 client.close();
 ```

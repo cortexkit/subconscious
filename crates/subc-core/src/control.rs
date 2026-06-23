@@ -67,6 +67,9 @@ pub struct ControlHandler {
     supervisor: SupervisorHandle,
     subc_capabilities: Arc<[String]>,
     route_bind_relay_timeout: Duration,
+    /// Central storage policy. When set, each registering module receives its
+    /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
+    storage_config: Option<crate::daemon_config::StorageConfig>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -156,7 +159,18 @@ impl ControlHandler {
                 CAP_SESSION_ATTACH.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
+            storage_config: None,
         }
+    }
+
+    /// Set the central storage policy: registering modules then receive their
+    /// resolved storage descriptor in HELLO_ACK.
+    pub fn with_storage_config(
+        mut self,
+        storage_config: Option<crate::daemon_config::StorageConfig>,
+    ) -> Self {
+        self.storage_config = storage_config;
+        self
     }
 
     /// Override the route.bind relay timeout. Used by tests that assert the
@@ -557,6 +571,10 @@ impl ControlHandler {
             negotiated_ver,
             subc_ops: subc_ops(),
             subc_capabilities: self.subc_capabilities.as_ref().to_vec(),
+            storage: self
+                .storage_config
+                .as_ref()
+                .map(|cfg| cfg.descriptor_for(&registration.manifest.module_id)),
         };
         let body = serde_json::to_vec(&ack).map_err(|err| {
             RouterError::backend(
@@ -1771,6 +1789,53 @@ mod tests {
         assert_eq!(registration.state, ChannelState::Active);
         assert_eq!(registration.connection_id, conn);
         assert_eq!(registration.control_ops, module_baseline_control_ops());
+    }
+
+    #[test]
+    fn hello_ack_omits_storage_when_no_storage_config() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let responses = handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame("aft", PROTOCOL_VERSION, 7),
+            )
+            .unwrap();
+        let ack = parse_ack(&responses[0]);
+        assert_eq!(ack.storage, None, "no storage config -> no descriptor");
+    }
+
+    #[test]
+    fn hello_ack_delivers_resolved_storage_descriptor_per_module() {
+        // With a central sqlite storage policy, each registering module gets its
+        // own resolved descriptor in HELLO_ACK, keyed by its module id.
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_storage_config(Some(
+            crate::daemon_config::StorageConfig::Sqlite {
+                data_home: std::path::PathBuf::from("/data"),
+            },
+        ));
+
+        let responses = handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame("alfonso-routing", PROTOCOL_VERSION, 7),
+            )
+            .unwrap();
+        let ack = parse_ack(&responses[0]);
+        assert_eq!(
+            ack.storage,
+            Some(serde_json::json!({
+                "module_id": "alfonso-routing",
+                "storage_namespace": "default",
+                "isolation": { "kind": "module" },
+                "backend": {
+                    "backend": "sqlite",
+                    "path": "/data/cortexkit/alfonso-routing/store.db"
+                }
+            })),
+            "the delivered descriptor is the module's own sqlite store path"
+        );
     }
 
     #[test]

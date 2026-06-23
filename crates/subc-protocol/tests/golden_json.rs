@@ -131,6 +131,7 @@ fn module_hello_ack_body() -> ModuleHelloAckBody {
             "route.poll".to_string(),
         ],
         subc_capabilities: vec!["manifest_registration_v1".to_string()],
+        storage: None,
     }
 }
 

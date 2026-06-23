@@ -53,3 +53,41 @@ function managementSurfaceRole(entry: CatalogEntry | undefined): { operations?: 
     (role) => role.role === "management_surface",
   );
 }
+
+describe("SubcProvider receives a delivered storage descriptor", () => {
+  let live: LiveDaemon;
+
+  beforeAll(async () => {
+    // A daemon configured with central sqlite storage delivers each module its
+    // own descriptor in HELLO_ACK.
+    live = await startLiveDaemon("subc-storage-live", {
+      subcJsonc: JSON.stringify({
+        version: 1,
+        storage: { backend: "sqlite", data_home: "/data" },
+      }),
+    });
+  });
+
+  afterAll(() => {
+    live?.stop();
+  });
+
+  test("a managed module reads its sqlite descriptor from HELLO_ACK", async () => {
+    const moduleId = "storage-consumer";
+    const provider = await SubcProvider.connect({
+      connectionFile: live.connFile,
+      manifest: managementSurfaceManifest({ moduleId, operations: ["noop"] }),
+      handler: async (_routeChannel, body) => body,
+    });
+    try {
+      expect(provider.storage).toEqual({
+        module_id: moduleId,
+        storage_namespace: "default",
+        isolation: { kind: "module" },
+        backend: { backend: "sqlite", path: `/data/cortexkit/${moduleId}/store.db` },
+      });
+    } finally {
+      await provider.close();
+    }
+  });
+});

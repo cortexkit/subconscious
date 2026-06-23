@@ -118,6 +118,14 @@ pub struct ModuleHelloAckBody {
     pub negotiated_ver: u8,
     pub subc_ops: Vec<String>,
     pub subc_capabilities: Vec<String>,
+    /// The module's resolved storage descriptor, when the daemon's central config
+    /// configures managed storage. Carried opaquely here (subc-protocol stays a
+    /// thin wire crate with no storage/database dependency); a module that uses
+    /// managed storage deserializes it into `cortexkit_store_types::StorageDescriptor`
+    /// and hands it to `cortexkit-store`. Absent when no storage is configured, and
+    /// `serde(default)` so an older module simply ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<serde_json::Value>,
 }
 
 /// Frame kind (`type` byte at offset 5).

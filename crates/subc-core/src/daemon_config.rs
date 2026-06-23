@@ -18,6 +18,42 @@ pub struct DaemonConfig {
     pub path: PathBuf,
     pub port: Option<u16>,
     pub modules: Vec<ConfiguredModule>,
+    /// Central storage policy: the single backend choice all managed modules use.
+    /// `None` when the config has no `storage` section (no managed storage).
+    pub storage: Option<StorageConfig>,
+}
+
+/// Central storage configuration: one backend for every managed module. subc
+/// resolves this into a per-module storage descriptor and delivers it in the
+/// module's HELLO_ACK; the module opens it via the shared store library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageConfig {
+    /// Each module gets its own sqlite file under `data_home`.
+    Sqlite { data_home: PathBuf },
+}
+
+impl StorageConfig {
+    /// Resolve this central policy into a module's storage descriptor: the opaque
+    /// JSON delivered in `HELLO_ACK.storage`. The shape matches
+    /// `cortexkit_store_types::StorageDescriptor` (subc constructs it by hand to
+    /// avoid a database-library dependency in the thin daemon). The module
+    /// deserializes it into that type and hands it to `cortexkit-store`.
+    pub fn descriptor_for(&self, module_id: &str) -> serde_json::Value {
+        match self {
+            // Path convention mirrors cortexkit_store_types::sqlite_store_path:
+            // <data_home>/cortexkit/<module_id>/store.db. One database per module;
+            // a project-scoped module partitions its own rows internally.
+            StorageConfig::Sqlite { data_home } => {
+                let path = data_home.join("cortexkit").join(module_id).join("store.db");
+                serde_json::json!({
+                    "module_id": module_id,
+                    "storage_namespace": "default",
+                    "isolation": { "kind": "module" },
+                    "backend": { "backend": "sqlite", "path": path.to_string_lossy() },
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +92,19 @@ struct RawDaemonConfig {
     port: Option<u16>,
     #[serde(default)]
     modules: BTreeMap<String, RawModuleConfig>,
+    #[serde(default)]
+    storage: Option<RawStorageConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+enum RawStorageConfig {
+    Sqlite {
+        /// Where per-module sqlite files live. Defaults to the platform data home
+        /// (`$XDG_DATA_HOME`, else `~/.local/share`) when omitted.
+        #[serde(default)]
+        data_home: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,15 +192,46 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         })
         .collect();
 
+    let storage = raw.storage.map(|s| match s {
+        RawStorageConfig::Sqlite { data_home } => StorageConfig::Sqlite {
+            data_home: data_home.unwrap_or_else(default_data_home),
+        },
+    });
+
     Ok(DaemonConfig {
         path: path.to_path_buf(),
         port: raw.port,
         modules,
+        storage,
     })
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+/// Platform data home for per-module storage: `$XDG_DATA_HOME`, else
+/// `~/.local/share` (or the Windows roaming app data), else a relative fallback.
+fn default_data_home() -> PathBuf {
+    if let Some(data_home) = non_empty_os_var("XDG_DATA_HOME") {
+        return PathBuf::from(data_home);
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = non_empty_os_var("APPDATA") {
+            return PathBuf::from(app_data);
+        }
+        if let Some(user_profile) = non_empty_os_var("USERPROFILE") {
+            return PathBuf::from(user_profile).join("AppData").join("Roaming");
+        }
+    }
+
+    if let Some(home) = non_empty_os_var("HOME") {
+        return PathBuf::from(home).join(".local").join("share");
+    }
+
+    PathBuf::from(".local").join("share")
 }
 
 fn non_empty_os_var(key: &str) -> Option<OsString> {
@@ -197,6 +277,73 @@ impl Error for DaemonConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_storage_section_yields_none() {
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": {} }"#,
+            Path::new("/tmp/subc.jsonc"),
+        )
+        .expect("parse");
+        assert_eq!(config.storage, None);
+    }
+
+    #[test]
+    fn sqlite_storage_parses_with_explicit_data_home() {
+        let config = parse_doc(
+            r#"{ "version": 1, "storage": { "backend": "sqlite", "data_home": "/data" } }"#,
+            Path::new("/tmp/subc.jsonc"),
+        )
+        .expect("parse");
+        assert_eq!(
+            config.storage,
+            Some(StorageConfig::Sqlite {
+                data_home: PathBuf::from("/data")
+            })
+        );
+    }
+
+    #[test]
+    fn sqlite_storage_defaults_data_home_when_omitted() {
+        // With no data_home, it falls back to the platform data home (here forced
+        // via XDG_DATA_HOME so the test is deterministic).
+        std::env::set_var("XDG_DATA_HOME", "/forced/data/home");
+        let config = parse_doc(
+            r#"{ "version": 1, "storage": { "backend": "sqlite" } }"#,
+            Path::new("/tmp/subc.jsonc"),
+        )
+        .expect("parse");
+        std::env::remove_var("XDG_DATA_HOME");
+        assert_eq!(
+            config.storage,
+            Some(StorageConfig::Sqlite {
+                data_home: PathBuf::from("/forced/data/home")
+            })
+        );
+    }
+
+    #[test]
+    fn descriptor_for_matches_store_types_shape() {
+        // The opaque descriptor subc delivers must match the
+        // cortexkit_store_types::StorageDescriptor JSON shape exactly (path
+        // convention <data_home>/cortexkit/<module>/store.db, one db per module).
+        let cfg = StorageConfig::Sqlite {
+            data_home: PathBuf::from("/data"),
+        };
+        let descriptor = cfg.descriptor_for("alfonso-routing");
+        assert_eq!(
+            descriptor,
+            serde_json::json!({
+                "module_id": "alfonso-routing",
+                "storage_namespace": "default",
+                "isolation": { "kind": "module" },
+                "backend": {
+                    "backend": "sqlite",
+                    "path": "/data/cortexkit/alfonso-routing/store.db"
+                }
+            })
+        );
+    }
 
     #[test]
     fn parse_jsonc_defaults_and_ignores_unknown_fields() {

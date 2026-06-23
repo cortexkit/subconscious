@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -37,11 +37,24 @@ export function ensureSubcCoreBuilt(): void {
   buildChecked = true;
 }
 
-export async function startLiveDaemon(prefix = "subc-live"): Promise<LiveDaemon> {
+export interface LiveDaemonOptions {
+  /** Raw subc.jsonc contents to write before the daemon starts (e.g. a storage section). */
+  subcJsonc?: string;
+}
+
+export async function startLiveDaemon(
+  prefix = "subc-live",
+  options: LiveDaemonOptions = {},
+): Promise<LiveDaemon> {
   ensureSubcCoreBuilt();
 
   const runtimeDir = mkdtempSync(join(tmpdir(), `${prefix}-rt-`));
   const configDir = mkdtempSync(join(tmpdir(), `${prefix}-cfg-`));
+  if (options.subcJsonc !== undefined) {
+    const cortexkitDir = join(configDir, "cortexkit");
+    mkdirSync(cortexkitDir, { recursive: true });
+    writeFileSync(join(cortexkitDir, "subc.jsonc"), options.subcJsonc);
+  }
   const connFile = join(runtimeDir, CONN_NAME);
   let stderr = "";
   let exit: { code: number | null; signal: NodeJS.Signals | null } | null = null;

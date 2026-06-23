@@ -197,6 +197,13 @@ export interface ModuleHelloAckBody {
   negotiated_ver: number;
   subc_ops: string[];
   subc_capabilities: string[];
+  /**
+   * The module's resolved storage descriptor, present when the daemon's central
+   * config configures managed storage. Carried opaquely (the wire crate has no
+   * storage dependency); a module using managed storage reads this and hands it to
+   * the storage library. Absent when no storage is configured.
+   */
+  storage?: unknown;
 }
 
 export class SubcProviderError extends Error {
@@ -266,13 +273,22 @@ export class SubcProvider {
   private closeStarted = false;
   private closedErr: Error | null = null;
 
+  /**
+   * The resolved storage descriptor the daemon delivered in HELLO_ACK, or
+   * `undefined` when no managed storage is configured. A module that persists
+   * hands this to the storage library.
+   */
+  readonly storage: unknown;
+
   private constructor(
     private readonly sock: SubcSocket,
     readonly conn: ConnectionInfo,
     private readonly handler: ProviderHandler,
+    storage: unknown,
     private readonly onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision,
     private readonly onRouteGone?: (routeChannel: number) => void | Promise<void>,
   ) {
+    this.storage = storage;
     this.closed = this.readLoop();
   }
 
@@ -305,13 +321,12 @@ export class SubcProvider {
           }),
         ),
       );
-      await expectHelloAck(sock, deadline);
+      const ack = await expectHelloAck(sock, deadline);
+      return new SubcProvider(sock, conn, opts.handler, ack.storage, opts.onBind, opts.onRouteGone);
     } catch (err) {
       sock.close();
       throw err;
     }
-
-    return new SubcProvider(sock, conn, opts.handler, opts.onBind, opts.onRouteGone);
   }
 
   async close(): Promise<void> {

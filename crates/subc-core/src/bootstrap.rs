@@ -52,6 +52,7 @@ pub struct BootstrapConfig {
     pub port: u16,
     pub daemon_ver: String,
     configured_modules: Vec<ConfiguredModule>,
+    storage_config: Option<daemon_config::StorageConfig>,
 }
 
 impl BootstrapConfig {
@@ -61,6 +62,7 @@ impl BootstrapConfig {
             port,
             daemon_ver: DAEMON_VERSION.to_owned(),
             configured_modules: Vec::new(),
+            storage_config: None,
         }
     }
 
@@ -74,6 +76,9 @@ impl BootstrapConfig {
         let daemon_config =
             daemon_config::load(daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
         let config_port = daemon_config.as_ref().and_then(|config| config.port);
+        let storage_config = daemon_config
+            .as_ref()
+            .and_then(|config| config.storage.clone());
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
@@ -96,18 +101,26 @@ impl BootstrapConfig {
             Ok(_) | Err(_) => config_port.unwrap_or(DEFAULT_SUBC_PORT),
         };
 
-        Ok(Self::new(connection_file_path(), port).with_configured_modules(configured_modules))
+        Ok(Self::new(connection_file_path(), port)
+            .with_configured_modules(configured_modules)
+            .with_storage_config(storage_config))
     }
 
     pub fn with_daemon_config_path(
         self,
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
-        let configured_modules = daemon_config::load(daemon_config_path)
-            .map_err(BootstrapError::DaemonConfig)?
+        let daemon_config =
+            daemon_config::load(daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+        let storage_config = daemon_config
+            .as_ref()
+            .and_then(|config| config.storage.clone());
+        let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
-        Ok(self.with_configured_modules(configured_modules))
+        Ok(self
+            .with_configured_modules(configured_modules)
+            .with_storage_config(storage_config))
     }
 
     pub fn with_configured_modules(
@@ -117,6 +130,14 @@ impl BootstrapConfig {
         self.configured_modules = modules.into_iter().collect();
         self.configured_modules
             .sort_by(|left, right| left.module_id.cmp(&right.module_id));
+        self
+    }
+
+    pub fn with_storage_config(
+        mut self,
+        storage_config: Option<daemon_config::StorageConfig>,
+    ) -> Self {
+        self.storage_config = storage_config;
         self
     }
 }
@@ -163,12 +184,15 @@ pub async fn run() -> Result<(), BootstrapError> {
 
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
     let configured_modules = config.configured_modules.clone();
+    let storage_config = config.storage_config.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
             Ok(())
         }
-        Outcome::Bound(bound) => serve_bound_daemon(bound, configured_modules).await,
+        Outcome::Bound(bound) => {
+            serve_bound_daemon(bound, configured_modules, storage_config).await
+        }
     }
 }
 
@@ -182,6 +206,7 @@ pub async fn run_with_daemon_config_path(
 async fn serve_bound_daemon(
     bound: BoundDaemon,
     configured_modules: Vec<ConfiguredModule>,
+    storage_config: Option<daemon_config::StorageConfig>,
 ) -> Result<(), BootstrapError> {
     info!(
         connection_file = %bound.connection_file_path.display(),
@@ -199,7 +224,8 @@ async fn serve_bound_daemon(
             Arc::new(ForwardingTable::default()),
         )
         .with_process_liveness(process_liveness.clone())
-        .with_supervisor(supervisor_handle.clone()),
+        .with_supervisor(supervisor_handle.clone())
+        .with_storage_config(storage_config),
     );
     let forwarding = control.forwarding();
     let router = Arc::new(Router::with_control_handler(control));

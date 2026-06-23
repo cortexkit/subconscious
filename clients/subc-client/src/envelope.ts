@@ -126,8 +126,20 @@ export function decodeHeader(bytes: Uint8Array): EnvelopeHeader {
   return { len, ver, ty, flags, channel, corr };
 }
 
-/** Build a full frame (header + body), enforcing the body-length cap and the pure-header rule. */
+/** Build a full current-version frame, enforcing the body-length cap and the pure-header rule. */
 export function buildFrame(
+  ty: FrameType,
+  flags: number,
+  channel: number,
+  corr: bigint,
+  body: Uint8Array,
+): Frame {
+  return buildFrameWithVersion(PROTOCOL_VERSION, ty, flags, channel, corr, body);
+}
+
+/** Build a full frame while preserving a peer-negotiated envelope version. */
+export function buildFrameWithVersion(
+  ver: number,
   ty: FrameType,
   flags: number,
   channel: number,
@@ -141,7 +153,7 @@ export function buildFrame(
     throw new DecodeError(`pure-header frame ${FrameType[ty]} cannot carry a body`);
   }
   return {
-    header: { len: body.length, ver: PROTOCOL_VERSION, ty, flags, channel, corr },
+    header: { len: body.length, ver, ty, flags, channel, corr },
     body,
   };
 }

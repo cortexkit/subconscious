@@ -1,12 +1,117 @@
 {
   "data_home": "/data",
   "vectors": [
-    { "module_id": "alfonso-routing", "postgres_database_name": "cortexkit_alfonso_routing_4ba9db993fef9afe", "sqlite_store_path": "/data/cortexkit/alfonso-routing/store.db" },
-    { "module_id": "llm-runner", "postgres_database_name": "cortexkit_llm_runner_393f35886c26fae5", "sqlite_store_path": "/data/cortexkit/llm-runner/store.db" },
-    { "module_id": "magic-context", "postgres_database_name": "cortexkit_magic_context_922fd2230b3ce5fa", "sqlite_store_path": "/data/cortexkit/magic-context/store.db" },
-    { "module_id": "ai-provider-quota", "postgres_database_name": "cortexkit_ai_provider_quota_40f7c994078b5902", "sqlite_store_path": "/data/cortexkit/ai-provider-quota/store.db" },
-    { "module_id": "a-b", "postgres_database_name": "cortexkit_a_b_e61ab31904644883", "sqlite_store_path": "/data/cortexkit/a-b/store.db" },
-    { "module_id": "a_b", "postgres_database_name": "cortexkit_a_b_e6c4a31904f4ad51", "sqlite_store_path": "/data/cortexkit/a_b/store.db" },
-    { "module_id": "a-very-long-module-id-that-exceeds-the-postgres-identifier-byte-limit-by-a-lot", "postgres_database_name": "cortexkit_a_very_long_module_id_that_exceeds_t_67087abf88b553c2", "sqlite_store_path": "/data/cortexkit/a-very-long-module-id-that-exceeds-the-postgres-identifier-byte-limit-by-a-lot/store.db" }
+    {
+      "module_id": "alfonso-routing",
+      "postgres_database_name": "cortexkit_alfonso_routing_4ba9db993fef9afe",
+      "sqlite_descriptor": {
+        "backend": {
+          "backend": "sqlite",
+          "path": "/data/cortexkit/alfonso-routing/store.db"
+        },
+        "isolation": {
+          "kind": "module"
+        },
+        "module_id": "alfonso-routing",
+        "storage_namespace": "default"
+      },
+      "sqlite_store_path": "/data/cortexkit/alfonso-routing/store.db"
+    },
+    {
+      "module_id": "llm-runner",
+      "postgres_database_name": "cortexkit_llm_runner_393f35886c26fae5",
+      "sqlite_descriptor": {
+        "backend": {
+          "backend": "sqlite",
+          "path": "/data/cortexkit/llm-runner/store.db"
+        },
+        "isolation": {
+          "kind": "module"
+        },
+        "module_id": "llm-runner",
+        "storage_namespace": "default"
+      },
+      "sqlite_store_path": "/data/cortexkit/llm-runner/store.db"
+    },
+    {
+      "module_id": "magic-context",
+      "postgres_database_name": "cortexkit_magic_context_922fd2230b3ce5fa",
+      "sqlite_descriptor": {
+        "backend": {
+          "backend": "sqlite",
+          "path": "/data/cortexkit/magic-context/store.db"
+        },
+        "isolation": {
+          "kind": "module"
+        },
+        "module_id": "magic-context",
+        "storage_namespace": "default"
+      },
+      "sqlite_store_path": "/data/cortexkit/magic-context/store.db"
+    },
+    {
+      "module_id": "ai-provider-quota",
+      "postgres_database_name": "cortexkit_ai_provider_quota_40f7c994078b5902",
+      "sqlite_descriptor": {
+        "backend": {
+          "backend": "sqlite",
+          "path": "/data/cortexkit/ai-provider-quota/store.db"
+        },
+        "isolation": {
+          "kind": "module"
+        },
+        "module_id": "ai-provider-quota",
+        "storage_namespace": "default"
+      },
+      "sqlite_store_path": "/data/cortexkit/ai-provider-quota/store.db"
+    },
+    {
+      "module_id": "a-b",
+      "postgres_database_name": "cortexkit_a_b_e61ab31904644883",
+      "sqlite_descriptor": {
+        "backend": {
+          "backend": "sqlite",
+          "path": "/data/cortexkit/a-b/store.db"
+        },
+        "isolation": {
+          "kind": "module"
+        },
+        "module_id": "a-b",
+        "storage_namespace": "default"
+      },
+      "sqlite_store_path": "/data/cortexkit/a-b/store.db"
+    },
+    {
+      "module_id": "a_b",
+      "postgres_database_name": "cortexkit_a_b_e6c4a31904f4ad51",
+      "sqlite_descriptor": {
+        "backend": {
+          "backend": "sqlite",
+          "path": "/data/cortexkit/a_b/store.db"
+        },
+        "isolation": {
+          "kind": "module"
+        },
+        "module_id": "a_b",
+        "storage_namespace": "default"
+      },
+      "sqlite_store_path": "/data/cortexkit/a_b/store.db"
+    },
+    {
+      "module_id": "a-very-long-module-id-that-exceeds-the-postgres-identifier-byte-limit-by-a-lot",
+      "postgres_database_name": "cortexkit_a_very_long_module_id_that_exceeds_t_67087abf88b553c2",
+      "sqlite_descriptor": {
+        "backend": {
+          "backend": "sqlite",
+          "path": "/data/cortexkit/a-very-long-module-id-that-exceeds-the-postgres-identifier-byte-limit-by-a-lot/store.db"
+        },
+        "isolation": {
+          "kind": "module"
+        },
+        "module_id": "a-very-long-module-id-that-exceeds-the-postgres-identifier-byte-limit-by-a-lot",
+        "storage_namespace": "default"
+      },
+      "sqlite_store_path": "/data/cortexkit/a-very-long-module-id-that-exceeds-the-postgres-identifier-byte-limit-by-a-lot/store.db"
+    }
   ]
 }

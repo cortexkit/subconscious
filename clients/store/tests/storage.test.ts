@@ -13,6 +13,7 @@ interface GoldenVector {
   module_id: string;
   postgres_database_name: string;
   sqlite_store_path: string;
+  sqlite_descriptor: unknown;
 }
 
 interface GoldenFixture {
@@ -29,6 +30,10 @@ describe("storage derivation parity", () => {
     for (const vector of fixture.vectors) {
       expect(postgresDatabaseName(vector.module_id)).toBe(vector.postgres_database_name);
       expect(sqliteStorePath(fixture.data_home, vector.module_id)).toBe(vector.sqlite_store_path);
+      // The descriptor in the shared fixture must parse and round-trip identically
+      // (the descriptor wire shape is part of the same cross-language contract).
+      const descriptor = parseStorageDescriptor(vector.sqlite_descriptor);
+      expect(JSON.parse(JSON.stringify(descriptor))).toEqual(vector.sqlite_descriptor);
     }
   });
 

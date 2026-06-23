@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
 import { authenticateClient } from "./auth.js";
-import type { BindIdentity, ConfigTier, RouteTarget } from "./client.js";
+import type { BindIdentity, RouteTarget } from "./client.js";
 import { readConnectionFile, type ConnectionInfo } from "./connection-file.js";
 import {
   buildFlags,
@@ -172,7 +172,6 @@ export interface RouteBindRequest {
   route_channel: number;
   target: RouteTarget;
   identity: BindIdentity;
-  config: ConfigTier[];
 }
 
 export type BindDecision =
@@ -411,7 +410,6 @@ export class SubcProvider {
       route_channel: numberField(request.route_channel, "route_channel"),
       target: request.target as RouteTarget,
       identity: request.identity as BindIdentity,
-      config: Array.isArray(request.config) ? (request.config as ConfigTier[]) : [],
     };
 
     const decision = await this.onBind?.(bindRequest);

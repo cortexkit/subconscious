@@ -8,7 +8,7 @@ use subc_protocol::{
         IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
         Tool, TrustTier,
     },
-    session::{ConfigTier, ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, RouteTarget, PROTOCOL_VERSION,
 };
 
@@ -36,7 +36,6 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             service_id: "llm".to_string(),
         },
     );
-    assert_golden("config_tier", &config_tier());
     assert_golden("error_body", &error_body());
     assert_golden("module_hello_body", &module_hello_body());
     assert_golden("module_hello_ack_body", &module_hello_ack_body());
@@ -98,14 +97,6 @@ fn bind_identity() -> BindIdentity {
     }
 }
 
-fn config_tier() -> ConfigTier {
-    ConfigTier {
-        tier: "project".to_string(),
-        source: "/tmp/subc/project/aft.jsonc".to_string(),
-        doc: "{ // jsonc owned by AFT\n  \"semantic\": true\n}".to_string(),
-    }
-}
-
 fn error_body() -> ErrorBody {
     ErrorBody {
         code: "config_divergence".to_string(),
@@ -142,7 +133,6 @@ fn module_control_request() -> ModuleControlRequest {
             module_id: "aft-tools".to_string(),
         },
         identity: bind_identity(),
-        config: vec![config_tier()],
     }
 }
 

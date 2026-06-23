@@ -6,7 +6,7 @@ use subc_control::{
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
-    session::{ConfigTier, ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
@@ -606,13 +606,8 @@ impl ControlHandler {
             ClientControlRequest::CatalogList { module_id } => {
                 self.handle_catalog_list(frame, module_id)
             }
-            ClientControlRequest::RouteOpen {
-                target,
-                identity,
-                config,
-            } => {
-                self.handle_route_open(ctx, frame, target, identity, config)
-                    .await
+            ClientControlRequest::RouteOpen { target, identity } => {
+                self.handle_route_open(ctx, frame, target, identity).await
             }
             ClientControlRequest::RoutePoll {
                 route_channel,
@@ -688,7 +683,6 @@ impl ControlHandler {
         frame: Frame,
         target: RouteTarget,
         mut identity: BindIdentity,
-        config: Vec<ConfigTier>,
     ) -> Result<Vec<Frame>, RouterError> {
         let target_module_id = target_module_id(&target).to_string();
         debug!(
@@ -827,7 +821,6 @@ impl ControlHandler {
             route_channel: module_channel,
             target,
             identity,
-            config,
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(

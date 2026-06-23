@@ -11,7 +11,6 @@ use subc_protocol::{
         ManagementOperationKind, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
         PipelineStageKind, ProviderRole, Tool,
     },
-    session::ConfigTier,
     BindIdentity, RouteTarget, PROTOCOL_VERSION,
 };
 
@@ -84,7 +83,6 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     service_id: "llm".to_string(),
                 },
                 identity: bind_identity(),
-                config: vec![config_tier()],
             },
         ),
         (
@@ -184,14 +182,6 @@ fn bind_identity() -> BindIdentity {
         project_root: PathBuf::from("/tmp/subc/project"),
         harness: "opencode".to_string(),
         session: "session-0001".to_string(),
-    }
-}
-
-fn config_tier() -> ConfigTier {
-    ConfigTier {
-        tier: "project".to_string(),
-        source: "/tmp/subc/project/aft.jsonc".to_string(),
-        doc: "{ // jsonc owned by AFT\n  \"semantic\": true\n}".to_string(),
     }
 }
 

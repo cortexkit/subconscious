@@ -42,20 +42,6 @@ export type RouteTarget =
   | { kind: "management_surface"; module_id: string }
   | { kind: "internal_service"; module_id: string; service_id: string };
 
-/**
- * One provenance-tagged config tier supplied on route.open. subc forwards these
- * verbatim and label-preserving; the module (e.g. AFT) decides how much to trust
- * each tier from its `tier` label and `source` path. The `tier` label is the
- * trust authority (known values "user"/"project"); `source` is the absolute path
- * the doc was read from (metadata only); `doc` is the verbatim, opaque
- * config-source text (subc never parses it).
- */
-export interface ConfigTier {
-  tier: string;
-  source: string;
-  doc: string;
-}
-
 export interface CatalogEntry {
   module_id: string;
   roles: unknown[];
@@ -128,17 +114,9 @@ export class SubcClient {
     return parsed.modules ?? [];
   }
 
-  /**
-   * Open a route to a provider (channel-0 route.open); returns the route channel.
-   *
-   * `config` carries optional provenance-tagged tiers the module reconciles at
-   * bind time (omit for the common no-config case). subc relays them opaque and
-   * label-preserving; a module may downgrade an unattested wire-relayed tier
-   * (e.g. cap a third-party front's "user" tier to project-level), so what the
-   * module honors can differ from what is sent.
-   */
-  async routeOpen(target: RouteTarget, identity: BindIdentity, config: ConfigTier[] = []): Promise<number> {
-    const body = this.encode({ op: "route.open", target, identity, config });
+  /** Open a route to a provider (channel-0 route.open); returns the route channel. */
+  async routeOpen(target: RouteTarget, identity: BindIdentity): Promise<number> {
+    const body = this.encode({ op: "route.open", target, identity });
     const reply = await this.controlRpc(body);
     const parsed = this.parseJson(reply) as { op: string; route_channel?: number };
     if (typeof parsed.route_channel !== "number") {

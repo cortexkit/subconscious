@@ -1,14 +1,14 @@
 //! Client-facing subc channel-0 control wire shapes.
 //!
 //! This crate is the client ↔ subc control-plane boundary. It depends only on
-//! [`subc-protocol`] for shared primitives such as `RouteTarget`,
-//! `BindIdentity`, and `ConfigTier`; clients can use it without depending on the
+//! [`subc-protocol`] for shared primitives such as `RouteTarget` and
+//! `BindIdentity`; clients can use it without depending on the
 //! daemon implementation.
 
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use subc_protocol::{manifest::ProviderRole, session::ConfigTier, BindIdentity, RouteTarget};
+use subc_protocol::{manifest::ProviderRole, BindIdentity, RouteTarget};
 
 /// Reserved dotted operation prefixes for the v0.4 control vocabulary.
 pub mod ops {
@@ -45,8 +45,6 @@ pub enum ClientControlRequest {
     RouteOpen {
         target: RouteTarget,
         identity: BindIdentity,
-        #[serde(default)]
-        config: Vec<ConfigTier>,
     },
     #[serde(rename = "route.poll")]
     RoutePoll { route_channel: u16, kind: PollKind },
@@ -143,7 +141,6 @@ mod tests {
                 harness: "opencode".to_string(),
                 session: "session-1".to_string(),
             },
-            config: Vec::new(),
         };
 
         let body = serde_json::to_value(request).unwrap();

@@ -585,7 +585,6 @@ async fn handle_control_request(
             route_channel,
             target,
             identity,
-            config: relay_config,
         } => {
             record_event(
                 config,
@@ -596,7 +595,6 @@ async fn handle_control_request(
                     "reject": config.reject_attach,
                     "target": target,
                     "identity": identity,
-                    "config": relay_config,
                 }),
             )?;
             if config.bind_never_reply {

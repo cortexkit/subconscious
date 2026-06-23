@@ -4,7 +4,6 @@ export {
   connectionFileExists,
   type BindIdentity,
   type RouteTarget,
-  type ConfigTier,
   type CatalogEntry,
   type RequestOptions,
   type ConnectOptions,

@@ -38,7 +38,7 @@ use subc_protocol::{
         IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
         Tool as ProviderTool, TrustTier,
     },
-    session::{ConfigTier, ModuleControlRequest, ModuleControlResponse},
+    session::{ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
@@ -983,23 +983,6 @@ async fn mcp_two_tier_config_project_overrides_user_and_null_deletes_override() 
         list_tool_names(&harness).await,
         vec!["aft_read", "aft_write"]
     );
-    let attach = wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
-        event.get("kind") == Some(&Value::String("attach".to_owned()))
-    })
-    .await;
-    let tiers = attach
-        .get("config")
-        .and_then(Value::as_array)
-        .expect("route.bind should receive raw config tiers");
-    assert_eq!(tiers.len(), 2);
-    assert_eq!(
-        tiers[0].get("tier"),
-        Some(&Value::String("user".to_owned()))
-    );
-    assert_eq!(
-        tiers[1].get("tier"),
-        Some(&Value::String("project".to_owned()))
-    );
 
     harness.shutdown().await;
 }
@@ -1422,7 +1405,6 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
                 module_id: "mcp".to_string(),
             },
             identity: route_identity("mcp", 2_001),
-            config: route_config(),
         },
     )
     .await;
@@ -2060,7 +2042,6 @@ where
                 module_id: module_id.to_string(),
             },
             identity: route_identity(module_id, corr),
-            config: route_config(),
         },
     )
     .await
@@ -2171,14 +2152,6 @@ fn route_identity(label: &str, corr: u64) -> BindIdentity {
         harness: "subc-mcp-test".to_string(),
         session: format!("session-{corr}"),
     }
-}
-
-fn route_config() -> Vec<ConfigTier> {
-    vec![ConfigTier {
-        tier: "project".to_string(),
-        source: "subc-mcp-test".to_string(),
-        doc: "{}".to_string(),
-    }]
 }
 
 async fn wait_for_stub_event<F>(path: &Path, wait: Duration, matches: F) -> Value

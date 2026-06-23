@@ -160,7 +160,6 @@ async fn route_open(
             harness: args.harness.clone(),
             session: args.session.clone(),
         },
-        config: Vec::new(),
     };
     let response = control_rpc(stream, serde_json::to_vec(&request)?).await?;
     match response.header.ty {

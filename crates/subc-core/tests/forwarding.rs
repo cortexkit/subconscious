@@ -25,7 +25,6 @@ use subc_protocol::{
         IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
         Tool, TrustTier,
     },
-    session::ConfigTier,
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
@@ -147,16 +146,7 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
         attach_event["identity"]["session"].as_str(),
         Some("ses-forwarding")
     );
-    let forwarded_config: Vec<ConfigTier> =
-        serde_json::from_value(attach_event["config"].clone()).unwrap();
-    assert_eq!(forwarded_config, attach_config(&project, "ses-forwarding"));
-    assert_eq!(
-        forwarded_config
-            .iter()
-            .map(|tier| tier.tier.as_str())
-            .collect::<Vec<_>>(),
-        vec!["user", "project"]
-    );
+    assert!(attach_event.get("config").is_none());
     assert!(ack.route_channel > 0);
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 1);
     assert!(server
@@ -1669,7 +1659,6 @@ async fn route_open_invalid_project_root_returns_error_without_provider_attach()
             harness: "opencode".to_string(),
             session: "ses-invalid-project-root".to_string(),
         },
-        config: attach_config(&project, "ses-invalid-project-root"),
     };
     write_frame(&mut client, &control_request_frame(481, request))
         .await
@@ -3639,27 +3628,7 @@ fn attach_request(project: &TestProject, session: &str, module_id: &str) -> Clie
             harness: "opencode".to_string(),
             session: session.to_string(),
         },
-        config: attach_config(project, session),
     }
-}
-
-fn attach_config(project: &TestProject, session: &str) -> Vec<ConfigTier> {
-    vec![
-        ConfigTier {
-            tier: "user".to_string(),
-            source: "/abs/user/aft.jsonc".to_string(),
-            doc: "{ // user defaults\n  \"auto_accept\": false\n}".to_string(),
-        },
-        ConfigTier {
-            tier: "project".to_string(),
-            source: project
-                .path
-                .join("aft.jsonc")
-                .to_string_lossy()
-                .into_owned(),
-            doc: format!(r#"{{ "session": "{session}", "semantic": true }}"#),
-        },
-    ]
 }
 
 fn attach_frame(corr: u64, attach: ClientControlRequest) -> Frame {

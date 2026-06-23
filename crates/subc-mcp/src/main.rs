@@ -35,7 +35,6 @@ use subc_protocol::{
         ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
         Tool as ManifestTool, TrustTier,
     },
-    session::ConfigTier,
     BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Priority, RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
     SUBC_MODULE_ID_ENV,
@@ -172,7 +171,6 @@ struct ToolConfig {
 #[derive(Debug, Clone)]
 struct ConfigSnapshot {
     effective: GatewayConfig,
-    tiers: Vec<ConfigTier>,
 }
 
 #[derive(Debug)]
@@ -774,7 +772,7 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
 
     let mut routes = HashMap::new();
     for provider in &desired.providers {
-        match open_provider_route(subc, &provider.module_id, &identity, &config.tiers).await {
+        match open_provider_route(subc, &provider.module_id, &identity).await {
             Ok(route_channel) => {
                 routes.insert(provider.module_id.clone(), route_channel);
             }
@@ -827,14 +825,12 @@ async fn open_provider_route(
     subc: &SubcClient,
     module_id: &str,
     identity: &BindIdentity,
-    config: &[ConfigTier],
 ) -> Result<u16> {
     let request = ClientControlRequest::RouteOpen {
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_owned(),
         },
         identity: identity.clone(),
-        config: config.to_vec(),
     };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr();
@@ -1104,7 +1100,6 @@ fn validate_mcp_name_component(kind: &str, value: &str) -> std::result::Result<(
 
 fn read_gateway_config(project_root: &Path) -> Result<ConfigSnapshot> {
     let mut effective = GatewayConfig::default();
-    let mut tiers = Vec::new();
     let config_files = [
         ("user", user_mcp_config_path()),
         (
@@ -1126,14 +1121,9 @@ fn read_gateway_config(project_root: &Path) -> Result<ConfigSnapshot> {
         };
         let raw = parse_gateway_config_doc(&doc, &path)?;
         merge_gateway_config(&mut effective, raw);
-        tiers.push(ConfigTier {
-            tier: tier.to_owned(),
-            source: absolute_config_source(&path),
-            doc,
-        });
     }
 
-    Ok(ConfigSnapshot { effective, tiers })
+    Ok(ConfigSnapshot { effective })
 }
 
 fn user_mcp_config_path() -> PathBuf {
@@ -1146,18 +1136,6 @@ fn user_mcp_config_path() -> PathBuf {
             .join(MCP_CONFIG_RELATIVE_PATH);
     }
     PathBuf::from(".config").join(MCP_CONFIG_RELATIVE_PATH)
-}
-
-fn absolute_config_source(path: &Path) -> String {
-    if path.is_absolute() {
-        path.display().to_string()
-    } else {
-        env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-            .display()
-            .to_string()
-    }
 }
 
 fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> {
@@ -1256,20 +1234,14 @@ async fn reconcile_session_from_catalog(
             routes.insert(provider.module_id.clone(), *route_channel);
             continue;
         }
-        let route_channel = match open_provider_route(
-            subc,
-            &provider.module_id,
-            &state.identity,
-            &state.config.tiers,
-        )
-        .await
-        {
-            Ok(route_channel) => route_channel,
-            Err(error) => {
-                let _ = send_route_goodbyes(subc, opened_routes).await;
-                return Err(error);
-            }
-        };
+        let route_channel =
+            match open_provider_route(subc, &provider.module_id, &state.identity).await {
+                Ok(route_channel) => route_channel,
+                Err(error) => {
+                    let _ = send_route_goodbyes(subc, opened_routes).await;
+                    return Err(error);
+                }
+            };
         opened_routes.push(route_channel);
         routes.insert(provider.module_id.clone(), route_channel);
     }

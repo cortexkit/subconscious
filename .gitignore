@@ -13,3 +13,6 @@
 /_bmad
 # Planning/decision artifacts kept LOCAL for now (Ufuk: not in the shared repo)
 /_bmad-output
+
+# Magic Context / CortexKit per-project module data (not source)
+.cortexkit/

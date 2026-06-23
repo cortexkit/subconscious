@@ -5,75 +5,31 @@
 //
 // The daemon is booted module-less in an isolated XDG_RUNTIME_DIR (ephemeral
 // port via SUBC_PORT=0) and XDG_CONFIG_HOME (so it finds no subc.jsonc and
-// supervises nothing). Skipped automatically when the binary is not built, so
-// `bun test` stays green standalone; the CI lane builds subc-core first.
+// supervises nothing). The helper builds subc-core first when the binary is
+// absent, so the live proof never silently skips.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { AuthError } from "../src/auth.js";
 import { readConnectionFile } from "../src/connection-file.js";
 import { SubcClient } from "../src/index.js";
+import { startLiveDaemon, type LiveDaemon } from "./live-daemon.js";
 
-const ROOT = join(import.meta.dir, "..", "..", "..");
-const DAEMON = join(ROOT, "target", "debug", "subc-core");
-const CONN_NAME = "subc-connection.json";
-
-const available = existsSync(DAEMON);
-if (!available) {
-  // eslint-disable-next-line no-console
-  console.warn(`[live-handshake] skipping: ${DAEMON} not built (run cargo build -p subc-core)`);
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`timed out waiting for ${label}`);
-}
-
-describe.if(available)("live handshake against real subc-core", () => {
-  let daemon: ChildProcess;
-  let runtimeDir: string;
-  let configDir: string;
-  let connFile: string;
-  let stderr = "";
+describe("live handshake against real subc-core", () => {
+  let live: LiveDaemon;
 
   beforeAll(async () => {
-    runtimeDir = mkdtempSync(join(tmpdir(), "subc-live-rt-"));
-    configDir = mkdtempSync(join(tmpdir(), "subc-live-cfg-"));
-    connFile = join(runtimeDir, CONN_NAME);
-
-    daemon = spawn(DAEMON, [], {
-      env: {
-        ...process.env,
-        XDG_RUNTIME_DIR: runtimeDir,
-        XDG_CONFIG_HOME: configDir,
-        SUBC_PORT: "0",
-      },
-      stdio: ["ignore", "ignore", "pipe"],
-    });
-    daemon.stderr?.on("data", (c: Buffer) => {
-      stderr += c.toString();
-    });
-
-    await waitFor(() => existsSync(connFile), 10_000, "daemon connection file");
+    live = await startLiveDaemon("subc-live-handshake");
   });
 
   afterAll(() => {
-    daemon?.kill("SIGKILL");
-    for (const dir of [runtimeDir, configDir]) {
-      if (dir) rmSync(dir, { recursive: true, force: true });
-    }
+    live?.stop();
   });
 
   test("authenticates and lists the (empty) catalog", async () => {
-    const client = await SubcClient.connect({ connectionFile: connFile });
+    const client = await SubcClient.connect({ connectionFile: live.connFile });
     try {
       // Reaching here at all proves the handshake: SubcClient.connect runs the
       // full ClientHello -> verify ServerProof+daemon_id -> ClientAuth exchange
@@ -86,13 +42,13 @@ describe.if(available)("live handshake against real subc-core", () => {
   });
 
   test("rejects a tampered key (proves the proof is actually verified)", async () => {
-    const conn = await readConnectionFile(connFile);
-    const tampered = { ...JSON.parse(readFileSync(connFile, "utf8")) };
+    const conn = await readConnectionFile(live.connFile);
+    const tampered = { ...JSON.parse(readFileSync(live.connFile, "utf8")) };
     const key = [...(tampered.key as number[])];
     key[0] = key[0]! ^ 0xff; // flip a byte so our client computes the wrong proof
     tampered.key = key;
 
-    const badPath = join(runtimeDir, "tampered-connection.json");
+    const badPath = join(live.runtimeDir, "tampered-connection.json");
     writeFileSync(badPath, JSON.stringify(tampered), { mode: 0o600 });
     chmodSync(badPath, 0o600);
 

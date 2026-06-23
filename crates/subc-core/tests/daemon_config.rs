@@ -13,7 +13,7 @@ use subc_core::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
     read_frame, write_frame, Frame,
 };
-use subc_protocol::{session::ConfigTier, BindIdentity, Flags, FrameType, Priority, RouteTarget};
+use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -389,11 +389,6 @@ where
                 harness: "daemon-config-test".to_string(),
                 session: format!("session-{corr}"),
             },
-            config: vec![ConfigTier {
-                tier: "project".to_string(),
-                source: "daemon-config-test".to_string(),
-                doc: "{}".to_string(),
-            }],
         },
     )
     .await

@@ -1,11 +1,4 @@
 {
-  "config": [
-    {
-      "doc": "{ // jsonc owned by AFT\n  \"semantic\": true\n}",
-      "source": "/tmp/subc/project/aft.jsonc",
-      "tier": "project"
-    }
-  ],
   "identity": {
     "harness": "opencode",
     "project_root": "/tmp/subc/project",

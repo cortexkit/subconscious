@@ -17,8 +17,7 @@ use subc_core::{
     SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{
-    session::ConfigTier, BindIdentity, ErrorBody, Flags, FrameType, Priority, RouteTarget,
-    PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, Flags, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -473,15 +472,6 @@ where
             harness: "opencode".to_string(),
             session: format!("closure-{}", corr),
         },
-        config: vec![ConfigTier {
-            tier: "project".to_string(),
-            source: project
-                .path
-                .join("aft.jsonc")
-                .to_string_lossy()
-                .into_owned(),
-            doc: r#"{"closure":true}"#.to_string(),
-        }],
     };
     write_frame(client, &control_request_frame(corr, request))
         .await

@@ -43,13 +43,22 @@ impl StorageConfig {
             // Path convention mirrors cortexkit_store_types::sqlite_store_path:
             // <data_home>/cortexkit/<module_id>/store.db. One database per module;
             // a project-scoped module partitions its own rows internally.
+            //
+            // Build the path with forward slashes (NOT PathBuf::join, which inserts
+            // backslashes on Windows) so the delivered wire descriptor is identical
+            // cross-platform and byte-matches the store-types helper. Forward-slash
+            // paths are accepted by sqlite on every platform.
             StorageConfig::Sqlite { data_home } => {
-                let path = data_home.join("cortexkit").join(module_id).join("store.db");
+                let data_home = data_home.to_string_lossy();
+                let path = format!(
+                    "{}/cortexkit/{module_id}/store.db",
+                    data_home.trim_end_matches('/')
+                );
                 serde_json::json!({
                     "module_id": module_id,
                     "storage_namespace": "default",
                     "isolation": { "kind": "module" },
-                    "backend": { "backend": "sqlite", "path": path.to_string_lossy() },
+                    "backend": { "backend": "sqlite", "path": path },
                 })
             }
         }

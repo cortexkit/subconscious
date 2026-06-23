@@ -48,7 +48,15 @@ const SUBC_CONTROL_OPS: &[&str] = &[
 ];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
-const ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long subc waits for a module to ack a relayed route.bind before returning
+/// `module_timeout`. The ack waits on the module's own configure, which for AFT
+/// includes a synchronous bounded project walk (up to ~20k files) plus gitignore
+/// and DB-open work — on a cold page cache or a large repo that legitimately
+/// exceeds a couple of seconds. The default is generous because rejecting a VALID
+/// bind is far worse than waiting on a slow one; a consumer that wants a tighter
+/// bound retries the bind itself (the sanctioned warm-bind-retry pattern).
+const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
@@ -58,6 +66,7 @@ pub struct ControlHandler {
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
     subc_capabilities: Arc<[String]>,
+    route_bind_relay_timeout: Duration,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -146,7 +155,15 @@ impl ControlHandler {
                 CAP_PING_PONG.to_string(),
                 CAP_SESSION_ATTACH.to_string(),
             ]),
+            route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
         }
+    }
+
+    /// Override the route.bind relay timeout. Used by tests that assert the
+    /// timeout path so they don't block on the production-safe default.
+    pub fn with_route_bind_relay_timeout(mut self, timeout: Duration) -> Self {
+        self.route_bind_relay_timeout = timeout;
+        self
     }
 
     pub fn with_process_liveness(
@@ -820,7 +837,7 @@ impl ControlHandler {
             )?]);
         }
 
-        match timeout(ROUTE_BIND_RELAY_TIMEOUT, receiver).await {
+        match timeout(self.route_bind_relay_timeout, receiver).await {
             Ok(Ok(RouteBindRelayOutcome::Accepted)) => {
                 if let Err(err) = self.forwarding.commit_route(
                     ctx.connection_id,
@@ -896,7 +913,7 @@ impl ControlHandler {
                     "module_timeout",
                     format!(
                         "module_id '{target_module_id}' did not answer route.bind within {:?}",
-                        ROUTE_BIND_RELAY_TIMEOUT
+                        self.route_bind_relay_timeout
                     ),
                 )?])
             }

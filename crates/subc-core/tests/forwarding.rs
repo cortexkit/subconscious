@@ -37,7 +37,8 @@ use tokio::{
 
 mod common;
 use common::{
-    connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
+    connect_authed_client, start_test_daemon_with_bind_timeout,
+    start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -58,14 +59,37 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_inner(None).await
+    }
+
+    /// Start with a short route.bind relay timeout so the timeout-path tests fire
+    /// quickly instead of waiting on the production-safe default.
+    async fn start_with_bind_timeout(bind_timeout: Duration) -> Self {
+        Self::start_inner(Some(bind_timeout)).await
+    }
+
+    async fn start_inner(bind_timeout: Option<Duration>) -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
         let supervisor_handle = SupervisorHandle::new();
-        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
-            "forwarding-server",
-            process_liveness.clone(),
-            supervisor_handle.clone(),
-        )
-        .await;
+        let daemon = match bind_timeout {
+            Some(timeout) => {
+                start_test_daemon_with_bind_timeout(
+                    "forwarding-server",
+                    process_liveness.clone(),
+                    supervisor_handle.clone(),
+                    timeout,
+                )
+                .await
+            }
+            None => {
+                start_test_daemon_with_process_liveness_and_supervisor(
+                    "forwarding-server",
+                    process_liveness.clone(),
+                    supervisor_handle.clone(),
+                )
+                .await
+            }
+        };
         Self {
             daemon,
             process_liveness,
@@ -1718,7 +1742,10 @@ async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_bind
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_drop_during_pending_route_open_releases_reservation() {
-    let server = TestServer::start().await;
+    // The abandoned-bind cleanup here is driven by the route.bind relay timeout
+    // (the stub never replies), so use a short timeout rather than the
+    // production-safe default to keep the test fast.
+    let server = TestServer::start_with_bind_timeout(Duration::from_millis(500)).await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-pending-client-drop";
     let (pending, events_path) = spawn_stub_with_events(
@@ -1828,7 +1855,7 @@ async fn module_death_during_route_bind_returns_target_unavailable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_open_timeout_releases_reservation_and_later_open_succeeds() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_bind_timeout(Duration::from_millis(500)).await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-bind-timeout";
     let timing_out = spawn_stub_with_env(
@@ -1879,7 +1906,7 @@ async fn route_open_timeout_sends_module_goodbye_for_abandoned_bind() {
     // a late-accepting module keeps a route subc has torn down. The stub records a
     // `detach` event for every route GOODBYE it receives, so observing that event
     // proves subc sent the abandoned-bind GOODBYE on the module channel.
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_bind_timeout(Duration::from_millis(500)).await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-bind-timeout-goodbye";
     let (timing_out, events_path) = spawn_stub_with_events(

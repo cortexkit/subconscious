@@ -51,14 +51,14 @@ impl Drop for TestDaemon {
 }
 
 pub async fn start_test_daemon(name: &str) -> TestDaemon {
-    start_test_daemon_inner(name, None, None).await
+    start_test_daemon_inner(name, None, None, None).await
 }
 
 pub async fn start_test_daemon_with_process_liveness(
     name: &str,
     process_liveness: Arc<dyn ModuleProcessLiveness>,
 ) -> TestDaemon {
-    start_test_daemon_inner(name, Some(process_liveness), None).await
+    start_test_daemon_inner(name, Some(process_liveness), None, None).await
 }
 
 pub async fn start_test_daemon_with_process_liveness_and_supervisor(
@@ -66,13 +66,31 @@ pub async fn start_test_daemon_with_process_liveness_and_supervisor(
     process_liveness: Arc<dyn ModuleProcessLiveness>,
     supervisor_handle: SupervisorHandle,
 ) -> TestDaemon {
-    start_test_daemon_inner(name, Some(process_liveness), Some(supervisor_handle)).await
+    start_test_daemon_inner(name, Some(process_liveness), Some(supervisor_handle), None).await
+}
+
+/// Start a test daemon with an explicit route.bind relay timeout, so the
+/// timeout-path tests fire quickly instead of waiting on the production default.
+pub async fn start_test_daemon_with_bind_timeout(
+    name: &str,
+    process_liveness: Arc<dyn ModuleProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
+    bind_timeout: Duration,
+) -> TestDaemon {
+    start_test_daemon_inner(
+        name,
+        Some(process_liveness),
+        Some(supervisor_handle),
+        Some(bind_timeout),
+    )
+    .await
 }
 
 async fn start_test_daemon_inner(
     name: &str,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor_handle: Option<SupervisorHandle>,
+    bind_timeout: Option<Duration>,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -99,6 +117,9 @@ async fn start_test_daemon_inner(
     }
     if let Some(supervisor_handle) = supervisor_handle {
         handler = handler.with_supervisor(supervisor_handle);
+    }
+    if let Some(bind_timeout) = bind_timeout {
+        handler = handler.with_route_bind_relay_timeout(bind_timeout);
     }
     let control = Arc::new(handler);
     let forwarding = control.forwarding();

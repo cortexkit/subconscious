@@ -7,6 +7,8 @@ export {
   type CatalogEntry,
   type RequestOptions,
   type ConnectOptions,
+  type SubscribeOptions,
+  type Subscription,
 } from "./client.js";
 export {
   readConnectionFile,
@@ -45,6 +47,7 @@ export {
   HELLO_CORR,
   managementSurfaceManifest,
   jsonProviderHandler,
+  type ProviderRequestContext,
   type BindDecision,
   type BindingsInput,
   type CircuitBreakerInput,

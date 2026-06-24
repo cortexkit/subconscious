@@ -30,6 +30,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 // Once a header arrives, its body must follow promptly; bound it so a truncated
 // frame cannot wedge the read loop forever.
 const BODY_READ_TIMEOUT_MS = 30_000;
+const EMPTY_BODY = new Uint8Array(0);
 
 export interface BindIdentity {
   project_root: string;
@@ -53,6 +54,23 @@ export interface RequestOptions {
   timeoutMs?: number;
   /** Called for each interim PUSH / StreamData frame before the terminal reply. */
   onProgress?: (body: Uint8Array) => void;
+}
+
+export interface SubscribeOptions {
+  priority?: Priority;
+}
+
+/**
+ * A live subscription to a provider's event stream, riding a single held-open
+ * request. `onEvent` fires for each StreamData frame; `closed` resolves when the
+ * provider ends the stream (StreamEnd) and rejects on an Error terminal or a route
+ * GOODBYE. `unsubscribe` cancels the held-open request so the provider unwinds.
+ */
+export interface Subscription {
+  /** Cancel the subscription: sends Cancel on the held-open request; idempotent. */
+  unsubscribe(): void;
+  /** Resolves on StreamEnd; rejects on an Error terminal or route close. */
+  readonly closed: Promise<void>;
 }
 
 export class SubcError extends Error {
@@ -131,6 +149,64 @@ export class SubcClient {
     const priority = opts.priority ?? Priority.Interactive;
     const reply = await this.send(routeChannel, bytes, priority, opts.timeoutMs, opts.onProgress);
     return this.parseJson(reply);
+  }
+
+  /**
+   * Open a held-open event subscription on a route channel. Sends one Request the
+   * provider keeps open, delivering each interim StreamData frame to `onEvent`; the
+   * returned `closed` settles on the StreamEnd terminal (resolve) or an Error / route
+   * GOODBYE (reject). Events ride this held-open request's correlation id — they are
+   * never unsolicited, so they are not dropped. Call `unsubscribe()` to cancel.
+   */
+  subscribe(
+    routeChannel: number,
+    body: unknown,
+    onEvent: (event: Uint8Array) => void,
+    opts: SubscribeOptions = {},
+  ): Subscription {
+    const bytes = body instanceof Uint8Array ? body : this.encode(body);
+    const priority = opts.priority ?? Priority.Interactive;
+    const corr = this.nextCorr++;
+    const key = `${routeChannel}:${corr}`;
+
+    const closed = new Promise<void>((resolve, reject) => {
+      if (this.closedErr) {
+        reject(this.closedErr);
+        return;
+      }
+      // No timeout: a subscription stays open indefinitely until StreamEnd, Error,
+      // route GOODBYE, or unsubscribe.
+      this.pending.set(key, {
+        channel: routeChannel,
+        resolve: () => resolve(),
+        reject,
+        onProgress: onEvent,
+        timer: null,
+      });
+      const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false), routeChannel, corr, bytes);
+      this.sock.write(encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch((err) => {
+        const p = this.pending.get(key);
+        if (p) {
+          this.pending.delete(key);
+          reject(err instanceof Error ? err : new SubcError(String(err)));
+        }
+      });
+    });
+
+    let cancelled = false;
+    const unsubscribe = (): void => {
+      if (cancelled) return;
+      cancelled = true;
+      // Pure-header Cancel on the held-open (channel, corr): the provider aborts its
+      // handler and ends with StreamEnd, which settles `closed`.
+      const cancel = buildFrame(FrameType.Cancel, buildFlags(false, priority, false), routeChannel, corr, EMPTY_BODY);
+      this.sock.write(encodeFrame(cancel), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => {
+        // Best-effort: if the socket is already gone, the read loop fails the
+        // pending waiter and `closed` rejects on its own.
+      });
+    };
+
+    return { unsubscribe, closed };
   }
 
   close(): void {

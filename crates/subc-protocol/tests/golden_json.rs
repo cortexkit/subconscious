@@ -109,6 +109,10 @@ fn module_hello_body() -> ModuleHelloBody {
         manifest: module_manifest("aft-tools"),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec!["route.bind".to_string(), "route.status".to_string()]),
+        // None + skip_serializing_if keeps the golden bytes byte-identical: an absent
+        // launch_nonce serializes to no field, so existing modules and AFT are
+        // unaffected by the added field.
+        launch_nonce: None,
     }
 }
 

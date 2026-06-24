@@ -642,6 +642,7 @@ fn stub_spec_with_env(module_id: &str, extra_env: Vec<(&str, String)>) -> Module
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),
         env,
+        reserved: false,
     }
 }
 

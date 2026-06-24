@@ -624,6 +624,7 @@ version = "0.0.0"
 dependencies = [
  "cortexkit-paths",
  "fs4",
+ "getrandom",
  "serde",
  "serde_json",
  "subc-control",

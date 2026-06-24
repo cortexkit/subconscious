@@ -492,6 +492,26 @@ impl ControlHandler {
             }
         };
 
+        // Reserved-module identity gate: a module_id configured `reserved` may be
+        // registered ONLY by the process subc spawned for it, proven by echoing the
+        // one-time launch nonce subc injected. A non-reserved id has no recorded
+        // nonce and always passes. This blocks a key-holder from impersonating a
+        // security-boundary module (e.g. the credential vault) while the real one is
+        // down/restarting and its registration slot is momentarily free.
+        if !self
+            .supervisor
+            .reserved_hello_authorized(&hello.manifest.module_id, hello.launch_nonce.as_deref())
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_module",
+                format!(
+                    "module_id '{}' is reserved; HELLO without a valid launch nonce is rejected",
+                    hello.manifest.module_id
+                ),
+            )?]);
+        }
+
         // A connection that already opened client routes must not also register as
         // a module: cleanup would then release only one side and leak the other.
         if self
@@ -1630,10 +1650,36 @@ mod tests {
         corr: u64,
         control_ops: Option<Vec<String>>,
     ) -> Frame {
+        hello_frame_full(module_id, protocol_ver, corr, control_ops, None)
+    }
+
+    fn hello_frame_with_nonce(
+        module_id: &str,
+        protocol_ver: u8,
+        corr: u64,
+        launch_nonce: Option<&str>,
+    ) -> Frame {
+        hello_frame_full(
+            module_id,
+            protocol_ver,
+            corr,
+            None,
+            launch_nonce.map(ToOwned::to_owned),
+        )
+    }
+
+    fn hello_frame_full(
+        module_id: &str,
+        protocol_ver: u8,
+        corr: u64,
+        control_ops: Option<Vec<String>>,
+        launch_nonce: Option<String>,
+    ) -> Frame {
         let body = serde_json::to_vec(&ModuleHelloBody {
             manifest: manifest(module_id, protocol_ver),
             protocol_ver,
             control_ops,
+            launch_nonce,
         })
         .unwrap();
         Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
@@ -1987,6 +2033,64 @@ mod tests {
         assert_eq!(responses[0].header.ty, FrameType::Error);
         assert_eq!(parse_error(&responses[0])["code"], "invalid_hello");
         assert!(registry.get_module("aft-second").unwrap().is_none());
+    }
+
+    #[test]
+    fn reserved_module_hello_requires_matching_launch_nonce() {
+        let registry = Arc::new(Registry::default());
+        let supervisor = SupervisorHandle::new();
+        // The supervisor recorded the nonce it injected when it spawned the reserved
+        // module; the HELLO verifier checks against the same shared handle.
+        supervisor.set_reserved_nonce("vault", "the-real-nonce".to_string());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor);
+
+        // A HELLO with NO nonce is rejected.
+        let no_nonce = handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame("vault", PROTOCOL_VERSION, 1),
+            )
+            .unwrap();
+        assert_eq!(no_nonce[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&no_nonce[0])["code"], "reserved_module");
+        assert!(registry.get_module("vault").unwrap().is_none());
+
+        // A HELLO with the WRONG nonce is rejected.
+        let wrong = handler
+            .handle_control(
+                ConnectionId::new(2),
+                hello_frame_with_nonce("vault", PROTOCOL_VERSION, 2, Some("forged")),
+            )
+            .unwrap();
+        assert_eq!(wrong[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&wrong[0])["code"], "reserved_module");
+        assert!(registry.get_module("vault").unwrap().is_none());
+
+        // A HELLO with the CORRECT nonce registers.
+        let ok = handler
+            .handle_control(
+                ConnectionId::new(3),
+                hello_frame_with_nonce("vault", PROTOCOL_VERSION, 3, Some("the-real-nonce")),
+            )
+            .unwrap();
+        assert_eq!(ok[0].header.ty, FrameType::HelloAck);
+        assert!(registry.get_module("vault").unwrap().is_some());
+    }
+
+    #[test]
+    fn non_reserved_module_ignores_launch_nonce() {
+        let registry = Arc::new(Registry::default());
+        // No reserved nonce recorded for this id: it is not reserved, so a HELLO
+        // registers whether or not it carries a nonce.
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let ack = handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame("aft", PROTOCOL_VERSION, 1),
+            )
+            .unwrap();
+        assert_eq!(ack[0].header.ty, FrameType::HelloAck);
+        assert!(registry.get_module("aft").unwrap().is_some());
     }
 
     #[test]

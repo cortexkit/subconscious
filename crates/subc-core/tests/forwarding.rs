@@ -213,6 +213,45 @@ async fn non_tool_provider_hello_registers_without_hijacking_active_forwarding_m
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_module_spawned_by_supervisor_registers_but_foreign_hello_is_rejected() {
+    // The credential-vault protection, proven end-to-end through real process spawn +
+    // env injection (not just the unit-level handle): a reserved module supervised by
+    // the daemon registers because it echoes the launch nonce subc injected, but a
+    // foreign authenticated connection claiming the SAME reserved module_id (e.g. a
+    // key-holder impersonating the vault) is rejected.
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "reserved-vault";
+
+    // The supervisor spawns the reserved stub; it reads SUBC_LAUNCH_NONCE and echoes
+    // it, so it registers. (spawn waits for registration, so reaching here proves the
+    // real nonce round-trip succeeded.)
+    let module = supervisor
+        .spawn(reserved_stub_spec(&server, module_id))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+
+    // A foreign authed connection claiming the same reserved module_id, with NO
+    // nonce, is rejected reserved_module — it cannot impersonate the vault.
+    let mut foreign = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut foreign,
+        &hello_frame(tool_provider_manifest(module_id), 701),
+    )
+    .await
+    .unwrap();
+    foreign.flush().await.unwrap();
+    let rejection = read_frame_timeout(&mut foreign).await;
+    assert_eq!(rejection.header.ty, FrameType::Error);
+    let body: ErrorBody = serde_json::from_slice(&rejection.body).unwrap();
+    assert_eq!(body.code, "reserved_module");
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
     let server = TestServer::start().await;
 
@@ -3586,6 +3625,7 @@ fn hello_frame_with_protocol(manifest: ModuleManifest, protocol_ver: u8, corr: u
         manifest,
         protocol_ver,
         control_ops: None,
+        launch_nonce: None,
     })
     .unwrap();
     Frame::build(
@@ -4106,6 +4146,12 @@ fn stub_spec(server: &TestServer, module_id: &str) -> ModuleSpec {
     stub_spec_with_env(server, module_id, std::iter::empty::<(&str, &str)>())
 }
 
+fn reserved_stub_spec(server: &TestServer, module_id: &str) -> ModuleSpec {
+    let mut spec = stub_spec(server, module_id);
+    spec.reserved = true;
+    spec
+}
+
 fn stub_spec_with_env<K, V, I>(_server: &TestServer, module_id: &str, extra_env: I) -> ModuleSpec
 where
     K: Into<String>,
@@ -4124,6 +4170,7 @@ where
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),
         env,
+        reserved: false,
     }
 }
 

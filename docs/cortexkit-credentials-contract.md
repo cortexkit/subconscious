@@ -1,10 +1,35 @@
 # CortexKit Credential Contract (v2 — hardened)
 
-Status: **v2** — folds in the Oracle's 7 must-fixes (bg_4769d137) AND the Athena
-council's 3 unanimous blockers + HIGH cluster (bg_c58c7f7f). The council reviewed
-v1 and returned an effective NO-GO; this revision closes B1-B3 and the HIGH cluster
-as v1 scope (Ufuk chose the full-durable path, not staged). Needs a re-review
-(Oracle or council) before any build is dispatched.
+Status: **v2 — BUILD-CLEARED with 3 tightenings (Oracle bg_268accbe: GO-WITH-CHANGES).**
+Folds in the Oracle's original 7 must-fixes (bg_4769d137), the Athena council's 3
+unanimous blockers + HIGH cluster (bg_c58c7f7f), and the Oracle confirmation pass's
+3 pre-build tightenings (bg_268accbe — T1/T2/T3 below). The confirmation Oracle
+verified B1-B3 + HIGH are closed in the right direction and thin-core survives; the
+3 tightenings are folded into §4/§8/§11. Cleared to build once they are reflected
+(they are, below).
+
+### Oracle confirmation tightenings (bg_268accbe — folded in)
+- **T1 — B2 reconciliation must not clear a pending intent just because the OLD
+  access token still works, and must NOT call a rotating refresh endpoint during
+  recovery unless the adapter declares idempotent recovery.** Rule: a pending intent
+  ⇒ `needs_reauth` UNLESS a **non-mutating** provider check proves the stored refresh
+  state is still valid. (§8 reconciliation rewritten.)
+- **T2 — B1 admin gate: an UNLOCKED vault must not itself authorize admin writes.**
+  Require an explicit caller-held master-key PROOF (challenge/HMAC from the admin CLI)
+  OR offline CLI while the daemon is stopped; headless key material must be
+  service-private / root-owned / LoadCredential-style, not merely "outside the data
+  tree but readable by the same UID." (§4 + §9.)
+- **T3 — module_id reservation must bind to SUPERVISOR LAUNCH, not just the name.**
+  A reserved-name check is still raceable on restart; make it a generic
+  supervised-module registration reservation via a one-time launch nonce / inherited
+  private channel / OS peer-process binding. `cortexkit-credentials` is just one
+  configured reserved module (preserves thin-core — it's a generic mechanism). (§11.)
+
+Plus two implementation-fold notes (not contract blockers): epoch-CAS ships as an
+**additive checked-write API** so existing `cortexkit-store` consumers (alfonso-core,
+llm-runner) are NOT broken — the vault uses only the checked path; and
+refresh-triggering reads (`force_refresh`/`min_ttl_ms`) are rate-limited like
+`report_auth_failure`.
 
 Owner: Alfonso @ subc. Decided forks (Ufuk):
 A = a separate credential **module** (subc-core stays out of credentials);
@@ -115,11 +140,20 @@ credential.invalidate { credential_id }                  (authoritative revoke)
 credential.rotate_master_key                             (rewrap — §9)
 ```
 - Admin ops are **not** served on the anonymous runtime route channel. They require
-  **master-key possession** (the operator/CLI proves it holds the vault master key —
-  a factor a plain route consumer, which has only the transport key, does not have).
-  Imports run as an operator action (`cortexkit-credentials import opencode`),
-  coordinating the single-writer lease (daemon-stopped, or a master-key-authenticated
-  admin handoff).
+  an explicit **caller-held master-key PROOF** — NOT merely "the vault happens to be
+  unlocked" (T2: an unlocked running vault must not authorize a write just because a
+  caller can reach it). Two acceptable mechanisms:
+  1. **Offline CLI while the daemon is stopped** — `cortexkit-credentials import …`
+     reads the master key (keychain/operator path), takes the single-writer lease,
+     writes, exits. No running-vault admin surface at all.
+  2. **Master-key challenge/HMAC** — if an admin op must run against the live vault,
+     the CLI proves master-key possession via a challenge/response (vault sends a
+     nonce, CLI returns HMAC(master_key, nonce)); the vault authorizes the write only
+     on a valid proof. A plain route consumer (transport key only, no master key)
+     cannot produce this.
+  Headless master-key material must be **service-private / root-owned /
+  LoadCredential-style**, not merely "outside the data tree but readable by the same
+  UID" (§9).
 - `put`/`import` are **CREATE-ONLY** by default: writing an id that already exists
   is rejected unless the caller passes `expected_payload_hash` matching the current
   record (**CAS / optimistic lock**). This stops blind overwrite.
@@ -217,12 +251,20 @@ before our commit. So we make the **indeterminate state detectable + safe**, not
    **ONE transaction** with `PRAGMA synchronous=FULL`, **epoch-fenced** (§9 lease).
 4. **Only post-commit** is the new payload visible to a `get`.
 
-### Startup reconciliation
+### Startup reconciliation (T1 — safety-tightened)
 On boot, scan `refresh_intent`. A pending intent (intent present, no committed new
-token) = **INDETERMINATE** (the provider may or may not have rotated). The vault
-**probes** (attempt the stored token / a refresh); on success it clears the intent,
-on `invalid_grant` it marks `needs_reauth`. It **never silently serves a token of
-unknown validity**.
+token) = **INDETERMINATE** (the provider may or may not have rotated). Reconciliation
+is **fail-safe to `needs_reauth`**, with one narrow exception:
+- The default resolution of a pending intent is **`needs_reauth`** (force re-login).
+- The ONLY way to clear it instead is a **non-mutating** provider check that proves
+  the stored refresh state is still valid (e.g. a read-only introspection/userinfo
+  endpoint that does NOT rotate tokens). The old access token still working is **NOT
+  sufficient** (it can outlive a rotated refresh token), and reconciliation must
+  **never call a rotating refresh endpoint** as the probe — that would itself rotate
+  and re-enter the bricking window. If the adapter has no non-mutating validity check,
+  the intent resolves to `needs_reauth`, full stop.
+- It **never silently serves a token of unknown validity** and **never re-runs a
+  rotation** during recovery.
 
 ### Concurrency
 - **Single-flight per credential_id** (in-process async lock): N concurrent `get`s
@@ -314,11 +356,23 @@ The council found, and I confirmed against subc-core, that the vault's *own* ide
 is spoofable: `handle_hello` rejects a duplicate `module_id` **only while the real
 module holds the slot** (`duplicate_module_id_is_rejected_without_replacing_active_registration`).
 So when the real vault is **down/restarting**, any key-holder can register AS
-`cortexkit-credentials` and serve fake credentials / receive imports. → v1 requires
-subc-core to **reserve** the `cortexkit-credentials` module_id: only the
-supervisor-launched process for that configured module may register it. This is a
-small, bounded subc-core change (thin-core stays intact — it's an identity
-reservation, not credential logic).
+`cortexkit-credentials` and serve fake credentials / receive imports.
+
+→ v1 requires subc-core to **bind the registration to the supervisor-launched
+process, not just the name** (T3 — a bare reserved-name check is still raceable on
+restart: a squatter could grab the name in the gap between the old process dying and
+the supervisor respawning). The reservation must be a **generic supervised-module
+registration binding** — the supervisor injects a **one-time launch nonce** (env, as
+it already injects `SUBC_MODULE_ID`) that the spawned process echoes in its HELLO,
+and subc accepts a reserved module_id's HELLO ONLY when the nonce matches the
+last-spawned token for that module_id (alternatives: an inherited private channel,
+or OS peer-process binding). A self-connecting process without the current nonce is
+rejected. This is a **generic mechanism keyed on "is this configured module's
+reserved id"** — `cortexkit-credentials` is just the first module to set
+`reserved: true` in `subc.jsonc`. Thin-core stays intact: it's a launch-identity
+binding (the supervisor already owns spawn), not credential logic. Applies only to
+modules a configured module marks reserved, so non-reserved self-connecting providers
+(e.g. ALF's host bridge) are unaffected.
 
 ### Audit (write-first, tamper-evident)
 - Audit **WRITES** (`import`/`put`/`invalidate`/`rotate`) with `payload_hash` +
@@ -361,10 +415,13 @@ gate, not a nice-to-have):
 
 ## 14. Build sequence (re-review gated)
 
-0. This v2 + a **re-review** (Oracle or council) confirming B1-B3 + HIGH are closed.
+0. ~~Re-review~~ DONE — Oracle bg_268accbe confirmed GO-WITH-CHANGES; T1/T2/T3 folded
+   in. Cleared to build.
 1. **Lib changes first** (the cross-cutting ones): `cortexkit-lease`/`cortexkit-store`
-   epoch-CAS on the **local** write path (§8); subc-core **module_id reservation**
-   (§11).
+   epoch-CAS on the **local** write path as an **additive checked-write API** (the
+   vault uses only the checked path; existing `with_conn` consumers — alfonso-core,
+   llm-runner — are untouched, T-fold note); subc-core **launch-nonce-bound module_id
+   reservation** (§11, T3 — generic `reserved: true` mechanism).
 2. `cortexkit-credentials` lib: encrypted store + typed VaultRecord + canonical
    OAuthCredential + bounded refresh adapters + durable refresh state machine +
    master-key resolution (keychain/operator-path, no co-location, CSPRNG, rewrap).
@@ -393,5 +450,12 @@ gate, not a nice-to-have):
 | #5 crash-loop | panic on corrupt → bricks all | never-panic, per-record quarantine, status, vault_locked |
 | #6 master key | 0600 beside DB | co-location forbidden, CSPRNG, keychain/operator-path |
 | #9 rotation | key_id stub | rotate_master_key op in v1 |
-| #13 vault spoofable | (missed) | reserve module_id in subc-core (verified) |
+| #13 vault spoofable | (missed) | launch-nonce-bound reserved module_id in subc-core (T3) |
 | #8 conformance | happy-path | §13 security-conformance ship gate |
+
+### Oracle confirmation tightenings (bg_268accbe)
+| T | Was | Now |
+|---|---|---|
+| T1 refresh reconciliation | "probe/refresh; on success clear intent" (could clear on a still-valid old access token; could call a rotating endpoint) | default `needs_reauth`; clear ONLY via a NON-mutating validity check; never call a rotating endpoint in recovery |
+| T2 admin gate | "master-key possession" (an unlocked vault could authorize) | explicit caller-held master-key PROOF (offline-CLI-while-stopped OR challenge/HMAC); headless key root-owned/LoadCredential, not same-UID-readable |
+| T3 module_id reservation | reserve the name | bind to supervisor launch via one-time launch nonce (a bare name check is race-able on restart); generic `reserved:true` mechanism |

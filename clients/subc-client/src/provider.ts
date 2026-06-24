@@ -166,7 +166,32 @@ export interface ManagementSurfaceManifestOptions {
   moduleVersion?: string;
 }
 
-export type ProviderHandler = (routeChannel: number, body: Uint8Array) => Promise<Uint8Array> | Uint8Array;
+/**
+ * Per-request context handed to a provider handler. A unary handler ignores it and
+ * just returns its response bytes; a streaming handler uses `emit` to push interim
+ * events and `signal` to learn when the consumer cancelled or the route went away.
+ */
+export interface ProviderRequestContext {
+  /**
+   * Emit an interim event as a StreamData frame on this request's (channel, corr).
+   * The consumer receives it via its subscription `onEvent`. A no-op once the
+   * request has been aborted (cancelled or route-gone).
+   */
+  emit(body: Uint8Array): Promise<void>;
+  /** Aborts when the consumer sends Cancel for this request, or the route is torn down. */
+  signal: AbortSignal;
+}
+
+/**
+ * A request handler. Return a `Uint8Array` for a single Response (unary), or
+ * `void` to end a streaming subscription with a StreamEnd terminal (after emitting
+ * events via `ctx.emit`). Throwing produces an Error terminal.
+ */
+export type ProviderHandler = (
+  routeChannel: number,
+  body: Uint8Array,
+  ctx: ProviderRequestContext,
+) => Promise<Uint8Array | void> | Uint8Array | void;
 
 export interface RouteBindRequest {
   route_channel: number;
@@ -271,6 +296,9 @@ export class SubcProvider {
   private readonly closed: Promise<void>;
   private closeStarted = false;
   private closedErr: Error | null = null;
+  // In-flight data requests, keyed "channel:corr", each with the controller that
+  // aborts its handler on an inbound Cancel or a route GOODBYE.
+  private readonly inflight = new Map<string, AbortController>();
 
   /**
    * The resolved storage descriptor the daemon delivered in HELLO_ACK, or
@@ -384,7 +412,15 @@ export class SubcProvider {
         return true;
       case FrameType.Goodbye:
         if (frame.header.channel === 0) return false;
+        // The route is gone: abort every in-flight request on that channel so any
+        // streaming handler unwinds, then notify.
+        this.abortChannel(frame.header.channel);
         await this.onRouteGone?.(frame.header.channel);
+        return true;
+      case FrameType.Cancel:
+        // The consumer cancelled one request: abort the matching handler. Its
+        // streaming handler observes ctx.signal and ends with a StreamEnd terminal.
+        this.inflight.get(routeKey(frame.header.channel, frame.header.corr))?.abort();
         return true;
       case FrameType.Request:
         if (frame.header.channel === 0) {
@@ -397,6 +433,14 @@ export class SubcProvider {
         return true;
       default:
         return true;
+    }
+  }
+
+  /** Abort every in-flight request on a route channel (route teardown). */
+  private abortChannel(channel: number): void {
+    const prefix = `${channel}:`;
+    for (const [key, controller] of this.inflight) {
+      if (key.startsWith(prefix)) controller.abort();
     }
   }
 
@@ -432,28 +476,48 @@ export class SubcProvider {
   }
 
   private async handleDataRequest(frame: Frame): Promise<void> {
+    const { channel, corr, ver } = frame.header;
+    const key = routeKey(channel, corr);
+    const controller = new AbortController();
+    this.inflight.set(key, controller);
+    const dataFlags = buildFlags(false, Priority.Interactive, false);
+    const ctx: ProviderRequestContext = {
+      signal: controller.signal,
+      emit: async (eventBody) => {
+        // Once aborted (cancel / route-gone), drop further events silently.
+        if (controller.signal.aborted) return;
+        await this.send(
+          buildFrameWithVersion(ver, FrameType.StreamData, dataFlags, channel, corr, eventBody),
+        );
+      },
+    };
     try {
-      const body = await this.handler(frame.header.channel, frame.body);
-      if (!(body instanceof Uint8Array)) {
-        throw new SubcProviderError("provider handler must return a Uint8Array", "invalid_handler_response");
+      const body = await this.handler(channel, frame.body, ctx);
+      if (body === undefined) {
+        // A streaming handler that ended: close the held-open request with a
+        // StreamEnd terminal (the consumer's subscription resolves).
+        await this.send(
+          buildFrameWithVersion(ver, FrameType.StreamEnd, dataFlags, channel, corr, new Uint8Array(0)),
+        );
+      } else if (body instanceof Uint8Array) {
+        await this.send(
+          buildFrameWithVersion(ver, FrameType.Response, dataFlags, channel, corr, body),
+        );
+      } else {
+        throw new SubcProviderError(
+          "provider handler must return a Uint8Array or void",
+          "invalid_handler_response",
+        );
       }
-      await this.send(
-        buildFrameWithVersion(
-          frame.header.ver,
-          FrameType.Response,
-          buildFlags(false, Priority.Interactive, false),
-          frame.header.channel,
-          frame.header.corr,
-          body,
-        ),
-      );
     } catch (err) {
       await this.sendError(
         frame,
         err instanceof SubcProviderError && err.code ? err.code : "handler_error",
         err instanceof Error ? err.message : String(err),
-        buildFlags(false, Priority.Interactive, false),
+        dataFlags,
       );
+    } finally {
+      this.inflight.delete(key);
     }
   }
 
@@ -474,6 +538,10 @@ export class SubcProvider {
     if (this.closedErr) throw this.closedErr;
     await sendFrame(this.sock, frame);
   }
+}
+
+function routeKey(channel: number, corr: bigint): string {
+  return `${channel}:${corr}`;
 }
 
 function controlFlags(): number {

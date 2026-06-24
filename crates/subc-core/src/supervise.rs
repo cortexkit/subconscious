@@ -16,7 +16,7 @@ use tokio::{
 };
 use tracing::{debug, error, warn};
 
-use subc_protocol::{Flags, FrameType, Priority, SUBC_MODULE_ID_ENV};
+use subc_protocol::{Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
 
 use crate::{
     forwarding::{CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleDrainTarget},
@@ -58,6 +58,11 @@ pub struct ModuleSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// When true this is a reserved module: each spawn gets a fresh one-time launch
+    /// nonce that the child must echo in its HELLO, so only the daemon-spawned
+    /// process can register this module_id (a security-boundary module like the
+    /// credential vault must not be impersonable while it is down/restarting).
+    pub reserved: bool,
 }
 
 /// Bounded restart policy for crash exits.
@@ -243,17 +248,54 @@ struct SupervisorRuntimeConfig {
     drain_timeout: Duration,
     connection_file_path: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
+    /// The shared handle, so every spawn path (initial, restart, reload) records the
+    /// reserved-module launch nonce the HELLO verifier checks against.
+    supervisor_handle: Option<SupervisorHandle>,
 }
 
 /// Shared daemon lookup table for supervised module handles.
+///
+/// Shared by clone between the [`Supervisor`] (which spawns processes) and the
+/// channel-0 control handler (which verifies HELLOs), so the launch nonce the
+/// supervisor records on spawn is the same one the HELLO verifier checks against.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
+    /// The current expected launch nonce for each reserved module_id. Set when the
+    /// supervisor spawns the reserved module; checked when a HELLO claims that id. A
+    /// non-reserved module never has an entry here and is never nonce-checked.
+    reserved_nonces: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl SupervisorHandle {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the launch nonce expected from the next HELLO for a reserved module,
+    /// replacing any prior nonce (a respawn invalidates the previous one).
+    pub fn set_reserved_nonce(&self, module_id: &str, nonce: String) {
+        self.reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(module_id.to_string(), nonce);
+    }
+
+    /// Whether a HELLO claiming `module_id` is authorized. A module with no reserved
+    /// nonce entry is not reserved and is always authorized (`true`). A reserved
+    /// module is authorized only when `presented` matches the expected nonce,
+    /// compared in constant time so a mismatch leaks no timing signal.
+    pub fn reserved_hello_authorized(&self, module_id: &str, presented: Option<&str>) -> bool {
+        let nonces = self
+            .reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match nonces.get(module_id) {
+            None => true,
+            Some(expected) => {
+                presented.is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes()))
+            }
+        }
     }
 
     pub fn insert(&self, module: SupervisedModule) -> Option<SupervisedModule> {
@@ -346,7 +388,11 @@ impl Supervisor {
 
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let child = spawn_child(&spec, runtime.connection_file_path.as_deref())?;
+        let child = spawn_child(
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+        )?;
         set_running(&snapshot, child.id())?;
         self.process_liveness
             .track(spec.module_id.clone(), Arc::clone(&snapshot));
@@ -373,7 +419,11 @@ impl Supervisor {
         }
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        match spawn_child(&spec, runtime.connection_file_path.as_deref()) {
+        match spawn_child(
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+        ) {
             Ok(child) => {
                 set_running(&snapshot, child.id())?;
                 self.process_liveness
@@ -399,6 +449,7 @@ impl Supervisor {
             drain_timeout: self.drain_timeout,
             connection_file_path: self.connection_file_path.clone(),
             forwarding: self.forwarding.clone(),
+            supervisor_handle: self.supervisor_handle.clone(),
         }
     }
 
@@ -617,6 +668,11 @@ pub enum SuperviseError {
         program: PathBuf,
         source: io::Error,
     },
+    /// CSPRNG failure generating a reserved module's launch nonce. Fail loud rather
+    /// than spawn a reserved module without its identity binding.
+    LaunchNonce {
+        reason: String,
+    },
     Wait {
         module_id: String,
         source: io::Error,
@@ -663,6 +719,12 @@ impl fmt::Display for SuperviseError {
                     f,
                     "failed to spawn module '{}': {source}",
                     program.display()
+                )
+            }
+            Self::LaunchNonce { reason } => {
+                write!(
+                    f,
+                    "failed to generate reserved-module launch nonce: {reason}"
                 )
             }
             Self::Wait { module_id, source } => {
@@ -713,7 +775,8 @@ impl Error for SuperviseError {
             }
             Self::Forwarding(err) => Some(err),
             Self::Registry(err) => Some(err),
-            Self::InvalidSpec { .. }
+            Self::LaunchNonce { .. }
+            | Self::InvalidSpec { .. }
             | Self::ReloadUnavailable { .. }
             | Self::Disabled { .. }
             | Self::ReloadFailed { .. }
@@ -1218,6 +1281,7 @@ fn untrack_if_registration_released(
 fn spawn_child(
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
+    handle: Option<&SupervisorHandle>,
 ) -> Result<Child, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
@@ -1228,6 +1292,19 @@ fn spawn_child(
         command.env(key, value);
     }
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
+
+    // For a reserved module, mint a fresh one-time launch nonce, record it as the
+    // expected nonce for this id (replacing any prior, so a stale child cannot
+    // re-register), and inject it. Only the process this spawn launches knows it, so
+    // only that process can register the reserved module_id. A respawn rotates it.
+    if spec.reserved {
+        let nonce = generate_launch_nonce()?;
+        if let Some(handle) = handle {
+            handle.set_reserved_nonce(&spec.module_id, nonce.clone());
+        }
+        command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
+    }
+
     command.kill_on_drop(true);
     command.spawn().map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),
@@ -1235,12 +1312,44 @@ fn spawn_child(
     })
 }
 
+/// A fresh 256-bit CSPRNG launch nonce, lowercase hex. Used to bind a reserved
+/// module's registration to the exact process the supervisor spawned.
+fn generate_launch_nonce() -> Result<String, SuperviseError> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|source| SuperviseError::LaunchNonce {
+        reason: source.to_string(),
+    })?;
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+/// Constant-time byte comparison so a reserved-nonce mismatch leaks no timing
+/// signal about how many leading bytes matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn spawn_and_mark_running(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
 ) -> Result<Child, SuperviseError> {
-    let child = spawn_child(spec, runtime.connection_file_path.as_deref())?;
+    let child = spawn_child(
+        spec,
+        runtime.connection_file_path.as_deref(),
+        runtime.supervisor_handle.as_ref(),
+    )?;
     set_running(snapshot, child.id())?;
     Ok(child)
 }

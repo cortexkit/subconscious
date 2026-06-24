@@ -215,6 +215,12 @@ export interface SubcProviderConnectOptions {
   controlOps?: string[] | null;
   onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision;
   onRouteGone?: (routeChannel: number) => void | Promise<void>;
+  /**
+   * The one-time launch nonce to echo in HELLO for a reserved module. Defaults to
+   * the `SUBC_LAUNCH_NONCE` environment variable subc injects on spawn; pass
+   * explicitly to override. Omitted from the wire when empty (non-reserved modules).
+   */
+  launchNonce?: string;
 }
 
 export interface ModuleHelloAckBody {
@@ -345,6 +351,10 @@ export class SubcProvider {
             manifest: normalizeManifest(opts.manifest),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: opts.controlOps === undefined ? null : opts.controlOps,
+            // Echo the one-time launch nonce subc injects for a reserved module
+            // (SUBC_LAUNCH_NONCE), so only the daemon-spawned process can register a
+            // reserved module_id. Omitted when unset (non-reserved / self-connecting).
+            ...(launchNonce(opts) ? { launch_nonce: launchNonce(opts) } : {}),
           }),
         ),
       );
@@ -543,6 +553,13 @@ export class SubcProvider {
 function routeKey(channel: number, corr: bigint): string {
   return `${channel}:${corr}`;
 }
+
+function launchNonce(opts: SubcProviderConnectOptions): string | undefined {
+  const nonce = opts.launchNonce ?? process.env[SUBC_LAUNCH_NONCE_ENV];
+  return nonce && nonce.length > 0 ? nonce : undefined;
+}
+
+const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
 
 function controlFlags(): number {
   return buildFlags(false, Priority.Passive, false);

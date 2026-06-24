@@ -72,6 +72,12 @@ pub struct ConfiguredModule {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub enabled: bool,
+    /// When true, only the daemon-spawned process for this `module_id` may register
+    /// it: subc injects a one-time launch nonce on spawn and rejects any HELLO for
+    /// this id whose nonce does not match. Protects security-boundary modules (e.g.
+    /// the credential vault) from being impersonated by another key-holder while the
+    /// real process is down or restarting. Defaults to false.
+    pub reserved: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +131,8 @@ struct RawModuleConfig {
     env: BTreeMap<String, String>,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    reserved: bool,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -198,6 +206,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
             args: module.args,
             env: module.env.into_iter().collect(),
             enabled: module.enabled,
+            reserved: module.reserved,
         })
         .collect();
 

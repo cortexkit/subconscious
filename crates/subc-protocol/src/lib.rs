@@ -81,6 +81,12 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// supervised under, so it can register under that id.
 pub const SUBC_MODULE_ID_ENV: &str = "SUBC_MODULE_ID";
 
+/// Env var subc sets, on each spawn of a `reserved` module only, to a fresh
+/// one-time launch nonce. The child echoes it in `ModuleHelloBody::launch_nonce`;
+/// subc accepts a reserved module_id's HELLO only when the nonce matches the one it
+/// last injected for that id. Non-reserved modules never receive it.
+pub const SUBC_LAUNCH_NONCE_ENV: &str = "SUBC_LAUNCH_NONCE";
+
 /// Fixed header length for `PROTOCOL_VERSION` 1.
 pub const HEADER_LEN: usize = 17;
 
@@ -110,6 +116,15 @@ pub struct ModuleHelloBody {
     pub protocol_ver: u8,
     #[serde(default)]
     pub control_ops: Option<Vec<String>>,
+    /// One-time launch nonce, echoed back from the `SUBC_LAUNCH_NONCE` environment
+    /// variable the daemon injected when it spawned this process. Only a daemon-spawned
+    /// process for a `reserved` module receives a nonce; subc accepts a reserved
+    /// `module_id`'s HELLO only when this matches the nonce it last injected for that
+    /// id, so a different process cannot register as a reserved module while the real
+    /// one is down/restarting. Absent (`serde(default)`) for non-reserved modules and
+    /// self-connecting providers, which are never nonce-checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce: Option<String>,
 }
 
 /// subc-to-module `HELLO_ACK` body used during module registration.

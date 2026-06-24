@@ -252,6 +252,7 @@ async fn serve_bound_daemon(
             program: configured.program,
             args: configured.args,
             env: configured.env,
+            reserved: configured.reserved,
         };
         match supervisor.supervise_configured(spec, enabled) {
             Ok(_) => {

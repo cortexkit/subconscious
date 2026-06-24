@@ -201,6 +201,7 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
         ),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
+        launch_nonce: config.launch_nonce.clone(),
     })
     .map_err(StubError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, HELLO_CORR, body)
@@ -1086,6 +1087,9 @@ struct StubConfig {
     toolcall_error: bool,
     toolcall_subc_error: bool,
     tools: Vec<String>,
+    /// The launch nonce subc injected (reserved modules only); echoed in HELLO. A
+    /// real supervised module reads this from the SUBC_LAUNCH_NONCE env var.
+    launch_nonce: Option<String>,
 }
 
 struct StubState {
@@ -1175,6 +1179,9 @@ impl StubConfig {
             toolcall_error: env_flag(FAKE_AFT_TOOLCALL_ERROR_ENV),
             toolcall_subc_error: env_flag(FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV),
             tools,
+            launch_nonce: env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+                .ok()
+                .filter(|value| !value.is_empty()),
         })
     }
 }

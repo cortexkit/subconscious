@@ -1774,6 +1774,7 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
         program,
         args,
         env,
+        reserved: false,
     }
 }
 
@@ -1794,6 +1795,7 @@ fn mcp_module_spec(
             "XDG_CONFIG_HOME".to_string(),
             xdg_config_home.display().to_string(),
         )],
+        reserved: false,
     }
 }
 
@@ -2267,6 +2269,7 @@ async fn run_raw_provider(
         manifest: raw_provider_manifest(module_id, tool_name),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
+        launch_nonce: None,
     };
     let body = serde_json::to_vec(&hello).unwrap();
     let frame = Frame::build(

@@ -556,6 +556,11 @@ async fn send_supervision_hello_if_configured(stream: &mut TcpStream) -> Result<
         manifest: supervision_manifest(module_id.clone()),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
+        // Echo the one-time launch nonce subc injects for a reserved module; absent
+        // (None) when this module is not reserved.
+        launch_nonce: env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty()),
     })
     .map_err(|source| {
         other_error(format!(

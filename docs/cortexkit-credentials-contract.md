@@ -1,6 +1,9 @@
 # CortexKit Credential Contract (design)
 
-Status: Oracle-reviewed (GO-WITH-CHANGES, bg_4769d137), must-fixes folded in.
+Status: **Oracle GO-WITH-CHANGES (folded in), then Athena council NO-GO** — a
+5-model adversarial pass (bg_c58c7f7f) found 3 unanimous BLOCKERS the single Oracle
+missed. This contract is NOT build-ready; it needs a revision pass closing the
+blockers (and a scope decision — see "Council verdict" below) before any build.
 Owner: Alfonso @ subc. Decided forks (Ufuk):
 A = a separate credential **module** (subc-core stays out of credentials);
 C = **simple now, scope later** (no per-module credential authorization enforced
@@ -21,6 +24,68 @@ for secrets but **pull-on-demand** rather than pushed at registration.
 > entitled to"; it delivers "the credential a trusted local caller asked for."
 
 ---
+
+## 0. Council verdict (bg_c58c7f7f) — 3 unanimous BLOCKERS the Oracle missed
+
+A 5-model Athena council (GPT-5.4-high, GPT-5.5-xhigh, XAI-Composer-2.5, GLM-5.2,
+Gemini-Flash-3.5) reviewed the post-Oracle contract and returned an effective
+**NO-GO**: the architecture is sound (not relitigated), but it ships a security
+boundary with 3 ship-blocking gaps + a HIGH cluster. Full synthesis:
+`.alfonso/athena/council-credential-vault-review-3aff8c21bd40883d/`.
+
+**SHIP-BLOCKERS (unanimous 5/5):**
+- **B1 — WRITE is unscoped (credential poisoning).** The Oracle's "import via the
+  module's own mutate op" (must-fix #5) runs over the SAME anonymous consumer
+  channel — so any local key-holder can `credential.put`/`import` and OVERWRITE
+  `opencode:anthropic` with attacker bytes. Because the payload is opaque,
+  llm-runner then uses the attacker's token as its auth header: credential
+  substitution → exfil-proxy / DoS / bricking. The Oracle framed v1 as read-only
+  and missed that its own import fix opened an anonymous WRITE surface. Strictly
+  worse than scattered files (attacker needn't know paths/formats).
+  → Fix: `put`/`import` **create-only**; overwrite requires **CAS on prior
+  `payload_hash`** (or an operator-only daemon-stopped path); write-audit ALARM on
+  any overwrite; split admin surface from read surface.
+- **B2 — OAuth refresh rotation is NOT crash-safe.** RFC 9700 rotation kills the OLD
+  refresh token the instant the provider issues the new one — BEFORE the local
+  commit+fsync. A crash/lease-loss in that window = permanent bricking (re-login).
+  "Persist-before-return" NARROWS but cannot ELIMINATE this (no 2PC with the
+  provider); the contract names the failure then wrongly claims the barrier
+  prevents it. Compounded: the local lease has **no epoch-CAS on the write path**
+  (storage-contract.md:119-122 — epoch-CAS is cloud-only), so "under the lease" is
+  exclusion-only, not write-correctness; single-flight is in-process only.
+  → Fix: durable refresh-intent log (fsync old-token-hash BEFORE the upstream call)
+  + startup reconciliation; one-transaction commit `PRAGMA synchronous=FULL`;
+  epoch-CAS on the vault's local write path; `kill -9`-mid-refresh conformance
+  test; document residual re-login risk honestly (do not claim elimination).
+- **B3 — Centralization + auto-refresh materially raises blast radius.** "Could read
+  auth.json anyway" is unsound (source-verified: llm-runner reads ONE static entry,
+  no refresh; a today-reads-nothing module reads nothing). The vault hands any
+  anonymous key-holder EVERY provider's LIVE rotated token via one endpoint +
+  `get_many` — a qualitative escalation a static file read can't produce.
+  → Fix (cheap, no full identity needed): cap/disable `get_many`; per-connection
+  fetch ceiling + per-id rate-anomaly alarm (the vault has `connection_id`);
+  evaluate v1 capability-handles or GLM's ephemeral per-module token; correct the
+  banner to say "live rotated tokens," not "file-equivalent."
+
+**HIGH cluster (fold in before ship or immediate fast-follow):** revocation
+propagation (`credential.invalidate` + consumer 401-feedback); per-credential fault
+isolation + `credential.status` + `vault_locked` (never panic on decrypt →
+crash-loop bricks all consumers); forbid headless master-key co-location + CSPRNG
+bootstrap; ship a `rotate_master_key`/rewrap op in v1; **reserve
+`cortexkit-credentials` module_id in subc-core** (B-spoof, finding #13 — VERIFIED
+against source: subc rejects a duplicate HELLO only WHILE the real module holds the
+slot, so a key-holder can register as the vault when it's down/restarting);
+security-conformance suite as a ship gate.
+
+**MEDIUM:** `record_version` + consumer cache-invalidation; explicit v1
+non-portable scope; bound refresh adapters to the 4 llm-runner providers + canonical
+`OAuthCredential` schema (own the thin-core exception explicitly); atomic-record
+write + read-visibility spec; fix the lingering "dumb id→bytes map" wording (§4)
+that contradicts the typed `VaultRecord`; write-audit + hash-chained tamper-evidence.
+
+> The sections below are the POST-ORACLE draft (the design the council reviewed).
+> They are retained as-is; the blockers above supersede them and a revision pass
+> must fold B1-B3 + the HIGH cluster in before this is build-ready.
 
 ## 1. Problem
 

@@ -16,18 +16,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 3-OS matrix is deliberate: subc's transport (loopback TCP + key auth) and
-  # the cortexkit-paths-backed canonicalization must behave identically on
-  # Windows, macOS, and Linux. Running the matrix on every push validates the
-  # cross-platform transport + the cfg(windows) paths continuously, instead of
-  # relying on a manual native check before each release.
+  # Linux + Windows matrix. subc's transport (loopback TCP + key auth) and the
+  # cortexkit-paths-backed canonicalization must behave identically across
+  # platforms; Windows is the load-bearing leg because the cfg(windows) paths
+  # and verbatim-path canonicalization cannot be exercised by local
+  # macOS/Linux development. macOS is intentionally NOT in CI: it is the
+  # development platform (continuously exercised by local cargo test + clippy)
+  # and macOS-vs-Linux divergence risk is low (both POSIX).
+  #
+  # Runners are Blacksmith, not GitHub-hosted: these repos are owned by a
+  # free-plan organization, where GitHub bills private-repo Actions minutes and
+  # blocks jobs once the (zero) spending limit is hit. Blacksmith third-party
+  # runners do not consume GitHub's included minutes, so CI runs without an org
+  # billing change. Revert `runner` to the GitHub-hosted `ubuntu-latest` /
+  # `windows-latest` labels if the repo becomes public (public-repo Actions
+  # minutes are free), at which point macOS can be re-added.
   test:
     name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - os: windows
+            runner: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v5
 

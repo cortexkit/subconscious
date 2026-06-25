@@ -22,15 +22,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Same 3-OS fmt/clippy/test matrix as PR-time CI. Reused (not copied) so a
-  # release can never ship code that wouldn't pass CI — including the
-  # cross-platform transport tests.
+  # Same fmt/clippy/test matrix as PR-time CI. Reused (not copied) so a release
+  # can never ship code that wouldn't pass CI — including the cross-platform
+  # transport tests.
   verify:
     uses: ./.github/workflows/ci.yml
 
   publish:
     name: Publish to crates.io
-    runs-on: ubuntu-latest
+    # Blacksmith runner (not GitHub-hosted): the owning org is on the free plan,
+    # where GitHub blocks private-repo Actions jobs at the zero spending limit.
+    # See ci.yml for the full rationale.
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: verify
     steps:
       - uses: actions/checkout@v5

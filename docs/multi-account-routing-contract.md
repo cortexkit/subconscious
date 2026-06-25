@@ -61,16 +61,51 @@ id (router maps model → provider → account-set); `account` = a user label
 
 ## 4. QTA (ai-provider-quota) — per-account quota data
 
+(QTA-reacted at source; the four items below are folded from its react.)
+
 - `usage.get` returns a window set per **`(provider, account)`** instead of one per
   provider. Each window: `{ window_name, remaining_percent, resets_at, fresh: bool }`
   (provider-generic window set — Anthropic has `five_hour`+`seven_day`, others differ;
   QTA reports each provider's real windows, never assumes a fixed pair).
-- QTA becomes a **vault consumer**: holds a handle per account, fetches each account's
-  token from the vault, queries that account's quota endpoint. (This couples per-account
-  quota to the vault being the live cred source — the v2 dependency.)
-- QTA owns per-account **quota-fetch backoff** (do NOT re-hit a 429'd quota endpoint;
-  serve cached + mark stale via `fresh:false`). It does NOT decide fail-closed — it
-  reports `fresh` and the router decides.
+
+- **TWO credential-source classes (QTA's correction — the contract must NOT assume every
+  provider is a vault consumer):**
+  - **vault-sourced** (genuine multi-account, handle-per-account): the OAuth set
+    (codex/claude/gemini/grok) + the API-key set (elevenlabs/llmproxy/warp/… ). These
+    have a token the vault holds N of → QTA is a vault consumer for them. **The actual
+    multi-account demand is the OAuth set** (Ufuk: "several Claude/OpenAI accounts" =
+    claude + codex); the API-key set is multi-account-CAPABLE, populate-later.
+  - **machine-local** (single implicit account, NOT a vault consumer, NO handle): the
+    browser-cookie cohort (cursor/factory/mimo/opencode/opencodego/amp/ollama),
+    antigravity (probes the one running editor), jetbrains (local IDE XML). These source
+    from local machine state, not a vault token — structurally ONE account (`account =
+    "local"`), EXEMPT from the vault-consumer path. The `fresh` flag still applies (dead
+    cookie / stopped editor → `fresh:false`).
+
+- **The read path must be NON-BLOCKING (QTA's Q4 correction — this was wrong in my draft).**
+  QTA's cache today is a LAZY pull-through (a miss synchronously fetches ALL providers
+  inline), so `route.select` on a cold/expired cache WOULD block on N HTTP fetches — Q4 is
+  NOT satisfied today. v2 build item (DESIGN, not free): flip to a **background-refresher**
+  (the reference `startBackgroundRefresh` 60s+jitter tick warms per-`(provider,account)`)
+  + a **cache-only read path** (miss/stale → last-known windows marked `fresh:false`,
+  NEVER an inline fetch). The router reads the cache; it never triggers a live fetch on
+  the hot path.
+
+- **Per-account quota-fetch backoff = TRANSIENT-AWARE (carry the reference, don't
+  reinvent):** exponential (`60s · 2^min(retryCount-1,6)`, cap 15m) for TRANSIENT
+  (429/≥500), fixed 5m for non-transient; honor the `429 Retry-After` header when present;
+  **stale-but-still-relevant** — a cached window whose `resets_at` hasn't passed is STILL
+  served (marked `fresh:false`), never blanked on a single 429. QTA does NOT decide
+  fail-closed — it reports `fresh`, the router decides.
+
+- **The `fresh` field is an ADDITIVE wire change → multi-module gate.** ProviderUsage /
+  RateWindow has no freshness field today, and its window shape has TWO consumers: the
+  EXISTING alfonso pace-model quota consumer (single-account aggregate, already cut over)
+  AND the new per-account router. So `fresh` must be serde-default / backward-compatible
+  (same class as the `resets_at`-optional change already shipped) so it doesn't break the
+  existing consumer. Coordinate the shared-shape change with ALF (its extractor reads the
+  window).
+
 - NO thresholds, NO ordering, NO combination. Pure per-account data.
 
 ## 5. Router (alfonso-routing) — selection + the policy model

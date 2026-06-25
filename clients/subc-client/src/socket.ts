@@ -9,6 +9,31 @@ import net from "node:net";
 export class SocketClosedError extends Error {}
 export class SocketTimeoutError extends Error {}
 
+export class SocketWriteNotQueuedError extends Error {
+  constructor(
+    message: string,
+    readonly cause?: Error,
+  ) {
+    super(message);
+  }
+}
+
+export class SocketWriteQueuedError extends Error {
+  constructor(
+    message: string,
+    readonly cause?: Error,
+  ) {
+    super(message);
+  }
+}
+
+export interface SocketWriteResult {
+  /** True once bytes were handed to Node's net.Socket.write. This is not a delivery guarantee. */
+  queued: boolean;
+  /** Resolves when Node reports the write complete; rejects with a classified write error. */
+  completed: Promise<void>;
+}
+
 interface Waiter {
   need: number;
   resolve: (bytes: Uint8Array) => void;
@@ -84,23 +109,91 @@ export class SubcSocket {
     });
   }
 
-  write(bytes: Uint8Array, deadlineMs: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.closedErr) {
-        reject(this.closedErr);
+  async write(bytes: Uint8Array, deadlineMs: number): Promise<void> {
+    try {
+      await this.writeTracked(bytes, deadlineMs).completed;
+    } catch (err) {
+      if (err instanceof SocketWriteNotQueuedError || err instanceof SocketWriteQueuedError) {
+        throw err.cause ?? err;
+      }
+      throw err;
+    }
+  }
+
+  writeTracked(bytes: Uint8Array, deadlineMs: number): SocketWriteResult {
+    if (this.closedErr) {
+      return {
+        queued: false,
+        completed: Promise.reject(
+          new SocketWriteNotQueuedError("subc socket was closed before bytes could be queued", this.closedErr),
+        ),
+      };
+    }
+
+    let queued = false;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const completed = new Promise<void>((resolve, reject) => {
+      const settle = (run: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        run();
+      };
+
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) {
+        settle(() =>
+          reject(
+            new SocketWriteNotQueuedError(
+              "timed out before bytes could be queued to subc",
+              new SocketTimeoutError("timed out writing to subc"),
+            ),
+          ),
+        );
         return;
       }
-      const remaining = deadlineMs - Date.now();
-      const timer =
-        remaining <= 0
-          ? null
-          : setTimeout(() => reject(new SocketTimeoutError("timed out writing to subc")), remaining);
-      this.sock.write(Buffer.from(bytes), (err) => {
-        if (timer) clearTimeout(timer);
-        if (err) reject(err);
-        else resolve();
-      });
+
+      timer = setTimeout(() => {
+        const timeout = new SocketTimeoutError("timed out writing to subc");
+        settle(() =>
+          reject(
+            queued
+              ? new SocketWriteQueuedError("timed out after bytes were handed to the subc socket", timeout)
+              : new SocketWriteNotQueuedError("timed out before bytes could be queued to subc", timeout),
+          ),
+        );
+      }, remaining);
+
+      try {
+        this.sock.write(Buffer.from(bytes), (err) => {
+          settle(() => {
+            if (err) {
+              reject(
+                new SocketWriteQueuedError(
+                  "subc socket reported a write error after bytes were handed to the socket",
+                  err instanceof Error ? err : new Error(String(err)),
+                ),
+              );
+            } else {
+              resolve();
+            }
+          });
+        });
+        queued = true;
+      } catch (err) {
+        settle(() =>
+          reject(
+            new SocketWriteNotQueuedError(
+              "subc socket write threw before bytes could be queued",
+              err instanceof Error ? err : new Error(String(err)),
+            ),
+          ),
+        );
+      }
     });
+
+    return { queued, completed };
   }
 
   close(): void {

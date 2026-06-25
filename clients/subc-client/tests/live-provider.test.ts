@@ -26,7 +26,8 @@ describe("SubcProvider live routing against real subc-core", () => {
       manifest: managementSurfaceManifest({ moduleId, operations: ["echo"] }),
       handler: async (_routeChannel, body) => body,
     });
-    const client = await SubcClient.connect({ connectionFile: live.connFile });
+    const identity = { project_root: live.configDir, harness: "opencode", session: "session-echo" };
+    const client = await SubcClient.connect({ connectionFile: live.connFile, identity });
 
     try {
       const entry = (await client.catalogList()).find((module) => module.module_id === moduleId);
@@ -37,10 +38,15 @@ describe("SubcProvider live routing against real subc-core", () => {
 
       const routeChannel = await client.routeOpen(
         { kind: "management_surface", module_id: moduleId },
-        { project_root: live.configDir, harness: "opencode", session: "session-echo" },
+        identity,
       );
       const request = { method: "echo", params: { text: "hello", n: 7 } };
       await expect(client.request(routeChannel, request, { timeoutMs: 10_000 })).resolves.toEqual(request);
+
+      const managedRequest = { method: "echo", params: { text: "managed", n: 8 } };
+      await expect(client.call(moduleId, "echo", managedRequest.params, { timeoutMs: 10_000 })).resolves.toEqual(
+        managedRequest,
+      );
     } finally {
       client.close();
       await provider.close();

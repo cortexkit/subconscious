@@ -109,6 +109,17 @@ inert field does not justify its own AFT-coordinated release cycle.
 - [ ] Daemon-and-modules-together deploy (the missing-field skew makes new-module
       + old-daemon a hard reject).
 
+## Release-train note (2026-06, shipping now)
+
+This removal ships in `subc-protocol 0.5.0` together with the other three pending
+wire changes (`HELLO_ACK.storage`, the `route.open` config-field removal,
+`launch_nonce`), paired with `subc-transport 0.2.2` (re-pin to `^0.5`). NOT in this
+train: `subc-client-rs` cannot publish yet — its consumer depends on `subc-control`
+(`publish = false`), and no crates.io consumer pulls it (AFT has its own serve
+impl; the other module repos path-dep subconscious). Publishing `subc-client-rs`
+would first require publishing `subc-control`, deferred to a follow-on. The commons
+storage crates are a separate train.
+
 ## Not doing now
 
 The field is inert (unused, ignored on the wire), so this is a clarity/thin-core

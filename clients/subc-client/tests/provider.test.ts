@@ -2,7 +2,7 @@ import { createServer, type AddressInfo, type Server, type Socket } from "node:n
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 
 import {
   CLIENT_AUTH_DOMAIN,
@@ -24,12 +24,22 @@ import {
   SubcProvider,
   type Frame,
   type ManifestInput,
+  type ProviderConnectionState,
 } from "../src/index.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0x4b));
 const DAEMON_ID = Uint8Array.from(Array(16).fill(0x6d));
 const SERVER_NONCE = Uint8Array.from(Array.from({ length: 32 }, (_, i) => i + 1));
 const CONTROL_FLAGS = buildFlags(false, Priority.Passive, false);
+const RECONNECT_BACKOFF = { baseMs: 5, capMs: 5, maxAttempts: 1 };
+
+const tempDirs: string[] = [];
+const scriptedDaemons: ScriptedProviderDaemon[] = [];
+
+afterEach(async () => {
+  for (const daemon of scriptedDaemons.splice(0)) await daemon.stop();
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 describe("managementSurfaceManifest", () => {
   test("builds the minimal ManagementSurface manifest shape", () => {
@@ -102,6 +112,171 @@ describe("SubcProvider serve loop", () => {
     }
   });
 });
+
+describe("SubcProvider managed reconnect", () => {
+  test("drops stale handler responses after a reconnect generation replaces the socket", async () => {
+    const oldWrites: Frame[] = [];
+    const newWrites: Frame[] = [];
+    const oldSock = fakeWritableSocket(oldWrites);
+    const newSock = fakeWritableSocket(newWrites);
+    let releaseHandler!: (body: Uint8Array) => void;
+
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      opts: { handler: (routeChannel: number, body: Uint8Array) => Promise<Uint8Array> };
+      handleDataRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = oldSock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.opts = {
+      handler: async () =>
+        await new Promise<Uint8Array>((resolve) => {
+          releaseHandler = resolve;
+        }),
+    };
+
+    const request = buildFrameWithVersion(
+      PROTOCOL_VERSION,
+      FrameType.Request,
+      buildFlags(false, Priority.Interactive, false),
+      7,
+      99n,
+      encodeJson({ method: "slow" }),
+    );
+    const handling = provider.handleDataRequest(request, oldSock, 1);
+
+    provider.sock = newSock;
+    provider.generation = 2;
+    releaseHandler(encodeJson({ ok: true }));
+    await handling;
+
+    expect(oldWrites).toEqual([]);
+    expect(newWrites).toEqual([]);
+  });
+
+  test("coalesces restored events while currentEpoch advances for each completed re-registration", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const dir = trackedTempDir("subc-provider-debounce-");
+    const connFile = writeConnectionFile(dir, daemon.port);
+    const sleep = createManualSleep();
+    const events: ProviderConnectionState[] = [];
+
+    const provider = await SubcProvider.connect({
+      connectionFile: connFile,
+      manifest: managementSurfaceManifest({ moduleId: "debounce-provider", operations: ["echo"] }),
+      handler: async (_routeChannel, body) => body,
+      reconnectBackoff: RECONNECT_BACKOFF,
+      restoredDebounceMs: 50,
+      sleep: sleep.sleep,
+      onConnectionState: (event) => {
+        events.push(event);
+      },
+    });
+
+    try {
+      expect(provider.currentEpoch()).toBe(1);
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(2);
+      await waitForCondition(() => provider.currentEpoch() === 2, "provider epoch 2");
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(3);
+      await waitForCondition(() => provider.currentEpoch() === 3, "provider epoch 3");
+
+      expect(sleep.calls).toEqual([50, 50]);
+      sleep.resolveAll();
+      await waitForCondition(
+        () => events.some((event) => event.state === "restored" && event.epoch === 3),
+        "coalesced restored event",
+      );
+
+      const restored = events.filter((event): event is Extract<ProviderConnectionState, { state: "restored" }> => event.state === "restored");
+      expect(restored).toEqual([{ state: "restored", epoch: 3 }]);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("retries duplicate_module_id on re-HELLO but treats it as fatal on initial connect", async () => {
+    const initialDuplicate = await ScriptedProviderDaemon.start([
+      { code: "duplicate_module_id", message: "already registered" },
+    ]);
+    const initialDir = trackedTempDir("subc-provider-initial-dup-");
+    const initialConnFile = writeConnectionFile(initialDir, initialDuplicate.port);
+
+    await expect(
+      SubcProvider.connect({
+        connectionFile: initialConnFile,
+        manifest: managementSurfaceManifest({ moduleId: "initial-dup-provider", operations: ["echo"] }),
+        handler: async (_routeChannel, body) => body,
+      }),
+    ).rejects.toMatchObject({ code: "duplicate_module_id" });
+    await initialDuplicate.stop();
+
+    const daemon = await ScriptedProviderDaemon.start([
+      "ack",
+      { code: "duplicate_module_id", message: "stale registration" },
+      "ack",
+    ]);
+    const dir = trackedTempDir("subc-provider-rehello-dup-");
+    const connFile = writeConnectionFile(dir, daemon.port);
+    const sleeps: number[] = [];
+
+    const provider = await SubcProvider.connect({
+      connectionFile: connFile,
+      manifest: managementSurfaceManifest({ moduleId: "rehello-dup-provider", operations: ["echo"] }),
+      handler: async (_routeChannel, body) => body,
+      reconnectBackoff: RECONNECT_BACKOFF,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    try {
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(3);
+      await waitForCondition(() => provider.currentEpoch() === 2, "provider epoch after duplicate retry");
+      expect(sleeps).toEqual([5]);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("close after a drop stops reconnect attempts", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const dir = trackedTempDir("subc-provider-close-drop-");
+    const connFile = writeConnectionFile(dir, daemon.port);
+    const sleep = createManualSleep();
+    const events: ProviderConnectionState[] = [];
+
+    const provider = await SubcProvider.connect({
+      connectionFile: connFile,
+      manifest: managementSurfaceManifest({ moduleId: "close-drop-provider", operations: ["echo"] }),
+      handler: async (_routeChannel, body) => body,
+      reconnectBackoff: RECONNECT_BACKOFF,
+      restoredDebounceMs: 1,
+      sleep: sleep.sleep,
+      onConnectionState: (event) => {
+        events.push(event);
+      },
+    });
+
+    await daemon.stop();
+    await waitForCondition(() => events.some((event) => event.state === "down"), "provider down event");
+    await waitForCondition(() => sleep.calls.includes(5), "provider reconnect backoff sleep");
+    await provider.close();
+    sleep.resolveAll();
+    await waitForCondition(() => provider.currentEpoch() === 1, "provider remains at initial epoch");
+    expect(daemon.helloCount).toBe(1);
+  });
+});
+
 
 async function listenFakeServer(): Promise<{ server: Server; port: number }> {
   const server = createServer();
@@ -320,4 +495,168 @@ class SocketReader {
     this.buffered -= n;
     return out;
   }
+}
+
+
+type HelloResult = "ack" | { code: string; message: string };
+
+class ScriptedProviderDaemon {
+  readonly sockets = new Set<Socket>();
+  helloCount = 0;
+  private readonly waiters: Array<{ count: number; resolve: () => void }> = [];
+  private stopped = false;
+
+  private constructor(
+    readonly server: Server,
+    readonly port: number,
+    private readonly helloResults: HelloResult[],
+  ) {}
+
+  static async start(helloResults: HelloResult[] = []): Promise<ScriptedProviderDaemon> {
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const daemon = new ScriptedProviderDaemon(server, (server.address() as AddressInfo).port, [...helloResults]);
+    server.on("connection", (socket) => {
+      daemon.sockets.add(socket);
+      socket.once("close", () => daemon.sockets.delete(socket));
+      void daemon.handleConnection(socket).catch(() => socket.destroy());
+    });
+    scriptedDaemons.push(daemon);
+    return daemon;
+  }
+
+  async waitForHelloCount(count: number): Promise<void> {
+    if (this.helloCount >= count) return;
+    await new Promise<void>((resolve) => {
+      this.waiters.push({ count, resolve });
+    });
+  }
+
+  dropLatest(): void {
+    const socket = Array.from(this.sockets).at(-1);
+    socket?.destroy();
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    for (const socket of this.sockets) socket.destroy();
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
+
+  private async handleConnection(socket: Socket): Promise<void> {
+    const reader = new SocketReader(socket);
+    const deadline = Date.now() + 10_000;
+    await authenticateFakeServer(reader, socket, deadline);
+    const hello = await readFrame(reader, deadline);
+    expect(hello.header.ty).toBe(FrameType.Hello);
+    expect(hello.header.channel).toBe(0);
+    expect(hello.header.corr).toBe(HELLO_CORR);
+
+    const result = this.helloResults.shift() ?? "ack";
+    if (result === "ack") {
+      await writeFrame(
+        socket,
+        buildFrameWithVersion(
+          PROTOCOL_VERSION,
+          FrameType.HelloAck,
+          CONTROL_FLAGS,
+          0,
+          hello.header.corr,
+          encodeJson({
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: ["server.describe", "catalog.list", "route.open", "route.poll"],
+            subc_capabilities: ["manifest_registration_v1"],
+          }),
+        ),
+        deadline,
+      );
+      this.recordHello();
+      await this.drainUntilClose(reader);
+      return;
+    }
+
+    await writeFrame(
+      socket,
+      buildFrameWithVersion(
+        PROTOCOL_VERSION,
+        FrameType.Error,
+        CONTROL_FLAGS,
+        0,
+        hello.header.corr,
+        encodeJson(result),
+      ),
+      deadline,
+    );
+    this.recordHello();
+  }
+
+  private async drainUntilClose(reader: SocketReader): Promise<void> {
+    for (;;) {
+      await readFrame(reader, Date.now() + 60_000);
+    }
+  }
+
+  private recordHello(): void {
+    this.helloCount += 1;
+    for (let i = this.waiters.length - 1; i >= 0; i -= 1) {
+      const waiter = this.waiters[i]!;
+      if (this.helloCount >= waiter.count) {
+        this.waiters.splice(i, 1);
+        waiter.resolve();
+      }
+    }
+  }
+}
+
+function trackedTempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function fakeWritableSocket(writes: Frame[]): unknown {
+  return {
+    async write(bytes: Uint8Array): Promise<void> {
+      const header = decodeHeader(bytes.subarray(0, HEADER_LEN));
+      const body = header.len === 0 ? new Uint8Array(0) : bytes.subarray(HEADER_LEN, HEADER_LEN + header.len);
+      writes.push({ header, body });
+    },
+    close(): void {
+      // Unit tests use this fake only to observe writes; there is no OS socket to close.
+    },
+  };
+}
+
+function createManualSleep(): {
+  calls: number[];
+  sleep: (ms: number) => Promise<void>;
+  resolveAll: () => void;
+} {
+  const calls: number[] = [];
+  const waiters: Array<() => void> = [];
+  return {
+    calls,
+    sleep(ms: number): Promise<void> {
+      calls.push(ms);
+      return new Promise((resolve) => {
+        waiters.push(resolve);
+      });
+    },
+    resolveAll(): void {
+      for (const resolve of waiters.splice(0)) resolve();
+    },
+  };
+}
+
+async function waitForCondition(predicate: () => boolean, label: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${label}`);
 }

@@ -187,6 +187,16 @@ export interface ProviderRequestContext {
   emit(body: Uint8Array): Promise<void>;
   /** Aborts when the consumer sends Cancel for this request, or the route is torn down. */
   signal: AbortSignal;
+  /**
+   * The provider's current transport connection epoch: 1 on the initial connection,
+   * +1 on each successful reconnect + re-registration. Read at the moment the handler
+   * calls it (so it reflects any reconnect that happened while the handler ran). A
+   * handler that reports connection liveness to its consumer (e.g. stamping the epoch
+   * on a response so the consumer can detect a reconnect) should read it from here —
+   * this is the single authoritative source of the transport epoch, so it can never
+   * drift from a separately-maintained counter.
+   */
+  currentEpoch(): number;
 }
 
 /**
@@ -567,6 +577,7 @@ export class SubcProvider {
     const dataFlags = buildFlags(false, Priority.Interactive, false);
     const ctx: ProviderRequestContext = {
       signal: controller.signal,
+      currentEpoch: () => this.connectionEpoch,
       emit: async (eventBody) => {
         // Once aborted (cancel / route-gone / socket drop), drop further events silently.
         if (controller.signal.aborted) return;

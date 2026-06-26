@@ -16,3 +16,8 @@
 
 # Magic Context / CortexKit per-project module data (not source)
 .cortexkit/
+
+# Auto-generated docs from a background tooling pass (not authored source — kept out
+# of the repo; same files appear in sibling repos from the same generator).
+/ARCHITECTURE.md
+/STRUCTURE.md

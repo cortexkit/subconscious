@@ -14,6 +14,7 @@ export interface LiveDaemon {
   runtimeDir: string;
   configDir: string;
   stderr: () => string;
+  restart: () => Promise<void>;
   stop: () => void;
 }
 
@@ -58,28 +59,38 @@ export async function startLiveDaemon(
   const connFile = join(runtimeDir, CONN_NAME);
   let stderr = "";
   let exit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  let daemon: ChildProcess = undefined as unknown as ChildProcess;
 
-  const daemon: ChildProcess = spawn(DAEMON, [], {
-    env: {
-      ...process.env,
-      XDG_RUNTIME_DIR: runtimeDir,
-      XDG_CONFIG_HOME: configDir,
-      SUBC_PORT: "0",
-    },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  daemon.stderr?.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-  daemon.once("exit", (code, signal) => {
-    exit = { code, signal };
-  });
+  const spawnDaemon = (): void => {
+    exit = null;
+    daemon = spawn(DAEMON, [], {
+      env: {
+        ...process.env,
+        XDG_RUNTIME_DIR: runtimeDir,
+        XDG_CONFIG_HOME: configDir,
+        SUBC_PORT: "0",
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    daemon.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    daemon.once("exit", (code, signal) => {
+      exit = { code, signal };
+    });
+  };
 
-  try {
+  const waitForConnectionFile = async (): Promise<void> => {
     await waitFor(() => existsSync(connFile) || exit !== null, 10_000, "daemon connection file");
     if (!existsSync(connFile)) {
       throw new Error(`subc-core exited before writing its connection file: ${JSON.stringify(exit)}\n${stderr}`);
     }
+  };
+
+  spawnDaemon();
+
+  try {
+    await waitForConnectionFile();
   } catch (err) {
     daemon.kill("SIGKILL");
     rmSync(runtimeDir, { recursive: true, force: true });
@@ -92,6 +103,13 @@ export async function startLiveDaemon(
     runtimeDir,
     configDir,
     stderr: () => stderr,
+    restart: async () => {
+      daemon.kill("SIGKILL");
+      await waitFor(() => exit !== null, 5_000, "previous daemon exit");
+      rmSync(connFile, { force: true });
+      spawnDaemon();
+      await waitForConnectionFile();
+    },
     stop: () => {
       daemon.kill("SIGKILL");
       rmSync(runtimeDir, { recursive: true, force: true });

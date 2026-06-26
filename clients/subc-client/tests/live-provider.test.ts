@@ -5,8 +5,9 @@ import {
   SubcClient,
   SubcProvider,
   type CatalogEntry,
+  type ProviderConnectionState,
 } from "../src/index.js";
-import { startLiveDaemon, type LiveDaemon } from "./live-daemon.js";
+import { startLiveDaemon, waitFor, type LiveDaemon } from "./live-daemon.js";
 
 describe("SubcProvider live routing against real subc-core", () => {
   let live: LiveDaemon;
@@ -53,6 +54,63 @@ describe("SubcProvider live routing against real subc-core", () => {
     }
   });
 });
+
+describe("SubcProvider live managed reconnect against real subc-core", () => {
+  let live: LiveDaemon;
+
+  beforeAll(async () => {
+    live = await startLiveDaemon("subc-provider-reconnect-live");
+  });
+
+  afterAll(() => {
+    live?.stop();
+  });
+
+  test("re-registers after daemon restart and serves requests on the restored connection", async () => {
+    const moduleId = "test-reconnect-provider";
+    const events: ProviderConnectionState[] = [];
+    const provider = await SubcProvider.connect({
+      connectionFile: live.connFile,
+      manifest: managementSurfaceManifest({ moduleId, operations: ["echo"] }),
+      handler: async (_routeChannel, body) => body,
+      reconnectBackoff: { baseMs: 50, capMs: 50, maxAttempts: 1 },
+      restoredDebounceMs: 10,
+      onConnectionState: (event) => {
+        events.push(event);
+      },
+    });
+
+    try {
+      expect(provider.currentEpoch()).toBe(1);
+      await live.restart();
+      await waitFor(() => provider.currentEpoch() === 2, 10_000, "provider epoch 2 after daemon restart");
+      await waitFor(
+        () => events.some((event) => event.state === "restored" && event.epoch === 2),
+        10_000,
+        "provider restored event after daemon restart",
+      );
+
+      const downIndex = events.findIndex((event) => event.state === "down");
+      const restoredIndex = events.findIndex((event) => event.state === "restored" && event.epoch === 2);
+      expect(downIndex).toBeGreaterThanOrEqual(0);
+      expect(restoredIndex).toBeGreaterThan(downIndex);
+
+      const identity = { project_root: live.configDir, harness: "opencode", session: "session-reconnect" };
+      const client = await SubcClient.connect({ connectionFile: live.connFile, identity });
+      try {
+        await expect(client.call(moduleId, "echo", { reconnected: true }, { timeoutMs: 10_000 })).resolves.toEqual({
+          method: "echo",
+          params: { reconnected: true },
+        });
+      } finally {
+        client.close();
+      }
+    } finally {
+      await provider.close();
+    }
+  });
+});
+
 
 function managementSurfaceRole(entry: CatalogEntry | undefined): { operations?: unknown[] } | undefined {
   return (entry?.roles as Array<{ role?: string; operations?: unknown[] }> | undefined)?.find(

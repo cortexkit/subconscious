@@ -77,6 +77,7 @@ export {
   type ObservabilitySurfaceInput,
   type PipelineAppliesToInput,
   type PipelineStageKind,
+  type ProviderConnectionState,
   type ProviderHandler,
   type ProviderRoleInput,
   type RouteBindRequest,

@@ -9,7 +9,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_module::{async_trait, BindDecision, HandlerOutcome, ModuleHandler, RequestCtx};
+use subc_client_rs::{async_trait, BindDecision, HandlerOutcome, ModuleHandler, RequestCtx};
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
@@ -18,7 +18,7 @@ use subc_protocol::{
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
 
-const DEFAULT_MODULE_ID: &str = "subc-module-echo";
+const DEFAULT_MODULE_ID: &str = "subc-client-rs-echo";
 const EVENTS_ENV: &str = "SUBC_MODULE_ECHO_EVENTS";
 
 #[tokio::main(flavor = "current_thread")]
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
     let events_path = std::env::var_os(EVENTS_ENV).map(PathBuf::from);
-    subc_module::serve(manifest(&module_id), EchoHandler { events_path }).await?;
+    subc_client_rs::serve(manifest(&module_id), EchoHandler { events_path }).await?;
     Ok(())
 }
 
@@ -86,7 +86,7 @@ impl ModuleHandler for EchoHandler {
         }));
     }
 
-    async fn on_bind(&self, req: &subc_module::RouteBindRequest) -> BindDecision {
+    async fn on_bind(&self, req: &subc_client_rs::RouteBindRequest) -> BindDecision {
         self.record(json!({
             "kind": "bind",
             "route_channel": req.route_channel,

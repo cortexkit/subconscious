@@ -1,9 +1,9 @@
 [package]
-name = "subc-module"
+name = "subc-client-rs"
 version = "0.1.0"
 edition = "2021"
 publish = true
-description = "Shared serve-side helper for Rust subc modules."
+description = "Shared serve + consume client for Rust subc modules."
 license = "MIT"
 repository = "https://github.com/cortexkit/subconscious"
 

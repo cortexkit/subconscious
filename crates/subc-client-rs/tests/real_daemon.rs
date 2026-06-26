@@ -21,7 +21,7 @@ use tokio::{
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const MODULE_ID: &str = "subc-module-echo";
+const MODULE_ID: &str = "subc-client-rs-echo";
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,7 +44,7 @@ impl Drop for LiveDaemon {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clean_subc_module_serves_through_real_daemon() {
+async fn clean_subc_client_rs_serves_through_real_daemon() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
@@ -54,10 +54,10 @@ async fn clean_subc_module_serves_through_real_daemon() {
     let module_bin = ensure_binary(
         &workspace,
         example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-module", "--example", "echo-module"],
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
     );
 
-    let temp_dir = unique_temp_dir("subc-module-real-daemon");
+    let temp_dir = unique_temp_dir("subc-client-rs-real-daemon");
     let runtime_dir = temp_dir.join("runtime");
     let config_dir = temp_dir.join("config");
     let events_path = temp_dir.join("events.jsonl");
@@ -279,7 +279,7 @@ async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> u16
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let project_root = unique_temp_dir("subc-module-project");
+    let project_root = unique_temp_dir("subc-client-rs-project");
     fs::create_dir_all(&project_root).unwrap();
     let response = control_rpc_on_stream(
         stream,
@@ -291,7 +291,7 @@ where
             },
             "identity": BindIdentity {
                 project_root,
-                harness: "subc-module-test".to_string(),
+                harness: "subc-client-rs-test".to_string(),
                 session: "clean-api".to_string(),
             },
         }),

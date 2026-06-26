@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+pub mod consumer;
+pub use consumer::{
+    CallError, CallOptions, ConnectionState, ConsumerError, ConsumerOptions, RetryBackoff,
+    SubcConsumer,
+};
+
 use std::{
     collections::HashMap,
     env,

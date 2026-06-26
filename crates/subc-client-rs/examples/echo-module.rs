@@ -17,6 +17,7 @@ use subc_protocol::{
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
+use tokio::time::{sleep, Duration};
 
 const DEFAULT_MODULE_ID: &str = "subc-client-rs-echo";
 const EVENTS_ENV: &str = "SUBC_MODULE_ECHO_EVENTS";
@@ -52,6 +53,23 @@ impl ModuleHandler for EchoHandler {
                     message: error.to_string(),
                 },
             },
+            Some("sleep") => {
+                let ms = request.get("ms").and_then(Value::as_u64).unwrap_or(100);
+                self.record(json!({
+                    "kind": "sleep_started",
+                    "channel": ctx.channel(),
+                    "corr": ctx.corr(),
+                    "ms": ms,
+                }));
+                sleep(Duration::from_millis(ms)).await;
+                match serde_json::to_vec(&json!({ "ok": true, "slept_ms": ms })) {
+                    Ok(response) => HandlerOutcome::Response(response),
+                    Err(error) => HandlerOutcome::Error {
+                        code: "encode_failed".to_string(),
+                        message: error.to_string(),
+                    },
+                }
+            }
             Some("cancel") => {
                 self.record(json!({
                     "kind": "cancel_waiting",

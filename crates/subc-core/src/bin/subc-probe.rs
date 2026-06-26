@@ -12,6 +12,7 @@
 //!   subc-probe --subc <connection-file> [--module-id <id>] [--root <path>]
 //!              [--harness <name>] [--session <id>] [--tool <name>]
 //!              [--args <json-object>] [--list-only]
+//!              [--supervisor-restart <module-id>]
 //!
 //! Defaults: module-id = first tool_provider in the catalog; root = cwd;
 //! harness = "probe"; tool = first tool of the selected provider; args = {}.
@@ -40,7 +41,7 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const USAGE: &str = "usage: subc-probe --subc <connection-file> [--module-id <id>] \
 [--root <path>] [--harness <name>] [--session <id>] [--tool <name>] \
-[--args <json-object>] [--list-only]";
+[--args <json-object>] [--list-only] [--supervisor-restart <module-id>]";
 
 #[tokio::main]
 async fn main() {
@@ -59,6 +60,7 @@ struct ProbeArgs {
     tool: Option<String>,
     args: Value,
     list_only: bool,
+    supervisor_restart: Option<String>,
 }
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError> {
@@ -90,6 +92,19 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
         .await
         .map_err(|source| ProbeError::Message(format!("authenticate: {source}")))?;
     eprintln!("[probe] authenticated");
+
+    // Operator op: drain + respawn a single supervised module, then exit.
+    // Used to roll one module onto a freshly built binary without restarting
+    // the whole daemon (and without killing the process directly).
+    if let Some(module_id) = &args.supervisor_restart {
+        let applied = supervisor_restart(&mut stream, module_id).await?;
+        eprintln!("[probe] supervisor.restart '{module_id}' -> applied={applied}");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "module_id": module_id, "applied": applied }))?
+        );
+        return Ok(());
+    }
 
     // 2. catalog.list — see what providers + tools are registered.
     let catalog = catalog_list(&mut stream).await?;
@@ -142,6 +157,27 @@ async fn catalog_list(stream: &mut TcpStream) -> Result<Vec<CatalogEntry>, Probe
         ClientControlResponse::CatalogList { modules, .. } => Ok(modules),
         other => Err(ProbeError::Message(format!(
             "unexpected catalog.list response: {other:?}"
+        ))),
+    }
+}
+
+async fn supervisor_restart(stream: &mut TcpStream, module_id: &str) -> Result<bool, ProbeError> {
+    let request = ClientControlRequest::SupervisorRestart {
+        module_id: module_id.to_string(),
+    };
+    let response = control_rpc(stream, serde_json::to_vec(&request)?).await?;
+    match response.header.ty {
+        FrameType::Response => {
+            match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
+                ClientControlResponse::SupervisorAck { applied, .. } => Ok(applied),
+                other => Err(ProbeError::Message(format!(
+                    "unexpected supervisor.restart response: {other:?}"
+                ))),
+            }
+        }
+        FrameType::Error => Err(ProbeError::Rejected(decode_error_body(&response.body))),
+        ty => Err(ProbeError::Message(format!(
+            "unexpected supervisor.restart frame {ty:?}"
         ))),
     }
 }
@@ -336,6 +372,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
     let mut tool = None;
     let mut args_value = json!({});
     let mut list_only = false;
+    let mut supervisor_restart = None;
 
     while let Some(arg) = args.next() {
         if arg == OsStr::new("--subc") {
@@ -356,6 +393,8 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
                 .map_err(|e| ProbeError::Message(format!("--args is not valid JSON: {e}")))?;
         } else if arg == OsStr::new("--list-only") {
             list_only = true;
+        } else if arg == OsStr::new("--supervisor-restart") {
+            supervisor_restart = Some(take_str(&mut args, "--supervisor-restart")?);
         } else if arg == OsStr::new("-h") || arg == OsStr::new("--help") {
             return Err(ProbeError::Message(USAGE.into()));
         } else {
@@ -383,6 +422,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
         tool,
         args: args_value,
         list_only,
+        supervisor_restart,
     })
 }
 

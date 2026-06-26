@@ -7,10 +7,12 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use serde_json::{json, Value};
+use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
 use subc_protocol::{BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, read_frame, write_frame};
 use tokio::{
@@ -26,6 +28,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
+const CONSUMER_MODULE_A: &str = "subc-client-rs-consumer-a";
+const CONSUMER_MODULE_B: &str = "subc-client-rs-consumer-b";
 
 struct LiveDaemon {
     child: Child,
@@ -34,12 +38,35 @@ struct LiveDaemon {
     connection_file: PathBuf,
 }
 
+struct ProviderProcess {
+    child: Child,
+}
+
+impl Drop for ProviderProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Drop for LiveDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.runtime_dir);
         let _ = fs::remove_dir_all(&self.config_dir);
+    }
+}
+
+impl LiveDaemon {
+    fn kill_and_wait(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.connection_file);
+    }
+
+    fn restart(&mut self, daemon_bin: &Path) {
+        self.child = spawn_daemon_child(daemon_bin, &self.runtime_dir, &self.config_dir);
     }
 }
 
@@ -165,8 +192,351 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     let _ = daemon.child.kill();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_reports_outcome_unknown_mid_call_then_reopens_after_restart() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-consumer-midcall");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let events_path = temp_dir.join("provider-a.jsonl");
+    let provider = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &events_path,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+
+    let consumer = Arc::new(
+        SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+            .await
+            .unwrap(),
+    );
+    let identity = consumer_identity("midcall");
+    let first = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"unary","value":1}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(&first)["echo"]["value"], 1);
+
+    let in_flight = {
+        let consumer = Arc::clone(&consumer);
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            consumer
+                .call(
+                    tool_target(CONSUMER_MODULE_A),
+                    identity,
+                    br#"{"kind":"sleep","ms":5000}"#.to_vec(),
+                    fast_call_options(),
+                )
+                .await
+        })
+    };
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "sleep_started"
+    })
+    .await;
+    daemon.kill_and_wait();
+    let mid_call = in_flight.await.unwrap();
+    assert!(
+        matches!(mid_call, Err(CallError::OutcomeUnknown(_))),
+        "accepted mid-call must surface OutcomeUnknown, got {mid_call:?}"
+    );
+    assert_eq!(
+        read_events(&events_path)
+            .into_iter()
+            .filter(|event| event["kind"] == "sleep_started")
+            .count(),
+        1,
+        "OutcomeUnknown calls must not be auto-retried"
+    );
+    drop(provider);
+
+    daemon.restart(&daemon_bin);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let events_path_restarted = temp_dir.join("provider-a-restarted.jsonl");
+    let _provider = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &events_path_restarted,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+
+    let reopened = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_A),
+            identity,
+            br#"{"kind":"unary","value":2}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(&reopened)["echo"]["value"], 2);
+    assert!(
+        consumer.current_epoch() >= 2,
+        "consumer epoch should advance after reconnect"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_retries_unknown_module_until_provider_registers_and_bounds_absence() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-consumer-race");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let initial_events = temp_dir.join("initial-provider.jsonl");
+    let initial_provider = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &initial_events,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+
+    let consumer = Arc::new(
+        SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+            .await
+            .unwrap(),
+    );
+    let identity = consumer_identity("race");
+    let warm = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"unary","value":"warm"}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(&warm)["echo"]["value"], "warm");
+
+    daemon.kill_and_wait();
+    drop(initial_provider);
+    daemon.restart(&daemon_bin);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    let racing_call = {
+        let consumer = Arc::clone(&consumer);
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            consumer
+                .call(
+                    tool_target(CONSUMER_MODULE_A),
+                    identity,
+                    br#"{"kind":"unary","value":"after-register"}"#.to_vec(),
+                    fast_call_options(),
+                )
+                .await
+        })
+    };
+    sleep(Duration::from_millis(250)).await;
+    let restarted_events = temp_dir.join("restarted-provider.jsonl");
+    let _provider = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &restarted_events,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+    let raced = racing_call.await.unwrap().unwrap();
+    assert_eq!(json_body(&raced)["echo"]["value"], "after-register");
+
+    let absent = consumer
+        .call(
+            tool_target("subc-client-rs-never-registers"),
+            identity,
+            br#"{"kind":"unary","value":"missing"}"#.to_vec(),
+            bounded_absence_options(),
+        )
+        .await;
+    assert!(
+        matches!(absent, Err(CallError::NotSent(_))),
+        "bounded target absence should terminate as NotSent, got {absent:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_multiplexes_targets_and_classifies_reconnect_in_flight() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-consumer-mux");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let events_a = temp_dir.join("a.jsonl");
+    let events_b = temp_dir.join("b.jsonl");
+    let provider_a = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &events_a,
+    );
+    let provider_b = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_B,
+        &events_b,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_B, START_TIMEOUT).await;
+
+    let consumer = Arc::new(
+        SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+            .await
+            .unwrap(),
+    );
+    let identity = consumer_identity("multiplex");
+    let mut handles = Vec::new();
+    for i in 0..20u64 {
+        let consumer = Arc::clone(&consumer);
+        let identity = identity.clone();
+        let module_id = if i % 2 == 0 {
+            CONSUMER_MODULE_A
+        } else {
+            CONSUMER_MODULE_B
+        };
+        handles.push(tokio::spawn(async move {
+            let body = serde_json::to_vec(&json!({ "kind": "unary", "value": i })).unwrap();
+            let bytes = consumer
+                .call(tool_target(module_id), identity, body, fast_call_options())
+                .await
+                .unwrap();
+            (i, json_body(&bytes))
+        }));
+    }
+    for handle in handles {
+        let (i, response) = handle.await.unwrap();
+        assert_eq!(response["echo"]["value"], i);
+    }
+
+    let mut sleepy = Vec::new();
+    for module_id in [
+        CONSUMER_MODULE_A,
+        CONSUMER_MODULE_B,
+        CONSUMER_MODULE_A,
+        CONSUMER_MODULE_B,
+    ] {
+        let consumer = Arc::clone(&consumer);
+        let identity = identity.clone();
+        sleepy.push(tokio::spawn(async move {
+            consumer
+                .call(
+                    tool_target(module_id),
+                    identity,
+                    br#"{"kind":"sleep","ms":5000}"#.to_vec(),
+                    fast_call_options(),
+                )
+                .await
+        }));
+    }
+    wait_for_event(&events_a, EVENT_TIMEOUT, |event| {
+        event["kind"] == "sleep_started"
+    })
+    .await;
+    wait_for_event(&events_b, EVENT_TIMEOUT, |event| {
+        event["kind"] == "sleep_started"
+    })
+    .await;
+    daemon.kill_and_wait();
+    for handle in sleepy {
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Err(CallError::OutcomeUnknown(_))),
+            "accepted multiplexed sleep should be OutcomeUnknown, got {result:?}"
+        );
+    }
+    drop(provider_a);
+    drop(provider_b);
+
+    daemon.restart(&daemon_bin);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let _provider_a = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &temp_dir.join("a-restarted.jsonl"),
+    );
+    let _provider_b = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_B,
+        &temp_dir.join("b-restarted.jsonl"),
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_B, START_TIMEOUT).await;
+    let after = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_B),
+            identity,
+            br#"{"kind":"unary","value":"after"}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(&after)["echo"]["value"], "after");
+}
+
 fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> LiveDaemon {
-    let child = Command::new(daemon_bin)
+    let child = spawn_daemon_child(daemon_bin, runtime_dir, config_dir);
+    LiveDaemon {
+        child,
+        runtime_dir: runtime_dir.to_path_buf(),
+        config_dir: config_dir.to_path_buf(),
+        connection_file: runtime_dir.join("subc-connection.json"),
+    }
+}
+
+fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Child {
+    Command::new(daemon_bin)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("SUBC_PORT", "0")
@@ -174,13 +544,26 @@ fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Liv
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|error| panic!("failed to spawn {}: {error}", daemon_bin.display()));
-    LiveDaemon {
-        child,
-        runtime_dir: runtime_dir.to_path_buf(),
-        config_dir: config_dir.to_path_buf(),
-        connection_file: runtime_dir.join("subc-connection.json"),
-    }
+        .unwrap_or_else(|error| panic!("failed to spawn {}: {error}", daemon_bin.display()))
+}
+
+fn spawn_provider(
+    module_bin: &Path,
+    connection_file: &Path,
+    module_id: &str,
+    events_path: &Path,
+) -> ProviderProcess {
+    let child = Command::new(module_bin)
+        .arg("--subc")
+        .arg(connection_file)
+        .env(subc_protocol::SUBC_MODULE_ID_ENV, module_id)
+        .env("SUBC_MODULE_ECHO_EVENTS", events_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn {}: {error}", module_bin.display()));
+    ProviderProcess { child }
 }
 
 fn config_doc(module_bin: &Path, events_path: &Path) -> String {
@@ -200,6 +583,73 @@ fn config_doc(module_bin: &Path, events_path: &Path) -> String {
         }
     }))
     .unwrap()
+}
+
+fn write_empty_config(config_dir: &Path) {
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&json!({ "version": 1, "modules": {} })).unwrap(),
+    )
+    .unwrap();
+}
+
+fn fast_consumer_options() -> ConsumerOptions {
+    ConsumerOptions {
+        handshake_timeout: AUTH_DEADLINE,
+        reconnect_backoff: RetryBackoff {
+            base: Duration::from_millis(50),
+            cap: Duration::from_millis(250),
+            max_attempts: 20,
+        },
+        restored_debounce: Duration::from_millis(10),
+    }
+}
+
+fn fast_call_options() -> CallOptions {
+    CallOptions {
+        timeout: Duration::from_secs(8),
+        route_retry: RetryBackoff {
+            base: Duration::from_millis(50),
+            cap: Duration::from_millis(250),
+            max_attempts: 20,
+        },
+        route_retry_deadline: Duration::from_secs(5),
+        ..CallOptions::default()
+    }
+}
+
+fn bounded_absence_options() -> CallOptions {
+    CallOptions {
+        timeout: Duration::from_secs(2),
+        route_retry: RetryBackoff {
+            base: Duration::from_millis(25),
+            cap: Duration::from_millis(50),
+            max_attempts: 4,
+        },
+        route_retry_deadline: Duration::from_millis(300),
+        ..CallOptions::default()
+    }
+}
+
+fn consumer_identity(session: &str) -> BindIdentity {
+    let project_root = unique_temp_dir("subc-client-rs-consumer-project");
+    fs::create_dir_all(&project_root).unwrap();
+    BindIdentity {
+        project_root,
+        harness: "subc-client-rs-consumer-test".to_string(),
+        session: session.to_string(),
+    }
+}
+
+fn tool_target(module_id: &str) -> RouteTarget {
+    RouteTarget::ToolProvider {
+        module_id: module_id.to_string(),
+    }
+}
+
+fn json_body(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes).unwrap()
 }
 
 async fn wait_for_connection_file(path: &Path, wait: Duration) {
@@ -394,9 +844,11 @@ fn goodbye_frame(channel: u16, corr: u64) -> Frame {
 }
 
 fn ensure_binary(workspace: &Path, path: PathBuf, cargo_args: &[&str]) -> PathBuf {
-    if path.exists() {
-        return path;
-    }
+    static BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = BUILD_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let output = Command::new("cargo")
         .args(cargo_args)
         .current_dir(workspace)

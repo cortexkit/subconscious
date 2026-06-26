@@ -616,6 +616,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "subc-control",
  "subc-protocol",
  "subc-transport",
  "tokio",

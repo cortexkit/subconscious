@@ -12,10 +12,12 @@ let package = Package(
     products: [
         .library(name: "SubcClient", targets: ["SubcClient"]),
         .executable(name: "subc-swift-probe", targets: ["SubcSwiftProbe"]),
+        .executable(name: "subc-chat", targets: ["SubcChat"]),
     ],
     targets: [
         .target(name: "SubcClient"),
         .executableTarget(name: "SubcSwiftProbe", dependencies: ["SubcClient"]),
+        .executableTarget(name: "SubcChat", dependencies: ["SubcClient"]),
         .testTarget(
             name: "SubcClientTests",
             dependencies: ["SubcClient"],

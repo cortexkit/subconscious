@@ -19,9 +19,14 @@ public struct CatalogEntry {
 /// One decoded subscribe-stream control event (the chat-renderable unit).
 public struct SessionEvent {
     public let walSeq: UInt64
+    public let subIndex: UInt32
     public let type: String        // run_started | step_started | assistant_message | tool_call | tool_result | step_finished | run_finished | ...
     public let text: String?       // assistant text (assistant_message) or tool result text, when present
+    public let runId: String?      // present on run_started (the run this episode belongs to)
 }
+
+/// A durable resubscribe position: replay strictly AFTER this (wal_seq, sub_index).
+public typealias SubscribeCursor = (walSeq: UInt64, subIndex: UInt32)
 
 public struct SubcError: Error { public let message: String }
 
@@ -113,17 +118,29 @@ public final class SubcClient {
         prompt: String,
         provider: String,
         model: String,
+        fromCursor: SubscribeCursor? = nil,
+        appendEpisode: Bool = false,
         onEvent: (SessionEvent) -> Void
-    ) throws {
+    ) throws -> SubscribeCursor? {
         let cmdChannel = try routeOpenManagementSurface(moduleId: moduleId, projectRoot: projectRoot, harness: harness, session: session)
         let subChannel = try routeOpenManagementSurface(moduleId: moduleId, projectRoot: projectRoot, harness: harness, session: session)
 
         // Subscribe FIRST (from the start of the lineage), without waiting — its corr
         // produces the StreamData stream we drain below.
         let subCorr = nextCorr; nextCorr += 1
+        // A continuing turn resubscribes from the prior turn's last cursor (replays
+        // strictly AFTER it), so the prior episode is never re-delivered; the first
+        // turn attaches from "start" on the empty lineage. The `from` wire shape is an
+        // untagged enum: a bare string ("start"/"live") or a { wal_seq, sub_index } object.
+        let fromValue: Any
+        if let c = fromCursor {
+            fromValue = ["wal_seq": c.walSeq, "sub_index": c.subIndex]
+        } else {
+            fromValue = "start"
+        }
         let subBody = try JSONSerialization.data(withJSONObject: [
             "method": "session.subscribe",
-            "params": ["from": "start"],
+            "params": ["from": fromValue],
         ])
         try writeRequest(channel: subChannel, corr: subCorr, body: subBody)
 
@@ -135,13 +152,14 @@ public final class SubcClient {
                 "prompt": prompt,
                 "model": ["provider": provider, "model": model],
                 "tools": [],
-                "append_episode": false,
+                "append_episode": appendEpisode,
             ],
         ])
         try writeRequest(channel: cmdChannel, corr: sendCorr, body: sendBody)
 
         // Drain: demux frames by corr. The send Response is the admission ack; the
         // subscribe corr carries the StreamData control units until the run's terminal.
+        var lastCursor: SubscribeCursor? = fromCursor
         while true {
             let frame = try readFrame()
             if frame.header.corr == sendCorr {
@@ -155,11 +173,12 @@ public final class SubcClient {
             switch frame.header.ty {
             case .streamData:
                 if let event = try decodeControlEvent(frame.body) {
+                    lastCursor = (event.walSeq, event.subIndex)
                     onEvent(event)
-                    if event.type == "run_finished" { return }
+                    if event.type == "run_finished" { return lastCursor }
                 }
             case .streamEnd:
-                return
+                return lastCursor
             case .error:
                 let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"
                 throw SubcError(message: "subscribe stream error: \(msg)")
@@ -214,10 +233,18 @@ private func decodeControlEvent(_ body: Data) throws -> SessionEvent? {
     guard (v["kind"] as? String) == "control" else { return nil }
     let cursor = v["cursor"] as? [String: Any]
     let walSeq = (cursor?["wal_seq"] as? Int).map { UInt64($0) } ?? 0
+    let subIndex = (cursor?["sub_index"] as? Int).map { UInt32($0) } ?? 0
     guard let unit = v["unit"] as? [String: Any], let type = unit["type"] as? String else {
         throw SubcError(message: "control event missing unit.type")
     }
-    return SessionEvent(walSeq: walSeq, type: type, text: extractText(type: type, unit: unit))
+    let runId: String?
+    if type == "run_started" {
+        // RunId is #[serde(transparent)] over a String, so it serializes as a bare string.
+        runId = unit["run_id"] as? String
+    } else {
+        runId = nil
+    }
+    return SessionEvent(walSeq: walSeq, subIndex: subIndex, type: type, text: extractText(type: type, unit: unit), runId: runId)
 }
 
 private func extractText(type: String, unit: [String: Any]) -> String? {

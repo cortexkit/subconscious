@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
     error::Error,
     fs,
     io::Write as _,
@@ -12,8 +11,8 @@ use serde_json::{json, Value};
 use subc_client_rs::{async_trait, BindDecision, HandlerOutcome, ModuleHandler, RequestCtx};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
-        IdentityScope, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ProviderRole,
+        StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
@@ -166,11 +165,6 @@ fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
                 owns_schema: false,
-            },
-            config: ConfigBinding {
-                source: ConfigSource::SubcMediated,
-                tiers: Vec::new(),
-                expansion: BTreeMap::new(),
             },
             vault_grants: Vec::new(),
             identity: IdentityBinding {

@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     net::Shutdown,
     ops::Deref,
@@ -21,9 +20,8 @@ use subc_core::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
-        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
-        Tool, TrustTier,
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
@@ -3584,11 +3582,6 @@ fn consumer_manifest(module_id: &str) -> ModuleManifest {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
                 owns_schema: false,
-            },
-            config: ConfigBinding {
-                source: ConfigSource::SubcMediated,
-                tiers: Vec::new(),
-                expansion: BTreeMap::new(),
             },
             vault_grants: Vec::new(),
             identity: IdentityBinding {

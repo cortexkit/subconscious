@@ -34,9 +34,8 @@ use subc_core::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
-        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
-        Tool as ProviderTool, TrustTier,
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool as ProviderTool, TrustTier,
     },
     session::{ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
@@ -2378,11 +2377,6 @@ fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
                 owns_schema: true,
-            },
-            config: ConfigBinding {
-                source: ConfigSource::SubcMediated,
-                tiers: vec!["user".to_string(), "project".to_string()],
-                expansion: Default::default(),
             },
             vault_grants: Vec::new(),
             identity: IdentityBinding {

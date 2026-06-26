@@ -8,7 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 /// A module's full declared participation in the subc mesh.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -225,11 +224,10 @@ pub struct CircuitBreaker {
     pub identical_failures: u32,
 }
 
-/// External resources and identity/config bindings supplied through subc.
+/// External storage, vault, and identity bindings supplied through subc.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Bindings {
     pub storage: StorageBinding,
-    pub config: ConfigBinding,
     pub vault_grants: Vec<VaultGrant>,
     pub identity: IdentityBinding,
 }
@@ -254,28 +252,6 @@ pub enum StorageScope {
     Project,
 }
 
-/// Layered config transport. subc stores tiered raw documents and transports
-/// literal token references; modules merge and expand them at use time.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ConfigBinding {
-    pub source: ConfigSource,
-    pub tiers: Vec<String>,
-    pub expansion: BTreeMap<String, Vec<TokenExpansion>>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigSource {
-    SubcMediated,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenExpansion {
-    Env,
-    File,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct VaultGrant {
     pub secret: String,
@@ -294,14 +270,6 @@ mod tests {
     use serde_json::json;
 
     fn aft_manifest_fixture() -> ModuleManifest {
-        let expansion = BTreeMap::from([
-            (
-                "user".to_string(),
-                vec![TokenExpansion::Env, TokenExpansion::File],
-            ),
-            ("project".to_string(), vec![]),
-        ]);
-
         ModuleManifest {
             module_id: "aft".to_string(),
             module_version: "0.39.2".to_string(),
@@ -359,11 +327,6 @@ mod tests {
                     kind: StorageKind::Sqlite,
                     scope: StorageScope::Project,
                     owns_schema: true,
-                },
-                config: ConfigBinding {
-                    source: ConfigSource::SubcMediated,
-                    tiers: vec!["user".to_string(), "project".to_string()],
-                    expansion,
                 },
                 vault_grants: vec![VaultGrant {
                     secret: "provider_api_key".to_string(),

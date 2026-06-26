@@ -1568,14 +1568,14 @@ fn control_flags() -> Flags {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::sync::Arc;
 
     use serde_json::{json, Value};
     use subc_protocol::{
         manifest::{
-            Bindings, CircuitBreaker, Concurrency, ConfigBinding, ConfigSource, ExecutionMode,
-            IdentityBinding, IdentityScope, ModelPolicy, ProviderRole, ScheduledTask,
-            StorageBinding, StorageKind, StorageScope, TaskEligibility, Tool,
+            Bindings, CircuitBreaker, Concurrency, ExecutionMode, IdentityBinding, IdentityScope,
+            ModelPolicy, ProviderRole, ScheduledTask, StorageBinding, StorageKind, StorageScope,
+            TaskEligibility, Tool,
         },
         FrameType,
     };
@@ -1625,11 +1625,6 @@ mod tests {
                     kind: StorageKind::Sqlite,
                     scope: StorageScope::Project,
                     owns_schema: true,
-                },
-                config: ConfigBinding {
-                    source: ConfigSource::SubcMediated,
-                    tiers: vec!["user".to_string(), "project".to_string()],
-                    expansion: BTreeMap::new(),
                 },
                 vault_grants: Vec::new(),
                 identity: IdentityBinding {

@@ -659,6 +659,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-module"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "subc-protocol",
+ "subc-transport",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "subc-protocol"
 version = "0.4.0"
 dependencies = [
@@ -773,6 +786,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

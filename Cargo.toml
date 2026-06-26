@@ -4,6 +4,7 @@ members = [
     "crates/subc-protocol",
     "crates/subc-control",
     "crates/subc-transport",
+    "crates/subc-module",
     "crates/subc-jsonc",
     "crates/subc-core",
     "crates/subc-mcp",

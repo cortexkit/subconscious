@@ -1,14 +1,26 @@
 import Foundation
 
-// Consumer-side channel-0 control RPC over a connected + authenticated transport.
-// Spike scope: connect -> authenticate -> catalog.list. route.open, unary call,
-// subscribe streaming, and managed reconnect build on this same control_rpc
-// pattern (mirrors clients/subc-client/src/client.ts and subc-probe.rs).
+// Consumer-side channel-0 control RPC + the session data/stream plane over a
+// connected + authenticated transport. Mirrors clients/subc-client/src/client.ts,
+// subc-probe.rs, and llm-runner's llmr-subc SubcConnection.
+//
+// Spike scope: a synchronous, single-socket demonstration. The production client
+// swaps the blocking transport for an async Network.framework connection with a
+// background read task and per-(channel, corr) registration, which is what lets
+// subscribe streams and concurrent in-flight requests share one connection. The
+// wire bytes (frames, bodies, demux key) are identical; only the I/O model changes.
 
 public struct CatalogEntry {
     public let moduleId: String
     public let roles: [String]
     public let controlOps: [String]
+}
+
+/// One decoded subscribe-stream control event (the chat-renderable unit).
+public struct SessionEvent {
+    public let walSeq: UInt64
+    public let type: String        // run_started | step_started | assistant_message | tool_call | tool_result | step_finished | run_finished | ...
+    public let text: String?       // assistant text (assistant_message) or tool result text, when present
 }
 
 public struct SubcError: Error { public let message: String }
@@ -73,7 +85,7 @@ public final class SubcClient {
     }
 
     /// Invoke a management operation on an open route channel and return the
-    /// decoded JSON result. The body shape is { method, params }.
+    /// decoded JSON result (unwrapping the serve side's `{ result: ... }` envelope).
     public func callManagement(routeChannel: UInt16, method: String, params: [String: Any] = [:]) throws -> [String: Any] {
         let body = try JSONSerialization.data(withJSONObject: ["method": method, "params": params])
         let reply = try request(channel: routeChannel, body: body)
@@ -83,41 +95,149 @@ public final class SubcClient {
         return obj
     }
 
+    /// Drive one llm-runner session turn end-to-end: subscribe (dedicated route),
+    /// send the prompt (command route), then drain the control stream to the run's
+    /// terminal, invoking `onEvent` for each decoded control unit.
+    ///
+    /// This is the spike-level synchronous proof of subscribe streaming: a subscribe
+    /// is a Request whose corr yields a series of StreamData frames (one per control
+    /// unit) ending in StreamEnd, distinct from a request/response's single terminal.
+    /// Subscribing BEFORE sending captures the run from seq 1 (the attach barrier
+    /// replays the projection from start). The read loop demultiplexes by corr: the
+    /// send's Response vs the subscribe's StreamData stream.
+    public func runSessionTurn(
+        moduleId: String,
+        projectRoot: String,
+        harness: String,
+        session: String,
+        prompt: String,
+        provider: String,
+        model: String,
+        onEvent: (SessionEvent) -> Void
+    ) throws {
+        let cmdChannel = try routeOpenManagementSurface(moduleId: moduleId, projectRoot: projectRoot, harness: harness, session: session)
+        let subChannel = try routeOpenManagementSurface(moduleId: moduleId, projectRoot: projectRoot, harness: harness, session: session)
+
+        // Subscribe FIRST (from the start of the lineage), without waiting — its corr
+        // produces the StreamData stream we drain below.
+        let subCorr = nextCorr; nextCorr += 1
+        let subBody = try JSONSerialization.data(withJSONObject: [
+            "method": "session.subscribe",
+            "params": ["from": "start"],
+        ])
+        try writeRequest(channel: subChannel, corr: subCorr, body: subBody)
+
+        // Then send the prompt on the command route (its own corr → one Response).
+        let sendCorr = nextCorr; nextCorr += 1
+        let sendBody = try JSONSerialization.data(withJSONObject: [
+            "method": "session.send",
+            "params": [
+                "prompt": prompt,
+                "model": ["provider": provider, "model": model],
+                "tools": [],
+                "append_episode": false,
+            ],
+        ])
+        try writeRequest(channel: cmdChannel, corr: sendCorr, body: sendBody)
+
+        // Drain: demux frames by corr. The send Response is the admission ack; the
+        // subscribe corr carries the StreamData control units until the run's terminal.
+        while true {
+            let frame = try readFrame()
+            if frame.header.corr == sendCorr {
+                if frame.header.ty == .error {
+                    let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"
+                    throw SubcError(message: "session.send rejected: \(msg)")
+                }
+                continue // Response = admission ack; the stream carries the run
+            }
+            guard frame.header.corr == subCorr else { continue }
+            switch frame.header.ty {
+            case .streamData:
+                if let event = try decodeControlEvent(frame.body) {
+                    onEvent(event)
+                    if event.type == "run_finished" { return }
+                }
+            case .streamEnd:
+                return
+            case .error:
+                let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"
+                throw SubcError(message: "subscribe stream error: \(msg)")
+            default:
+                continue // interim push, ignore
+            }
+        }
+    }
+
     public func close() { transport.close() }
 
     // Send a Request on `channel` and read frames until the terminal
-    // (Response/Error) carrying THIS request's corr. Frames for other
-    // correlations (e.g. an interim push or a concurrent exchange) are skipped,
-    // which is the demux-by-corr discipline the production client generalizes to
-    // full (channel, corr) keying for concurrent in-flight requests.
+    // (Response/Error) carrying THIS request's corr. Frames for other correlations
+    // are skipped — the demux-by-corr discipline the production client generalizes
+    // to full (channel, corr) keying for concurrent in-flight requests.
     private func request(channel: UInt16, body: Data) throws -> Data {
-        let corr = nextCorr
-        nextCorr += 1
-        let flags = buildFlags(binary: false, priority: .interactive, last: false)
-        let frame = encodeFrame(ty: .request, flags: flags, channel: channel, corr: corr, body: body)
-        try transport.writeAll(frame)
-
+        let corr = nextCorr; nextCorr += 1
+        try writeRequest(channel: channel, corr: corr, body: body)
         while true {
-            let header = try decodeHeader(try transport.readExact(HEADER_LEN))
-            let payload = header.len > 0 ? try transport.readExact(Int(header.len)) : Data()
-            guard header.corr == corr else { continue }
-            switch header.ty {
+            let frame = try readFrame()
+            guard frame.header.corr == corr else { continue }
+            switch frame.header.ty {
             case .response:
-                return payload
+                return frame.body
             case .error:
-                let msg = String(data: payload, encoding: .utf8) ?? "<binary>"
+                let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"
                 throw SubcError(message: "request on channel \(channel) rejected: \(msg)")
             default:
-                continue // interim frame (e.g. push) for this corr; keep reading
+                continue
             }
         }
+    }
+
+    private func writeRequest(channel: UInt16, corr: UInt64, body: Data) throws {
+        let flags = buildFlags(binary: false, priority: .interactive, last: false)
+        try transport.writeAll(encodeFrame(ty: .request, flags: flags, channel: channel, corr: corr, body: body))
+    }
+
+    private func readFrame() throws -> Frame {
+        let header = try decodeHeader(try transport.readExact(HEADER_LEN))
+        let body = header.len > 0 ? try transport.readExact(Int(header.len)) : Data()
+        return Frame(header: header, body: body)
+    }
+}
+
+// Decode a subscribe StreamData body { kind, cursor:{wal_seq, sub_index}, unit:{type,...} }
+// into a renderable SessionEvent. Returns nil for display events (lossy, not rendered here).
+private func decodeControlEvent(_ body: Data) throws -> SessionEvent? {
+    guard let v = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+        throw SubcError(message: "subscribe event not a JSON object")
+    }
+    guard (v["kind"] as? String) == "control" else { return nil }
+    let cursor = v["cursor"] as? [String: Any]
+    let walSeq = (cursor?["wal_seq"] as? Int).map { UInt64($0) } ?? 0
+    guard let unit = v["unit"] as? [String: Any], let type = unit["type"] as? String else {
+        throw SubcError(message: "control event missing unit.type")
+    }
+    return SessionEvent(walSeq: walSeq, type: type, text: extractText(type: type, unit: unit))
+}
+
+private func extractText(type: String, unit: [String: Any]) -> String? {
+    switch type {
+    case "assistant_message":
+        let content = (unit["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+        let text = content.compactMap { block -> String? in
+            (block["type"] as? String) == "text" ? block["text"] as? String : nil
+        }.joined()
+        return text.isEmpty ? nil : text
+    case "tool_result":
+        return (unit["result"] as? [String: Any])?["output"].flatMap { ($0 as? [String: Any])?["text"] as? String }
+    default:
+        return nil
     }
 }
 
 private func rolesOf(_ value: Any?) -> [String] {
     // Each ProviderRole serializes as an internally-tagged object
-    // { "role": "management_surface", ... } (serde tag = "role"). The label is
-    // the `role` field; the rest of the object is the role's payload.
+    // { "role": "management_surface", ... } (serde tag = "role").
     if let objs = value as? [[String: Any]] {
         return objs.compactMap { $0["role"] as? String }
     }

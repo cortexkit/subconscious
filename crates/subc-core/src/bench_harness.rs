@@ -1,12 +1,11 @@
 //! In-process forwarding table setup for contention benchmarks (feature `bench-harness` only).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
-        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
-        Tool, TrustTier,
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     Flags, FrameType, Priority, PROTOCOL_VERSION,
 };
@@ -61,11 +60,6 @@ pub fn bench_tool_provider_manifest(module_id: &str) -> ModuleManifest {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
                 owns_schema: false,
-            },
-            config: ConfigBinding {
-                source: ConfigSource::SubcMediated,
-                tiers: vec!["user".to_string(), "project".to_string()],
-                expansion: BTreeMap::new(),
             },
             vault_grants: Vec::new(),
             identity: IdentityBinding {

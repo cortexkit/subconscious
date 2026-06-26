@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     env,
     error::Error,
     ffi::{OsStr, OsString},
@@ -31,9 +31,8 @@ use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::{
     manifest::{
-        Bindings, ConfigBinding, ConfigSource, ConsumerRole, ExecutionMode, IdentityBinding,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
-        Tool as ManifestTool, TrustTier,
+        Bindings, ConsumerRole, ExecutionMode, IdentityBinding, ModuleManifest, ProviderRole,
+        StorageBinding, StorageKind, StorageScope, Tool as ManifestTool, TrustTier,
     },
     BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Priority, RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
@@ -645,20 +644,15 @@ fn supervision_manifest(module_id: String) -> ModuleManifest {
 
 fn supervision_bindings() -> Bindings {
     // Manifest v1 requires concrete binding records. subc-mcp is only a
-    // gateway/consumer here: it owns no subc-mediated schema, secrets, config,
-    // or identity grant for the supervision registration itself; per-call
-    // config/identity arrives later through route.open. Keep every grant empty
-    // and explicitly decline storage schema ownership.
+    // gateway/consumer here: it owns no subc-managed storage schema, secrets,
+    // or identity grant for the supervision registration itself. Per-call
+    // identity is supplied later when the route is opened. Keep every grant
+    // empty and explicitly decline storage schema ownership.
     Bindings {
         storage: StorageBinding {
             kind: StorageKind::Sqlite,
             scope: StorageScope::Project,
             owns_schema: false,
-        },
-        config: ConfigBinding {
-            source: ConfigSource::SubcMediated,
-            tiers: Vec::new(),
-            expansion: BTreeMap::new(),
         },
         vault_grants: Vec::new(),
         identity: IdentityBinding {

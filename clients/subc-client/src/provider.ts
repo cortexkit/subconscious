@@ -39,8 +39,6 @@ export type ObservabilityKind = "snapshot" | "stream";
 export type InternalTransport = "bulk";
 export type StorageKind = "sqlite";
 export type StorageScope = "project";
-export type ConfigSource = "subc_mediated";
-export type TokenExpansion = "env" | "file";
 export type LeaseScope = "project";
 
 export interface ManifestInput {
@@ -140,7 +138,6 @@ export interface CircuitBreakerInput {
 
 export interface BindingsInput {
   storage: StorageBindingInput;
-  config: ConfigBindingInput;
   vault_grants: VaultGrantInput[];
   identity: IdentityBindingInput;
 }
@@ -151,11 +148,6 @@ export interface StorageBindingInput {
   owns_schema: boolean;
 }
 
-export interface ConfigBindingInput {
-  source: ConfigSource;
-  tiers: string[];
-  expansion: Record<string, TokenExpansion[]>;
-}
 
 export interface VaultGrantInput {
   secret: string;
@@ -325,11 +317,6 @@ export function managementSurfaceManifest(opts: ManagementSurfaceManifestOptions
         kind: "sqlite",
         scope: "project",
         owns_schema: false,
-      },
-      config: {
-        source: "subc_mediated",
-        tiers: [],
-        expansion: {},
       },
       vault_grants: [],
       identity: {
@@ -920,11 +907,6 @@ function normalizeManifest(manifest: ManifestInput): ManifestInput {
         scope: manifest.bindings.storage.scope,
         owns_schema: manifest.bindings.storage.owns_schema,
       },
-      config: {
-        source: manifest.bindings.config.source,
-        tiers: [...manifest.bindings.config.tiers],
-        expansion: sortStringRecord(manifest.bindings.config.expansion),
-      },
       vault_grants: manifest.bindings.vault_grants.map((grant) => ({
         secret: grant.secret,
         reason: grant.reason,
@@ -1020,12 +1002,4 @@ function normalizeScheduledTask(task: ScheduledTaskInput): ScheduledTaskInput {
       identical_failures: task.circuit_breaker.identical_failures,
     },
   };
-}
-
-function sortStringRecord(record: Record<string, TokenExpansion[]>): Record<string, TokenExpansion[]> {
-  const sorted: Record<string, TokenExpansion[]> = {};
-  for (const key of Object.keys(record).sort()) {
-    sorted[key] = [...(record[key] ?? [])];
-  }
-  return sorted;
 }

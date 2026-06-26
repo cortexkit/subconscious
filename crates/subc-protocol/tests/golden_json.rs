@@ -4,9 +4,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
-        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
-        Tool, TrustTier,
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, RouteTarget, PROTOCOL_VERSION,
@@ -164,11 +163,6 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
                 owns_schema: true,
-            },
-            config: ConfigBinding {
-                source: ConfigSource::SubcMediated,
-                tiers: vec!["user".to_string(), "project".to_string()],
-                expansion: Default::default(),
             },
             vault_grants: Vec::new(),
             identity: IdentityBinding {

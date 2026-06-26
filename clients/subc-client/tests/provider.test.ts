@@ -70,7 +70,6 @@ describe("managementSurfaceManifest", () => {
       scheduled_tasks: [],
       bindings: {
         storage: { kind: "sqlite", scope: "project", owns_schema: false },
-        config: { source: "subc_mediated", tiers: [], expansion: {} },
         vault_grants: [],
         identity: { requires: [], optional: [] },
       },

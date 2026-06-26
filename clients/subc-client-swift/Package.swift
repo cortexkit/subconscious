@@ -16,5 +16,10 @@ let package = Package(
     targets: [
         .target(name: "SubcClient"),
         .executableTarget(name: "SubcSwiftProbe", dependencies: ["SubcClient"]),
+        .testTarget(
+            name: "SubcClientTests",
+            dependencies: ["SubcClient"],
+            resources: [.copy("Fixtures/wire_vectors.json")]
+        ),
     ]
 )

@@ -304,10 +304,14 @@ impl Router {
                     return Ok(());
                 }
 
-                // subc only drops stale route frames for released channels; re-sending a
-                // dropped PUSH after the module re-attaches is the module's responsibility,
-                // not the router's.
-                warn!(
+                // A module frame landing on an already-released route channel is an
+                // expected, by-design teardown race: the consumer closed/GOODBYE'd the
+                // route while a response or push was already in flight. subc deliberately
+                // drops the straggler (no NACK); re-sending after the module re-attaches is
+                // the module's responsibility, not the router's. This is normal during route
+                // churn, so it is logged at debug rather than warn to avoid steady-state
+                // noise from consumers that open and close routes routinely.
+                debug!(
                     connection_id = ctx.connection_id.get(),
                     channel,
                     corr,

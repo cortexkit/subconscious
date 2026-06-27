@@ -78,6 +78,26 @@ impl Default for ConsumerOptions {
     }
 }
 
+/// Options for [`SubcConsumer::close_route`].
+#[derive(Debug, Clone)]
+pub struct CloseRouteOptions {
+    /// Await in-flight unary requests on the route to settle naturally before tearing
+    /// it down. Defaults to false: close immediately, settling anything in flight as
+    /// at-most-once failures (outcome_unknown if already sent, not_sent otherwise).
+    pub drain: bool,
+    /// Upper bound on the drain wait (ignored when `drain` is false).
+    pub drain_timeout: Duration,
+}
+
+impl Default for CloseRouteOptions {
+    fn default() -> Self {
+        Self {
+            drain: false,
+            drain_timeout: DEFAULT_CALL_TIMEOUT,
+        }
+    }
+}
+
 /// Per-call options for [`SubcConsumer::call`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
@@ -183,6 +203,27 @@ impl SubcConsumer {
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    /// Tear down ONE route, keyed by its (target, identity) — the parity of the TS
+    /// client's `closeRoute`. For a long-lived consumer that opens unbounded distinct
+    /// routes (one per session), this releases a route on session-end without dropping
+    /// the whole consumer: it drops the cached route, settles in-flight requests on it
+    /// at-most-once (OutcomeUnknown if already sent, NotSent otherwise), and sends a
+    /// best-effort route GOODBYE so the daemon releases it and notifies the module.
+    ///
+    /// Idempotent: a no-op if the route was never opened or is already closed (callers
+    /// over-call on session-end). NOT a permanent tombstone — a later `call()` for the
+    /// same key opens a fresh route. The close-beats-reopen guard ensures a close that
+    /// races an in-flight route.open WINS (the opened channel is GOODBYE'd, not cached).
+    pub async fn close_route(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        opts: CloseRouteOptions,
+    ) {
+        let key = RouteKey::new(&target, &identity);
+        self.shared.close_route(&key, &opts).await;
     }
 
     /// Current transport epoch: 1 on initial connect, then +1 per successful reconnect.
@@ -343,6 +384,16 @@ type Callback = Arc<Mutex<Box<dyn Fn(ConnectionState) + Send + 'static>>>;
 
 type OpeningWaiter = oneshot::Sender<Result<RouteState, SharedCallFailure>>;
 
+/// An in-flight route.open for one key: the waiters parked behind the lead opener,
+/// plus a `closed` flag a concurrent `close_route` flips so the lead opener refuses
+/// to install its channel (the close-beats-reopen guard). The flag lives here, with
+/// the in-flight open, so it vanishes when the open finishes — no lingering per-key
+/// state to leak for a long-lived consumer with unbounded distinct routes.
+struct Opening {
+    waiters: Vec<OpeningWaiter>,
+    closed: bool,
+}
+
 struct Shared {
     connection_file: PathBuf,
     opts: ConsumerOptions,
@@ -358,7 +409,7 @@ struct Inner {
     writer: Option<mpsc::Sender<WriteCommand>>,
     pending: HashMap<PendingKey, PendingEntry>,
     routes: HashMap<RouteKey, RouteState>,
-    openings: HashMap<RouteKey, Vec<OpeningWaiter>>,
+    openings: HashMap<RouteKey, Opening>,
     callbacks: Vec<Callback>,
     closed: bool,
     reconnecting: bool,
@@ -624,12 +675,18 @@ impl Shared {
                         return Ok(route.clone());
                     }
                 }
-                if let Some(waiters) = inner.openings.get_mut(key) {
+                if let Some(opening) = inner.openings.get_mut(key) {
                     let (tx, rx) = oneshot::channel();
-                    waiters.push(tx);
+                    opening.waiters.push(tx);
                     RouteOpenAction::Wait(rx)
                 } else {
-                    inner.openings.insert(key.clone(), Vec::new());
+                    inner.openings.insert(
+                        key.clone(),
+                        Opening {
+                            waiters: Vec::new(),
+                            closed: false,
+                        },
+                    );
                     RouteOpenAction::Lead
                 }
             };
@@ -695,15 +752,25 @@ impl Shared {
                         generation,
                         sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
                     };
-                    let cached = {
+                    let install = {
                         let mut inner = self.lock_inner();
                         if inner.closed {
                             return Err(CallError::not_sent("consumer closed"));
                         }
-                        if inner.generation != generation || inner.writer.is_none() {
-                            None
+                        // Close-beats-reopen guard: a close_route may have flipped this
+                        // opening's `closed` flag WHILE this route.open was in flight. If
+                        // so, close wins — do NOT cache the channel; GOODBYE it below and
+                        // fail as NotSent (the route was closed before the open landed).
+                        let closed_during_open = inner.openings.get(key).is_some_and(|o| o.closed);
+                        if closed_during_open
+                            || inner.generation != generation
+                            || inner.writer.is_none()
+                        {
+                            RouteInstall::Discard {
+                                closed: closed_during_open,
+                            }
                         } else {
-                            Some(
+                            RouteInstall::Cached(
                                 inner
                                     .routes
                                     .entry(key.clone())
@@ -712,8 +779,19 @@ impl Shared {
                             )
                         }
                     };
-                    if let Some(cached) = cached {
-                        return Ok(cached);
+                    match install {
+                        RouteInstall::Cached(cached) => return Ok(cached),
+                        RouteInstall::Discard { closed } => {
+                            if closed {
+                                // GOODBYE the channel we opened so the daemon/module don't
+                                // leak it, then report the close as a NotSent failure.
+                                self.send_route_goodbye(generation, route.channel);
+                                return Err(CallError::not_sent(
+                                    "route was closed before route.open completed",
+                                ));
+                            }
+                            // Stale generation / writer gone: fall through to retry.
+                        }
                     }
                     self.sleep_until_retry(route_deadline, opts.route_retry.base)
                         .await?;
@@ -918,7 +996,7 @@ impl Shared {
                 inner
                     .openings
                     .drain()
-                    .map(|(_, waiters)| waiters)
+                    .map(|(_, opening)| opening.waiters)
                     .collect::<Vec<_>>(),
                 inner
                     .routes
@@ -975,10 +1053,113 @@ impl Shared {
     }
 
     fn finish_opening(&self, key: &RouteKey, result: Result<RouteState, SharedCallFailure>) {
-        let waiters = self.lock_inner().openings.remove(key).unwrap_or_default();
-        for waiter in waiters {
+        let opening = self.lock_inner().openings.remove(key);
+        for waiter in opening.map(|o| o.waiters).unwrap_or_default() {
             let _ = waiter.send(result.clone());
         }
+    }
+
+    /// Tear down one route by key. See [`SubcConsumer::close_route`].
+    async fn close_route(self: &Arc<Self>, key: &RouteKey, opts: &CloseRouteOptions) {
+        // Under the lock: flip the close-beats-reopen flag on any in-flight open for
+        // this key (so a lead-opener whose channel hasn't been cached yet refuses to
+        // install it), and remove the cached route if one exists.
+        let route = {
+            let mut inner = self.lock_inner();
+            if let Some(opening) = inner.openings.get_mut(key) {
+                opening.closed = true;
+            }
+            inner.routes.remove(key)
+        };
+
+        // Nothing cached: either never opened (idempotent no-op) or still opening (the
+        // racing lead-opener will see the flag and GOODBYE whatever channel it opens).
+        let Some(route) = route else {
+            return;
+        };
+
+        if opts.drain {
+            // Wait for in-flight UNARY requests on this channel to settle naturally,
+            // bounded by drain_timeout, before tearing the route down.
+            self.drain_channel(route.generation, route.channel, opts.drain_timeout)
+                .await;
+        }
+
+        // Closing the semaphore makes any not-yet-sent acquire() return Err -> the
+        // caller classifies it NotSent. Already-sent pending requests are settled
+        // at-most-once (OutcomeUnknown if the writer accepted their bytes).
+        route.sem.close();
+        self.fail_channel_pending(
+            route.generation,
+            route.channel,
+            "route closed by close_route",
+        );
+
+        // Best-effort route GOODBYE: the daemon releases the route + relays the module
+        // route-gone GOODBYE the module's reaper consumes. One-way, no ack.
+        self.send_route_goodbye(route.generation, route.channel);
+    }
+
+    /// Settle every in-flight pending request on `channel` (this generation) as an
+    /// at-most-once failure: OutcomeUnknown if the writer already accepted its bytes,
+    /// NotSent otherwise. Mirrors the connection-drop path, scoped to one channel.
+    fn fail_channel_pending(&self, generation: u64, channel: u16, reason: &str) {
+        let entries = {
+            let mut inner = self.lock_inner();
+            drain_pending_channel(&mut inner.pending, generation, channel)
+        };
+        settle_pending_entries(entries, reason.to_string());
+    }
+
+    /// Resolve once every in-flight unary pending on `channel` has settled, or the
+    /// timeout elapses. Polls the pending map (entries are removed on settle); the
+    /// volume here is tiny (a route window is small) so a short poll is adequate.
+    async fn drain_channel(&self, generation: u64, channel: u16, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let has_inflight = {
+                let inner = self.lock_inner();
+                inner
+                    .pending
+                    .keys()
+                    .any(|k| k.generation == generation && k.channel == channel)
+            };
+            if !has_inflight || Instant::now() >= deadline {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Send a best-effort header-only route GOODBYE for `channel` (this generation).
+    /// One-way: the daemon releases the route and relays a route-gone GOODBYE to the
+    /// module. Dropped silently if the connection is gone (the route died with it).
+    fn send_route_goodbye(&self, generation: u64, channel: u16) {
+        let writer = {
+            let inner = self.lock_inner();
+            if inner.closed || inner.generation != generation {
+                return;
+            }
+            inner.writer.clone()
+        };
+        let Some(writer) = writer else {
+            return;
+        };
+        let Ok(frame) = Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            0,
+            Vec::new(),
+        ) else {
+            return;
+        };
+        // try_send: best-effort, never block the caller; a full egress means the
+        // connection is saturated and the route is being torn down regardless.
+        let _ = writer.try_send(WriteCommand {
+            frame,
+            pending: None,
+        });
     }
 
     fn emit_connection_state(&self, state: ConnectionState) {
@@ -996,6 +1177,16 @@ enum InstallKind {
 enum EnsureAction {
     Wait,
     Lead,
+}
+
+/// Outcome of the install decision after a route.open response arrives, taken under
+/// the inner lock so a racing close_route is observed atomically.
+enum RouteInstall {
+    /// Install (or reuse) the cached route and return it.
+    Cached(RouteState),
+    /// Do not install. `closed` => a close_route won the race (GOODBYE + NotSent);
+    /// otherwise the generation moved (retry the open).
+    Discard { closed: bool },
 }
 
 enum RouteOpenAction {
@@ -1483,8 +1674,11 @@ fn drain_pending_channel(
         .collect()
 }
 
-fn drain_openings(openings: &mut HashMap<RouteKey, Vec<OpeningWaiter>>) -> Vec<Vec<OpeningWaiter>> {
-    openings.drain().map(|(_, waiters)| waiters).collect()
+fn drain_openings(openings: &mut HashMap<RouteKey, Opening>) -> Vec<Vec<OpeningWaiter>> {
+    openings
+        .drain()
+        .map(|(_, opening)| opening.waiters)
+        .collect()
 }
 
 fn fail_openings(openings: Vec<Vec<OpeningWaiter>>, failure: SharedCallFailure) {
@@ -1570,6 +1764,66 @@ mod tests {
         }
         assert!(!is_retryable_route_open_code("invalid_project_root"));
         assert!(!is_retryable_route_open_code("route_rejected"));
+    }
+
+    #[tokio::test]
+    async fn close_route_flips_inflight_opening_so_a_racing_open_discards() {
+        // The load-bearing close-beats-reopen guard, in isolation: a close that lands
+        // while a route.open is in flight (channel not yet cached) must flip the
+        // opening's `closed` flag, so the lead opener re-checks it before installing and
+        // GOODBYEs the channel it opened instead of caching it.
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let key = RouteKey::new(
+            &RouteTarget::ToolProvider {
+                module_id: "m".into(),
+            },
+            &BindIdentity {
+                project_root: PathBuf::from("/tmp/p"),
+                harness: "h".into(),
+                session: "s".into(),
+            },
+        );
+        // Simulate an in-flight lead open: an openings entry exists, not yet closed,
+        // with no cached route (channel hasn't been installed yet).
+        shared.lock_inner().openings.insert(
+            key.clone(),
+            Opening {
+                waiters: Vec::new(),
+                closed: false,
+            },
+        );
+
+        // close_route with no cached route is an idempotent no-op on routes, but MUST
+        // flip the in-flight opening's flag so the racing open discards.
+        shared
+            .close_route(&key, &CloseRouteOptions::default())
+            .await;
+        assert!(
+            shared
+                .lock_inner()
+                .openings
+                .get(&key)
+                .is_some_and(|o| o.closed),
+            "close_route must flip the in-flight opening's closed flag (close-beats-reopen)"
+        );
+
+        // And closing a key with neither a route nor an in-flight open is a no-op.
+        let absent = RouteKey::new(
+            &RouteTarget::ToolProvider {
+                module_id: "absent".into(),
+            },
+            &BindIdentity {
+                project_root: PathBuf::from("/tmp/p"),
+                harness: "h".into(),
+                session: "s".into(),
+            },
+        );
+        shared
+            .close_route(&absent, &CloseRouteOptions::default())
+            .await;
     }
 
     #[test]

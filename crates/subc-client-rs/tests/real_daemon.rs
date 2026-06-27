@@ -12,7 +12,9 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
+use subc_client_rs::{
+    CallError, CallOptions, CloseRouteOptions, ConsumerOptions, RetryBackoff, SubcConsumer,
+};
 use subc_protocol::{BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, read_frame, write_frame};
 use tokio::{
@@ -523,6 +525,99 @@ async fn subc_consumer_multiplexes_targets_and_classifies_reconnect_in_flight() 
         .await
         .unwrap();
     assert_eq!(json_body(&after)["echo"]["value"], "after");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_close_route_releases_the_route_and_reopens_fresh() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-close-route");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let events_path = temp_dir.join("provider.jsonl");
+    let _provider = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &events_path,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+
+    let consumer = Arc::new(
+        SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+            .await
+            .unwrap(),
+    );
+    let identity = consumer_identity("close-route");
+
+    // Open a route via a call (the echo-module logs a `bind` event with route_channel).
+    let warm = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"unary","value":"warm"}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(&warm)["echo"]["value"], "warm");
+    let bind = wait_for_event(&events_path, EVENT_TIMEOUT, |event| event["kind"] == "bind").await;
+    let first_channel = bind["route_channel"].as_u64().unwrap();
+
+    // close_route: the module must observe a route-gone GOODBYE for that channel.
+    consumer
+        .close_route(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            CloseRouteOptions::default(),
+        )
+        .await;
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "route_gone" && event["route_channel"].as_u64() == Some(first_channel)
+    })
+    .await;
+
+    // A later call for the SAME key opens a FRESH route (not a tombstone): the module
+    // logs a NEW bind on a different route_channel and the call succeeds.
+    let after = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_A),
+            identity,
+            br#"{"kind":"unary","value":"after"}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(&after)["echo"]["value"], "after");
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "bind" && event["route_channel"].as_u64() != Some(first_channel)
+    })
+    .await;
+
+    // close_route is idempotent: closing an already-closed / never-opened route is a no-op.
+    consumer
+        .close_route(
+            tool_target("subc-client-rs-never-opened"),
+            consumer_identity("close-route-absent"),
+            CloseRouteOptions::default(),
+        )
+        .await;
+
+    daemon.kill_and_wait();
 }
 
 fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> LiveDaemon {

@@ -30,8 +30,11 @@ final class ChatViewModel: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var status: String = "idle"
 
-    // Stable per-window session identity → one durable lineage across turns.
-    private let sessionId = "ck-chat-\(Int(Date().timeIntervalSince1970))"
+    // Stable per-window session identity → one durable lineage across turns. A UUID, not a
+    // timestamp: the session id keys the durable lineage and its single-writer lease
+    // (project_root + harness are fixed here), so two windows opened in the same second with
+    // a second-granularity id would collide onto one lineage and contend on one lease.
+    private let sessionId = "ck-chat-\(UUID().uuidString)"
     private let projectRoot = NSTemporaryDirectory() + "ck-chat-project"
     private let work = DispatchQueue(label: "subc-chat.client", qos: .userInitiated)
     // The last durable cursor processed; the next turn resubscribes strictly after it so a

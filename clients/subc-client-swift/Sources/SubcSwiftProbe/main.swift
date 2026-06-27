@@ -37,7 +37,7 @@ do {
         var finalText = ""
         _ = try client.runSessionTurn(
             moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
-            session: "swift-chat-\(Int(Date().timeIntervalSince1970))",
+            session: "swift-chat-\(UUID().uuidString)",
             prompt: args[3], provider: provider, model: modelId
         ) { ev in
             print("  [event] seq=\(ev.walSeq):\(ev.subIndex) \(ev.type)\(ev.runId.map { " run_id=\($0)" } ?? "")")
@@ -46,7 +46,7 @@ do {
         print("[swift-probe] FINAL: \(finalText)")
     } else if args.count >= 5, args[2] == "convo" {
         let (provider, modelId) = splitModel(args.count >= 6 ? args[5] : "anthropic/claude-haiku-4-5")
-        let session = "swift-convo-\(Int(Date().timeIntervalSince1970))"
+        let session = "swift-convo-\(UUID().uuidString)"
         var cursor: SubscribeCursor? = nil
         for (i, prompt) in [args[3], args[4]].enumerated() {
             print("--- TURN \(i + 1): \(prompt) (cursor=\(cursor.map { "\($0.walSeq):\($0.subIndex)" } ?? "start"))")
@@ -69,7 +69,7 @@ do {
         // Falsifiable model-switch test: turn 1 with model args[4], turn 2 (same session,
         // append) with model args[5]. If per-turn model is honored, a bogus turn-2 model
         // ERRORS; if the model is silently ignored, turn 2 succeeds with turn-1's model.
-        let session = "swift-switch-\(Int(Date().timeIntervalSince1970))"
+        let session = "swift-switch-\(UUID().uuidString)"
         var cursor: SubscribeCursor? = nil
         let models = [args[4], args[5]]
         for (i, model) in models.enumerated() {

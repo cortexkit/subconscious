@@ -20,12 +20,15 @@ public struct CatalogEntry {
 public struct SessionEvent {
     public let walSeq: UInt64
     public let subIndex: UInt32
-    public let type: String        // run_started | step_started | assistant_message | tool_call | tool_result | step_finished | run_finished | error | ...
-    public let text: String?       // assistant text (assistant_message), tool result text, or the error message (error)
+    public let type: String        // run_started | step_started | assistant_message | tool_call | tool_result | step_finished | run_finished | error | text_delta | ...
+    public let text: String?       // assistant text (assistant_message), tool result text, the error message (error), or a live token delta (text_delta)
     public let runId: String?      // present on run_started (the run this episode belongs to)
     public let errorClass: String? // present on type=="error": transient | permanent | auth | context_overflow | provider_unavailable
     public let errorStatus: Int?   // present on type=="error" when the provider supplied an HTTP status
     public let finishReason: String? // present on type=="run_finished": completed | max_steps | cancelled | interrupted | error
+    /// True for a durable CONTROL unit (carries a cursor); false for a live DISPLAY event
+    /// (token delta, lossy, no cursor). Only control events advance the resubscribe cursor.
+    public let isControl: Bool
 }
 
 /// A durable resubscribe position: replay strictly AFTER this (wal_seq, sub_index).
@@ -175,8 +178,10 @@ public final class SubcClient {
             guard frame.header.corr == subCorr else { continue }
             switch frame.header.ty {
             case .streamData:
-                if let event = try decodeControlEvent(frame.body) {
-                    lastCursor = (event.walSeq, event.subIndex)
+                if let event = try decodeStreamEvent(frame.body) {
+                    // Only durable CONTROL events carry a cursor and advance the resubscribe
+                    // position; live DISPLAY deltas are lossy and must not move the cursor.
+                    if event.isControl { lastCursor = (event.walSeq, event.subIndex) }
                     onEvent(event)
                     if event.type == "run_finished" { return lastCursor }
                 }
@@ -227,11 +232,15 @@ public final class SubcClient {
     }
 }
 
-// Decode a subscribe StreamData body { kind, cursor:{wal_seq, sub_index}, unit:{type,...} }
-// into a renderable SessionEvent. Returns nil for display events (lossy, not rendered here).
-private func decodeControlEvent(_ body: Data) throws -> SessionEvent? {
+// Decode a subscribe StreamData body into a renderable SessionEvent. Two shapes:
+//   control: { kind:"control", cursor:{wal_seq, sub_index}, unit:{type,...} }  (durable)
+//   display: { kind:"display", event:{type:"text_delta", delta, ...} }         (live, lossy)
+private func decodeStreamEvent(_ body: Data) throws -> SessionEvent? {
     guard let v = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
         throw SubcError(message: "subscribe event not a JSON object")
+    }
+    if (v["kind"] as? String) == "display" {
+        return decodeDisplayEvent(v)
     }
     guard (v["kind"] as? String) == "control" else { return nil }
     let cursor = v["cursor"] as? [String: Any]
@@ -258,7 +267,21 @@ private func decodeControlEvent(_ body: Data) throws -> SessionEvent? {
     let finishReason = type == "run_finished" ? (unit["reason"] as? String) : nil
     return SessionEvent(
         walSeq: walSeq, subIndex: subIndex, type: type, text: text,
-        runId: runId, errorClass: errorClass, errorStatus: errorStatus, finishReason: finishReason)
+        runId: runId, errorClass: errorClass, errorStatus: errorStatus,
+        finishReason: finishReason, isControl: true)
+}
+
+// Decode a live display event { kind:"display", event:{ type, delta, ... } }. Only
+// text_delta carries renderable assistant text; reasoning/tool-input deltas and the
+// gap/reset markers are surfaced by type with no text so the view can ignore them.
+private func decodeDisplayEvent(_ v: [String: Any]) -> SessionEvent? {
+    guard let event = v["event"] as? [String: Any], let type = event["type"] as? String else {
+        return nil
+    }
+    let text = type == "text_delta" ? (event["delta"] as? String) : nil
+    return SessionEvent(
+        walSeq: 0, subIndex: 0, type: type, text: text,
+        runId: nil, errorClass: nil, errorStatus: nil, finishReason: nil, isControl: false)
 }
 
 private func extractText(type: String, unit: [String: Any]) -> String? {

@@ -41,6 +41,10 @@ let MODEL_PRESETS: [String] = [
     "anthropic/claude-haiku-4-5",
     "deepseek/deepseek-chat",
     "deepseek/deepseek-reasoner",
+    "cerebras/gpt-oss-120b",
+    "xai/grok-4.3",
+    "inception/mercury-2",
+    "ollama-cloud/deepseek-v3.2",
 ]
 
 /// Drives the native Swift subc client against llm-runner sessions and renders streamed

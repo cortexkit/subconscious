@@ -20,9 +20,12 @@ public struct CatalogEntry {
 public struct SessionEvent {
     public let walSeq: UInt64
     public let subIndex: UInt32
-    public let type: String        // run_started | step_started | assistant_message | tool_call | tool_result | step_finished | run_finished | ...
-    public let text: String?       // assistant text (assistant_message) or tool result text, when present
+    public let type: String        // run_started | step_started | assistant_message | tool_call | tool_result | step_finished | run_finished | error | ...
+    public let text: String?       // assistant text (assistant_message), tool result text, or the error message (error)
     public let runId: String?      // present on run_started (the run this episode belongs to)
+    public let errorClass: String? // present on type=="error": transient | permanent | auth | context_overflow | provider_unavailable
+    public let errorStatus: Int?   // present on type=="error" when the provider supplied an HTTP status
+    public let finishReason: String? // present on type=="run_finished": completed | max_steps | cancelled | interrupted | error
 }
 
 /// A durable resubscribe position: replay strictly AFTER this (wal_seq, sub_index).
@@ -237,14 +240,25 @@ private func decodeControlEvent(_ body: Data) throws -> SessionEvent? {
     guard let unit = v["unit"] as? [String: Any], let type = unit["type"] as? String else {
         throw SubcError(message: "control event missing unit.type")
     }
-    let runId: String?
-    if type == "run_started" {
-        // RunId is #[serde(transparent)] over a String, so it serializes as a bare string.
-        runId = unit["run_id"] as? String
-    } else {
-        runId = nil
+    let runId: String? = type == "run_started" ? (unit["run_id"] as? String) : nil
+
+    // A terminal typed error: { type: "error", error: { class, message, status?, ... } }.
+    // The wire carries this on the control lane; surfacing it is the client's job (an
+    // unrendered error is the difference between a blank bubble and a real diagnosis).
+    var text = extractText(type: type, unit: unit)
+    var errorClass: String? = nil
+    var errorStatus: Int? = nil
+    if type == "error", let err = unit["error"] as? [String: Any] {
+        text = err["message"] as? String
+        errorClass = err["class"] as? String
+        errorStatus = err["status"] as? Int
     }
-    return SessionEvent(walSeq: walSeq, subIndex: subIndex, type: type, text: extractText(type: type, unit: unit), runId: runId)
+    // run_finished carries the terminal reason (snake_case); a non-`completed` reason means
+    // the run failed/stopped without producing a normal answer.
+    let finishReason = type == "run_finished" ? (unit["reason"] as? String) : nil
+    return SessionEvent(
+        walSeq: walSeq, subIndex: subIndex, type: type, text: text,
+        runId: runId, errorClass: errorClass, errorStatus: errorStatus, finishReason: finishReason)
 }
 
 private func extractText(type: String, unit: [String: Any]) -> String? {

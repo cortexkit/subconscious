@@ -108,7 +108,26 @@ final class ChatViewModel: ObservableObject {
                 messages[index].text = t
                 messages[index].pending = false
             }
-        case "run_finished": status = "done"
+        case "error":
+            // Surface the provider's terminal error in the bubble instead of a blank one.
+            if index < messages.count {
+                let cls = event.errorClass.map { " [\($0)\(event.errorStatus.map { s in " \(s)" } ?? "")]" } ?? ""
+                messages[index].text = "⚠️ \(event.text ?? "provider error")\(cls)"
+                messages[index].pending = false
+            }
+            status = "error"
+        case "run_finished":
+            // A non-`completed` terminal reason means the run failed/stopped. The error
+            // DETAIL isn't projected on the subscribe stream yet (only the reason is), so if
+            // nothing already filled the bubble, surface the reason rather than a blank one.
+            let reason = event.finishReason ?? "completed"
+            if reason != "completed", index < messages.count, messages[index].text.isEmpty {
+                messages[index].text = "⚠️ run ended: \(reason) (no response produced)"
+                messages[index].pending = false
+                status = "error"
+            } else if status != "error" {
+                status = "done"
+            }
         default: break
         }
     }
@@ -120,7 +139,8 @@ final class ChatViewModel: ObservableObject {
 
     private func finish(at index: Int) {
         if index < messages.count, messages[index].text.isEmpty {
-            messages[index].text = "(no text returned)"
+            // An empty terminal with no error unit (rare): the run ended producing no text.
+            messages[index].text = "(the model returned no text)"
         }
         if index < messages.count { messages[index].pending = false }
         isRunning = false

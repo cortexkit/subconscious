@@ -35,11 +35,17 @@ do {
     if args.count >= 4, args[2] == "chat" {
         let (provider, modelId) = splitModel(args.count >= 5 ? args[4] : "anthropic/claude-haiku-4-5")
         var finalText = ""
+        var deltaCount = 0
         _ = try client.runSessionTurn(
             moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
             session: "swift-chat-\(UUID().uuidString)",
             prompt: args[3], provider: provider, model: modelId
         ) { ev in
+            if ev.type == "text_delta" {
+                deltaCount += 1
+                if deltaCount <= 3 { print("  [delta \(deltaCount)] \(ev.text ?? "")") }
+                return
+            }
             print("  [event] seq=\(ev.walSeq):\(ev.subIndex) \(ev.type)\(ev.runId.map { " run_id=\($0)" } ?? "")")
             if ev.type == "assistant_message", let t = ev.text { finalText = t }
             if ev.type == "error" {
@@ -48,7 +54,7 @@ do {
                 print("    ERROR class=\(cls)\(st) msg=\(ev.text ?? "")")
             }
         }
-        print("[swift-probe] FINAL: \(finalText)")
+        print("[swift-probe] deltas=\(deltaCount) FINAL: \(finalText)")
     } else if args.count >= 5, args[2] == "convo" {
         let (provider, modelId) = splitModel(args.count >= 6 ? args[5] : "anthropic/claude-haiku-4-5")
         let session = "swift-convo-\(UUID().uuidString)"

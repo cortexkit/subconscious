@@ -76,6 +76,15 @@ export interface SubscribeOptions {
   priority?: Priority;
 }
 
+export interface CloseRouteOptions {
+  /**
+   * Await in-flight UNARY requests on the route to settle before tearing it down.
+   * Subscriptions are always aborted (a held-open stream cannot be drained).
+   * Defaults to false: close immediately, aborting everything in flight.
+   */
+  drain?: boolean;
+}
+
 /**
  * Capped exponential reconnect backoff. maxAttempts includes the first immediate
  * reconnect attempt; sleeps happen only between failed transient attempts.
@@ -152,6 +161,10 @@ interface Pending {
   onProgress?: (body: Uint8Array) => void;
   timer: ReturnType<typeof setTimeout> | null;
   classifyFailure?: (err: Error) => Error;
+  /** True for a held-open subscription (never drained — always aborted on close). */
+  subscription?: boolean;
+  /** Invoked when this pending settles (resolve or reject); used to await drain. */
+  onSettle?: () => void;
 }
 
 export interface ConnectOptions {
@@ -189,6 +202,15 @@ interface CachedRoute {
   channel: number | null;
   generation: number;
   opening: Promise<number> | null;
+  /**
+   * Tombstone set by closeRoute. An in-flight openCachedRoute holds this exact
+   * object across its routeOpen await; if closeRoute flips this while the open is in
+   * flight, the open must NOT install its channel (it GOODBYEs the channel it opened
+   * and yields RouteClosed) — so a close can never be resurrected by a racing reopen.
+   * Not a permanent tombstone: the map entry is deleted, so a later call for the same
+   * key creates a fresh object and opens legitimately.
+   */
+  closed?: boolean;
 }
 
 export class SubcClient {
@@ -313,6 +335,7 @@ export class SubcClient {
         reject,
         onProgress: onEvent,
         timer: null,
+        subscription: true,
       });
       const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false), routeChannel, corr, bytes);
       this.sock.write(encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch((err) => {
@@ -337,10 +360,101 @@ export class SubcClient {
     return { unsubscribe, closed };
   }
 
+  /**
+   * Tear down ONE managed route (a route opened via `call()`), keyed by its
+   * (target, identity). Idempotent and never throws — callers over-call on
+   * session-end. The teardown:
+   *  - flips a tombstone on the cached route and removes it from the cache, so an
+   *    in-flight `openCachedRoute` for the same key will NOT install its channel
+   *    (the generation guard: close beats a racing reopen), and a later `call()`
+   *    opens a fresh route (this is NOT a permanent tombstone);
+   *  - settles in-flight requests on the channel as RouteClosed (managed requests
+   *    keep their at-most-once classification: outcome_unknown if already sent,
+   *    not_sent otherwise; subscriptions always abort);
+   *  - sends a best-effort route GOODBYE so subc releases the route and notifies
+   *    the module to free per-session resources.
+   * `opts.drain` waits for in-flight UNARY requests to settle before tearing down.
+   */
+  async closeRoute(
+    target: Extract<RouteTarget, { kind: ManagedRouteKind }>,
+    identity: BindIdentity,
+    opts: CloseRouteOptions = {},
+  ): Promise<void> {
+    const key = routeCacheKey(target, identity);
+    const cached = this.routes.get(key);
+    if (!cached) return; // never opened / already closed — idempotent no-op.
+    // Generation guard: an in-flight openCachedRoute holds this same object and
+    // re-checks `closed` before installing its channel, so flipping it here makes
+    // close win over a racing reopen. Removing the map entry lets a later call()
+    // create a fresh route for the key (not a permanent tombstone).
+    cached.closed = true;
+    this.routes.delete(key);
+    const channel = cached.channel;
+    cached.channel = null;
+    // channel === null means the route was still opening (no channel installed yet);
+    // the racing open will see closed=true and GOODBYE whatever it opens, so there is
+    // nothing local to tear down here.
+    if (channel !== null) await this.closeRouteChannel(channel, opts);
+  }
+
+  /**
+   * Tear down ONE route by its channel number — the primitive for callers that
+   * opened a route with `routeOpen` directly (e.g. a tool route carrying raw
+   * {name, arguments}) and hold the channel themselves. Idempotent, never throws.
+   * Settles in-flight requests on the channel as RouteClosed and sends a best-effort
+   * route GOODBYE. `opts.drain` awaits in-flight UNARY requests first; subscriptions
+   * are always aborted (a held-open stream cannot be drained).
+   */
+  async closeRouteChannel(channel: number, opts: CloseRouteOptions = {}): Promise<void> {
+    if (channel === 0) return; // channel 0 is the control plane, never a route.
+    if (opts.drain) {
+      // Wait only for in-flight UNARY requests on this channel; subscriptions are
+      // aborted below (a held-open stream has no natural completion to drain to).
+      await this.drainUnaryOnChannel(channel);
+    }
+    // Settle anything still in flight on the channel (all of it in abort mode; only
+    // subscriptions + late stragglers after a drain). Managed requests are classified
+    // at-most-once via their classifyFailure; raw requests/subscriptions get a plain
+    // RouteClosed error.
+    this.failChannel(channel, new SubcError("route closed by closeRoute", "route_closed"));
+    // Best-effort GOODBYE: releases the route on the daemon and notifies the module.
+    this.sendRouteGoodbye(channel);
+  }
+
   close(): void {
     this.closeStarted = true;
     this.fail(new SubcError("client closed"));
     this.sock.close();
+  }
+
+  /** Resolve once every in-flight UNARY request on the channel (snapshot at call
+   * time) has settled. Subscriptions are excluded — they are aborted, not drained. */
+  private drainUnaryOnChannel(channel: number): Promise<void> {
+    const waiters: Promise<void>[] = [];
+    for (const pending of this.pending.values()) {
+      if (pending.channel === channel && !pending.subscription) {
+        waiters.push(
+          new Promise<void>((resolve) => {
+            const prev = pending.onSettle;
+            pending.onSettle = () => {
+              prev?.();
+              resolve();
+            };
+          }),
+        );
+      }
+    }
+    return Promise.all(waiters).then(() => undefined);
+  }
+
+  /** Send a best-effort header-only route GOODBYE for `channel`. One-way: the daemon
+   * releases the route and relays a route-gone GOODBYE to the module; no ack. */
+  private sendRouteGoodbye(channel: number): void {
+    if (this.closedErr) return; // connection already gone — the route died with it.
+    const goodbye = buildFrame(FrameType.Goodbye, buildFlags(false, Priority.Interactive, false), channel, 0n, EMPTY_BODY);
+    this.sock.write(encodeFrame(goodbye), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => {
+      // Best-effort: if the socket is already gone, the route is torn down anyway.
+    });
   }
 
   private static async openConnection(opts: NormalizedConnectOptions): Promise<OpenedConnection> {
@@ -504,6 +618,7 @@ export class SubcClient {
 
   private async openCachedRoute(cached: CachedRoute): Promise<number> {
     for (;;) {
+      if (cached.closed) throw this.routeClosedDuringOpen();
       try {
         await this.ensureConnectedForManaged();
       } catch (err) {
@@ -516,10 +631,19 @@ export class SubcClient {
 
       try {
         const channel = await this.routeOpen(cached.target, cached.identity);
+        // Generation guard: a closeRoute may have flipped the tombstone WHILE this
+        // route.open was in flight. If so, close wins — do NOT install the channel
+        // into the (already-removed) cache entry; GOODBYE the channel we just opened
+        // so the daemon/module don't leak it, and fail as RouteClosed.
+        if (cached.closed) {
+          this.sendRouteGoodbye(channel);
+          throw this.routeClosedDuringOpen();
+        }
         cached.channel = channel;
         cached.generation = this.generation;
         return channel;
       } catch (err) {
+        if (err instanceof SubcCallError && err.code === "route_closed") throw err;
         if (!this.closeStarted && isConsumerReconnectTransient(err)) {
           try {
             await this.reconnectAfterDrop(err);
@@ -600,10 +724,22 @@ export class SubcClient {
       cached.generation = 0;
     }
     for (const cached of this.routes.values()) {
+      if (cached.closed) continue; // closed concurrently with reconnect — don't reopen.
       const channel = await this.routeOpen(cached.target, cached.identity);
+      // A closeRoute may have raced this reopen (flipping the tombstone during the
+      // route.open await). If so, GOODBYE the channel instead of installing it, so the
+      // closed route isn't silently re-established on the new connection.
+      if (cached.closed) {
+        this.sendRouteGoodbye(channel);
+        continue;
+      }
       cached.channel = channel;
       cached.generation = this.generation;
     }
+  }
+
+  private routeClosedDuringOpen(): SubcCallError {
+    return new SubcCallError("not_sent", "route was closed before route.open completed", "route_closed");
   }
 
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
@@ -657,6 +793,7 @@ export class SubcClient {
     this.pending.delete(key);
     if (pending.timer) clearTimeout(pending.timer);
     run();
+    pending.onSettle?.();
   }
 
   private rejectPending(key: string, pending: Pending, err: Error): void {

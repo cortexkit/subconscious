@@ -16,6 +16,7 @@ export {
   type SubcCallErrorKind,
   type SubscribeOptions,
   type Subscription,
+  type CloseRouteOptions,
 } from "./client.js";
 export {
   readConnectionFile,

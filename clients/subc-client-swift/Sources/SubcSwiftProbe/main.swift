@@ -65,6 +65,33 @@ do {
             turnClient.close()
             print("[turn \(i + 1)] FINAL: \(finalText)")
         }
+    } else if args.count >= 6, args[2] == "switchmodel" {
+        // Falsifiable model-switch test: turn 1 with model args[4], turn 2 (same session,
+        // append) with model args[5]. If per-turn model is honored, a bogus turn-2 model
+        // ERRORS; if the model is silently ignored, turn 2 succeeds with turn-1's model.
+        let session = "swift-switch-\(Int(Date().timeIntervalSince1970))"
+        var cursor: SubscribeCursor? = nil
+        let models = [args[4], args[5]]
+        for (i, model) in models.enumerated() {
+            let (provider, modelId) = splitModel(model)
+            print("--- TURN \(i + 1): model=\(model)")
+            var finalText = ""
+            do {
+                let turnClient = try SubcClient.connect(connectionFilePath: args[1])
+                cursor = try turnClient.runSessionTurn(
+                    moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
+                    session: session, prompt: args[3], provider: provider, model: modelId,
+                    fromCursor: cursor, appendEpisode: cursor != nil
+                ) { ev in
+                    print("  [event] seq=\(ev.walSeq):\(ev.subIndex) \(ev.type)")
+                    if ev.type == "assistant_message", let t = ev.text { finalText = t }
+                }
+                turnClient.close()
+                print("[turn \(i + 1)] OK model=\(model): \(finalText.prefix(80))")
+            } catch {
+                print("[turn \(i + 1)] ERROR model=\(model): \(error)")
+            }
+        }
     } else if catalog.contains(where: { $0.moduleId == "ai-provider-quota" }) {
         let ch = try client.routeOpenManagementSurface(
             moduleId: "ai-provider-quota", projectRoot: projectRoot, harness: "swift-probe", session: "p1")

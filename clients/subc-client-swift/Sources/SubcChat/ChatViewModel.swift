@@ -9,6 +9,9 @@ struct ChatMessage: Identifiable {
     let role: Role
     var text: String
     var pending: Bool = false
+    /// The model handle this turn ran on (assistant bubbles), so a per-turn model switch
+    /// is visible in the transcript. nil for system notices.
+    var model: String? = nil
 }
 
 /// Drives the native Swift subc client against an llm-runner session and renders the
@@ -49,13 +52,13 @@ final class ChatViewModel: ObservableObject {
         guard !prompt.isEmpty, !isRunning else { return }
         input = ""
         isRunning = true
-        status = "running"
+        let modelHandle = model
+        status = "\(shortModel(modelHandle)) …"
         messages.append(ChatMessage(role: .user, text: prompt))
         let assistantIndex = messages.count
-        messages.append(ChatMessage(role: .assistant, text: "", pending: true))
+        messages.append(ChatMessage(role: .assistant, text: "", pending: true, model: modelHandle))
 
         let cf = connectionFile
-        let modelHandle = model
         let parts = modelHandle.split(separator: "/", maxSplits: 1).map(String.init)
         let provider = parts.first ?? "anthropic"
         let modelId = parts.count > 1 ? parts[1] : modelHandle
@@ -93,9 +96,10 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func apply(_ event: SessionEvent, at index: Int) {
+        let model = index < messages.count ? (messages[index].model ?? "") : ""
         switch event.type {
-        case "run_started": status = "model working…"
-        case "tool_call": status = "calling tool…"
+        case "run_started": status = "\(shortModel(model)) working…"
+        case "tool_call": status = "\(shortModel(model)) calling tool…"
         case "assistant_message":
             if let t = event.text, index < messages.count {
                 messages[index].text = t
@@ -104,6 +108,11 @@ final class ChatViewModel: ObservableObject {
         case "run_finished": status = "done"
         default: break
         }
+    }
+
+    /// The model id without the provider prefix, for compact status text.
+    private func shortModel(_ handle: String) -> String {
+        handle.split(separator: "/", maxSplits: 1).last.map(String.init) ?? handle
     }
 
     private func finish(at index: Int) {

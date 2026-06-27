@@ -50,7 +50,7 @@ struct ContentView: View {
         HStack {
             if msg.role == .user { Spacer(minLength: 40) }
             VStack(alignment: .leading, spacing: 2) {
-                Text(label(msg.role)).font(.caption2).foregroundColor(.secondary)
+                Text(headerLabel(msg)).font(.caption2).foregroundColor(.secondary)
                 Text(msg.pending && msg.text.isEmpty ? "…" : msg.text)
                     .textSelection(.enabled)
                     .padding(10)
@@ -61,10 +61,12 @@ struct ContentView: View {
         }
     }
 
-    private func label(_ role: ChatMessage.Role) -> String {
-        switch role {
+    // The bubble's caption: assistant bubbles show which model produced the turn, so a
+    // per-turn model switch is visible right where the answer lands.
+    private func headerLabel(_ msg: ChatMessage) -> String {
+        switch msg.role {
         case .user: return "you"
-        case .assistant: return "assistant"
+        case .assistant: return msg.model.map { "assistant · \($0)" } ?? "assistant"
         case .system: return "system"
         }
     }

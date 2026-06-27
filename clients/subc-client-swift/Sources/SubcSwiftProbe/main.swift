@@ -42,6 +42,11 @@ do {
         ) { ev in
             print("  [event] seq=\(ev.walSeq):\(ev.subIndex) \(ev.type)\(ev.runId.map { " run_id=\($0)" } ?? "")")
             if ev.type == "assistant_message", let t = ev.text { finalText = t }
+            if ev.type == "error" {
+                let cls = ev.errorClass ?? "?"
+                let st = ev.errorStatus.map { " status=\($0)" } ?? ""
+                print("    ERROR class=\(cls)\(st) msg=\(ev.text ?? "")")
+            }
         }
         print("[swift-probe] FINAL: \(finalText)")
     } else if args.count >= 5, args[2] == "convo" {

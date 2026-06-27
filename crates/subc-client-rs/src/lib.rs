@@ -2,8 +2,8 @@
 
 pub mod consumer;
 pub use consumer::{
-    CallError, CallOptions, ConnectionState, ConsumerError, ConsumerOptions, RetryBackoff,
-    SubcConsumer,
+    CallError, CallOptions, CloseRouteOptions, ConnectionState, ConsumerError, ConsumerOptions,
+    RetryBackoff, SubcConsumer,
 };
 
 use std::{

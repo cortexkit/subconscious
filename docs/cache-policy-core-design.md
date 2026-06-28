@@ -428,3 +428,41 @@ Everything is locked and verified. The build sequence on sign-off:
 
 The vector file is the **migration invariant** pinned on both sides. No crate code is
 written until Ufuk signs off the contract.
+
+
+---
+
+# Frozen-set durability: lineage-cumulative vs per-episode units (cache-core requirement)
+
+Surfaced during the CK#1 reconcile (LLMRUNNER, the reasoning-retention durability twin of
+FrozenRenderConfig). A requirement on the cache-core's durable frozen-set model, banked here
+so it is designed in, not retrofitted.
+
+**The frozen-set has TWO durability classes of unit, and the durable store (Edge B: cache-
+DECISION state persists) MUST distinguish them:**
+
+- **Per-episode units** (most drops/strips/skeletons): scoped to one run/episode. Reset at a
+  new `RunStarted` boundary, like `run_config` / `usage` / `completed_steps`.
+- **Lineage-cumulative units**: persist across turns AND across episode boundaries (a clear
+  that landed in episode 1 must stay frozen through episode 5). Examples:
+  - the **frozen reasoning-clear watermark** (the `clearedReasoningThroughTag`-style advance-
+    only watermark from the retention invariant);
+  - likely the **m0/m1 compartment boundary** (the compaction boundary is lineage-scoped, not
+    run-scoped).
+
+**Why this is load-bearing (the two bust modes it prevents):**
+- **Crash-resume:** if a lineage-cumulative watermark is in-memory or a per-run frozen value,
+  a mid-lineage crash re-derives it from scratch → the clear/boundary lands at a different
+  position → busts the very cache it exists to protect.
+- **Cross-episode:** if it is per-run-frozen (resets at each `RunStarted`), the older-turn
+  clear un-freezes at every episode boundary → re-derive bust per episode (the same class as
+  the §8.1 identity-lead cross-episode bust).
+
+**Requirement:** lineage-cumulative frozen units MUST live in durable lineage replay state
+(WAL-recorded on the owned leg, the durable store on the module leg), survive `RunStarted`
+boundaries, and be reproduced byte-identically by resume + cross-episode replay — gated by the
+same crash-cut + cross-episode byte-identity discipline as the existing resume gates. This is
+the reasoning-retention twin of FrozenRenderConfig durability: same freeze discipline, a new
+lineage-scoped field. The owned-leg implementation rides the cache_tiers + cache-core build
+(not the B2 reconcile build); this note ensures the durable frozen-set model treats lineage-
+cumulative units as a first-class class from day one.

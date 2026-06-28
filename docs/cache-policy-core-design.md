@@ -460,9 +460,9 @@ unit frozen on which pass, which passes SOFT+) is the invariant.
 ## Status: CONTRACT COMPLETE — awaiting Ufuk design-before-code sign-off
 
 Everything is locked and verified. The build sequence on sign-off:
-1. Rust cache-policy core (per-pass fn + `{version, anchor_fingerprint, frozen_units,
-   pending_changes}` state + `{signal, input_identity}` pass-input, opaque-token equality),
-   green against MC's 8 `mechanics` vectors (V4 + V8 first).
+1. Rust cache-policy core (per-pass fn + `{version, boundary_id, frozen_units,
+   pending_changes}` state + `{signal, boundary_present}` pass-input, opaque-token equality),
+   green against MC's 9 vectors — 8 `mechanics` (V4 + V8 first) + V9 cross-episode `durability`.
 2. llm-runner consumes it (the author harness: caller hands flat policy -> module resolves
    schemas from the subc catalog -> pins the per-session-sticky render-config epoch). This
    resolves the original Swift tool-calling wart structurally (no per-turn schema shipping).
@@ -484,17 +484,26 @@ Surfaced during the CK#1 reconcile (LLMRUNNER, the reasoning-retention durabilit
 FrozenRenderConfig). A requirement on the cache-core's durable frozen-set model, banked here
 so it is designed in, not retrofitted.
 
-**The frozen-set has TWO durability classes of unit, and the durable store (Edge B: cache-
-DECISION state persists) MUST distinguish them:**
+**The durable model has TWO durability classes — but they live in DIFFERENT structures, and
+conflating them was a mis-model (corrected; MC's golden-vector regen surfaced it):**
 
-- **Per-episode units** (most drops/strips/skeletons): scoped to one run/episode. Reset at a
-  new `RunStarted` boundary, like `run_config` / `usage` / `completed_steps`.
-- **Lineage-cumulative units**: persist across turns AND across episode boundaries (a clear
-  that landed in episode 1 must stay frozen through episode 5). Examples:
-  - the **frozen reasoning-clear watermark** (the `clearedReasoningThroughTag`-style advance-
-    only watermark from the retention invariant);
-  - likely the **m0/m1 compartment boundary** (the compaction boundary is lineage-scoped, not
-    run-scoped).
+- **The cache FROZEN-SET units are ALL `lineage`.** A frozen render unit (drop / strip /
+  skeleton / m0 / m1 / reasoning-clear watermark) compacts a region of the CONVERSATION PREFIX,
+  and the conversation prefix is lineage-cumulative — a drop that landed in episode 1 stays
+  dropped through episode 5 (it does NOT un-compact at a new `RunStarted`). So there is no
+  per-episode cache frozen unit today; every unit is `lineage` (survive + advance-only-merge,
+  never reset). MC confirms its entire frozen set is lineage-durable — which is exactly WHY a
+  restart does not bust its prefix.
+- **The `episode`-class state is WAL REPLAY-STATE, NOT cache frozen units.** `run_config` /
+  `usage` / `completed_steps` reset at `RunStarted`; `prompt` + the reasoning-clear watermark
+  survive (lineage). That reset distinction is llm-runner's durability core (the WAL replay
+  state machine, codec §B.4(d)), a SEPARATE structure from the cache frozen-set.
+
+So `durability_class` on a frozen_unit is `"lineage"` for every current unit kind; `"episode"`
+is RESERVED (no real episode-class cache unit exists — we do not fabricate one to exercise
+`reset_rule`; the reset_rule fires on the WAL replay-state, tested in llm-runner resume
+conformance, not the cache golden vectors). The field stays for schema-completeness and so a
+future run-scoped frozen unit (if one is ever identified) is expressible without a schema break.
 
 **Why this is load-bearing (the two bust modes it prevents):**
 - **Crash-resume:** if a lineage-cumulative watermark is in-memory or a per-run frozen value,

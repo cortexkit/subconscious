@@ -379,3 +379,52 @@ consumes first -> author-policy vectors layered -> MC migrates later). I shape t
 (per-pass function + `{version, anchor_fingerprint, frozen_units, pending_changes}` state +
 `{signal, input_identity}` pass-input) against the frozen schema in parallel; consumes MC's
 file unchanged when it lands.
+
+
+---
+
+# Round 5 — vector file SHIPPED + verified. Contract complete.
+
+MC shipped the golden-vector file (cortexkit/magic-context @ `09b58896`), independently
+verified at source against the frozen schema — exact match:
+- `docs/cache-policy/cache-stability-golden-vectors.json` — **8 `mechanics` vectors**
+  (MC added V2 post-execute-settle from the A2 E2E case; additive), all opaque tokens
+  (`cov0`/`cov0@r1`/`cov1`, `sys0`/`tools0`/`m0`), **zero real hashes** -> the Rust core
+  passes by branching correctly, never by porting MC's fingerprint.
+- `docs/cache-policy/cache-stability-golden-vectors.schema.md` — the one-page contract:
+  SOFT+/SOFT/HARD action model, frozen-render-unit byte-completeness, anchor-content-over-
+  coverage, opaque-token rule, the two-source coordinator, and the stated axioms.
+
+**The 8 vectors:** V1 growing-tail-defer (steady-state zero-bust), V2 post-execute-settle
+(execute busts once, defers after are byte-stable), V3 frozen-strip-not-first-applied-on-
+defer (the single most-broken MC regression), **V4 skeleton-byte-complete-across-moving-
+window (Leak-A catch)**, V5 delta-rides-m1-SOFT-m0-frozen, V6 hard-fold-folds-m1-into-m0-
+and-drains-deferred (the coordinator), V7 provider-nonce-only-is-not-a-bust, **V8 revert-
+within-covered-prefix-discards-and-rebuilds (Leak-C catch)**.
+
+**V4 + V8 are the two to wire first** — they encode the exact two leaks the clean model
+would have walked into (byte-complete payload, anchor-content-over-coverage). A consumer
+that greens those two has the two scar-forced refinements correctly implemented.
+
+`common_asserts` (top-level): the three locked + "a SOFT/HARD pass may/must change cached
+bytes (that is the bust)." `frozen_payload` values are illustrative harness-output samples
+(each harness compares its own renderer's bytes to its own payloads); the STRUCTURE (which
+unit frozen on which pass, which passes SOFT+) is the invariant.
+
+## Status: CONTRACT COMPLETE — awaiting Ufuk design-before-code sign-off
+
+Everything is locked and verified. The build sequence on sign-off:
+1. Rust cache-policy core (per-pass fn + `{version, anchor_fingerprint, frozen_units,
+   pending_changes}` state + `{signal, input_identity}` pass-input, opaque-token equality),
+   green against MC's 8 `mechanics` vectors (V4 + V8 first).
+2. llm-runner consumes it (the author harness: caller hands flat policy -> module resolves
+   schemas from the subc catalog -> pins the per-session-sticky render-config epoch). This
+   resolves the original Swift tool-calling wart structurally (no per-turn schema shipping).
+3. Author-policy vector layer (`pending_changes` + defer/now/forced epoch vectors,
+   `layer:"author-policy"`) appended to MC's file; sent to MC to review the two-source
+   coordinator drain.
+4. MC migrates onto the shared Rust core later (parity held by the same vector file) when
+   MC-under-subc lands — retiring MC's permanent TS-opencode/TS-pi parity tax.
+
+The vector file is the **migration invariant** pinned on both sides. No crate code is
+written until Ufuk signs off the contract.

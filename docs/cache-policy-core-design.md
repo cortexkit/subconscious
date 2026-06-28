@@ -466,3 +466,9 @@ the reasoning-retention twin of FrozenRenderConfig durability: same freeze disci
 lineage-scoped field. The owned-leg implementation rides the cache_tiers + cache-core build
 (not the B2 reconcile build); this note ensures the durable frozen-set model treats lineage-
 cumulative units as a first-class class from day one.
+
+**Shipped reference implementation (proof-of-existence, not theoretical):** MC's plugin leg
+already does exactly this — `clearedReasoningThroughTag` is persisted durably in `session_meta`,
+survives restart, and is reproduced across the conversation lifetime (advance-only watermark,
+clear-on-bust, replay-identical-on-defer). So the owned-leg WAL-durable watermark has a working
+pattern to mirror, not a design to invent.

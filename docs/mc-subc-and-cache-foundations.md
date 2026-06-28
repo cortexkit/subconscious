@@ -79,12 +79,19 @@ over a shared DB across two message models. A single stateful daemon + one canon
 ## 6. MITM harnesses (Claude Code, Codex) — VIABLE (MC exploration complete)
 **Both harnesses fully viable.** Settled empirically via a base-URL-redirect logging proxy.
 
-WIRE FORMATS + REDIRECT:
-- Claude Code: Anthropic `/v1/messages`, plain HTTP. Redirect = `ANTHROPIC_BASE_URL=http://host:port`.
-  Also carries a server-side `context_management` directive (`clear_thinking_*`) we neutralize/co-opt in MITM.
-- Codex: OpenAI Responses `/v1/responses`, **WebSocket by default** (raw-WS, note #346). Redirect =
-  top-level `openai_base_url` in `~/.codex/config.toml` + a custom `[model_providers.headroom]`
-  table with `supports_websockets=true` (the built-in `openai` provider can't be overridden directly).
+WIRE FORMATS + REDIRECT (note the per-row evidence grade):
+- Claude Code [SELF-VERIFIED — request bodies directly captured through the proxy]: Anthropic
+  `/v1/messages`, plain HTTP. Redirect = `ANTHROPIC_BASE_URL=http://host:port`. Also carries a
+  server-side `context_management` directive (`clear_thinking_*`) — we PASS IT THROUGH unchanged in
+  MITM (do NOT strip; see §6b — Anthropic owns the tail thinking-clear, residual-zero).
+- Codex [HEADROOM-DOCUMENTED + consistent with observed behavior; TO CONFIRM end-to-end at build
+  with a WS-capable proxy]: OpenAI Responses `/v1/responses`, **WebSocket by default** (raw-WS, note
+  #346). Redirect = top-level `openai_base_url` in `~/.codex/config.toml` + a custom
+  `[model_providers.headroom]` table with `supports_websockets=true` (the built-in `openai` provider
+  can't be overridden directly). NOT self-captured end-to-end — the recipe comes from headroom's
+  `wrap.py` + its `handle_openai_responses_ws` relay (production prior art) + note #346; a wrong-key
+  redirect attempt (`chatgpt_base_url`) caught only backend housekeeping, consistent-with-but-not-a-
+  direct-WS-capture. If Codex uses HTTP under some auth config, the recipe shifts — the build re-confirms.
 
 THE KEYSTONE FINDING (the architectural fact, proven 3 ways): **store-marker injection does NOT
 drive LIVE compaction on MITM harnesses** — it's resume-boundary-only. Claude Code + Codex build
@@ -93,7 +100,8 @@ unlike OpenCode/Pi which rebuild the wire from store each turn. Proof: (1) live 
 session disk edit was NOT recalled, in-memory value was, on both; (2) binary recon — no session-
 file watch; (3) claude-code source — compaction is `setMessages(getMessagesAfterCompactBoundary)`
 on the in-memory array scanning an in-memory `compact_boundary` streaming-event, NOT the JSONL
-marker; the only disk read is `loadConversationForResume` (resume only). **This is WHY request-
+marker; the only disk read is `loadConversationForResume` (only at session-load — startup / `--print`
+/ `--resume` — never per-turn). **This is WHY request-
 rewrite is mandatory for MITM, not a choice** — and it cleanly explains the plugin/MITM split.
 
 THE DUAL DESIGN (locked):

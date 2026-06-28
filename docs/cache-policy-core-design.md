@@ -1,8 +1,21 @@
-# Cache-Policy Core — Design Notes (working, pre-co-design with MC)
+# Cache-Policy Core — Design (SPEC #6)
 
-Status: **working draft, NOT locked.** Authored by Alfonso @ subconscious, brokering a
-cross-product design (MC + llm-runner + future harnesses). To be validated against MC's
-accumulated cache-stability invariants before any build.
+Status: **CONVERGED, pending Oracle gate.** Authored by Alfonso @ subconscious, brokering a
+cross-product design (MC + llm-runner + future harnesses). Validated across 5 co-design rounds
+with MC (the frozen-set state machine, anchor-validity, the golden vectors) and aligned to the
+blessed CK#1 (`magic-context/docs/specs/ck-message.md`). The Rust cache-core binds CK#1 §3
+(the `CkMessage` type) + §5.13.4 (`Opaque` as an immovable atomic unit). This doc is the
+companion design that the cache-core Rust implementation binds to; it goes through the same
+Oracle gate CK#1 did before the build.
+
+**CK#1 integration (post-inversion).** The frozen-set has TWO unit categories: (a) transform
+DECISION units (drop / strip / skeleton / synthesized-region / injection — the cache-core's
+own frozen render units), and (b) CONTENT units the machinery must treat as atomic+immovable
+but never originates — chiefly `Opaque` blocks (CK#1 §5.13.4): native-preserved, never
+span-edited, never reordered (immovable under the segmentation-invariance axiom), and
+arc-grouped (an `OpaqueArc{kind:Tool|Approval}` is reclaimed as a whole pair). The anchor
+fingerprint covers content order including `Opaque` positions; the determinism guarantee
+applies to both categories.
 
 ## Why this exists
 
@@ -472,3 +485,36 @@ already does exactly this — `clearedReasoningThroughTag` is persisted durably 
 survives restart, and is reproduced across the conversation lifetime (advance-only watermark,
 clear-on-bust, replay-identical-on-defer). So the owned-leg WAL-durable watermark has a working
 pattern to mirror, not a design to invent.
+
+
+---
+
+# Codec determinism binding (the cache-core ↔ codec seam, SPEC #2 §B)
+
+The codec spec (#2) §B binds the codec layer to this cache-core's frozen-set/byte-stability
+contract. Stated here so both specs assert the same thing (single source of truth for the seam):
+
+**The FrozenRenderConfig is a CLOSED set.** `encode(ck)` (a wire codec's render) MUST be a pure
+function of `(CkMessage, FrozenRenderConfig)` and MUST read NOTHING byte-affecting outside it.
+The closed set, frozen at run-start and reproduced from durable state on resume:
+`{ target wire family, model/wire_model_id, resolved tool set, tool_choice, generation params,
+response_format, cache-policy/breakpoint config, system bytes, the frozen reasoning positional
+bits (is_last_assistant_turn / merge-group membership), the target-native alias map basis,
+provider_options }`. A closed enumeration (not an open "etc.") is what makes "the codec
+introduces no new bust input" CHECKABLE rather than aspirational.
+
+**The three bust-input classes a codec MUST freeze-or-exclude:**
+1. Nonces/timestamps in any emitted field (the identity-lead class) — frozen or stripped.
+2. Non-deterministic iteration order — every map a codec serializes (provider_extras, tool
+   input JSON object keys, nested Opaque-summary structures) MUST be canonical-ordered, or two
+   logically-equal requests diverge on key order = a silent bust.
+3. The per-request alias map — looks stateful, MUST be a pure fn of `(canonical_id, frozen
+   target family)`; never a counter/RNG.
+
+**Cross-episode determinism (the lineage-cumulative gate).** Beyond cross-pass stability
+(`encode` the same CK twice under frozen config → identical bytes), the codec MUST be
+byte-identical across an EPISODE boundary when the FrozenRenderConfig is reproduced from durable
+state (new `RunStarted`, config rebuilt from the durable WAL/store). This is the codec-side twin
+of the lineage-cumulative frozen-unit durability requirement above: without it a codec passes
+every within-run test and busts at the episode boundary (the class that bit the identity-lead).
+SPEC #2 §B.4(d) is this test.

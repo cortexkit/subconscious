@@ -260,3 +260,67 @@ schema doc = **the migration invariant both MC and the Rust core pin**.
 In parallel (contract-shaping, NOT building): the Rust core state value
 `{version, anchor_fingerprint, frozen_units}` + pass-input `{signal, input_identity}` + the
 pure per-pass function, so the harness consumes MC's vector file unchanged when it lands.
+
+
+---
+
+# Round 3 — Leak-A confirmed at source, schema frozen
+
+**Leak-A confirmed (MC, at `inject-compartments.ts:258-292`):** on a defer pass MC does NOT
+re-render m[0]/m[1] — it replays `cached.injection` verbatim; the only per-pass work is
+re-splicing the frozen boundary against the freshly-rebuilt message array (a TRIM to a
+frozen boundary id, not a content re-render). Re-render happens only on a bust pass. So the
+simplification IS MC's reality, and the contract version is *stronger*: MC enforces
+"defer returns cached" by **convention**; our model enforces it **structurally** (the core
+never calls render on defer — there is no defer-path code that *could* re-derive). The
+discipline becomes an invariant.
+
+**Anchor semantics — the load-bearing Leak-C refinement.** Anchor-validity is NOT "is the
+boundary id present?" (too weak *and* too strict). It is **"is the frozen prefix still a
+correct prefix of the live input?"** — a CONTENT fingerprint over the COVERED prefix:
+- `anchor_fingerprint` = fingerprint of the **content** of the prefix the frozen set covers
+  (the bytes it owns), never the boundary id/position.
+- per-pass `input_identity` = the same fingerprint over the **live** prefix at the **same
+  coverage**.
+- Two required sub-cases:
+  - (a) host trimmed/grew **below** the covered prefix, covered content still matches ->
+    **VALID, replay** (the trimmed messages are the ones the splice removes anyway) — must
+    NOT false-positive into a bust.
+  - (b) content **within** the covered prefix changed/retracted -> fingerprint diverges ->
+    **discard + fresh = bust**.
+
+This is MC's `computeRawRangeFingerprint` shape (hash raw content, never tag/drop state).
+"Boundary id present?" misses (b) and false-busts (a); content-over-coverage is correct.
+
+**Frozen schema (the contract MC emits the vector file to):**
+```
+vector = {
+  name,
+  render_config,                  // opaque { system_hash, tool_set_id, model_key }
+  initial_state: { version, anchor_fingerprint, frozen_units: [{ key, kind, frozen_payload }] },
+  passes: [ { signal, input_identity, expect_action, expect_frozen_set_delta: [{ key, kind, frozen_payload }] }, ... ],
+  asserts: [
+    "for every pass i>0 where expect_action==SOFT+: cached_prefix_bytes[i] == cached_prefix_bytes[i-1]",
+    "for every replayed unit on a SOFT+ pass: rendered_bytes(unit) == unit.frozen_payload",
+    "every pass with input_identity diverging over covered prefix: expect_action in {SOFT,HARD}, never SOFT+"
+  ]
+}
+```
+My one pre-freeze ask (the only non-additive item): **`signal` is an OBJECT `{ kind, ... }`,
+never a bare string** — the author layer extends it with `requested_policy` + `provenance` +
+`what`, and string->object is breaking while object+fields is additive.
+
+**Author layer = additive on top of MC's 7 universal vectors** (nothing MC's harness emits):
+- STATE gains an optional `pending_changes` field = queued deferred author transitions
+  awaiting the next HARD bust (the observer harness never populates it). Exercised on the
+  author side of the coordinator vector: a `requested_policy: defer` signal -> SOFT+ + a
+  `pending_changes` delta; a later HARD bust -> all `pending_changes` drain into the fold.
+- I author the AUTHOR-POLICY vectors (defer/now/forced epoch transitions) as an additive set
+  on top of MC's 7. MC's 7 = universal mechanics (anchor/freeze/replay/classify/coordinator);
+  mine = the author-side policy lever. Same file format.
+
+**Status:** architecture + schema converged and frozen (modulo MC's ack of `signal`-as-object).
+Remaining: MC emits the first-cut vector file (its next work item; release train cleared);
+I shape the Rust core (per-pass function + state value) against the frozen schema in parallel;
+then layer the author-policy vectors. **Ufuk sign-off on this converged contract before any
+build.** The vector file is the migration invariant both MC and the Rust core pin.

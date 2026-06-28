@@ -107,15 +107,23 @@ in-memory array, store is read only at resume). So:
   the harness doesn't compact on its own and fight the virtual boundary.
 
 **Codex / OpenAI-Responses server-side chaining — HARD GATE (Oracle, CK#1 §5.12.5).** A
-chaining-capable provider can omit history the server holds (`previous_response_id` + `store:true`).
-We CANNOT compact hidden server-side history — there is nothing on the wire to rewrite, and
-keeping those residual fields would double-count (hidden server history + our m0/m1 prefix). So on
-EVERY outbound Codex request the MITM module MUST verify full-input mode and **REJECT/ABORT
-compaction** (forward untouched or error) if `previous_response_id` is present OR `store` is not
-forced `false`/equivalent. This is a per-request REJECT, not merely a `residual` pass-through. The
-disable-native-compaction step (above) should also force `store:false`/no-chaining where the harness
-config allows; if Codex cannot be forced into full-input mode, Codex MITM is INFEASIBLE (Anthropic,
-which never chains, is the clean first MITM leg regardless).
+chaining-capable provider can omit history the server holds. We CANNOT compact hidden server-side
+history — there is nothing on the wire to rewrite, and keeping those residual fields would
+double-count (hidden server history + our m0/m1 prefix). OpenAI Responses has **THREE** server-state
+references, all of which MUST be gated (not just `previous_response_id`):
+- `previous_response_id` (present/non-null) — chains onto a stored prior response.
+- `conversation` (present/non-null) — a stored conversation whose items are PREPENDED to the
+  request; conversation items persist independently of the 30-day response TTL, so this is hidden
+  history even when `store:false`.
+- `store` not forced `false`/equivalent — leaves the response object server-stored for chaining.
+So on **EVERY outbound Codex request — every WS `response.create` event, not just connection
+setup** — the MITM module MUST **REJECT/ABORT compaction** (forward untouched or error) if ANY of:
+`previous_response_id` present, `conversation` present/non-null, `store !== false`, or any future
+Responses field that references server-held input items. This is a per-request REJECT keyed on
+"any server-side-state ref," not merely a `residual` pass-through. The disable-native-compaction
+step (above) should also force `store:false` + no `conversation`/`previous_response_id` where the
+harness config allows; if Codex cannot be forced into full-input mode, Codex MITM is INFEASIBLE
+(Anthropic, which never chains, is the clean first MITM leg regardless).
 
 **Boundary authority (resolves the §2/§8 "stateless per call" vs "in-memory virtual boundary"
 tension).** MC is the SOLE authority for the compaction boundary + frozen-set. The MITM module is
@@ -123,6 +131,17 @@ stateless-authoritative: it MAY cache only an EPHEMERAL `(session_id, mc_state_v
 mirror for the in-flight request, and MUST refresh/validate it against MC every transform pass
 (carry `mc_state_version`; on mismatch, re-fetch). The MITM mirror is never authoritative — it
 cannot become a split-brain second source of boundary truth.
+
+**Provider-wire `boundary_id` derivation (cache-core requires boundary-PRESENCE, not just
+whole-message presence).** The cache core's anchor is `boundary_id` / `boundary_present` (a stable
+boundary descriptor matched in the live array), so the MITM provider-wire `decode` MUST produce a
+**stable boundary descriptor per provider message-array element** for MC to splice against — NOT
+merely assert "whole messages." For a wire with a stable native item/message id (Anthropic message
+objects), that id IS the descriptor. For a wire WITHOUT a stable native id, the codec MUST define a
+deterministic descriptor (e.g. a content-derived stable element key), or MITM compaction is
+INFEASIBLE for that wire (documented per-family, like the Codex full-input precondition). Without a
+stable boundary descriptor the cache core cannot do boundary-presence, so this is a hard per-wire
+requirement, not a should.
 
 ## 6. Byte-fidelity contract
 
@@ -208,7 +227,17 @@ transport headers**:
 
 - **Claude Code (HTTP):** a local HTTP server; read the request body, decode/transform/
   rewrite, forward to `api.anthropic.com` with the header rule above, stream the SSE response
-  back verbatim.
+  back to the harness.
+
+**Response-side rules (the response is NOT a blind passthrough).** Stream the provider response
+back but: strip hop-by-hop RESPONSE headers; never forward a stale `Content-Length` (the stream is
+proxied, not buffered); PRESERVE `Content-Type: text/event-stream` + the provider's
+request-id/rate-limit headers (the harness reads them); do NOT auto-follow a cross-origin redirect
+carrying the auth header; and do NOT retry the upstream once any response byte has been written
+back to the harness (a retry-after-partial-write would duplicate/corrupt the SSE stream). The SSE
+body itself passes through verbatim (we do not rewrite the response), but the event framing
+(`data:` chunks, ping/keepalive events, the terminal `[DONE]`/`message_stop`) must be relayed
+intact — a dropped terminator hangs the harness.
 - **Codex (WS):** a WS relay with a WS→HTTP fallback — TERMINATE the harness WS and INITIATE a
   fresh upstream WS handshake (WS handshake headers cannot be blindly forwarded). **Reference
   headroom** (`~/Work/OSS/headroom`, Apache-2.0): its `headroom-proxy` has a working
@@ -221,11 +250,12 @@ transport headers**:
 
 The MITM module is stateless per call, so its OWN restart is trivial (next request re-decodes
 full). The stateful piece is MC (the frozen-set + the virtual boundary), recovered per SPEC
-#5. MC's persisted state includes the **byte-complete frozen m0/m1 payloads** + the boundary id
-+ the state version — NOT just a boundary pointer — so the rewritten prefix is byte-identical
-across a daemon restart (a pointer alone would force a re-render and risk drift). The harness-side
-store marker (§5) covers a HARNESS restart/resume (loads compacted, not full), with the
-MC-first write ordering above.
+#5. MC's persisted state includes the **byte-complete frozen payloads of ALL cache-core
+frozen_units** (the m0/m1 synthesized regions AND any v2 span-edit `[dropped §N§]` units — all
+`lineage`-class per the cache-core durability model) + the boundary id + the state version — NOT
+just a boundary pointer — so the rewritten prefix is byte-identical across a daemon restart (a
+pointer alone would force a re-render and risk drift). The harness-side store marker (§5) covers a
+HARNESS restart/resume (loads compacted, not full), with the MC-first write ordering above.
 
 ## 9. Auth (explicit)
 

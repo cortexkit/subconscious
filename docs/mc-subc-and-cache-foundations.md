@@ -27,13 +27,19 @@ over a shared DB across two message models. A single stateful daemon + one canon
 - **MC-under-SUBC** (the migration): MC becomes a daemon module; the transform relocates,
   the self-inflicted machinery collapses.
 
-## 2. Cache-policy core (LOCKED — full contract in cache-policy-core-design.md)
+## 2. Cache-policy core (LOCKED — full contract in cache-policy-core-design.md; this summary UPDATED to the Round-4 boundary-presence mechanism)
 - Render-on-bust / replay-verbatim-on-defer = the structural bug-class kill (no defer-pass render).
-- Frozen RENDER UNITS with byte-complete payloads; atomic version-stamped CAS state.
-- Anchor-validity = content fingerprint over the COVERED prefix (host-trim-below = replay;
-  in-prefix-retract = bust). Opaque tokens, not hashes — harness-neutral.
-- 8 golden mechanics vectors verified at source; V4 (byte-complete) + V8 (revert) are the leak-catches.
-- The delta wire protocol's `array_fingerprint` == the vectors' `input_identity` (one mechanism, two purposes).
+- Frozen RENDER UNITS with byte-complete (EXACT-bytes) payloads; atomic version-stamped CAS state.
+- **Anchor-validity = BOUNDARY-PRESENCE** (is `boundary_id` still in the live array?) + frozen-byte
+  replacement of the covered prefix — there is **NO content fingerprint over the covered prefix**
+  (the old "content-fingerprint / in-prefix-retract = bust" model is SUPERSEDED). An in-prefix edit
+  is summarized away (not stale-cache); a revert that removes the boundary reuses-then-reconciles on
+  the next bust. `boundary_id` / `boundary_present` are opaque equality tokens, not hashes.
+- 9 golden vectors (schema_version 2): 8 mechanics (V4 byte-complete + V8 revert-removes-boundary)
+  + V9 cross-episode lineage. Cache frozen units are ALL `lineage`.
+- **`full_array_fingerprint` (spec #4 delta/LKG whole-array staleness) is DISTINCT from the cache
+  anchor (boundary-presence)** — the old `array_fingerprint == input_identity` equation was a
+  conflation, now split. `computeRawRangeFingerprint` = historian snapshot validator, NOT the anchor.
 
 ## 3. CK Message canonical (LOCKED pending Ufuk blessing)
 - **[DECISION — Ufuk]** CK SUPERSET, llm-runner canonical = byte-affecting PROJECTION.

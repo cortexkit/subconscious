@@ -17,9 +17,16 @@ Oracle gate CK#1 did before the build.
 >   covered prefix, so NO collision surface. An in-prefix edit is summarized away (not stale-
 >   cache); a revert that removes the boundary reuses-then-reconciles-on-next-bust.
 > - **Field names:** `boundary_id` (state coverage descriptor), `boundary_present` (per-pass
->   bool), `full_array_fingerprint` (spec #4 delta/LKG staleness — a DIFFERENT, whole-array
->   identity, never the cache anchor). The old `anchor_fingerprint` / `input_identity` are the
->   same opaque-token state/pass slots, renamed.
+>   OPAQUE TOKEN compared for equality against `boundary_id`, NOT a bool — present-id or the
+>   absent-sentinel `"-"`), `full_array_fingerprint` (spec #4 delta/LKG staleness — a DIFFERENT,
+>   whole-array identity, never the cache anchor). The old `anchor_fingerprint` / `input_identity`
+>   are the same opaque-token state/pass slots, renamed.
+> - **`system_hash` is a CONTENT-DERIVED HARD-bust/epoch marker, NOT a `FrozenRenderConfig`
+>   member** (system is CK content per CK#1 §2.1/§5.11 + codec §B.2). `render_config` in the
+>   vectors is the observed bust-EPOCH tuple (system_hash + tool_set_id + model_key +
+>   serializer_profile_id); the codec's `FrozenRenderConfig` closed set is the byte-affecting
+>   RENDER inputs (system excluded — it's content). Same epoch, two distinct roles: epoch marker
+>   vs render input.
 > - **`computeRawRangeFingerprint` is the HISTORIAN in-flight snapshot validator, NOT the cache
 >   anchor** (MC source-verified). Any earlier line citing it as the anchor reference impl is
 >   superseded; the anchor reference impl is the boundary-id splice (`inject-compartments.ts:258-292`).
@@ -215,15 +222,18 @@ Resolution — split the frozen-id pattern by who is error-prone:
   replays and **never interprets the payload** (stays harness-neutral). Write-back of the
   whole set is **ATOMIC** — `new_state` is ONE value (units + markers + manifest), never
   per-unit (MC tore the cache when m[1] persisted but markers didn't).
-- **Leak C — "replay every pass" is UNSAFE under revert/truncation -> "replay every pass
-  WHILE ANCHORED."** If the user reverts turns or the host trims the array, the ids the
-  frozen set points at vanish; blind-replay renders against a shifted/absent anchor. Fix:
-  the core's FIRST per-pass step is an **anchor-validity check** — does the live input-prefix
-  identity still match the identity the frozen set was computed against? match -> replay;
-  mismatch -> **discard frozen set + treat as bust (fresh render)**, never blind-replay.
-  Critically, **revert is HOST-caused = OBSERVED even for the author harness**, so the
-  anchor check is **universal**, not observer-only — the author-side advantage covers
-  *authored* changes but not revert.
+- **Leak C — "replay every pass" is qualified by BOUNDARY-PRESENCE (corrected Round 4; the
+  original "discard + bust on mismatch" framing is SUPERSEDED).** If the user reverts turns or
+  the host trims the array, the boundary id the frozen set splices at may vanish. The core's
+  FIRST per-pass step is the **boundary-presence check**: is `state.boundary_id` still in the
+  live array? PRESENT → splice the covered prefix out at it + replay the frozen bytes. ABSENT
+  (a revert removed/crossed the boundary) → **KEEP replaying the frozen bytes THIS pass (SOFT+,
+  `reconcile_pending`)** and rematerialize on the NEXT cache-busting pass — NOT a same-pass
+  discard/bust (there is no covered-prefix fingerprint, so an in-prefix edit is summarized away,
+  never a bust; only an explicit `render_config` epoch change is a HARD bust). **Revert is
+  HOST-caused = OBSERVED even for the author harness**, so the boundary-presence check is
+  **universal**, not observer-only — the author-side advantage covers *authored* changes but
+  not revert.
 - **Leak D — the transition must be VERSION-STAMPED CAS, not last-write-wins.** MC shares
   one SQLite store across opencode+pi processes; the shared core must back MC later, so
   `core(prev_state, signal) -> (new_state, action)` stamps `new_state.version =
@@ -238,8 +248,11 @@ Resolution — split the frozen-id pattern by who is error-prone:
 
 ```
 core(prev_state, pass_input) -> (new_state, action)
-  pass_input = { signal, boundary_present }     // boundary_present: bool, harness derives by
-                                                //   findIndex(live array, state.boundary_id) >= 0
+  pass_input = { signal, boundary_present }     // boundary_present: an OPAQUE live-boundary TOKEN
+                                                //   (e.g. "b0" / "-"), compared for EQUALITY against
+                                                //   state.boundary_id — NOT a bool. The harness derives it
+                                                //   by findIndex(live array, state.boundary_id): the matched
+                                                //   id token if present, the absent-sentinel "-" if not.
   state      = { version,
                  boundary_id,                    // the coverage descriptor (Oracle B2): the id the
                                                  //   covered prefix is spliced out at; CAS-retry
@@ -247,10 +260,11 @@ core(prev_state, pass_input) -> (new_state, action)
                  frozen_units: [{ key, kind, frozen_payload, durability_class }] }
                                                  // durability_class: "episode" | "lineage"
 
-  1. BOUNDARY CHECK (Leak C): boundary_present?
-        present -> covered prefix is spliced out at boundary_id, frozen bytes replace it -> eligible to replay
-        absent  -> reuse cache THIS pass; the revert reconciles on the NEXT bust (no discard, no
-                   content-fingerprint divergence — in-prefix edits are summarized away, never bust)
+  1. BOUNDARY CHECK (Leak C): boundary_present == state.boundary_id ?
+        equal  -> covered prefix is spliced out at boundary_id, frozen bytes replace it -> eligible to replay
+        absent ("-") -> reuse cache THIS pass (SOFT+, reconcile_pending); the revert reconciles on the
+                   NEXT bust (no discard, no content-fingerprint divergence — in-prefix edits are
+                   summarized away, never bust)
   2. CLASSIFY (signals): SOFT+ | SOFT | HARD
   3a. on BUST: harness renders byte-complete units -> freeze into new_state (A/B),
         version = prev.version + 1, drain ALL deferred work into this one bust (coordinator);
@@ -345,9 +359,13 @@ fingerprint over the covered prefix at all**:
   - boundary id **present** in the live array → splice succeeds against the same frozen bytes →
     **replay**.
   - boundary id **removed/moved** by a revert → `findIndex < 0` → **reuse the cache THIS pass**
-    (treat as already-trimmed) + **reconcile on the next BUST pass** (rematerialize m0 against the
-    live reverted array). A one-pass stale-summary window — content-quality, not cache-correctness,
-    and the existing shipped behavior; NOT a new hazard.
+    (treat as already-trimmed) + **reconcile on the next cache-busting pass** (rematerialize m0
+    against the live reverted array). The stale-summary window lasts **until the next bust** — it
+    is typically one pass, but if only `SOFT+` defer passes follow, `reconcile_pending` persists
+    across them (the frozen bytes keep replaying, byte-stable). This is an accepted content-quality
+    loss (the summary describes briefly-reverted content), NOT a cache-correctness bug, and the
+    existing shipped behavior. (If a future requirement needs faster reconciliation,
+    `reconcile_pending` could force the next pass to bust — not v1.)
 
 So: **anchor-validity = boundary-presence + frozen-byte replacement, never a covered-prefix
 fingerprint.** `computeRawRangeFingerprint` is a different mechanism on a different path
@@ -366,9 +384,10 @@ vector = {
   asserts: [
     "for every pass i>0 where expect_action==SOFT+: cached_prefix_bytes[i] == cached_prefix_bytes[i-1]",
     "for every replayed unit on a SOFT+ pass: replayed_bytes(unit) == unit.frozen_payload (EXACT, not re-rendered)",
-    "every pass with boundary_present==false: expect_action != SOFT+ (reuse-then-reconcile, never a fresh SOFT+ replay against a moved boundary)",
-    "a whole-frozen-set anchor mismatch ⇒ expect_action == HARD (full invalidation, never SOFT/SOFT+)",   // SF2
-    "across a RunStarted boundary: 'episode' units reset; 'lineage' units (m0/m1 boundary, reasoning-clear watermark) survive byte-identical"  // B5 cross-episode
+    "boundary_present == boundary_id: splice+replay (SOFT+ unless a delta/render_config/epoch forces SOFT/HARD)",
+    "boundary_present absent ('-'): KEEP replaying frozen bytes (SOFT+, reconcile_pending), NEVER a blind same-pass rebuild; reconcile on the next cache-busting pass",   // SF2 (boundary-presence model)
+    "a render_config/epoch HARD bust ⇒ expect_action == HARD (full invalidation + fresh render + new boundary_id)",
+    "across a RunStarted boundary: 'lineage' units (m0/m1 boundary, reasoning-clear watermark) reproduce byte-identical; 'episode' units (none in the cache set today; reserved) would reset"  // B5 cross-episode
   ]
 }
 ```
@@ -407,7 +426,7 @@ vector = {
   render_config: { system_hash, tool_set_id, model_key, serializer_profile_id },
   initial_state: { version, boundary_id, frozen_units:[{key,kind,frozen_payload,durability_class,reset_rule}], pending_changes?:[...] },
   passes: [ { signal:{kind,...}, boundary_present, expect_action: "SOFT+"|"SOFT"|"HARD",
-              expect_frozen_set_delta:[{key,kind,frozen_payload,durability_class}], expect_pending_delta?:[...] } ],
+              expect_frozen_set_delta:[{key,kind,frozen_payload,durability_class,reset_rule}], expect_pending_delta?:[...] } ],
   asserts: [
     "i>0 & expect_action==SOFT+  ->  cached_prefix_bytes[i] == cached_prefix_bytes[i-1]",
     "replayed unit on SOFT+      ->  rendered_bytes(unit) == unit.frozen_payload",
@@ -463,16 +482,18 @@ verified at source against the frozen schema — exact match:
   SOFT+/SOFT/HARD action model, frozen-render-unit byte-completeness, anchor-content-over-
   coverage, opaque-token rule, the two-source coordinator, and the stated axioms.
 
-**The 8 vectors:** V1 growing-tail-defer (steady-state zero-bust), V2 post-execute-settle
-(execute busts once, defers after are byte-stable), V3 frozen-strip-not-first-applied-on-
-defer (the single most-broken MC regression), **V4 skeleton-byte-complete-across-moving-
-window (Leak-A catch)**, V5 delta-rides-m1-SOFT-m0-frozen, V6 hard-fold-folds-m1-into-m0-
-and-drains-deferred (the coordinator), V7 provider-nonce-only-is-not-a-bust, **V8 revert-
-within-covered-prefix-discards-and-rebuilds (Leak-C catch)**.
+**The 9 vectors (schema_version 2):** V1 growing-tail-defer (steady-state zero-bust), V2
+post-execute-settle (execute busts once, defers after are byte-stable), V3 frozen-strip-not-
+first-applied-on-defer (the single most-broken MC regression), **V4 skeleton-byte-complete-
+across-moving-window (Leak-A catch)**, V5 delta-rides-m1-SOFT-m0-frozen, V6 hard-fold-folds-
+m1-into-m0-and-drains-deferred (the coordinator), V7 provider-nonce-only-is-not-a-bust, **V8
+revert-removes-boundary-reconciles-next-bust (Leak-C catch, boundary-presence model)**, V9
+cross-episode-lineage-units-reproduce-byte-identical (the durability / RunStarted twin).
 
 **V4 + V8 are the two to wire first** — they encode the exact two leaks the clean model
-would have walked into (byte-complete payload, anchor-content-over-coverage). A consumer
-that greens those two has the two scar-forced refinements correctly implemented.
+would have walked into (byte-complete payload; the boundary-presence anchor, NOT a content
+fingerprint over coverage). A consumer that greens those two has the two scar-forced
+refinements correctly implemented; V9 adds the cross-episode lineage-durability gate.
 
 `common_asserts` (top-level): the three locked + "a SOFT/HARD pass may/must change cached
 bytes (that is the bust)." `frozen_payload` values are illustrative harness-output samples

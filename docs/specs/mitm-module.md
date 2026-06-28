@@ -124,8 +124,12 @@ prefix} + {verbatim tail bytes} + {residual top-level fields}` — no full round
 
 **The v1 byte-fidelity contract = SPLICE-VALIDITY + frozen-prefix-replay + tail-passthrough.**
 Splice-validity:
-- the boundary must NOT cut a tool arc (an orphaned tool_result 400s — same as MC's
-  protected-tail open-arc handling);
+- the boundary must NOT cut any correlated ARC. This is the general form (CK#1 §5.13.3
+  `OpaqueArc{kind, id, role}`): a standard tool_use↔tool_result pair, AND a provider
+  `OpaqueArc` of kind `Tool` (server_tool_use↔result) OR `Approval`
+  (mcp_approval_request↔response). `synthesize_hard_stop` groups an arc and MUST keep both
+  halves on the same side of the boundary — an orphaned result (standard or Opaque) 400s.
+  Arc-grouping survives the MITM compaction boundary (CK#1 §5.13.3).
 - signed-thinking continuity across the boundary (a replaced/compacted earlier assistant
   turn must not strand a signed thinking block the next turn's validation needs);
 - valid message-sequence/role ordering after the splice.
@@ -138,6 +142,14 @@ wire bytes, splice `[dropped §N§]` in place, every other byte verbatim. STILL 
 tail re-render. The only new mechanism is **offset-aware decode** (byte-offset tracking for
 mutation-target spans). Cache-wise identical to a plugin-leg reclaim — a surgical
 `[dropped §N§]` span IS a frozen unit, so it reuses the cache core unchanged.
+
+**Span-edits target STANDARD `ToolResult` content ONLY — never inside an `Opaque` block.**
+CK#1 §5.13.4 makes `Opaque` ATOMIC: a provider-native block (server_tool_use, web_search
+result, etc.) is NEVER partially edited. So v2 reclaim of an Opaque server-tool result is
+not a span-edit inside it — it is whole-block: the WHOLE Opaque (and its whole arc, both
+halves) is either summarized into the m0/m1 prefix or passed through verbatim in the tail,
+never span-mutated. Only a standard typed-core `ToolResult.output` content region is
+span-reclaimable. This keeps Opaque opacity + arc validity intact under v2.
 
 ## 7. Transport (HTTP and WS)
 

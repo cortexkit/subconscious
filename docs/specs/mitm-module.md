@@ -96,9 +96,33 @@ in-memory array, store is read only at resume). So:
   the wire and we own the wire.
 - **RESTART persistence = store-marker injection.** ALSO write the harness's native store
   marker (`isCompactSummary` / `compacted`) so a resume loads from the compacted state, not
-  full history.
+  full history. **Write ordering (Oracle SF): persist MC's frozen-set state FIRST, THEN write the
+  harness marker, stamped with the `mc_state_version` + session id.** The MC durable boundary and
+  the harness store marker are two different stores; on a resume mismatch (marker version ≠ MC
+  state, or a corrupt/half-written marker) treat it as a HARD bust/reconcile — rematerialize against
+  the live array, never blindly replay a frozen set whose marker can't be confirmed against MC's
+  state. A half-written marker is thus always safe (it loses the marker, falls back to a fresh
+  fold, never replays stale frozen bytes).
 - **DISABLE native auto-compaction** (`DISABLE_AUTO_COMPACT` / `auto_compact_token_limit`) so
   the harness doesn't compact on its own and fight the virtual boundary.
+
+**Codex / OpenAI-Responses server-side chaining — HARD GATE (Oracle, CK#1 §5.12.5).** A
+chaining-capable provider can omit history the server holds (`previous_response_id` + `store:true`).
+We CANNOT compact hidden server-side history — there is nothing on the wire to rewrite, and
+keeping those residual fields would double-count (hidden server history + our m0/m1 prefix). So on
+EVERY outbound Codex request the MITM module MUST verify full-input mode and **REJECT/ABORT
+compaction** (forward untouched or error) if `previous_response_id` is present OR `store` is not
+forced `false`/equivalent. This is a per-request REJECT, not merely a `residual` pass-through. The
+disable-native-compaction step (above) should also force `store:false`/no-chaining where the harness
+config allows; if Codex cannot be forced into full-input mode, Codex MITM is INFEASIBLE (Anthropic,
+which never chains, is the clean first MITM leg regardless).
+
+**Boundary authority (resolves the §2/§8 "stateless per call" vs "in-memory virtual boundary"
+tension).** MC is the SOLE authority for the compaction boundary + frozen-set. The MITM module is
+stateless-authoritative: it MAY cache only an EPHEMERAL `(session_id, mc_state_version, boundary)`
+mirror for the in-flight request, and MUST refresh/validate it against MC every transform pass
+(carry `mc_state_version`; on mismatch, re-fetch). The MITM mirror is never authoritative — it
+cannot become a split-brain second source of boundary truth.
 
 ## 6. Byte-fidelity contract
 
@@ -123,16 +147,26 @@ prefix} + {verbatim tail bytes} + {residual top-level fields}` — no full round
   message needs quirk-fixing → pure pass-through is viable).
 
 **The v1 byte-fidelity contract = SPLICE-VALIDITY + frozen-prefix-replay + tail-passthrough.**
-Splice-validity:
+A boundary is **splice-safe** iff it is a provider-wire **message-array element boundary** that
+ALSO satisfies all of the following (Oracle: role+arc validity alone is insufficient — a boundary
+can be role-valid and arc-valid yet still cut a provider-rendered ASSEMBLY UNIT and reflow
+neighboring blocks):
 - the boundary must NOT cut any correlated ARC. This is the general form (CK#1 §5.13.3
   `OpaqueArc{kind, id, role}`): a standard tool_use↔tool_result pair, AND a provider
   `OpaqueArc` of kind `Tool` (server_tool_use↔result) OR `Approval`
   (mcp_approval_request↔response). `synthesize_hard_stop` groups an arc and MUST keep both
   halves on the same side of the boundary — an orphaned result (standard or Opaque) 400s.
   Arc-grouping survives the MITM compaction boundary (CK#1 §5.13.3).
+- the boundary must NOT split a CK **render ASSEMBLY GROUP or SEGMENT** (CK#1 §5.12): a
+  consecutive-assistant merge-group, a user+tool combined group, or a thinking-segment boundary
+  (`moveToolUseBlocksToEnd`). Splitting one makes the raw tail no longer byte-spliceable OR
+  reflows neighboring `tool_use` blocks across the cut = a different, possibly-invalid request.
 - signed-thinking continuity across the boundary (a replaced/compacted earlier assistant
   turn must not strand a signed thinking block the next turn's validation needs);
-- valid message-sequence/role ordering after the splice.
+- valid message-sequence/role ordering after the splice, AND whole-message presence (the
+  boundary falls BETWEEN provider message-array elements, never mid-element).
+Conformance: splice-safety tests for assistant merge-groups, user+tool assembly, thinking-boundary
+tool-use reflow, and whole-message presence — not only the arc/signature/role checks.
 
 ### v2 — tail reclaim via surgical byte-span edits (extension)
 MC also reclaims SPENT TOOL OUTPUTS in the working window (smart-drops, emergency drops,
@@ -143,23 +177,43 @@ tail re-render. The only new mechanism is **offset-aware decode** (byte-offset t
 mutation-target spans). Cache-wise identical to a plugin-leg reclaim — a surgical
 `[dropped §N§]` span IS a frozen unit, so it reuses the cache core unchanged.
 
-**Span-edits target STANDARD `ToolResult` content ONLY — never inside an `Opaque` block.**
-CK#1 §5.13.4 makes `Opaque` ATOMIC: a provider-native block (server_tool_use, web_search
-result, etc.) is NEVER partially edited. So v2 reclaim of an Opaque server-tool result is
-not a span-edit inside it — it is whole-block: the WHOLE Opaque (and its whole arc, both
-halves) is either summarized into the m0/m1 prefix or passed through verbatim in the tail,
-never span-mutated. Only a standard typed-core `ToolResult.output` content region is
-span-reclaimable. This keeps Opaque opacity + arc validity intact under v2.
+**Span-edits target STANDARD `ToolResult` LEAF content spans ONLY — never an `Opaque` block,
+including a NESTED one.** CK#1 §5.13.4 makes `Opaque` ATOMIC wherever it appears — top-level OR
+nested. The trap (Oracle): a standard typed `ToolResult.output` of kind `Content(Vec<ResultBlock>)`
+can CONTAIN a `ResultBlockKind::Opaque` (CK#1 §5.6.2) — so a byte-span replacement over the WHOLE
+tool-result content would overwrite the nested Opaque's bytes, violating atomicity. Therefore the
+v2 offset map MUST expose **leaf spans** (the `Text` / `Json` output regions), NOT the parent
+`ToolResult` span, and a span-edit edits ONLY non-Opaque leaf spans, preserving every nested
+`Opaque` byte range whole. A whole Opaque server-tool result (and its whole arc) is either
+summarized into the m0/m1 prefix or passed through verbatim — never span-mutated. (Shared finding:
+this is the same atomic-Opaque rule the §F provider-wire encode binds — a nested Opaque is re-emitted
+whole, never flattened. One rule, three consumers: encode, MITM v2 span-edit, cache-core unit.)
 
 ## 7. Transport (HTTP and WS)
 
+**Header handling after a body rewrite (Oracle: "preserve original headers" is invalid once the
+body changes).** The rule is **preserve AUTH-relevant provider headers verbatim; RECONSTRUCT
+transport headers**:
+- preserve verbatim: `Authorization` / `x-api-key` / the harness's auth + provider-API headers
+  (e.g. `anthropic-version`, `anthropic-beta`) — the auth/semantic dimension (§9).
+- recompute/rewrite: `Content-Length` (the body changed), `Host` / `:authority` (must target the
+  REAL provider, not localhost), and strip hop-by-hop headers (`Connection`, `Transfer-Encoding`,
+  `Keep-Alive`, etc.). Reject or normalize a COMPRESSED request body (`Content-Encoding`) — decode
+  it before rewrite, re-encode or drop the header to match the emitted body.
+- **Auth-safety caveat:** this assumes a HEADER/token auth scheme (Anthropic, OpenAI — true for
+  both targets). If a provider ever used a SIGNED-BODY scheme (a body HMAC/signature header), a
+  body rewrite would invalidate the signature → MITM is infeasible for that provider without
+  re-signing, which we cannot do without its key. Both v1 targets are token-auth, so this is a
+  documented non-issue today, flagged so a future signed-body provider isn't silently broken.
+
 - **Claude Code (HTTP):** a local HTTP server; read the request body, decode/transform/
-  rewrite, forward to `api.anthropic.com` preserving the original headers (auth + the
-  `context_management` field), stream the SSE response back verbatim.
-- **Codex (WS):** a WS relay with a WS→HTTP fallback. **Reference headroom**
-  (`~/Work/OSS/headroom`, Apache-2.0): its `headroom-proxy` has a working
-  `/v1/responses` WS relay + WS→HTTP fallback — study the transport solution, build
-  subc-native in Rust with OUR codecs/cache core. Do NOT fork or depend.
+  rewrite, forward to `api.anthropic.com` with the header rule above, stream the SSE response
+  back verbatim.
+- **Codex (WS):** a WS relay with a WS→HTTP fallback — TERMINATE the harness WS and INITIATE a
+  fresh upstream WS handshake (WS handshake headers cannot be blindly forwarded). **Reference
+  headroom** (`~/Work/OSS/headroom`, Apache-2.0): its `headroom-proxy` has a working
+  `/v1/responses` WS relay + WS→HTTP fallback — study the transport solution, build subc-native
+  in Rust with OUR codecs/cache core. Do NOT fork or depend.
 - Session identity is derived from the request (harness/provider-specific — e.g. a session
   header or a stable conversation id); the MITM module keys its per-session MC route on it.
 
@@ -167,9 +221,11 @@ span-reclaimable. This keeps Opaque opacity + arc validity intact under v2.
 
 The MITM module is stateless per call, so its OWN restart is trivial (next request re-decodes
 full). The stateful piece is MC (the frozen-set + the virtual boundary), recovered per SPEC
-#5 (durable store → reconstruct frozen-set; the boundary is also persisted so the rewritten
-prefix is stable across a daemon restart). The harness-side store marker (§5) covers a
-HARNESS restart/resume (loads compacted, not full).
+#5. MC's persisted state includes the **byte-complete frozen m0/m1 payloads** + the boundary id
++ the state version — NOT just a boundary pointer — so the rewritten prefix is byte-identical
+across a daemon restart (a pointer alone would force a re-render and risk drift). The harness-side
+store marker (§5) covers a HARNESS restart/resume (loads compacted, not full), with the
+MC-first write ordering above.
 
 ## 9. Auth (explicit)
 

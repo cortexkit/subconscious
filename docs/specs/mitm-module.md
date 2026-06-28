@@ -105,8 +105,13 @@ in-memory array, store is read only at resume). So:
 ### v1 — prefix-compaction + verbatim tail (ship first)
 The rewritten request is:
 ```
-[ frozen m0/m1 PREFIX ]  +  [ post-boundary TAIL passed through VERBATIM ]  +  a clean SPLICE
+[ frozen m0/m1 PREFIX ]  +  [ post-boundary TAIL passed through VERBATIM ]
+   + [ request-level RESIDUAL fields spliced back ]  +  a clean SPLICE
 ```
+The `residual` is `DecodedRequest.residual` (SPEC #2 §4): request-level JSON the summarizer
+must not lose but does not interpret (unknown/forward-compat top-level fields, e.g. Claude
+Code's `context_management` directive). The MITM re-encode is therefore `{frozen m0/m1
+prefix} + {verbatim tail bytes} + {residual top-level fields}` — no full round-trip.
 - The m0/m1 prefix is MC's synthesis, rendered CK → provider wire by the codec lib, and is a
   cache-core **frozen unit** (byte-identical replay across defer passes).
 - The tail is the harness's own emitted bytes, **passed through unchanged** — we never

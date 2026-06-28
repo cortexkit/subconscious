@@ -133,3 +133,130 @@ both feeding the in-process decider via pushed epoch state, never a per-pass cal
    consumed by MC?
 4. Which MC-specific invariants would the classifier extraction risk breaking — what must
    the contract preserve verbatim?
+
+
+---
+
+# Co-design with MC — converged contract (rounds 1-2)
+
+Status: **architecture converged; final artifact (golden vectors) pending.** MC (Alfonso @
+magic-context) delivered its hard-won invariants and we ran two design rounds. The model
+below is materially stronger than the draft above — MC's *post-frozen-id* scars (the bugs
+that bit MC *after* it already had the frozen-id discipline) are exactly the traps a clean
+model walks into.
+
+## The reshape: hoist the frozen-set state machine INTO the core
+
+The keystone correction: **byte-identical-defer-replay is a Layer-2 (render) property the
+classifier does not own.** A perfectly correct classifier can still kill the cache if the
+render layer re-derives bytes from moving state (window position, watermark, boundary,
+current content). So the contract must protect byte-identity **structurally**, not leave
+each harness to rediscover the frozen-id discipline and re-scar.
+
+Resolution — split the frozen-id pattern by who is error-prone:
+- **WHEN to freeze** (only on a bust pass) = decision logic -> **CORE**.
+- **WHAT is frozen** (the affected render units + their byte-complete payloads) = state ->
+  **CORE-owned value**, harness-persisted, replayed every pass.
+- **HOW a unit renders to bytes** = the harness produces final bytes **on a bust pass**;
+  the core freezes those bytes. **There is NO render call on a defer pass** — defer = place
+  the frozen bytes verbatim. This makes defer-pass re-derivation *structurally impossible*.
+
+## The four leaks (MC) and their integration
+
+- **Leak A — `decision` must be a byte-COMPLETE payload, not an enum tag.** A rich unit
+  (skeleton/edit-marker renders filePath + a 40-char diff-prefix) re-derived from current
+  content flips bytes on defer. Fix: the harness renders final bytes at freeze time; the
+  core stores `{key, kind, frozen_payload}` (bytes or complete inputs), **never
+  `{id, enum}`**. "Pure render" is necessary but not sufficient; "decision is byte-complete"
+  is the other half. (MC's collapse to a single `[dropped N]` worked precisely because the
+  payload was made trivial; rich payloads must freeze the payload.)
+- **Leak B — the frozen set is RENDER UNITS, not just per-id drops.** A unit is
+  `{drop | strip | skeleton | synthesized-region | injection}` — includes whole synthesized
+  regions (m[0], m[1] full block bytes) AND deterministic injections (synthetic-todowrite).
+  Each is an opaque byte-complete payload the harness produces on bust; the core freezes +
+  replays and **never interprets the payload** (stays harness-neutral). Write-back of the
+  whole set is **ATOMIC** — `new_state` is ONE value (units + markers + manifest), never
+  per-unit (MC tore the cache when m[1] persisted but markers didn't).
+- **Leak C — "replay every pass" is UNSAFE under revert/truncation -> "replay every pass
+  WHILE ANCHORED."** If the user reverts turns or the host trims the array, the ids the
+  frozen set points at vanish; blind-replay renders against a shifted/absent anchor. Fix:
+  the core's FIRST per-pass step is an **anchor-validity check** — does the live input-prefix
+  identity still match the identity the frozen set was computed against? match -> replay;
+  mismatch -> **discard frozen set + treat as bust (fresh render)**, never blind-replay.
+  Critically, **revert is HOST-caused = OBSERVED even for the author harness**, so the
+  anchor check is **universal**, not observer-only — the author-side advantage covers
+  *authored* changes but not revert.
+- **Leak D — the transition must be VERSION-STAMPED CAS, not last-write-wins.** MC shares
+  one SQLite store across opencode+pi processes; the shared core must back MC later, so
+  `core(prev_state, signal) -> (new_state, action)` stamps `new_state.version =
+  prev.version + 1` and defines the compare-version contract; the **harness** does the
+  atomic CAS write-back (compare prev-version, swap, idempotent under retry). Single-writer
+  (llm-runner) always wins uncontended; multi-writer (MC) retries — same core. This is the
+  epoch-CAS primitive already shipped in `cortexkit-lease` + the credential vault. The core
+  stays storage-agnostic (stamps + defines compare-version; the harness's store enforces
+  atomicity).
+
+## The per-pass core function (converged)
+
+```
+core(prev_state, pass_input) -> (new_state, action)
+  pass_input = { signal, input_identity }       // input_identity = opaque prefix fingerprint
+  state      = { version, anchor_fingerprint, frozen_units: [{ key, kind, frozen_payload }] }
+
+  1. ANCHOR CHECK (Leak C): input_identity vs prev_state.anchor_fingerprint
+        mismatch -> bust (discard frozen set)
+  2. CLASSIFY (signals): SOFT+ | SOFT | HARD   (anchor-mismatch forces a bust class)
+  3a. on BUST: harness renders byte-complete units -> freeze into new_state (A/B),
+        version = prev.version + 1, drain ALL deferred work into this one bust (coordinator)
+  3b. on DEFER (SOFT+): action = replay frozen units VERBATIM (no render call)
+```
+
+Pure function. The harness: renders-on-bust, places-every-pass, CAS-persists. Render runs
+ONLY on bust passes -> defer-pass re-derivation is structurally impossible = the bug-class
+kill. MC confirmed all four of its strip/drop scars die under this, AND it additionally
+covers the regions/injections/revert/concurrency cases that bit MC *after* frozen-id — a
+strictly stronger contract than MC currently ships.
+
+## Golden-vector schema (harness-neutral; MC is extracting the first cut)
+
+```
+vector = {
+  name,
+  render_config,            // opaque { system_hash, tool_set_id, model_key } — no harness specifics
+  initial_state,            // opaque epoch/frozen-set value, carries `version`
+  passes: [ { signal, input_identity, expect_action: SOFT+|SOFT|HARD,
+              expect_frozen_set_delta: [{ key, kind, frozen_payload }] }, ... ],
+  assert: "for every pass i with expect_action == SOFT+: cached_prefix_bytes[i] ==
+           cached_prefix_bytes[i-1]; AND replayed bytes == the unit's frozen_payload"
+}
+```
+
+Bust definition (MC's, ported): a wire segment **before the final `cache_control`
+breakpoint** changed between two consecutive requests. The byte-stability assert is
+**conditional on `expect_action == SOFT+`** (a SOFT/HARD pass is required to change cached
+bytes — that IS the bust); a revert pass MUST classify as bust, never SOFT+.
+
+Three fields I asked MC to add before freezing the schema: (1) per-pass `input_identity`
+(makes the revert/anchor case expressible + testable), (2) `frozen_payload` on each unit
+(direct test for Leak A — "stable but wrong" vs mere drift), (3) `version` on state (no
+concurrent vector in the first cut, but the field present means a two-writers vector adds
+later with no schema break).
+
+MC's first-cut vectors (load-bearing, from its cache-invariant E2E suite): growing-tail
+defer (N passes, zero busts), watermark-crossing-an-image on defer (no first-strip),
+skeleton-vs-full across a moving window (Leak A), m[1]-on-SOFT/m[0]-frozen, HARD-fold
+drains all deferred drops (coordinator), provider-nonce-only change is NOT a bust,
+revert-beneath-a-frozen-set (Leak C). Delivered as a single harness-neutral JSON file + a
+schema doc = **the migration invariant both MC and the Rust core pin**.
+
+## Remaining open (before build)
+
+- MC confirms the Leak-A simplification (it freezes FULL block bytes and replays, does NOT
+  re-render on defer — I believe yes from `cached_m1_bytes`, awaiting confirm).
+- MC delivers the first-cut vector file (it is mid-release-train; this is its next work
+  item).
+- Ufuk sign-off on this converged contract before any code.
+
+In parallel (contract-shaping, NOT building): the Rust core state value
+`{version, anchor_fingerprint, frozen_units}` + pass-input `{signal, input_identity}` + the
+pure per-pass function, so the harness consumes MC's vector file unchanged when it lands.

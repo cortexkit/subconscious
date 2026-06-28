@@ -179,8 +179,13 @@ Resolution — split the frozen-id pattern by who is error-prone:
 - **Leak A — `decision` must be a byte-COMPLETE payload, not an enum tag.** A rich unit
   (skeleton/edit-marker renders filePath + a 40-char diff-prefix) re-derived from current
   content flips bytes on defer. Fix: the harness renders final bytes at freeze time; the
-  core stores `{key, kind, frozen_payload}` (bytes or complete inputs), **never
-  `{id, enum}`**. "Pure render" is necessary but not sufficient; "decision is byte-complete"
+  core stores `{key, kind, frozen_payload}` where **`frozen_payload` is the EXACT bytes as
+  emitted on the bust pass** — never `{id, enum}`, and never "structured inputs to re-render"
+  (Oracle B3: "bytes OR complete inputs" reopens the exact re-derivation bug — a defer pass
+  re-rendering from inputs can diverge on renderer-version / canonicalization drift). Structured
+  inputs MAY be carried only as DEBUG metadata and MUST NOT be rendered on a SOFT+ pass; the
+  SOFT+ assert (`replayed bytes == frozen_payload`) only holds if `frozen_payload` is
+  authoritative bytes. "Pure render" is necessary but not sufficient; "decision is byte-complete"
   is the other half. (MC's collapse to a single `[dropped N]` worked precisely because the
   payload was made trivial; rich payloads must freeze the payload.)
 - **Leak B — the frozen set is RENDER UNITS, not just per-id drops.** A unit is
@@ -213,20 +218,32 @@ Resolution — split the frozen-id pattern by who is error-prone:
 
 ```
 core(prev_state, pass_input) -> (new_state, action)
-  pass_input = { signal, input_identity }       // input_identity = opaque prefix fingerprint
-  state      = { version, anchor_fingerprint, frozen_units: [{ key, kind, frozen_payload }] }
+  pass_input = { signal, boundary_present }     // boundary_present: bool, harness derives by
+                                                //   findIndex(live array, state.boundary_id) >= 0
+  state      = { version,
+                 boundary_id,                    // the coverage descriptor (Oracle B2): the id the
+                                                 //   covered prefix is spliced out at; CAS-retry
+                                                 //   re-splices the SAME id
+                 frozen_units: [{ key, kind, frozen_payload, durability_class }] }
+                                                 // durability_class: "episode" | "lineage"
 
-  1. ANCHOR CHECK (Leak C): input_identity vs prev_state.anchor_fingerprint
-        mismatch -> bust (discard frozen set)
-  2. CLASSIFY (signals): SOFT+ | SOFT | HARD   (anchor-mismatch forces a bust class)
+  1. BOUNDARY CHECK (Leak C): boundary_present?
+        present -> covered prefix is spliced out at boundary_id, frozen bytes replace it -> eligible to replay
+        absent  -> reuse cache THIS pass; the revert reconciles on the NEXT bust (no discard, no
+                   content-fingerprint divergence — in-prefix edits are summarized away, never bust)
+  2. CLASSIFY (signals): SOFT+ | SOFT | HARD
   3a. on BUST: harness renders byte-complete units -> freeze into new_state (A/B),
-        version = prev.version + 1, drain ALL deferred work into this one bust (coordinator)
+        version = prev.version + 1, drain ALL deferred work into this one bust (coordinator);
+        on RunStarted: reset "episode" units, carry "lineage" units forward (advance-only merge)
   3b. on DEFER (SOFT+): action = replay frozen units VERBATIM (no render call)
 ```
 
 Pure function. The harness: renders-on-bust, places-every-pass, CAS-persists. Render runs
 ONLY on bust passes -> defer-pass re-derivation is structurally impossible = the bug-class
-kill. MC confirmed all four of its strip/drop scars die under this, AND it additionally
+kill. The state carries the `boundary_id` (coverage descriptor) so a CAS-retry recomputes
+boundary-presence against the latest state's boundary and re-splices the same coverage (Oracle
+B2/SF3): on CAS failure, reload latest state, recompute boundary-presence, apply set/advance-only
+merges, retry — never against the stale pre-image. MC confirmed all four of its strip/drop scars die under this, AND it additionally
 covers the regions/injections/revert/concurrency cases that bit MC *after* frozen-id — a
 strictly stronger contract than MC currently ships.
 
@@ -288,34 +305,50 @@ simplification IS MC's reality, and the contract version is *stronger*: MC enfor
 never calls render on defer — there is no defer-path code that *could* re-derive). The
 discipline becomes an invariant.
 
-**Anchor semantics — the load-bearing Leak-C refinement.** Anchor-validity is NOT "is the
-boundary id present?" (too weak *and* too strict). It is **"is the frozen prefix still a
-correct prefix of the live input?"** — a CONTENT fingerprint over the COVERED prefix:
-- `anchor_fingerprint` = fingerprint of the **content** of the prefix the frozen set covers
-  (the bytes it owns), never the boundary id/position.
-- per-pass `input_identity` = the same fingerprint over the **live** prefix at the **same
-  coverage**.
-- Two required sub-cases:
-  - (a) host trimmed/grew **below** the covered prefix, covered content still matches ->
-    **VALID, replay** (the trimmed messages are the ones the splice removes anyway) — must
-    NOT false-positive into a bust.
-  - (b) content **within** the covered prefix changed/retracted -> fingerprint diverges ->
-    **discard + fresh = bust**.
+**Anchor semantics — CORRECTED to the shipped mechanism (Oracle B1, MC source-verified).**
+An earlier draft of this section bound anchor-validity to a CONTENT fingerprint over the covered
+prefix (MC's `computeRawRangeFingerprint` shape). That was a CONFLATION: `computeRawRangeFingerprint`
+is the HISTORIAN in-flight snapshot validator (a deliberately length-based check that the
+runner's raw read matches the trigger's fire-decision; a content-quality residual, NOT the cache
+anchor). The actual SOFT+ cache mechanism (shipped, `inject-compartments.ts:258-292`) has **NO
+fingerprint over the covered prefix at all**:
 
-This is MC's `computeRawRangeFingerprint` shape (hash raw content, never tag/drop state).
-"Boundary id present?" misses (b) and false-busts (a); content-over-coverage is correct.
+- The covered prefix is **REPLACED** by the frozen m0/m1 bytes (the `<session-history>` payload).
+  It is summarized away, not re-validated.
+- Defer-pass validity = **BOUNDARY-PRESENCE ONLY**: `findIndex(m => m.id === boundary_id)` over
+  the live array, then `splice(0, cutoff+1)` out the covered prefix and prepend the frozen bytes.
+- **Consequences (this is the whole Leak-C truth, milder than the old framing):**
+  - an in-prefix **content edit** (any size, same-length or not) → the prefix is summarized away
+    → **intentional lossiness, NOT stale-cache**. There is NO collision surface because there is
+    no hash on the covered region. (The old "(b) content within covered prefix → bust" case does
+    not exist — in-prefix edits never bust.)
+  - boundary id **present** in the live array → splice succeeds against the same frozen bytes →
+    **replay**.
+  - boundary id **removed/moved** by a revert → `findIndex < 0` → **reuse the cache THIS pass**
+    (treat as already-trimmed) + **reconcile on the next BUST pass** (rematerialize m0 against the
+    live reverted array). A one-pass stale-summary window — content-quality, not cache-correctness,
+    and the existing shipped behavior; NOT a new hazard.
+
+So: **anchor-validity = boundary-presence + frozen-byte replacement, never a covered-prefix
+fingerprint.** `computeRawRangeFingerprint` is a different mechanism on a different path
+(historian-snapshot) and MUST NOT be cited as the cache anchor — the codec spec adds a permanent
+note splitting the two so the conflation cannot recur.
 
 **Frozen schema (the contract MC emits the vector file to):**
 ```
 vector = {
   name,
-  render_config,                  // opaque { system_hash, tool_set_id, model_key }
-  initial_state: { version, anchor_fingerprint, frozen_units: [{ key, kind, frozen_payload }] },
-  passes: [ { signal, input_identity, expect_action, expect_frozen_set_delta: [{ key, kind, frozen_payload }] }, ... ],
+  render_config,                  // opaque { system_hash, tool_set_id, model_key, serializer_profile_id }
+  initial_state: { version, boundary_id,
+                   frozen_units: [{ key, kind, frozen_payload, durability_class }] },  // "episode" | "lineage"
+  passes: [ { signal, boundary_present, expect_action,
+              expect_frozen_set_delta: [{ key, kind, frozen_payload, durability_class }] }, ... ],
   asserts: [
     "for every pass i>0 where expect_action==SOFT+: cached_prefix_bytes[i] == cached_prefix_bytes[i-1]",
-    "for every replayed unit on a SOFT+ pass: rendered_bytes(unit) == unit.frozen_payload",
-    "every pass with input_identity diverging over covered prefix: expect_action in {SOFT,HARD}, never SOFT+"
+    "for every replayed unit on a SOFT+ pass: replayed_bytes(unit) == unit.frozen_payload (EXACT, not re-rendered)",
+    "every pass with boundary_present==false: expect_action != SOFT+ (reuse-then-reconcile, never a fresh SOFT+ replay against a moved boundary)",
+    "a whole-frozen-set anchor mismatch ⇒ expect_action == HARD (full invalidation, never SOFT/SOFT+)",   // SF2
+    "across a RunStarted boundary: 'episode' units reset; 'lineage' units (m0/m1 boundary, reasoning-clear watermark) survive byte-identical"  // B5 cross-episode
   ]
 }
 ```
@@ -498,18 +531,29 @@ contract. Stated here so both specs assert the same thing (single source of trut
 function of `(CkMessage, FrozenRenderConfig)` and MUST read NOTHING byte-affecting outside it.
 The closed set, frozen at run-start and reproduced from durable state on resume:
 `{ target wire family, model/wire_model_id, resolved tool set, tool_choice, generation params,
-response_format, cache-policy/breakpoint config, system bytes, the frozen reasoning positional
-bits (is_last_assistant_turn / merge-group membership), the target-native alias map basis,
-provider_options }`. A closed enumeration (not an open "etc.") is what makes "the codec
-introduces no new bust input" CHECKABLE rather than aspirational.
+response_format, cache-policy/breakpoint config, the frozen reasoning positional bits
+(is_last_assistant_turn / merge-group membership), the target-native alias map basis,
+provider_options, serializer_profile_id }`. A closed enumeration (not an open "etc.") is what
+makes "the codec introduces no new bust input" CHECKABLE rather than aspirational.
 
-**The three bust-input classes a codec MUST freeze-or-exclude:**
+> **`system` is NOT a closed-set member** (corrected per CK#1 §2.1/§5.11, Oracle B4): system
+> bytes are CK CONTENT (leading `Role::System` messages), not a render input — listing them
+> here would double-represent them (the content anchor already covers a system change). `encode`
+> DERIVES the top-level system field FROM those messages (§A.5). `serializer_profile_id`
+> (§6.1 quirk seam: clear-shape / segmentation guard / residual) IS a member — it is a
+> non-CK byte-affecting render input.
+
+**The four bust-input classes a codec MUST freeze-or-exclude:**
 1. Nonces/timestamps in any emitted field (the identity-lead class) — frozen or stripped.
 2. Non-deterministic iteration order — every map a codec serializes (provider_extras, tool
    input JSON object keys, nested Opaque-summary structures) MUST be canonical-ordered, or two
    logically-equal requests diverge on key order = a silent bust.
 3. The per-request alias map — looks stateful, MUST be a pure fn of `(canonical_id, frozen
    target family)`; never a counter/RNG.
+4. Id-less tool-call id synthesis (Gemini optional ids, CK#1 §5.6.1 r2 / codec §A.4) — MUST be
+   a pure fn of `(message ordinal, part ordinal, tool name, hash(input))`, NEVER a clock/counter
+   (the Pi `google.ts` `Date.now()` bug). This is a distinct synthesis trap, not a sub-case of
+   class 1 (Oracle SF1).
 
 **Cross-episode determinism (the lineage-cumulative gate).** Beyond cross-pass stability
 (`encode` the same CK twice under frozen config → identical bytes), the codec MUST be
@@ -518,3 +562,48 @@ state (new `RunStarted`, config rebuilt from the durable WAL/store). This is the
 of the lineage-cumulative frozen-unit durability requirement above: without it a codec passes
 every within-run test and busts at the episode boundary (the class that bit the identity-lead).
 SPEC #2 §B.4(d) is this test.
+
+---
+
+# Round 4 — Oracle gate hardening (bg_992d1730, Ufuk-directed self-gate)
+
+The cache-core spec went through the same adversarial Oracle gate CK#1 did. It found 5 blockers
++ 3 should-fixes — all spec-tightening (the architecture held; no structural rethink). Resolutions:
+
+**B4 — FrozenRenderConfig was not closed against CK#1.** FIXED above (Codec determinism binding
+section): `system` removed (it's CK content, double-represented), `serializer_profile_id` added.
+The early epoch text that pinned only `system + tools + model` is superseded by the closed set
+(those three were a first-cut gloss; the closed set is authoritative).
+
+**B3 — `frozen_payload` "bytes OR complete inputs" reopened the re-render bug.** FIXED above
+(Leak A): `frozen_payload` is EXACT emitted bytes only; structured inputs are debug-only, never
+rendered on SOFT+. The golden-vector schema doc is corrected on MC's side (same change).
+
+**SF1 — id-less synthesis is a 4th bust-input class.** FIXED above (now 4 classes, not 3).
+
+**B5 — lineage-cumulative vs per-episode durability was required but not represented/tested.**
+The frozen-vector STATE shape gains, per unit, `durability_class: "episode" | "lineage"` + b a
+`reset_rule`: an `"episode"` unit resets at `RunStarted`; a `"lineage"` unit survives episode
+boundaries and merges advance-only. The reasoning-clear watermark AND the m0/m1 boundary are
+`"lineage"` (resolving the earlier "likely" → REQUIRED, matching codec §B.4(d)). Add a
+crash-resume + `RunStarted` cross-episode golden vector (the durable-state twin of the within-run
+defer vectors). Field name/values synced identically with MC's golden-vector schema.
+
+**SF2 — anchor-mismatch action.** A whole-frozen-set anchor mismatch ⇒ HARD (full invalidation +
+fresh render), never SOFT+ and never a narrower SOFT rebuild (a per-unit-anchored narrower SOFT
+is only valid if per-unit anchors prove it safe — not in v1). The schema assert is tightened to
+"input_identity diverging over covered prefix ⇒ expect_action == HARD."
+
+**SF3 — CAS-retry semantics (one normative sentence).** On a CAS write-back failure: reload the
+latest state, recompute `input_identity` against THAT state's stored coverage descriptor, and
+apply set/advance-only merges before retrying. Never retry against the stale pre-image.
+
+**B1 + B2 — anchor mechanism (pending MC source-confirm, then rewrite).** The Oracle flagged the
+anchor as length-based (→ silent stale cache) and coverage-not-in-state. MC source-verified that
+the cited `computeRawRangeFingerprint` is the HISTORIAN in-flight snapshot validator (deliberately
+length-based, content-quality residual only), NOT the SOFT+ cache anchor — so this spec's line
+binding the anchor to `computeRawRangeFingerprint` was a CONFLATION (my error). Pending MC's
+confirm of the exact replay-vs-bust validity mechanism (boundary-presence + frozen-byte
+replacement, vs a covered-prefix fingerprint), the anchor section is rewritten to state the
+correct mechanism + B2 (the boundary/coverage descriptor lives in core state, not just a
+fingerprint). Held until MC confirms; then re-gate.

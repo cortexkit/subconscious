@@ -35,7 +35,7 @@ A channel-data request on the plugin's route to the MC module:
 {
   session_id,                 // stable per harness session; the MC per-session actor key
   serializer_profile,         // e.g. "opencode-aisdk-1.17" | "pi-0.80" — the healing-coverage key
-  render_config,              // { system_hash, tool_set_id, model_key, serializer_profile_id } — the HARD-marker epoch inputs
+  render_config,              // the HARD-bust EPOCH tuple (see note) — { system_hash, tool_set_id, model_key, serializer_profile_id }
   full_array_fingerprint,     // whole-input identity (DELTA staleness + LKG validity) — NOT the cache anchor
   payload,                    // one of: { full: CK[] } | { tail_delta: ... }   (see §4)
 }
@@ -50,8 +50,13 @@ A channel-data request on the plugin's route to the MC module:
   (mechanism (a), `cache-policy-core-design.md`) — internal to the MC module over the array it
   holds, NOT a plugin-sent covered-prefix fingerprint. The plugin sends whole-array identity; the
   module owns boundary-presence.
-- `render_config`: the single-unit render-config epoch (system+tools+model+serializer_profile_id);
-  a change is a HARD bust.
+- `render_config`: the HARD-bust EPOCH tuple. NOTE the role split (cache-core §B / CK#1 §2.1):
+  `system_hash` is a CONTENT-DERIVED epoch/HARD-bust MARKER (system is CK content, NOT a
+  `FrozenRenderConfig` render input — it lives in the CK message array). `tool_set_id` / `model_key`
+  / `serializer_profile_id` correspond to cache-core `FrozenRenderConfig` members. A change to any
+  is a HARD bust. So `render_config` here is the observed bust-epoch tuple, defined BY REFERENCE to
+  cache-core's closed `FrozenRenderConfig` (plus the system-content epoch marker), not a competing
+  definition.
 
 ## 4. always-full vs delta (Edge A — measurement-gated)
 
@@ -99,10 +104,16 @@ provider-quirk residual (the downstream gap-fill, SPEC #2 decide_*) to the retur
 ## 7. Daemon-unavailable / transform-failure (Edge D)
 
 - Fail-open raw-passthrough is **REJECTED** (causes double-bust / provider overflow).
-- The plugin caches the LAST MC-returned transformed array per session (last-known-good). On
-  daemon-down/timeout: if the current input's anchor still matches the last-known-good's
-  coverage → re-emit the cached transformed array (safe, same bytes); if it diverged → **ABORT
-  THE TURN** (surface a clean error), never a raw cache-busting/overflowing array.
+- The plugin caches the LAST MC-returned transformed array per session (last-known-good), keyed
+  by the FULL request identity `{session_id, full_array_fingerprint, render_config,
+  serializer_profile_id}`. On daemon-down/timeout: re-emit the cached transformed array ONLY when
+  the current request's `{session_id, full_array_fingerprint, render_config, serializer_profile_id}`
+  EXACTLY equals the LKG cache key (same bytes, provably safe); on ANY difference → **ABORT THE
+  TURN** (surface a clean error), never a raw cache-busting/overflowing array. **LKG replay keys
+  on `full_array_fingerprint` (whole-array identity), NOT the cache anchor/boundary-presence** —
+  the cache anchor only proves the covered PREFIX is spliceable; it stays equal while a new tail
+  message arrives (the silent-stale-tail hole), so whole-array identity is required to replay a
+  WHOLE transformed array. (This is the same anchor-vs-full-array distinction as §3/§4.)
 - Health: the plugin reads subc Ping/Pong + connection-liveness (a real signal, not just an IPC
   timeout); a transform-failure returns a clean Error frame, not a hang. (The host-side
   quiet-cancel mechanism — OpenCode's duck-typed sentinel — is the plugin's concern; the subc

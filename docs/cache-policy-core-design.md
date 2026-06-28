@@ -324,3 +324,58 @@ Remaining: MC emits the first-cut vector file (its next work item; release train
 I shape the Rust core (per-pass function + state value) against the frozen schema in parallel;
 then layer the author-policy vectors. **Ufuk sign-off on this converged contract before any
 build.** The vector file is the migration invariant both MC and the Rust core pin.
+
+
+---
+
+# Round 4 — schema final, vector file in flight
+
+MC accepted `signal`-as-object and added a `layer` tag (`"mechanics" | "author-policy"`) so
+the universal vectors and the additive author-policy set stay explicitly separated. Final
+frozen schema:
+
+```
+vector = {
+  name,
+  layer: "mechanics",                          // author-policy vectors tag "author-policy"
+  render_config: { system_hash, tool_set_id, model_key },
+  initial_state: { version, anchor_fingerprint, frozen_units:[{key,kind,frozen_payload}], pending_changes?:[...] },
+  passes: [ { signal:{kind,...}, input_identity, expect_action: "SOFT+"|"SOFT"|"HARD",
+              expect_frozen_set_delta:[{key,kind,frozen_payload}], expect_pending_delta?:[...] } ],
+  asserts: [
+    "i>0 & expect_action==SOFT+  ->  cached_prefix_bytes[i] == cached_prefix_bytes[i-1]",
+    "replayed unit on SOFT+      ->  rendered_bytes(unit) == unit.frozen_payload",
+    "input_identity diverges over covered prefix  ->  expect_action in {SOFT,HARD}, never SOFT+"
+  ]
+}
+```
+First-cut observer signal kinds: `growing-tail | watermark-crossed-image |
+skeleton-window-moved | memory-delta | compartment-published | hard-fold-trigger |
+provider-nonce-only | revert-or-truncate | idle-ttl-expired`. Author layer adds
+`requested_policy | provenance | what` on top.
+
+**Anchor reference impl confirmed (MC source):** `computeRawRangeFingerprint`
+(`read-session-true-raw-tokens.ts:661`) hashes `ordinal:id:parts.length:partContentFingerprint`
+per message over `[start,end)` — raw CONTENT only, NEVER tag/drop/strip state. That property
+is *why* a tail drop/strip cannot false-bust (tag state isn't hashed) while an in-prefix
+content retract diverges -> the two anchor sub-cases fall out for free. It's the reference
+impl for the anchor field.
+
+**Value convention (load-bearing for harness-neutrality):** the vector file emits
+`anchor_fingerprint` / `input_identity` as **opaque-but-consistent TOKENS, not real hashes.**
+The core never *computes* a fingerprint — it only *compares* per-pass `input_identity`
+against the stored anchor for EQUALITY and branches (match->replay, diverge->bust). Opaque
+tokens (e.g. `"cov:A"` stable across a tail-grow pass, `"cov:A"` -> `"cov:A-reverted"` on an
+in-prefix retract) test the **core's branch** — the thing the vector is *for* — without
+forcing the Rust core to reimplement MC's exact hash. Each real harness plugs its own stable
+fingerprint (MC = `computeRawRangeFingerprint`, llm-runner = its WAL-message fingerprint)
+behind the same opaque-comparable contract.
+
+**Status: contract + schema fully frozen.** MC is extracting the 7 mechanics vectors (from
+its cache-invariant E2E suite) into the frozen JSON + a one-page schema doc; it will ping a
+readable path. Remaining gates: (1) MC's vector file lands, (2) **Ufuk sign-off on this
+converged contract**, then the build (Rust core against the frozen schema -> llm-runner
+consumes first -> author-policy vectors layered -> MC migrates later). I shape the Rust core
+(per-pass function + `{version, anchor_fingerprint, frozen_units, pending_changes}` state +
+`{signal, input_identity}` pass-input) against the frozen schema in parallel; consumes MC's
+file unchanged when it lands.

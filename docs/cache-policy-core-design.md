@@ -8,14 +8,34 @@ blessed CK#1 (`magic-context/docs/specs/ck-message.md`). The Rust cache-core bin
 companion design that the cache-core Rust implementation binds to; it goes through the same
 Oracle gate CK#1 did before the build.
 
+> **AUTHORITATIVE MECHANISM (Round 4, supersedes all earlier rounds where they conflict).**
+> This doc accreted across rounds; the Oracle gate (bg_992d1730) corrected the anchor model.
+> Where any earlier section below describes a *content fingerprint over the covered prefix*, or
+> uses the field names `anchor_fingerprint` / `input_identity`, it is **SUPERSEDED** by Round 4:
+> - **The cache anchor is BOUNDARY-PRESENCE** (`is state.boundary_id still in the live array?`)
+>   **+ frozen-byte replacement of the covered prefix** — there is NO fingerprint over the
+>   covered prefix, so NO collision surface. An in-prefix edit is summarized away (not stale-
+>   cache); a revert that removes the boundary reuses-then-reconciles-on-next-bust.
+> - **Field names:** `boundary_id` (state coverage descriptor), `boundary_present` (per-pass
+>   bool), `full_array_fingerprint` (spec #4 delta/LKG staleness — a DIFFERENT, whole-array
+>   identity, never the cache anchor). The old `anchor_fingerprint` / `input_identity` are the
+>   same opaque-token state/pass slots, renamed.
+> - **`computeRawRangeFingerprint` is the HISTORIAN in-flight snapshot validator, NOT the cache
+>   anchor** (MC source-verified). Any earlier line citing it as the anchor reference impl is
+>   superseded; the anchor reference impl is the boundary-id splice (`inject-compartments.ts:258-292`).
+> - **Cache frozen units are ALL `lineage`** (the conversation prefix is lineage-cumulative);
+>   the `episode`-class reset state is WAL replay-state, a separate structure (llm-runner / codec §B.4(d)).
+> The Round-4 sections ("Round 4 — Oracle gate hardening", "Codec determinism binding",
+> "Frozen-set durability") are authoritative; the Round-1/3 prose is kept for design history.
+
 **CK#1 integration (post-inversion).** The frozen-set has TWO unit categories: (a) transform
 DECISION units (drop / strip / skeleton / synthesized-region / injection — the cache-core's
 own frozen render units), and (b) CONTENT units the machinery must treat as atomic+immovable
 but never originates — chiefly `Opaque` blocks (CK#1 §5.13.4): native-preserved, never
 span-edited, never reordered (immovable under the segmentation-invariance axiom), and
-arc-grouped (an `OpaqueArc{kind:Tool|Approval}` is reclaimed as a whole pair). The anchor
-fingerprint covers content order including `Opaque` positions; the determinism guarantee
-applies to both categories.
+arc-grouped (an `OpaqueArc{kind:Tool|Approval}` is reclaimed as a whole pair). Anchor-validity
+covers content order including `Opaque` positions via **boundary-presence** (per the banner
+above); the determinism guarantee applies to both categories.
 
 ## Why this exists
 
@@ -249,13 +269,18 @@ strictly stronger contract than MC currently ships.
 
 ## Golden-vector schema (harness-neutral; MC is extracting the first cut)
 
+> SUPERSEDED by the frozen schema in "Round 3 — schema frozen" + Round 4 (boundary-presence
+> field names). Kept for history. The current schema uses `boundary_id` / `boundary_present`,
+> not `input_identity`, and a revert that removes the boundary is reuse-then-reconcile (SOFT+),
+> NOT a bust.
+
 ```
 vector = {
   name,
-  render_config,            // opaque { system_hash, tool_set_id, model_key } — no harness specifics
-  initial_state,            // opaque epoch/frozen-set value, carries `version`
-  passes: [ { signal, input_identity, expect_action: SOFT+|SOFT|HARD,
-              expect_frozen_set_delta: [{ key, kind, frozen_payload }] }, ... ],
+  render_config,            // opaque { system_hash, tool_set_id, model_key, serializer_profile_id }
+  initial_state,            // { version, boundary_id, frozen_units, pending_changes }
+  passes: [ { signal, boundary_present, expect_action: SOFT+|SOFT|HARD,
+              expect_frozen_set_delta: [{ key, kind, frozen_payload, durability_class }] }, ... ],
   assert: "for every pass i with expect_action == SOFT+: cached_prefix_bytes[i] ==
            cached_prefix_bytes[i-1]; AND replayed bytes == the unit's frozen_payload"
 }
@@ -264,13 +289,8 @@ vector = {
 Bust definition (MC's, ported): a wire segment **before the final `cache_control`
 breakpoint** changed between two consecutive requests. The byte-stability assert is
 **conditional on `expect_action == SOFT+`** (a SOFT/HARD pass is required to change cached
-bytes — that IS the bust); a revert pass MUST classify as bust, never SOFT+.
-
-Three fields I asked MC to add before freezing the schema: (1) per-pass `input_identity`
-(makes the revert/anchor case expressible + testable), (2) `frozen_payload` on each unit
-(direct test for Leak A — "stable but wrong" vs mere drift), (3) `version` on state (no
-concurrent vector in the first cut, but the field present means a two-writers vector adds
-later with no schema break).
+bytes — that IS the bust); a revert that REMOVES the boundary is SOFT+ reuse-then-reconcile
+(per Round 4), while a `render_config` epoch change is a HARD bust.
 
 MC's first-cut vectors (load-bearing, from its cache-invariant E2E suite): growing-tail
 defer (N passes, zero busts), watermark-crossing-an-image on defer (no first-strip),
@@ -288,7 +308,7 @@ schema doc = **the migration invariant both MC and the Rust core pin**.
 - Ufuk sign-off on this converged contract before any code.
 
 In parallel (contract-shaping, NOT building): the Rust core state value
-`{version, anchor_fingerprint, frozen_units}` + pass-input `{signal, input_identity}` + the
+`{version, boundary_id, frozen_units}` + pass-input `{signal, boundary_present}` + the
 pure per-pass function, so the harness consumes MC's vector file unchanged when it lands.
 
 
@@ -383,15 +403,16 @@ frozen schema:
 ```
 vector = {
   name,
-  layer: "mechanics",                          // author-policy vectors tag "author-policy"
-  render_config: { system_hash, tool_set_id, model_key },
-  initial_state: { version, anchor_fingerprint, frozen_units:[{key,kind,frozen_payload}], pending_changes?:[...] },
-  passes: [ { signal:{kind,...}, input_identity, expect_action: "SOFT+"|"SOFT"|"HARD",
-              expect_frozen_set_delta:[{key,kind,frozen_payload}], expect_pending_delta?:[...] } ],
+  layer: "mechanics",                          // author-policy vectors tag "author-policy"; durability vectors tag "durability"
+  render_config: { system_hash, tool_set_id, model_key, serializer_profile_id },
+  initial_state: { version, boundary_id, frozen_units:[{key,kind,frozen_payload,durability_class,reset_rule}], pending_changes?:[...] },
+  passes: [ { signal:{kind,...}, boundary_present, expect_action: "SOFT+"|"SOFT"|"HARD",
+              expect_frozen_set_delta:[{key,kind,frozen_payload,durability_class}], expect_pending_delta?:[...] } ],
   asserts: [
     "i>0 & expect_action==SOFT+  ->  cached_prefix_bytes[i] == cached_prefix_bytes[i-1]",
     "replayed unit on SOFT+      ->  rendered_bytes(unit) == unit.frozen_payload",
-    "input_identity diverges over covered prefix  ->  expect_action in {SOFT,HARD}, never SOFT+"
+    "boundary_present absent      ->  reuse-then-reconcile (SOFT+ this pass), never a blind same-pass rebuild",
+    "lineage unit across RunStarted -> reproduced bytes == pre-boundary frozen_payload (restart never busts)"
   ]
 }
 ```
@@ -400,30 +421,31 @@ skeleton-window-moved | memory-delta | compartment-published | hard-fold-trigger
 provider-nonce-only | revert-or-truncate | idle-ttl-expired`. Author layer adds
 `requested_policy | provenance | what` on top.
 
-**Anchor reference impl confirmed (MC source):** `computeRawRangeFingerprint`
-(`read-session-true-raw-tokens.ts:661`) hashes `ordinal:id:parts.length:partContentFingerprint`
-per message over `[start,end)` — raw CONTENT only, NEVER tag/drop/strip state. That property
-is *why* a tail drop/strip cannot false-bust (tag state isn't hashed) while an in-prefix
-content retract diverges -> the two anchor sub-cases fall out for free. It's the reference
-impl for the anchor field.
+> SUPERSEDED by Round 4 (kept for history). The two paragraphs below described the anchor as a
+> CONTENT FINGERPRINT and cited `computeRawRangeFingerprint` as its reference impl — both wrong
+> (see the authoritative banner at the top). `computeRawRangeFingerprint` is the historian
+> snapshot validator, not the cache anchor; the cache anchor is boundary-presence, with no
+> covered-prefix fingerprint at all. The opaque-token-equality discipline below still holds, but
+> the token is `boundary_present` vs `boundary_id` (a presence/identity check), NOT a
+> content-fingerprint comparison.
 
-**Value convention (load-bearing for harness-neutrality):** the vector file emits
-`anchor_fingerprint` / `input_identity` as **opaque-but-consistent TOKENS, not real hashes.**
-The core never *computes* a fingerprint — it only *compares* per-pass `input_identity`
-against the stored anchor for EQUALITY and branches (match->replay, diverge->bust). Opaque
-tokens (e.g. `"cov:A"` stable across a tail-grow pass, `"cov:A"` -> `"cov:A-reverted"` on an
-in-prefix retract) test the **core's branch** — the thing the vector is *for* — without
-forcing the Rust core to reimplement MC's exact hash. Each real harness plugs its own stable
-fingerprint (MC = `computeRawRangeFingerprint`, llm-runner = its WAL-message fingerprint)
-behind the same opaque-comparable contract.
+**Value convention (load-bearing for harness-neutrality, RENAMED per Round 4):** the vector file
+emits `boundary_id` / `boundary_present` as **opaque-but-consistent TOKENS, not real hashes/ids.**
+The core never *computes* anything — it only *compares* per-pass `boundary_present` against the
+stored `boundary_id` for EQUALITY and branches (present -> splice+replay, absent ->
+reuse-then-reconcile-next-bust). Opaque tokens (e.g. `"b0"` present across a tail-grow pass,
+`"b0"` -> `"-"` when a revert removes the boundary message) test the **core's branch** — the
+thing the vector is *for* — without forcing the Rust core to reimplement any harness internals.
+Each real harness plugs its own boundary-presence check (MC = `findIndex(info.id === boundary_id)`,
+llm-runner = its WAL boundary lookup) behind the same opaque-comparable contract.
 
 **Status: contract + schema fully frozen.** MC is extracting the 7 mechanics vectors (from
 its cache-invariant E2E suite) into the frozen JSON + a one-page schema doc; it will ping a
 readable path. Remaining gates: (1) MC's vector file lands, (2) **Ufuk sign-off on this
 converged contract**, then the build (Rust core against the frozen schema -> llm-runner
 consumes first -> author-policy vectors layered -> MC migrates later). I shape the Rust core
-(per-pass function + `{version, anchor_fingerprint, frozen_units, pending_changes}` state +
-`{signal, input_identity}` pass-input) against the frozen schema in parallel; consumes MC's
+(per-pass function + `{version, boundary_id, frozen_units, pending_changes}` state +
+`{signal, boundary_present}` pass-input) against the frozen schema in parallel; consumes MC's
 file unchanged when it lands.
 
 
@@ -598,14 +620,19 @@ boundaries and merges advance-only. The reasoning-clear watermark AND the m0/m1 
 crash-resume + `RunStarted` cross-episode golden vector (the durable-state twin of the within-run
 defer vectors). Field name/values synced identically with MC's golden-vector schema.
 
-**SF2 — anchor-mismatch action.** A whole-frozen-set anchor mismatch ⇒ HARD (full invalidation +
-fresh render), never SOFT+ and never a narrower SOFT rebuild (a per-unit-anchored narrower SOFT
-is only valid if per-unit anchors prove it safe — not in v1). The schema assert is tightened to
-"input_identity diverging over covered prefix ⇒ expect_action == HARD."
+**SF2 — anchor-mismatch action (reconciled with the boundary-presence model).** There is no
+"covered-prefix fingerprint mismatch" event under boundary-presence. The two real events are:
+(i) `boundary_present == boundary_id` → splice + replay (SOFT+ unless a delta/render_config/epoch
+forces SOFT/HARD); (ii) `boundary_present` absent (revert removed the boundary) → KEEP replaying
+the frozen bytes this pass (SOFT+, `reconcile_pending`) and reconcile on the next cache-busting
+pass — never a blind same-pass HARD rebuild. A `render_config`/epoch HARD bust is a separate,
+explicit cause (full invalidation + fresh render + new `boundary_id`). The golden-vector assert is
+"`boundary_present` absent ⇒ `expect_action != SOFT` blind-rebuild on that pass" (reuse-then-
+reconcile), and "a `render_config` epoch change ⇒ HARD."
 
 **SF3 — CAS-retry semantics (one normative sentence).** On a CAS write-back failure: reload the
-latest state, recompute `input_identity` against THAT state's stored coverage descriptor, and
-apply set/advance-only merges before retrying. Never retry against the stale pre-image.
+latest state, recompute `boundary_present` against THAT state's stored `boundary_id`, and apply
+set/advance-only merges before retrying. Never retry against the stale pre-image.
 
 **B1 + B2 — anchor mechanism (pending MC source-confirm, then rewrite).** The Oracle flagged the
 anchor as length-based (→ silent stale cache) and coverage-not-in-state. MC source-verified that

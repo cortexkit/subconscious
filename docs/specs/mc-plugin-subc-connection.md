@@ -35,19 +35,23 @@ A channel-data request on the plugin's route to the MC module:
 {
   session_id,                 // stable per harness session; the MC per-session actor key
   serializer_profile,         // e.g. "opencode-aisdk-1.17" | "pi-0.80" — the healing-coverage key
-  render_config,              // { system_hash, tool_set_id, model_key } — the HARD-marker epoch inputs
-  input_identity,             // covered-prefix content fingerprint (the cache anchor)
+  render_config,              // { system_hash, tool_set_id, model_key, serializer_profile_id } — the HARD-marker epoch inputs
+  full_array_fingerprint,     // whole-input identity (DELTA staleness + LKG validity) — NOT the cache anchor
   payload,                    // one of: { full: CK[] } | { tail_delta: ... }   (see §4)
 }
 ```
 - `serializer_profile` (Edge C, REQUIRED): the MC module maps it to a healing-coverage table
   to compute the provider-quirk residual (`quirk_work = provider_requirement −
   serializer_healing(provider, profile)`). It's also what gates the reasoning-strip merge-term.
-- `input_identity` (the cache anchor): content fingerprint over the COVERED prefix (NOT
-  boundary position). Match → replay the frozen-set; diverge over coverage → bust (cache-core
-  anchor-validity). Same mechanism as the golden vectors.
-- `render_config`: the single-unit render-config epoch (system+tools+model); a change is a
-  HARD bust.
+- `full_array_fingerprint` — **distinct from the cache anchor** (Oracle: the two were conflated).
+  It is a fingerprint over the WHOLE input array (covered prefix AND tail), used for (i) DELTA
+  staleness (does the daemon's held canonical still match the plugin's view) and (ii) LKG-replay
+  validity (§7). The CACHE-REPLAY anchor itself is the cache-core's **boundary-presence** check
+  (mechanism (a), `cache-policy-core-design.md`) — internal to the MC module over the array it
+  holds, NOT a plugin-sent covered-prefix fingerprint. The plugin sends whole-array identity; the
+  module owns boundary-presence.
+- `render_config`: the single-unit render-config epoch (system+tools+model+serializer_profile_id);
+  a change is a HARD bust.
 
 ## 4. always-full vs delta (Edge A — measurement-gated)
 
@@ -57,14 +61,18 @@ A channel-data request on the plugin's route to the MC module:
   to produce (the host re-hands it every pass today).
 - **DELTA is a plugin-path OPTIMIZATION**, decided later from a measurement (a ~550-message /
   ~1MB subc round-trip at the target session size). If it justifies the complexity: the plugin
-  sends `{ tail_delta }` + `input_identity`; the MC module holds the canonical array and
+  sends `{ tail_delta }` + `full_array_fingerprint`; the MC module holds the canonical array and
   reconciles the delta. The daemon is authoritative on staleness — it returns **NEED_FULL_SYNC**
-  when its held canonical doesn't match the plugin's `input_identity` (cold daemon, in-coverage
-  revert, or first pass), and the plugin re-sends `{ full: CK[] }`. So the plugin never guesses;
-  up to 2 hops on a cold/revert pass, 1 hop steady-state.
+  when its held canonical doesn't match the plugin's `full_array_fingerprint` (cold daemon,
+  any-position revert, or first pass), and the plugin re-sends `{ full: CK[] }`. So the plugin
+  never guesses; up to 2 hops on a cold/revert pass, 1 hop steady-state.
 
-`array_fingerprint` == the cache-core `input_identity` — one mechanism, two purposes
-(anchor-validity AND the delta wire protocol).
+**`full_array_fingerprint` (delta staleness) is NOT the cache anchor (boundary-presence)** —
+different identities for different jobs (Oracle: the earlier `array_fingerprint == input_identity`
+equation was a conflation). Delta staleness needs WHOLE-ARRAY freshness: a covered-prefix-only
+anchor stays equal while the daemon's held TAIL goes stale (a new user message outside the covered
+prefix), so a delta could apply to the wrong base without tripping NEED_FULL_SYNC. So NEED_FULL_SYNC
+keys on `full_array_fingerprint`; cache replay keys on the module-internal boundary-presence.
 
 ## 5. The response (MC module → plugin)
 

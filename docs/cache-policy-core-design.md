@@ -247,12 +247,18 @@ Resolution — split the frozen-id pattern by who is error-prone:
 ## The per-pass core function (converged)
 
 ```
-core(prev_state, pass_input) -> (new_state, action)
-  pass_input = { signal, boundary_present }     // boundary_present: an OPAQUE live-boundary TOKEN
-                                                //   (e.g. "b0" / "-"), compared for EQUALITY against
-                                                //   state.boundary_id — NOT a bool. The harness derives it
-                                                //   by findIndex(live array, state.boundary_id): the matched
-                                                //   id token if present, the absent-sentinel "-" if not.
+core(prev_state, pass_input) -> (new_state, executed_action)
+  pass_input = { action, boundary_present, rendered_units? }
+        // action: the HARNESS's classification (SOFT+ | SOFT | HARD). The core does NOT
+        //   classify a raw signal — trigger causes are a harness-provided predicate: the
+        //   observer/author adapter maps its signal {kind,...} -> action, then the core
+        //   APPLIES the mechanics of that action. The core is signal-agnostic (it never
+        //   sees the signal kind); it returns the executed_action it applied.
+        // boundary_present: an OPAQUE live-boundary TOKEN (e.g. "b0" / "-"), compared for
+        //   EQUALITY against state.boundary_id — NOT a bool, NOT a content fingerprint. The
+        //   harness derives it by findIndex(live array, state.boundary_id): the matched id
+        //   token if present, the absent-sentinel "-" if not.
+        // rendered_units: byte-complete units the harness rendered for a BUST (empty on defer).
   state      = { version,
                  boundary_id,                    // the coverage descriptor (Oracle B2): the id the
                                                  //   covered prefix is spliced out at; CAS-retry
@@ -265,12 +271,21 @@ core(prev_state, pass_input) -> (new_state, action)
         absent ("-") -> reuse cache THIS pass (SOFT+, reconcile_pending); the revert reconciles on the
                    NEXT bust (no discard, no content-fingerprint divergence — in-prefix edits are
                    summarized away, never bust)
-  2. CLASSIFY (signals): SOFT+ | SOFT | HARD
-  3a. on BUST: harness renders byte-complete units -> freeze into new_state (A/B),
+  2. APPLY the harness-supplied action's mechanics (the core does NOT re-derive the action):
+  3a. on BUST (SOFT/HARD): freeze the harness's byte-complete rendered_units into new_state (A/B),
         version = prev.version + 1, drain ALL deferred work into this one bust (coordinator);
         on RunStarted: reset "episode" units, carry "lineage" units forward (advance-only merge)
-  3b. on DEFER (SOFT+): action = replay frozen units VERBATIM (no render call)
+  3b. on DEFER (SOFT+): replay frozen units VERBATIM (no render call, no rendered_units)
 ```
+
+> **Binding note (authoritative — the Rust `cortexkit-cache-core` API is the source of truth):**
+> the shipped signature is `CoreState::step(&mut self, PassInput) -> StepResult`, where
+> `PassInput { proposed: Action, boundary_present: String, rendered_units, queued,
+> new_boundary_id, run_started }` and `StepResult { action, reconcile_pending }`. The harness
+> supplies the **classified `Action`** (`proposed`), never a raw signal; the anchor input is the
+> **`boundary_present` token**, never a content fingerprint. Any consumer spec describing an
+> `input_identity` content-fingerprint anchor or an `anchor_fingerprint` state field is on the
+> SUPERSEDED pre-Round-4 model and must migrate to boundary-presence before binding.
 
 Pure function. The harness: renders-on-bust, places-every-pass, CAS-persists. Render runs
 ONLY on bust passes -> defer-pass re-derivation is structurally impossible = the bug-class

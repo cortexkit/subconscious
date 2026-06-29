@@ -106,24 +106,33 @@ in-memory array, store is read only at resume). So:
 - **DISABLE native auto-compaction** (`DISABLE_AUTO_COMPACT` / `auto_compact_token_limit`) so
   the harness doesn't compact on its own and fight the virtual boundary.
 
-**Codex / OpenAI-Responses server-side chaining — HARD GATE (Oracle, CK#1 §5.12.5).** A
-chaining-capable provider can omit history the server holds. We CANNOT compact hidden server-side
-history — there is nothing on the wire to rewrite, and keeping those residual fields would
-double-count (hidden server history + our m0/m1 prefix). OpenAI Responses has **THREE** server-state
-references, all of which MUST be gated (not just `previous_response_id`):
+**Codex / OpenAI-Responses server-side chaining — HARD GATE, FAIL-CLOSED ON THE PRINCIPLE
+(Oracle, CK#1 §5.12.5).** A chaining-capable provider can omit history the server holds. We CANNOT
+compact hidden server-side history — there is nothing on the wire to rewrite, and keeping those
+residual fields would double-count (hidden server history + our m0/m1 prefix). The gate is an
+INVARIANT, NOT a denylist — enumerating OpenAI's server-state fields is non-convergent (each API
+revision adds another: `previous_response_id`, then `conversation`, then
+`input[*].type:"item_reference"`, …):
+
+> **The MITM module compacts a request ONLY if it is provably SELF-CONTAINED FULL-INPUT — the
+> entire conversation is on the wire and the request references NO server-held state. Otherwise it
+> forwards the request UNTOUCHED (no compaction).** Fail-closed: an unrecognized or new field is
+> treated as possible server-state → no compaction, never a guess that it's safe.
+
+This is checked on **EVERY outbound request — every WS `response.create` event, not just connection
+setup**. Known server-state references that violate self-contained-full-input (any one present ⇒ do
+NOT compact):
 - `previous_response_id` (present/non-null) — chains onto a stored prior response.
-- `conversation` (present/non-null) — a stored conversation whose items are PREPENDED to the
-  request; conversation items persist independently of the 30-day response TTL, so this is hidden
-  history even when `store:false`.
+- `conversation` (present/non-null) — a stored conversation whose items are PREPENDED; persists
+  independently of the 30-day response TTL, so it's hidden history even with `store:false`.
+- any `input[*]` item of `type:"item_reference"` (`{id, type:"item_reference"}`) — a direct
+  reference to a server-held input item.
 - `store` not forced `false`/equivalent — leaves the response object server-stored for chaining.
-So on **EVERY outbound Codex request — every WS `response.create` event, not just connection
-setup** — the MITM module MUST **REJECT/ABORT compaction** (forward untouched or error) if ANY of:
-`previous_response_id` present, `conversation` present/non-null, `store !== false`, or any future
-Responses field that references server-held input items. This is a per-request REJECT keyed on
-"any server-side-state ref," not merely a `residual` pass-through. The disable-native-compaction
-step (above) should also force `store:false` + no `conversation`/`previous_response_id` where the
-harness config allows; if Codex cannot be forced into full-input mode, Codex MITM is INFEASIBLE
-(Anthropic, which never chains, is the clean first MITM leg regardless).
+The disable-native-compaction step (above) should also force `store:false` + drop
+`conversation`/`previous_response_id`/`item_reference` where the harness config allows. If Codex
+cannot be driven into provable self-contained-full-input mode, Codex MITM is INFEASIBLE (Anthropic,
+which never chains, is the clean first MITM leg regardless). **The self-contained-full-input
+PREDICATE is the contract; the field list is the known-instances note, not the gate.**
 
 **Boundary authority (resolves the §2/§8 "stateless per call" vs "in-memory virtual boundary"
 tension).** MC is the SOLE authority for the compaction boundary + frozen-set. The MITM module is

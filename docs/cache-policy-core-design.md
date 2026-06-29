@@ -458,11 +458,11 @@ thing the vector is *for* — without forcing the Rust core to reimplement any h
 Each real harness plugs its own boundary-presence check (MC = `findIndex(info.id === boundary_id)`,
 llm-runner = its WAL boundary lookup) behind the same opaque-comparable contract.
 
-**Status: contract + schema fully frozen.** MC is extracting the 7 mechanics vectors (from
-its cache-invariant E2E suite) into the frozen JSON + a one-page schema doc; it will ping a
-readable path. Remaining gates: (1) MC's vector file lands, (2) **Ufuk sign-off on this
-converged contract**, then the build (Rust core against the frozen schema -> llm-runner
-consumes first -> author-policy vectors layered -> MC migrates later). I shape the Rust core
+**Status: contract + schema fully frozen.** MC has extracted the 9 vectors (8 mechanics from
+its cache-invariant E2E suite + V9 cross-episode) into the frozen JSON (schema_version 2) + the
+schema doc. Remaining gates: **Ufuk sign-off on this converged contract**, then the build (Rust
+core against the frozen schema -> llm-runner consumes first -> author-policy vectors layered ->
+MC migrates later). I shape the Rust core
 (per-pass function + `{version, boundary_id, frozen_units, pending_changes}` state +
 `{signal, boundary_present}` pass-input) against the frozen schema in parallel; consumes MC's
 file unchanged when it lands.

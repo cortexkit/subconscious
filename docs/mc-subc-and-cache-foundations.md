@@ -71,8 +71,11 @@ over a shared DB across two message models. A single stateful daemon + one canon
 - **B durability:** daemon persists cache-DECISION state + frozen_units, NOT content; content
   reconstructs from the harness full-array hand-off; restart = full-array + durable frozen-set → byte-identical.
 - **C serializer_profile:** required request field → healing-coverage table → residual.
-- **D daemon-down:** fail-open-raw REJECTED; cache-last-known-good + abort-on-anchor-divergence;
-  health via subc Ping/Pong + connection-liveness + clean Error frame (not a hang).
+- **D daemon-down:** fail-open-raw REJECTED; replay last-known-good ONLY on exact full-request
+  identity `{session_id, full_array_fingerprint, render_config, serializer_profile_id}` match,
+  else ABORT the turn (LKG keys on whole-array identity, NOT the cache anchor — the anchor only
+  proves the covered prefix is spliceable, it stays equal while a new tail arrives); health via
+  subc Ping/Pong + connection-liveness + clean Error frame (not a hang).
 - **E injection/delivery:** daemon owns transform-time injections (frozen-units); plugin keeps out-of-band delivery.
 - **F per-session actor:** daemon serializes per-session (subc coordinator precedent; no cross-process leases).
 - **G compaction-marker:** plugin-path concern the daemon never sees (store-marker injection drives

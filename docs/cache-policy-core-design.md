@@ -476,11 +476,13 @@ MC shipped the golden-vector file (cortexkit/magic-context @ `09b58896`), indepe
 verified at source against the frozen schema — exact match:
 - `docs/cache-policy/cache-stability-golden-vectors.json` — **8 `mechanics` vectors**
   (MC added V2 post-execute-settle from the A2 E2E case; additive), all opaque tokens
-  (`cov0`/`cov0@r1`/`cov1`, `sys0`/`tools0`/`m0`), **zero real hashes** -> the Rust core
-  passes by branching correctly, never by porting MC's fingerprint.
+  (`b0`/`b1`/`-` for boundary presence, `sys0`/`tools0`/`m0`/`prof0` for render_config),
+  **zero real hashes** -> the Rust core passes by branching correctly, never by porting any
+  harness fingerprint.
 - `docs/cache-policy/cache-stability-golden-vectors.schema.md` — the one-page contract:
-  SOFT+/SOFT/HARD action model, frozen-render-unit byte-completeness, anchor-content-over-
-  coverage, opaque-token rule, the two-source coordinator, and the stated axioms.
+  SOFT+/SOFT/HARD action model, frozen-render-unit byte-completeness, BOUNDARY-PRESENCE +
+  frozen-byte replacement (NOT a content fingerprint over coverage), opaque-token rule, the
+  two-source coordinator, and the stated axioms.
 
 **The 9 vectors (schema_version 2):** V1 growing-tail-defer (steady-state zero-bust), V2
 post-execute-settle (execute busts once, defers after are byte-stable), V3 frozen-strip-not-

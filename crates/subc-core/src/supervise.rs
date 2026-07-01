@@ -256,8 +256,8 @@ struct SupervisorRuntimeConfig {
 /// Shared daemon lookup table for supervised module handles.
 ///
 /// Shared by clone between the [`Supervisor`] (which spawns processes) and the
-/// channel-0 control handler (which verifies HELLOs), so the launch nonce the
-/// supervisor records on spawn is the same one the HELLO verifier checks against.
+/// channel-0 control handler (which verifies HELLOs and consumer route opens), so
+/// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
@@ -265,11 +265,24 @@ pub struct SupervisorHandle {
     /// supervisor spawns the reserved module; checked when a HELLO claims that id. A
     /// non-reserved module never has an entry here and is never nonce-checked.
     reserved_nonces: Arc<Mutex<HashMap<String, String>>>,
+    /// The current launch nonce for every supervised spawn. This is separate from
+    /// reserved_nonces because consumer route.open attestation applies to all spawned
+    /// modules, while HELLO id-squatting protection remains opt-in via `reserved`.
+    spawn_nonces: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl SupervisorHandle {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the launch nonce from a supervised spawn, replacing any prior nonce so
+    /// a respawn invalidates stale consumer identities.
+    pub fn set_spawn_nonce(&self, module_id: &str, nonce: String) {
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(module_id.to_string(), nonce);
     }
 
     /// Record the launch nonce expected from the next HELLO for a reserved module,
@@ -296,6 +309,41 @@ impl SupervisorHandle {
                 presented.is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes()))
             }
         }
+    }
+
+    /// Whether a consumer connection proved it came from a daemon-spawned module.
+    ///
+    /// Absence of an expected spawn nonce is a hard failure: consumer_identity is
+    /// accepted only for module ids the supervisor has spawned.
+    pub fn spawned_consumer_authorized(&self, module_id: &str, presented: &str) -> bool {
+        if presented.is_empty() {
+            return false;
+        }
+        let nonces = self
+            .spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        nonces
+            .get(module_id)
+            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()))
+    }
+
+    /// Test/support lookup for the current launch nonce of a supervised spawn.
+    pub fn spawn_launch_nonce_for(&self, module_id: &str) -> Option<String> {
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned()
+    }
+
+    /// Test/support lookup for the HELLO-gating nonce of a reserved module.
+    pub fn reserved_launch_nonce_for(&self, module_id: &str) -> Option<String> {
+        self.reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned()
     }
 
     pub fn insert(&self, module: SupervisedModule) -> Option<SupervisedModule> {
@@ -1293,17 +1341,17 @@ fn spawn_child(
     }
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
 
-    // For a reserved module, mint a fresh one-time launch nonce, record it as the
-    // expected nonce for this id (replacing any prior, so a stale child cannot
-    // re-register), and inject it. Only the process this spawn launches knows it, so
-    // only that process can register the reserved module_id. A respawn rotates it.
-    if spec.reserved {
-        let nonce = generate_launch_nonce()?;
-        if let Some(handle) = handle {
+    // Every supervised spawn receives a fresh one-time launch nonce for consumer
+    // route.open attestation. Reserved modules additionally use the same nonce for
+    // HELLO id-squatting protection. A respawn rotates both records.
+    let nonce = generate_launch_nonce()?;
+    if let Some(handle) = handle {
+        handle.set_spawn_nonce(&spec.module_id, nonce.clone());
+        if spec.reserved {
             handle.set_reserved_nonce(&spec.module_id, nonce.clone());
         }
-        command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
     }
+    command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
 
     command.kill_on_drop(true);
     command.spawn().map_err(|source| SuperviseError::Spawn {

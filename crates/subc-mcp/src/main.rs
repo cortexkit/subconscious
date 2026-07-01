@@ -27,7 +27,7 @@ use rmcp::{
     RoleServer, ServerHandler,
 };
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
-use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
+use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::{
     manifest::{
@@ -36,7 +36,7 @@ use subc_protocol::{
     },
     BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Priority, RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
-    SUBC_MODULE_ID_ENV,
+    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
     authenticate_client, authenticate_server, connection_file, generate_daemon_id, generate_key,
@@ -830,6 +830,7 @@ async fn open_provider_route(
             module_id: module_id.to_owned(),
         },
         identity: identity.clone(),
+        consumer_identity: consumer_identity_from_env(),
     };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr();
@@ -854,6 +855,19 @@ async fn open_provider_route(
             response.header.channel, response.header.corr
         ))),
     }
+}
+
+fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
+    let module_id = env::var(SUBC_MODULE_ID_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let launch_nonce = env::var(SUBC_LAUNCH_NONCE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    Some(ConsumerIdentity {
+        module_id,
+        launch_nonce,
+    })
 }
 
 fn desired_session_from_catalog(

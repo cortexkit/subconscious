@@ -2,13 +2,14 @@ use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use subc_control::{
-    ops, CatalogEntry, ClientControlRequest, ClientControlResponse, PollKind, SupervisorEntry,
+    ops, CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
+    SupervisorEntry,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
     session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
-    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
-    RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
+    Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -626,8 +627,13 @@ impl ControlHandler {
             ClientControlRequest::CatalogList { module_id } => {
                 self.handle_catalog_list(frame, module_id)
             }
-            ClientControlRequest::RouteOpen { target, identity } => {
-                self.handle_route_open(ctx, frame, target, identity).await
+            ClientControlRequest::RouteOpen {
+                target,
+                identity,
+                consumer_identity,
+            } => {
+                self.handle_route_open(ctx, frame, target, identity, consumer_identity)
+                    .await
             }
             ClientControlRequest::RoutePoll {
                 route_channel,
@@ -697,12 +703,41 @@ impl ControlHandler {
         )?])
     }
 
+    fn route_open_principal(
+        &self,
+        frame: &Frame,
+        consumer_identity: Option<ConsumerIdentity>,
+    ) -> Result<Result<Principal, Frame>, RouterError> {
+        let Some(consumer_identity) = consumer_identity else {
+            return Ok(Ok(Principal::Direct));
+        };
+
+        if self.supervisor.spawned_consumer_authorized(
+            &consumer_identity.module_id,
+            &consumer_identity.launch_nonce,
+        ) {
+            return Ok(Ok(Principal::Reserved {
+                module_id: consumer_identity.module_id,
+            }));
+        }
+
+        Ok(Err(control_error_frame(
+            frame,
+            "bad_consumer_identity",
+            format!(
+                "consumer_identity for module_id '{}' did not match a supervised launch nonce",
+                consumer_identity.module_id
+            ),
+        )?))
+    }
+
     async fn handle_route_open(
         &self,
         ctx: &RouteCtx,
         frame: Frame,
         target: RouteTarget,
         mut identity: BindIdentity,
+        consumer_identity: Option<ConsumerIdentity>,
     ) -> Result<Vec<Frame>, RouterError> {
         let target_module_id = target_module_id(&target).to_string();
         debug!(
@@ -793,6 +828,11 @@ impl ControlHandler {
             return Ok(vec![error]);
         }
 
+        let principal = match self.route_open_principal(&frame, consumer_identity)? {
+            Ok(principal) => principal,
+            Err(error) => return Ok(vec![error]),
+        };
+
         let project_root = match ProjectRootId::from_path(&identity.project_root) {
             Ok(project_root) => project_root,
             Err(err) => {
@@ -841,6 +881,7 @@ impl ControlHandler {
             route_channel: module_channel,
             target,
             identity,
+            principal: Some(principal),
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(
@@ -2075,17 +2116,26 @@ mod tests {
     #[test]
     fn non_reserved_module_ignores_launch_nonce() {
         let registry = Arc::new(Registry::default());
-        // No reserved nonce recorded for this id: it is not reserved, so a HELLO
-        // registers whether or not it carries a nonce.
+        // No reserved nonce recorded for these ids: they are not reserved, so HELLO
+        // registration succeeds whether a spawned process echoes a nonce or not.
         let handler = ControlHandler::new(Arc::clone(&registry));
-        let ack = handler
+        let no_nonce = handler
             .handle_control(
                 ConnectionId::new(1),
-                hello_frame("aft", PROTOCOL_VERSION, 1),
+                hello_frame("aft-no-nonce", PROTOCOL_VERSION, 1),
             )
             .unwrap();
-        assert_eq!(ack[0].header.ty, FrameType::HelloAck);
-        assert!(registry.get_module("aft").unwrap().is_some());
+        assert_eq!(no_nonce[0].header.ty, FrameType::HelloAck);
+        assert!(registry.get_module("aft-no-nonce").unwrap().is_some());
+
+        let echoed_nonce = handler
+            .handle_control(
+                ConnectionId::new(2),
+                hello_frame_with_nonce("aft-with-nonce", PROTOCOL_VERSION, 2, Some("spawn-nonce")),
+            )
+            .unwrap();
+        assert_eq!(echoed_nonce[0].header.ty, FrameType::HelloAck);
+        assert!(registry.get_module("aft-with-nonce").unwrap().is_some());
     }
 
     #[test]

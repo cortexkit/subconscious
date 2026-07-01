@@ -18,11 +18,12 @@ use std::{
 };
 
 pub use async_trait::async_trait;
+pub use subc_control::ConsumerIdentity;
 use subc_protocol::{
     manifest::ModuleManifest,
     session::{ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
-    ModuleHelloBody, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV,
+    ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV,
     SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
@@ -140,6 +141,7 @@ pub struct RouteBindRequest {
     pub route_channel: u16,
     pub target: RouteTarget,
     pub identity: BindIdentity,
+    pub principal: Option<Principal>,
 }
 
 /// Decision returned by [`ModuleHandler::on_bind`].
@@ -388,11 +390,13 @@ where
             route_channel,
             target,
             identity,
+            principal,
         } => {
             let req = RouteBindRequest {
                 route_channel,
                 target,
                 identity,
+                principal,
             };
             let decision = handler.on_bind(&req).await;
             match decision.kind {

@@ -12,7 +12,7 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
+use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind};
 use subc_core::{
     read_frame, write_frame, ExitKind, ForwardingTable, Frame, ModuleSpec, ModuleState,
     ModuleStatus, Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle,
@@ -129,6 +129,7 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
         attach_event["target"]["module_id"].as_str(),
         Some(module_id)
     );
+    assert_eq!(attach_event["principal"]["kind"].as_str(), Some("direct"));
     // subc canonicalizes project_root via cortexkit-paths (ProjectRootId) before
     // relaying — NOT raw fs::canonicalize, which keeps Windows' verbatim \\?\ prefix.
     // Assert against the same canonicalization subc uses so this holds on every OS.
@@ -165,6 +166,159 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
     assert_eq!(response.body, payload);
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_consumer_identity_stamps_reserved_principal() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let target_module_id = "fake-aft-principal-target";
+    let (target, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, target_module_id, "principal-reserved")
+            .await;
+
+    let consumer_module_id = "fake-consumer-reserved";
+    let consumer = supervisor
+        .spawn(reserved_stub_spec(&server, consumer_module_id))
+        .unwrap();
+    wait_for_registration(&server.registry, consumer_module_id, SETUP_TIMEOUT).await;
+    let launch_nonce = server
+        .supervisor_handle
+        .reserved_launch_nonce_for(consumer_module_id)
+        .expect("reserved spawn records launch nonce");
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &attach_frame(
+            151,
+            attach_request_with_consumer_identity(
+                &project,
+                "ses-principal-reserved",
+                target_module_id,
+                Some(ConsumerIdentity {
+                    module_id: consumer_module_id.to_string(),
+                    launch_nonce,
+                }),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let ack_frame = read_frame_timeout(&mut client).await;
+    assert_eq!(ack_frame.header.ty, FrameType::Response);
+    assert_eq!(ack_frame.header.corr, 151);
+    let attach_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(attach_event["principal"]["kind"].as_str(), Some("reserved"));
+    assert_eq!(
+        attach_event["principal"]["module_id"].as_str(),
+        Some(consumer_module_id)
+    );
+
+    target.stop().await.unwrap();
+    consumer.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mismatched_consumer_identity_rejects_without_route_bind() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let target_module_id = "fake-aft-principal-mismatch-target";
+    let (target, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, target_module_id, "principal-mismatch")
+            .await;
+
+    let consumer_module_id = "fake-consumer-mismatch";
+    let consumer = supervisor
+        .spawn(reserved_stub_spec(&server, consumer_module_id))
+        .unwrap();
+    wait_for_registration(&server.registry, consumer_module_id, SETUP_TIMEOUT).await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &attach_frame(
+            152,
+            attach_request_with_consumer_identity(
+                &project,
+                "ses-principal-mismatch",
+                target_module_id,
+                Some(ConsumerIdentity {
+                    module_id: consumer_module_id.to_string(),
+                    launch_nonce: "wrong-nonce".to_string(),
+                }),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let error_frame = read_frame_timeout(&mut client).await;
+    let error = assert_error(&error_frame, 0, 152, "bad_consumer_identity");
+    assert!(error.message.contains(consumer_module_id));
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
+
+    target.stop().await.unwrap();
+    consumer.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_consumer_identity_rejects_without_route_bind() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let target_module_id = "fake-aft-principal-unknown-target";
+    let (target, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, target_module_id, "principal-unknown")
+            .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &attach_frame(
+            153,
+            attach_request_with_consumer_identity(
+                &project,
+                "ses-principal-unknown",
+                target_module_id,
+                Some(ConsumerIdentity {
+                    module_id: "missing-consumer".to_string(),
+                    launch_nonce: "nonce".to_string(),
+                }),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let error_frame = read_frame_timeout(&mut client).await;
+    assert_error(&error_frame, 0, 153, "bad_consumer_identity");
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
+
+    target.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1696,6 +1850,7 @@ async fn route_open_invalid_project_root_returns_error_without_provider_attach()
             harness: "opencode".to_string(),
             session: "ses-invalid-project-root".to_string(),
         },
+        consumer_identity: None,
     };
     write_frame(&mut client, &control_request_frame(481, request))
         .await
@@ -3652,6 +3807,15 @@ where
 }
 
 fn attach_request(project: &TestProject, session: &str, module_id: &str) -> ClientControlRequest {
+    attach_request_with_consumer_identity(project, session, module_id, None)
+}
+
+fn attach_request_with_consumer_identity(
+    project: &TestProject,
+    session: &str,
+    module_id: &str,
+    consumer_identity: Option<ConsumerIdentity>,
+) -> ClientControlRequest {
     ClientControlRequest::RouteOpen {
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
@@ -3661,6 +3825,7 @@ fn attach_request(project: &TestProject, session: &str, module_id: &str) -> Clie
             harness: "opencode".to_string(),
             session: session.to_string(),
         },
+        consumer_identity,
     }
 }
 

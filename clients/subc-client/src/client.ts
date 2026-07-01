@@ -38,6 +38,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const BODY_READ_TIMEOUT_MS = 30_000;
 const EMPTY_BODY = new Uint8Array(0);
 const DEFAULT_MANAGED_TARGET_KIND: ManagedRouteKind = "management_surface";
+export const SUBC_MODULE_ID_ENV = "SUBC_MODULE_ID";
+export const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
 
 export interface BindIdentity {
   project_root: string;
@@ -51,6 +53,16 @@ export type RouteTarget =
   | { kind: "internal_service"; module_id: string; service_id: string };
 
 export type ManagedRouteKind = "management_surface" | "tool_provider";
+
+export interface ConsumerIdentity {
+  module_id: string;
+  launch_nonce: string;
+}
+
+export interface RouteOpenOptions {
+  /** Optional override for the consumer identity; by default the SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used when both are non-empty. Set null to send route.open without consumer_identity. */
+  consumerIdentity?: ConsumerIdentity | null;
+}
 
 export interface CatalogEntry {
   module_id: string;
@@ -70,6 +82,8 @@ export interface ManagedCallOptions extends RequestOptions {
   identity?: BindIdentity;
   /** Defaults to management_surface, matching the store/host management APIs. */
   targetKind?: ManagedRouteKind;
+  /** Optional override for the consumer identity; by default the SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used when both are non-empty. Set null to send route.open without consumer_identity. */
+  consumerIdentity?: ConsumerIdentity | null;
 }
 
 export interface SubscribeOptions {
@@ -83,6 +97,8 @@ export interface CloseRouteOptions {
    * Defaults to false: close immediately, aborting everything in flight.
    */
   drain?: boolean;
+  /** Consumer identity to use when looking up the route to close; only needed for routes opened with a non-default consumer identity. */
+  consumerIdentity?: ConsumerIdentity | null;
 }
 
 /**
@@ -199,6 +215,7 @@ interface CachedRoute {
   moduleId: string;
   target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
   identity: BindIdentity;
+  consumerIdentity?: ConsumerIdentity;
   channel: number | null;
   generation: number;
   opening: Promise<number> | null;
@@ -252,8 +269,14 @@ export class SubcClient {
   }
 
   /** Open a route to a provider (channel-0 route.open); returns the route channel. */
-  async routeOpen(target: RouteTarget, identity: BindIdentity): Promise<number> {
-    const body = this.encode({ op: "route.open", target, identity });
+  async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<number> {
+    const consumerIdentity = routeOpenConsumerIdentity(opts);
+    const body = this.encode({
+      op: "route.open",
+      target,
+      identity,
+      ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
+    });
     const reply = await this.controlRpc(body);
     const parsed = this.parseJson(reply) as { op: string; route_channel?: number };
     if (typeof parsed.route_channel !== "number") {
@@ -380,7 +403,7 @@ export class SubcClient {
     identity: BindIdentity,
     opts: CloseRouteOptions = {},
   ): Promise<void> {
-    const key = routeCacheKey(target, identity);
+    const key = routeCacheKey(target, identity, routeOpenConsumerIdentity(opts));
     const cached = this.routes.get(key);
     if (!cached) return; // never opened / already closed — idempotent no-op.
     // Generation guard: an in-flight openCachedRoute holds this same object and
@@ -590,7 +613,8 @@ export class SubcClient {
       RouteTarget,
       { kind: ManagedRouteKind }
     >;
-    const key = routeCacheKey(target, identity);
+    const consumerIdentity = routeOpenConsumerIdentity(opts);
+    const key = routeCacheKey(target, identity, consumerIdentity);
     let cached = this.routes.get(key);
     if (!cached) {
       cached = {
@@ -598,6 +622,7 @@ export class SubcClient {
         moduleId,
         target,
         identity,
+        consumerIdentity,
         channel: null,
         generation: 0,
         opening: null,
@@ -630,7 +655,9 @@ export class SubcClient {
       }
 
       try {
-        const channel = await this.routeOpen(cached.target, cached.identity);
+        const channel = await this.routeOpen(cached.target, cached.identity, {
+          consumerIdentity: cached.consumerIdentity ?? null,
+        });
         // Generation guard: a closeRoute may have flipped the tombstone WHILE this
         // route.open was in flight. If so, close wins — do NOT install the channel
         // into the (already-removed) cache entry; GOODBYE the channel we just opened
@@ -885,8 +912,23 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
   };
 }
 
-function routeCacheKey(target: Extract<RouteTarget, { kind: ManagedRouteKind }>, identity: BindIdentity): string {
-  return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}`;
+function routeCacheKey(
+  target: Extract<RouteTarget, { kind: ManagedRouteKind }>,
+  identity: BindIdentity,
+  consumerIdentity?: ConsumerIdentity,
+): string {
+  const consumerPart = consumerIdentity
+    ? `${consumerIdentity.module_id}\0${consumerIdentity.launch_nonce}`
+    : "";
+  return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}`;
+}
+
+function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): ConsumerIdentity | undefined {
+  if (opts.consumerIdentity !== undefined) return opts.consumerIdentity ?? undefined;
+  const moduleId = process.env[SUBC_MODULE_ID_ENV];
+  const launchNonce = process.env[SUBC_LAUNCH_NONCE_ENV];
+  if (!moduleId || !launchNonce) return undefined;
+  return { module_id: moduleId, launch_nonce: launchNonce };
 }
 
 function errorCode(err: unknown): string | undefined {

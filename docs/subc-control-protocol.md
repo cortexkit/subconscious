@@ -60,6 +60,14 @@ pub enum RouteTarget {                          // explicit provider/surface sel
 }
 
 pub struct ErrorBody { pub code: String, pub message: String } // code = open string; v1 set in §8
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Principal {
+    Reserved { module_id: String },
+    Direct,
+    Unverified,
+}
 ```
 **RouteTarget.kind ↔ ProviderRole mapping (normative):**
 | RouteTarget.kind | required ProviderRole | disambiguator |
@@ -78,6 +86,8 @@ pub enum ClientControlRequest {
     #[serde(rename = "server.describe")]        ServerDescribe {},
     #[serde(rename = "catalog.list")]           CatalogList { module_id: Option<String> }, // NO plane filter (thin-core)
     #[serde(rename = "route.open")]             RouteOpen { target: RouteTarget, identity: BindIdentity,
+                                                            #[serde(default, skip_serializing_if = "Option::is_none")]
+                                                            consumer_identity: Option<ConsumerIdentity>,
                                                             #[serde(default)] config: Vec<ConfigTier> },
     #[serde(rename = "route.poll")]             RoutePoll { route_channel: u16, kind: PollKind }, // status|liveness
     #[serde(rename = "supervisor.list")]        SupervisorList {},
@@ -99,6 +109,7 @@ pub enum ClientControlResponse {
 }
 
 #[serde(rename_all="snake_case")] pub enum PollKind { Status, Liveness }
+pub struct ConsumerIdentity { pub module_id: String, pub launch_nonce: String }
 pub struct CatalogEntry { pub module_id: String, pub roles: Vec<ProviderRole>, pub control_ops: Vec<String> }
 pub struct SupervisorEntry { pub module_id: String, pub state: String, pub enabled: bool, pub live: bool }
 // Route teardown = GOODBYE frame (§2). Errors = ErrorBody on FrameType::Error (§8), correlated by channel+corr.
@@ -135,7 +146,9 @@ pub struct ModuleHelloAckBody {
 #[derive(Serialize, Deserialize)] #[serde(tag = "op")]
 pub enum ModuleControlRequest {
     #[serde(rename = "route.bind")] RouteBind { route_channel: u16, target: RouteTarget,
-                                                identity: BindIdentity, #[serde(default)] config: Vec<ConfigTier> },
+                                                identity: BindIdentity, #[serde(default)] config: Vec<ConfigTier>,
+                                                #[serde(default, skip_serializing_if = "Option::is_none")]
+                                                principal: Option<Principal> },
 }
 ```
 
@@ -146,6 +159,7 @@ pub enum ModuleControlRequest {
 - Role-aware registration (merged) generalizes: only modules whose manifest declares a routable role enter the routable set; consumer-only modules (the MCP gateway) register for supervision/liveness only.
 - **`BindIdentity` is per-route context, NOT a routing key** (the key is `target.module_id`). subc does NOT dedup identity; the same triple may open N routes (e.g. one project → AFT + MC). Any per-identity uniqueness is module-enforced.
 - **subc OWNS `project_root` canonicalization at the `route.open`→`route.bind` boundary** (AFT pin #2). subc canonicalizes `BindIdentity.project_root` via `cortexkit-paths` BEFORE emitting `route.bind`; the module consumes it as-is and MUST NOT re-canonicalize (the shared crate makes both sides' `ProjectRootId` byte-identical, but single-ownership prevents a double-canonicalize divergence on symlinked/case-folded paths). `harness`/`session` are passed through verbatim.
+- **Principal extension:** `route.open.consumer_identity` is optional. When absent, subc stamps `RouteBind.principal = {"kind":"direct"}`. When present, subc verifies `module_id` + `launch_nonce` against the supervisor's reserved launch-nonce state and stamps `{"kind":"reserved","module_id":...}` only on a match. Unknown module ids, empty nonces, and mismatches reject `route.open` with `bad_consumer_identity`; subc never downgrades a failed reserved claim to direct. `{"kind":"unverified"}` is reserved vocabulary and is not emitted today.
 - **subc does NO `RouteStatus` fan-out** (AFT pin #5). When a module has N routes open for one project, the MODULE emits `route.status` per `route_channel` itself; subc only caches per route_channel (it never replicates one status across routes).
 - v1 ships AFT as the single registered tool-provider; the registry is exercised in tests against a SECOND stub provider so multi-provider is proven, not hypothetical.
 - **RESERVED: the subc→client Push direction.** v1 defines NO `ClientControlPush` enum, but the direction is reserved: **clients MUST ignore unrecognized channel-0 Push ops (never error)**. This makes `route.*`/`catalog.*`/`watch.*` client pushes (e.g. `catalog.changed{generation}`) additive-later with no re-bump. **Route death is already expressed by GOODBYE:** on module crash/disable, subc emits a route `GOODBYE` to each affected client AND tears down its own forwarding state (this BEHAVIOR is required in v1; the new push family is not).
@@ -158,7 +172,7 @@ pub enum ModuleControlRequest {
 **Guardrail (P4):** a conformance test stubs MC/embedding/LLM-runner/bus/federation and asserts each integrates with ZERO new `FrameType` and ZERO new subc-understood op. Unknown control op → `unknown_control_op` (never silent). subc owns the config STORE substrate + raw-tier transport, NEVER the config CRUD OPERATION (`memory.list`/`config.upsert` bodies are module RPC).
 
 ## 8. Errors, capability negotiation, versioning
-- **Errors:** `ErrorBody { code, message }` on `FrameType::Error`; channel+corr identify the failing request (corr is unique per route channel). v1 code set: `unknown_control_op`, `invalid_control_body`, `op_not_allowed`, `unknown_channel`, `unknown_module`, `target_unavailable`, `module_reloading`, `reload_failed`, `route_limit`, `config_divergence`, `version_unsupported`, `duplicate_module_id`, `invalid_hello`, `invalid_manifest`. State machine: `unknown_module` = no registration/supervised module with that id; `target_unavailable` = registered but down/restarting/disabled/wrong-role; `module_reloading` = reload drain gate is rejecting new route.open / route REQUEST admission; `reload_failed` = supervised reload drained the old generation but the replacement could not register.
+- **Errors:** `ErrorBody { code, message }` on `FrameType::Error`; channel+corr identify the failing request (corr is unique per route channel). v1 code set: `unknown_control_op`, `invalid_control_body`, `op_not_allowed`, `unknown_channel`, `unknown_module`, `target_unavailable`, `bad_consumer_identity`, `module_reloading`, `reload_failed`, `route_limit`, `config_divergence`, `version_unsupported`, `duplicate_module_id`, `invalid_hello`, `invalid_manifest`. State machine: `unknown_module` = no registration/supervised module with that id; `target_unavailable` = registered but down/restarting/disabled/wrong-role; `bad_consumer_identity` = route.open presented a consumer_identity whose module_id is unknown to the supervisor's reserved launch-nonce table, whose nonce is empty, or whose nonce does not match; `module_reloading` = reload drain gate is rejecting new route.open / route REQUEST admission; `reload_failed` = supervised reload drained the old generation but the replacement could not register.
 - **MODULE rejection is relayed VERBATIM to the client (AFT pin #3, normative):** when a module rejects `route.bind` on the Error lane, subc relays that `ErrorBody { code, message }` **verbatim** to the originating client's `route.open` corr — subc MUST NOT synthesize a generic "bind failed" or truncate `message`. Rationale: `config_divergence`'s diff (which RootConfig keys conflict, active-vs-incoming) rides in `ErrorBody.message`; the user needs it intact to fix their `aft.jsonc`. This applies to ANY module Error-lane rejection of a relayed request, not just attach.
 - **Capability negotiation:** module direction is BIDIRECTIONAL — module HELLO carries `control_ops: Option<...>` (None = legacy BASELINE only), subc HELLO_ACK carries `subc_ops` (precise allowlist) + `subc_capabilities` (coarse). Client direction is DISCOVERY-ONLY via `server.describe` (no client HELLO). Known-but-ungranted module op → `op_not_allowed`.
 - **The BASELINE control op set (what `control_ops: None` grants a module — AFT pin #4, enumerated):** RECEIVE `route.bind` + GOODBYE (route teardown); EMIT `RouteBindAck` / Error-lane rejection (responses), `route.status` push, and GOODBYE. I.e. a module that declares `None` can fully participate in routing + status + teardown without enumerating anything. `control_ops: Some([...])` is only needed to opt INTO ops ADDED later (e.g. a future `scheduler.*`/`lease.*` a module wants to receive). **Pushes are always accepted (ignored-if-unknown), so `route.status` emission is NOT gated by `subc_ops`** — a baseline-only v1 module may ignore `subc_ops` entirely (AFT pin #5b).

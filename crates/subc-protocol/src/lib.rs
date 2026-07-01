@@ -47,6 +47,18 @@ pub struct BindIdentity {
     pub session: String,
 }
 
+/// Caller fact stamped by subc on each route.bind relayed to a module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Principal {
+    /// A daemon-spawned reserved module proved possession of its launch nonce.
+    Reserved { module_id: String },
+    /// No consumer identity was presented; the caller is a direct key-holder.
+    Direct,
+    /// Reserved vocabulary for a future degraded/no-key-auth mode.
+    Unverified,
+}
+
 /// Explicit target for a route open/bind operation.
 ///
 /// RouteTarget.kind ↔ ProviderRole mapping:

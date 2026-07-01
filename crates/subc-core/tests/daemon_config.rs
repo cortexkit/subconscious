@@ -389,6 +389,7 @@ where
                 harness: "daemon-config-test".to_string(),
                 session: format!("session-{corr}"),
             },
+            consumer_identity: None,
         },
     )
     .await

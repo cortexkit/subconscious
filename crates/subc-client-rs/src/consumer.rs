@@ -7,9 +7,10 @@ use std::{
     time::Duration,
 };
 
-use subc_control::{ClientControlRequest, ClientControlResponse};
+use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::{
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget,
+    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
@@ -87,6 +88,10 @@ pub struct CloseRouteOptions {
     pub drain: bool,
     /// Upper bound on the drain wait (ignored when `drain` is false).
     pub drain_timeout: Duration,
+    /// Override for the consumer identity used to locate the route being closed;
+    /// when absent, SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables
+    /// identify the route for a supervised consumer.
+    pub consumer_identity: Option<ConsumerIdentity>,
 }
 
 impl Default for CloseRouteOptions {
@@ -94,6 +99,7 @@ impl Default for CloseRouteOptions {
         Self {
             drain: false,
             drain_timeout: DEFAULT_CALL_TIMEOUT,
+            consumer_identity: None,
         }
     }
 }
@@ -107,6 +113,8 @@ pub struct CallOptions {
     pub route_retry: RetryBackoff,
     /// Maximum real-time limit for retrying route.open attempts when the target is temporarily absent.
     pub route_retry_deadline: Duration,
+    /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
+    pub consumer_identity: Option<ConsumerIdentity>,
 }
 
 impl Default for CallOptions {
@@ -116,6 +124,7 @@ impl Default for CallOptions {
             priority: Priority::Interactive,
             route_retry: RetryBackoff::default(),
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
+            consumer_identity: None,
         }
     }
 }
@@ -155,12 +164,20 @@ impl SubcConsumer {
         opts: CallOptions,
     ) -> Result<Vec<u8>, CallError> {
         let call_deadline = Instant::now() + opts.timeout;
-        let route_key = RouteKey::new(&target, &identity);
+        let consumer_identity = route_open_consumer_identity(&opts);
+        let route_key = RouteKey::new(&target, &identity, consumer_identity.as_ref());
 
         loop {
             let route = self
                 .shared
-                .ensure_route(&route_key, &target, &identity, &opts, call_deadline)
+                .ensure_route(
+                    &route_key,
+                    &target,
+                    &identity,
+                    &consumer_identity,
+                    &opts,
+                    call_deadline,
+                )
                 .await?;
             let permit = match Arc::clone(&route.sem).acquire_owned().await {
                 Ok(permit) => permit,
@@ -222,7 +239,8 @@ impl SubcConsumer {
         identity: BindIdentity,
         opts: CloseRouteOptions,
     ) {
-        let key = RouteKey::new(&target, &identity);
+        let consumer_identity = close_route_consumer_identity(&opts);
+        let key = RouteKey::new(&target, &identity, consumer_identity.as_ref());
         self.shared.close_route(&key, &opts).await;
     }
 
@@ -661,6 +679,7 @@ impl Shared {
         key: &RouteKey,
         target: &RouteTarget,
         identity: &BindIdentity,
+        consumer_identity: &Option<ConsumerIdentity>,
         opts: &CallOptions,
         call_deadline: Instant,
     ) -> Result<RouteState, CallError> {
@@ -700,7 +719,14 @@ impl Shared {
                 RouteOpenAction::Lead => {
                     let mut guard = OpeningGuard::new(Arc::clone(self), key.clone());
                     let result = self
-                        .open_route_with_retry(key, target, identity, opts, call_deadline)
+                        .open_route_with_retry(
+                            key,
+                            target,
+                            identity,
+                            consumer_identity,
+                            opts,
+                            call_deadline,
+                        )
                         .await
                         .map_err(SharedCallFailure::from);
                     guard.finish(result.clone());
@@ -715,6 +741,7 @@ impl Shared {
         key: &RouteKey,
         target: &RouteTarget,
         identity: &BindIdentity,
+        consumer_identity: &Option<ConsumerIdentity>,
         opts: &CallOptions,
         call_deadline: Instant,
     ) -> Result<RouteState, CallError> {
@@ -726,6 +753,7 @@ impl Shared {
             let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
                 target: target.clone(),
                 identity: identity.clone(),
+                consumer_identity: consumer_identity.clone(),
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
             let remaining = remaining_duration(route_deadline)?;
@@ -1241,15 +1269,21 @@ struct RouteKey {
     project_root: PathBuf,
     harness: String,
     session: String,
+    consumer_identity: Option<ConsumerIdentityKey>,
 }
 
 impl RouteKey {
-    fn new(target: &RouteTarget, identity: &BindIdentity) -> Self {
+    fn new(
+        target: &RouteTarget,
+        identity: &BindIdentity,
+        consumer_identity: Option<&ConsumerIdentity>,
+    ) -> Self {
         Self {
             target: RouteTargetKey::from(target),
             project_root: identity.project_root.clone(),
             harness: identity.harness.clone(),
             session: identity.session.clone(),
+            consumer_identity: consumer_identity.map(ConsumerIdentityKey::from),
         }
     }
 
@@ -1263,6 +1297,21 @@ impl RouteKey {
                 module_id,
                 service_id,
             } => format!("internal_service:{module_id}:{service_id}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ConsumerIdentityKey {
+    module_id: String,
+    launch_nonce: String,
+}
+
+impl From<&ConsumerIdentity> for ConsumerIdentityKey {
+    fn from(value: &ConsumerIdentity) -> Self {
+        Self {
+            module_id: value.module_id.clone(),
+            launch_nonce: value.launch_nonce.clone(),
         }
     }
 }
@@ -1628,6 +1677,31 @@ async fn write_one_and_flush(
     writer.flush().await.map_err(FrameIoError::Io)
 }
 
+fn route_open_consumer_identity(opts: &CallOptions) -> Option<ConsumerIdentity> {
+    opts.consumer_identity
+        .clone()
+        .or_else(consumer_identity_from_env)
+}
+
+fn close_route_consumer_identity(opts: &CloseRouteOptions) -> Option<ConsumerIdentity> {
+    opts.consumer_identity
+        .clone()
+        .or_else(consumer_identity_from_env)
+}
+
+fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
+    let module_id = std::env::var(SUBC_MODULE_ID_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let launch_nonce = std::env::var(SUBC_LAUNCH_NONCE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    Some(ConsumerIdentity {
+        module_id,
+        launch_nonce,
+    })
+}
+
 fn classify_failure(accepted: bool, reason: impl Into<String>) -> CallError {
     if accepted {
         CallError::outcome_unknown(reason)
@@ -1785,6 +1859,7 @@ mod tests {
                 harness: "h".into(),
                 session: "s".into(),
             },
+            None,
         );
         // Simulate an in-flight lead open: an openings entry exists, not yet closed,
         // with no cached route (channel hasn't been installed yet).
@@ -1820,6 +1895,7 @@ mod tests {
                 harness: "h".into(),
                 session: "s".into(),
             },
+            None,
         );
         shared
             .close_route(&absent, &CloseRouteOptions::default())
@@ -1837,7 +1913,7 @@ mod tests {
             harness: "h".into(),
             session: "s".into(),
         };
-        let key = RouteKey::new(&target, &identity);
+        let key = RouteKey::new(&target, &identity, None);
         assert_eq!(key.project_root, PathBuf::from("/tmp/project"));
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
     }

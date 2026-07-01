@@ -68,10 +68,28 @@ jobs:
 
       # Idempotent: a retag of the same version (recovery re-run) treats
       # "already exists" as success instead of failing the release.
+      #
+      # Paired-release race: subc-transport depends on subc-protocol, so when both
+      # tags are pushed together, transport's publish can run before the freshly
+      # published protocol version is resolvable on the index ("failed to select a
+      # version for the requirement"). That is transient index propagation, not a
+      # real failure — retry with a delay before giving up.
       - name: Publish
         run: |
           CRATE="${{ steps.tag.outputs.crate }}"
-          cargo publish --package "$CRATE" \
-            || { ec=$?; cargo publish --package "$CRATE" --dry-run 2>&1 | grep -q "already exists" && echo "already published; treating as success" || exit $ec; }
+          for attempt in 1 2 3 4 5 6; do
+            out=$(cargo publish --package "$CRATE" 2>&1) && { echo "$out"; exit 0; }
+            echo "$out"
+            if echo "$out" | grep -q "already exists"; then
+              echo "already published; treating as success"; exit 0
+            fi
+            if echo "$out" | grep -q "failed to select a version for the requirement"; then
+              echo "dependency not yet resolvable on the index (attempt $attempt); retrying in 60s"
+              sleep 60; continue
+            fi
+            exit 1
+          done
+          echo "::error::dependency still unresolvable after retries"
+          exit 1
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

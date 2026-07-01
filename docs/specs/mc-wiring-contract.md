@@ -53,7 +53,13 @@ projection).
   "messages": [                      // FULL CK#1 CkMessages, in order, INCLUDING
     {                                //  leading system message(s) — see §2.1
       "mid": "…",                   // durable per-message identity (§3.2) — sidecar
-      "ordinal": 42,                 //  field, NOT part of CK#1 (never rendered)
+      "ordinal": 42,                 // DURABLE monotonic lineage coordinate — NOT the
+                                     //  array index (index restarts at 0 under the §6.5
+                                     //  coverage trim while MC's ordinal-keyed durable
+                                     //  state keeps advancing; same data-not-position
+                                     //  rule as mid: stable per mid across requests,
+                                     //  strictly increasing in lineage order, renderer-
+                                     //  ignored). Neither field is part of CK#1.
       "ck": { /* CkMessage: role, content[], origin, provider_extras, meta */ }
     }
   ],

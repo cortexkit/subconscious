@@ -863,6 +863,7 @@ async fn open_route(
                     harness: "opencode".to_string(),
                     session: session.to_string(),
                 },
+                consumer_identity: None,
             },
         ))
         .await;
@@ -880,6 +881,7 @@ async fn open_route(
         route_channel: module_channel,
         target,
         identity,
+        ..
     } = bind;
     assert!(route_target_is_module(&target, module_id));
     assert_eq!(identity.session, session);

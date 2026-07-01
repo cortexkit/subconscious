@@ -298,6 +298,32 @@ impl SupervisorHandle {
         }
     }
 
+    /// Whether a consumer connection proved it came from the reserved module spawn.
+    ///
+    /// Absence of an expected nonce is a hard failure: a consumer_identity claim is
+    /// meaningful only for daemon-spawned reserved modules.
+    pub fn reserved_consumer_authorized(&self, module_id: &str, presented: &str) -> bool {
+        if presented.is_empty() {
+            return false;
+        }
+        let nonces = self
+            .reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        nonces
+            .get(module_id)
+            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()))
+    }
+
+    /// Test/support lookup for the current launch nonce of a reserved supervised module.
+    pub fn reserved_launch_nonce_for(&self, module_id: &str) -> Option<String> {
+        self.reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned()
+    }
+
     pub fn insert(&self, module: SupervisedModule) -> Option<SupervisedModule> {
         let mut modules = self
             .modules

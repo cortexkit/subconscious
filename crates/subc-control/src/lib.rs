@@ -10,6 +10,13 @@
 use serde::{Deserialize, Serialize};
 use subc_protocol::{manifest::ProviderRole, BindIdentity, RouteTarget};
 
+/// Daemon-spawned consumer identity presented on route.open.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ConsumerIdentity {
+    pub module_id: String,
+    pub launch_nonce: String,
+}
+
 /// Reserved dotted operation prefixes for the v0.4 control vocabulary.
 pub mod ops {
     pub const SERVER: &str = "server.";
@@ -45,6 +52,8 @@ pub enum ClientControlRequest {
     RouteOpen {
         target: RouteTarget,
         identity: BindIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consumer_identity: Option<ConsumerIdentity>,
     },
     #[serde(rename = "route.poll")]
     RoutePoll { route_channel: u16, kind: PollKind },
@@ -141,10 +150,34 @@ mod tests {
                 harness: "opencode".to_string(),
                 session: "session-1".to_string(),
             },
+            consumer_identity: None,
         };
 
         let body = serde_json::to_value(request).unwrap();
         assert_eq!(body["op"], "route.open");
         assert_eq!(body["target"]["kind"], "tool_provider");
+        assert!(body.get("consumer_identity").is_none());
+    }
+
+    #[test]
+    fn route_open_without_consumer_identity_still_decodes() {
+        let body = serde_json::json!({
+            "op": "route.open",
+            "target": { "kind": "tool_provider", "module_id": "aft" },
+            "identity": {
+                "project_root": "/tmp/project",
+                "harness": "opencode",
+                "session": "session-1"
+            }
+        });
+
+        let decoded: ClientControlRequest = serde_json::from_value(body).unwrap();
+        let ClientControlRequest::RouteOpen {
+            consumer_identity, ..
+        } = decoded
+        else {
+            panic!("decoded wrong request variant");
+        };
+        assert_eq!(consumer_identity, None);
     }
 }

@@ -3,7 +3,8 @@ use std::{fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
-    CatalogEntry, ClientControlRequest, ClientControlResponse, PollKind, SupervisorEntry,
+    CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
+    SupervisorEntry,
 };
 use subc_protocol::{
     manifest::{
@@ -83,6 +84,10 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     service_id: "llm".to_string(),
                 },
                 identity: bind_identity(),
+                consumer_identity: Some(ConsumerIdentity {
+                    module_id: "subc-mcp".to_string(),
+                    launch_nonce: "0123456789abcdef".to_string(),
+                }),
             },
         ),
         (

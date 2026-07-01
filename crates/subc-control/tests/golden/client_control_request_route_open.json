@@ -1,4 +1,8 @@
 {
+  "consumer_identity": {
+    "launch_nonce": "0123456789abcdef",
+    "module_id": "subc-mcp"
+  },
   "identity": {
     "harness": "opencode",
     "project_root": "/tmp/subc/project",

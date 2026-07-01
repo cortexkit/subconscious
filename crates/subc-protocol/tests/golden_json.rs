@@ -8,7 +8,8 @@ use subc_protocol::{
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
-    BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, Principal, RouteTarget,
+    PROTOCOL_VERSION,
 };
 
 // Drift-prevention contract: UPDATE_GOLDEN=1 rewrites the committed JSON
@@ -36,6 +37,9 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         },
     );
     assert_golden("error_body", &error_body());
+    assert_golden("principal_reserved", &principal_reserved());
+    assert_golden("principal_direct", &Principal::Direct);
+    assert_golden("principal_unverified", &Principal::Unverified);
     assert_golden("module_hello_body", &module_hello_body());
     assert_golden("module_hello_ack_body", &module_hello_ack_body());
     assert_golden(
@@ -103,6 +107,12 @@ fn error_body() -> ErrorBody {
     }
 }
 
+fn principal_reserved() -> Principal {
+    Principal::Reserved {
+        module_id: "subc-mcp".to_string(),
+    }
+}
+
 fn module_hello_body() -> ModuleHelloBody {
     ModuleHelloBody {
         manifest: module_manifest("aft-tools"),
@@ -136,6 +146,7 @@ fn module_control_request() -> ModuleControlRequest {
             module_id: "aft-tools".to_string(),
         },
         identity: bind_identity(),
+        principal: Some(Principal::Direct),
     }
 }
 

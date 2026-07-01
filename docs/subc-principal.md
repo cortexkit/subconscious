@@ -35,10 +35,15 @@ policy's identity axis (docs/subc-mcp-gateway-design.md §2.4).
 }
 ```
 
-- A **daemon-spawned** process already holds `SUBC_MODULE_ID` + the launch nonce
-  (env-injected by the supervisor at spawn). Its *consumer* connection presents
-  them here. This resolves the consumer-attestation crux by reusing the exact
-  provider-HELLO attestation secret on the consumer path — no new credential.
+- Every **daemon-spawned** process holds `SUBC_MODULE_ID` + a fresh launch
+  nonce (env-injected by the supervisor at every spawn, rotated on respawn). Its
+  *consumer* connection presents them here. This resolves the
+  consumer-attestation crux by reusing the existing spawn secret on the consumer
+  path — no new credential and no dependence on a module's `reserved: true`
+  config flag.
+- `reserved: true` remains only the provider-HELLO id-squatting protection: it
+  decides whether a module must echo the nonce to register that module id. It is
+  **not** required for consumer principal attestation.
 - A **host-launched** key-holder (opencode/pi plugin) sends no
   `consumer_identity` at all.
 
@@ -47,11 +52,14 @@ policy's identity axis (docs/subc-mcp-gateway-design.md §2.4).
 | `consumer_identity` | Check | Resulting principal |
 |---|---|---|
 | absent | — | `direct` |
-| present, nonce matches supervisor's expected nonce for `module_id` | ✓ | `reserved:<module_id>` |
-| present, unknown module_id OR nonce mismatch | ✗ | **REJECT** `route.open` (`bad_consumer_identity`) |
+| present, nonce matches supervisor's current spawn nonce for `module_id` | ✓ | `reserved:<module_id>` |
+| present, unknown module_id OR nonce mismatch/stale nonce | ✗ | **REJECT** `route.open` (`bad_consumer_identity`) |
 
-Fail-loud on mismatch — never silently downgrade a claimed reserved identity to
-`direct` (a wrong nonce is a spoof attempt or a deploy bug; both must surface).
+`reserved:<module_id>` means daemon-spawned and spawn-attested; the wire name is
+frozen, but the semantic is universal spawn attestation rather than
+`reserved: true` config membership. Fail-loud on mismatch — never silently
+downgrade a claimed reserved identity to `direct` (a wrong/stale nonce is a
+spoof attempt or a deploy bug; both must surface).
 
 ### 2.3 `RouteBind` (daemon → module relay) — new field
 
@@ -80,8 +88,10 @@ documented; modules policy-map these strings.
 
 subc provides the fact; the module owns the mapping. AFT's stated policy:
 - `direct` → trusted (first-party host plugins; opencode/pi/runner equally).
-- `reserved:<id>` → per-id allowlist (trust `llm-runner`; UNTRUST `subc-mcp` —
-  the facade is the remote-model choke point → containment/forced-restrict).
+- `reserved:<id>` → per-id allowlist over daemon-spawned, spawn-attested module
+  ids (trust `llm-runner`; UNTRUST `subc-mcp` — the facade is the remote-model
+  choke point → containment/forced-restrict). The facade's attestation does not
+  depend on a `reserved: true` config flag.
 - `unverified` → fail-closed (defensive backstop).
 - `principal` ABSENT → **UNTRUSTED (forced-restrict)** — AFT-confirmed delta:
   both sides are pre-release (no legacy daemon to be rollout-compatible with),

@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BindIdentity, RouteTarget};
+use crate::{BindIdentity, Principal, RouteTarget};
 
 /// subc-to-module channel-0 control RPC body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -18,6 +18,8 @@ pub enum ModuleControlRequest {
         route_channel: u16,
         target: RouteTarget,
         identity: BindIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<Principal>,
     },
 }
 

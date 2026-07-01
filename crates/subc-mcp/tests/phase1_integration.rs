@@ -1404,6 +1404,7 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
                 module_id: "mcp".to_string(),
             },
             identity: route_identity("mcp", 2_001),
+            consumer_identity: None,
         },
     )
     .await;
@@ -2043,6 +2044,7 @@ where
                 module_id: module_id.to_string(),
             },
             identity: route_identity(module_id, corr),
+            consumer_identity: None,
         },
     )
     .await

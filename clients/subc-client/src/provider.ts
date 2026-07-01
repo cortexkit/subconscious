@@ -202,10 +202,16 @@ export type ProviderHandler = (
   ctx: ProviderRequestContext,
 ) => Promise<Uint8Array | void> | Uint8Array | void;
 
+export type Principal =
+  | { kind: "reserved"; module_id: string }
+  | { kind: "direct" }
+  | { kind: "unverified" };
+
 export interface RouteBindRequest {
   route_channel: number;
   target: RouteTarget;
   identity: BindIdentity;
+  principal?: Principal;
 }
 
 export type BindDecision =
@@ -533,6 +539,7 @@ export class SubcProvider {
       route_channel: numberField(request.route_channel, "route_channel"),
       target: request.target as RouteTarget,
       identity: request.identity as BindIdentity,
+      principal: request.principal as Principal | undefined,
     };
 
     const decision = await this.opts.onBind?.(bindRequest);

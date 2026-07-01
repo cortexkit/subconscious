@@ -5,6 +5,9 @@
     "session": "session-0001"
   },
   "op": "route.bind",
+  "principal": {
+    "kind": "direct"
+  },
   "route_channel": 42,
   "target": {
     "kind": "tool_provider",

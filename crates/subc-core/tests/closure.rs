@@ -472,6 +472,7 @@ where
             harness: "opencode".to_string(),
             session: format!("closure-{}", corr),
         },
+        consumer_identity: None,
     };
     write_frame(client, &control_request_frame(corr, request))
         .await

@@ -29,8 +29,15 @@ bash-permission-over-elicitation.
    answers.
 6. **Settlement:** a `Cancel` for the enclosing forward call, or a route
    `GOODBYE`/teardown, settles any outstanding reverse request — the module
-   resolves it as cancelled/denied and never hangs. Frames arriving for a
-   released channel are dropped silently (existing router behavior).
+   resolves it as cancelled/denied and never hangs. Released-channel behavior is
+   direction-split (standing router behavior, empirically pinned): a frame sent
+   by the MODULE to a released channel is dropped silently; a CLIENT frame on a
+   released/unknown channel is answered with `Error{unknown_channel}` (useful
+   client diagnostics; our TS closeRoute path relies on it). A late client
+   answer to a torn-down reverse request therefore yields a client-visible
+   `unknown_channel` Error carrying the module's corr — benign under rule 2's
+   per-originator matching (it matches nothing in the client's outstanding
+   table). Either way the module receives nothing and resolves via rule 5.
 7. A consumer that does not support reverse requests SHOULD answer with an
    `Error` frame (fast fail-closed); one that silently drops still resolves via
    the module's timeout (rule 5).

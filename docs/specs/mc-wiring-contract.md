@@ -1,9 +1,10 @@
 # MC Module Wiring Contract — own-harness leg (v2)
 
-Status: DRAFT v2 — Oracle pass 1 (bg_f359db24) returned NO-GO with 7 blockers;
-all folded here. ONE co-design item remains open with LLMRUNNER (§3.2: durable
-message identity — two options, decision needed before freeze). Owner: subc.
-Consumers: MC (transform side), LLMRUNNER (producer side).
+Status: **FROZEN (v3)** — Oracle pass 1 (bg_f359db24, NO-GO, 7 blockers) and
+MC's reverse pass (pm_726cf238, ACCEPT + 6 findings) folded; the §3.2 mid
+decision landed (LLMRUNNER: option (a), logical-coordinate basis, pm_5ac053cf;
+MC endorsed (a) independently). Owner: subc. Consumers: MC (transform side),
+LLMRUNNER (producer side).
 
 Scope: the OWN-HARNESS leg (llm-runner as producer). MITM and plugin legs later;
 leg-dependent decisions pin the own-harness resolution and mark the MITM slot.
@@ -78,10 +79,11 @@ re-hoisting.
 Provider-reported usage is ground truth the module cannot derive. Feeds the
 85/95 bands + emergency fixedFloor. Poison analysis accepted (worst case is
 cache-economics harm; the caller owns `messages` anyway). RESTART CONTINUITY
-(Oracle #9): the module persists last-seen usage in ModuleMeta; on a pass with
-absent/zero usage (first pass, restart) it uses `max(request.usage,
-module_meta.last_usage)` so a restart cannot silently exit emergency pressure.
-Compose-side budgets remain module-internal (estimator over composed m0/m1/tail).
+(Oracle #9, rule precise per MC R5): request-supplied NON-ZERO usage always
+WINS — a genuine post-reclaim/post-fold DECREASE must be accepted or the
+emergency band never exits; absent/zero usage (first pass, restart) falls back
+to the ModuleMeta-persisted last value. Compose-side budgets remain
+module-internal (estimator over composed m0/m1/tail).
 
 ### 2.3 `agent_drop_ids` (control signal — caller-owned)
 
@@ -120,27 +122,48 @@ back-reference) projected 1:1 from CK#1. The reduction mechanics (slices 2/3)
 keep keying on id/ordinal/bytes — unchanged. Nothing pre-flattened crosses the
 wire.
 
-### 3.2 Durable message identity (`mid`) — LLMRUNNER co-design, the ONE open item
+ARC IDENTITY (MC R1 — same demotion as block identity): `arc_id` MUST be
+session-injective. `tool_call_id` is only the PAIRING HINT — ToolResult→ToolCall
+pairing resolves by id + adjacency (nearest-FIFO within the message
+neighborhood), and the arc is then KEYED by the ToolCall block's `mid#i`. A bare
+tool_call_id arc key would fuse arcs across turns under per-turn synthesized ids
+(Gemini `call_0`), corrupting emergency reclaim accounting, arc-atomic emission,
+and shared-Reasoning dedup — the TS v10 (callID, owner_message_id) lesson.
+Ingress test: two turns each containing `call_0` produce two distinct arcs.
 
-Oracle #2 (source-verified): llm-runner's prompt model has NO durable
-per-message id today — `Message` carries role/content/origin only;
-`AssistantMessage.message_id` is dropped at prompt-commit; `RunStarted.input`
-is bare `Vec<Message>`. So `mid` must be BUILT. Two options:
+### 3.2 Durable message identity (`mid`) — DECIDED: (a), logical-coordinate basis
 
-- **(a) Explicit durable id on the canonical message** (my recommendation):
-  llm-runner adds a `mid` (mint-at-append, WAL-stamped) to its canonical
-  message; the renderer provably ignores it (C7 test: render(with mid) ==
-  render(without)). Survives store-merge AND full-replay paths by construction
-  (it is data, not position), and — decisive — survives LINEAGE FORKING
-  (planned from day 1): forked sessions share prefix mids naturally, while any
-  positional scheme diverges at the fork point.
-- **(b) WAL-projection identity** (`wal_seq/sub_index/slot` computed at
-  request-build): no type change, but reproducibility must be PROVEN identical
-  across the store-merge and full-replay read paths, and fork semantics get a
-  bespoke rule. More fragile under every future prompt-affecting feature.
+Background (Oracle #2, source-verified): llm-runner's prompt model had NO
+durable per-message id — `Message` carries role/content/origin only;
+`AssistantMessage.message_id` is dropped at prompt-commit (and empty-prone);
+`RunStarted.input` is bare `Vec<Message>`.
 
-Freeze gate: LLMRUNNER picks (a)/(b) (or a variant) + commits to the C7 test;
-until then §3 is design-final but id-DERIVATION-open.
+DECISION (LLMRUNNER, pm_5ac053cf; MC concurring): **explicit durable `mid` as
+DATA on the canonical Message** — `Option<Mid>`, serde-skip-none (additive,
+same shape/discipline as the shipped `origin` field), stamped identically at
+the live-append site and the replay-reconstruct sites.
+
+- **Value basis = DURABLE LOGICAL COORDINATES** (episode index + step_id +
+  role-slot; input messages by input index) — NOT wal_seq/sub_index. Logical
+  coordinates are identical across the store-merge and full-replay read paths
+  by construction; WAL byte-stream positions are not (that would be (b)'s
+  fragility inside (a)'s carrier).
+- **OPAQUE to MC**: the mid is a producer-owned token. MC uses it ONLY for
+  equality and for composing block ids by concatenation (`<mid>#<index>`) —
+  it never parses mid internals; the format stays LLMRUNNER's to evolve.
+  RESERVED CHARACTER: the producer guarantees `#` never appears in a mid, so
+  `mid#index` stays injective given injective mids.
+- **Producer guarantee**: the transform-request builder asserts mid PRESENT on
+  every message it sends (deriving on the fly from the logical coordinates for
+  any legacy record) — the Option on the type never reaches MC as None.
+- **C7 commitment (3 tests, LLMRUNNER)**: (1) render(with-mids) ==
+  render(mids-stripped), byte-identical; (2) cross-read-path mid identity rides
+  the EXISTING merge_equals_full_replay_at_every_turn_boundary gate for free
+  (whole-Message comparison — the gate that already caught the origin seed
+  bug); (3) stamping non-vacuousness (non-empty, scheme-conformant, injective
+  per session).
+- Forking: forked lineages copy prefix mids verbatim (data, not position) — no
+  fork special-case.
 
 ### 3.3 Block identity: `mid#<block_index>` for ALL blocks (Oracle #3 fix)
 
@@ -157,12 +180,13 @@ unchanged, mechanical golden regen at wiring (as always planned for id strings).
 - REPRODUCIBLE: same producer history → same ids every pass and across restart.
 - INJECTIVE within a session.
 - ENFORCEMENT: at first sight of a `mid`, the module persists its ordered
-  block-identity vector (per-block kind + byte-fingerprint). On every later
-  pass it fail-CLOSES on drift: changed block list for a live `mid`, duplicate
-  ids in one request, or a frozen `red:<id>` whose target vanishes while its
-  message is live. Codec/projection version is part of the HARD epoch
-  (render_config), so an intentional projection change is a clean HARD, never
-  silent identity drift.
+  block-identity vector (per-block kind + byte-fingerprint), batched into the
+  PASS-COMMIT transaction (MC R6 — no standalone per-mid writes; the pass stays
+  single-write). On every later pass it fail-CLOSES on drift: changed block
+  list for a live `mid`, duplicate ids in one request, or a frozen `red:<id>`
+  whose target vanishes while its message is live. Codec/projection version is
+  part of the HARD epoch (render_config), so an intentional projection change
+  is a clean HARD, never silent identity drift.
 
 ## 4. Codec render obligations
 
@@ -184,11 +208,15 @@ unchanged, mechanical golden regen at wiring (as always planned for id strings).
 The synthetic todo part follows the same freeze/replay discipline as every
 byte-affecting unit (this is what Unit I's freeze/replay transition already
 implements — the v1 draft's "re-composed each pass" wording was wrong):
-- Composed ONLY on a bust pass (from the newest todowrite ToolCall.input in the
-  typed tail — tail-derived capture, no new wire input on this leg).
-- FROZEN with the pass; a defer replays the frozen bytes VERBATIM (never
-  re-derives, even if the tail's todo state changed — the change rides the next
-  bust; Unit I's Clear outcome handles a bust where no part is built).
+- CAPTURE (MC R2 — survives coverage): at each bust the module persists the
+  newest tail todo-state (todowrite ToolCall.input) into ModuleMeta and
+  composes FROM ModuleMeta. A tail-only read would silently Clear the view once
+  a coverage advance consumes the todowrite into compacted history (long
+  sessions); ModuleMeta capture preserves the TS `last_todo_state` semantics
+  with no wire change. Unit I's Clear outcome remains for a genuinely
+  terminal/emptied list, never for mere absence-from-tail.
+- Composed ONLY on a bust pass; FROZEN with the pass; a defer replays the
+  frozen bytes VERBATIM (a todo change mid-defer rides the next bust).
 - Marked `synthetic: true` on the wire (annotation-only, excluded from the
   cache hash), rendered by the producer as an ordinary block, never persisted
   into the producer's durable store.
@@ -204,6 +232,12 @@ Per transform pass, llm-runner:
    `overflow_error_text` verbatim.
 4. Sends on its MC route (unary, Interactive) and awaits the transformed array.
 5. Renders the returned array VERBATIM in order (keystone invariant).
+   RESPONSE + TRIM (MC R3): the response carries `coverage_ordinal` alongside
+   the transformed array. The producer MAY trim its NEXT request's `messages`
+   to those at/above `coverage_ordinal` (mids are durable so identity is
+   unaffected; the module re-trims internally regardless, so a non-trimming
+   producer stays correct). Bounds the wire+flatten cost on long sessions (2M+
+   token sessions exist) instead of O(session) forever.
 6. FAILURE POSTURE (Oracle #6 — fail-open is REJECTED): on MC-route failure,
    ONE retry with the byte-identical request; if that fails, replay the
    LAST-KNOWN-GOOD transformed array IFF full request identity matches
@@ -212,12 +246,13 @@ Per transform pass, llm-runner:
    otherwise FAIL the turn with a typed MC-unavailable error. NEVER send the
    raw untransformed array (it busts the cache once on the failure and again on
    recovery, and can overflow the context the transform exists to manage).
-7. RETRY/COMMIT AMBIGUITY (Oracle #7): a lost response after MC's CAS commit is
-   safe by construction — the retry is byte-identical (same messages, same
-   drop-ids, same usage), and the module's pass evaluation is deterministic +
-   idempotent at same inputs (CAS at same version re-serves the committed
-   result rather than double-advancing). Producer-side inputs advance only
-   AFTER a rendered response (§2.3).
+7. RETRY/COMMIT AMBIGUITY (Oracle #7, mechanism per MC R4): a lost response
+   after MC's CAS commit is safe by IDEMPOTENCE VIA DETERMINISTIC
+   FROZEN-REPLAY, not a response cache: the byte-identical retry arrives at
+   the new row_version and re-evaluates as a defer-class pass whose frozen
+   sets replay byte-identically (selection excludes frozen_keys → no new
+   decisions → same bytes out). No literal re-serve mechanism exists or is
+   needed. Producer-side inputs advance only AFTER a rendered response (§2.3).
 
 Timing: once per provider call, before render, on the complete outgoing array.
 
@@ -235,6 +270,10 @@ after the reverse pass; this doc is the contract of record until then.
 ## 8. Open items
 
 1. **§3.2 `mid` derivation** — LLMRUNNER decision (a)/(b) + the C7
-   renderer-ignores-mid test commitment. THE freeze gate.
+   renderer-ignores-mid test commitment. THE freeze gate. (MC endorses (a).)
 2. MITM-leg slots (module-assigned first-seen identity; Opaque carriage;
    injection inert) — deferred by design, tracked in the ledger.
+3. Coverage-GC verify-pin (from the writer-relocation pass): frozen `red:<id>`
+   targets that leave the live tail via a coverage advance must be GC'd with
+   the epoch — MC to confirm slice-3's orphan GC covers that path and add a
+   fail-loud assert if a frozen reduction survives its target's coverage.

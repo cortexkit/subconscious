@@ -169,6 +169,73 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_non_reserved_consumer_identity_stamps_reserved_principal() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let target_module_id = "fake-aft-principal-non-reserved-target";
+    let (target, events_path) = spawn_stub_with_events_path(
+        &server,
+        &supervisor,
+        target_module_id,
+        "principal-non-reserved",
+    )
+    .await;
+
+    let consumer_module_id = "fake-consumer-non-reserved";
+    let consumer = spawn_stub(&server, &supervisor, consumer_module_id).await;
+    let launch_nonce = server
+        .supervisor_handle
+        .spawn_launch_nonce_for(consumer_module_id)
+        .expect("every supervised spawn records a consumer launch nonce");
+    assert!(
+        server
+            .supervisor_handle
+            .reserved_launch_nonce_for(consumer_module_id)
+            .is_none(),
+        "non-reserved modules must not gain HELLO-gating reserved nonce state"
+    );
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &attach_frame(
+            150,
+            attach_request_with_consumer_identity(
+                &project,
+                "ses-principal-non-reserved",
+                target_module_id,
+                Some(ConsumerIdentity {
+                    module_id: consumer_module_id.to_string(),
+                    launch_nonce,
+                }),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let ack_frame = read_frame_timeout(&mut client).await;
+    assert_eq!(ack_frame.header.ty, FrameType::Response);
+    assert_eq!(ack_frame.header.corr, 150);
+    let attach_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(attach_event["principal"]["kind"].as_str(), Some("reserved"));
+    assert_eq!(
+        attach_event["principal"]["module_id"].as_str(),
+        Some(consumer_module_id)
+    );
+
+    target.stop().await.unwrap();
+    consumer.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reserved_consumer_identity_stamps_reserved_principal() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
@@ -185,7 +252,15 @@ async fn reserved_consumer_identity_stamps_reserved_principal() {
     let launch_nonce = server
         .supervisor_handle
         .reserved_launch_nonce_for(consumer_module_id)
-        .expect("reserved spawn records launch nonce");
+        .expect("reserved spawn records HELLO-gating launch nonce");
+    assert_eq!(
+        server
+            .supervisor_handle
+            .spawn_launch_nonce_for(consumer_module_id)
+            .as_deref(),
+        Some(launch_nonce.as_str()),
+        "reserved modules record the same nonce for spawn attestation and HELLO gating"
+    );
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -276,6 +351,70 @@ async fn mismatched_consumer_identity_rejects_without_route_bind() {
 
     target.stop().await.unwrap();
     consumer.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_spawn_nonce_rejects_without_route_bind_after_respawn() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let target_module_id = "fake-aft-principal-stale-target";
+    let (target, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, target_module_id, "principal-stale")
+            .await;
+
+    let consumer_module_id = "fake-consumer-stale";
+    let first = spawn_stub(&server, &supervisor, consumer_module_id).await;
+    let stale_nonce = server
+        .supervisor_handle
+        .spawn_launch_nonce_for(consumer_module_id)
+        .expect("first spawn records nonce");
+    first.stop().await.unwrap();
+    wait_for_registration_absent(&server.registry, consumer_module_id, SETUP_TIMEOUT).await;
+
+    let second = spawn_stub(&server, &supervisor, consumer_module_id).await;
+    let current_nonce = server
+        .supervisor_handle
+        .spawn_launch_nonce_for(consumer_module_id)
+        .expect("respawn records nonce");
+    assert_ne!(
+        stale_nonce, current_nonce,
+        "respawn must rotate launch nonce"
+    );
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &attach_frame(
+            154,
+            attach_request_with_consumer_identity(
+                &project,
+                "ses-principal-stale",
+                target_module_id,
+                Some(ConsumerIdentity {
+                    module_id: consumer_module_id.to_string(),
+                    launch_nonce: stale_nonce,
+                }),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let error_frame = read_frame_timeout(&mut client).await;
+    let error = assert_error(&error_frame, 0, 154, "bad_consumer_identity");
+    assert!(error.message.contains(consumer_module_id));
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
+
+    target.stop().await.unwrap();
+    second.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

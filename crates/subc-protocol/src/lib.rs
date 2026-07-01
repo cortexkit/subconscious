@@ -51,7 +51,7 @@ pub struct BindIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Principal {
-    /// A daemon-spawned reserved module proved possession of its launch nonce.
+    /// A daemon-spawned module proved possession of its launch nonce.
     Reserved { module_id: String },
     /// No consumer identity was presented; the caller is a direct key-holder.
     Direct,

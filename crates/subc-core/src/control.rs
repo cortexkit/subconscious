@@ -712,7 +712,7 @@ impl ControlHandler {
             return Ok(Ok(Principal::Direct));
         };
 
-        if self.supervisor.reserved_consumer_authorized(
+        if self.supervisor.spawned_consumer_authorized(
             &consumer_identity.module_id,
             &consumer_identity.launch_nonce,
         ) {
@@ -2116,17 +2116,26 @@ mod tests {
     #[test]
     fn non_reserved_module_ignores_launch_nonce() {
         let registry = Arc::new(Registry::default());
-        // No reserved nonce recorded for this id: it is not reserved, so a HELLO
-        // registers whether or not it carries a nonce.
+        // No reserved nonce recorded for these ids: they are not reserved, so HELLO
+        // registration succeeds whether a spawned process echoes a nonce or not.
         let handler = ControlHandler::new(Arc::clone(&registry));
-        let ack = handler
+        let no_nonce = handler
             .handle_control(
                 ConnectionId::new(1),
-                hello_frame("aft", PROTOCOL_VERSION, 1),
+                hello_frame("aft-no-nonce", PROTOCOL_VERSION, 1),
             )
             .unwrap();
-        assert_eq!(ack[0].header.ty, FrameType::HelloAck);
-        assert!(registry.get_module("aft").unwrap().is_some());
+        assert_eq!(no_nonce[0].header.ty, FrameType::HelloAck);
+        assert!(registry.get_module("aft-no-nonce").unwrap().is_some());
+
+        let echoed_nonce = handler
+            .handle_control(
+                ConnectionId::new(2),
+                hello_frame_with_nonce("aft-with-nonce", PROTOCOL_VERSION, 2, Some("spawn-nonce")),
+            )
+            .unwrap();
+        assert_eq!(echoed_nonce[0].header.ty, FrameType::HelloAck);
+        assert!(registry.get_module("aft-with-nonce").unwrap().is_some());
     }
 
     #[test]

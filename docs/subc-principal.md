@@ -1,8 +1,9 @@
 # subc Authenticated Principal (wire-shape design note)
 
-Status: DRAFT for AFT confirmation (their 7-point consumer contract is the
-acceptance test). Design basis: Option A, already converged with AFT — this note
-pins the concrete wire shape before freezing.
+Status: **CONFIRMED / wire-frozen** — AFT checked the shape against its 7-point
+consumer contract point-by-point (pm_b5d66d4d), all seven map; one AFT-side
+policy delta folded into §3 (absent principal → untrusted). Design basis:
+Option A.
 
 ## 1. What the principal is (and is not)
 
@@ -82,8 +83,12 @@ subc provides the fact; the module owns the mapping. AFT's stated policy:
 - `reserved:<id>` → per-id allowlist (trust `llm-runner`; UNTRUST `subc-mcp` —
   the facade is the remote-model choke point → containment/forced-restrict).
 - `unverified` → fail-closed (defensive backstop).
-- `principal` ABSENT (old daemon) → today's behavior, no enforcement change —
-  rollout-safe by construction.
+- `principal` ABSENT → **UNTRUSTED (forced-restrict)** — AFT-confirmed delta:
+  both sides are pre-release (no legacy daemon to be rollout-compatible with),
+  and absent→trusted would turn a daemon bug that fails to stamp into a silent
+  trust grant — the exact silent-downgrade class this design closes. Enforcement
+  is module policy, so this costs the wire nothing; soften only if a real
+  rollout-order constraint emerges.
 
 `harness` stays cosmetic (routing/storage-slug); AFT audits that nothing
 trust-relevant keys off it when the principal lands.

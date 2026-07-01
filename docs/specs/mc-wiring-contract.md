@@ -279,7 +279,11 @@ after the reverse pass; this doc is the contract of record until then.
    renderer-ignores-mid test commitment. THE freeze gate. (MC endorses (a).)
 2. MITM-leg slots (module-assigned first-seen identity; Opaque carriage;
    injection inert) — deferred by design, tracked in the ledger.
-3. Coverage-GC verify-pin (from the writer-relocation pass): frozen `red:<id>`
-   targets that leave the live tail via a coverage advance must be GC'd with
-   the epoch — MC to confirm slice-3's orphan GC covers that path and add a
-   fail-loud assert if a frozen reduction survives its target's coverage.
+3. Coverage-GC verify-pin — RESOLVED (confirmed a REAL gap by MC's
+   writer-relocation Oracle, bg_b314e8c9): HARD folds prune covered `red:*`
+   (surviving_red_units), but a COVERAGE-EXTENDING SOFT advances
+   `coverage_ordinal` WITHOUT pruning — a now-covered frozen reduction survives
+   as silent bloat + a false-ReductionConflict trap (not a stale-byte replay;
+   build_output trims covered items before applying reductions). Fix lands in
+   MC's W1: prune frozen `red:<id>` targeting ordinals <= the new
+   coverage_ordinal on ANY coverage advance, plus a fail-loud invariant test.

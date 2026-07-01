@@ -1,253 +1,240 @@
-# MC Module Wiring Contract — own-harness leg
+# MC Module Wiring Contract — own-harness leg (v2)
 
-Status: DRAFT (pre-Oracle). Owner: subc (this repo). Consumers: MC (magic-context
-module — the transform side), LLMRUNNER (llm-runner — the own-harness producer
-side). This is the contract that unblocks WIRING of MC's completed decision
-surface (selection, scheduler, boundary/trigger, injection — all built isolated
-and differential-golden'd vs TS) into the live transform, and the llm-runner ↔ MC
-integration.
+Status: DRAFT v2 — Oracle pass 1 (bg_f359db24) returned NO-GO with 7 blockers;
+all folded here. ONE co-design item remains open with LLMRUNNER (§3.2: durable
+message identity — two options, decision needed before freeze). Owner: subc.
+Consumers: MC (transform side), LLMRUNNER (producer side).
 
-Scope: the OWN-HARNESS leg only (llm-runner as producer). The MITM leg (cc/codex)
-and the oc/pi plugin leg come later per standing order; where a decision is
-leg-dependent this doc pins the own-harness resolution and marks the MITM slot.
+Scope: the OWN-HARNESS leg (llm-runner as producer). MITM and plugin legs later;
+leg-dependent decisions pin the own-harness resolution and mark the MITM slot.
 
-It consolidates the five codec-boundary items banked during MC's build waves
-(note #414 + wave-2): (1) agent_drop_ids transport, (2) no-omit pairing render,
-(3) flat-block granularity + module-derived identity, (4) todo-state capture,
-(5) injection placement — plus the transform-request wire additions (usage,
-pass-level inputs) ruled during the wave-2 contract pass.
-
-References: magic-context/docs/specs/ck-message.md (CK#1, canonical),
-magic-context/docs/specs/codec.md (Spec #2, MC-owned),
-docs/specs/mc-plugin-subc-connection.md (Spec #4, this repo),
-docs/cache-policy-core-design.md (Spec #6).
+Consolidates the five codec-boundary ledger items + the wave-2 wire rulings.
+References: magic-context/docs/specs/ck-message.md (CK#1),
+magic-context/docs/specs/codec.md (#2), docs/specs/mc-plugin-subc-connection.md
+(#4), docs/cache-policy-core-design.md (#6).
 
 ---
 
-## 1. The pipeline (own-harness leg)
+## 1. The pipeline
 
 ```
 llm-runner (producer)                    MC module (transform)
-  canonical messages                       flatten -> CkItem blocks (module ingress)
-    -> CkMessage array  ──(subc route)──►  identity assignment (module-owned)
-    + control-plane side inputs            classify -> HARD/SOFT/defer (cache-core)
-    + pressure inputs                      decision surface (selection/scheduler/
-                                             boundary/trigger/injection)
-  render(provider wire) ◄──(response)──   [m0, m1] ++ transformed tail (CkItemWire)
+  canonical messages + durable ids        flatten -> block-granular items (INTERNAL)
+    -> CkMessage array + id sidecar ──►   block identity (module-owned, §3)
+    + usage / agent_drop_ids              classify -> HARD/SOFT/defer (cache-core)
+    (subc route, Interactive)             decision surface (selection/scheduler/
+                                            boundary/trigger/injection)
+  render VERBATIM ◄── transformed array   [pinned system ++ m0, m1 ++ tail]
 ```
 
-Division of labor (locked previously, restated):
-- **llm-runner** owns the provider render (C7 byte-determinism, its renderer) and
-  the durable store (WAL + message identity). It produces CK#1 `CkMessage`s from
-  its canonical messages and consumes the transformed array back into its render
-  path.
+- **llm-runner** owns the provider render (C7) and the durable store (WAL +
+  message identity). It produces CK#1 `CkMessage`s and renders the returned
+  array verbatim (keystone invariant: no re-derivation/reorder/filter).
 - **MC module** owns the transform: flattening, block identity, cache-stability
-  state machine (via cortexkit-cache-core), and the decision surface.
-- **subc** routes opaque bytes; nothing here touches subc-core.
+  state machine, decision surface.
+- **subc** routes opaque bytes. No subc-core changes anywhere in this contract.
 
-## 2. Transform-request wire (the #4 additions)
+## 2. Transform-request wire
 
-The transform request grows from `{session_id, render_config, items}` to:
+The request carries FULL CK messages (not pre-flattened thin items) plus an
+identity sidecar. Rationale (Oracle #8): the decision surface reads full
+`ToolCall.input` (edit-marker payloads, ctx_note action, todowrite view) and
+message-level grouping (BoundaryMsg role/ordinal); and llm-runner's render side
+consumes messages, not flat items — so messages are the wire unit, and the
+flatten lives at MODULE INGRESS (module owns reduction identity → owns the
+projection).
 
 ```jsonc
 {
+  "v": 1,
   "session_id": "…",
-  "render_config": "…",              // unchanged: the frozen render-config hash basis
-  "items": [ CkItemWire… ],           // unchanged shape; see §3 for granularity
-  "usage": {                          // NEW — caller-owned pressure ground truth
+  "render_config": "…",             // frozen render-config hash basis (epoch marker)
+  "messages": [                      // FULL CK#1 CkMessages, in order, INCLUDING
+    {                                //  leading system message(s) — see §2.1
+      "mid": "…",                   // durable per-message identity (§3.2) — sidecar
+      "ordinal": 42,                 //  field, NOT part of CK#1 (never rendered)
+      "ck": { /* CkMessage: role, content[], origin, provider_extras, meta */ }
+    }
+  ],
+  "usage": {                         // caller-owned pressure ground truth (§2.2)
     "current_total_input_tokens": 123456,
     "context_limit_tokens": 200000
   },
-  "agent_drop_ids": ["…"],           // NEW — control-plane side input (leg-optional)
-  "pass_hint": null                   // RESERVED — see §2.3
+  "agent_drop_ids": ["…"]           // control-plane side input (§2.3)
 }
 ```
 
-### 2.1 `usage` (pressure — caller-owned)
+### 2.1 System is IN the array (Oracle #1)
 
-Provider-reported usage is ground truth the module can never derive (it never
-sees the provider response). Rides the request. Feeds the scheduler's 85/95
-bands and the emergency `fixedFloor` math. Poison analysis (accepted): a lying
-`usage` can only force an early HARD (benign) or delay one (overflow → provider
-400 → recoverable; scheduler overflow-detection catches it) — cache-economics
-harm at worst, and the caller already owns `items` so it can bust the cache
-trivially anyway. Distinct from the module's COMPOSE-side budget (estimator over
-its own composed m0/m1/tail), which stays module-internal.
+Leading `Role::System` message(s) ride the array as ordinary CK content, marked
+by position, and MC treats them as PINNED: never summarized, reordered, or
+reduced (CK#1's pinned-system rule). Their bytes feed the HARD-bust hash;
+`render_config` carries only the epoch marker. The transformed array returns
+them verbatim in position, so the producer renders one array with no out-of-band
+re-hoisting.
 
-`context_limit_tokens` is the model's context limit as the caller resolved it;
-the module derives `ceiling = context_limit × executeThreshold%` with the
-threshold from its own config-home (frozen at bind).
+### 2.2 `usage` (pressure — caller-owned)
 
-### 2.2 `agent_drop_ids` (control signal — caller-owned)
+Provider-reported usage is ground truth the module cannot derive. Feeds the
+85/95 bands + emergency fixedFloor. Poison analysis accepted (worst case is
+cache-economics harm; the caller owns `messages` anyway). RESTART CONTINUITY
+(Oracle #9): the module persists last-seen usage in ModuleMeta; on a pass with
+absent/zero usage (first pass, restart) it uses `max(request.usage,
+module_meta.last_usage)` so a restart cannot silently exit emergency pressure.
+Compose-side budgets remain module-internal (estimator over composed m0/m1/tail).
 
-`ctx_reduce` §N§ marks, as flat-item ids (§3 identity). Leg-optional by
-construction: empty/absent on legs with no ctx_reduce tool. NEVER a per-item CK
-annotation (content-vs-control-signal separation: CK#1 is canonical CONTENT; a
-drop mark is a CONTROL signal). The module treats the set as durable add-only,
-filtered through frozen_keys.
+### 2.3 `agent_drop_ids` (control signal — caller-owned)
 
-On the own-harness leg the producer of these ids is llm-runner's harness layer
-(the ctx_reduce tool result feeds back as ids of items in the array it sends).
-The id vocabulary is therefore the SAME vocabulary as §3 (producer-supplied
-stable ids) — no §N§→id mapping lives in the module.
+ctx_reduce §N§ marks as flat block ids (§3.3 vocabulary — the producer addresses
+blocks by `mid#index`, which the harness derives from the same id sidecar it
+sent). Leg-optional (absent on MITM). Module treats the set as durable add-only,
+filtered through frozen_keys. CLEARING RULE (Oracle #7): the producer clears its
+accumulated set only after a transformed response for a request carrying those
+ids has been RENDERED; until then every retry re-sends the identical set.
 
-### 2.3 What does NOT ride the request (poison discipline, restated)
+### 2.4 Scheduler input source map (Oracle #9)
 
-- `boundary_present` — module-derived from durable state (poison surface).
-- pass class (execute / force / defer) — the module's scheduler DECIDES it (that
-  is the point of Unit S); `pass_hint` is reserved as an advisory for a future
-  caller-forced-execute UX and is ignored in v1.
-- prior_input_sample / has_prior_drop / last_execute_ordinal — durable in
-  ModuleMeta (module-owned state).
-- smart_drops, thresholds, keep-Ns, reserves — config-home, frozen at bind.
+Every `SchedulerInputs` field has exactly one source:
 
-## 3. Flat-block granularity + identity (the load-bearing seam)
+| Input | Source |
+|---|---|
+| current_total_input_tokens, context_limit | request `usage` (+ ModuleMeta max-merge, §2.2) |
+| executeThreshold %, TTLs, bands, smart_drops, keep-Ns, reserves | config-home, frozen at bind |
+| last_response_time_ms, session timing | request-derived (now_ms) + ModuleMeta |
+| prior_input_sample, has_prior_drop (emergency latch) | ModuleMeta (durable) |
+| last_execute_ordinal (two-pass watermark) | ModuleMeta (durable) |
+| deferred_execute, drain_latch | ModuleMeta (durable) |
+| overflow_error_text | request-supplied on the pass AFTER a provider overflow error (producer forwards the provider 400 body verbatim); absent otherwise |
+| tail_state / items | derived from `messages` at ingress |
+| pass class | module-DECIDED (Unit S) — never caller-supplied |
+| boundary_present | module-derived from durable state — never caller-supplied |
 
-### 3.1 Granularity
+## 3. Flattening, granularity, identity (the load-bearing seam)
 
-The transform operates on a FLAT block-granular item space: **one `CkItemWire`
-per CK#1 `ContentBlock`**, not per `CkMessage`. `CkItemWire` is EXTENDED with the
-typed fields the decision surface reads:
+### 3.1 Flatten at module ingress
 
-```jsonc
-{
-  "id": "…",             // stable item id — §3.2
-  "ordinal": 42,          // monotonic absolute, never positional
-  "bytes": "…",           // the block's faithful bytes (render-input basis)
-  "kind": "tool_call",    // NEW — projected 1:1 from ContentKind variant
-  "name": "edit",         // NEW — ToolCall.name / ToolResult.tool_name (else absent)
-  "file_path": "a.ts",    // NEW — ToolCall.input path keys (edit/write; else absent)
-  "provider_executed": false, // NEW — server-tool arcs excluded from reduction
-  "arc_id": "…",          // NEW — codec-derived arc grouping (ToolCall+ToolResult+Reasoning)
-  "message_ref": {         // NEW — grouping back-reference for BoundaryMsg (wave-2 Unit T)
-    "message_id": "…",    // the producer's durable message identity (§3.2)
-    "role": "assistant",
-    "block_index": 0
-  }
-}
-```
+MC projects `messages` → flat block-granular items internally: one item per
+`ContentBlock`, typed fields (kind, name, file_path via PATH_KEYS, full
+`ToolCall.input`, provider_executed, arc grouping, message role/ordinal
+back-reference) projected 1:1 from CK#1. The reduction mechanics (slices 2/3)
+keep keying on id/ordinal/bytes — unchanged. Nothing pre-flattened crosses the
+wire.
 
-Typed fields are additive; the slice-2/3 reduction mechanics (key on
-id/ordinal/bytes) are unchanged. `message_ref` exists because boundary/trigger
-group by MESSAGE over the flat vocabulary (Unit T's `BoundaryMsg`) — it is
-grouping metadata, not identity.
+### 3.2 Durable message identity (`mid`) — LLMRUNNER co-design, the ONE open item
 
-### 3.2 Identity (module-consumed, producer-anchored on this leg)
+Oracle #2 (source-verified): llm-runner's prompt model has NO durable
+per-message id today — `Message` carries role/content/origin only;
+`AssistantMessage.message_id` is dropped at prompt-commit; `RunStarted.input`
+is bare `Vec<Message>`. So `mid` must be BUILT. Two options:
 
-Ruling (locked during the selection slice): stable block identity is a
-MODULE-OWNED concern, NOT a CK#1 field — CkMessage carries no id by design.
-On the OWN-HARNESS leg the module derives ids from the producer's durable
-identity, which llm-runner already has:
+- **(a) Explicit durable id on the canonical message** (my recommendation):
+  llm-runner adds a `mid` (mint-at-append, WAL-stamped) to its canonical
+  message; the renderer provably ignores it (C7 test: render(with mid) ==
+  render(without)). Survives store-merge AND full-replay paths by construction
+  (it is data, not position), and — decisive — survives LINEAGE FORKING
+  (planned from day 1): forked sessions share prefix mids naturally, while any
+  positional scheme diverges at the fork point.
+- **(b) WAL-projection identity** (`wal_seq/sub_index/slot` computed at
+  request-build): no type change, but reproducibility must be PROVEN identical
+  across the store-merge and full-replay read paths, and fork semantics get a
+  bespoke rule. More fragile under every future prompt-affecting feature.
 
-- **message_id** = llm-runner's durable message identity (the WAL-backed id of
-  the canonical message; stable across passes, resumes, and process restarts by
-  construction of the WAL).
-- **Tool blocks**: `<tool_call_id>#call` / `<tool_call_id>#result` — injective
-  despite the shared tool_call_id, stable because tool_call_id is native
-  canonical (CK#1 §5.6.1). FINAL (already used in the selection golden).
-- **id-less blocks** (Text/Reasoning/RedactedReasoning/Media/Opaque):
-  `<message_id>#<block_index>` — stable because a historical message's block
-  list is immutable (byte-immutability of the live tail is already a cache
-  invariant; a mutated history is a HARD by definition).
+Freeze gate: LLMRUNNER picks (a)/(b) (or a variant) + commits to the C7 test;
+until then §3 is design-final but id-DERIVATION-open.
 
-The FLATTEN + id-assignment happens at MODULE INGRESS (the module owns reduction
-identity, so it owns the projection), consuming the producer's `CkMessage` array.
-The producer supplies `message_id` per message; it does NOT compute block ids.
+### 3.3 Block identity: `mid#<block_index>` for ALL blocks (Oracle #3 fix)
 
-MITM leg (later): no producer-durable id exists → module-assigned first-seen ids
-persisted in the module's own store (NOT bare content-hash — byte-identical
-blocks collide; first-seen-order disambiguation required). Marked as the open
-MITM slot; nothing on this leg depends on it.
+`block_id = <mid>#<block_index>` uniformly — including tool blocks.
+`tool_call_id` is DEMOTED to pairing/arc metadata only (it stays in the typed
+fields for arc grouping and render pairing), because it is NOT session-injective:
+Gemini synthesis emits per-turn `call_0`, so `<tool_call_id>#call` collides
+across turns and a frozen `red:call_0#call` would cross-apply. The selection
+golden's `id#call`/`id#result` strings become `mid#i` — decision logic
+unchanged, mechanical golden regen at wiring (as always planned for id strings).
 
-### 3.3 Identity invariants (cache-critical)
+### 3.4 Identity invariants (cache-critical, now ENFORCED not asserted — Oracle #4)
 
-- Ids are REPRODUCIBLE: same producer history → same ids on every pass and
-  after restart (reduction-replay depends on `red:<id>` matching across passes;
-  a re-derived id would make a frozen reduction first-apply on a defer = V3
-  violation).
-- Ids are INJECTIVE within a session (collision would cross-apply reductions).
-- The module MUST fail loud on: duplicate ids in one request, a known frozen
-  `red:<id>` whose target id vanishes while its message is still live (identity
-  drift), or a `message_id` changing its block list (immutability violation).
+- REPRODUCIBLE: same producer history → same ids every pass and across restart.
+- INJECTIVE within a session.
+- ENFORCEMENT: at first sight of a `mid`, the module persists its ordered
+  block-identity vector (per-block kind + byte-fingerprint). On every later
+  pass it fail-CLOSES on drift: changed block list for a live `mid`, duplicate
+  ids in one request, or a frozen `red:<id>` whose target vanishes while its
+  message is live. Codec/projection version is part of the HARD epoch
+  (render_config), so an intentional projection change is a clean HARD, never
+  silent identity drift.
 
-## 4. Codec render obligations (the two render-side pins)
+## 4. Codec render obligations
 
-These bind the codec's render leg (llm-runner's renderer on this leg, the
-module's compose on m0/m1):
+1. **No-omit pairing**: reduced ToolCall renders as a valid tool_use, reduced
+   ToolResult as a tool_result, even at `[dropped N]`/skeleton. Never omit a
+   drop-markered block (orphaned tool_use 400s).
+2. **Arc atomicity carries to render**: a reduced arc renders with all members
+   present in reduced form, or (only where the grammar permits) the complete
+   arc omitted together. Never a half-rendered arc.
+3. **Opaque/Media v1 posture (Oracle #10): FAIL-LOUD.** Own-harness v1 rejects
+   at ingress any `Opaque` block (and Media beyond llm-runner's supported set)
+   with a typed error, rather than carrying a lossy projection. Full CK#1
+   Opaque carriage {source, kind, raw, arc} is the MITM-leg prerequisite and
+   lands there. (llm-runner's own canonical does not emit Opaque today; this
+   gate is a tripwire, not a feature cut.)
 
-1. **No-omit pairing**: a reduced ToolCall renders as a syntactically valid
-   tool_use and a reduced ToolResult as a tool_result, even when the content is
-   `[dropped N]` or a skeleton. NEVER omit a drop-markered block — an orphaned
-   tool_use 400s at the provider. Pairing is preserved by construction at the
-   reduction layer (in-place content replace); render must not undo it.
-2. **Arc atomicity carries to render**: a reduced arc renders with all its
-   members present in reduced form (call skeleton + `[dropped N]` result +
-   dropped reasoning), or — only where the provider grammar permits omitting a
-   COMPLETE arc — the whole arc together. Never a half-rendered arc.
+## 5. Synthetic injection = a FROZEN RENDER UNIT (Oracle #5 fix)
 
-## 5. Injection (Unit I capture + placement — items 4 and 5)
+The synthetic todo part follows the same freeze/replay discipline as every
+byte-affecting unit (this is what Unit I's freeze/replay transition already
+implements — the v1 draft's "re-composed each pass" wording was wrong):
+- Composed ONLY on a bust pass (from the newest todowrite ToolCall.input in the
+  typed tail — tail-derived capture, no new wire input on this leg).
+- FROZEN with the pass; a defer replays the frozen bytes VERBATIM (never
+  re-derives, even if the tail's todo state changed — the change rides the next
+  bust; Unit I's Clear outcome handles a bust where no part is built).
+- Marked `synthetic: true` on the wire (annotation-only, excluded from the
+  cache hash), rendered by the producer as an ordinary block, never persisted
+  into the producer's durable store.
 
-- **Capture (todo-state)**: TAIL-DERIVED on this leg. The current todo view is
-  derived from the newest `todowrite` ToolCall.input present in the typed tail —
-  no new wire input. (The fallback — a control-plane side input like
-  agent_drop_ids — activates only if a leg's tail cannot carry the state; not
-  needed on the own-harness leg. MITM slot: cc/codex have no todowrite; the
-  injection selector is inert there.)
-- **Placement**: the synthetic todo part is composed by the MODULE (it owns m1
-  and the tail splice) at the position the TS implementation pins (end-of-tail
-  injection unit), and rides the transformed array back as a `synthetic: true`
-  wire item — annotation-only, excluded from the cache hash (ruled in slice-2:
-  synthetic is a wire-envelope annotation, never hashed). The producer renders
-  it as an ordinary user-visible block; it never persists into llm-runner's
-  durable store (synthetic items are per-pass output, re-composed each pass).
-
-## 6. Producer contract (llm-runner side — LLMRUNNER to confirm)
+## 6. Producer contract (llm-runner side)
 
 Per transform pass, llm-runner:
-1. Builds the `CkMessage` array from its canonical messages via its CK#1 codec
-   (Spec #2's harness-model leg for llm-runner is trivial: its canonical is
-   already CK#1-shaped by design — confirm mapping, esp. provider_executed and
-   Opaque carriage).
-2. Supplies per-message `message_id` (durable, WAL-anchored) + role + block list.
-3. Supplies `usage` from the last provider response (authoritative), and
-   `agent_drop_ids` accumulated from ctx_reduce calls since the last pass.
-4. Sends the transform request on its MC route (ordinary subc unary call,
-   Interactive priority) and awaits the transformed array.
-5. Renders the returned `[m0, m1] ++ tail` VERBATIM in array order into the
-   provider request (C7: the transformed array IS the render input; no
-   re-derivation, no reordering, no filtering — the keystone invariant).
-6. On MC-route failure: fail-OPEN for liveness (send untransformed, flag the
-   pass) or fail-CLOSED (error the turn)? **OPEN QUESTION — see §8.**
+1. Builds the `CkMessage` array (its canonical → CK#1 mapping; confirm
+   provider_executed handling; system message(s) included, §2.1).
+2. Supplies per-message `mid` + ordinal (per the §3.2 decision).
+3. Supplies `usage` (last provider response), `agent_drop_ids` (accumulated;
+   clearing rule §2.3), and — on the pass after a provider overflow error —
+   `overflow_error_text` verbatim.
+4. Sends on its MC route (unary, Interactive) and awaits the transformed array.
+5. Renders the returned array VERBATIM in order (keystone invariant).
+6. FAILURE POSTURE (Oracle #6 — fail-open is REJECTED): on MC-route failure,
+   ONE retry with the byte-identical request; if that fails, replay the
+   LAST-KNOWN-GOOD transformed array IFF full request identity matches
+   `{session_id, full_array_fingerprint, render_config, serializer_profile_id}`
+   (the #4 LKG rule — a stale LKG never replays against a changed input);
+   otherwise FAIL the turn with a typed MC-unavailable error. NEVER send the
+   raw untransformed array (it busts the cache once on the failure and again on
+   recovery, and can overflow the context the transform exists to manage).
+7. RETRY/COMMIT AMBIGUITY (Oracle #7): a lost response after MC's CAS commit is
+   safe by construction — the retry is byte-identical (same messages, same
+   drop-ids, same usage), and the module's pass evaluation is deterministic +
+   idempotent at same inputs (CAS at same version re-serves the committed
+   result rather than double-advancing). Producer-side inputs advance only
+   AFTER a rendered response (§2.3).
 
-Timing: the transform runs ONCE per provider call, before render, on the
-complete outgoing array (system prompt handling stays producer-side per CK#1's
-pinned-system rule; MC receives it as part of render_config's hash basis, not as
-a reducible item).
+Timing: once per provider call, before render, on the complete outgoing array.
+
+SUBAGENT SESSIONS: a child/subagent session is an ordinary session (own
+BindIdentity, own route, own lineage) — MC is ON by default for children
+(mirroring the Pi children-with-discovery-ON model); capability gating happens
+per-agent fail-closed at the tool-surface layer, never by disabling MC.
 
 ## 7. Versioning + evolution
 
-- The transform request/response shapes carry `"v": 1`. Unknown fields ignored
-  (no deny_unknown_fields) — additive evolution without breaks.
-- The five boundary items resolved here fold back into the MC-owned specs (CK#1,
-  codec.md) BY MC after the reverse pass — peer-owns-repo; this doc is the
-  contract of record until then.
+`"v": 1` on request/response; unknown fields ignored (additive evolution). The
+resolved boundary items fold back into the MC-owned specs (CK#1, codec.md) by MC
+after the reverse pass; this doc is the contract of record until then.
 
-## 8. Open questions (for the reverse pass + LLMRUNNER)
+## 8. Open items
 
-1. **MC-route failure posture** (§6.6): llm-runner's call: fail-open
-   (untransformed pass-through keeps the session alive but busts the cache and
-   balloons context) vs fail-closed (turn errors; MC becomes availability-
-   critical). Lean: fail-open with a loud flag + single retry, because context
-   ballooning is recoverable and a dead turn is worse UX — but this is exactly
-   the "MC criticality" question flagged in the daemon-degraded-boot discussion
-   (note #298's per-module criticality); decide consciously.
-2. **Usage staleness**: `usage` reflects the PREVIOUS provider response; on the
-   first pass of a session it is absent. Module behavior on absent usage:
-   scheduler runs with pressure=0 (no emergency path) — confirm acceptable.
-3. **message_id for the in-flight tail**: the newest user message may not be
-   WAL-committed at transform time — LLMRUNNER to confirm the id exists at the
-   point the transform request is built (or define a deterministic provisional
-   id rule).
-4. **Opaque blocks in the flat space**: Opaque is never reduced (immovable unit
-   per spec #6) but MUST still carry a stable id (it occupies coverage). The
-   `<message_id>#<block_index>` rule covers it — confirm no codec special case.
+1. **§3.2 `mid` derivation** — LLMRUNNER decision (a)/(b) + the C7
+   renderer-ignores-mid test commitment. THE freeze gate.
+2. MITM-leg slots (module-assigned first-seen identity; Opaque carriage;
+   injection inert) — deferred by design, tracked in the ledger.

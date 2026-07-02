@@ -151,8 +151,7 @@ final class ChatViewModel: ObservableObject {
                     prompt: prompt,
                     provider: provider,
                     model: modelId,
-                    fromCursor: priorCursor,
-                    appendEpisode: priorCursor != nil
+                    fromCursor: priorCursor
                 ) { event in
                     DispatchQueue.main.async {
                         self?.apply(event, sessionId: session, assistantMsgId: assistantMsgId)

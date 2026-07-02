@@ -521,7 +521,7 @@ export class SubcClient {
         timer: null,
       };
       pending.timer = setTimeout(() => {
-        this.rejectPending(key, pending, new SubcError(`request on channel ${channel} timed out after ${ms}ms`));
+        this.rejectPending(key, pending, new SubcError(this.timeoutMessage(channel, corr, ms)));
       }, ms);
       this.pending.set(key, pending);
       this.sock.write(encodeFrame(frame), Date.now() + ms).catch((err) => {
@@ -586,7 +586,7 @@ export class SubcClient {
         classifyFailure,
       };
       pending.timer = setTimeout(() => {
-        this.rejectPending(key, pending, new SubcError(`request on channel ${channel} timed out after ${ms}ms`));
+        this.rejectPending(key, pending, new SubcError(this.timeoutMessage(channel, corr, ms)));
       }, ms);
       this.pending.set(key, pending);
 
@@ -770,6 +770,16 @@ export class SubcClient {
       cached.channel = channel;
       cached.generation = this.generation;
     }
+  }
+
+  // A request timeout carries the local socket port and (channel, corr) so a
+  // packet capture can pinpoint the exact on-wire exchange — the decisive evidence
+  // for whether a "timed out" reply was actually delivered to this socket (a
+  // client-local demux problem) or never sent (a daemon/module problem).
+  private timeoutMessage(channel: number, corr: bigint, ms: number): string {
+    const port = this.sock.localPort();
+    const where = port === null ? "channel" : `local_port=${port} channel`;
+    return `request on ${where} ${channel} corr ${corr} timed out after ${ms}ms`;
   }
 
   private routeClosedDuringOpen(): SubcCallError {

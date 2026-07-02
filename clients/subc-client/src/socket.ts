@@ -64,6 +64,15 @@ export class SubcSocket {
     sock.on("close", () => fail(new SocketClosedError("subc connection closed")));
   }
 
+  /**
+   * The OS-assigned local TCP port of this connection, or null if not yet
+   * connected/closed. Used to correlate a client-side timeout with a specific
+   * socket in a packet capture when diagnosing reply-delivery issues.
+   */
+  localPort(): number | null {
+    return this.sock.localPort ?? null;
+  }
+
   static connect(host: string, port: number, deadlineMs: number): Promise<SubcSocket> {
     return new Promise((resolve, reject) => {
       const sock = net.connect({ host, port });

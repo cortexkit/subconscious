@@ -48,17 +48,21 @@ describe("SubcClient route.open consumer identity", () => {
 
 function routeOpenHarness(): { client: SubcClient; captured: () => unknown } {
   let captured: unknown;
-  const client = Object.create(SubcClient.prototype) as SubcClient & {
+  const client = Object.create(SubcClient.prototype) as SubcClient;
+  // Patch the private collaborators through an `unknown` cast: intersecting
+  // SubcClient with a public re-declaration of these (private) members reduces
+  // to `never` under tsc, so reach them via a separate structural view instead.
+  const internals = client as unknown as {
     encode(value: unknown): Uint8Array;
     controlRpc(body: Uint8Array): Promise<unknown>;
     parseJson(frame: unknown): unknown;
   };
-  client.encode = (value: unknown): Uint8Array => {
+  internals.encode = (value: unknown): Uint8Array => {
     captured = value;
     return new Uint8Array([1]);
   };
-  client.controlRpc = async () => ({ ok: true });
-  client.parseJson = () => ({ op: "route.open", route_channel: 7 });
+  internals.controlRpc = async () => ({ ok: true });
+  internals.parseJson = () => ({ op: "route.open", route_channel: 7 });
   return { client, captured: () => captured };
 }
 

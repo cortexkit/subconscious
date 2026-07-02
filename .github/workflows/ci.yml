@@ -57,3 +57,25 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
+
+  # The TypeScript client (@cortexkit/subc-client) ships from this repo and is
+  # wire-compatible with the Rust crates, so its typecheck + tests gate here too
+  # — otherwise a TS-only break (e.g. a private-member test-harness type error)
+  # stays invisible until a release workflow that runs typecheck fails.
+  ts-client:
+    name: TS client (subc-client)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: clients/subc-client
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install
+        run: bun install --frozen-lockfile || bun install
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Test
+        run: bun test

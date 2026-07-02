@@ -31,6 +31,17 @@ setting allows "automation / trusted publishing" (Settings → "Require
 two-factor authentication or automation tokens" is compatible with trusted
 publishing — OIDC counts as automation and satisfies 2FA).
 
+### Provenance is OFF on purpose (Blacksmith constraint)
+
+The workflow sets `NPM_CONFIG_PROVENANCE=false`. sigstore provenance attestation
+is only accepted by npm from **github-hosted** runners; this repo runs on
+Blacksmith (self-hosted class, forced by the free-plan private-repo Actions
+block). OIDC trusted-publishing AUTH works fine on Blacksmith — only the
+provenance bundle is rejected (`E422: Only github-hosted runners are
+supported`). npm >= 11.5.1 auto-enables provenance under trusted publishing, so
+we must override it off explicitly. If this repo ever moves to github-hosted
+runners (e.g. goes public), drop the override to regain provenance.
+
 ## Releasing (after the one-time setup)
 
 ```

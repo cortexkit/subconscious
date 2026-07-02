@@ -168,17 +168,44 @@ the request control-plane, never a poison-prone content field (same discipline a
 - **agent-role** is a caller-supplied label, distinct from the principal (one
   authenticated caller can run many agent roles).
 
-### 2.5 Stickiness + refresh (reuse the render-config-epoch model)
+### 2.5 Stickiness + refresh (ratified 2026-07: pending-queue with a
+configurable drain class)
 
-The active tool surface is **sticky across turns** (from the session-tool-
-stickiness design). A tool-surface change is a **HARD render-config bust** — it
-pins the session's active capabilities, so it folds into the unified
-render-config epoch alongside model + system prompt. Refresh policy: **forced**
-(immediate, next turn) or **natural** (deferred, rides the next hard fold). This
-is why the tool surface must be a first-class part of render-config, not an
-out-of-band per-call field: byte-stability of the tool list is a cache-stability
-input (memory 7069/7127 — tools ride the frozen render-config; a reordered or
-churned tool list busts the prefix cache).
+The active tool surface is **sticky across turns** and is a first-class part of
+the render config: byte-stability of the tool list is a cache-stability input
+(tools ride the frozen render-config; a reordered or churned tool list busts
+the prefix cache from position 0, since the tool block precedes the messages).
+Applying a tool-surface change is therefore always HARD-class cache damage —
+the design question is only WHEN it applies.
+
+Ratified model: a config-side change (user adds a tool/MCP server, edits
+allow/deny) does NOT touch live sessions immediately. It lands in a **pending
+tool-surface change** for each affected session and is APPLIED per the
+session's refresh mode:
+
+- **`immediate`** — auto-apply on the next pass (busts the prefix now). For
+  users who prefer freshness over cache economics.
+- **`on-hard` (default)** — the pending change rides the next pass that is
+  ALREADY a hard bust (model switch, system-prompt change, MC epoch…): zero
+  additional cache damage, the change is free by piggyback. Until then the
+  session keeps its frozen surface.
+- **`on-soft`** — the pending change rides the next bust pass of ANY class
+  (a SOFT m1-delta pass counts). Applies sooner than `on-hard`, at the cost of
+  escalating that SOFT into hard-class damage (the tool block busts the whole
+  prefix regardless of which region triggered the pass).
+
+Plus the **explicit-activation override**: in every mode the user can force the
+pending change NOW (the CK app's "apply tool surface changes" action → a
+forced `policy.set` on the session). Under `on-hard`/`on-soft`, explicit
+activation is the only way a change applies outside its drain class — the CK
+app shows "pending" until then.
+
+MECHANISM NOTE: this is exactly the cache-core deferred-work model (pending
+changes queue; a bust pass of sufficient class drains them; a HARD drains
+everything) — the tool surface becomes another queued-work producer, not a new
+mechanism. The refresh mode is per-session policy (part of §2.3's resolved
+shape, `refresh: "immediate" | "on-hard" | "on-soft"`), so an ephemeral
+subagent can run `immediate` while the primary runs `on-hard`.
 
 ---
 
@@ -300,21 +327,19 @@ model → execute_code(js) → [code-mode module: QuickJS runtime]
 
 ---
 
-## 6. Open decisions for Ufuk
+## 6. Decisions (ratified by Ufuk, 2026-07-02)
 
-1. **Composition home for the dynamic layers.** Confirmed lean: caller composes
-   (owned-harness path) / module composes static-only (dumb-host path). Any case
-   where the module should compose agent/model layers itself?
-2. **`agent-role` vocabulary.** Free-form string (caller-defined roles) vs a
-   fixed enum. Lean: free-form (roles are a caller/app concept; the module just
-   applies the resolved set).
-3. **Policy delivery wire.** Rides the session bind (initial) + a `policy.set`
-   control op (mid-session change → HARD render-config bust). Confirm the op
-   shape belongs in subc-control vs the gateway module's own control surface.
-   Lean: gateway-module control surface (keeps subc-control generic).
-4. **Search-mode ranking inputs.** Pure name/description match (portable) vs
-   usage-weighted (needs a module-side usage store). Lean: start pure, add
-   usage-weighting as a module store later.
-5. **Code-mode home.** A mode of the subc-mcp gateway module vs a dedicated
-   `code-mode` module. Lean: dedicated module (QuickJS + effect-log + sandbox is
-   substantial; keep the gateway module lean). Decide at code-mode build time.
+1. **Composition home** — as leaned: caller composes the dynamic layers on the
+   owned-harness path; module composes static-only (config-home) on the
+   dumb-host path. The module never composes agent/model layers.
+2. **`agent-role`** — free-form string. Roles are a caller/app concept.
+3. **Policy delivery** — rides the session bind + `policy.set` on the GATEWAY
+   MODULE's own control surface (subc-control stays generic). Mid-session
+   changes follow the ratified pending-queue refresh model in §2.5: config
+   changes never bust a live session's cache implicitly; they apply per the
+   session's refresh mode (`immediate` | `on-hard` default | `on-soft`) or on
+   the user's explicit "apply tool surface changes" activation from the CK app.
+4. **Search-mode ranking** — start pure name/description match; usage-weighting
+   later as a module-side store.
+5. **Code-mode home** — a dedicated `code-mode` module, built LAST; the policy
+   shape is code-mode-ready now (§4.3), nothing else moves early.

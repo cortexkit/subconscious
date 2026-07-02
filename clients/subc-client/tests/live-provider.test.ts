@@ -9,7 +9,12 @@ import {
 } from "../src/index.js";
 import { startLiveDaemon, waitFor, type LiveDaemon } from "./live-daemon.js";
 
-describe("SubcProvider live routing against real subc-core", () => {
+// Live tests need a compiled subc-core daemon (Rust toolchain). They are
+// OFF by default so the unit suite runs in a bun-only environment (npm
+// release gate, bun-only CI job); set RUN_SUBC_LIVE=1 to run them.
+const LIVE = process.env.RUN_SUBC_LIVE === "1";
+
+describe.skipIf(!LIVE)("SubcProvider live routing against real subc-core", () => {
   let live: LiveDaemon;
 
   beforeAll(async () => {
@@ -55,7 +60,7 @@ describe("SubcProvider live routing against real subc-core", () => {
   });
 });
 
-describe("SubcProvider live managed reconnect against real subc-core", () => {
+describe.skipIf(!LIVE)("SubcProvider live managed reconnect against real subc-core", () => {
   let live: LiveDaemon;
 
   beforeAll(async () => {
@@ -118,7 +123,7 @@ function managementSurfaceRole(entry: CatalogEntry | undefined): { operations?: 
   );
 }
 
-describe("SubcProvider receives a delivered storage descriptor", () => {
+describe.skipIf(!LIVE)("SubcProvider receives a delivered storage descriptor", () => {
   let live: LiveDaemon;
 
   beforeAll(async () => {

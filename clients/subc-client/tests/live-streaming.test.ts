@@ -19,7 +19,12 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
   }
 }
 
-describe("SubcProvider streaming subscription against real subc-core", () => {
+// Live tests need a compiled subc-core daemon (Rust toolchain). They are
+// OFF by default so the unit suite runs in a bun-only environment (npm
+// release gate, bun-only CI job); set RUN_SUBC_LIVE=1 to run them.
+const LIVE = process.env.RUN_SUBC_LIVE === "1";
+
+describe.skipIf(!LIVE)("SubcProvider streaming subscription against real subc-core", () => {
   let live: LiveDaemon;
 
   beforeAll(async () => {

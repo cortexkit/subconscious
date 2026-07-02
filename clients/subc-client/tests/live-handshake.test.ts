@@ -17,7 +17,12 @@ import { readConnectionFile } from "../src/connection-file.js";
 import { SubcClient } from "../src/index.js";
 import { startLiveDaemon, type LiveDaemon } from "./live-daemon.js";
 
-describe("live handshake against real subc-core", () => {
+// Live tests need a compiled subc-core daemon (Rust toolchain). They are
+// OFF by default so the unit suite runs in a bun-only environment (npm
+// release gate, bun-only CI job); set RUN_SUBC_LIVE=1 to run them.
+const LIVE = process.env.RUN_SUBC_LIVE === "1";
+
+describe.skipIf(!LIVE)("live handshake against real subc-core", () => {
   let live: LiveDaemon;
 
   beforeAll(async () => {

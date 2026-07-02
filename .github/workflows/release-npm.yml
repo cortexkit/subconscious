@@ -1,0 +1,81 @@
+name: Release npm (subc-client)
+
+# Publishes @cortexkit/subc-client to npm via OIDC TRUSTED PUBLISHING — no
+# NPM_TOKEN, no manual passkey. Authentication is a short-lived GitHub OIDC
+# token exchanged with npm, scoped to this repo + this workflow file. One-time
+# npm-side setup is required (see docs/npm-trusted-publishing.md): configure the
+# package's Trusted Publisher on npmjs.com to point at this repo + workflow.
+#
+# Tag format: `subc-client@<version>` (npm-style, e.g. subc-client@0.2.1).
+# Deliberately NOT `<name>-v<version>` so it never triggers release.yml (crates),
+# which matches `*-v*` and would fail on a non-existent crate of that name.
+on:
+  push:
+    tags:
+      - "subc-client@*"
+
+concurrency:
+  group: release-npm-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # REQUIRED: lets the job mint the GitHub OIDC token npm verifies.
+
+jobs:
+  publish:
+    name: Publish @cortexkit/subc-client
+    # Blacksmith runner (private repo on the free plan blocks GitHub-hosted
+    # Actions). Blacksmith is a drop-in that honors GitHub-native OIDC, so
+    # trusted publishing works unchanged as long as id-token: write is granted.
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: clients/subc-client
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing (OIDC) requires npm >= 11.5.1; Node 22 ships npm 10.x.
+      - name: Upgrade npm to a trusted-publishing-capable version
+        run: npm install -g npm@latest
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Gate the publish on the same checks a PR runs — a release can never ship
+      # code that would not pass CI.
+      - name: Install dev deps + verify
+        run: |
+          bun install --frozen-lockfile || bun install
+          bun run typecheck
+          bun test
+
+      # Guard: the tag version must match package.json, so a stale or mistyped
+      # tag can't publish the wrong version (mirrors the crate release guard).
+      - name: Assert tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          TAG_VERSION="${TAG#subc-client@}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag wants ${TAG_VERSION} but package.json has ${PKG_VERSION}"
+            exit 1
+          fi
+          echo "Publishing @cortexkit/subc-client ${PKG_VERSION}"
+
+      # Idempotent: a retag of an already-published version (recovery re-run) is
+      # treated as success rather than failing the release.
+      - name: Publish (OIDC trusted publishing, with provenance)
+        run: |
+          out=$(npm publish --access public --provenance 2>&1) && { echo "$out"; exit 0; }
+          echo "$out"
+          if echo "$out" | grep -qi "cannot publish over\|previously published\|You cannot publish over"; then
+            echo "already published; treating as success"; exit 0
+          fi
+          exit 1

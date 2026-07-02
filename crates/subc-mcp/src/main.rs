@@ -18,11 +18,12 @@ use std::{
 
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ErrorCode, ErrorData, Implementation, JsonObject,
+        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
+        ClientResult, CustomRequest, ErrorCode, ErrorData, Implementation, JsonObject,
         ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
-        ServerCapabilities, ServerInfo, Tool as McpTool, ToolAnnotations,
+        RequestId, ServerCapabilities, ServerInfo, ServerRequest, Tool as McpTool, ToolAnnotations,
     },
-    service::{NotificationContext, Peer, RequestContext},
+    service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError},
     transport::async_rw::AsyncRwTransport,
     RoleServer, ServerHandler,
 };
@@ -46,6 +47,7 @@ use tokio::{
     io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
     sync::{broadcast, mpsc, watch, Mutex},
+    task::JoinHandle,
     time,
 };
 
@@ -61,6 +63,9 @@ const CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SUPERVISION_HELLO_CORR: u64 = 1;
 const MCP_CONFIG_RELATIVE_PATH: &str = "cortexkit/mcp.jsonc";
 const PROJECT_MCP_CONFIG_RELATIVE_PATH: &str = ".cortexkit/mcp.jsonc";
+const REVERSE_RELAY_PENDING_PER_SESSION: usize = 8;
+const DEFAULT_REVERSE_RELAY_TTL: Duration = Duration::from_secs(10 * 60);
+const REVERSE_RELAY_TTL_MS_ENV: &str = "SUBC_MCP_REVERSE_RELAY_TTL_MS";
 
 const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [--harness <name>]\n  subc-mcp module --subc <subc-connection-file> [--connection-file <path>]";
 
@@ -73,6 +78,562 @@ type PendingTx = mpsc::Sender<SubcFrame>;
 enum SubcEvent {
     RouteGoodbye { route_channel: u16 },
     CatalogChanged { generation: u64 },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReverseCapability {
+    Elicitation,
+    Sampling,
+    Roots,
+}
+
+impl ReverseCapability {
+    fn for_method(method: &str) -> Option<Self> {
+        match method {
+            "elicitation/create" => Some(Self::Elicitation),
+            "sampling/createMessage" => Some(Self::Sampling),
+            "roots/list" => Some(Self::Roots),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReverseCapabilities {
+    elicitation: bool,
+    sampling: bool,
+    roots: bool,
+}
+
+impl ReverseCapabilities {
+    fn from_client(capabilities: &ClientCapabilities) -> Self {
+        Self {
+            elicitation: capabilities.elicitation.is_some(),
+            sampling: capabilities.sampling.is_some(),
+            roots: capabilities.roots.is_some(),
+        }
+    }
+
+    fn supports(self, capability: ReverseCapability) -> bool {
+        match capability {
+            ReverseCapability::Elicitation => self.elicitation,
+            ReverseCapability::Sampling => self.sampling,
+            ReverseCapability::Roots => self.roots,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RelayPeerState {
+    peer: Option<Peer<RoleServer>>,
+    capabilities: Option<ReverseCapabilities>,
+}
+
+#[derive(Debug)]
+struct RelaySession {
+    id: String,
+    peer_state: RwLock<RelayPeerState>,
+}
+
+impl RelaySession {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            peer_state: RwLock::new(RelayPeerState::default()),
+        }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn record_initialized_peer(&self, peer: Peer<RoleServer>) {
+        let capabilities = peer
+            .peer_info()
+            .map(|info| ReverseCapabilities::from_client(&info.capabilities))
+            .unwrap_or_default();
+        let mut state = self.peer_state.write().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "subc-mcp module: warning: recovering from poisoned reverse-relay peer-state write lock"
+            );
+            poisoned.into_inner()
+        });
+        state.peer = Some(peer);
+        state.capabilities = Some(capabilities);
+    }
+
+    fn peer_for_capability(
+        &self,
+        method: &str,
+        capability: ReverseCapability,
+    ) -> std::result::Result<Peer<RoleServer>, ErrorData> {
+        let state = self.peer_state.read().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "subc-mcp module: warning: recovering from poisoned reverse-relay peer-state read lock"
+            );
+            poisoned.into_inner()
+        });
+        let Some(peer) = state.peer.clone() else {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("MCP client has not declared support for {method}"),
+                None,
+            ));
+        };
+        let Some(capabilities) = state.capabilities else {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("MCP client has not declared support for {method}"),
+                None,
+            ));
+        };
+        if !capabilities.supports(capability) {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("MCP client did not declare support for {method}"),
+                None,
+            ));
+        }
+        Ok(peer)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReverseMcpRequest {
+    method: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Clone)]
+struct RelayCancelHandle {
+    peer: Peer<RoleServer>,
+    request_id: RequestId,
+}
+
+impl RelayCancelHandle {
+    async fn cancel(self, reason: &'static str) {
+        if let Err(error) = self
+            .peer
+            .notify_cancelled(CancelledNotificationParam {
+                request_id: self.request_id,
+                reason: Some(reason.to_owned()),
+            })
+            .await
+        {
+            eprintln!("subc-mcp module: failed to cancel reverse MCP request: {error}");
+        }
+    }
+}
+
+struct PendingRelayEntry {
+    session_id: String,
+    created_at: time::Instant,
+    cancel: Option<RelayCancelHandle>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl PendingRelayEntry {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            created_at: time::Instant::now(),
+            cancel: None,
+            task: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReverseRelay {
+    tx: mpsc::Sender<SubcFrame>,
+    routes: Arc<Mutex<HashMap<u16, Arc<RelaySession>>>>,
+    pending: Arc<Mutex<HashMap<PendingKey, PendingRelayEntry>>>,
+    ttl: Duration,
+    max_pending_per_session: usize,
+}
+
+impl ReverseRelay {
+    fn new(tx: mpsc::Sender<SubcFrame>) -> Self {
+        Self {
+            tx,
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            ttl: reverse_relay_ttl_from_env(),
+            max_pending_per_session: REVERSE_RELAY_PENDING_PER_SESSION,
+        }
+    }
+
+    async fn register_route(&self, route_channel: u16, session: Arc<RelaySession>) {
+        self.routes.lock().await.insert(route_channel, session);
+    }
+
+    async fn unregister_session_routes(&self, session: &RelaySession) {
+        self.routes
+            .lock()
+            .await
+            .retain(|_, route_session| route_session.id() != session.id());
+    }
+
+    async fn route_session(&self, route_channel: u16) -> Option<Arc<RelaySession>> {
+        self.routes.lock().await.get(&route_channel).cloned()
+    }
+
+    async fn handle_reverse_request(&self, frame: SubcFrame) {
+        let route_channel = frame.header.channel;
+        let reverse_corr = frame.header.corr;
+        let key = (route_channel, reverse_corr);
+
+        if self.pending.lock().await.contains_key(&key) {
+            return;
+        }
+
+        let request = match serde_json::from_slice::<ReverseMcpRequest>(&frame.body) {
+            Ok(request) => request,
+            Err(error) => {
+                self.send_reverse_error(
+                    route_channel,
+                    reverse_corr,
+                    ErrorData::invalid_params(
+                        format!("malformed reverse MCP request body: {error}"),
+                        None,
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let Some(capability) = ReverseCapability::for_method(&request.method) else {
+            self.send_reverse_error(
+                route_channel,
+                reverse_corr,
+                ErrorData::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    format!("unsupported reverse MCP method '{}'", request.method),
+                    None,
+                ),
+            )
+            .await;
+            return;
+        };
+
+        let Some(session) = self.route_session(route_channel).await else {
+            self.send_reverse_error(
+                route_channel,
+                reverse_corr,
+                ErrorData::internal_error(
+                    format!("no MCP session owns route channel {route_channel}"),
+                    None,
+                ),
+            )
+            .await;
+            return;
+        };
+
+        let peer = match session.peer_for_capability(&request.method, capability) {
+            Ok(peer) => peer,
+            Err(error) => {
+                self.send_reverse_error(route_channel, reverse_corr, error)
+                    .await;
+                return;
+            }
+        };
+
+        let created_at = {
+            let mut pending = self.pending.lock().await;
+            if pending.contains_key(&key) {
+                return;
+            }
+            let session_pending = pending
+                .values()
+                .filter(|entry| entry.session_id == session.id())
+                .count();
+            if session_pending >= self.max_pending_per_session {
+                drop(pending);
+                self.send_reverse_error(
+                    route_channel,
+                    reverse_corr,
+                    ErrorData::internal_error(
+                        "too many pending reverse MCP requests for this MCP session",
+                        None,
+                    ),
+                )
+                .await;
+                return;
+            }
+            let entry = PendingRelayEntry::new(session.id().to_owned());
+            let created_at = entry.created_at;
+            pending.insert(key, entry);
+            created_at
+        };
+
+        let host_request =
+            ServerRequest::CustomRequest(CustomRequest::new(request.method, request.params));
+        let handle = match peer
+            .send_cancellable_request(host_request, PeerRequestOptions::no_options())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if self.remove_pending_for_current_task(key).await.is_some() {
+                    self.send_reverse_error(
+                        route_channel,
+                        reverse_corr,
+                        service_error_to_reverse_error(error),
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+
+        let cancel_handle = RelayCancelHandle {
+            peer: handle.peer.clone(),
+            request_id: handle.id.clone(),
+        };
+        let relay = self.clone();
+        let ttl_deadline = created_at + self.ttl;
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                result = handle.await_response() => {
+                    relay.settle_host_answer(key, result).await;
+                }
+                _ = time::sleep_until(ttl_deadline) => {
+                    relay.expire_pending(key).await;
+                }
+            }
+        });
+
+        let mut task = Some(task);
+        let mut cancel_if_gone = None;
+        {
+            let mut pending = self.pending.lock().await;
+            if let Some(entry) = pending.get_mut(&key) {
+                entry.cancel = Some(cancel_handle.clone());
+                entry.task = task.take();
+            } else {
+                cancel_if_gone = Some(cancel_handle);
+            }
+        }
+        if let Some(task) = task {
+            task.abort();
+        }
+        if let Some(cancel) = cancel_if_gone {
+            cancel
+                .cancel("reverse MCP request was settled before the host request started")
+                .await;
+        }
+    }
+
+    async fn settle_host_answer(
+        &self,
+        key: PendingKey,
+        result: std::result::Result<ClientResult, ServiceError>,
+    ) {
+        if self.remove_pending_for_current_task(key).await.is_none() {
+            return;
+        }
+        match result {
+            Ok(result) => self.send_reverse_response(key.0, key.1, result).await,
+            Err(error) => {
+                self.send_reverse_error(key.0, key.1, service_error_to_reverse_error(error))
+                    .await;
+            }
+        }
+    }
+
+    async fn expire_pending(&self, key: PendingKey) {
+        let Some(entry) = self.remove_pending_for_current_task(key).await else {
+            return;
+        };
+        if let Some(cancel) = entry.cancel {
+            cancel.cancel("reverse MCP request relay expired").await;
+        }
+    }
+
+    async fn fail_session(&self, session: &RelaySession, message: &'static str) {
+        let entries = self
+            .remove_pending_where(|_, entry| entry.session_id == session.id())
+            .await;
+        for (key, mut entry) in entries {
+            if let Some(task) = entry.task.take() {
+                task.abort();
+            }
+            if let Some(cancel) = entry.cancel.take() {
+                cancel.cancel(message).await;
+            }
+            self.send_reverse_error(
+                key.0,
+                key.1,
+                ErrorData::internal_error(message.to_owned(), None),
+            )
+            .await;
+        }
+    }
+
+    async fn drop_route(&self, route_channel: u16) {
+        self.routes.lock().await.remove(&route_channel);
+        let entries = self
+            .remove_pending_where(|(entry_route, _), _| *entry_route == route_channel)
+            .await;
+        for (_, mut entry) in entries {
+            if let Some(task) = entry.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    async fn cancel_route_prompts(&self, route_channel: u16, message: &'static str) {
+        let entries = self
+            .remove_pending_where(|(entry_route, _), _| *entry_route == route_channel)
+            .await;
+        for (key, mut entry) in entries {
+            if let Some(task) = entry.task.take() {
+                task.abort();
+            }
+            if let Some(cancel) = entry.cancel.take() {
+                cancel.cancel(message).await;
+            }
+            self.send_reverse_error(
+                key.0,
+                key.1,
+                ErrorData::internal_error(message.to_owned(), None),
+            )
+            .await;
+        }
+    }
+
+    async fn clear_all(&self) {
+        self.routes.lock().await.clear();
+        let entries = self.remove_pending_where(|_, _| true).await;
+        for (_, mut entry) in entries {
+            if let Some(task) = entry.task.take() {
+                task.abort();
+            }
+            if let Some(cancel) = entry.cancel.take() {
+                cancel.cancel("subc connection closed").await;
+            }
+        }
+    }
+
+    async fn remove_pending_for_current_task(&self, key: PendingKey) -> Option<PendingRelayEntry> {
+        self.pending.lock().await.remove(&key)
+    }
+
+    async fn remove_pending_where<F>(
+        &self,
+        mut predicate: F,
+    ) -> Vec<(PendingKey, PendingRelayEntry)>
+    where
+        F: FnMut(&PendingKey, &PendingRelayEntry) -> bool,
+    {
+        let mut pending = self.pending.lock().await;
+        let keys = pending
+            .iter()
+            .filter_map(|(key, entry)| predicate(key, entry).then_some(*key))
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| pending.remove(&key).map(|entry| (key, entry)))
+            .collect()
+    }
+
+    async fn send_reverse_response(
+        &self,
+        route_channel: u16,
+        reverse_corr: u64,
+        result: ClientResult,
+    ) {
+        match serde_json::to_vec(&result) {
+            Ok(body) => {
+                self.send_reverse_frame(FrameType::Response, route_channel, reverse_corr, body)
+                    .await
+            }
+            Err(error) => {
+                self.send_reverse_error(
+                    route_channel,
+                    reverse_corr,
+                    ErrorData::internal_error(
+                        format!("failed to encode reverse MCP response: {error}"),
+                        None,
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn send_reverse_error(&self, route_channel: u16, reverse_corr: u64, error: ErrorData) {
+        let body = match serde_json::to_vec(&error) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("subc-mcp module: failed to encode reverse MCP error: {error}");
+                Vec::new()
+            }
+        };
+        self.send_reverse_frame(FrameType::Error, route_channel, reverse_corr, body)
+            .await;
+    }
+
+    async fn send_reverse_frame(
+        &self,
+        ty: FrameType,
+        route_channel: u16,
+        reverse_corr: u64,
+        body: Vec<u8>,
+    ) {
+        let frame = match build_frame(ty, data_flags(), route_channel, reverse_corr, body) {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!("subc-mcp module: failed to build reverse relay frame: {error}");
+                return;
+            }
+        };
+        if let Err(error) = self.tx.send(frame).await {
+            eprintln!("subc-mcp module: failed to send reverse relay frame: {error}");
+        }
+    }
+}
+
+fn reverse_relay_ttl_from_env() -> Duration {
+    match env::var(REVERSE_RELAY_TTL_MS_ENV) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(0) => DEFAULT_REVERSE_RELAY_TTL,
+            Ok(ms) => Duration::from_millis(ms),
+            Err(error) => {
+                eprintln!(
+                    "subc-mcp module: ignoring invalid {REVERSE_RELAY_TTL_MS_ENV}={raw:?}: {error}"
+                );
+                DEFAULT_REVERSE_RELAY_TTL
+            }
+        },
+        Err(_) => DEFAULT_REVERSE_RELAY_TTL,
+    }
+}
+
+fn service_error_to_reverse_error(error: ServiceError) -> ErrorData {
+    match error {
+        ServiceError::McpError(error) => error,
+        ServiceError::Cancelled { reason } => ErrorData::internal_error(
+            reason.unwrap_or_else(|| "reverse MCP request was cancelled".to_owned()),
+            None,
+        ),
+        ServiceError::Timeout { timeout } => ErrorData::internal_error(
+            format!("reverse MCP request timed out after {timeout:?}"),
+            None,
+        ),
+        ServiceError::TransportClosed => {
+            ErrorData::internal_error("MCP client transport closed before response", None)
+        }
+        ServiceError::UnexpectedResponse => {
+            ErrorData::internal_error("MCP client returned an unexpected response type", None)
+        }
+        ServiceError::TransportSend(error) => ErrorData::internal_error(
+            format!("failed to send reverse MCP request to client: {error}"),
+            None,
+        ),
+        other => ErrorData::internal_error(format!("reverse MCP request failed: {other}"), None),
+    }
 }
 
 #[tokio::main]
@@ -141,6 +702,7 @@ struct ShimHelloAck {
 #[derive(Debug, Clone)]
 struct AttachedSession {
     state: Arc<SessionState>,
+    relay_session: Arc<RelaySession>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +815,7 @@ struct SubcClient {
     tx: mpsc::Sender<SubcFrame>,
     pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
     events: broadcast::Sender<SubcEvent>,
+    relay: Arc<ReverseRelay>,
     next_corr: Arc<AtomicU64>,
     catalog_poller_started: Arc<AtomicBool>,
 }
@@ -263,11 +826,13 @@ impl SubcClient {
         let (tx, rx) = mpsc::channel(128);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
+        let relay = Arc::new(ReverseRelay::new(tx.clone()));
 
         tokio::spawn(subc_reader_loop(
             read_half,
             Arc::clone(&pending),
             events.clone(),
+            Arc::clone(&relay),
         ));
         tokio::spawn(subc_writer_loop(write_half, rx));
 
@@ -275,6 +840,7 @@ impl SubcClient {
             tx,
             pending,
             events,
+            relay,
             next_corr: Arc::new(AtomicU64::new(1)),
             catalog_poller_started: Arc::new(AtomicBool::new(false)),
         }
@@ -286,6 +852,10 @@ impl SubcClient {
 
     fn subscribe_events(&self) -> broadcast::Receiver<SubcEvent> {
         self.events.subscribe()
+    }
+
+    fn relay(&self) -> Arc<ReverseRelay> {
+        Arc::clone(&self.relay)
     }
 
     fn ensure_catalog_poller(&self) {
@@ -739,6 +1309,7 @@ async fn handle_shim_connection(
     let handler = SubcMcpServer {
         subc: subc.clone(),
         state: Arc::clone(&attached.state),
+        relay_session: Arc::clone(&attached.relay_session),
         lifecycle_started: Arc::new(AtomicBool::new(false)),
         shutdown: shutdown_rx,
         reconcile_gate: Arc::clone(&reconcile_gate),
@@ -748,6 +1319,12 @@ async fn handle_shim_connection(
     let serve_result = serve_mcp_server(handler, transport).await;
     let _ = shutdown_tx.send(true);
     let _reconcile_guard = reconcile_gate.lock().await;
+    subc.relay()
+        .fail_session(&attached.relay_session, "MCP host session disconnected")
+        .await;
+    subc.relay()
+        .unregister_session_routes(&attached.relay_session)
+        .await;
     let goodbye_result = send_route_goodbyes(&subc, attached.state.route_channels()).await;
 
     match (serve_result, goodbye_result) {
@@ -770,13 +1347,18 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
         session: generated_session_id(&hello.shim_session_id)?,
     };
 
+    let relay_session = Arc::new(RelaySession::new(identity.session.clone()));
     let mut routes = HashMap::new();
     for provider in &desired.providers {
         match open_provider_route(subc, &provider.module_id, &identity).await {
             Ok(route_channel) => {
+                subc.relay()
+                    .register_route(route_channel, Arc::clone(&relay_session))
+                    .await;
                 routes.insert(provider.module_id.clone(), route_channel);
             }
             Err(error) => {
+                subc.relay().unregister_session_routes(&relay_session).await;
                 let opened_routes = routes.values().copied().collect::<Vec<_>>();
                 let _ = send_route_goodbyes(subc, opened_routes).await;
                 return Err(error);
@@ -784,9 +1366,18 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
         }
     }
 
-    let inner = session_inner_from_desired(catalog.generation, desired, routes)?;
+    let opened_routes = routes.values().copied().collect::<Vec<_>>();
+    let inner = match session_inner_from_desired(catalog.generation, desired, routes) {
+        Ok(inner) => inner,
+        Err(error) => {
+            subc.relay().unregister_session_routes(&relay_session).await;
+            let _ = send_route_goodbyes(subc, opened_routes).await;
+            return Err(error);
+        }
+    };
     Ok(AttachedSession {
         state: Arc::new(SessionState::new(config, identity, inner)),
+        relay_session,
     })
 }
 
@@ -1252,6 +1843,7 @@ where
 async fn reconcile_session_from_catalog(
     subc: &SubcClient,
     state: &SessionState,
+    relay_session: &Arc<RelaySession>,
     catalog: CatalogSnapshot,
 ) -> Result<bool> {
     let desired = desired_session_from_catalog(&state.config.effective, &catalog.modules)?;
@@ -1279,10 +1871,16 @@ async fn reconcile_session_from_catalog(
             match open_provider_route(subc, &provider.module_id, &state.identity).await {
                 Ok(route_channel) => route_channel,
                 Err(error) => {
+                    for route_channel in &opened_routes {
+                        subc.relay().drop_route(*route_channel).await;
+                    }
                     let _ = send_route_goodbyes(subc, opened_routes).await;
                     return Err(error);
                 }
             };
+        subc.relay()
+            .register_route(route_channel, Arc::clone(relay_session))
+            .await;
         opened_routes.push(route_channel);
         routes.insert(provider.module_id.clone(), route_channel);
     }
@@ -1290,12 +1888,18 @@ async fn reconcile_session_from_catalog(
     let inner = match session_inner_from_desired(catalog.generation, desired, routes) {
         Ok(inner) => inner,
         Err(error) => {
+            for route_channel in &opened_routes {
+                subc.relay().drop_route(*route_channel).await;
+            }
             let _ = send_route_goodbyes(subc, opened_routes).await;
             return Err(error);
         }
     };
     let changed = state.replace_inner(inner);
     if !removed_routes.is_empty() {
+        for route_channel in &removed_routes {
+            subc.relay().drop_route(*route_channel).await;
+        }
         let _ = send_route_goodbyes(subc, removed_routes).await;
     }
     Ok(changed)
@@ -1304,6 +1908,7 @@ async fn reconcile_session_from_catalog(
 async fn session_lifecycle(
     subc: SubcClient,
     state: Arc<SessionState>,
+    relay_session: Arc<RelaySession>,
     mut events: broadcast::Receiver<SubcEvent>,
     peer: Peer<RoleServer>,
     mut shutdown: watch::Receiver<bool>,
@@ -1337,7 +1942,7 @@ async fn session_lifecycle(
                                     if *shutdown.borrow() {
                                         break;
                                     }
-                                    reconcile_session_from_catalog(&subc, &state, catalog).await
+                                    reconcile_session_from_catalog(&subc, &state, &relay_session, catalog).await
                                 };
                                 match reconciliation {
                                     Ok(true) => {
@@ -1367,7 +1972,7 @@ async fn session_lifecycle(
                                     if *shutdown.borrow() {
                                         break;
                                     }
-                                    reconcile_session_from_catalog(&subc, &state, catalog).await
+                                    reconcile_session_from_catalog(&subc, &state, &relay_session, catalog).await
                                 };
                                 match reconciliation {
                                     Ok(true) => {
@@ -1407,6 +2012,7 @@ async fn notify_tool_list_changed(peer: &Peer<RoleServer>) -> bool {
 struct SubcMcpServer {
     subc: SubcClient,
     state: Arc<SessionState>,
+    relay_session: Arc<RelaySession>,
     lifecycle_started: Arc<AtomicBool>,
     shutdown: watch::Receiver<bool>,
     reconcile_gate: Arc<Mutex<()>>,
@@ -1490,13 +2096,16 @@ impl ServerHandler for SubcMcpServer {
         self.subc.ensure_catalog_poller();
         let subc = self.subc.clone();
         let state = Arc::clone(&self.state);
+        let relay_session = Arc::clone(&self.relay_session);
         let events = self.subc.subscribe_events();
         let peer = context.peer.clone();
+        self.relay_session.record_initialized_peer(peer.clone());
         let shutdown = self.shutdown.clone();
         let reconcile_gate = Arc::clone(&self.reconcile_gate);
         tokio::spawn(session_lifecycle(
             subc,
             state,
+            relay_session,
             events,
             peer,
             shutdown,
@@ -1588,6 +2197,10 @@ impl SubcMcpServer {
     }
 
     async fn send_route_cancel(&self, route_channel: u16, corr: u64) -> Result<()> {
+        self.subc
+            .relay()
+            .cancel_route_prompts(route_channel, "enclosing route request was cancelled")
+            .await;
         let frame = build_frame(
             FrameType::Cancel,
             data_flags(),
@@ -1727,6 +2340,7 @@ async fn subc_reader_loop<R>(
     mut read_half: R,
     pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
     events: broadcast::Sender<SubcEvent>,
+    relay: Arc<ReverseRelay>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -1741,7 +2355,13 @@ async fn subc_reader_loop<R>(
                     continue;
                 }
 
+                if frame.header.ty == FrameType::Request && frame.header.channel != 0 {
+                    relay.handle_reverse_request(frame).await;
+                    continue;
+                }
+
                 if frame.header.ty == FrameType::Goodbye && frame.header.channel != 0 {
+                    relay.drop_route(frame.header.channel).await;
                     fail_pending_on_route(
                         &pending,
                         frame.header.channel,
@@ -1752,6 +2372,15 @@ async fn subc_reader_loop<R>(
                         route_channel: frame.header.channel,
                     });
                     continue;
+                }
+
+                if frame.header.ty == FrameType::Cancel && frame.header.channel != 0 {
+                    relay
+                        .cancel_route_prompts(
+                            frame.header.channel,
+                            "provider cancelled the enclosing route request",
+                        )
+                        .await;
                 }
 
                 let key = (frame.header.channel, frame.header.corr);
@@ -1784,6 +2413,7 @@ async fn subc_reader_loop<R>(
     }
 
     pending.lock().await.clear();
+    relay.clear_all().await;
 }
 
 async fn fail_pending_on_route(
@@ -1827,7 +2457,7 @@ async fn fail_pending_on_route(
 fn is_terminal_frame_type(frame_type: FrameType) -> bool {
     matches!(
         frame_type,
-        FrameType::Response | FrameType::Error | FrameType::StreamEnd
+        FrameType::Response | FrameType::Error | FrameType::StreamEnd | FrameType::Cancel
     )
 }
 
@@ -2204,7 +2834,9 @@ mod tests {
         let reader_pending = Arc::clone(&pending);
         let reader = tokio::spawn(async move {
             let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
-            subc_reader_loop(client, reader_pending, events).await;
+            let (tx, _rx) = mpsc::channel(1);
+            let relay = Arc::new(ReverseRelay::new(tx));
+            subc_reader_loop(client, reader_pending, events, relay).await;
         });
 
         let push = build_frame(

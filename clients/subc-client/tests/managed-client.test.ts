@@ -34,6 +34,9 @@ interface FakeStats {
   routeOpens: number;
   dataRequests: number;
   dataBodies: unknown[];
+  // The consumer_identity sent on each route.open, in order (undefined when absent),
+  // so a test can assert the principal survives a reconnect reopen.
+  routeOpenConsumerIdentities: (unknown | undefined)[];
 }
 
 interface FakeDaemonOptions {
@@ -49,7 +52,7 @@ interface FakeDaemon {
 }
 
 function newStats(): FakeStats {
-  return { routeOpens: 0, dataRequests: 0, dataBodies: [] };
+  return { routeOpens: 0, dataRequests: 0, dataBodies: [], routeOpenConsumerIdentities: [] };
 }
 
 afterEach(async () => {
@@ -124,6 +127,52 @@ describe("SubcClient managed call", () => {
       expect(firstStats.dataRequests).toBe(1);
       expect(secondStats.dataRequests).toBe(1);
       expect(sleeps).toEqual([]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("re-attaches the same consumer_identity when reopening a cached route after reconnect", async () => {
+    // A route opened with a consumer_identity (principal attestation) must send the
+    // SAME consumer_identity when it is reopened on a fresh connection after a
+    // reconnect. Dropping it there would let the daemon re-stamp the route with a
+    // weaker principal than it was originally bound under — a silent post-reconnect
+    // trust downgrade. This drives the bulk reopenCachedRoutes path (not the lazy
+    // per-call openCachedRoute path) by having a route already installed before the
+    // connection drops.
+    const { connFile } = tempConnectionFile();
+    const consumerIdentity = { module_id: "reserved-module", launch_nonce: "nonce-abc" };
+    const firstStats = newStats();
+    const first = await startFakeDaemon({ stats: firstStats, closeAfterDataResponses: 1 });
+    writeConnectionFile(connFile, first.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      sleep: async () => {},
+    });
+
+    try {
+      // First call installs the cached route on connection 1 (carrying the identity).
+      await expect(
+        client.call("managed-provider", "echo", { n: 1 }, { consumerIdentity }),
+      ).resolves.toEqual({ method: "echo", params: { n: 1 } });
+      await waitFor(() => clientClosedErr(client) !== null, "client to observe first daemon close");
+      await first.stop();
+
+      const secondStats = newStats();
+      const second = await startFakeDaemon({ stats: secondStats });
+      writeConnectionFile(connFile, second.port);
+
+      // Second call triggers reconnect + bulk reopen of the installed route.
+      await expect(
+        client.call("managed-provider", "echo", { n: 2 }, { consumerIdentity }),
+      ).resolves.toEqual({ method: "echo", params: { n: 2 } });
+
+      // The reopen on connection 2 must carry the identical consumer_identity.
+      expect(firstStats.routeOpenConsumerIdentities).toEqual([consumerIdentity]);
+      expect(secondStats.routeOpenConsumerIdentities).toEqual([consumerIdentity]);
     } finally {
       client.close();
     }
@@ -290,6 +339,9 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
         await writeFrame(socket, responseFrame(frame, { op: "catalog.list", modules: [] }), deadline);
       } else if (request.op === "route.open") {
         options.stats.routeOpens += 1;
+        options.stats.routeOpenConsumerIdentities.push(
+          (request as { consumer_identity?: unknown }).consumer_identity,
+        );
         if (options.routeOpenError) {
           await writeFrame(socket, errorFrame(frame, options.routeOpenError), deadline);
         } else {

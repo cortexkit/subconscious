@@ -752,7 +752,14 @@ export class SubcClient {
     }
     for (const cached of this.routes.values()) {
       if (cached.closed) continue; // closed concurrently with reconnect — don't reopen.
-      const channel = await this.routeOpen(cached.target, cached.identity);
+      // Thread the route's consumer identity through the reopen, exactly as the
+      // lazy per-call path (openCachedRoute) does. Dropping it here would make a
+      // route reopened after a reconnect send route.open with no consumer_identity,
+      // so the daemon would re-stamp it with a different (weaker) principal than the
+      // one it was originally bound under — a silent post-reconnect trust downgrade.
+      const channel = await this.routeOpen(cached.target, cached.identity, {
+        consumerIdentity: cached.consumerIdentity ?? null,
+      });
       // A closeRoute may have raced this reopen (flipping the tombstone during the
       // route.open await). If so, GOODBYE the channel instead of installing it, so the
       // closed route isn't silently re-established on the new connection.

@@ -71,9 +71,19 @@ jobs:
 
       # Idempotent: a retag of an already-published version (recovery re-run) is
       # treated as success rather than failing the release.
-      - name: Publish (OIDC trusted publishing, with provenance)
+      #
+      # Provenance is DISABLED: sigstore provenance attestation is only accepted
+      # from github-hosted runners, and this repo is forced onto Blacksmith
+      # (self-hosted class) because the free-plan org blocks private-repo
+      # GitHub-hosted Actions. OIDC trusted-publishing AUTH itself works on
+      # Blacksmith; only the provenance bundle is rejected (E422). npm >= 11.5.1
+      # auto-enables provenance under trusted publishing, so we override it off
+      # explicitly via NPM_CONFIG_PROVENANCE.
+      - name: Publish (OIDC trusted publishing)
+        env:
+          NPM_CONFIG_PROVENANCE: "false"
         run: |
-          out=$(npm publish --access public --provenance 2>&1) && { echo "$out"; exit 0; }
+          out=$(npm publish --access public 2>&1) && { echo "$out"; exit 0; }
           echo "$out"
           if echo "$out" | grep -qi "cannot publish over\|previously published\|You cannot publish over"; then
             echo "already published; treating as success"; exit 0

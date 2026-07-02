@@ -17,8 +17,10 @@ use std::{
 
 use rmcp::{
     model::{
-        CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
-        JsonObject, ProgressNotificationParam,
+        CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities,
+        ClientInfo, ClientRequest, CreateElicitationRequestParams, CreateElicitationResult,
+        ElicitationAction, ErrorData as McpErrorData, Implementation, JsonObject,
+        ProgressNotificationParam,
     },
     service::{
         MaybeSendFuture, NotificationContext, PeerRequestOptions, RunningService, ServiceError,
@@ -49,7 +51,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    sync::{oneshot, Mutex as TokioMutex},
+    sync::{mpsc, oneshot, Mutex as TokioMutex},
     task::JoinHandle,
     time::{sleep, timeout, Instant},
 };
@@ -358,6 +360,761 @@ impl RawProviderHarness {
         }
         raw_provider.shutdown().await;
     }
+}
+
+#[derive(Debug)]
+enum ScriptedProviderEvent {
+    Bound { route_channel: u16 },
+    RouteRequest(Frame),
+    ReverseResponse { corr: u64, body: Value },
+    ReverseError { corr: u64, body: Value },
+    RouteCancel { corr: u64, claimed: bool },
+    RouteGoodbye,
+}
+
+enum ScriptedProviderCommand {
+    Send(Frame),
+    Shutdown,
+}
+
+struct ScriptedProvider {
+    module_id: String,
+    tool_name: String,
+    command_tx: mpsc::Sender<ScriptedProviderCommand>,
+    events_rx: mpsc::Receiver<ScriptedProviderEvent>,
+    task: JoinHandle<()>,
+}
+
+impl ScriptedProvider {
+    async fn start(connection_file_path: &Path, module_id: &str, tool_name: &str) -> Self {
+        let (command_tx, command_rx) = mpsc::channel(32);
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let connection_file_path = connection_file_path.to_path_buf();
+        let module_id_owned = module_id.to_owned();
+        let tool_name_owned = tool_name.to_owned();
+        let task_module_id = module_id_owned.clone();
+        let task_tool_name = tool_name_owned.clone();
+        let task = tokio::spawn(async move {
+            run_scripted_provider(
+                &connection_file_path,
+                &task_module_id,
+                &task_tool_name,
+                command_rx,
+                events_tx,
+            )
+            .await;
+        });
+
+        Self {
+            module_id: module_id_owned,
+            tool_name: tool_name_owned,
+            command_tx,
+            events_rx,
+            task,
+        }
+    }
+
+    fn exposed_tool_name(&self) -> String {
+        format!("{}_{}", self.module_id, self.tool_name)
+    }
+
+    async fn shutdown(mut self) {
+        let _ = self
+            .command_tx
+            .send(ScriptedProviderCommand::Shutdown)
+            .await;
+        match timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(joined) => {
+                let _ = joined;
+            }
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+            }
+        }
+    }
+
+    async fn wait_bound(&mut self) -> u16 {
+        match self
+            .wait_for_event("route bind", |event| {
+                matches!(event, ScriptedProviderEvent::Bound { .. })
+            })
+            .await
+        {
+            ScriptedProviderEvent::Bound { route_channel } => route_channel,
+            other => panic!("expected route bind event, got {other:?}"),
+        }
+    }
+
+    async fn wait_route_request(&mut self) -> Frame {
+        match self
+            .wait_for_event("route request", |event| {
+                matches!(event, ScriptedProviderEvent::RouteRequest(_))
+            })
+            .await
+        {
+            ScriptedProviderEvent::RouteRequest(frame) => frame,
+            other => panic!("expected route request event, got {other:?}"),
+        }
+    }
+
+    async fn wait_reverse_response(&mut self, corr: u64) -> Value {
+        match self
+            .wait_for_event("reverse response", |event| {
+                matches!(event, ScriptedProviderEvent::ReverseResponse { corr: event_corr, .. } if *event_corr == corr)
+            })
+            .await
+        {
+            ScriptedProviderEvent::ReverseResponse { body, .. } => body,
+            other => panic!("expected reverse response event, got {other:?}"),
+        }
+    }
+
+    async fn wait_reverse_error(&mut self, corr: u64) -> Value {
+        match self
+            .wait_for_event("reverse error", |event| {
+                matches!(event, ScriptedProviderEvent::ReverseError { corr: event_corr, .. } if *event_corr == corr)
+            })
+            .await
+        {
+            ScriptedProviderEvent::ReverseError { body, .. } => body,
+            other => panic!("expected reverse error event, got {other:?}"),
+        }
+    }
+
+    async fn wait_route_cancel(&mut self, corr: u64) -> bool {
+        match self
+            .wait_for_event("route cancel", |event| {
+                matches!(event, ScriptedProviderEvent::RouteCancel { corr: event_corr, .. } if *event_corr == corr)
+            })
+            .await
+        {
+            ScriptedProviderEvent::RouteCancel { claimed, .. } => claimed,
+            other => panic!("expected route cancel event, got {other:?}"),
+        }
+    }
+
+    async fn wait_for_event<F>(&mut self, label: &str, mut matches: F) -> ScriptedProviderEvent
+    where
+        F: FnMut(&ScriptedProviderEvent) -> bool,
+    {
+        let deadline = Instant::now() + READ_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for {label}");
+            let event = timeout(remaining, self.events_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+                .expect("scripted provider event stream should stay open");
+            if matches(&event) {
+                return event;
+            }
+        }
+    }
+
+    async fn send_frame(&self, frame: Frame) {
+        self.command_tx
+            .send(ScriptedProviderCommand::Send(frame))
+            .await
+            .expect("scripted provider should accept outbound frame commands");
+    }
+
+    async fn send_reverse_request(&self, route_channel: u16, corr: u64, body: Value) {
+        let body = serde_json::to_vec(&body).unwrap();
+        self.send_frame(data_request(route_channel, corr, &body))
+            .await;
+    }
+
+    async fn send_route_response(&self, request: &Frame, body: Value) {
+        let body = serde_json::to_vec(&body).unwrap();
+        let frame = Frame::build_with_version(
+            request.header.ver,
+            FrameType::Response,
+            request.header.flags,
+            request.header.channel,
+            request.header.corr,
+            body,
+        )
+        .unwrap();
+        self.send_frame(frame).await;
+    }
+}
+
+#[derive(Clone)]
+struct ReverseTestClient {
+    capabilities: ClientCapabilities,
+    prompt_count: Arc<AtomicUsize>,
+    cancel_count: Arc<AtomicUsize>,
+    response_tx: mpsc::Sender<std::result::Result<CreateElicitationResult, McpErrorData>>,
+    response_rx:
+        Arc<TokioMutex<mpsc::Receiver<std::result::Result<CreateElicitationResult, McpErrorData>>>>,
+}
+
+impl ReverseTestClient {
+    fn new(capabilities: ClientCapabilities) -> Self {
+        let (response_tx, response_rx) = mpsc::channel(16);
+        Self {
+            capabilities,
+            prompt_count: Arc::new(AtomicUsize::new(0)),
+            cancel_count: Arc::new(AtomicUsize::new(0)),
+            response_tx,
+            response_rx: Arc::new(TokioMutex::new(response_rx)),
+        }
+    }
+
+    async fn respond_elicitation(&self, result: CreateElicitationResult) {
+        self.response_tx
+            .send(Ok(result))
+            .await
+            .expect("reverse test client should accept elicitation responses");
+    }
+
+    async fn wait_for_prompts(&self, expected: usize) {
+        wait_for_atomic_at_least(&self.prompt_count, expected, "elicitation prompts").await;
+    }
+
+    async fn wait_for_cancellations(&self, expected: usize) {
+        wait_for_atomic_at_least(&self.cancel_count, expected, "MCP request cancellations").await;
+    }
+
+    async fn assert_prompt_count_stays(&self, expected: usize) {
+        assert_counter_stays(
+            &self.prompt_count,
+            expected,
+            "elicitation prompts",
+            QUIET_TIMEOUT,
+        )
+        .await;
+    }
+}
+
+impl ClientHandler for ReverseTestClient {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::new(
+            self.capabilities.clone(),
+            Implementation::new("subc-mcp-reverse-test", "0"),
+        )
+    }
+
+    fn create_elicitation(
+        &self,
+        _request: CreateElicitationRequestParams,
+        context: rmcp::service::RequestContext<RoleClient>,
+    ) -> impl Future<Output = std::result::Result<CreateElicitationResult, McpErrorData>>
+           + MaybeSendFuture
+           + '_ {
+        let prompt_count = Arc::clone(&self.prompt_count);
+        let response_rx = Arc::clone(&self.response_rx);
+        async move {
+            prompt_count.fetch_add(1, Ordering::SeqCst);
+            tokio::select! {
+                response = async {
+                    let mut response_rx = response_rx.lock().await;
+                    response_rx.recv().await
+                } => {
+                    response.unwrap_or_else(|| {
+                        Ok(CreateElicitationResult::new(ElicitationAction::Decline))
+                    })
+                }
+                _ = context.ct.cancelled() => Err(McpErrorData::internal_error(
+                    "elicitation request was cancelled by the server",
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn on_cancelled(
+        &self,
+        _params: CancelledNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        self.cancel_count.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(())
+    }
+}
+
+struct ReverseHarness {
+    _server: TestServer,
+    _project: TestProject,
+    provider: ScriptedProvider,
+    module: Child,
+    shim: ShimProcess,
+    client: Option<RunningService<RoleClient, ReverseTestClient>>,
+    client_handler: ReverseTestClient,
+}
+
+impl ReverseHarness {
+    async fn start(label: &str, capabilities: ClientCapabilities) -> Self {
+        Self::start_with_module_env(label, capabilities, &[]).await
+    }
+
+    async fn start_with_module_env(
+        label: &str,
+        capabilities: ClientCapabilities,
+        module_env: &[(&str, &str)],
+    ) -> Self {
+        Self::start_inner(label, capabilities, module_env, true).await
+    }
+
+    async fn start_attach_window(label: &str) -> Self {
+        Self::start_inner(label, ClientCapabilities::default(), &[], false).await
+    }
+
+    async fn start_inner(
+        label: &str,
+        capabilities: ClientCapabilities,
+        module_env: &[(&str, &str)],
+        serve_client: bool,
+    ) -> Self {
+        let server = TestServer::start().await;
+        let provider =
+            ScriptedProvider::start(&server.daemon.connection_file_path, "raw", "probe").await;
+        wait_for_registration(&server.daemon.registry, "raw", READ_TIMEOUT).await;
+
+        let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
+        fs::create_dir_all(&user_config_home).unwrap();
+        let module_connection_file = server
+            .daemon
+            .temp_dir
+            .join(format!("{label}-subc-mcp.json"));
+        let mut module = spawn_module_with_extra_env(
+            &server.daemon.connection_file_path,
+            &module_connection_file,
+            &user_config_home,
+            module_env,
+        );
+        wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
+
+        let project = TestProject::new(label);
+        let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
+        let client_handler = ReverseTestClient::new(capabilities);
+        let client = if serve_client {
+            Some(shim.serve_mcp_client(client_handler.clone()).await)
+        } else {
+            None
+        };
+
+        Self {
+            _server: server,
+            _project: project,
+            provider,
+            module,
+            shim,
+            client,
+            client_handler,
+        }
+    }
+
+    async fn stop_client(&mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = client.cancel().await;
+        }
+        let _ = timeout(Duration::from_secs(2), self.shim.child.wait()).await;
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = client.cancel().await;
+        }
+        let _ = timeout(Duration::from_secs(2), self.shim.child.wait()).await;
+        if self.module.try_wait().unwrap().is_none() {
+            let _ = self.module.start_kill();
+            let _ = timeout(Duration::from_secs(2), self.module.wait()).await;
+        }
+        self.provider.shutdown().await;
+    }
+}
+
+async fn run_scripted_provider(
+    connection_file_path: &Path,
+    module_id: &str,
+    tool_name: &str,
+    mut command_rx: mpsc::Receiver<ScriptedProviderCommand>,
+    events_tx: mpsc::Sender<ScriptedProviderEvent>,
+) {
+    let mut stream = connect_control_client(connection_file_path)
+        .await
+        .expect("scripted test provider should authenticate to the daemon");
+    let hello = ModuleHelloBody {
+        manifest: raw_provider_manifest(module_id, tool_name),
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: None,
+    };
+    let body = serde_json::to_vec(&hello).unwrap();
+    let frame = Frame::build(
+        FrameType::Hello,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        1,
+        body,
+    )
+    .unwrap();
+    write_frame(&mut stream, &frame).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let ack = read_frame_timeout(&mut stream).await;
+    assert_eq!(ack.header.ty, FrameType::HelloAck);
+    let _ack: ModuleHelloAckBody = serde_json::from_slice(&ack.body).unwrap();
+
+    let mut route_channel = None;
+    loop {
+        tokio::select! {
+            command = command_rx.recv() => {
+                match command {
+                    Some(ScriptedProviderCommand::Send(frame)) => {
+                        write_frame(&mut stream, &frame).await.unwrap();
+                        stream.flush().await.unwrap();
+                    }
+                    Some(ScriptedProviderCommand::Shutdown) | None => return,
+                }
+            }
+            frame = read_frame(&mut stream) => {
+                let Some(frame) = frame.unwrap() else {
+                    return;
+                };
+                match frame.header.ty {
+                    FrameType::Request if frame.header.channel == 0 => {
+                        let request: ModuleControlRequest = serde_json::from_slice(&frame.body).unwrap();
+                        match request {
+                            ModuleControlRequest::RouteBind { route_channel: next_route_channel, .. } => {
+                                route_channel = Some(next_route_channel);
+                                let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
+                                let response = Frame::build_with_version(
+                                    frame.header.ver,
+                                    FrameType::Response,
+                                    Flags::new(false, Priority::Passive, false),
+                                    0,
+                                    frame.header.corr,
+                                    body,
+                                )
+                                .unwrap();
+                                write_frame(&mut stream, &response).await.unwrap();
+                                stream.flush().await.unwrap();
+                                let _ = events_tx.send(ScriptedProviderEvent::Bound { route_channel: next_route_channel }).await;
+                            }
+                        }
+                    }
+                    FrameType::Request if Some(frame.header.channel) == route_channel => {
+                        let _ = events_tx.send(ScriptedProviderEvent::RouteRequest(frame)).await;
+                    }
+                    FrameType::Response if Some(frame.header.channel) == route_channel => {
+                        let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+                        let _ = events_tx.send(ScriptedProviderEvent::ReverseResponse { corr: frame.header.corr, body }).await;
+                    }
+                    FrameType::Error if Some(frame.header.channel) == route_channel => {
+                        let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+                        let _ = events_tx.send(ScriptedProviderEvent::ReverseError { corr: frame.header.corr, body }).await;
+                    }
+                    FrameType::Cancel if Some(frame.header.channel) == route_channel => {
+                        let _ = events_tx.send(ScriptedProviderEvent::RouteCancel { corr: frame.header.corr, claimed: true }).await;
+                    }
+                    FrameType::Goodbye if Some(frame.header.channel) == route_channel => {
+                        let _ = events_tx.send(ScriptedProviderEvent::RouteGoodbye).await;
+                        return;
+                    }
+                    FrameType::Goodbye if frame.header.channel == 0 => return,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn elicitation_capabilities() -> ClientCapabilities {
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.elicitation = Some(Default::default());
+    capabilities
+}
+
+fn elicitation_body(label: &str) -> Value {
+    json!({
+        "method": "elicitation/create",
+        "params": {
+            "mode": "url",
+            "message": format!("approve {label}"),
+            "url": "https://example.invalid/approve",
+            "elicitationId": label,
+        }
+    })
+}
+
+fn accepted_elicitation(content: Value) -> CreateElicitationResult {
+    CreateElicitationResult::new(ElicitationAction::Accept).with_content(content)
+}
+
+async fn wait_for_atomic_at_least(counter: &AtomicUsize, expected: usize, label: &str) {
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        if counter.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_declared_host_round_trips() {
+    let mut harness =
+        ReverseHarness::start("mcp-reverse-roundtrip", elicitation_capabilities()).await;
+    let route_channel = harness.provider.wait_bound().await;
+
+    harness
+        .provider
+        .send_reverse_request(route_channel, 901, elicitation_body("roundtrip"))
+        .await;
+    harness.client_handler.wait_for_prompts(1).await;
+    harness
+        .client_handler
+        .respond_elicitation(accepted_elicitation(json!({ "approved": true })))
+        .await;
+
+    let response = harness.provider.wait_reverse_response(901).await;
+    assert_eq!(
+        response.get("action"),
+        Some(&Value::String("accept".to_owned()))
+    );
+    assert_eq!(
+        response.pointer("/content/approved"),
+        Some(&Value::Bool(true))
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_absent_capability_and_attach_window_fail_fast() {
+    let mut absent =
+        ReverseHarness::start("mcp-reverse-no-cap", ClientCapabilities::default()).await;
+    let absent_route = absent.provider.wait_bound().await;
+    absent
+        .provider
+        .send_reverse_request(absent_route, 902, elicitation_body("no-cap"))
+        .await;
+    let error = absent.provider.wait_reverse_error(902).await;
+    assert_eq!(error.get("code"), Some(&json!(-32601)));
+    absent.client_handler.assert_prompt_count_stays(0).await;
+    absent.shutdown().await;
+
+    let mut window = ReverseHarness::start_attach_window("mcp-reverse-attach-window").await;
+    let window_route = window.provider.wait_bound().await;
+    sleep(Duration::from_millis(50)).await;
+    window
+        .provider
+        .send_reverse_request(window_route, 903, elicitation_body("before-init"))
+        .await;
+    let error = window.provider.wait_reverse_error(903).await;
+    assert_eq!(error.get("code"), Some(&json!(-32601)));
+    window.client_handler.assert_prompt_count_stays(0).await;
+    window.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_corr_collision_does_not_poison_forward_call() {
+    let mut harness =
+        ReverseHarness::start("mcp-reverse-corr-collision", elicitation_capabilities()).await;
+    let _route_channel = harness.provider.wait_bound().await;
+    let tool_name = harness.provider.exposed_tool_name();
+    let peer = harness.client.as_ref().unwrap().peer().clone();
+    let call =
+        tokio::spawn(async move { peer.call_tool(CallToolRequestParams::new(tool_name)).await });
+
+    let forward_request = harness.provider.wait_route_request().await;
+    let colliding_corr = forward_request.header.corr;
+    harness
+        .provider
+        .send_reverse_request(
+            forward_request.header.channel,
+            colliding_corr,
+            elicitation_body("collision"),
+        )
+        .await;
+    harness.client_handler.wait_for_prompts(1).await;
+    harness
+        .client_handler
+        .respond_elicitation(accepted_elicitation(json!({ "collision": "ok" })))
+        .await;
+    let reverse_response = harness.provider.wait_reverse_response(colliding_corr).await;
+    assert_eq!(
+        reverse_response.pointer("/content/collision"),
+        Some(&Value::String("ok".to_owned()))
+    );
+
+    harness
+        .provider
+        .send_route_response(
+            &forward_request,
+            json!({
+                "content": [{ "type": "text", "text": "forward-ok" }],
+                "isError": false,
+            }),
+        )
+        .await;
+    let result = call.await.unwrap().unwrap();
+    assert_eq!(result_text(&result), "forward-ok");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_duplicate_corr_is_ignored_while_pending() {
+    let mut harness =
+        ReverseHarness::start("mcp-reverse-duplicate", elicitation_capabilities()).await;
+    let route_channel = harness.provider.wait_bound().await;
+
+    harness
+        .provider
+        .send_reverse_request(route_channel, 904, elicitation_body("duplicate"))
+        .await;
+    harness.client_handler.wait_for_prompts(1).await;
+    harness
+        .provider
+        .send_reverse_request(route_channel, 904, elicitation_body("duplicate-again"))
+        .await;
+    harness.client_handler.assert_prompt_count_stays(1).await;
+    harness
+        .client_handler
+        .respond_elicitation(accepted_elicitation(json!({ "deduped": true })))
+        .await;
+    let response = harness.provider.wait_reverse_response(904).await;
+    assert_eq!(
+        response.pointer("/content/deduped"),
+        Some(&Value::Bool(true))
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_shim_death_settles_pending_with_error() {
+    let mut harness =
+        ReverseHarness::start("mcp-reverse-shim-death", elicitation_capabilities()).await;
+    let route_channel = harness.provider.wait_bound().await;
+
+    harness
+        .provider
+        .send_reverse_request(route_channel, 905, elicitation_body("shim-death"))
+        .await;
+    harness.client_handler.wait_for_prompts(1).await;
+    harness.stop_client().await;
+    let error = harness.provider.wait_reverse_error(905).await;
+    assert_eq!(error.get("code"), Some(&json!(-32603)));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_forward_cancel_settles_prompt_and_provider() {
+    let mut harness =
+        ReverseHarness::start("mcp-reverse-forward-cancel", elicitation_capabilities()).await;
+    let _route_channel = harness.provider.wait_bound().await;
+    let tool_name = harness.provider.exposed_tool_name();
+    let peer = harness.client.as_ref().unwrap().peer().clone();
+    let handle = peer
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                tool_name,
+            ))),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    let request_id = handle.id.clone();
+
+    let forward_request = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_reverse_request(
+            forward_request.header.channel,
+            906,
+            elicitation_body("forward-cancel"),
+        )
+        .await;
+    harness.client_handler.wait_for_prompts(1).await;
+
+    peer.notify_cancelled(CancelledNotificationParam {
+        request_id,
+        reason: Some("test cancellation".to_owned()),
+    })
+    .await
+    .unwrap();
+
+    let reverse_error = harness.provider.wait_reverse_error(906).await;
+    assert_eq!(reverse_error.get("code"), Some(&json!(-32603)));
+    assert!(
+        harness
+            .provider
+            .wait_route_cancel(forward_request.header.corr)
+            .await
+    );
+    harness.client_handler.wait_for_cancellations(1).await;
+    let err = handle.await_response().await.unwrap_err();
+    match err {
+        ServiceError::Cancelled { .. } => {}
+        ServiceError::McpError(error) if error.message.contains("cancelled") => {}
+        other => panic!("expected cancelled call result, got {other:?}"),
+    }
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_pending_cap_errors_ninth_request() {
+    let mut harness = ReverseHarness::start("mcp-reverse-cap", elicitation_capabilities()).await;
+    let route_channel = harness.provider.wait_bound().await;
+
+    for corr in 1_000..=1_008 {
+        harness
+            .provider
+            .send_reverse_request(
+                route_channel,
+                corr,
+                elicitation_body(&format!("cap-{corr}")),
+            )
+            .await;
+    }
+
+    let error = harness.provider.wait_reverse_error(1_008).await;
+    assert_eq!(error.get("code"), Some(&json!(-32603)));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_reverse_elicitation_ttl_expires_one_pending_without_disturbing_another() {
+    let mut harness = ReverseHarness::start_with_module_env(
+        "mcp-reverse-ttl",
+        elicitation_capabilities(),
+        &[("SUBC_MCP_REVERSE_RELAY_TTL_MS", "300")],
+    )
+    .await;
+    let route_channel = harness.provider.wait_bound().await;
+
+    harness
+        .provider
+        .send_reverse_request(route_channel, 2_001, elicitation_body("ttl-expired"))
+        .await;
+    harness.client_handler.wait_for_prompts(1).await;
+    sleep(Duration::from_millis(150)).await;
+    harness
+        .provider
+        .send_reverse_request(route_channel, 2_002, elicitation_body("ttl-survivor"))
+        .await;
+    harness.client_handler.wait_for_prompts(2).await;
+    harness.client_handler.wait_for_cancellations(1).await;
+    harness
+        .client_handler
+        .respond_elicitation(accepted_elicitation(json!({ "survived": true })))
+        .await;
+    let response = harness.provider.wait_reverse_response(2_002).await;
+    assert_eq!(
+        response.pointer("/content/survived"),
+        Some(&Value::Bool(true))
+    );
+
+    harness.shutdown().await;
 }
 
 struct McpHarness {
@@ -1911,6 +2668,24 @@ fn spawn_module(
         module_connection_file,
         xdg_config_home,
     );
+    command.stderr(process::Stdio::null());
+    command.spawn().unwrap()
+}
+
+fn spawn_module_with_extra_env(
+    subc_connection_file: &Path,
+    module_connection_file: &Path,
+    xdg_config_home: &Path,
+    extra_env: &[(&str, &str)],
+) -> Child {
+    let mut command = module_command(
+        subc_connection_file,
+        module_connection_file,
+        xdg_config_home,
+    );
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     command.stderr(process::Stdio::null());
     command.spawn().unwrap()
 }

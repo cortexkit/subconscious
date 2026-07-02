@@ -56,6 +56,11 @@ use tokio::{
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TEST_DAEMON_VER: &str = "test-subc-mcp";
+// The module refuses to serve without daemon spawn attestation (SUBC_MODULE_ID +
+// SUBC_LAUNCH_NONCE), so the tests spawn it exactly as the daemon would: env
+// injected, nonce seeded into the supervisor handle for route.open verification.
+const TEST_MCP_MODULE_ID: &str = "subc-mcp";
+const TEST_MCP_LAUNCH_NONCE: &str = "test-mcp-launch-nonce";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = SETUP_TIMEOUT;
 const QUIET_TIMEOUT: Duration = Duration::from_millis(750);
@@ -94,6 +99,9 @@ impl TestServer {
             supervisor_handle.clone(),
         )
         .await;
+        // Authorize the attested module's route.opens: the daemon-injected nonce the
+        // module echoes as consumer_identity must match a known spawn nonce.
+        supervisor_handle.set_spawn_nonce(TEST_MCP_MODULE_ID, TEST_MCP_LAUNCH_NONCE.to_owned());
         Self {
             daemon,
             process_liveness,
@@ -1524,6 +1532,52 @@ async fn mcp_shim_rejects_unsupported_hello_ack_schema() {
 }
 
 #[tokio::test]
+async fn mcp_module_without_spawn_attestation_exits_loud_before_serving() {
+    // The facade fronts remote-model callers; its binds must carry the attested
+    // reserved principal. Started WITHOUT the daemon-injected env (a manual
+    // launch or an injection regression), it must refuse to serve — the
+    // alternative is silently binding as the trusted `direct` principal.
+    let server = TestServer::start().await;
+    let module_connection_file = server.daemon.temp_dir.join("mcp-unattested-module.json");
+    let xdg_config_home = server.daemon.temp_dir.join("mcp-unattested-xdg-config");
+    fs::create_dir_all(&xdg_config_home).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
+    command
+        .arg("module")
+        .arg("--subc")
+        .arg(&server.daemon.connection_file_path)
+        .arg("--connection-file")
+        .arg(&module_connection_file)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
+        .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+        .stderr(process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
+    let mut stderr = child.stderr.take().expect("module stderr should be piped");
+
+    let exit = timeout(SETUP_TIMEOUT, child.wait())
+        .await
+        .expect("unattested module must exit promptly (it did not within SETUP_TIMEOUT)")
+        .expect("waiting for the module child to exit failed");
+    assert!(
+        !exit.success(),
+        "unattested module must exit with a failure status, got {exit:?}"
+    );
+    let mut stderr_text = String::new();
+    stderr.read_to_string(&mut stderr_text).await.unwrap();
+    assert!(
+        stderr_text.contains("spawn attestation"),
+        "failure must name the missing attestation, got: {stderr_text}"
+    );
+    assert!(
+        !module_connection_file.exists(),
+        "unattested module must never publish its connection file (never serves)"
+    );
+}
+
+#[tokio::test]
 async fn mcp_module_rejects_unsupported_shim_hello_schema_without_opening_routes() {
     let bad_schema = TEST_SHIM_SCHEMA_VERSION + 1;
     let server = TestServer::start().await;
@@ -1849,12 +1903,16 @@ fn spawn_module(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> Child {
-    let (child, _stderr) = spawn_module_with_stderr(
+    // Discard stderr with /dev/null, NOT a dropped pipe handle: the attested
+    // module eprintln!s its registration line, and writing to a closed pipe
+    // makes eprintln! panic (exit 101) in the child.
+    let mut command = module_command(
         subc_connection_file,
         module_connection_file,
         xdg_config_home,
     );
-    child
+    command.stderr(process::Stdio::null());
+    command.spawn().unwrap()
 }
 
 fn spawn_module_with_stderr(
@@ -1862,6 +1920,22 @@ fn spawn_module_with_stderr(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> (Child, ChildStderr) {
+    let mut command = module_command(
+        subc_connection_file,
+        module_connection_file,
+        xdg_config_home,
+    );
+    command.stderr(process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let stderr = child.stderr.take().expect("module stderr should be piped");
+    (child, stderr)
+}
+
+fn module_command(
+    subc_connection_file: &Path,
+    module_connection_file: &Path,
+    xdg_config_home: &Path,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
     command
         .arg("module")
@@ -1870,11 +1944,10 @@ fn spawn_module_with_stderr(
         .arg("--connection-file")
         .arg(module_connection_file)
         .env("XDG_CONFIG_HOME", xdg_config_home)
-        .stderr(process::Stdio::piped())
+        .env(subc_protocol::SUBC_MODULE_ID_ENV, TEST_MCP_MODULE_ID)
+        .env(subc_protocol::SUBC_LAUNCH_NONCE_ENV, TEST_MCP_LAUNCH_NONCE)
         .kill_on_drop(true);
-    let mut child = command.spawn().unwrap();
-    let stderr = child.stderr.take().expect("module stderr should be piped");
-    (child, stderr)
+    command
 }
 
 async fn wait_for_module_connection_file(child: &mut Child, path: &Path, wait: Duration) {

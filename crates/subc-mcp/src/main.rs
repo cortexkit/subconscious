@@ -500,6 +500,7 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 }
 
 async fn run_module(args: ModuleArgs) -> Result<()> {
+    require_spawn_attestation()?;
     let mut subc_stream = connect_authenticated(&args.subc_connection_file).await?;
     send_supervision_hello_if_configured(&mut subc_stream).await?;
     let subc = SubcClient::start(subc_stream);
@@ -855,6 +856,33 @@ async fn open_provider_route(
             response.header.channel, response.header.corr
         ))),
     }
+}
+
+/// Refuse to serve without daemon spawn attestation. The MCP facade fronts
+/// remote-model callers, so its route binds must reach providers stamped as the
+/// attested `reserved:<module_id>` principal (which provider policy distrusts),
+/// never as `direct` (which it trusts). Both env vars are injected by the
+/// daemon on spawn; a facade started any other way (manual launch, a supervisor
+/// that stopped injecting the nonce, an SDK regression dropping the attach)
+/// would silently bind as a trusted first-party — the exact downgrade this
+/// guard turns into a loud startup failure.
+fn require_spawn_attestation() -> Result<()> {
+    let module_id_present = env::var(SUBC_MODULE_ID_ENV)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let nonce_present = env::var(SUBC_LAUNCH_NONCE_ENV)
+        .map(|value| !value.is_empty())
+        .unwrap_or(false);
+    if module_id_present && nonce_present {
+        return Ok(());
+    }
+    Err(other_error(format!(
+        "subc-mcp module requires daemon spawn attestation: {SUBC_MODULE_ID_ENV} and \
+         {SUBC_LAUNCH_NONCE_ENV} must both be set (they are injected when subc spawns \
+         the module). Run it as a supervised module from subc.jsonc; an unattested \
+         facade would bind with the trusted 'direct' principal instead of \
+         'reserved:<module_id>'."
+    )))
 }
 
 fn consumer_identity_from_env() -> Option<ConsumerIdentity> {

@@ -125,7 +125,7 @@ public final class SubcClient {
         provider: String,
         model: String,
         fromCursor: SubscribeCursor? = nil,
-        appendEpisode: Bool = false,
+        sendId: String = UUID().uuidString,
         onEvent: (SessionEvent) -> Void
     ) throws -> SubscribeCursor? {
         let cmdChannel = try routeOpenManagementSurface(moduleId: moduleId, projectRoot: projectRoot, harness: harness, session: session)
@@ -151,6 +151,11 @@ public final class SubcClient {
         try writeRequest(channel: subChannel, corr: subCorr, body: subBody)
 
         // Then send the prompt on the command route (its own corr → one Response).
+        // A continuing turn needs no append flag: the module auto-appends on a fresh
+        // run identity. `send_id` is the idempotency key — the module derives the run
+        // id from it, so a lost-response retry of the SAME logical send maps to the
+        // same run instead of appending a duplicate turn (retries must reuse the id
+        // verbatim; a new logical send must mint a new one).
         let sendCorr = nextCorr; nextCorr += 1
         let sendBody = try JSONSerialization.data(withJSONObject: [
             "method": "session.send",
@@ -158,7 +163,7 @@ public final class SubcClient {
                 "prompt": prompt,
                 "model": ["provider": provider, "model": model],
                 "tools": [],
-                "append_episode": appendEpisode,
+                "send_id": sendId,
             ],
         ])
         try writeRequest(channel: cmdChannel, corr: sendCorr, body: sendBody)

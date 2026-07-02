@@ -68,7 +68,7 @@ do {
             cursor = try turnClient.runSessionTurn(
                 moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
                 session: session, prompt: prompt, provider: provider, model: modelId,
-                fromCursor: cursor, appendEpisode: cursor != nil
+                fromCursor: cursor
             ) { ev in
                 print("  [event] seq=\(ev.walSeq):\(ev.subIndex) \(ev.type)\(ev.runId.map { " run_id=\($0)" } ?? "")")
                 if ev.type == "assistant_message", let t = ev.text { finalText = t }
@@ -92,7 +92,7 @@ do {
                 cursor = try turnClient.runSessionTurn(
                     moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
                     session: session, prompt: args[3], provider: provider, model: modelId,
-                    fromCursor: cursor, appendEpisode: cursor != nil
+                    fromCursor: cursor
                 ) { ev in
                     print("  [event] seq=\(ev.walSeq):\(ev.subIndex) \(ev.type)")
                     if ev.type == "assistant_message", let t = ev.text { finalText = t }

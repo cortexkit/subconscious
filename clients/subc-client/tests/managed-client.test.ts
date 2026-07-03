@@ -37,12 +37,24 @@ interface FakeStats {
   // The consumer_identity sent on each route.open, in order (undefined when absent),
   // so a test can assert the principal survives a reconnect reopen.
   routeOpenConsumerIdentities: (unknown | undefined)[];
+  // Count of accepted TCP connections — a test asserts a healthy-socket deadline
+  // does NOT trigger a reconnect (count stays 1).
+  connections: number;
 }
 
 interface FakeDaemonOptions {
   stats: FakeStats;
-  dataMode?: "echo" | "drop" | "error";
+  // "delay-body": reply with the frame HEADER immediately, then the body after
+  //   `delayBodyMs` — so the client's read loop is mid-frame (bytes present) when a
+  //   short request deadline fires, deterministically exercising timeout arbitration.
+  // "silent-hold": accept the data request and never reply, keeping the socket
+  //   healthy — a genuine deadline with no drop.
+  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold";
+  delayBodyMs?: number;
   routeOpenError?: { code: string; message: string };
+  // Reject the first N route.open requests with this code (a booting-target
+  // simulation), then serve subsequent ones normally.
+  routeOpenFailFirst?: { count: number; code: string; message: string };
   closeAfterDataResponses?: number;
 }
 
@@ -52,7 +64,7 @@ interface FakeDaemon {
 }
 
 function newStats(): FakeStats {
-  return { routeOpens: 0, dataRequests: 0, dataBodies: [], routeOpenConsumerIdentities: [] };
+  return { routeOpens: 0, dataRequests: 0, dataBodies: [], routeOpenConsumerIdentities: [], connections: 0 };
 }
 
 afterEach(async () => {
@@ -295,11 +307,139 @@ describe("SubcClient managed call", () => {
       client.close();
     }
   });
+
+  test("retries a retryable route.open rejection in-place and recovers when the target becomes available", async () => {
+    // A daemon-restart boot window: the target is supervised but not yet live, so
+    // the first two route.open attempts are rejected target_unavailable, then it
+    // comes up. The retry is IN-PLACE (same connection, no socket reconnect), so
+    // the call recovers transparently instead of surfacing a misleading error.
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const sleeps: number[] = [];
+    const daemon = await startFakeDaemon({
+      stats,
+      routeOpenFailFirst: { count: 2, code: "target_unavailable", message: "supervised but not available" },
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    try {
+      const reply = await client.call("managed-provider", "echo", { n: 1 });
+      expect(reply).toEqual({ method: "echo", params: { n: 1 } });
+      // Three route.opens: two rejected + the one that succeeded — all on the SAME
+      // connection (no reconnect), proven by the two backoff sleeps between them.
+      expect(stats.routeOpens).toBe(3);
+      expect(sleeps.length).toBe(2);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("surfaces a retryable route.open rejection as not_sent after the retry budget is exhausted", async () => {
+    // The target never comes up within the budget: the rejection is provably
+    // pre-send (no data frame left the client), so it must classify not_sent — not
+    // terminal — so the caller's own retry policy may safely re-attempt later.
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({
+      stats,
+      routeOpenError: { code: "module_reloading", message: "target is reloading" },
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      sleep: async () => {},
+    });
+
+    try {
+      await expect(client.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
+        kind: "not_sent",
+        code: "module_reloading",
+      });
+      // Bounded by maxAttempts — did not storm the daemon.
+      expect(stats.routeOpens).toBe(BACKOFF.maxAttempts);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("timeout arbitration recovers a reply that raced the deadline (no lost success, no reconnect)", async () => {
+    // The demux-drop bug: under event-loop starvation a reply already in the socket
+    // buffer is dispatched only after the request-timeout timer fires, so the naive
+    // path deletes the waiter and drops the arriving reply. We reproduce the shape
+    // deterministically: the daemon writes the reply HEADER promptly (the client
+    // parks mid-frame on the body read → readerActive) then the BODY after the
+    // deadline. With arbitration, the raced reply wins and the call RESOLVES.
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, dataMode: "delay-body", delayBodyMs: 200 });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      // Large grace so the mid-arrival body is deterministically inside the window;
+      // the body arrives ~200ms after a header that lands sub-ms, past the 80ms
+      // deadline but far inside the 2s grace.
+      timeoutArbitrationGraceMs: 2_000,
+    });
+
+    try {
+      const reply = await client.call("managed-provider", "echo", { n: 7 }, { timeoutMs: 80 });
+      expect(reply).toEqual({ method: "echo", params: { n: 7 } });
+      // The reply won on the SAME connection — arbitration did not trigger a reconnect.
+      expect(stats.connections).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a genuine deadline on a healthy socket is outcome_unknown + deadline code and does NOT reconnect", async () => {
+    // The target accepts the request and never replies while the socket stays
+    // healthy. The call must settle as outcome_unknown with the deadline-not-drop
+    // code, and must NOT tear down the healthy connection (no reconnect) — only an
+    // actual connection drop should trigger a reconnect, not a slow reply.
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, dataMode: "silent-hold" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: { baseMs: 1, capMs: 1, maxAttempts: 1 },
+      timeoutArbitrationGraceMs: 10,
+    });
+
+    try {
+      await expect(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 })).rejects.toMatchObject({
+        kind: "outcome_unknown",
+        code: "deadline_exceeded_no_drop_observed",
+      });
+      // Give any (erroneous) reconnect a chance to open a second connection.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(stats.connections).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
 });
 
 async function startFakeDaemon(options: FakeDaemonOptions): Promise<FakeDaemon> {
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
+    options.stats.connections += 1;
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     void handleFakeConnection(socket, options).catch(() => socket.destroy());
@@ -342,7 +482,14 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
         options.stats.routeOpenConsumerIdentities.push(
           (request as { consumer_identity?: unknown }).consumer_identity,
         );
-        if (options.routeOpenError) {
+        const failFirst = options.routeOpenFailFirst;
+        if (failFirst && options.stats.routeOpens <= failFirst.count) {
+          await writeFrame(
+            socket,
+            errorFrame(frame, { code: failFirst.code, message: failFirst.message }),
+            deadline,
+          );
+        } else if (options.routeOpenError) {
           await writeFrame(socket, errorFrame(frame, options.routeOpenError), deadline);
         } else {
           await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: routeChannel++ }), deadline);
@@ -359,7 +506,20 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       socket.destroy();
       return;
     }
-    if (options.dataMode === "error") {
+    if (options.dataMode === "silent-hold") {
+      // Accept the request, never reply, keep the socket healthy — a genuine
+      // deadline with no drop. Loop back to keep reading (and stay alive).
+      continue;
+    }
+    if (options.dataMode === "delay-body") {
+      // Write the reply HEADER now, then the BODY after a delay, so the client's
+      // read loop is parked mid-frame (bytes buffered) when a short deadline fires.
+      const reply = responseFrame(frame, body);
+      const full = encodeFrame(reply);
+      await writeAll(socket, full.subarray(0, HEADER_LEN), deadline);
+      await new Promise((resolve) => setTimeout(resolve, options.delayBodyMs ?? 30));
+      await writeAll(socket, full.subarray(HEADER_LEN), deadline);
+    } else if (options.dataMode === "error") {
       await writeFrame(socket, errorFrame(frame, { code: "module_boom", message: "boom" }), deadline);
     } else {
       await writeFrame(socket, responseFrame(frame, body), deadline);

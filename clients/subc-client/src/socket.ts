@@ -48,6 +48,13 @@ export class SubcSocket {
   private waiter: Waiter | null = null;
   private closedErr: Error | null = null;
 
+  /** Bytes currently buffered but not yet consumed by a reader. A timeout
+   * arbitration uses this to tell "a reply already arrived, keep draining" from
+   * "nothing is here, settle the timeout". */
+  bufferedBytes(): number {
+    return this.buffered;
+  }
+
   private constructor(sock: net.Socket) {
     this.sock = sock;
     sock.on("data", (chunk: Buffer) => {

@@ -10,6 +10,7 @@
 // correlation id, not arrival order.
 
 import { promises as fs } from "node:fs";
+import { debuglog } from "node:util";
 
 import { AuthError, authenticateClient } from "./auth.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
@@ -31,8 +32,38 @@ import {
   SubcSocket,
 } from "./socket.js";
 
+const debug = debuglog("subc-client");
+
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// When a request-timeout timer fires, its reply may already be sitting in the
+// socket read buffer, unprocessed only because the event loop was starved (Node
+// runs the TIMERS phase before the POLL phase, so an expired timer can beat an
+// already-arrived frame). Rather than settle as a timeout immediately, arbitrate:
+// yield one check-phase turn (setImmediate) so a fully-buffered reply dispatches
+// and wins, and — only while the reader is actively draining the same socket —
+// allow a small hard-capped grace for a reply whose header/body spans more than
+// one loop turn. This is a demux tiebreak for a reply that RACED the deadline,
+// NOT a deadline extension: an absent reply still settles right after the check
+// phase. Capped so it can never approach BODY_READ_TIMEOUT_MS.
+const TIMEOUT_ARBITRATION_GRACE_MS = 50;
+// Internal marker set as the `code` on the SubcError a request-deadline timeout
+// rejects with, so the managed classifier can tell a deadline (reply may simply
+// not have been read in time) from an actual connection drop. Never surfaced to
+// callers directly — it is refined into DEADLINE_NO_DROP_CODE by classifyFailure.
+const REQUEST_DEADLINE_MARKER = "request_deadline";
+// The consumer-facing code for a managed call whose deadline elapsed while its
+// bytes were queued to the local socket and NO connection drop / GOODBYE was
+// observed. Distinct from "connection_dropped" so a caller can skip a
+// was-it-even-sent recovery path — but still kind=outcome_unknown (never safe to
+// retry: "queued to the local socket" is NOT proof the daemon received or ran it).
+const DEADLINE_NO_DROP_CODE = "deadline_exceeded_no_drop_observed";
+// A retryable route.open rejection (target booting / reloading / momentarily
+// absent) is retried in-place against the same connection up to this deadline
+// before it is surfaced as not_sent. Mirrors subc-client-rs
+// DEFAULT_ROUTE_RETRY_DEADLINE so a target that is briefly unavailable at daemon
+// restart recovers without a misleading terminal error.
+const ROUTE_OPEN_RETRY_DEADLINE_MS = 10_000;
 // Once a header arrives, its body must follow promptly; bound it so a truncated
 // frame cannot wedge the read loop forever.
 const BODY_READ_TIMEOUT_MS = 30_000;
@@ -194,6 +225,14 @@ export interface ConnectOptions {
   reconnectBackoff?: ReconnectBackoff;
   /** Injectable sleep for timer-free reconnect tests. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Hard cap on the timeout-arbitration grace window (see
+   * TIMEOUT_ARBITRATION_GRACE_MS). A reply whose bytes are actively arriving when
+   * the request deadline fires is given up to this long to finish dispatching
+   * before the call settles as a timeout. Bounded and never a deadline extension;
+   * exposed mainly so tests can prove the arbitration deterministically.
+   */
+  timeoutArbitrationGraceMs?: number;
 }
 
 interface NormalizedConnectOptions {
@@ -203,6 +242,7 @@ interface NormalizedConnectOptions {
   targetKind: ManagedRouteKind;
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
+  timeoutArbitrationGraceMs: number;
 }
 
 interface OpenedConnection {
@@ -238,6 +278,11 @@ export class SubcClient {
   private closeStarted = false;
   private reconnecting: Promise<void> | null = null;
   private generation = 1;
+  // True while the read loop is actively reading/dispatching a frame off the
+  // current socket (between reading a header and finishing its dispatch). The
+  // timeout arbitration reads it to decide whether a just-fired timeout should
+  // grant a reply mid-arrival a small grace window before settling.
+  private readerActive = false;
 
   private constructor(
     private sock: SubcSocket,
@@ -319,7 +364,11 @@ export class SubcClient {
           }
           continue;
         }
-        if (err.kind === "outcome_unknown") {
+        if (err.kind === "outcome_unknown" && err.code !== DEADLINE_NO_DROP_CODE) {
+          // A real drop schedules a reconnect. A deadline-with-no-drop does NOT:
+          // the socket was never observed to fail (the reply was likely just read
+          // late under load), so tearing it down would abandon a healthy connection
+          // and its other in-flight routes for nothing.
           this.scheduleReconnectAfterDrop(err);
         }
         throw err;
@@ -521,7 +570,7 @@ export class SubcClient {
         timer: null,
       };
       pending.timer = setTimeout(() => {
-        this.rejectPending(key, pending, new SubcError(this.timeoutMessage(channel, corr, ms)));
+        this.arbitrateTimeout(key, pending, channel, corr, ms);
       }, ms);
       this.pending.set(key, pending);
       this.sock.write(encodeFrame(frame), Date.now() + ms).catch((err) => {
@@ -529,6 +578,42 @@ export class SubcClient {
         if (p) this.rejectPending(key, p, err instanceof Error ? err : new SubcError(String(err)));
       });
     });
+  }
+
+  /**
+   * A request-deadline timer has fired. Before settling as a timeout, arbitrate
+   * the timer-vs-poll race: a reply may already be in the socket buffer, unread
+   * only because the loop was starved. Yield one check phase (setImmediate) so a
+   * fully-buffered reply dispatches and wins via settle()'s identity guard; then,
+   * only while the reader is actively draining THIS socket (a frame mid-arrival),
+   * grant a single hard-capped grace before finally settling. Absent replies
+   * still settle right after the check phase. The settle carries the deadline
+   * marker so the managed classifier reports deadline-not-drop.
+   */
+  private arbitrateTimeout(key: string, pending: Pending, channel: number, corr: bigint, ms: number): void {
+    const settleAsTimeout = (): void => {
+      this.rejectPending(
+        key,
+        pending,
+        new SubcError(this.timeoutMessage(channel, corr, ms), REQUEST_DEADLINE_MARKER),
+      );
+    };
+    const graceDeadline = Date.now() + this.opts.timeoutArbitrationGraceMs;
+    const arbitrate = (): void => {
+      // Already settled (by dispatch, fail, GOODBYE, or close)? Nothing to do.
+      if (this.pending.get(key) !== pending) return;
+      // A reply is mid-arrival on this socket (or bytes are buffered), and we are
+      // still inside the grace window: give the reader another turn to finish
+      // dispatching it. The generation guard in readLoop keeps this scoped to the
+      // live socket; the grace cap keeps it from approaching the body-read timeout.
+      const readerDraining = this.readerActive || this.sock.bufferedBytes() > 0;
+      if (readerDraining && Date.now() < graceDeadline) {
+        setImmediate(arbitrate);
+        return;
+      }
+      settleAsTimeout();
+    };
+    setImmediate(arbitrate);
   }
 
   private async managedRequest(
@@ -572,6 +657,18 @@ export class SubcClient {
       if (!handedToSocket) {
         return this.notSentCallError("request bytes were not queued to the subc socket", err);
       }
+      // A request-deadline timeout (arbitration expired without observing a drop)
+      // is refined from a real connection drop: the socket was NOT seen to fail, so
+      // the caller can skip a was-it-even-sent recovery path. Still outcome_unknown
+      // — queued-to-local-socket is not proof the daemon received or ran it.
+      if (err instanceof SubcError && err.code === REQUEST_DEADLINE_MARKER) {
+        return new SubcCallError(
+          "outcome_unknown",
+          `managed call deadline exceeded after request bytes were queued to the local socket; no terminal response was observed; outcome unknown${causeMessage(err)}`,
+          DEADLINE_NO_DROP_CODE,
+          err,
+        );
+      }
       return this.outcomeUnknownCallError("connection dropped before the managed call returned a response", err);
     };
 
@@ -586,7 +683,7 @@ export class SubcClient {
         classifyFailure,
       };
       pending.timer = setTimeout(() => {
-        this.rejectPending(key, pending, new SubcError(this.timeoutMessage(channel, corr, ms)));
+        this.arbitrateTimeout(key, pending, channel, corr, ms);
       }, ms);
       this.pending.set(key, pending);
 
@@ -642,6 +739,9 @@ export class SubcClient {
   }
 
   private async openCachedRoute(cached: CachedRoute): Promise<number> {
+    const routeRetryDeadline = Date.now() + ROUTE_OPEN_RETRY_DEADLINE_MS;
+    let routeRetryDelay = this.opts.reconnectBackoff.baseMs;
+    let routeRetryAttempt = 0;
     for (;;) {
       if (cached.closed) throw this.routeClosedDuringOpen();
       try {
@@ -679,6 +779,29 @@ export class SubcClient {
           }
           continue;
         }
+        // A daemon-rejected route.open with a RETRYABLE code (target booting /
+        // reloading / momentarily absent) is retried IN-PLACE against the same live
+        // connection — never a socket reconnect, which would needlessly disrupt this
+        // connection's other routes — until the route-retry deadline. Past the
+        // deadline it surfaces as not_sent: provably pre-send (no data frame ever
+        // left the client) AND still transient, so the caller's own retry policy may
+        // safely re-attempt later. Reason and set kept in parity with subc-client-rs.
+        if (!this.closeStarted && err instanceof SubcError && isRetryableRouteOpenCode(err.code)) {
+          routeRetryAttempt += 1;
+          if (routeRetryAttempt < this.opts.reconnectBackoff.maxAttempts && Date.now() < routeRetryDeadline) {
+            await this.opts.sleep(routeRetryDelay);
+            routeRetryDelay = Math.min(routeRetryDelay * 2, this.opts.reconnectBackoff.capMs);
+            continue;
+          }
+          throw this.notSentCallError(
+            `route.open failed for module ${cached.moduleId}: ${err.code} (retry budget exhausted)`,
+            err,
+          );
+        }
+        // A permanent route.open rejection (bad_consumer_identity, config_divergence,
+        // unknown_target, ...) is pre-send but would never succeed on retry, so it
+        // stays terminal — a not_sent class here would invite a retry storm against a
+        // request the daemon will always reject.
         throw this.terminalCallError(`route.open failed for module ${cached.moduleId}`, err);
       }
     }
@@ -789,14 +912,29 @@ export class SubcClient {
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
     try {
       for (;;) {
-        // Header read waits indefinitely — idle time between frames is normal.
+        // Header read waits indefinitely — idle time between frames is normal, and
+        // the reader is NOT "active" while parked here (a racing timeout must not
+        // grant grace just because the connection is idle between frames).
         const headerBytes = await sock.readExact(HEADER_LEN, Number.POSITIVE_INFINITY);
-        const header = decodeHeader(headerBytes);
-        const body =
-          header.len === 0
-            ? new Uint8Array(0)
-            : await sock.readExact(header.len, Date.now() + BODY_READ_TIMEOUT_MS);
-        this.dispatch({ header, body });
+        // A frame is now arriving. Mark the reader active THROUGH dispatch so a
+        // timeout that fires mid-arrival grants the reply its bounded grace window
+        // instead of settling as a spurious timeout.
+        this.readerActive = true;
+        try {
+          const header = decodeHeader(headerBytes);
+          const body =
+            header.len === 0
+              ? new Uint8Array(0)
+              : await sock.readExact(header.len, Date.now() + BODY_READ_TIMEOUT_MS);
+          // Drop a frame read off a socket this client has already replaced
+          // (reconnect): its pendings were settled by fail(), and dispatching it
+          // against the current pending map could match a re-used (channel, corr).
+          if (this.sock === sock && this.generation === generation) {
+            this.dispatch({ header, body });
+          }
+        } finally {
+          this.readerActive = false;
+        }
       }
     } catch (err) {
       if (this.sock === sock && this.generation === generation) {
@@ -829,15 +967,46 @@ export class SubcClient {
       this.failChannel(frame.header.channel, new SubcError("route closed by subc (GOODBYE)"));
       return;
     }
+    // A terminal frame (Response/Error/StreamEnd) with no waiter is almost always
+    // a reply that arrived AFTER its request already settled — the fingerprint of a
+    // premature timeout under event-loop starvation (the reply raced the deadline
+    // and lost). Metadata-only debug log (never the body) so every future
+    // occurrence is a one-line diagnosis instead of an invisible drop. Enable with
+    // NODE_DEBUG=subc-client.
+    if (
+      frame.header.ty === FrameType.Response ||
+      frame.header.ty === FrameType.Error ||
+      frame.header.ty === FrameType.StreamEnd
+    ) {
+      debug(
+        "dropped terminal frame with no waiter: type=%d channel=%d corr=%s port=%s",
+        frame.header.ty,
+        frame.header.channel,
+        frame.header.corr,
+        this.sock.localPort() ?? "?",
+      );
+      return;
+    }
     // Unmatched Push or stray frame: no registered waiter. Drop it — v1 has no
     // unsolicited-push consumers.
   }
 
-  private settle(key: string, pending: Pending, run: () => void): void {
+  /**
+   * Settle a pending exactly once. The object-identity guard (the map still
+   * holds THIS pending under `key`) is the single-winner primitive: whichever of
+   * dispatch, a timeout, fail(), failChannel(), a GOODBYE, or a deferred timeout
+   * arbitration reaches it first wins, and every later caller no-ops. This is what
+   * makes the deferred-timeout arbitration safe — it cannot double-settle, reject
+   * an already-resolved promise, or delete a pending re-created for a later corr.
+   * Returns true when this call was the settler.
+   */
+  private settle(key: string, pending: Pending, run: () => void): boolean {
+    if (this.pending.get(key) !== pending) return false;
     this.pending.delete(key);
     if (pending.timer) clearTimeout(pending.timer);
     run();
     pending.onSettle?.();
+    return true;
   }
 
   private rejectPending(key: string, pending: Pending, err: Error): void {
@@ -909,6 +1078,27 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
   return code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT" || code === "ENOENT";
 }
 
+/**
+ * The closed set of route.open rejection codes that mean "the target is
+ * momentarily unavailable but the request could succeed on retry" — the target
+ * is booting, mid-reload, transiently absent, or the bind relay timed out. A
+ * daemon-rejected route.open is provably pre-send (no data frame ever left the
+ * client), so these classify as not_sent; the managed path retries them in-place
+ * within ROUTE_OPEN_RETRY_DEADLINE_MS. Permanent rejections (bad_consumer_identity,
+ * config_divergence, unknown_target, ...) are excluded — they are pre-send but
+ * would never succeed, so retrying them would only storm the daemon. Kept
+ * byte-identical to subc-client-rs is_retryable_route_open_code for cross-client
+ * classification parity.
+ */
+export function isRetryableRouteOpenCode(code: string | undefined): boolean {
+  return (
+    code === "unknown_module" ||
+    code === "module_reloading" ||
+    code === "target_unavailable" ||
+    code === "module_timeout"
+  );
+}
+
 export async function connectionFileExists(path: string): Promise<boolean> {
   try {
     await fs.access(path);
@@ -926,6 +1116,7 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     targetKind: opts.targetKind ?? DEFAULT_MANAGED_TARGET_KIND,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
+    timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS,
   };
 }
 

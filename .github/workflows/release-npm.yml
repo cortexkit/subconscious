@@ -1,18 +1,20 @@
-name: Release npm (subc-client)
+name: Release npm
 
-# Publishes @cortexkit/subc-client to npm via OIDC TRUSTED PUBLISHING — no
+# Publishes the monorepo's npm packages via OIDC TRUSTED PUBLISHING — no
 # NPM_TOKEN, no manual passkey. Authentication is a short-lived GitHub OIDC
 # token exchanged with npm, scoped to this repo + this workflow file. One-time
-# npm-side setup is required (see docs/npm-trusted-publishing.md): configure the
-# package's Trusted Publisher on npmjs.com to point at this repo + workflow.
+# npm-side setup is required PER PACKAGE (see docs/npm-trusted-publishing.md):
+# configure the package's Trusted Publisher on npmjs.com to point at this repo
+# + this workflow filename.
 #
-# Tag format: `subc-client@<version>` (npm-style, e.g. subc-client@0.2.1).
+# Tag format: `<pkg>@<version>` (npm-style, e.g. subc-client@0.2.1, store@0.1.0).
 # Deliberately NOT `<name>-v<version>` so it never triggers release.yml (crates),
 # which matches `*-v*` and would fail on a non-existent crate of that name.
 on:
   push:
     tags:
       - "subc-client@*"
+      - "store@*"
 
 concurrency:
   group: release-npm-${{ github.ref }}-${{ github.sha }}
@@ -24,16 +26,29 @@ permissions:
 
 jobs:
   publish:
-    name: Publish @cortexkit/subc-client
+    name: Publish npm package
     # Blacksmith runner (private repo on the free plan blocks GitHub-hosted
     # Actions). Blacksmith is a drop-in that honors GitHub-native OIDC, so
     # trusted publishing works unchanged as long as id-token: write is granted.
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    defaults:
-      run:
-        working-directory: clients/subc-client
     steps:
       - uses: actions/checkout@v5
+
+      # Map the tag prefix to the package directory. Adding a package = add a
+      # tag pattern above + a case arm here + the one-time npm Trusted Publisher.
+      - name: Resolve package dir from tag
+        id: pkg
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PKG="${TAG%@*}"
+          case "$PKG" in
+            subc-client) DIR="clients/subc-client" ;;
+            store)       DIR="clients/store" ;;
+            *) echo "::error::No package mapping for tag prefix '$PKG'"; exit 1 ;;
+          esac
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#*@}" >> "$GITHUB_OUTPUT"
+          echo "Publishing from $DIR (tag $TAG)"
 
       - uses: actions/setup-node@v4
         with:
@@ -51,6 +66,7 @@ jobs:
       # Gate the publish on the same checks a PR runs — a release can never ship
       # code that would not pass CI.
       - name: Install dev deps + verify
+        working-directory: ${{ steps.pkg.outputs.dir }}
         run: |
           bun install --frozen-lockfile || bun install
           bun run typecheck
@@ -59,15 +75,15 @@ jobs:
       # Guard: the tag version must match package.json, so a stale or mistyped
       # tag can't publish the wrong version (mirrors the crate release guard).
       - name: Assert tag matches package.json version
+        working-directory: ${{ steps.pkg.outputs.dir }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          TAG_VERSION="${TAG#subc-client@}"
+          TAG_VERSION="${{ steps.pkg.outputs.version }}"
           PKG_VERSION=$(node -p "require('./package.json').version")
           if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
             echo "::error::Tag wants ${TAG_VERSION} but package.json has ${PKG_VERSION}"
             exit 1
           fi
-          echo "Publishing @cortexkit/subc-client ${PKG_VERSION}"
+          echo "Publishing ${PKG_VERSION}"
 
       # Idempotent: a retag of an already-published version (recovery re-run) is
       # treated as success rather than failing the release.
@@ -80,6 +96,7 @@ jobs:
       # auto-enables provenance under trusted publishing, so we override it off
       # explicitly via NPM_CONFIG_PROVENANCE.
       - name: Publish (OIDC trusted publishing)
+        working-directory: ${{ steps.pkg.outputs.dir }}
         env:
           NPM_CONFIG_PROVENANCE: "false"
         run: |

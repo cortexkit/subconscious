@@ -1,6 +1,6 @@
-# npm Trusted Publishing (OIDC) for @cortexkit/subc-client
+# npm Trusted Publishing (OIDC) for the monorepo's npm packages
 
-Goal: publish `@cortexkit/subc-client` from CI with **no NPM_TOKEN and no manual
+Goal: publish the monorepo's npm packages (`@cortexkit/subc-client`, `@cortexkit/store`) from CI with **no NPM_TOKEN and no manual
 passkey** — every release becomes a tag push. Replaces the passkey-gated manual
 `npm publish` that has gated every release since the 0.1.0 bootstrap.
 
@@ -63,3 +63,21 @@ sitting in repo secrets — the exact leak surface trusted publishing removes.
 OIDC tokens live for the job only and are cryptographically scoped to this repo
 + workflow, so a stolen CI log or a compromised unrelated workflow cannot
 publish. Same reasoning that put the Rust crates on their own release pipeline.
+
+
+## Adding a package (the @cortexkit/store bootstrap, and any future one)
+
+Trusted Publishers are configured PER PACKAGE, and npm only lets you configure
+one on a package that already EXISTS. So a brand-new package needs a one-time
+manual bootstrap publish (passkey), then the same one-time Trusted Publisher
+setup, then it's tag-push forever:
+
+1. Bump the version in `clients/<pkg>/package.json` (already done for store: 0.1.0).
+2. Bootstrap publish (passkey, once): `cd clients/store && npm publish --access public`
+3. Configure Trusted Publisher on npmjs.com for @cortexkit/store:
+   org `cortexkit`, repo `subconscious`, workflow `release-npm.yml`, env blank.
+4. Future releases: bump version, commit, `git tag store@<version>`, push the tag.
+
+The workflow maps tag prefixes to package dirs (`subc-client@*` ->
+clients/subc-client, `store@*` -> clients/store); adding a future package =
+one tag pattern + one case arm + its npm-side Trusted Publisher.

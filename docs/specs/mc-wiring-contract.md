@@ -171,6 +171,56 @@ the live-append site and the replay-reconstruct sites.
 - Forking: forked lineages copy prefix mids verbatim (data, not position) — no
   fork special-case.
 
+### 3.2.1 The mid stability contract is TWO-WAY (all codecs, not just llm-runner)
+
+3.2 pins llm-runner's basis; this is the general obligation every codec that
+produces `mid`s must satisfy — the plugin/codec leg (OpenCode/Pi), the CC MITM
+leg, and any future producer. A `mid` is a STABLE PER-MESSAGE IDENTITY across
+passes, which is TWO directions, both load-bearing:
+
+1. **No reuse** — a `mid` never maps to different content across passes. A
+   revert-then-continue mints FRESH mids for the new continuation; it never
+   re-stamps an old mid onto new content. (This is the revert-stability rule:
+   same mid ⇒ same content, forever.)
+2. **No churn** — a message that PERSISTS across passes keeps the SAME mid;
+   the same content is never re-stamped under a different mid. Once a message
+   is first assigned a mid, that mid is monotonic-stable for that message.
+
+Both are required because a cache frozen unit (a boundary anchor or a reduction
+target) is KEYED by `mid#index`. Violating (1) makes boundary-presence match a
+stale mid onto wrong content; violating (2) makes a boundary anchor's mid vanish
+from the live array (→ spurious reconcile/re-cut) and orphans reductions whose
+target mid no longer exists. The one-directional phrasing "same mid ⇒ same
+content" alone is insufficient — churn (different-mid-same-content) is permitted
+by that literal phrasing but breaks frozen-unit stability, so the contract is
+explicitly both directions.
+
+How each producer satisfies it:
+- **llm-runner** (§3.2): durable logical coordinates are stable-by-construction
+  in both directions (a persistent message's coordinates don't change; a new
+  message gets new coordinates). No extra mechanism.
+- **OpenCode**: `mid = info.id`, immutable-per-message — both directions free.
+- **Pi**: `mid = responseId` when present at first sight, else
+  `pi-ts-<timestamp>`; the FIRST-SEEN mid is PINNED via the id sidecar so a
+  streaming entry that later gains a `responseId` keeps its first-seen mid (no
+  churn). The mid value is opaque — keeping a "uglier" `pi-ts` mid after settle
+  is correct, only stability matters. For Pi the pin is SHOULD-hard
+  (defense-in-depth), not MUST-load-bearing: churn cannot reach a frozen-unit key
+  by construction — the only entries whose id can change are mid-stream assistant
+  entries (no `responseId` yet), which are by definition the NEWEST message and
+  thus always inside the protected live tail, so coverage/reductions/boundary
+  minting never reach an entry still on a fallback mid; all other
+  timestamp-keyed classes (user, toolResult, custom) never carry `responseId` and
+  are timestamp-stable forever; and a restart mid-stream aborts the stream so the
+  fallback mid becomes the entry's permanent identity. The unconditional pin
+  guards only a FUTURE harness behavior change (e.g. Pi backfilling `responseId`s
+  on resume).
+- **CC MITM leg** (ai-proxy): positional wire arrays have no native durable id,
+  so the codec's id-synthesis MUST be content-anchored or sequence-monotonic —
+  never bare-positional (a positional id churns the moment the array shifts).
+  Here the first-seen-pin discipline via the leg's sidecar is genuinely
+  MUST-load-bearing (no native ids to fall back on), unlike Pi's belt case.
+
 ### 3.3 Block identity: `mid#<block_index>` for ALL blocks (Oracle #3 fix)
 
 `block_id = <mid>#<block_index>` uniformly — including tool blocks.

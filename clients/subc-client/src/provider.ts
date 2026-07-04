@@ -685,6 +685,10 @@ export class SubcProvider {
       } catch (err) {
         if (this.closeStarted) throw err;
         if (!isProviderReconnectTransient(err)) throw err;
+        // Providers retry transient failures indefinitely by design (a module
+        // keeps trying until closed; only permanent errors fail-fatal), so an
+        // auth mismatch heals as soon as the daemon settles and a retry re-reads
+        // the rotated connection file.
         await this.opts.sleep(delay);
         delay = Math.min(delay * 2, this.opts.reconnectBackoff.capMs);
       }
@@ -827,7 +831,14 @@ function isProviderReconnectTransient(err: unknown): boolean {
   if (err instanceof SubcProviderError) return err.code === "duplicate_module_id";
   if (err instanceof SocketClosedError || err instanceof SocketTimeoutError) return true;
   if (err instanceof SocketWriteNotQueuedError || err instanceof SocketWriteQueuedError) return true;
-  if (err instanceof ConnectionFileError || err instanceof AuthError) return false;
+  // AuthError is transient during reconnect: the daemon rotates its key on every
+  // restart, and with a fixed port a client racing the restart can read the
+  // pre-rotation file yet still connect — proof mismatch then means "stale key
+  // mid-rotation", not "impostor". Each retry re-reads the connection file, and
+  // server-proves-first protects every attempt. First-connect auth failures stay
+  // permanent in serve()'s initial openConnection (never routed through here).
+  if (err instanceof AuthError) return true;
+  if (err instanceof ConnectionFileError) return false;
 
   const code = errorCode(err);
   return code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT" || code === "ENOENT";

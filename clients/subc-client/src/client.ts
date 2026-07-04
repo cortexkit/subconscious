@@ -851,6 +851,18 @@ export class SubcClient {
         return;
       } catch (err) {
         if (!isConsumerReconnectTransient(err) || attempt >= this.opts.reconnectBackoff.maxAttempts) {
+          // An auth failure that survives the whole budget (which re-reads the
+          // connection file every attempt) is no longer explainable by key
+          // rotation — but the raw "impostor daemon" wording sent a real
+          // operator down the wrong path, so name the likelier operational
+          // causes and the recovery action.
+          if (err instanceof AuthError && attempt > 1) {
+            throw new AuthError(
+              `reconnect gave up after ${attempt} attempts: ${err.message} — the connection file and the daemon's key disagree persistently ` +
+                `(daemon restarting in a loop, split connection-file paths, or a genuinely foreign daemon on this port); ` +
+                `check the daemon, then restart this host app`,
+            );
+          }
           throw err;
         }
         await this.opts.sleep(delay);
@@ -1072,7 +1084,17 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
   if (err instanceof SocketClosedError || err instanceof SocketTimeoutError) return true;
   if (err instanceof SocketWriteNotQueuedError || err instanceof SocketWriteQueuedError) return true;
   if (err instanceof SubcCallError) return err.kind === "not_sent" || err.kind === "outcome_unknown";
-  if (err instanceof SubcError || err instanceof ConnectionFileError || err instanceof AuthError) return false;
+  // AuthError is transient DURING RECONNECT (this classifier's only call site):
+  // the daemon rotates its key on every restart, and with a fixed port a client
+  // racing the restart can read the pre-rotation file yet still connect — the
+  // proof mismatch then means "stale key mid-rotation", not "impostor". Every
+  // retry re-reads the connection file (openConnection), so the next attempt
+  // picks up the rotated key; server-proves-first protects each attempt, so
+  // retrying costs nothing security-wise. First-connect auth failures never
+  // reach here — connect() throws them directly, where they stay permanent
+  // (that IS the impostor/misconfig case).
+  if (err instanceof AuthError) return true;
+  if (err instanceof SubcError || err instanceof ConnectionFileError) return false;
 
   const code = errorCode(err);
   return code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT" || code === "ENOENT";

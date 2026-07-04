@@ -1810,9 +1810,16 @@ fn is_reconnect_transient(err: &ConsumerError) -> bool {
             ConnectionFileError::Io { source, .. } => source.kind() == io::ErrorKind::NotFound,
             _ => false,
         },
-        ConsumerError::NoEndpoint { .. } | ConsumerError::Auth { .. } | ConsumerError::Closed => {
-            false
-        }
+        // Auth failure is transient during reconnect: the daemon rotates its key
+        // on every restart, and with a fixed port a client racing the restart can
+        // read the pre-rotation connection file yet still connect — the proof
+        // mismatch then means "stale key mid-rotation", not "impostor". Each
+        // retry re-reads the connection file (open_connection), so the next
+        // attempt picks up the rotated key, and server-proves-first protects
+        // every attempt. First-connect auth failures stay permanent: connect()
+        // surfaces them directly without entering the reconnect classifier.
+        ConsumerError::Auth { .. } => true,
+        ConsumerError::NoEndpoint { .. } | ConsumerError::Closed => false,
     }
 }
 
@@ -1825,6 +1832,32 @@ impl From<FrameBuildError> for CallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_classifier_treats_auth_failure_as_transient() {
+        // Key rotation across a daemon restart on the fixed port: a client racing
+        // the restart reads the pre-rotation file, connects, and fails the proof.
+        // That must be retryable — each retry re-reads the file, so the next
+        // attempt picks up the rotated key. Treating it as a permanent impostor
+        // verdict would turn every daemon restart into a permanent client wedge.
+        let auth = ConsumerError::Auth {
+            path: PathBuf::from("/tmp/subc-connection.json"),
+            endpoint: "127.0.0.1:8757".to_string(),
+            source: subc_transport::AuthError::InvalidServerProof,
+        };
+        assert!(is_reconnect_transient(&auth), "rotation race must retry");
+
+        // Absent file mid-restart stays transient; malformed file stays permanent.
+        let absent = ConsumerError::ConnectionFile {
+            path: PathBuf::from("/tmp/subc-connection.json"),
+            source: ConnectionFileError::Io {
+                op: "read",
+                path: PathBuf::from("/tmp/subc-connection.json"),
+                source: io::Error::new(io::ErrorKind::NotFound, "gone"),
+            },
+        };
+        assert!(is_reconnect_transient(&absent));
+    }
 
     #[test]
     fn retryable_route_open_codes_are_code_specific() {

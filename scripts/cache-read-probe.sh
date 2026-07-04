@@ -26,15 +26,19 @@ echo "session=$SESSION model=$MODEL turns=$TURNS"
 
 # Turn 1 establishes the prefix; later turns append. Prompts grow the tail
 # without touching earlier turns so the cached prefix stays byte-stable.
+# --cache-role primary opts into the cache policy (an absent cache field means
+# no policy at all, the byte-identity default); primary resolves to the 1h tier
+# for Anthropic per the shipped defaults.
+CACHE_ROLE="${CACHE_PROBE_ROLE:-primary}"
 "$LLMR_SESSION" --subc "$CONN" --project-root "$ROOT" --session "$SESSION" \
   --json-events run --prompt "Turn 1: reply with exactly CACHE-PROBE-T1" \
-  --model "$MODEL" >/dev/null
+  --cache-role "$CACHE_ROLE" --model "$MODEL" >/dev/null
 
 for i in $(seq 2 "$TURNS"); do
   "$LLMR_SESSION" --subc "$CONN" --project-root "$ROOT" --session "$SESSION" \
-    --json-events send --append-episode \
+    --json-events send \
     --prompt "Turn $i: what is $i+$i? Reply with just the number." \
-    --model "$MODEL" >/dev/null
+    --cache-role "$CACHE_ROLE" --model "$MODEL" >/dev/null
   # level-triggered: wait for the run to leave Active before the next send
   for _ in $(seq 1 60); do
     st=$("$LLMR_SESSION" --subc "$CONN" --project-root "$ROOT" --session "$SESSION" \

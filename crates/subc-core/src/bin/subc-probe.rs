@@ -41,7 +41,8 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const USAGE: &str = "usage: subc-probe --subc <connection-file> [--module-id <id>] \
 [--root <path>] [--harness <name>] [--session <id>] [--tool <name>] \
-[--args <json-object>] [--list-only] [--supervisor-restart <module-id>]";
+[--args <json-object>] [--list-only] [--supervisor-restart <module-id>]
+             [--supervisor-disable <module-id>] [--supervisor-enable <module-id>]";
 
 #[tokio::main]
 async fn main() {
@@ -61,6 +62,7 @@ struct ProbeArgs {
     args: Value,
     list_only: bool,
     supervisor_restart: Option<String>,
+    supervisor_set_enabled: Option<(String, bool)>,
 }
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError> {
@@ -102,6 +104,24 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({ "module_id": module_id, "applied": applied }))?
+        );
+        return Ok(());
+    }
+
+    // Operator op: disable/enable a supervised module without a whole-daemon
+    // restart. Disabling drains + stops the process so an offline admin tool can
+    // take the module's single-writer storage lease (e.g. re-importing a stale
+    // vault credential), then re-enable to respawn.
+    if let Some((module_id, enabled)) = &args.supervisor_set_enabled {
+        let applied = supervisor_set_enabled(&mut stream, module_id, *enabled).await?;
+        eprintln!(
+            "[probe] supervisor.set_enabled '{module_id}' enabled={enabled} -> applied={applied}"
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({ "module_id": module_id, "enabled": enabled, "applied": applied })
+            )?
         );
         return Ok(());
     }
@@ -178,6 +198,32 @@ async fn supervisor_restart(stream: &mut TcpStream, module_id: &str) -> Result<b
         FrameType::Error => Err(ProbeError::Rejected(decode_error_body(&response.body))),
         ty => Err(ProbeError::Message(format!(
             "unexpected supervisor.restart frame {ty:?}"
+        ))),
+    }
+}
+
+async fn supervisor_set_enabled(
+    stream: &mut TcpStream,
+    module_id: &str,
+    enabled: bool,
+) -> Result<bool, ProbeError> {
+    let request = ClientControlRequest::SupervisorSetEnabled {
+        module_id: module_id.to_string(),
+        enabled,
+    };
+    let response = control_rpc(stream, serde_json::to_vec(&request)?).await?;
+    match response.header.ty {
+        FrameType::Response => {
+            match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
+                ClientControlResponse::SupervisorAck { applied, .. } => Ok(applied),
+                other => Err(ProbeError::Message(format!(
+                    "unexpected supervisor.set_enabled response: {other:?}"
+                ))),
+            }
+        }
+        FrameType::Error => Err(ProbeError::Rejected(decode_error_body(&response.body))),
+        ty => Err(ProbeError::Message(format!(
+            "unexpected supervisor.set_enabled frame {ty:?}"
         ))),
     }
 }
@@ -374,6 +420,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
     let mut args_value = json!({});
     let mut list_only = false;
     let mut supervisor_restart = None;
+    let mut supervisor_set_enabled = None;
 
     while let Some(arg) = args.next() {
         if arg == OsStr::new("--subc") {
@@ -396,6 +443,10 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
             list_only = true;
         } else if arg == OsStr::new("--supervisor-restart") {
             supervisor_restart = Some(take_str(&mut args, "--supervisor-restart")?);
+        } else if arg == OsStr::new("--supervisor-disable") {
+            supervisor_set_enabled = Some((take_str(&mut args, "--supervisor-disable")?, false));
+        } else if arg == OsStr::new("--supervisor-enable") {
+            supervisor_set_enabled = Some((take_str(&mut args, "--supervisor-enable")?, true));
         } else if arg == OsStr::new("-h") || arg == OsStr::new("--help") {
             return Err(ProbeError::Message(USAGE.into()));
         } else {
@@ -424,6 +475,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
         args: args_value,
         list_only,
         supervisor_restart,
+        supervisor_set_enabled,
     })
 }
 

@@ -42,7 +42,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const USAGE: &str = "usage: subc-probe --subc <connection-file> [--module-id <id>] \
 [--root <path>] [--harness <name>] [--session <id>] [--tool <name>] \
 [--args <json-object>] [--list-only] [--supervisor-restart <module-id>]
-             [--supervisor-disable <module-id>] [--supervisor-enable <module-id>]";
+             [--supervisor-disable <module-id>] [--supervisor-enable <module-id>]
+             [--supervisor-health] [--health-probe <module-id>]";
 
 #[tokio::main]
 async fn main() {
@@ -63,6 +64,8 @@ struct ProbeArgs {
     list_only: bool,
     supervisor_restart: Option<String>,
     supervisor_set_enabled: Option<(String, bool)>,
+    supervisor_health: bool,
+    health_probe: Option<String>,
 }
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError> {
@@ -124,6 +127,53 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
             )?
         );
         return Ok(());
+    }
+
+    // Operator op: read the daemon's aggregated per-module health table (prober
+    // state, last domain reports, last actions) without touching any module.
+    if args.supervisor_health {
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorHealth {})?;
+        let response = control_rpc(&mut stream, body).await?;
+        match response.header.ty {
+            FrameType::Response => {
+                let value: Value = serde_json::from_slice(&response.body)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            FrameType::Error => {
+                return Err(ProbeError::Rejected(decode_error_body(&response.body)))
+            }
+            ty => {
+                return Err(ProbeError::Message(format!(
+                    "unexpected supervisor.health frame {ty:?}"
+                )))
+            }
+        }
+    }
+
+    // Operator op: send ONE health.check to a module right now (independent of
+    // the cadenced prober) and print its report — "is this module wedged?" as a
+    // single command.
+    if let Some(module_id) = &args.health_probe {
+        let request = ClientControlRequest::SupervisorHealthProbe {
+            module_id: module_id.clone(),
+        };
+        let response = control_rpc(&mut stream, serde_json::to_vec(&request)?).await?;
+        match response.header.ty {
+            FrameType::Response => {
+                let value: Value = serde_json::from_slice(&response.body)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            FrameType::Error => {
+                return Err(ProbeError::Rejected(decode_error_body(&response.body)))
+            }
+            ty => {
+                return Err(ProbeError::Message(format!(
+                    "unexpected supervisor.health_probe frame {ty:?}"
+                )))
+            }
+        }
     }
 
     // 2. catalog.list — see what providers + tools are registered.
@@ -421,6 +471,8 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
     let mut list_only = false;
     let mut supervisor_restart = None;
     let mut supervisor_set_enabled = None;
+    let mut supervisor_health = false;
+    let mut health_probe = None;
 
     while let Some(arg) = args.next() {
         if arg == OsStr::new("--subc") {
@@ -447,6 +499,10 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
             supervisor_set_enabled = Some((take_str(&mut args, "--supervisor-disable")?, false));
         } else if arg == OsStr::new("--supervisor-enable") {
             supervisor_set_enabled = Some((take_str(&mut args, "--supervisor-enable")?, true));
+        } else if arg == OsStr::new("--supervisor-health") {
+            supervisor_health = true;
+        } else if arg == OsStr::new("--health-probe") {
+            health_probe = Some(take_str(&mut args, "--health-probe")?);
         } else if arg == OsStr::new("-h") || arg == OsStr::new("--help") {
             return Err(ProbeError::Message(USAGE.into()));
         } else {
@@ -476,6 +532,8 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
         list_only,
         supervisor_restart,
         supervisor_set_enabled,
+        supervisor_health,
+        health_probe,
     })
 }
 

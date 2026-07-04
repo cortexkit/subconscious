@@ -1133,6 +1133,15 @@ fn parse_shim_args(args: impl IntoIterator<Item = OsString>) -> Result<ShimArgs>
             if harness.trim().is_empty() {
                 return Err(invalid_input("--harness must not be empty"));
             }
+            // The shim IS the MCP facade, so every bind it produces is an
+            // mcp-class identity. Providers validate harness against
+            // opencode|pi|runner|mcp:<client> and reject bare tokens with an
+            // opaque config_divergence — auto-prefix so `--harness claude-code`
+            // means what the operator obviously intended. Explicit prefixed
+            // values (and the reserved non-mcp identities) pass through.
+            if !harness.contains(':') && !matches!(harness.as_str(), "opencode" | "pi" | "runner") {
+                harness = format!("mcp:{harness}");
+            }
         } else {
             return Err(invalid_input(format!(
                 "unknown shim argument '{}'.\n{USAGE}",
@@ -3689,6 +3698,29 @@ mod tests {
         effective
     }
 
+    fn shim_args(harness: &str) -> ShimArgs {
+        parse_shim_args(vec![OsString::from("--harness"), OsString::from(harness)]).unwrap()
+    }
+
+    #[test]
+    fn shim_harness_bare_token_gets_mcp_prefix() {
+        assert_eq!(shim_args("claude-code").harness, "mcp:claude-code");
+    }
+
+    #[test]
+    fn shim_harness_prefixed_and_reserved_pass_through() {
+        assert_eq!(shim_args("mcp:codex").harness, "mcp:codex");
+        assert_eq!(shim_args("custom:thing").harness, "custom:thing");
+        assert_eq!(shim_args("opencode").harness, "opencode");
+        assert_eq!(shim_args("pi").harness, "pi");
+        assert_eq!(shim_args("runner").harness, "runner");
+    }
+
+    #[test]
+    fn shim_harness_default_unchanged_when_flag_absent() {
+        let args = parse_shim_args(Vec::<OsString>::new()).unwrap();
+        assert_eq!(args.harness, DEFAULT_HARNESS);
+    }
     #[test]
     fn schema_accepts_legacy_bool_and_object_overrides() {
         let config = compose_test_config(

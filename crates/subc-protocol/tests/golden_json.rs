@@ -7,7 +7,7 @@ use subc_protocol::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
-    session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    session::{HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, Principal, RouteTarget,
     PROTOCOL_VERSION,
 };
@@ -49,6 +49,27 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "module_control_response_route_bind_ack",
         &ModuleControlResponse::RouteBindAck {},
+    );
+    assert_golden(
+        "module_control_request_health_check",
+        &ModuleControlRequest::HealthCheck {},
+    );
+    assert_golden(
+        "module_control_response_health_check",
+        &ModuleControlResponse::HealthCheck {
+            status: HealthStatus::Degraded,
+            detail: Some("warming model".to_string()),
+            metrics: Some(serde_json::json!({"queue_depth": 3})),
+        },
+    );
+    assert_golden(
+        "tool_with_description",
+        &Tool {
+            name: "memory.write".to_string(),
+            description: Some("Persist a memory item".to_string()),
+            execution_mode: ExecutionMode::Mutating,
+            schema: serde_json::json!({"type": "object"}),
+        },
     );
     assert_golden(
         "module_control_push_route_status",
@@ -159,6 +180,7 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "memory.read".to_string(),
+                description: None,
                 execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({"type": "object", "required": ["id"]}),
             }],

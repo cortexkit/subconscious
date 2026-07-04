@@ -882,7 +882,10 @@ async fn open_route(
         target,
         identity,
         ..
-    } = bind;
+    } = bind
+    else {
+        panic!("expected route.bind request, got {bind:?}");
+    };
     assert!(route_target_is_module(&target, module_id));
     assert_eq!(identity.session, session);
 
@@ -910,6 +913,7 @@ fn route_bind_targets_module(frame: &Frame, module_id: &str) -> bool {
         Ok(ModuleControlRequest::RouteBind { target, .. }) => {
             route_target_is_module(&target, module_id)
         }
+        Ok(ModuleControlRequest::HealthCheck {}) => false,
         Err(_) => false,
     }
 }
@@ -997,6 +1001,7 @@ fn tool_provider_manifest(module_id: &str, concurrency: Concurrency) -> ModuleMa
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "read".to_string(),
+                description: None,
                 execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({"type": "object"}),
             }],

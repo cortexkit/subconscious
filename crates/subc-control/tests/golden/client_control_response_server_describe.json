@@ -12,6 +12,7 @@
     "supervisor.list",
     "supervisor.restart",
     "supervisor.reload",
-    "supervisor.set_enabled"
+    "supervisor.set_enabled",
+    "supervisor.health_probe"
   ]
 }

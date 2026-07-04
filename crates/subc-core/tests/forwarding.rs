@@ -23,6 +23,7 @@ use subc_protocol::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
+    session::HealthStatus,
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
@@ -105,6 +106,105 @@ impl Deref for TestServer {
     fn deref(&self) -> &Self::Target {
         &self.daemon
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_health_probe_refuses_old_module_without_sending_health_check() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-old-health";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "old-health").await;
+
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            120,
+            ClientControlRequest::SupervisorHealthProbe {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let frame = read_frame_timeout(&mut client).await;
+    assert_error(&frame, 0, 120, "health_not_advertised");
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event["kind"] == "health_check"
+    })
+    .await;
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_health_probe_carries_degraded_report_verbatim() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-degraded-health";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "degraded-health",
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "degraded"),
+            ("FAKE_AFT_HEALTH_DETAIL", "warming model"),
+            (
+                "FAKE_AFT_HEALTH_METRICS",
+                r#"{"queue_depth":3,"phase":"load"}"#,
+            ),
+        ],
+    )
+    .await;
+
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            121,
+            ClientControlRequest::SupervisorHealthProbe {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let frame = read_frame_timeout(&mut client).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, 121);
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorHealthProbe {
+            module_id: response_module_id,
+            status,
+            detail,
+            metrics,
+        } => {
+            assert_eq!(response_module_id, module_id);
+            assert_eq!(status, HealthStatus::Degraded);
+            assert_eq!(detail.as_deref(), Some("warming model"));
+            assert_eq!(
+                metrics,
+                Some(serde_json::json!({"queue_depth": 3, "phase": "load"}))
+            );
+        }
+        other => panic!("unexpected health response: {other:?}"),
+    }
+    wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "health_check"
+    })
+    .await;
+
+    module.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3891,6 +3991,7 @@ fn tool_provider_manifest(module_id: &str) -> ModuleManifest {
     manifest.provides = vec![ProviderRole::ToolProvider {
         tools: vec![Tool {
             name: "read".to_string(),
+            description: None,
             execution_mode: ExecutionMode::Pure,
             schema: serde_json::json!({"type": "object"}),
         }],

@@ -100,6 +100,7 @@ describe("SubcProvider serve loop", () => {
         connectionFile: connFile,
         manifest,
         handler: async (_routeChannel, body) => body,
+        launchNonce: "",
       });
       await pongSeen;
       await provider.close();
@@ -110,6 +111,97 @@ describe("SubcProvider serve loop", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  test("answers health.check with default ok report", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      opts: { handler: () => Uint8Array; health: () => { status: "ok" } };
+      handleControlRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.opts = {
+      handler: () => new Uint8Array(0),
+      health: () => ({ status: "ok" }),
+    };
+
+    await provider.handleControlRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, CONTROL_FLAGS, 0, 88n, encodeJson({ op: "health.check" })),
+      sock,
+      1,
+    );
+
+    await waitForCondition(() => writes.length === 1, "health response");
+    const response = writes[0]!;
+    expect(response.header.ty).toBe(FrameType.Response);
+    expect(response.header.channel).toBe(0);
+    expect(response.header.corr).toBe(88n);
+    expect(parseJson(response.body)).toEqual({ op: "health.check", status: "ok" });
+  });
+
+  test("health.check waits behind saturated provider request capacity", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const gate = createPermitGate(2);
+    let entered = 0;
+    let releaseHandler!: () => void;
+    const blocked = new Promise<Uint8Array>(() => undefined);
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      requestGate: { acquire(): Promise<() => void> };
+      opts: { handler: () => Promise<Uint8Array>; health: () => { status: "ok" } };
+      handleDataRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+      handleControlRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.requestGate = gate;
+    provider.opts = {
+      handler: async () => {
+        entered += 1;
+        releaseHandler = () => undefined;
+        return await blocked;
+      },
+      health: () => ({ status: "ok" }),
+    };
+
+    void provider.handleDataRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1n, encodeJson({ n: 1 })),
+      sock,
+      1,
+    );
+    void provider.handleDataRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 2n, encodeJson({ n: 2 })),
+      sock,
+      1,
+    );
+    await waitForCondition(() => entered === 2, "saturated handler gate");
+
+    await provider.handleControlRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, CONTROL_FLAGS, 0, 89n, encodeJson({ op: "health.check" })),
+      sock,
+      1,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(writes).toEqual([]);
+    releaseHandler();
+  });
+
 });
 
 describe("SubcProvider managed reconnect", () => {
@@ -150,6 +242,7 @@ describe("SubcProvider managed reconnect", () => {
       encodeJson({ method: "slow" }),
     );
     const handling = provider.handleDataRequest(request, oldSock, 1);
+    await waitForCondition(() => releaseHandler !== undefined, "handler entered");
 
     provider.sock = newSock;
     provider.generation = 2;
@@ -316,7 +409,7 @@ async function runPingPeer(socket: Socket, manifest: ManifestInput, sawPong: () 
   expect(hello.header.corr).toBe(HELLO_CORR);
   expect(hello.header.flags).toBe(CONTROL_FLAGS);
   expect(Buffer.from(hello.body).toString("utf8")).toBe(
-    JSON.stringify({ manifest, protocol_ver: PROTOCOL_VERSION, control_ops: null }),
+    JSON.stringify({ manifest, protocol_ver: PROTOCOL_VERSION, control_ops: ["health.check"] }),
   );
 
   await writeFrame(
@@ -404,6 +497,32 @@ async function writeFrame(socket: Socket, frame: Frame, deadline: number): Promi
 
 function encodeJson(value: unknown): Uint8Array {
   return new Uint8Array(Buffer.from(JSON.stringify(value), "utf8"));
+}
+
+function parseJson(bytes: Uint8Array): unknown {
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function createPermitGate(capacity: number): { acquire(): Promise<() => void> } {
+  let available = capacity;
+  const waiters: Array<() => void> = [];
+  return {
+    async acquire(): Promise<() => void> {
+      if (available > 0) {
+        available -= 1;
+      } else {
+        await new Promise<void>((resolve) => waiters.push(resolve));
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const next = waiters.shift();
+        if (next) next();
+        else available += 1;
+      };
+    },
+  };
 }
 
 async function writeAll(socket: Socket, bytes: Uint8Array, deadline: number): Promise<void> {

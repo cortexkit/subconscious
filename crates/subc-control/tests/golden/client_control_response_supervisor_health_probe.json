@@ -1,0 +1,9 @@
+{
+  "detail": "warming model",
+  "metrics": {
+    "queue_depth": 3
+  },
+  "module_id": "aft-tools",
+  "op": "supervisor.health_probe",
+  "status": "degraded"
+}

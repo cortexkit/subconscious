@@ -8,8 +8,9 @@ use std::{
     },
 };
 
-use subc_protocol::{manifest::Concurrency, ErrorBody};
+use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse, ErrorBody};
 use tokio::sync::{oneshot, Semaphore};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::{registry::ConnectionId, router::FrameSink};
@@ -139,6 +140,31 @@ pub(crate) enum RouteBindRelayOutcome {
     ModuleGone(String),
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingModuleControlRpc {
+    pub endpoint: ModuleEndpointId,
+    pub module_sink: FrameSink,
+    pub negotiated_ver: u8,
+    pub corr: u64,
+    pub receiver: oneshot::Receiver<ModuleControlRpcOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ModuleControlRpcOutcome {
+    Response(ModuleControlResponse),
+    Rejected(ErrorBody),
+    ModuleGone(String),
+    MalformedResponse(String),
+    UnexpectedOp { expected: String, actual: String },
+}
+
+#[derive(Debug)]
+struct PendingModuleControlRpcEntry {
+    expected_op: String,
+    deadline: Instant,
+    sender: oneshot::Sender<ModuleControlRpcOutcome>,
+}
+
 #[derive(Debug, Clone)]
 struct ModuleConnection {
     endpoint: ModuleEndpointId,
@@ -163,6 +189,8 @@ struct ForwardingInner {
     module_to_client: HashMap<ModuleRouteKey, Arc<RouteBinding>>,
     status: HashMap<ClientRouteKey, String>,
     pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<RouteBindRelayOutcome>>,
+    next_control_corr: HashMap<ModuleEndpointId, u64>,
+    pending_control_rpcs: HashMap<(ModuleEndpointId, u64), PendingModuleControlRpcEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +291,7 @@ impl ForwardingTable {
             .module_id_by_endpoint
             .insert(endpoint, module_id.clone());
         inner.next_module_channel.insert(endpoint, 1);
+        inner.next_control_corr.insert(endpoint, 1);
         if inner.next_relay_corr == 0 {
             inner.next_relay_corr = 1;
         }
@@ -284,6 +313,43 @@ impl ForwardingTable {
         module_id: &str,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         self.begin_route_bind_relay_inner(client_connection_id, module_id)
+    }
+
+    pub(crate) fn begin_module_control_rpc_for(
+        &self,
+        module_id: &str,
+        expected_op: &str,
+        deadline: Instant,
+    ) -> Result<PendingModuleControlRpc, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        let module = inner
+            .modules_by_id
+            .get(module_id)
+            .cloned()
+            .ok_or(ForwardingError::NoModuleConnection)?;
+        if inner.draining_endpoints.contains(&module.endpoint) {
+            return Err(ForwardingError::ModuleReloading {
+                module_id: module_id.to_string(),
+            });
+        }
+        let corr = inner.allocate_control_corr(module.endpoint)?;
+        let (sender, receiver) = oneshot::channel();
+        inner.pending_control_rpcs.insert(
+            (module.endpoint, corr),
+            PendingModuleControlRpcEntry {
+                expected_op: expected_op.to_string(),
+                deadline,
+                sender,
+            },
+        );
+
+        Ok(PendingModuleControlRpc {
+            endpoint: module.endpoint,
+            module_sink: module.sink,
+            negotiated_ver: module.negotiated_ver,
+            corr,
+            receiver,
+        })
     }
 
     fn begin_route_bind_relay_inner(
@@ -461,6 +527,17 @@ impl ForwardingTable {
         Ok(())
     }
 
+    pub(crate) fn cancel_module_control_rpc(
+        &self,
+        endpoint: ModuleEndpointId,
+        corr: u64,
+    ) -> Result<(), ForwardingError> {
+        self.write_inner()?
+            .pending_control_rpcs
+            .remove(&(endpoint, corr));
+        Ok(())
+    }
+
     pub(crate) fn complete_pending_relay(
         &self,
         connection_id: ConnectionId,
@@ -475,6 +552,49 @@ impl ForwardingTable {
             return Ok(false);
         };
         let _ = sender.send(outcome);
+        Ok(true)
+    }
+
+    pub(crate) fn pending_module_control_op(
+        &self,
+        connection_id: ConnectionId,
+        corr: u64,
+    ) -> Result<Option<String>, ForwardingError> {
+        let inner = self.read_inner()?;
+        let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
+            return Ok(None);
+        };
+        Ok(inner
+            .pending_control_rpcs
+            .get(&(endpoint, corr))
+            .map(|pending| pending.expected_op.clone()))
+    }
+
+    pub(crate) fn complete_module_control_rpc(
+        &self,
+        connection_id: ConnectionId,
+        corr: u64,
+        actual_op: Option<&str>,
+        outcome: ModuleControlRpcOutcome,
+    ) -> Result<bool, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
+            return Ok(false);
+        };
+        let Some(pending) = inner.pending_control_rpcs.remove(&(endpoint, corr)) else {
+            return Ok(false);
+        };
+        let _deadline = pending.deadline;
+        let outcome = match actual_op {
+            Some(actual) if actual != pending.expected_op => {
+                ModuleControlRpcOutcome::UnexpectedOp {
+                    expected: pending.expected_op,
+                    actual: actual.to_string(),
+                }
+            }
+            _ => outcome,
+        };
+        let _ = pending.sender.send(outcome);
         Ok(true)
     }
 
@@ -889,11 +1009,41 @@ impl ForwardingInner {
             if candidate == 0 {
                 candidate = 1;
             }
-            if !self.pending_relays.contains_key(&(endpoint, candidate)) {
+            if !self.pending_relays.contains_key(&(endpoint, candidate))
+                && !self
+                    .pending_control_rpcs
+                    .contains_key(&(endpoint, candidate))
+            {
                 self.next_relay_corr = candidate.wrapping_add(1);
                 if self.next_relay_corr == 0 {
                     self.next_relay_corr = 1;
                 }
+                return Ok(candidate);
+            }
+            candidate = candidate.wrapping_add(1);
+        }
+        Err(ForwardingError::RelayCorrelationExhausted)
+    }
+
+    fn allocate_control_corr(
+        &mut self,
+        endpoint: ModuleEndpointId,
+    ) -> Result<u64, ForwardingError> {
+        let mut candidate = self.next_control_corr.get(&endpoint).copied().unwrap_or(1);
+        for _ in 0..u64::MAX {
+            if candidate == 0 {
+                candidate = 1;
+            }
+            if !self.pending_relays.contains_key(&(endpoint, candidate))
+                && !self
+                    .pending_control_rpcs
+                    .contains_key(&(endpoint, candidate))
+            {
+                let mut next = candidate.wrapping_add(1);
+                if next == 0 {
+                    next = 1;
+                }
+                self.next_control_corr.insert(endpoint, next);
                 return Ok(candidate);
             }
             candidate = candidate.wrapping_add(1);
@@ -981,6 +1131,7 @@ fn remove_module_connection_locked(
     }
     inner.endpoint_by_connection.remove(&endpoint.connection_id);
     inner.next_module_channel.remove(&endpoint);
+    inner.next_control_corr.remove(&endpoint);
     let reserved_module_keys: Vec<ModuleRouteKey> = inner
         .reserved_module
         .keys()
@@ -1008,6 +1159,25 @@ fn remove_module_connection_locked(
         let _ = sender.send(RouteBindRelayOutcome::ModuleGone(format!(
             "module '{module_label}' connection closed during route.bind relay"
         )));
+    }
+
+    let pending_control_keys: Vec<_> = inner
+        .pending_control_rpcs
+        .keys()
+        .filter(|(pending_endpoint, _)| *pending_endpoint == endpoint)
+        .copied()
+        .collect();
+    let pending_control: Vec<_> = pending_control_keys
+        .into_iter()
+        .filter_map(|key| inner.pending_control_rpcs.remove(&key))
+        .collect();
+    for pending in pending_control {
+        let module_label = module_id.as_deref().unwrap_or("unknown");
+        let _ = pending
+            .sender
+            .send(ModuleControlRpcOutcome::ModuleGone(format!(
+                "module '{module_label}' connection closed during module-control RPC"
+            )));
     }
 
     let module_keys: Vec<ModuleRouteKey> = inner

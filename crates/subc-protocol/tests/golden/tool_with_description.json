@@ -1,0 +1,8 @@
+{
+  "description": "Persist a memory item",
+  "execution_mode": "mutating",
+  "name": "memory.write",
+  "schema": {
+    "type": "object"
+  }
+}

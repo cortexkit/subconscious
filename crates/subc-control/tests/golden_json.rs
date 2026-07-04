@@ -12,6 +12,7 @@ use subc_protocol::{
         ManagementOperationKind, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
         PipelineStageKind, ProviderRole, Tool,
     },
+    session::HealthStatus,
     BindIdentity, RouteTarget, PROTOCOL_VERSION,
 };
 
@@ -120,6 +121,12 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 enabled: false,
             },
         ),
+        (
+            "client_control_request_supervisor_health_probe",
+            ClientControlRequest::SupervisorHealthProbe {
+                module_id: "aft-tools".to_string(),
+            },
+        ),
     ]
 }
 
@@ -166,6 +173,15 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 applied: true,
             },
         ),
+        (
+            "client_control_response_supervisor_health_probe",
+            ClientControlResponse::SupervisorHealthProbe {
+                module_id: "aft-tools".to_string(),
+                status: HealthStatus::Degraded,
+                detail: Some("warming model".to_string()),
+                metrics: Some(serde_json::json!({"queue_depth": 3})),
+            },
+        ),
     ]
 }
 
@@ -179,6 +195,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.restart".to_string(),
         "supervisor.reload".to_string(),
         "supervisor.set_enabled".to_string(),
+        "supervisor.health_probe".to_string(),
     ]
 }
 
@@ -212,6 +229,7 @@ fn provider_roles() -> Vec<ProviderRole> {
         ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "memory.read".to_string(),
+                description: None,
                 execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({"type": "object", "required": ["id"]}),
             }],

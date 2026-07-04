@@ -1958,6 +1958,7 @@ fn search_meta_tools() -> Vec<ExposedTool> {
         ExposedTool {
             manifest: ManifestTool {
                 name: TOOLS_SEARCH_NAME.to_owned(),
+                description: None,
                 execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({
                     "type": "object",
@@ -1974,6 +1975,7 @@ fn search_meta_tools() -> Vec<ExposedTool> {
         ExposedTool {
             manifest: ManifestTool {
                 name: TOOLS_INVOKE_NAME.to_owned(),
+                description: None,
                 execution_mode: ExecutionMode::Unfenceable,
                 schema: serde_json::json!({
                     "type": "object",

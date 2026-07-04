@@ -90,6 +90,8 @@ pub enum ExecutionMode {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Tool {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// How the tool's side effects are fenced for durable at-most-once handling.
     /// Observability + durability metadata only; subc's thin core never acts on
     /// this for routing, scheduling, or concurrency — the module's declared
@@ -279,36 +281,43 @@ mod tests {
                 tools: vec![
                     Tool {
                         name: "read".to_string(),
+                        description: None,
                         execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "grep".to_string(),
+                        description: None,
                         execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "outline".to_string(),
+                        description: None,
                         execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "semantic_search".to_string(),
+                        description: None,
                         execution_mode: ExecutionMode::Pure,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "edit".to_string(),
+                        description: None,
                         execution_mode: ExecutionMode::Mutating,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "write".to_string(),
+                        description: None,
                         execution_mode: ExecutionMode::Mutating,
                         schema: json!({"type": "object"}),
                     },
                     Tool {
                         name: "bash".to_string(),
+                        description: None,
                         execution_mode: ExecutionMode::Unfenceable,
                         schema: json!({"type": "object"}),
                     },

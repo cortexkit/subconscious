@@ -27,7 +27,12 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(10);
+// Sized against the daemon's route.bind relay timeout (12s default): one
+// load-stalled bind relay burns ~12s before the daemon rejects with
+// module_timeout, so a 10s budget could be exhausted by a SINGLE slow bind.
+// 30s leaves room for ~2 full relay waits plus backoff (still clamped by the
+// overall call timeout below).
+const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const DEFAULT_RESTORED_DEBOUNCE: Duration = Duration::from_millis(250);
 const EGRESS_BUFFER: usize = 128;
 const DEFAULT_ROUTE_WINDOW: usize = 1024;

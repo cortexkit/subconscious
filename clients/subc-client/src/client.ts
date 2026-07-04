@@ -63,7 +63,12 @@ const DEADLINE_NO_DROP_CODE = "deadline_exceeded_no_drop_observed";
 // before it is surfaced as not_sent. Mirrors subc-client-rs
 // DEFAULT_ROUTE_RETRY_DEADLINE so a target that is briefly unavailable at daemon
 // restart recovers without a misleading terminal error.
-const ROUTE_OPEN_RETRY_DEADLINE_MS = 10_000;
+// Sized against the daemon's route.bind relay timeout (12s default): a single
+// load-stalled bind relay consumes ~12s of this budget before the daemon even
+// rejects with module_timeout, so the deadline must leave room for MULTIPLE
+// full relay waits or one slow bind exhausts the whole retry clock. 30s allows
+// ~2 full relay timeouts plus backoff before surfacing not_sent.
+const ROUTE_OPEN_RETRY_DEADLINE_MS = 30_000;
 // Once a header arrives, its body must follow promptly; bound it so a truncated
 // frame cannot wedge the read loop forever.
 const BODY_READ_TIMEOUT_MS = 30_000;

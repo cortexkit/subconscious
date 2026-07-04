@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use rmcp::{
@@ -27,7 +27,10 @@ use rmcp::{
     transport::async_rw::AsyncRwTransport,
     RoleServer, ServerHandler,
 };
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{
+    de::{self, DeserializeOwned},
+    Deserialize, Deserializer, Serialize,
+};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::{
@@ -66,6 +69,9 @@ const PROJECT_MCP_CONFIG_RELATIVE_PATH: &str = ".cortexkit/mcp.jsonc";
 const REVERSE_RELAY_PENDING_PER_SESSION: usize = 8;
 const DEFAULT_REVERSE_RELAY_TTL: Duration = Duration::from_secs(10 * 60);
 const REVERSE_RELAY_TTL_MS_ENV: &str = "SUBC_MCP_REVERSE_RELAY_TTL_MS";
+const TOOLS_SEARCH_NAME: &str = "tools_search";
+const TOOLS_INVOKE_NAME: &str = "tools_invoke";
+const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 
 const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [--harness <name>]\n  subc-mcp module --subc <subc-connection-file> [--connection-file <path>]";
 
@@ -711,8 +717,50 @@ struct CatalogSnapshot {
     modules: Vec<CatalogEntry>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SurfaceMode {
+    #[default]
+    Full,
+    Search,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RefreshMode {
+    #[default]
+    OnAttach,
+    Immediate,
+}
+
+impl<'de> Deserialize<'de> for RefreshMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "on-attach" => Ok(Self::OnAttach),
+            "immediate" => Ok(Self::Immediate),
+            "on-hard" | "on-soft" => Err(de::Error::custom(
+                "refresh value requires a bust-signal source; not available on the MCP path",
+            )),
+            other => Err(de::Error::unknown_variant(
+                other,
+                &["on-attach", "immediate"],
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExposedTool {
+    manifest: ManifestTool,
+    description: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct GatewayConfig {
+    surface_mode: SurfaceMode,
+    refresh: RefreshMode,
     providers: HashMap<String, ProviderConfig>,
 }
 
@@ -723,29 +771,50 @@ struct ProviderConfig {
     tools: ToolConfig,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ToolConfig {
     default_enabled: Option<bool>,
-    overrides: HashMap<String, bool>,
+    overrides: HashMap<String, ToolOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ToolOverride {
+    enabled: Option<bool>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFileState {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFileSnapshot {
+    user: ConfigFileState,
+    project: ConfigFileState,
 }
 
 #[derive(Debug, Clone)]
 struct ConfigSnapshot {
     effective: GatewayConfig,
+    files: ConfigFileSnapshot,
 }
 
 #[derive(Debug)]
 struct SessionState {
-    config: ConfigSnapshot,
+    config: RwLock<ConfigSnapshot>,
     identity: BindIdentity,
     inner: RwLock<SessionInner>,
 }
 
 #[derive(Debug, Clone)]
 struct SessionInner {
+    surface_mode: SurfaceMode,
     catalog_generation: u64,
     routes: HashMap<String, u16>,
-    tools: Vec<ManifestTool>,
+    tools: Vec<ExposedTool>,
     bindings: HashMap<String, ToolBinding>,
 }
 
@@ -770,17 +839,51 @@ struct DesiredProvider {
 #[derive(Debug, Clone)]
 struct DesiredTool {
     bare_tool: ManifestTool,
-    exposed_tool: ManifestTool,
+    exposed_tool: ExposedTool,
+}
+
+#[derive(Debug, Default)]
+struct RawGatewayLayer {
+    surface_mode: MaybeSet<SurfaceMode>,
+    refresh: MaybeSet<RefreshMode>,
+    providers: HashMap<String, RawProviderConfig>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawGatewayConfig {
     version: u8,
+    #[serde(
+        default,
+        rename = "surfaceMode",
+        deserialize_with = "deserialize_maybe_set"
+    )]
+    surface_mode: MaybeSet<SurfaceMode>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    refresh: MaybeSet<RefreshMode>,
+    #[serde(default)]
+    providers: HashMap<String, RawProviderConfig>,
+    #[serde(default)]
+    harness: HashMap<String, RawGatewayOverlayConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawGatewayOverlayConfig {
+    #[serde(
+        default,
+        rename = "surfaceMode",
+        deserialize_with = "deserialize_maybe_set"
+    )]
+    surface_mode: MaybeSet<SurfaceMode>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    refresh: MaybeSet<RefreshMode>,
     #[serde(default)]
     providers: HashMap<String, RawProviderConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawProviderConfig {
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     enabled: MaybeSet<bool>,
@@ -791,6 +894,7 @@ struct RawProviderConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawToolConfig {
     #[serde(
         default,
@@ -799,7 +903,42 @@ struct RawToolConfig {
     )]
     default_enabled: MaybeSet<bool>,
     #[serde(default)]
-    overrides: HashMap<String, Option<bool>>,
+    overrides: HashMap<String, RawToolOverrideValue>,
+}
+
+#[derive(Debug)]
+enum RawToolOverrideValue {
+    Object(RawToolOverrideObject),
+    Bool(bool),
+    Null(()),
+}
+
+impl<'de> Deserialize<'de> for RawToolOverrideValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Null(())),
+            serde_json::Value::Bool(enabled) => Ok(Self::Bool(enabled)),
+            serde_json::Value::Object(_) => serde_json::from_value(value)
+                .map(Self::Object)
+                .map_err(de::Error::custom),
+            other => Err(de::Error::custom(format!(
+                "tool override must be bool, null, or object, got {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawToolOverrideObject {
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    enabled: MaybeSet<bool>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    description: MaybeSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1338,7 +1477,7 @@ async fn handle_shim_connection(
 }
 
 async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<AttachedSession> {
-    let config = read_gateway_config(&hello.project_root)?;
+    let config = read_gateway_config(&hello.project_root, &hello.harness)?;
     let catalog = catalog_list(subc).await?;
     let desired = desired_session_from_catalog(&config.effective, &catalog.modules)?;
     let identity = BindIdentity {
@@ -1367,7 +1506,12 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
     }
 
     let opened_routes = routes.values().copied().collect::<Vec<_>>();
-    let inner = match session_inner_from_desired(catalog.generation, desired, routes) {
+    let inner = match session_inner_from_desired(
+        catalog.generation,
+        desired,
+        routes,
+        config.effective.surface_mode,
+    ) {
         Ok(inner) => inner,
         Err(error) => {
             subc.relay().unregister_session_routes(&relay_session).await;
@@ -1528,6 +1672,11 @@ fn desired_session_from_catalog(
             }
 
             let exposed_name = format!("{namespace}_{}", tool.name);
+            if is_reserved_meta_tool_name(&exposed_name) {
+                return Err(other_error(format!(
+                    "MCP tool name collision for reserved exposed name '{exposed_name}'"
+                )));
+            }
             if let Some((other_module, other_bare)) = exposed_names.insert(
                 exposed_name.clone(),
                 (entry.module_id.clone(), tool.name.clone()),
@@ -1538,12 +1687,22 @@ fn desired_session_from_catalog(
                 )));
             }
 
-            let mut exposed_tool = tool.clone();
-            exposed_tool.name = exposed_name;
+            let description = config
+                .tool_description(&entry.module_id, &tool.name)
+                .unwrap_or_else(|| default_tool_description(&exposed_name));
+            let mut exposed_manifest = tool.clone();
+            exposed_manifest.name = exposed_name;
             tools.push(DesiredTool {
                 bare_tool: tool,
-                exposed_tool,
+                exposed_tool: ExposedTool {
+                    manifest: exposed_manifest,
+                    description,
+                },
             });
+        }
+
+        if tools.is_empty() {
+            continue;
         }
 
         providers.push(DesiredProvider {
@@ -1559,6 +1718,7 @@ fn session_inner_from_desired(
     catalog_generation: u64,
     desired: DesiredSession,
     routes: HashMap<String, u16>,
+    surface_mode: SurfaceMode,
 ) -> Result<SessionInner> {
     let mut tools = Vec::new();
     let mut bindings = HashMap::new();
@@ -1571,7 +1731,7 @@ fn session_inner_from_desired(
             ))
         })?;
         for desired_tool in provider.tools {
-            let exposed_name = desired_tool.exposed_tool.name.clone();
+            let exposed_name = desired_tool.exposed_tool.manifest.name.clone();
             bindings.insert(
                 exposed_name.clone(),
                 ToolBinding {
@@ -1584,8 +1744,9 @@ fn session_inner_from_desired(
         }
     }
 
-    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools.sort_by(|left, right| left.manifest.name.cmp(&right.manifest.name));
     Ok(SessionInner {
+        surface_mode,
         catalog_generation,
         routes,
         tools,
@@ -1594,6 +1755,20 @@ fn session_inner_from_desired(
 }
 
 impl SessionState {
+    fn read_config(&self) -> RwLockReadGuard<'_, ConfigSnapshot> {
+        self.config.read().unwrap_or_else(|poisoned| {
+            eprintln!("subc-mcp module: warning: recovering from poisoned config read lock");
+            poisoned.into_inner()
+        })
+    }
+
+    fn write_config(&self) -> RwLockWriteGuard<'_, ConfigSnapshot> {
+        self.config.write().unwrap_or_else(|poisoned| {
+            eprintln!("subc-mcp module: warning: recovering from poisoned config write lock");
+            poisoned.into_inner()
+        })
+    }
+
     fn read_inner(&self) -> RwLockReadGuard<'_, SessionInner> {
         self.inner.read().unwrap_or_else(|poisoned| {
             eprintln!("subc-mcp module: warning: recovering from poisoned session-state read lock");
@@ -1612,26 +1787,58 @@ impl SessionState {
 
     fn new(config: ConfigSnapshot, identity: BindIdentity, inner: SessionInner) -> Self {
         Self {
-            config,
+            config: RwLock::new(config),
             identity,
             inner: RwLock::new(inner),
         }
     }
 
-    fn exposed_tools(&self) -> Vec<ManifestTool> {
+    fn config_snapshot(&self) -> ConfigSnapshot {
+        self.read_config().clone()
+    }
+
+    fn replace_config(&self, next: ConfigSnapshot) {
+        *self.write_config() = next;
+    }
+
+    fn exposed_tools(&self) -> Vec<ExposedTool> {
+        let inner = self.read_inner();
+        match inner.surface_mode {
+            SurfaceMode::Full => inner.tools.clone(),
+            SurfaceMode::Search => search_meta_tools(),
+        }
+    }
+
+    fn resolved_tools(&self) -> Vec<ExposedTool> {
         self.read_inner().tools.clone()
     }
 
-    fn get_tool(&self, name: &str) -> Option<ManifestTool> {
-        self.read_inner()
-            .tools
-            .iter()
-            .find(|tool| tool.name == name)
-            .cloned()
+    fn get_tool(&self, name: &str) -> Option<ExposedTool> {
+        let inner = self.read_inner();
+        match inner.surface_mode {
+            SurfaceMode::Full => inner
+                .tools
+                .iter()
+                .find(|tool| tool.manifest.name == name)
+                .cloned(),
+            SurfaceMode::Search => meta_tool(name),
+        }
     }
 
-    fn binding(&self, name: &str) -> Option<ToolBinding> {
+    fn direct_binding(&self, name: &str) -> Option<ToolBinding> {
+        let inner = self.read_inner();
+        match inner.surface_mode {
+            SurfaceMode::Full => inner.bindings.get(name).cloned(),
+            SurfaceMode::Search => None,
+        }
+    }
+
+    fn private_binding(&self, name: &str) -> Option<ToolBinding> {
         self.read_inner().bindings.get(name).cloned()
+    }
+
+    fn surface_mode(&self) -> SurfaceMode {
+        self.read_inner().surface_mode
     }
 
     fn route_channels(&self) -> Vec<u16> {
@@ -1674,19 +1881,33 @@ impl SessionState {
             .bindings
             .retain(|_, binding| !removed_modules.contains(&binding.module_id));
         let live_names = inner.bindings.keys().cloned().collect::<HashSet<_>>();
-        inner.tools.retain(|tool| live_names.contains(&tool.name));
+        inner
+            .tools
+            .retain(|tool| live_names.contains(&tool.manifest.name));
         old_tools != inner.tools
     }
 
     fn replace_inner(&self, next: SessionInner) -> bool {
         let mut inner = self.write_inner();
-        let changed = inner.tools != next.tools;
+        let changed = inner.surface_mode != next.surface_mode || inner.tools != next.tools;
         *inner = next;
         changed
     }
 }
 
 impl GatewayConfig {
+    fn facade_default() -> Self {
+        let mut config = Self::default();
+        for module_id in FACADE_DEFAULT_DISABLED {
+            config
+                .providers
+                .entry((*module_id).to_owned())
+                .or_default()
+                .enabled = Some(false);
+        }
+        config
+    }
+
     fn provider_enabled(&self, module_id: &str) -> bool {
         self.providers
             .get(module_id)
@@ -1709,9 +1930,70 @@ impl GatewayConfig {
             .tools
             .overrides
             .get(tool_name)
-            .copied()
+            .and_then(|override_config| override_config.enabled)
             .unwrap_or_else(|| provider.tools.default_enabled.unwrap_or(true))
     }
+
+    fn tool_description(&self, module_id: &str, tool_name: &str) -> Option<String> {
+        self.providers
+            .get(module_id)?
+            .tools
+            .overrides
+            .get(tool_name)?
+            .description
+            .clone()
+    }
+}
+
+fn default_tool_description(name: &str) -> String {
+    format!("subc tool {name}")
+}
+
+fn is_reserved_meta_tool_name(name: &str) -> bool {
+    matches!(name, TOOLS_SEARCH_NAME | TOOLS_INVOKE_NAME)
+}
+
+fn search_meta_tools() -> Vec<ExposedTool> {
+    vec![
+        ExposedTool {
+            manifest: ManifestTool {
+                name: TOOLS_SEARCH_NAME.to_owned(),
+                execution_mode: ExecutionMode::Pure,
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            },
+            description: "Search the policy-enabled live subc tool catalog".to_owned(),
+        },
+        ExposedTool {
+            manifest: ManifestTool {
+                name: TOOLS_INVOKE_NAME.to_owned(),
+                execution_mode: ExecutionMode::Unfenceable,
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "arguments": { "type": "object" }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+            },
+            description: "Invoke a policy-enabled live subc tool by name".to_owned(),
+        },
+    ]
+}
+
+fn meta_tool(name: &str) -> Option<ExposedTool> {
+    search_meta_tools()
+        .into_iter()
+        .find(|tool| tool.manifest.name == name)
 }
 
 fn validate_mcp_name_component(kind: &str, value: &str) -> std::result::Result<(), String> {
@@ -1730,32 +2012,81 @@ fn validate_mcp_name_component(kind: &str, value: &str) -> std::result::Result<(
     }
 }
 
-fn read_gateway_config(project_root: &Path) -> Result<ConfigSnapshot> {
-    let mut effective = GatewayConfig::default();
-    let config_files = [
-        ("user", user_mcp_config_path()),
-        (
-            "project",
-            project_root.join(PROJECT_MCP_CONFIG_RELATIVE_PATH),
-        ),
-    ];
+fn read_gateway_config(project_root: &Path, harness_name: &str) -> Result<ConfigSnapshot> {
+    let mut effective = GatewayConfig::facade_default();
+    let user_path = user_mcp_config_path();
+    let project_path = project_root.join(PROJECT_MCP_CONFIG_RELATIVE_PATH);
 
-    for (tier, path) in config_files {
-        let doc = match fs::read_to_string(&path) {
-            Ok(doc) => doc,
-            Err(err) if err.kind() == stdio::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(other_error(format!(
-                    "failed to read {tier} MCP config {}: {err}",
-                    path.display()
-                )))
-            }
-        };
-        let raw = parse_gateway_config_doc(&doc, &path)?;
-        merge_gateway_config(&mut effective, raw);
+    if let Some(raw) = read_raw_gateway_config("user", &user_path)? {
+        let (top_level, harness_layers) = raw.into_parts();
+        merge_gateway_config(&mut effective, top_level);
+        for harness_layer in matching_harness_layers(harness_layers, harness_name) {
+            merge_gateway_config(&mut effective, harness_layer);
+        }
     }
 
-    Ok(ConfigSnapshot { effective })
+    if let Some(raw) = read_raw_gateway_config("project", &project_path)? {
+        let (top_level, harness_layers) = raw.into_parts();
+        merge_project_gateway_config(&mut effective, top_level);
+        for harness_layer in matching_harness_layers(harness_layers, harness_name) {
+            merge_project_gateway_config(&mut effective, harness_layer);
+        }
+    }
+
+    Ok(ConfigSnapshot {
+        effective,
+        files: gateway_config_file_snapshot(user_path, project_path)?,
+    })
+}
+
+fn read_raw_gateway_config(tier: &str, path: &Path) -> Result<Option<RawGatewayConfig>> {
+    let doc = match fs::read_to_string(path) {
+        Ok(doc) => doc,
+        Err(err) if err.kind() == stdio::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(other_error(format!(
+                "failed to read {tier} MCP config {}: {err}",
+                path.display()
+            )))
+        }
+    };
+    parse_gateway_config_doc(&doc, path).map(Some)
+}
+
+fn gateway_config_file_snapshot(
+    user_path: PathBuf,
+    project_path: PathBuf,
+) -> Result<ConfigFileSnapshot> {
+    Ok(ConfigFileSnapshot {
+        user: config_file_state(user_path)?,
+        project: config_file_state(project_path)?,
+    })
+}
+
+fn config_file_state(path: PathBuf) -> Result<ConfigFileState> {
+    match fs::metadata(&path) {
+        Ok(metadata) => Ok(ConfigFileState {
+            path,
+            modified: metadata.modified().ok(),
+            len: Some(metadata.len()),
+        }),
+        Err(err) if err.kind() == stdio::ErrorKind::NotFound => Ok(ConfigFileState {
+            path,
+            modified: None,
+            len: None,
+        }),
+        Err(err) => Err(other_error(format!(
+            "failed to stat MCP config {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn config_files_changed(snapshot: &ConfigSnapshot) -> Result<bool> {
+    Ok(gateway_config_file_snapshot(
+        snapshot.files.user.path.clone(),
+        snapshot.files.project.path.clone(),
+    )? != snapshot.files)
 }
 
 fn user_mcp_config_path() -> PathBuf {
@@ -1787,10 +2118,106 @@ fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> 
             raw.version
         )));
     }
+    validate_raw_gateway_config(&raw, path)?;
     Ok(raw)
 }
 
-fn merge_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayConfig) {
+fn validate_raw_gateway_config(raw: &RawGatewayConfig, path: &Path) -> Result<()> {
+    validate_raw_providers(&raw.providers, path, "providers")?;
+    for (harness_name, harness) in &raw.harness {
+        validate_raw_providers(
+            &harness.providers,
+            path,
+            &format!("harness.{harness_name}.providers"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_raw_providers(
+    providers: &HashMap<String, RawProviderConfig>,
+    path: &Path,
+    prefix: &str,
+) -> Result<()> {
+    for (module_id, provider) in providers {
+        if let MaybeSet::Value(tools) = &provider.tools {
+            validate_raw_tool_config(tools, path, &format!("{prefix}.{module_id}.tools"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_raw_tool_config(tools: &RawToolConfig, path: &Path, prefix: &str) -> Result<()> {
+    for (tool_name, override_value) in &tools.overrides {
+        if let RawToolOverrideValue::Object(object) = override_value {
+            if matches!(object.enabled, MaybeSet::Null) {
+                return Err(other_error(format!(
+                    "invalid MCP config {}: {prefix}.overrides.{tool_name}.enabled must be omitted instead of null; use null for the whole override entry to delete it",
+                    path.display()
+                )));
+            }
+            if matches!(object.description, MaybeSet::Null) {
+                return Err(other_error(format!(
+                    "invalid MCP config {}: {prefix}.overrides.{tool_name}.description must be omitted instead of null",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl RawGatewayConfig {
+    fn into_parts(self) -> (RawGatewayLayer, HashMap<String, RawGatewayOverlayConfig>) {
+        (
+            RawGatewayLayer {
+                surface_mode: self.surface_mode,
+                refresh: self.refresh,
+                providers: self.providers,
+            },
+            self.harness,
+        )
+    }
+}
+
+impl From<RawGatewayOverlayConfig> for RawGatewayLayer {
+    fn from(raw: RawGatewayOverlayConfig) -> Self {
+        Self {
+            surface_mode: raw.surface_mode,
+            refresh: raw.refresh,
+            providers: raw.providers,
+        }
+    }
+}
+
+fn matching_harness_layers(
+    harness_layers: HashMap<String, RawGatewayOverlayConfig>,
+    harness_name: &str,
+) -> Vec<RawGatewayLayer> {
+    let wanted = harness_name.to_ascii_lowercase();
+    let mut matches = harness_layers
+        .into_iter()
+        .filter(|(name, _)| name.to_ascii_lowercase() == wanted)
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left, _), (right, _)| left.cmp(right));
+    matches
+        .into_iter()
+        .map(|(_, layer)| RawGatewayLayer::from(layer))
+        .collect()
+}
+
+fn merge_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLayer) {
+    match raw.surface_mode {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.surface_mode = SurfaceMode::Full,
+        MaybeSet::Value(surface_mode) => effective.surface_mode = surface_mode,
+    }
+    match raw.refresh {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.refresh = RefreshMode::OnAttach,
+        MaybeSet::Value(refresh) => effective.refresh = refresh,
+    }
+
     for (module_id, raw_provider) in raw.providers {
         let provider = effective.providers.entry(module_id).or_default();
         match raw_provider.enabled {
@@ -1811,6 +2238,75 @@ fn merge_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayConfig) {
     }
 }
 
+fn merge_project_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLayer) {
+    match raw.surface_mode {
+        MaybeSet::Missing => {}
+        MaybeSet::Value(SurfaceMode::Search) => effective.surface_mode = SurfaceMode::Search,
+        MaybeSet::Value(SurfaceMode::Full) | MaybeSet::Null => {
+            if effective.surface_mode == SurfaceMode::Search {
+                warn_project_drop(
+                    "surfaceMode",
+                    "project MCP config cannot widen a search surface back to full",
+                );
+            }
+        }
+    }
+    if !matches!(raw.refresh, MaybeSet::Missing) {
+        warn_project_drop(
+            "refresh",
+            "project MCP config cannot weaken user-chosen refresh latency",
+        );
+    }
+
+    for (module_id, raw_provider) in raw.providers {
+        let baseline = effective.clone();
+        {
+            let provider = effective.providers.entry(module_id.clone()).or_default();
+            match raw_provider.enabled {
+                MaybeSet::Missing => {}
+                MaybeSet::Value(false) => provider.enabled = Some(false),
+                MaybeSet::Value(true) => {
+                    if baseline.provider_enabled(&module_id) {
+                        provider.enabled = Some(true);
+                    } else {
+                        warn_project_drop(
+                            &format!("providers.{module_id}.enabled"),
+                            "project MCP config cannot enable a provider disabled by the user baseline",
+                        );
+                    }
+                }
+                MaybeSet::Null => {
+                    if baseline.provider_enabled(&module_id) {
+                        provider.enabled = None;
+                    } else {
+                        warn_project_drop(
+                            &format!("providers.{module_id}.enabled"),
+                            "project MCP config cannot delete a provider deny from the user baseline",
+                        );
+                    }
+                }
+            }
+            if !matches!(raw_provider.namespace, MaybeSet::Missing) {
+                warn_project_drop(
+                    &format!("providers.{module_id}.namespace"),
+                    "project MCP config cannot rename model-facing tool identities",
+                );
+            }
+        }
+
+        match raw_provider.tools {
+            MaybeSet::Missing => {}
+            MaybeSet::Null => warn_project_drop(
+                &format!("providers.{module_id}.tools"),
+                "project MCP config cannot reset inherited tool policy",
+            ),
+            MaybeSet::Value(tools) => {
+                merge_project_tool_config(effective, &baseline, &module_id, tools);
+            }
+        }
+    }
+}
+
 fn merge_tool_config(effective: &mut ToolConfig, raw: RawToolConfig) {
     match raw.default_enabled {
         MaybeSet::Missing => {}
@@ -1819,14 +2315,140 @@ fn merge_tool_config(effective: &mut ToolConfig, raw: RawToolConfig) {
     }
     for (tool_name, override_value) in raw.overrides {
         match override_value {
-            Some(enabled) => {
-                effective.overrides.insert(tool_name, enabled);
-            }
-            None => {
+            RawToolOverrideValue::Null(()) => {
                 effective.overrides.remove(&tool_name);
+            }
+            RawToolOverrideValue::Bool(enabled) => {
+                effective.overrides.entry(tool_name).or_default().enabled = Some(enabled);
+            }
+            RawToolOverrideValue::Object(object) => {
+                let override_config = effective.overrides.entry(tool_name).or_default();
+                match object.enabled {
+                    MaybeSet::Missing => {}
+                    MaybeSet::Null => unreachable!("validated object override enabled null"),
+                    MaybeSet::Value(enabled) => override_config.enabled = Some(enabled),
+                }
+                match object.description {
+                    MaybeSet::Missing => {}
+                    MaybeSet::Null => unreachable!("validated object override description null"),
+                    MaybeSet::Value(description) => override_config.description = Some(description),
+                }
             }
         }
     }
+}
+
+fn merge_project_tool_config(
+    effective: &mut GatewayConfig,
+    baseline: &GatewayConfig,
+    module_id: &str,
+    raw: RawToolConfig,
+) {
+    let baseline_default_enabled = baseline
+        .providers
+        .get(module_id)
+        .map(|provider| provider.tools.default_enabled.unwrap_or(true))
+        .unwrap_or(true);
+    let provider = effective.providers.entry(module_id.to_owned()).or_default();
+    match raw.default_enabled {
+        MaybeSet::Missing => {}
+        MaybeSet::Value(false) => provider.tools.default_enabled = Some(false),
+        MaybeSet::Value(true) => {
+            if baseline_default_enabled {
+                provider.tools.default_enabled = Some(true);
+            } else {
+                warn_project_drop(
+                    &format!("providers.{module_id}.tools.defaultEnabled"),
+                    "project MCP config cannot enable tools disabled by the user baseline",
+                );
+            }
+        }
+        MaybeSet::Null => {
+            if baseline_default_enabled {
+                provider.tools.default_enabled = None;
+            } else {
+                warn_project_drop(
+                    &format!("providers.{module_id}.tools.defaultEnabled"),
+                    "project MCP config cannot delete a default tool deny from the user baseline",
+                );
+            }
+        }
+    }
+
+    for (tool_name, override_value) in raw.overrides {
+        let field = format!("providers.{module_id}.tools.overrides.{tool_name}");
+        let baseline_callable =
+            baseline.provider_enabled(module_id) && baseline.tool_enabled(module_id, &tool_name);
+        match override_value {
+            RawToolOverrideValue::Null(()) => {
+                let has_description = provider
+                    .tools
+                    .overrides
+                    .get(&tool_name)
+                    .and_then(|override_config| override_config.description.as_ref())
+                    .is_some();
+                if baseline_callable && !has_description {
+                    provider.tools.overrides.remove(&tool_name);
+                } else {
+                    warn_project_drop(
+                        &field,
+                        "project MCP config cannot delete a deny or inherited tool description",
+                    );
+                }
+            }
+            RawToolOverrideValue::Bool(enabled) => merge_project_override_enabled(
+                &mut provider.tools,
+                &field,
+                &tool_name,
+                enabled,
+                baseline_callable,
+            ),
+            RawToolOverrideValue::Object(object) => {
+                if !matches!(object.description, MaybeSet::Missing) {
+                    warn_project_drop(
+                        &format!("{field}.description"),
+                        "project MCP config cannot rewrite model-facing tool descriptions",
+                    );
+                }
+                match object.enabled {
+                    MaybeSet::Missing => {}
+                    MaybeSet::Null => unreachable!("validated object override enabled null"),
+                    MaybeSet::Value(enabled) => merge_project_override_enabled(
+                        &mut provider.tools,
+                        &format!("{field}.enabled"),
+                        &tool_name,
+                        enabled,
+                        baseline_callable,
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn merge_project_override_enabled(
+    effective: &mut ToolConfig,
+    field: &str,
+    tool_name: &str,
+    enabled: bool,
+    baseline_callable: bool,
+) {
+    if !enabled || baseline_callable {
+        effective
+            .overrides
+            .entry(tool_name.to_owned())
+            .or_default()
+            .enabled = Some(enabled);
+    } else {
+        warn_project_drop(
+            field,
+            "project MCP config cannot enable a tool disabled by the user baseline",
+        );
+    }
+}
+
+fn warn_project_drop(field: &str, reason: &str) {
+    eprintln!("subc-mcp module: warning: dropping project MCP config field {field}: {reason}");
 }
 
 fn deserialize_maybe_set<'de, D, T>(deserializer: D) -> std::result::Result<MaybeSet<T>, D::Error>
@@ -1845,8 +2467,9 @@ async fn reconcile_session_from_catalog(
     state: &SessionState,
     relay_session: &Arc<RelaySession>,
     catalog: CatalogSnapshot,
+    config: &GatewayConfig,
 ) -> Result<bool> {
-    let desired = desired_session_from_catalog(&state.config.effective, &catalog.modules)?;
+    let desired = desired_session_from_catalog(config, &catalog.modules)?;
     let existing_routes = state.route_snapshot();
     let desired_modules = desired
         .providers
@@ -1885,7 +2508,12 @@ async fn reconcile_session_from_catalog(
         routes.insert(provider.module_id.clone(), route_channel);
     }
 
-    let inner = match session_inner_from_desired(catalog.generation, desired, routes) {
+    let inner = match session_inner_from_desired(
+        catalog.generation,
+        desired,
+        routes,
+        config.surface_mode,
+    ) {
         Ok(inner) => inner,
         Err(error) => {
             for route_channel in &opened_routes {
@@ -1942,7 +2570,17 @@ async fn session_lifecycle(
                                     if *shutdown.borrow() {
                                         break;
                                     }
-                                    reconcile_session_from_catalog(&subc, &state, &relay_session, catalog).await
+                                    {
+                                        let config = state.config_snapshot();
+                                        reconcile_session_from_catalog(
+                                            &subc,
+                                            &state,
+                                            &relay_session,
+                                            catalog,
+                                            &config.effective,
+                                        )
+                                        .await
+                                    }
                                 };
                                 match reconciliation {
                                     Ok(true) => {
@@ -1972,7 +2610,17 @@ async fn session_lifecycle(
                                     if *shutdown.borrow() {
                                         break;
                                     }
-                                    reconcile_session_from_catalog(&subc, &state, &relay_session, catalog).await
+                                    {
+                                        let config = state.config_snapshot();
+                                        reconcile_session_from_catalog(
+                                            &subc,
+                                            &state,
+                                            &relay_session,
+                                            catalog,
+                                            &config.effective,
+                                        )
+                                        .await
+                                    }
                                 };
                                 match reconciliation {
                                     Ok(true) => {
@@ -2042,6 +2690,29 @@ struct RouteToolProgress {
     message: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsSearchArgs {
+    query: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsInvokeArgs {
+    name: String,
+    #[serde(default)]
+    arguments: JsonObject,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolsSearchMatch {
+    name: String,
+    description: String,
+    input_schema: JsonObject,
+    execution_mode: ExecutionMode,
+}
+
 impl ServerHandler for SubcMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -2056,14 +2727,15 @@ impl ServerHandler for SubcMcpServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
+        self.refresh_policy_if_needed(&context.peer).await?;
         Ok(ListToolsResult {
             tools: self
                 .state
                 .exposed_tools()
                 .iter()
-                .map(mcp_tool_from_manifest)
+                .map(mcp_tool_from_exposed)
                 .collect(),
             ..Default::default()
         })
@@ -2073,7 +2745,7 @@ impl ServerHandler for SubcMcpServer {
         self.state
             .get_tool(name)
             .as_ref()
-            .map(mcp_tool_from_manifest)
+            .map(mcp_tool_from_exposed)
     }
 
     async fn call_tool(
@@ -2081,7 +2753,11 @@ impl ServerHandler for SubcMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
-        self.call_tool_over_route(request, context).await
+        self.refresh_policy_if_needed(&context.peer).await?;
+        match self.state.surface_mode() {
+            SurfaceMode::Full => self.call_tool_over_route(request, context).await,
+            SurfaceMode::Search => self.call_search_mode_tool(request, context).await,
+        }
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
@@ -2115,23 +2791,132 @@ impl ServerHandler for SubcMcpServer {
 }
 
 impl SubcMcpServer {
+    async fn refresh_policy_if_needed(
+        &self,
+        peer: &Peer<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        let snapshot = self.state.config_snapshot();
+        if snapshot.effective.refresh != RefreshMode::Immediate {
+            return Ok(());
+        }
+
+        let _reconcile_guard = self.reconcile_gate.lock().await;
+        let snapshot = self.state.config_snapshot();
+        if snapshot.effective.refresh != RefreshMode::Immediate {
+            return Ok(());
+        }
+        if !config_files_changed(&snapshot).map_err(mcp_internal_error)? {
+            return Ok(());
+        }
+
+        let next_config = read_gateway_config(
+            &self.state.identity.project_root,
+            &self.state.identity.harness,
+        )
+        .map_err(mcp_internal_error)?;
+        let catalog = catalog_list(&self.subc).await.map_err(mcp_internal_error)?;
+        let changed = reconcile_session_from_catalog(
+            &self.subc,
+            &self.state,
+            &self.relay_session,
+            catalog,
+            &next_config.effective,
+        )
+        .await
+        .map_err(mcp_internal_error)?;
+        self.state.replace_config(next_config);
+        if changed && !notify_tool_list_changed(peer).await {
+            return Err(ErrorData::internal_error(
+                "failed to notify MCP tools/list_changed after immediate policy refresh",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn call_search_mode_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        match request.name.as_ref() {
+            TOOLS_SEARCH_NAME => self.handle_tools_search(request.arguments).await,
+            TOOLS_INVOKE_NAME => self.handle_tools_invoke(request.arguments, context).await,
+            other => Err(unknown_tool_error(other)),
+        }
+    }
+
+    async fn handle_tools_search(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let args: ToolsSearchArgs = parse_tool_arguments(TOOLS_SEARCH_NAME, arguments)?;
+        let query = args.query.trim();
+        let mut matches = self
+            .state
+            .resolved_tools()
+            .into_iter()
+            .filter_map(|tool| {
+                lexical_search_rank(&tool, query).map(|rank| {
+                    (
+                        rank,
+                        tool.manifest.name.clone(),
+                        ToolsSearchMatch {
+                            name: tool.manifest.name.clone(),
+                            description: tool.description.clone(),
+                            input_schema: schema_value_to_object(&tool.manifest.schema),
+                            execution_mode: tool.manifest.execution_mode,
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+        let limit = args.limit.unwrap_or(matches.len());
+        let results = matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, result)| result)
+            .collect::<Vec<_>>();
+        json_tool_result(serde_json::json!(results))
+    }
+
+    async fn handle_tools_invoke(
+        &self,
+        arguments: Option<JsonObject>,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let args: ToolsInvokeArgs = parse_tool_arguments(TOOLS_INVOKE_NAME, arguments)?;
+        let Some(binding) = self.state.private_binding(&args.name) else {
+            return Err(unknown_tool_error(&args.name));
+        };
+        self.call_bound_tool(binding, args.arguments, context).await
+    }
+
     async fn call_tool_over_route(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
-        let Some(binding) = self.state.binding(&request.name) else {
-            return Err(ErrorData::invalid_params(
-                format!("unknown tool '{}'", request.name),
-                None,
-            ));
+        let Some(binding) = self.state.direct_binding(&request.name) else {
+            return Err(unknown_tool_error(&request.name));
         };
+        self.call_bound_tool(binding, request.arguments.unwrap_or_default(), context)
+            .await
+    }
 
+    async fn call_bound_tool(
+        &self,
+        binding: ToolBinding,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         let route_channel = binding.route_channel;
         let progress_token = context.meta.get_progress_token();
         let body = RouteToolCallRequest {
             name: binding.bare_tool_name,
-            arguments: request.arguments.unwrap_or_default(),
+            arguments,
             progress_token: progress_token.clone(),
         };
         let body = serde_json::to_vec(&body).map_err(mcp_internal_error)?;
@@ -2212,6 +2997,59 @@ impl SubcMcpServer {
     }
 }
 
+fn parse_tool_arguments<T: DeserializeOwned>(
+    tool_name: &str,
+    arguments: Option<JsonObject>,
+) -> std::result::Result<T, ErrorData> {
+    serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())).map_err(
+        |source| {
+            ErrorData::invalid_params(
+                format!("invalid arguments for '{tool_name}': {source}"),
+                None,
+            )
+        },
+    )
+}
+
+fn unknown_tool_error(name: &str) -> ErrorData {
+    ErrorData::invalid_params(format!("unknown tool '{name}'"), None)
+}
+
+fn lexical_search_rank(tool: &ExposedTool, query: &str) -> Option<usize> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let name = tool.manifest.name.to_ascii_lowercase();
+    let description = tool.description.to_ascii_lowercase();
+    if name == query {
+        Some(0)
+    } else if name.contains(&query) {
+        Some(1)
+    } else if description.contains(&query) {
+        Some(2)
+    } else {
+        let tokens = query
+            .split_whitespace()
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        (!tokens.is_empty()
+            && tokens
+                .iter()
+                .all(|token| name.contains(token) || description.contains(token)))
+        .then_some(3)
+    }
+}
+
+fn json_tool_result(value: serde_json::Value) -> std::result::Result<CallToolResult, ErrorData> {
+    serde_json::from_value(serde_json::json!({
+        "content": [{ "type": "text", "text": value.to_string() }],
+        "isError": false,
+    }))
+    .map_err(mcp_internal_error)
+}
+
 async fn serve_mcp_server<R, W>(
     handler: SubcMcpServer,
     transport: AsyncRwTransport<RoleServer, R, W>,
@@ -2230,17 +3068,16 @@ where
         .map_err(|source| other_error(format!("rmcp server task failed: {source}")))
 }
 
-fn mcp_tool_from_manifest(tool: &ManifestTool) -> McpTool {
-    let description = format!("subc tool {}", tool.name);
+fn mcp_tool_from_exposed(tool: &ExposedTool) -> McpTool {
     McpTool::new(
-        tool.name.clone(),
-        description,
-        Arc::new(schema_value_to_object(&tool.schema)),
+        tool.manifest.name.clone(),
+        tool.description.clone(),
+        Arc::new(schema_value_to_object(&tool.manifest.schema)),
     )
     .with_annotations(
         ToolAnnotations::new()
-            .read_only(tool.execution_mode == ExecutionMode::Pure)
-            .destructive(tool.execution_mode != ExecutionMode::Pure),
+            .read_only(tool.manifest.execution_mode == ExecutionMode::Pure)
+            .destructive(tool.manifest.execution_mode != ExecutionMode::Pure),
     )
 }
 
@@ -2822,6 +3659,269 @@ fn other_error(message: impl Into<String>) -> BoxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_test_config(doc: &str) -> RawGatewayConfig {
+        parse_gateway_config_doc(doc, Path::new("test-mcp.jsonc")).unwrap()
+    }
+
+    fn compose_test_config(
+        user_doc: Option<&str>,
+        project_doc: Option<&str>,
+        harness_name: &str,
+    ) -> GatewayConfig {
+        let mut effective = GatewayConfig::facade_default();
+        if let Some(user_doc) = user_doc {
+            let (top, harness) = parse_test_config(user_doc).into_parts();
+            merge_gateway_config(&mut effective, top);
+            for layer in matching_harness_layers(harness, harness_name) {
+                merge_gateway_config(&mut effective, layer);
+            }
+        }
+        if let Some(project_doc) = project_doc {
+            let (top, harness) = parse_test_config(project_doc).into_parts();
+            merge_project_gateway_config(&mut effective, top);
+            for layer in matching_harness_layers(harness, harness_name) {
+                merge_project_gateway_config(&mut effective, layer);
+            }
+        }
+        effective
+    }
+
+    #[test]
+    fn schema_accepts_legacy_bool_and_object_overrides() {
+        let config = compose_test_config(
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "providers": {
+                    "aft": {
+                      "tools": {
+                        "defaultEnabled": false,
+                        "overrides": {
+                          "read": true,
+                          "write": { "enabled": false, "description": "curated write" },
+                          "drop_me": null
+                        }
+                      }
+                    }
+                  }
+                }
+                "#,
+            ),
+            None,
+            DEFAULT_HARNESS,
+        );
+
+        let tools = &config.providers["aft"].tools;
+        assert_eq!(tools.default_enabled, Some(false));
+        assert_eq!(tools.overrides["read"].enabled, Some(true));
+        assert_eq!(tools.overrides["write"].enabled, Some(false));
+        assert_eq!(
+            tools.overrides["write"].description.as_deref(),
+            Some("curated write")
+        );
+        assert!(!tools.overrides.contains_key("drop_me"));
+    }
+
+    #[test]
+    fn schema_rejects_reserved_refresh_values_unknown_fields_and_object_nulls() {
+        let reserved = parse_gateway_config_doc(
+            r#"{ "version": 1, "refresh": "on-hard" }"#,
+            Path::new("reserved.jsonc"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            reserved.contains("requires a bust-signal source; not available on the MCP path"),
+            "unexpected reserved-refresh error: {reserved}"
+        );
+
+        let unknown_field_docs = [
+            r#"{ "version": 1, "unknown": true }"#,
+            r#"{ "version": 1, "harness": { "mcp:generic": { "unknown": true } } }"#,
+            r#"{ "version": 1, "providers": { "aft": { "unknown": true } } }"#,
+            r#"{ "version": 1, "providers": { "aft": { "tools": { "unknown": true } } } }"#,
+            r#"{ "version": 1, "providers": { "aft": { "tools": { "overrides": { "read": { "unknown": true } } } } } }"#,
+        ];
+        for doc in unknown_field_docs {
+            let err = parse_gateway_config_doc(doc, Path::new("unknown.jsonc"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unknown field"), "unexpected error: {err}");
+        }
+
+        let null_inside_object = parse_gateway_config_doc(
+            r#"
+            {
+              "version": 1,
+              "providers": {
+                "aft": {
+                  "tools": {
+                    "overrides": { "read": { "enabled": null } }
+                  }
+                }
+              }
+            }
+            "#,
+            Path::new("null-object.jsonc"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            null_inside_object.contains("enabled must be omitted instead of null"),
+            "unexpected object-null error: {null_inside_object}"
+        );
+    }
+
+    #[test]
+    fn global_harness_sections_compose_and_unknown_harness_is_ignored() {
+        let config = compose_test_config(
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "surfaceMode": "search",
+                  "refresh": "immediate",
+                  "providers": {
+                    "aft": {
+                      "namespace": "global",
+                      "tools": {
+                        "defaultEnabled": false,
+                        "overrides": {
+                          "read": false,
+                          "write": { "enabled": true, "description": "global write" }
+                        }
+                      }
+                    }
+                  },
+                  "harness": {
+                    "MCP:GENERIC": {
+                      "surfaceMode": "full",
+                      "refresh": null,
+                      "providers": {
+                        "aft": {
+                          "namespace": "harnessed",
+                          "tools": {
+                            "defaultEnabled": null,
+                            "overrides": {
+                              "read": null,
+                              "write": { "description": "harness write" }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "other": {
+                      "providers": { "aft": { "enabled": false } }
+                    }
+                  }
+                }
+                "#,
+            ),
+            None,
+            "mcp:generic",
+        );
+
+        assert_eq!(config.surface_mode, SurfaceMode::Full);
+        assert_eq!(config.refresh, RefreshMode::OnAttach);
+        assert_eq!(config.provider_namespace("aft"), "harnessed");
+        let tools = &config.providers["aft"].tools;
+        assert_eq!(tools.default_enabled, None);
+        assert!(!tools.overrides.contains_key("read"));
+        assert_eq!(tools.overrides["write"].enabled, Some(true));
+        assert_eq!(
+            tools.overrides["write"].description.as_deref(),
+            Some("harness write")
+        );
+        assert!(config.provider_enabled("aft"));
+    }
+
+    #[test]
+    fn project_tier_only_narrows_and_preserves_global_model_facing_strings() {
+        let config = compose_test_config(
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "refresh": "immediate",
+                  "providers": {
+                    "aft": {
+                      "enabled": false,
+                      "namespace": "global",
+                      "tools": {
+                        "defaultEnabled": false,
+                        "overrides": {
+                          "read": false,
+                          "write": { "enabled": true, "description": "global write" }
+                        }
+                      }
+                    }
+                  }
+                }
+                "#,
+            ),
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "surfaceMode": "search",
+                  "refresh": "on-attach",
+                  "providers": {
+                    "aft": {
+                      "enabled": true,
+                      "namespace": "project",
+                      "tools": {
+                        "defaultEnabled": true,
+                        "overrides": {
+                          "read": null,
+                          "grant": true,
+                          "write": { "enabled": false, "description": "project write" }
+                        }
+                      }
+                    }
+                  }
+                }
+                "#,
+            ),
+            DEFAULT_HARNESS,
+        );
+
+        assert_eq!(config.surface_mode, SurfaceMode::Search);
+        assert_eq!(config.refresh, RefreshMode::Immediate);
+        assert!(!config.provider_enabled("aft"));
+        assert_eq!(config.provider_namespace("aft"), "global");
+        let tools = &config.providers["aft"].tools;
+        assert_eq!(tools.default_enabled, Some(false));
+        assert_eq!(tools.overrides["read"].enabled, Some(false));
+        assert!(!tools.overrides.contains_key("grant"));
+        assert_eq!(tools.overrides["write"].enabled, Some(false));
+        assert_eq!(
+            tools.overrides["write"].description.as_deref(),
+            Some("global write")
+        );
+    }
+
+    #[test]
+    fn facade_default_disabled_modules_require_global_enable() {
+        let baseline = GatewayConfig::facade_default();
+        assert!(!baseline.provider_enabled("magic-context"));
+        assert!(!baseline.provider_enabled("llm-runner"));
+
+        let project_only = compose_test_config(
+            None,
+            Some(r#"{ "version": 1, "providers": { "magic-context": { "enabled": true } } }"#),
+            DEFAULT_HARNESS,
+        );
+        assert!(!project_only.provider_enabled("magic-context"));
+
+        let global_enabled = compose_test_config(
+            Some(r#"{ "version": 1, "providers": { "magic-context": { "enabled": true } } }"#),
+            None,
+            DEFAULT_HARNESS,
+        );
+        assert!(global_enabled.provider_enabled("magic-context"));
+    }
 
     #[tokio::test]
     async fn client_ignores_unknown_channel_zero_push() {

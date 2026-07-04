@@ -119,16 +119,21 @@ async fn watchdog_failed_tick_logs_stage_and_recovery_streak() {
     );
     let watchdog_task = watchdog.spawn();
 
-    wait_for_log(&capture, LOG_TIMEOUT, |line| {
+    // A dead endpoint manifests OS-dependently: unix refuses fast (stage
+    // "connect"), Windows keeps retrying SYN past the tick deadline (stage
+    // "timeout"). The mechanism under test is the failure streak + recovery,
+    // not which stage a dead endpoint surfaces as.
+    let dead_endpoint_failure = |line: &str, streak: &str| {
         line.contains("daemon self-watchdog tick failed")
-            && line.contains("stage=\"connect\"")
-            && line.contains("consecutive_failures=1")
+            && (line.contains("stage=\"connect\"") || line.contains("stage=\"timeout\""))
+            && line.contains(streak)
+    };
+    wait_for_log(&capture, LOG_TIMEOUT, |line| {
+        dead_endpoint_failure(line, "consecutive_failures=1")
     })
     .await;
     wait_for_log(&capture, LOG_TIMEOUT, |line| {
-        line.contains("daemon self-watchdog tick failed")
-            && line.contains("stage=\"connect\"")
-            && line.contains("consecutive_failures=2")
+        dead_endpoint_failure(line, "consecutive_failures=2")
     })
     .await;
 

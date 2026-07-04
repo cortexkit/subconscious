@@ -19,9 +19,10 @@ use std::{
 
 pub use async_trait::async_trait;
 pub use subc_control::ConsumerIdentity;
+pub use subc_protocol::session::{HealthReport, HealthStatus};
 use subc_protocol::{
     manifest::ModuleManifest,
-    session::{ModuleControlRequest, ModuleControlResponse},
+    session::{ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK},
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV,
     SUBC_MODULE_ID_ENV,
@@ -33,16 +34,32 @@ use subc_transport::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const EGRESS_BUFFER: usize = 64;
+const HANDLER_TASK_CAPACITY: usize = 64;
 const HELLO_CORR: u64 = 1;
 
 type RequestKey = (u16, u64);
 type InFlight = Arc<Mutex<HashMap<RequestKey, CancellationToken>>>;
+
+#[derive(Clone)]
+struct RequestDispatcher {
+    in_flight: InFlight,
+    permits: Arc<Semaphore>,
+}
+
+impl RequestDispatcher {
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            permits: Arc::new(Semaphore::new(HANDLER_TASK_CAPACITY)),
+        }
+    }
+}
 
 /// Trait implemented by a module for its business logic. The serve functions in
 /// this crate own all wire-protocol plumbing.
@@ -61,6 +78,11 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// Decide a route.bind. The default accepts every route.
     async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
         BindDecision::accept()
+    }
+
+    /// Return cheap in-memory health for the module. The default reports healthy.
+    async fn health(&self) -> HealthReport {
+        HealthReport::ok()
     }
 
     /// A route channel was torn down by a per-route GOODBYE. The default is a no-op.
@@ -232,12 +254,12 @@ where
     let ack = expect_hello_ack(reader).await?;
     handler.on_hello_ack(&ack).await;
 
-    let in_flight = Arc::new(Mutex::new(HashMap::new()));
+    let dispatcher = RequestDispatcher::new();
     loop {
         let Some(frame) = read_frame(reader).await.map_err(SubcModuleError::FrameIo)? else {
             return Ok(());
         };
-        if !handle_frame(frame, &egress, Arc::clone(&handler), Arc::clone(&in_flight)).await? {
+        if !handle_frame(frame, &egress, Arc::clone(&handler), dispatcher.clone()).await? {
             return Ok(());
         }
     }
@@ -247,7 +269,7 @@ async fn handle_frame<H>(
     frame: Frame,
     egress: &mpsc::Sender<Frame>,
     handler: Arc<H>,
-    in_flight: InFlight,
+    dispatcher: RequestDispatcher,
 ) -> Result<bool, SubcModuleError>
 where
     H: ModuleHandler,
@@ -268,20 +290,20 @@ where
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
-            cancel_channel(&in_flight, frame.header.channel)?;
+            cancel_channel(&dispatcher.in_flight, frame.header.channel)?;
             handler.on_route_gone(frame.header.channel).await;
             Ok(true)
         }
         FrameType::Cancel => {
-            handle_cancel(frame, &in_flight)?;
+            handle_cancel(frame, &dispatcher.in_flight)?;
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, egress, handler).await?;
+            handle_control_request(frame, egress, handler, dispatcher).await?;
             Ok(true)
         }
         FrameType::Request => {
-            spawn_data_request(frame, egress.clone(), handler, in_flight)?;
+            spawn_data_request(frame, egress.clone(), handler, dispatcher)?;
             Ok(true)
         }
         _ => Ok(true),
@@ -292,7 +314,7 @@ fn spawn_data_request<H>(
     frame: Frame,
     egress: mpsc::Sender<Frame>,
     handler: Arc<H>,
-    in_flight: InFlight,
+    dispatcher: RequestDispatcher,
 ) -> Result<(), SubcModuleError>
 where
     H: ModuleHandler,
@@ -301,7 +323,7 @@ where
     let corr = frame.header.corr;
     let cancellation = CancellationToken::new();
     {
-        let mut guard = lock_in_flight(&in_flight)?;
+        let mut guard = lock_in_flight(&dispatcher.in_flight)?;
         guard.insert((channel, corr), cancellation.clone());
     }
 
@@ -313,9 +335,67 @@ where
         cancelled: cancellation,
     };
     let body = frame.body;
+    let in_flight = Arc::clone(&dispatcher.in_flight);
+    let permits = Arc::clone(&dispatcher.permits);
     tokio::spawn(async move {
+        let Ok(_permit) = permits.acquire_owned().await else {
+            if let Ok(mut guard) = in_flight.lock() {
+                guard.remove(&(channel, corr));
+            }
+            return;
+        };
         let outcome = handler.handle(ctx.clone(), body).await;
         let _ = send_handler_outcome(&ctx, outcome).await;
+        if let Ok(mut guard) = in_flight.lock() {
+            guard.remove(&(channel, corr));
+        }
+    });
+    Ok(())
+}
+
+fn spawn_health_request<H>(
+    frame: Frame,
+    egress: mpsc::Sender<Frame>,
+    handler: Arc<H>,
+    dispatcher: RequestDispatcher,
+) -> Result<(), SubcModuleError>
+where
+    H: ModuleHandler,
+{
+    let channel = frame.header.channel;
+    let corr = frame.header.corr;
+    let ver = frame.header.ver;
+    let cancellation = CancellationToken::new();
+    {
+        let mut guard = lock_in_flight(&dispatcher.in_flight)?;
+        guard.insert((channel, corr), cancellation.clone());
+    }
+
+    let in_flight = Arc::clone(&dispatcher.in_flight);
+    let permits = Arc::clone(&dispatcher.permits);
+    tokio::spawn(async move {
+        let Ok(_permit) = permits.acquire_owned().await else {
+            if let Ok(mut guard) = in_flight.lock() {
+                guard.remove(&(channel, corr));
+            }
+            return;
+        };
+        if !cancellation.is_cancelled() {
+            let report = handler.health().await;
+            let response = ModuleControlResponse::from(report);
+            if let Ok(body) = serde_json::to_vec(&response) {
+                if let Ok(frame) = Frame::build_with_version(
+                    ver,
+                    FrameType::Response,
+                    control_flags(),
+                    channel,
+                    corr,
+                    body,
+                ) {
+                    let _ = send_outbound(&egress, frame).await;
+                }
+            }
+        }
         if let Ok(mut guard) = in_flight.lock() {
             guard.remove(&(channel, corr));
         }
@@ -379,6 +459,7 @@ async fn handle_control_request<H>(
     frame: Frame,
     egress: &mpsc::Sender<Frame>,
     handler: Arc<H>,
+    dispatcher: RequestDispatcher,
 ) -> Result<(), SubcModuleError>
 where
     H: ModuleHandler,
@@ -430,6 +511,9 @@ where
                 }
             }
         }
+        ModuleControlRequest::HealthCheck {} => {
+            spawn_health_request(frame, egress.clone(), handler, dispatcher)?;
+        }
     }
     Ok(())
 }
@@ -441,7 +525,7 @@ async fn send_hello(
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,
-        control_ops: None,
+        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
         launch_nonce: env::var(SUBC_LAUNCH_NONCE_ENV)
             .ok()
             .filter(|value| !value.is_empty()),
@@ -691,5 +775,123 @@ impl Error for SubcModuleError {
 impl From<serde_json::Error> for SubcModuleError {
     fn from(err: serde_json::Error) -> Self {
         Self::Json(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::{sync::Notify, time::timeout};
+
+    use super::*;
+
+    struct EchoHandler;
+
+    #[async_trait]
+    impl ModuleHandler for EchoHandler {
+        async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(body)
+        }
+    }
+
+    struct BlockingHandler {
+        entered: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for BlockingHandler {
+        async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            HandlerOutcome::Streamed
+        }
+    }
+
+    fn health_request(corr: u64) -> Frame {
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            corr,
+            serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn data_request(channel: u16, corr: u64) -> Frame {
+        Frame::build(
+            FrameType::Request,
+            data_flags(),
+            channel,
+            corr,
+            b"opaque".to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn default_health_check_answers_ok() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handler = Arc::new(EchoHandler);
+        let dispatcher = RequestDispatcher::new();
+
+        assert!(handle_frame(health_request(77), &tx, handler, dispatcher,)
+            .await
+            .unwrap());
+
+        let response = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.header.ty, FrameType::Response);
+        assert_eq!(response.header.channel, 0);
+        assert_eq!(response.header.corr, 77);
+        assert_eq!(
+            serde_json::from_slice::<ModuleControlResponse>(&response.body).unwrap(),
+            ModuleControlResponse::from(HealthReport::ok())
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_waits_behind_saturated_request_dispatcher() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let handler = Arc::new(BlockingHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let dispatcher = RequestDispatcher::new();
+
+        for corr in 0..HANDLER_TASK_CAPACITY as u64 {
+            handle_frame(
+                data_request(7, corr + 1),
+                &tx,
+                Arc::clone(&handler),
+                dispatcher.clone(),
+            )
+            .await
+            .unwrap();
+        }
+
+        timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) < HANDLER_TASK_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        handle_frame(health_request(900), &tx, handler, dispatcher)
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(75), rx.recv()).await.is_err(),
+            "health.check must share the same saturated request dispatch capacity as data requests"
+        );
+
+        release.notify_waiters();
     }
 }

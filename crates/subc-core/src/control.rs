@@ -7,17 +7,21 @@ use subc_control::{
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
-    session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    session::{
+        HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlResponse,
+        MODULE_CONTROL_OP_HEALTH_CHECK,
+    },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::time::timeout;
+use tokio::time::{timeout_at, Instant};
 use tracing::{debug, info, warn};
 
 use crate::{
     forwarding::{
-        CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleEndpointId,
-        RouteBindRelayOutcome,
+        CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
+        ModuleEndpointId, PendingModuleControlRpc, RouteBindRelayOutcome,
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
@@ -46,6 +50,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_RESTART,
     ops::SUPERVISOR_RELOAD,
     ops::SUPERVISOR_SET_ENABLED,
+    ops::SUPERVISOR_HEALTH_PROBE,
 ];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
@@ -58,6 +63,7 @@ const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 /// bind is far worse than waiting on a slow one; a consumer that wants a tighter
 /// bound retries the bind itself (the sanctioned warm-bind-retry pattern).
 const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
+const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
@@ -68,6 +74,7 @@ pub struct ControlHandler {
     supervisor: SupervisorHandle,
     subc_capabilities: Arc<[String]>,
     route_bind_relay_timeout: Duration,
+    health_probe_timeout: Duration,
     /// Central storage policy. When set, each registering module receives its
     /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
     storage_config: Option<crate::daemon_config::StorageConfig>,
@@ -93,6 +100,38 @@ struct RouteBindReservationGuard {
     module_channel: u16,
     relay_corr: u64,
     armed: bool,
+}
+
+struct ModuleControlRpcGuard {
+    forwarding: Arc<ForwardingTable>,
+    endpoint: ModuleEndpointId,
+    corr: u64,
+    armed: bool,
+}
+
+impl ModuleControlRpcGuard {
+    fn new(forwarding: Arc<ForwardingTable>, endpoint: ModuleEndpointId, corr: u64) -> Self {
+        Self {
+            forwarding,
+            endpoint,
+            corr,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ModuleControlRpcGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .forwarding
+                .cancel_module_control_rpc(self.endpoint, self.corr);
+        }
+    }
 }
 
 impl RouteBindReservationGuard {
@@ -160,6 +199,7 @@ impl ControlHandler {
                 CAP_SESSION_ATTACH.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
+            health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             storage_config: None,
         }
     }
@@ -178,6 +218,12 @@ impl ControlHandler {
     /// timeout path so they don't block on the production-safe default.
     pub fn with_route_bind_relay_timeout(mut self, timeout: Duration) -> Self {
         self.route_bind_relay_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_health_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.health_probe_timeout = timeout;
         self
     }
 
@@ -649,6 +695,9 @@ impl ControlHandler {
             ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
                 self.handle_supervisor_set_enabled(frame, module_id, enabled)
                     .await
+            }
+            ClientControlRequest::SupervisorHealthProbe { module_id } => {
+                self.handle_supervisor_health_probe(frame, module_id).await
             }
         }
     }
@@ -1135,6 +1184,154 @@ impl ControlHandler {
         )?])
     }
 
+    async fn handle_supervisor_health_probe(
+        &self,
+        frame: Frame,
+        module_id: String,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(registration) = self
+            .registry
+            .get_module(&module_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{module_id}' is not registered"),
+            )?]);
+        };
+
+        if !module_registration_grants_op(&registration.control_ops, MODULE_CONTROL_OP_HEALTH_CHECK)
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "health_not_advertised",
+                format!("module_id '{module_id}' did not advertise health.check"),
+            )?]);
+        }
+
+        let deadline = Instant::now() + self.health_probe_timeout;
+        let pending = match self.forwarding.begin_module_control_rpc_for(
+            &module_id,
+            MODULE_CONTROL_OP_HEALTH_CHECK,
+            deadline,
+        ) {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    forwarding_error_code(&err),
+                    err.to_string(),
+                )?])
+            }
+        };
+
+        let PendingModuleControlRpc {
+            endpoint,
+            module_sink,
+            negotiated_ver,
+            corr: probe_corr,
+            receiver,
+        } = pending;
+        let mut guard =
+            ModuleControlRpcGuard::new(Arc::clone(&self.forwarding), endpoint, probe_corr);
+        let probe_body =
+            serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).map_err(|err| {
+                RouterError::backend(
+                    0,
+                    frame.header.corr,
+                    format!("failed to encode health.check request: {err}"),
+                )
+            })?;
+        let probe_frame = Frame::build_with_version(
+            negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            probe_corr,
+            probe_body,
+        )
+        .map_err(RouterError::FrameBuild)?;
+
+        if let Err(err) = module_sink.send(probe_frame).await {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "target_unavailable",
+                err.to_string(),
+            )?]);
+        }
+
+        match timeout_at(deadline, receiver).await {
+            Ok(Ok(ModuleControlRpcOutcome::Response(response))) => {
+                guard.disarm();
+                let Some(report) = response.health_report() else {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "invalid_control_body",
+                        "health.check RPC returned a non-health response",
+                    )?]);
+                };
+                let HealthReport {
+                    status,
+                    detail,
+                    metrics,
+                } = report;
+                let response = ClientControlResponse::SupervisorHealthProbe {
+                    module_id,
+                    status,
+                    detail,
+                    metrics,
+                };
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &response,
+                    "ClientControlResponse::SupervisorHealthProbe",
+                )?])
+            }
+            Ok(Ok(ModuleControlRpcOutcome::Rejected(body))) => {
+                guard.disarm();
+                Ok(vec![control_error_body_frame(&frame, body)?])
+            }
+            Ok(Ok(ModuleControlRpcOutcome::ModuleGone(message))) => {
+                guard.disarm();
+                Ok(vec![control_error_frame(
+                    &frame,
+                    "target_unavailable",
+                    message,
+                )?])
+            }
+            Ok(Ok(ModuleControlRpcOutcome::MalformedResponse(message))) => {
+                guard.disarm();
+                Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_control_body",
+                    message,
+                )?])
+            }
+            Ok(Ok(ModuleControlRpcOutcome::UnexpectedOp { expected, actual })) => {
+                guard.disarm();
+                Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_control_body",
+                    format!("expected module-control op '{expected}', got '{actual}'"),
+                )?])
+            }
+            Ok(Err(_)) => Ok(vec![control_error_frame(
+                &frame,
+                "target_unavailable",
+                "health.check waiter was canceled before the module responded",
+            )?]),
+            Err(_) => Ok(vec![control_error_frame(
+                &frame,
+                "module_timeout",
+                format!(
+                    "module_id '{module_id}' did not answer health.check within {:?}",
+                    self.health_probe_timeout
+                ),
+            )?]),
+        }
+    }
+
     fn supervisor_status(
         &self,
         module_id: &str,
@@ -1299,11 +1496,131 @@ impl ControlHandler {
     ) -> Result<Vec<Frame>, RouterError> {
         let mut secondary_error = None;
         let outcome = match frame.header.ty {
-            FrameType::Response => {
-                match serde_json::from_slice::<ModuleControlResponse>(&frame.body) {
-                    Ok(ModuleControlResponse::RouteBindAck {}) => RouteBindRelayOutcome::Accepted,
+            FrameType::Response => match serde_json::from_slice::<ControlOpProbe>(&frame.body) {
+                Ok(probe) if probe.op == "route.bind" => {
+                    match serde_json::from_slice::<ModuleControlResponse>(&frame.body) {
+                        Ok(ModuleControlResponse::RouteBindAck {}) => {
+                            RouteBindRelayOutcome::Accepted
+                        }
+                        Ok(other) => {
+                            let message =
+                                format!("route.bind response carried unexpected body: {other:?}");
+                            secondary_error = Some(control_error_frame(
+                                &frame,
+                                "invalid_control_body",
+                                message.clone(),
+                            )?);
+                            RouteBindRelayOutcome::ModuleGone(message)
+                        }
+                        Err(err) => {
+                            let message = format!("malformed route.bind response body: {err}");
+                            secondary_error = Some(control_error_frame(
+                                &frame,
+                                "invalid_control_body",
+                                message.clone(),
+                            )?);
+                            RouteBindRelayOutcome::ModuleGone(message)
+                        }
+                    }
+                }
+                Ok(probe) => {
+                    let outcome = match serde_json::from_slice::<ModuleControlResponse>(&frame.body)
+                    {
+                        Ok(response) => ModuleControlRpcOutcome::Response(response),
+                        Err(err) => ModuleControlRpcOutcome::MalformedResponse(format!(
+                            "malformed {} response body: {err}",
+                            probe.op
+                        )),
+                    };
+                    let settled = self
+                        .forwarding
+                        .complete_module_control_rpc(
+                            connection_id,
+                            frame.header.corr,
+                            Some(&probe.op),
+                            outcome,
+                        )
+                        .map_err(RouterError::Forwarding)?;
+                    if !settled {
+                        debug!(
+                            connection_id = connection_id.get(),
+                            corr = frame.header.corr,
+                            op = %probe.op,
+                            "dropping late or unknown module-control RPC response"
+                        );
+                    }
+                    return Ok(Vec::new());
+                }
+                Err(err) => {
+                    if let Some(expected_op) = self
+                        .forwarding
+                        .pending_module_control_op(connection_id, frame.header.corr)
+                        .map_err(RouterError::Forwarding)?
+                    {
+                        let settled = self
+                            .forwarding
+                            .complete_module_control_rpc(
+                                connection_id,
+                                frame.header.corr,
+                                None,
+                                ModuleControlRpcOutcome::MalformedResponse(format!(
+                                    "malformed {expected_op} response body: {err}"
+                                )),
+                            )
+                            .map_err(RouterError::Forwarding)?;
+                        if !settled {
+                            debug!(
+                                connection_id = connection_id.get(),
+                                corr = frame.header.corr,
+                                "dropping late malformed module-control RPC response"
+                            );
+                        }
+                        return Ok(Vec::new());
+                    }
+                    let message = format!("malformed route.bind response body: {err}");
+                    secondary_error = Some(control_error_frame(
+                        &frame,
+                        "invalid_control_body",
+                        message.clone(),
+                    )?);
+                    RouteBindRelayOutcome::ModuleGone(message)
+                }
+            },
+            FrameType::Error => {
+                if self
+                    .forwarding
+                    .pending_module_control_op(connection_id, frame.header.corr)
+                    .map_err(RouterError::Forwarding)?
+                    .is_some()
+                {
+                    let outcome = match serde_json::from_slice::<ErrorBody>(&frame.body) {
+                        Ok(body) => ModuleControlRpcOutcome::Rejected(body),
+                        Err(err) => ModuleControlRpcOutcome::MalformedResponse(format!(
+                            "malformed module-control ERROR body: {err}"
+                        )),
+                    };
+                    let settled = self
+                        .forwarding
+                        .complete_module_control_rpc(
+                            connection_id,
+                            frame.header.corr,
+                            None,
+                            outcome,
+                        )
+                        .map_err(RouterError::Forwarding)?;
+                    if !settled {
+                        debug!(
+                            connection_id = connection_id.get(),
+                            corr = frame.header.corr,
+                            "dropping late or unknown module-control RPC error"
+                        );
+                    }
+                    return Ok(Vec::new());
+                }
+                match serde_json::from_slice::<ErrorBody>(&frame.body) {
+                    Ok(body) => RouteBindRelayOutcome::Rejected(body),
                     Err(err) => {
-                        let message = format!("malformed route.bind response body: {err}");
+                        let message = format!("malformed route.bind ERROR body: {err}");
                         secondary_error = Some(control_error_frame(
                             &frame,
                             "invalid_control_body",
@@ -1313,18 +1630,6 @@ impl ControlHandler {
                     }
                 }
             }
-            FrameType::Error => match serde_json::from_slice::<ErrorBody>(&frame.body) {
-                Ok(body) => RouteBindRelayOutcome::Rejected(body),
-                Err(err) => {
-                    let message = format!("malformed route.bind ERROR body: {err}");
-                    secondary_error = Some(control_error_frame(
-                        &frame,
-                        "invalid_control_body",
-                        message.clone(),
-                    )?);
-                    RouteBindRelayOutcome::ModuleGone(message)
-                }
-            },
             ty => {
                 return Ok(vec![control_error_frame(
                     &frame,
@@ -1618,6 +1923,7 @@ mod tests {
             ModelPolicy, ProviderRole, ScheduledTask, StorageBinding, StorageKind, StorageScope,
             TaskEligibility, Tool,
         },
+        session::HealthStatus,
         FrameType,
     };
 
@@ -1634,6 +1940,7 @@ mod tests {
             provides: vec![ProviderRole::ToolProvider {
                 tools: vec![Tool {
                     name: "read".to_string(),
+                    description: None,
                     execution_mode: ExecutionMode::Pure,
                     schema: json!({"type": "object"}),
                 }],
@@ -1762,6 +2069,58 @@ mod tests {
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+    }
+
+    fn supervisor_health_probe_frame(corr: u64, module_id: &str) -> Frame {
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorHealthProbe {
+            module_id: module_id.to_string(),
+        })
+        .unwrap();
+        Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+    }
+
+    fn route_open_frame(corr: u64, module_id: &str, project_root: std::path::PathBuf) -> Frame {
+        let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            identity: BindIdentity {
+                project_root,
+                harness: "unit".to_string(),
+                session: "session".to_string(),
+            },
+            consumer_identity: None,
+        })
+        .unwrap();
+        Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+    }
+
+    fn health_response(corr: u64, status: HealthStatus) -> Frame {
+        let body = serde_json::to_vec(&ModuleControlResponse::HealthCheck {
+            status,
+            detail: Some("warming".to_string()),
+            metrics: Some(json!({"queue_depth": 3})),
+        })
+        .unwrap();
+        Frame::build(FrameType::Response, control_flags(), 0, corr, body).unwrap()
+    }
+
+    fn route_bind_ack(corr: u64) -> Frame {
+        let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
+        Frame::build(FrameType::Response, control_flags(), 0, corr, body).unwrap()
+    }
+
+    fn unique_project_root(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "subc-control-{label}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 
     fn assert_route_poll_liveness(frame: &Frame, expected_live: bool) {
@@ -1973,6 +2332,180 @@ mod tests {
             .guard_module_control_op(&frame, "aft", "future.synthetic")
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn health_probe_refuses_unadvertised_module_without_sending_frame() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(10));
+        let responses = handler
+            .handle_control_frame(
+                &module_ctx,
+                hello_frame_with_control_ops("aft", PROTOCOL_VERSION, 7, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(responses[0].header.ty, FrameType::HelloAck);
+
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(20));
+        let responses = handler
+            .handle_control_frame(&client_ctx, supervisor_health_probe_frame(77, "aft"))
+            .await
+            .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&responses[0])["code"], "health_not_advertised");
+        assert!(module_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_demuxes_while_route_bind_relay_is_in_flight() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(30));
+        handler
+            .handle_control_frame(
+                &module_ctx,
+                hello_frame_with_control_ops(
+                    "aft",
+                    PROTOCOL_VERSION,
+                    7,
+                    Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let project_root = unique_project_root("demux");
+        let (route_client_ctx, _route_client_rx) = route_ctx(ConnectionId::new(31));
+        let route_handler = handler.clone();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(
+                    &route_client_ctx,
+                    route_open_frame(100, "aft", project_root),
+                )
+                .await
+                .unwrap()
+        });
+        let bind_frame = tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ModuleControlRequest>(&bind_frame.body).unwrap(),
+            ModuleControlRequest::RouteBind { .. }
+        ));
+
+        let (health_client_ctx, _health_client_rx) = route_ctx(ConnectionId::new(32));
+        let health_handler = handler.clone();
+        let health_task = tokio::spawn(async move {
+            health_handler
+                .handle_control_frame(
+                    &health_client_ctx,
+                    supervisor_health_probe_frame(101, "aft"),
+                )
+                .await
+                .unwrap()
+        });
+        let health_frame = tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ModuleControlRequest>(&health_frame.body).unwrap(),
+            ModuleControlRequest::HealthCheck {}
+        );
+
+        handler
+            .handle_control_frame(
+                &module_ctx,
+                health_response(health_frame.header.corr, HealthStatus::Degraded),
+            )
+            .await
+            .unwrap();
+        let health_response = health_task.await.unwrap();
+        assert_eq!(health_response.len(), 1);
+        match serde_json::from_slice::<ClientControlResponse>(&health_response[0].body).unwrap() {
+            ClientControlResponse::SupervisorHealthProbe {
+                module_id,
+                status,
+                detail,
+                metrics,
+            } => {
+                assert_eq!(module_id, "aft");
+                assert_eq!(status, HealthStatus::Degraded);
+                assert_eq!(detail.as_deref(), Some("warming"));
+                assert_eq!(metrics, Some(json!({"queue_depth": 3})));
+            }
+            other => panic!("unexpected health response: {other:?}"),
+        }
+
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind_frame.header.corr))
+            .await
+            .unwrap();
+        let route_response = route_task.await.unwrap();
+        assert_eq!(route_response.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
+            ClientControlResponse::RouteOpen { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn health_probe_timeout_and_module_death_are_typed() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_health_probe_timeout(Duration::from_millis(50));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(40));
+        handler
+            .handle_control_frame(
+                &module_ctx,
+                hello_frame_with_control_ops(
+                    "aft",
+                    PROTOCOL_VERSION,
+                    7,
+                    Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(41));
+        let responses = handler
+            .handle_control_frame(&client_ctx, supervisor_health_probe_frame(201, "aft"))
+            .await
+            .unwrap();
+        assert_eq!(responses[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&responses[0])["code"], "module_timeout");
+        let _ = module_rx.try_recv();
+
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(42));
+        let health_handler = handler.clone();
+        let death_task = tokio::spawn(async move {
+            health_handler
+                .handle_control_frame(&client_ctx, supervisor_health_probe_frame(202, "aft"))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        handler
+            .cleanup_connection(module_ctx.connection_id)
+            .unwrap();
+        let responses = death_task.await.unwrap();
+        assert_eq!(responses[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&responses[0])["code"], "target_unavailable");
     }
 
     #[test]

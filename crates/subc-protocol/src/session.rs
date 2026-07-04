@@ -6,8 +6,38 @@
 //! handshake that binds one client route to a module route channel.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{BindIdentity, Principal, RouteTarget};
+
+pub const MODULE_CONTROL_OP_HEALTH_CHECK: &str = "health.check";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    Ok,
+    Degraded,
+    Failing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HealthReport {
+    pub status: HealthStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Value>,
+}
+
+impl HealthReport {
+    pub fn ok() -> Self {
+        Self {
+            status: HealthStatus::Ok,
+            detail: None,
+            metrics: None,
+        }
+    }
+}
 
 /// subc-to-module channel-0 control RPC body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,15 +51,52 @@ pub enum ModuleControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
     },
+    #[serde(rename = "health.check")]
+    HealthCheck {},
 }
 
 /// Module-to-subc channel-0 response body.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op")]
 pub enum ModuleControlResponse {
     /// ACK-only success. Rejections use the `FrameType::Error` lane.
     #[serde(rename = "route.bind")]
     RouteBindAck {},
+    #[serde(rename = "health.check")]
+    HealthCheck {
+        status: HealthStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metrics: Option<Value>,
+    },
+}
+
+impl From<HealthReport> for ModuleControlResponse {
+    fn from(report: HealthReport) -> Self {
+        Self::HealthCheck {
+            status: report.status,
+            detail: report.detail,
+            metrics: report.metrics,
+        }
+    }
+}
+
+impl ModuleControlResponse {
+    pub fn health_report(&self) -> Option<HealthReport> {
+        match self {
+            Self::HealthCheck {
+                status,
+                detail,
+                metrics,
+            } => Some(HealthReport {
+                status: *status,
+                detail: detail.clone(),
+                metrics: metrics.clone(),
+            }),
+            Self::RouteBindAck {} => None,
+        }
+    }
 }
 
 /// Module-to-subc channel-0 push body.

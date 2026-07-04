@@ -794,6 +794,7 @@ async fn run_scripted_provider(
                                 stream.flush().await.unwrap();
                                 let _ = events_tx.send(ScriptedProviderEvent::Bound { route_channel: next_route_channel }).await;
                             }
+                            ModuleControlRequest::HealthCheck {} => {}
                         }
                     }
                     FrameType::Request if Some(frame.header.channel) == route_channel => {
@@ -3641,6 +3642,7 @@ async fn run_raw_provider(
                                 write_frame(&mut stream, &response).await.unwrap();
                                 stream.flush().await.unwrap();
                             }
+                            ModuleControlRequest::HealthCheck {} => {}
                         }
                     }
                     FrameType::Request if Some(frame.header.channel) == route_channel => {
@@ -3690,6 +3692,7 @@ fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![ProviderTool {
                 name: tool_name.to_owned(),
+                description: None,
                 execution_mode: ExecutionMode::Pure,
                 schema: json!({"type": "object"}),
             }],

@@ -150,6 +150,7 @@ fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "echo".to_string(),
+                description: None,
                 execution_mode: ExecutionMode::Pure,
                 schema: json!({"type": "object"}),
             }],

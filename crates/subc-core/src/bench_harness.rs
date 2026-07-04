@@ -45,6 +45,7 @@ pub fn bench_tool_provider_manifest(module_id: &str) -> ModuleManifest {
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "read".to_string(),
+                description: None,
                 execution_mode: ExecutionMode::Pure,
                 schema: serde_json::json!({"type": "object"}),
             }],

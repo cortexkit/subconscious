@@ -1,0 +1,8 @@
+{
+  "detail": "warming model",
+  "metrics": {
+    "queue_depth": 3
+  },
+  "op": "health.check",
+  "status": "degraded"
+}

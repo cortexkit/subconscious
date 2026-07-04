@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use subc_protocol::{manifest::ProviderRole, BindIdentity, RouteTarget};
+use subc_protocol::{manifest::ProviderRole, session::HealthStatus, BindIdentity, RouteTarget};
 
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -35,6 +35,7 @@ pub mod ops {
     pub const SUPERVISOR_RESTART: &str = "supervisor.restart";
     pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
     pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
+    pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -65,6 +66,8 @@ pub enum ClientControlRequest {
     SupervisorReload { module_id: String },
     #[serde(rename = "supervisor.set_enabled")]
     SupervisorSetEnabled { module_id: String, enabled: bool },
+    #[serde(rename = "supervisor.health_probe")]
+    SupervisorHealthProbe { module_id: String },
 }
 
 /// subc's channel-0 response body for client control RPCs.
@@ -97,6 +100,15 @@ pub enum ClientControlResponse {
     },
     #[serde(rename = "supervisor.ack")]
     SupervisorAck { module_id: String, applied: bool },
+    #[serde(rename = "supervisor.health_probe")]
+    SupervisorHealthProbe {
+        module_id: String,
+        status: HealthStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metrics: Option<serde_json::Value>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

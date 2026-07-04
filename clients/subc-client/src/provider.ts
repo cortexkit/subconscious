@@ -27,6 +27,8 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const BODY_READ_TIMEOUT_MS = 30_000;
 const WRITE_TIMEOUT_MS = 30_000;
 const DEFAULT_RESTORED_DEBOUNCE_MS = 250;
+const DEFAULT_PROVIDER_HANDLER_CAPACITY = 64;
+const HEALTH_CHECK_OP = "health.check";
 export const HELLO_CORR = 1n;
 
 export type TrustTier = "first_party" | "reviewed" | "untrusted";
@@ -40,6 +42,13 @@ export type InternalTransport = "bulk";
 export type StorageKind = "sqlite";
 export type StorageScope = "project";
 export type LeaseScope = "project";
+export type HealthStatus = "ok" | "degraded" | "failing";
+
+export interface HealthReport {
+  status: HealthStatus;
+  detail?: string;
+  metrics?: unknown;
+}
 
 export interface ManifestInput {
   module_id: string;
@@ -87,6 +96,7 @@ export type ProviderRoleInput =
 
 export interface ToolInput {
   name: string;
+  description?: string;
   execution_mode: ExecutionMode;
   schema: unknown;
 }
@@ -202,6 +212,8 @@ export type ProviderHandler = (
   ctx: ProviderRequestContext,
 ) => Promise<Uint8Array | void> | Uint8Array | void;
 
+export type ProviderHealthHandler = () => Promise<HealthReport> | HealthReport;
+
 export type Principal =
   | { kind: "reserved"; module_id: string }
   | { kind: "direct" }
@@ -232,6 +244,7 @@ export interface SubcProviderConnectOptions {
   connectionFile: string;
   manifest: ManifestInput;
   handler: ProviderHandler;
+  health?: ProviderHealthHandler;
   handshakeTimeoutMs?: number;
   controlOps?: string[] | null;
   onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision;
@@ -256,6 +269,7 @@ interface NormalizedSubcProviderConnectOptions {
   connectionFile: string;
   manifest: ManifestInput;
   handler: ProviderHandler;
+  health: ProviderHealthHandler;
   handshakeTimeoutMs?: number;
   controlOps?: string[] | null;
   onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision;
@@ -284,6 +298,44 @@ export interface ModuleHelloAckBody {
    * the storage library. Absent when no storage is configured.
    */
   storage?: unknown;
+}
+
+class AsyncPermitPool {
+  private available: number;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(capacity: number) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new SubcProviderError("provider handler capacity must be a positive integer", "invalid_handler_capacity");
+    }
+    this.available = capacity;
+  }
+
+  async acquire(): Promise<() => void> {
+    if (this.available > 0) {
+      this.available -= 1;
+      return this.releaseOnce();
+    }
+
+    await new Promise<void>((resolve) => {
+      this.waiters.push(resolve);
+    });
+    return this.releaseOnce();
+  }
+
+  private releaseOnce(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.waiters.shift();
+      if (next) {
+        next();
+      } else {
+        this.available += 1;
+      }
+    };
+  }
 }
 
 export class SubcProviderError extends Error {
@@ -352,6 +404,7 @@ export class SubcProvider {
   // A socket drop only makes the reply path stale; handlers may still finish their
   // durable work, and their late sends are ignored by the generation guard.
   private readonly inflight = new Map<string, AbortController>();
+  private readonly requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
   private reconnecting: Promise<void> | null = null;
   private generation = 1;
   private connectionEpoch = 1;
@@ -531,6 +584,14 @@ export class SubcProvider {
 
   private async handleControlRequest(frame: Frame, sock: SubcSocket, generation: number): Promise<void> {
     const request = parseJson(frame.body) as Partial<RouteBindRequest> & { op?: string };
+    if (request.op === HEALTH_CHECK_OP) {
+      void this.handleHealthRequest(frame, sock, generation).catch((err) => {
+        if (!this.closeStarted && this.sock === sock && this.generation === generation) {
+          console.warn("SubcProvider health handler failed after its request was dispatched", err);
+        }
+      });
+      return;
+    }
     if (request.op !== "route.bind") {
       throw new SubcProviderError(`unsupported module control request ${request.op ?? "<missing op>"}`);
     }
@@ -582,6 +643,7 @@ export class SubcProvider {
         );
       },
     };
+    const releasePermit = await (this.requestGate ?? new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY)).acquire();
     try {
       const body = await this.opts.handler(channel, frame.body, ctx);
       if (body === undefined) {
@@ -614,6 +676,48 @@ export class SubcProvider {
         generation,
       );
     } finally {
+      releasePermit();
+      if (this.inflight.get(key) === controller) this.inflight.delete(key);
+    }
+  }
+
+  private async handleHealthRequest(frame: Frame, sock: SubcSocket, generation: number): Promise<void> {
+    const { channel, corr, ver } = frame.header;
+    const key = routeKey(generation, channel, corr);
+    const controller = new AbortController();
+    this.inflight.set(key, controller);
+    const releasePermit = await (this.requestGate ?? new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY)).acquire();
+    try {
+      if (controller.signal.aborted) return;
+      const report = await this.opts.health();
+      await this.sendOn(
+        sock,
+        generation,
+        buildFrameWithVersion(
+          ver,
+          FrameType.Response,
+          controlFlags(),
+          channel,
+          corr,
+          encodeJson({
+            op: HEALTH_CHECK_OP,
+            status: report.status,
+            ...(report.detail === undefined ? {} : { detail: report.detail }),
+            ...(report.metrics === undefined ? {} : { metrics: report.metrics }),
+          }),
+        ),
+      );
+    } catch (err) {
+      await this.sendError(
+        frame,
+        err instanceof SubcProviderError && err.code ? err.code : "health_error",
+        err instanceof Error ? err.message : String(err),
+        controlFlags(),
+        sock,
+        generation,
+      );
+    } finally {
+      releasePermit();
       if (this.inflight.get(key) === controller) this.inflight.delete(key);
     }
   }
@@ -795,6 +899,7 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
     connectionFile: opts.connectionFile,
     manifest: opts.manifest,
     handler: opts.handler,
+    health: opts.health ?? (() => ({ status: "ok" })),
     handshakeTimeoutMs: opts.handshakeTimeoutMs,
     controlOps: opts.controlOps,
     onBind: opts.onBind,
@@ -807,6 +912,13 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
   };
 }
 
+function normalizedControlOps(controlOps: string[] | null | undefined): string[] | null {
+  if (controlOps === null) return null;
+  const merged = new Set(controlOps ?? []);
+  merged.add(HEALTH_CHECK_OP);
+  return [...merged];
+}
+
 function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
   const nonce = launchNonce(opts);
   return buildFrame(
@@ -817,7 +929,7 @@ function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
     encodeJson({
       manifest: normalizeManifest(opts.manifest),
       protocol_ver: PROTOCOL_VERSION,
-      control_ops: opts.controlOps === undefined ? null : opts.controlOps,
+      control_ops: normalizedControlOps(opts.controlOps),
       // Echo the one-time launch nonce subc injects for a reserved module
       // (SUBC_LAUNCH_NONCE), so only the daemon-spawned process can register a
       // reserved module_id. Omitted when unset (non-reserved / self-connecting).
@@ -944,6 +1056,7 @@ function normalizeProviderRole(role: ProviderRoleInput): ProviderRoleInput {
         role: "tool_provider",
         tools: role.tools.map((tool) => ({
           name: tool.name,
+          ...(tool.description === undefined ? {} : { description: tool.description }),
           execution_mode: tool.execution_mode,
           schema: tool.schema,
         })),

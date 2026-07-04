@@ -15,7 +15,10 @@ use serde_json::{json, Value};
 use subc_client_rs::{
     CallError, CallOptions, CloseRouteOptions, ConsumerOptions, RetryBackoff, SubcConsumer,
 };
-use subc_protocol::{BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget};
+use subc_control::{ClientControlRequest, ClientControlResponse};
+use subc_protocol::{
+    session::HealthStatus, BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget,
+};
 use subc_transport::{authenticate_client, read_frame, write_frame};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -105,6 +108,31 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     let mut client = connect_authed_client(&daemon.connection_file)
         .await
         .unwrap();
+    let health = control_rpc_on_stream(
+        &mut client,
+        99,
+        serde_json::to_value(ClientControlRequest::SupervisorHealthProbe {
+            module_id: MODULE_ID.to_string(),
+        })
+        .unwrap(),
+    )
+    .await;
+    let health: ClientControlResponse = serde_json::from_value(health).unwrap();
+    match health {
+        ClientControlResponse::SupervisorHealthProbe {
+            module_id,
+            status,
+            detail,
+            metrics,
+        } => {
+            assert_eq!(module_id, MODULE_ID);
+            assert_eq!(status, HealthStatus::Ok);
+            assert_eq!(detail, None);
+            assert_eq!(metrics, None);
+        }
+        other => panic!("unexpected health response: {other:?}"),
+    }
+
     let route_channel = open_route(&mut client, MODULE_ID, 100).await;
     wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
         event["kind"] == "bind" && event["route_channel"].as_u64() == Some(u64::from(route_channel))

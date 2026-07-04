@@ -23,7 +23,10 @@ use subc_protocol::{
         PipelineAppliesTo, PipelineStageKind, ProviderRole, StorageBinding, StorageKind,
         StorageScope, Tool, TrustTier,
     },
-    session::{ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    session::{
+        HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlResponse,
+        MODULE_CONTROL_OP_HEALTH_CHECK,
+    },
     ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, AuthError, ConnectionFileError};
@@ -58,6 +61,11 @@ const FAKE_AFT_TOOLCALL_RESULT_ENV: &str = "FAKE_AFT_TOOLCALL_RESULT";
 const FAKE_AFT_TOOLCALL_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_ERROR";
 const FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_SUBC_ERROR";
 const FAKE_AFT_TOOLS_ENV: &str = "FAKE_AFT_TOOLS";
+const FAKE_AFT_ADVERTISE_HEALTH_ENV: &str = "FAKE_AFT_ADVERTISE_HEALTH";
+const FAKE_AFT_HEALTH_NEVER_REPLY_ENV: &str = "FAKE_AFT_HEALTH_NEVER_REPLY";
+const FAKE_AFT_HEALTH_STATUS_ENV: &str = "FAKE_AFT_HEALTH_STATUS";
+const FAKE_AFT_HEALTH_DETAIL_ENV: &str = "FAKE_AFT_HEALTH_DETAIL";
+const FAKE_AFT_HEALTH_METRICS_ENV: &str = "FAKE_AFT_HEALTH_METRICS";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
@@ -200,7 +208,11 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
             &config.tools,
         ),
         protocol_ver: PROTOCOL_VERSION,
-        control_ops: None,
+        control_ops: if config.advertise_health {
+            Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()])
+        } else {
+            None
+        },
         launch_nonce: config.launch_nonce.clone(),
     })
     .map_err(StubError::Json)?;
@@ -669,6 +681,34 @@ async fn handle_control_request(
             state.bound_channels.insert(route_channel);
             emit_status_update(writer, config, frame.header.ver, route_channel).await?;
         }
+        ModuleControlRequest::HealthCheck {} => {
+            record_event(
+                config,
+                json!({
+                    "kind": "health_check",
+                    "corr": frame.header.corr,
+                }),
+            )?;
+            if config.health_never_reply {
+                return Ok(());
+            }
+            let body = serde_json::to_vec(&ModuleControlResponse::HealthCheck {
+                status: config.health_status,
+                detail: config.health_detail.clone(),
+                metrics: config.health_metrics.clone(),
+            })
+            .map_err(StubError::Json)?;
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                control_flags(),
+                0,
+                frame.header.corr,
+                body,
+            )
+            .map_err(StubError::FrameBuild)?;
+            send_outbound(writer, response).await?;
+        }
     }
     Ok(())
 }
@@ -982,6 +1022,7 @@ fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> 
                 .iter()
                 .map(|name| Tool {
                     name: name.clone(),
+                    description: None,
                     execution_mode: ExecutionMode::Pure,
                     schema: json!({"type": "object"}),
                 })
@@ -1084,6 +1125,11 @@ struct StubConfig {
     toolcall_error: bool,
     toolcall_subc_error: bool,
     tools: Vec<String>,
+    advertise_health: bool,
+    health_never_reply: bool,
+    health_status: HealthStatus,
+    health_detail: Option<String>,
+    health_metrics: Option<Value>,
     /// The launch nonce subc injected (reserved modules only); echoed in HELLO. A
     /// real supervised module reads this from the SUBC_LAUNCH_NONCE env var.
     launch_nonce: Option<String>,
@@ -1176,6 +1222,17 @@ impl StubConfig {
             toolcall_error: env_flag(FAKE_AFT_TOOLCALL_ERROR_ENV),
             toolcall_subc_error: env_flag(FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV),
             tools,
+            advertise_health: env_flag(FAKE_AFT_ADVERTISE_HEALTH_ENV),
+            health_never_reply: env_flag(FAKE_AFT_HEALTH_NEVER_REPLY_ENV),
+            health_status: health_status_from_env()?,
+            health_detail: env::var(FAKE_AFT_HEALTH_DETAIL_ENV)
+                .ok()
+                .filter(|value| !value.is_empty()),
+            health_metrics: env::var(FAKE_AFT_HEALTH_METRICS_ENV)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|raw| serde_json::from_str::<Value>(&raw).map_err(StubError::Json))
+                .transpose()?,
             launch_nonce: env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
                 .ok()
                 .filter(|value| !value.is_empty()),
@@ -1225,6 +1282,19 @@ enum StubRole {
     ManagementSurface,
     InternalService { service_id: String },
     PipelineStage,
+}
+
+fn health_status_from_env() -> Result<HealthStatus, StubError> {
+    match env::var(FAKE_AFT_HEALTH_STATUS_ENV)
+        .ok()
+        .as_deref()
+        .unwrap_or("ok")
+    {
+        "ok" => Ok(HealthStatus::Ok),
+        "degraded" => Ok(HealthStatus::Degraded),
+        "failing" => Ok(HealthStatus::Failing),
+        raw => Err(StubError::InvalidHealthStatus(raw.to_string())),
+    }
 }
 
 fn role_from_env() -> Result<StubRole, StubError> {
@@ -1299,6 +1369,7 @@ enum StubError {
         raw: String,
         source: std::num::ParseIntError,
     },
+    InvalidHealthStatus(String),
     InvalidConcurrency {
         raw: String,
     },
@@ -1358,6 +1429,10 @@ impl fmt::Display for StubError {
             Self::InvalidToolcallDelay { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_TOOLCALL_DELAY_MS_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidHealthStatus(raw) => write!(
+                f,
+                "invalid {FAKE_AFT_HEALTH_STATUS_ENV} value '{raw}': expected ok, degraded, or failing"
             ),
             Self::InvalidConcurrency { raw } => write!(
                 f,
@@ -1435,6 +1510,7 @@ impl Error for StubError {
             | Self::NoEndpoint { .. }
             | Self::InvalidEndpoint { .. }
             | Self::InvalidConcurrency { .. }
+            | Self::InvalidHealthStatus(_)
             | Self::InvalidRole { .. }
             | Self::InvalidMalformedBindReply { .. }
             | Self::WriterClosed

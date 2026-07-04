@@ -9,6 +9,11 @@ off `clientInfo.name` onto the existing trusted `--harness` flag, a normative
 raw-config schema + monotonic project-tier merge, search-mode dispatch pinned to
 a private binding table, meta-tool name reservation, the catalog-liveness
 exception, zero-tool provider route drop, and a concrete default-deny mechanism.
+v3 folds the re-gate (bg_03eb1252): schema aligned with the shipped
+`RawGatewayConfig` spelling and shapes, explicit null semantics, unknown-field
+rejection stated as an implementation requirement, project-tier `refresh`
+dropped, collision semantics corrected to the shipped whole-attach fail-closed,
+and monotonicity defined over the provider-callable set.
 
 ## 1. What v1 builds
 
@@ -47,20 +52,26 @@ project) share one schema. This EXTENDS the existing `RawGatewayConfig`
 ```jsonc
 {
   "version": 1,
-  "surface_mode": "full",            // "full" | "search"; absent = "full"
-  "refresh": "on-attach",            // "on-attach" | "immediate"; absent = "on-attach"
+  "surfaceMode": "full",             // "full" | "search"; absent = "full"; null = reset to absent
+  "refresh": "on-attach",            // "on-attach" | "immediate"; absent = "on-attach"; null = reset
                                      // "on-hard" | "on-soft" = RESERVED: parse error with
                                      // "requires a bust-signal source; not available on the MCP path"
   "providers": {
     "<module_id>": {
-      "enabled": true,               // tri-state: absent | null (delete tier's setting) | bool
+      "enabled": true,               // tri-state: absent | null (delete tier's setting) | bool (existing)
       "namespace": "aft",            // exposed-name prefix (existing)
       "tools": {
-        "default_enabled": true,     // existing
+        "defaultEnabled": true,      // existing (camelCase, matches shipped RawToolConfig)
         "overrides": {
-          "<bare_name>": {
-            "enabled": false,        // existing
-            "description": "…"       // NEW: model-facing description override
+          // Existing bool shorthand AND the new object form are both valid
+          // (serde untagged). bool = enable/disable; null = delete this
+          // override entry (existing semantics, preserved).
+          "<bare_name>": false,
+          "<other_name>": {
+            "enabled": false,        // absent = inherit defaultEnabled; null INVALID inside object
+                                     // (delete the whole entry with the null shorthand instead)
+            "description": "…"       // NEW: model-facing description override; absent = provider
+                                     // manifest description; null INVALID (omit instead)
           }
         }
       }
@@ -68,7 +79,7 @@ project) share one schema. This EXTENDS the existing `RawGatewayConfig`
   },
   "harness": {                       // NEW: per-harness overlay sections
     "<harness_name>": {
-      "surface_mode": "search",      // may override top-level
+      "surfaceMode": "search",       // may override top-level
       "refresh": "immediate",
       "providers": { /* same provider schema */ }
     }
@@ -76,9 +87,17 @@ project) share one schema. This EXTENDS the existing `RawGatewayConfig`
 }
 ```
 
-Unknown fields: rejected (fail-closed, existing posture). `harness` sections
-with names not matching the session's harness are ignored (not validated
-against a registry — free-form, lowercase-compared).
+Spelling and shape are NORMATIVE and match the shipped `RawGatewayConfig` /
+`RawToolConfig` (camelCase `defaultEnabled`; overrides accept the existing
+`bool | null` shorthand, extended with the object form via untagged deserialize).
+
+Unknown fields: rejected — an IMPLEMENTATION REQUIREMENT of this spec, not
+current behavior (the shipped Raw structs do not carry `deny_unknown_fields`;
+the build must add it at every level of this schema and gate-test it). This is
+what makes the reserved `refresh` values and future keys fail loud instead of
+silently no-oping. `harness` sections with names not matching the session's
+harness are ignored (not validated against a registry — free-form,
+lowercase-compared).
 
 ## 4. Composition algorithm (normative, monotonic)
 
@@ -115,13 +134,20 @@ global baseline is fully composed:
   project config).
 - `namespace`: DROPPED at project tier (renaming affects collision handling and
   model-facing names — identity-adjacent, global-only).
-- `surface_mode` / `refresh`: project may set `surface_mode:"search"` (strictly
-  narrowing exposure) and `refresh:"on-attach"`; `"full"` when global says
-  `"search"` and `"immediate"` when global says `"on-attach"` are DROPPED
-  (widening/faster-churn respectively).
+- `surfaceMode`: project may set `"search"` (strictly narrowing exposure);
+  `"full"` when the baseline says `"search"` is DROPPED (widening).
+- `refresh`: DROPPED at project tier entirely (WARN). Re-gate finding: letting
+  a project set `on-attach` under a global `immediate` would delay the user's
+  own revocations (a global disable would not apply until next attach) — an
+  in-repo file must not weaken revocation latency. `refresh` is global/harness
+  tier only.
 
-The result is monotone: for every tool, exposed(project applied) ⊆
-exposed(global baseline), and no model-facing string is project-controlled.
+The result is monotone over the PROVIDER-CALLABLE SET: for every provider
+tool, callable(project applied) ⊆ callable(global baseline), and no
+model-facing string is project-controlled. (`surfaceMode: "search"` changes
+the literal MCP tool list to the two meta-tools; monotonicity is stated over
+what is invokable through whatever surface is exposed, not over literal
+`tools/list` names.)
 
 ### 4.3 Description overrides
 
@@ -153,7 +179,8 @@ Config-file edits during a live session do not change the frozen policy;
 they become a PENDING change applied per the session's `refresh` mode:
 
 - **`on-attach` (default)** — applies at the next shim-session attach (new
-  conversation/process). Zero mid-session churn; the MCP analogue of
+  conversation/process). Zero mid-session CONFIG-POLICY churn (catalog
+  liveness still moves the served list, §5.2); the MCP analogue of
   "ride the next hard bust" (a fresh session IS a cold cache). Requires no
   persisted queue: config is the durable source; recompute at attach.
 - **`immediate`** — the module re-reads config lazily on request activity
@@ -189,10 +216,12 @@ When the resolved mode is `search`:
 ### 6.1 Meta-tool name reservation (Oracle S7)
 
 `tools_search` and `tools_invoke` are RESERVED exposed names in every mode.
-The collision pass (existing fail-closed machinery) treats a provider tool
-resolving to either name as a collision → that provider tool is excluded and
-an ERROR is logged (fail-closed on the colliding tool, not the whole session —
-consistent with existing per-collision handling).
+The collision pass treats a provider tool resolving to either name as a
+collision, and collisions keep the SHIPPED semantics: the ATTACH FAILS CLOSED
+with an error naming the colliding exposed name (the existing machinery aborts
+the session on any exposed-name collision; this spec does not change that —
+the fix is the user renaming the provider namespace). The v2 text claiming
+per-tool exclusion was wrong about the shipped behavior and is retracted.
 
 ## 7. Zero-tool providers get no route (Oracle S9)
 
@@ -218,11 +247,14 @@ route; v2 closes that.)
 
 The facade ships a built-in constant `FACADE_DEFAULT_DISABLED: &[&str] =
 &["magic-context", "llm-runner"]` — modules whose tool surfaces are
-agent-internal control planes, not host-facing tools. Semantics: these are
-treated as `enabled: absent → false` at baseline; the GLOBAL tier may
-explicitly enable them (`"magic-context": { "enabled": true }`), the project
-tier cannot (§4.2). This is a facade-local default, not a manifest change —
-revisit as a manifest capability flag (`facade_exposable`) if the list grows.
+agent-internal control planes, not host-facing tools. Semantics and ORDERING
+(load-bearing, because the shipped default is allow-by-absence via
+`unwrap_or(true)`): the constant is applied as the PRE-MERGE BASELINE — for
+these module IDs, absence means `enabled: false` instead of the default-true —
+BEFORE the global tier merges. The GLOBAL tier may explicitly enable them
+(`"magic-context": { "enabled": true }`); the project tier cannot (§4.2).
+This is a facade-local default, not a manifest change — revisit as a manifest
+capability flag (`facade_exposable`) if the list grows.
 
 Rationale for the two entries: `magic-context`'s `ctx_reduce` requires the
 shim-ephemeral → durable-session mapping that does not exist yet (the Mode-4
@@ -232,9 +264,12 @@ convergence design); `llm-runner`'s session ops are consumer APIs, not tools.
 
 - Composition: global-only; global harness-section override; project narrows;
   project attempts-to-grant dropped WITH warn; project description-override
-  dropped; project namespace dropped; null-deletes at global tier; null-at-
-  project-tier dropped when it would widen; unknown harness name ignored;
-  reserved refresh values rejected with the documented error.
+  dropped; project namespace dropped; project refresh dropped; null-deletes at
+  global tier; null-at-project-tier dropped when it would widen; unknown
+  harness name ignored; reserved refresh values rejected with the documented
+  error; UNKNOWN FIELDS rejected at every schema level; bool-shorthand and
+  object-form overrides both parse; existing configs (bool overrides,
+  camelCase defaultEnabled) parse unchanged.
 - Stickiness: mid-session config edit does not change served surface
   (`on-attach`); `immediate` recomputes + emits list_changed + just-disabled
   tool fails closed within the triggering request; provider death/rejoin still

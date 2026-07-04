@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 
-use subc_transport::{authenticate_server, AuthError, DAEMON_ID_LEN};
+use subc_transport::{authenticate_server, AuthError, DAEMON_ID_LEN, WATCHDOG_CLIENT_ROLE};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpListener,
@@ -188,7 +188,7 @@ where
         }
     };
 
-    authenticate_server(
+    let authenticated = authenticate_server(
         &mut stream,
         auth.key.as_ref(),
         &auth.daemon_id,
@@ -201,7 +201,8 @@ where
 
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
-    let _connected_client = auth.connected_clients.open(connection_id);
+    let _connected_client = (authenticated.role != WATCHDOG_CLIENT_ROLE)
+        .then(|| auth.connected_clients.open(connection_id));
     let close_receiver = connection.take_close_receiver();
     debug!(
         connection_id = connection_id.get(),

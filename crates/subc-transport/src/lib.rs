@@ -10,9 +10,10 @@ pub mod connection_file;
 pub mod frame_io;
 
 pub use auth::{
-    authenticate_client, authenticate_server, compute_proof, AuthError, AuthStage, Authenticated,
-    ClientAuth, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE,
-    MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
+    authenticate_client, authenticate_client_with_role, authenticate_server, compute_proof,
+    AuthError, AuthStage, Authenticated, ClientAuth, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN,
+    DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
+    WATCHDOG_CLIENT_ROLE,
 };
 pub use connection_file::{
     generate_daemon_id, generate_key, read, write_atomic, ConnectionFileError, ConnectionInfo,

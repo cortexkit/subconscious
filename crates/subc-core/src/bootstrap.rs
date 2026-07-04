@@ -24,8 +24,9 @@ use tracing::{error, info, warn};
 use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
-    ConnectedClients, ControlHandler, ForwardingTable, ModuleSpec, Registry, RestartPolicy, Router,
-    Supervisor, SupervisorHandle, SupervisorProcessLiveness,
+    ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig,
+    ForwardingTable, ModuleSpec, Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
+    SupervisorProcessLiveness,
 };
 use std::sync::Arc;
 
@@ -53,6 +54,7 @@ pub struct BootstrapConfig {
     pub daemon_ver: String,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
+    watchdog_config: DaemonSelfWatchdogConfig,
 }
 
 impl BootstrapConfig {
@@ -63,6 +65,7 @@ impl BootstrapConfig {
             daemon_ver: DAEMON_VERSION.to_owned(),
             configured_modules: Vec::new(),
             storage_config: None,
+            watchdog_config: DaemonSelfWatchdogConfig::default(),
         }
     }
 
@@ -140,6 +143,11 @@ impl BootstrapConfig {
         self.storage_config = storage_config;
         self
     }
+
+    pub fn with_watchdog_config(mut self, watchdog_config: DaemonSelfWatchdogConfig) -> Self {
+        self.watchdog_config = watchdog_config;
+        self
+    }
 }
 
 /// Result of singleton discovery.
@@ -185,13 +193,14 @@ pub async fn run() -> Result<(), BootstrapError> {
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
     let configured_modules = config.configured_modules.clone();
     let storage_config = config.storage_config.clone();
+    let watchdog_config = config.watchdog_config.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
             Ok(())
         }
         Outcome::Bound(bound) => {
-            serve_bound_daemon(bound, configured_modules, storage_config).await
+            serve_bound_daemon(bound, configured_modules, storage_config, watchdog_config).await
         }
     }
 }
@@ -207,6 +216,7 @@ async fn serve_bound_daemon(
     bound: BoundDaemon,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
+    watchdog_config: DaemonSelfWatchdogConfig,
 ) -> Result<(), BootstrapError> {
     info!(
         connection_file = %bound.connection_file_path.display(),
@@ -246,6 +256,14 @@ async fn serve_bound_daemon(
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     tokio::task::yield_now().await;
+    let _watchdog_task = AbortOnDrop::new(
+        DaemonSelfWatchdog::new(
+            bound.connection_info.clone(),
+            bound.connection_file_path.clone(),
+        )
+        .with_config(watchdog_config)
+        .spawn(),
+    );
 
     for configured in configured_modules {
         let enabled = configured.enabled;

@@ -17,6 +17,7 @@ pub const MAX_AUTH_MESSAGE_LEN: u32 = 4096;
 pub const SERVER_PROOF_DOMAIN: &str = "subc-server-v1";
 pub const CLIENT_AUTH_DOMAIN: &str = "subc-client-v1";
 pub const DEFAULT_CLIENT_ROLE: &str = "client";
+pub const WATCHDOG_CLIENT_ROLE: &str = "watchdog";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -222,8 +223,20 @@ pub async fn authenticate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    authenticate_client_with_role(stream, conn, deadline, DEFAULT_CLIENT_ROLE).await
+}
+
+pub async fn authenticate_client_with_role<S>(
+    stream: &mut S,
+    conn: &ConnectionInfo,
+    deadline: Duration,
+    role: &str,
+) -> Result<(), AuthError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let deadline = Deadline::starting_now(deadline);
-    let result = authenticate_client_inner(stream, conn, deadline).await;
+    let result = authenticate_client_inner(stream, conn, deadline, role).await;
     if result.is_err() {
         let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
     }
@@ -234,6 +247,7 @@ async fn authenticate_client_inner<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
     deadline: Deadline,
+    role: &str,
 ) -> Result<(), AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -246,7 +260,7 @@ where
         AuthStage::ClientHello,
         &ClientHello {
             client_nonce,
-            role: DEFAULT_CLIENT_ROLE.to_owned(),
+            role: role.to_owned(),
         },
         deadline,
     )

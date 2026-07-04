@@ -16,6 +16,7 @@ pub mod registry;
 pub mod router;
 pub mod server;
 pub mod supervise;
+pub mod watchdog;
 
 #[cfg(feature = "bench-harness")]
 pub mod bench_harness;
@@ -43,4 +44,8 @@ pub use supervise::{
     ExitKind, ExitReport, HealthAction, HealthConfig, ModuleHealthStatus, ModuleProcessLiveness,
     ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError, SupervisedModule,
     Supervisor, SupervisorHandle, SupervisorProcessLiveness, SUBC_ARG,
+};
+pub use watchdog::{
+    DaemonSelfWatchdog, DaemonSelfWatchdogConfig, WatchdogStage, WatchdogTickError,
+    DEFAULT_SELF_WATCHDOG_DEADLINE, DEFAULT_SELF_WATCHDOG_INTERVAL,
 };

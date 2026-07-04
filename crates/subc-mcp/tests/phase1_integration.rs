@@ -1711,7 +1711,7 @@ async fn mcp_project_config_allowlist_mode_exposes_only_overrides() {
 }
 
 #[tokio::test]
-async fn mcp_two_tier_config_project_overrides_user_and_null_deletes_override() {
+async fn mcp_project_tier_cannot_reenable_user_denied_tools_or_null_delete_denies() {
     let user_config = r#"
     {
       "version": 1,
@@ -1743,16 +1743,13 @@ async fn mcp_two_tier_config_project_overrides_user_and_null_deletes_override() 
     )
     .await;
 
-    assert_eq!(
-        list_tool_names(&harness).await,
-        vec!["aft_read", "aft_write"]
-    );
+    assert_eq!(list_tool_names(&harness).await, Vec::<String>::new());
 
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn mcp_provider_level_null_resets_restore_defaults() {
+async fn mcp_project_provider_level_null_cannot_reset_user_denies() {
     let user_config = r#"
     {
       "version": 1,
@@ -1760,7 +1757,7 @@ async fn mcp_provider_level_null_resets_restore_defaults() {
         "aft": {
           "enabled": false,
           "namespace": "renamed",
-          "tools": { "default_enabled": false }
+          "tools": { "defaultEnabled": false }
         }
       }
     }
@@ -1785,26 +1782,21 @@ async fn mcp_provider_level_null_resets_restore_defaults() {
     )
     .await;
 
-    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
-    let result = harness
+    assert_eq!(list_tool_names(&harness).await, Vec::<String>::new());
+    let err = harness
         .client
         .peer()
         .call_tool(CallToolRequestParams::new("aft_read"))
         .await
-        .unwrap();
-    assert_eq!(result.is_error, Some(false));
-    let event = wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
-        event.get("kind") == Some(&Value::String("tool_call".to_owned()))
-    })
-    .await;
-    assert_eq!(event.get("name"), Some(&Value::String("read".to_owned())));
+        .unwrap_err();
+    assert_unknown_tool_error(err, "aft_read");
 
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn mcp_namespace_override_changes_exposed_prefix() {
-    let project_config = r#"
+async fn mcp_global_namespace_override_changes_exposed_prefix() {
+    let user_config = r#"
     {
       "version": 1,
       "providers": {
@@ -1815,8 +1807,8 @@ async fn mcp_namespace_override_changes_exposed_prefix() {
     let harness = McpHarness::start_configured(
         "mcp-namespace",
         vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        Some(user_config),
         None,
-        Some(project_config),
     )
     .await;
 
@@ -1838,8 +1830,248 @@ async fn mcp_namespace_override_changes_exposed_prefix() {
 }
 
 #[tokio::test]
-async fn mcp_invalid_namespace_fails_attach_closed() {
+async fn mcp_project_namespace_and_description_overrides_are_dropped() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": {
+          "tools": {
+            "overrides": {
+              "read": { "description": "global read description" }
+            }
+          }
+        }
+      }
+    }
+    "#;
     let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": {
+          "namespace": "project",
+          "tools": {
+            "overrides": {
+              "read": { "description": "project read description" }
+            }
+          }
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-project-dropped-strings",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        Some(user_config),
+        Some(project_config),
+    )
+    .await;
+
+    let tools = harness.client.peer().list_tools(None).await.unwrap().tools;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "aft_read");
+    assert_eq!(
+        tools[0].description.as_deref(),
+        Some("global read description")
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_project_attempts_to_grant_are_dropped_with_warning() {
+    let label = "mcp-project-grant-warning";
+    let server = TestServer::start().await;
+    let events_path = server
+        .daemon
+        .temp_dir
+        .join(format!("{label}-aft-events.jsonl"));
+    let provider = supervisor(&server)
+        .spawn(stub_spec(
+            "aft",
+            &events_path,
+            &[("FAKE_AFT_TOOLS", "read")],
+        ))
+        .unwrap();
+    wait_for_registration(&server.daemon.registry, "aft", READ_TIMEOUT).await;
+
+    let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
+    fs::create_dir_all(&user_config_home).unwrap();
+    write_user_mcp_config(
+        &user_config_home,
+        r#"
+        {
+          "version": 1,
+          "providers": { "aft": { "enabled": false } }
+        }
+        "#,
+    );
+
+    let module_connection_file = server
+        .daemon
+        .temp_dir
+        .join(format!("{label}-subc-mcp.json"));
+    let (mut module, mut module_stderr) = spawn_module_with_stderr(
+        &server.daemon.connection_file_path,
+        &module_connection_file,
+        &user_config_home,
+    );
+    wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
+
+    let project = TestProject::new(label);
+    write_project_mcp_config(
+        &project.path,
+        r#"
+        {
+          "version": 1,
+          "providers": { "aft": { "enabled": true } }
+        }
+        "#,
+    );
+
+    let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
+    let client_handler = TestMcpClient::new();
+    let client = shim.serve_mcp_client(client_handler).await;
+    assert_eq!(
+        list_tool_names_on_peer(client.peer()).await,
+        Vec::<String>::new()
+    );
+    let stderr = wait_for_child_stderr_contains(
+        &mut module_stderr,
+        "dropping project MCP config field providers.aft.enabled",
+        READ_TIMEOUT,
+    )
+    .await;
+    assert!(
+        stderr.contains("cannot enable a provider disabled by the user baseline"),
+        "warning should explain why the grant was dropped: {stderr}"
+    );
+
+    let _ = client.cancel().await;
+    let _ = timeout(Duration::from_secs(2), shim.child.wait()).await;
+    if module.try_wait().unwrap().is_none() {
+        let _ = module.start_kill();
+        let _ = timeout(Duration::from_secs(2), module.wait()).await;
+    }
+    provider.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_zero_tool_provider_gets_no_route() {
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "aft": { "tools": { "defaultEnabled": false } }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-zero-tool-provider",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        None,
+        Some(project_config),
+    )
+    .await;
+
+    assert_eq!(list_tool_names(&harness).await, Vec::<String>::new());
+    wait_for_binding_count(&harness.server.daemon.forwarding, 0, READ_TIMEOUT).await;
+    assert_no_stub_event_within(
+        harness.provider_events_path("aft"),
+        QUIET_TIMEOUT,
+        |event| event.get("kind") == Some(&Value::String("attach".to_owned())),
+    )
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_facade_default_deny_requires_global_enable() {
+    let default_harness = McpHarness::start_configured(
+        "mcp-default-deny-absent",
+        vec![StubProvider::new(
+            "magic-context",
+            &[("FAKE_AFT_TOOLS", "read")],
+        )],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&default_harness).await,
+        Vec::<String>::new()
+    );
+    wait_for_binding_count(&default_harness.server.daemon.forwarding, 0, READ_TIMEOUT).await;
+    default_harness.shutdown().await;
+
+    let global_config = r#"
+    {
+      "version": 1,
+      "providers": { "magic-context": { "enabled": true } }
+    }
+    "#;
+    let global_harness = McpHarness::start_configured(
+        "mcp-default-deny-global",
+        vec![StubProvider::new(
+            "magic-context",
+            &[("FAKE_AFT_TOOLS", "read")],
+        )],
+        Some(global_config),
+        None,
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&global_harness).await,
+        vec!["magic-context_read"]
+    );
+    global_harness.shutdown().await;
+
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": { "magic-context": { "enabled": true } }
+    }
+    "#;
+    let project_harness = McpHarness::start_configured(
+        "mcp-default-deny-project",
+        vec![StubProvider::new(
+            "magic-context",
+            &[("FAKE_AFT_TOOLS", "read")],
+        )],
+        None,
+        Some(project_config),
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&project_harness).await,
+        Vec::<String>::new()
+    );
+    wait_for_binding_count(&project_harness.server.daemon.forwarding, 0, READ_TIMEOUT).await;
+    project_harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_meta_tool_name_collision_fails_attach_closed() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "providers": { "aft": { "namespace": "tools" } }
+    }
+    "#;
+    expect_shim_attach_failure(
+        "mcp-meta-reserved-collision",
+        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "search")])],
+        Some(user_config),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_invalid_namespace_fails_attach_closed() {
+    let user_config = r#"
     {
       "version": 1,
       "providers": {
@@ -1850,8 +2082,8 @@ async fn mcp_invalid_namespace_fails_attach_closed() {
     expect_shim_attach_failure(
         "mcp-invalid-namespace",
         vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        Some(user_config),
         None,
-        Some(project_config),
     )
     .await;
 }
@@ -1869,7 +2101,7 @@ async fn mcp_invalid_tool_name_fails_attach_closed() {
 
 #[tokio::test]
 async fn mcp_namespace_collision_fails_attach_closed() {
-    let project_config = r#"
+    let user_config = r#"
     {
       "version": 1,
       "providers": {
@@ -1884,8 +2116,8 @@ async fn mcp_namespace_collision_fails_attach_closed() {
             StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")]),
             StubProvider::new("mc", &[("FAKE_AFT_TOOLS", "read")]),
         ],
+        Some(user_config),
         None,
-        Some(project_config),
     )
     .await;
 }
@@ -1980,6 +2212,252 @@ async fn mcp_catalog_poller_adds_new_provider_and_notifies() {
         list_tool_names(&harness).await,
         vec!["aft_read", "mc_memory"]
     );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_on_attach_refresh_keeps_mid_session_config_edits_sticky() {
+    let harness = McpHarness::start_configured(
+        "mcp-on-attach-sticky",
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "read,write")],
+        )],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "aft_write"]
+    );
+
+    write_project_mcp_config(
+        &harness._project.path,
+        r#"
+        {
+          "version": 1,
+          "providers": {
+            "aft": { "tools": { "overrides": { "write": false } } }
+          }
+        }
+        "#,
+    );
+
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "aft_write"]
+    );
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("aft_write"))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_immediate_refresh_recomputes_before_triggering_call_and_notifies() {
+    let user_config = r#"{ "version": 1, "refresh": "immediate" }"#;
+    let harness = McpHarness::start_configured(
+        "mcp-immediate-refresh",
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "read,write")],
+        )],
+        Some(user_config),
+        None,
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "aft_write"]
+    );
+
+    let baseline = harness
+        .client_handler
+        .tool_list_changed_count
+        .load(Ordering::SeqCst);
+    write_project_mcp_config(
+        &harness._project.path,
+        r#"
+        {
+          "version": 1,
+          "providers": {
+            "aft": { "tools": { "overrides": { "write": false } } }
+          }
+        }
+        "#,
+    );
+
+    let err = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("aft_write"))
+        .await
+        .unwrap_err();
+    assert_unknown_tool_error(err, "aft_write");
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        baseline,
+        "tools/list_changed after immediate policy refresh",
+    )
+    .await;
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
+    assert_no_stub_event_within(
+        harness.provider_events_path("aft"),
+        QUIET_TIMEOUT,
+        |event| {
+            event.get("kind") == Some(&Value::String("tool_call".to_owned()))
+                && event.get("name") == Some(&Value::String("write".to_owned()))
+        },
+    )
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_search_mode_exposes_meta_surface_and_private_invocation() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "surfaceMode": "search",
+      "providers": {
+        "aft": { "tools": { "overrides": { "bash": false } } }
+      }
+    }
+    "#;
+    let mut harness = McpHarness::start_configured(
+        "mcp-search-mode",
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "write,bash,read")],
+        )],
+        Some(user_config),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["tools_invoke", "tools_search"]
+    );
+
+    let direct_err = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("aft_read"))
+        .await
+        .unwrap_err();
+    assert_unknown_tool_error(direct_err, "aft_read");
+    assert_no_stub_event_within(
+        harness.provider_events_path("aft"),
+        QUIET_TIMEOUT,
+        |event| event.get("kind") == Some(&Value::String("tool_call".to_owned())),
+    )
+    .await;
+
+    let mut search_args = JsonObject::new();
+    search_args.insert("query".to_owned(), json!("aft_"));
+    let search_result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("tools_search").with_arguments(search_args))
+        .await
+        .unwrap();
+    let search_json = result_json(&search_result);
+    let names = search_json
+        .as_array()
+        .expect("tools_search should return an array")
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["aft_read", "aft_write"]);
+
+    let mut invoke_args = JsonObject::new();
+    invoke_args.insert("name".to_owned(), json!("aft_read"));
+    invoke_args.insert("arguments".to_owned(), json!({ "value": "via invoke" }));
+    let invoke_result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("tools_invoke").with_arguments(invoke_args))
+        .await
+        .unwrap();
+    assert_eq!(invoke_result.is_error, Some(false));
+    let event = wait_for_stub_event(harness.provider_events_path("aft"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("tool_call".to_owned()))
+    })
+    .await;
+    assert_eq!(event.get("name"), Some(&Value::String("read".to_owned())));
+    assert_eq!(
+        event.pointer("/arguments/value"),
+        Some(&json!("via invoke"))
+    );
+
+    for missing in ["aft_bash", "aft_missing"] {
+        let mut args = JsonObject::new();
+        args.insert("name".to_owned(), json!(missing));
+        let err = harness
+            .client
+            .peer()
+            .call_tool(CallToolRequestParams::new("tools_invoke").with_arguments(args))
+            .await
+            .unwrap_err();
+        assert_unknown_tool_error(err, missing);
+    }
+
+    let before_death = harness
+        .client_handler
+        .tool_list_changed_count
+        .load(Ordering::SeqCst);
+    harness.providers.get("aft").unwrap().stop().await.unwrap();
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        before_death,
+        "tools/list_changed after search-mode provider death",
+    )
+    .await;
+    let mut dead_args = JsonObject::new();
+    dead_args.insert("name".to_owned(), json!("aft_read"));
+    let dead_err = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("tools_invoke").with_arguments(dead_args))
+        .await
+        .unwrap_err();
+    assert_unknown_tool_error(dead_err, "aft_read");
+
+    let before_rejoin = harness
+        .client_handler
+        .tool_list_changed_count
+        .load(Ordering::SeqCst);
+    harness
+        .spawn_provider("aft", &[("FAKE_AFT_TOOLS", "read,write,bash")])
+        .await;
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        before_rejoin,
+        "tools/list_changed after search-mode provider rejoin",
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["tools_invoke", "tools_search"]
+    );
+    let mut rejoin_args = JsonObject::new();
+    rejoin_args.insert("name".to_owned(), json!("aft_read"));
+    let rejoin_result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("tools_invoke").with_arguments(rejoin_args))
+        .await
+        .unwrap();
+    assert_eq!(rejoin_result.is_error, Some(false));
 
     harness.shutdown().await;
 }
@@ -3348,6 +3826,25 @@ fn result_text(result: &rmcp::model::CallToolResult) -> &str {
         .and_then(|content| content.as_text())
         .map(|text| text.text.as_str())
         .expect("tool result should contain text content")
+}
+
+fn result_json(result: &rmcp::model::CallToolResult) -> Value {
+    serde_json::from_str(result_text(result)).unwrap_or_else(|err| {
+        panic!(
+            "tool result text should be JSON, got {:?}: {err}",
+            result_text(result)
+        )
+    })
+}
+
+fn assert_unknown_tool_error(error: ServiceError, name: &str) {
+    match error {
+        ServiceError::McpError(error) => {
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message, format!("unknown tool '{name}'"));
+        }
+        other => panic!("expected invalid-params unknown-tool error for {name}, got {other:?}"),
+    }
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

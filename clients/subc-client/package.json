@@ -1,19 +1,22 @@
 {
   "name": "@cortexkit/subc-client",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "TypeScript client for the subc daemon. Wire-compatible (byte-for-byte) with the Rust subc-transport handshake and subc-protocol envelope.",
   "type": "module",
   "exports": {
     ".": {
-      "types": "./src/index.ts",
-      "import": "./src/index.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
   "files": [
+    "dist",
     "src",
     "README.md"
   ],
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
     "test": "bun test",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit"
   },

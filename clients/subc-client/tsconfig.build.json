@@ -1,0 +1,20 @@
+{
+  // Emit config for the published package: compiled JS + .d.ts into dist/.
+  // The dev tsconfig.json stays noEmit (typecheck only); this one exists so the
+  // package can be published as plain JS — raw-TS publishing breaks any Node
+  // consumer that resolves the package from node_modules at runtime (Node
+  // refuses to strip types under node_modules).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    // Emit-safe module settings: source imports carry explicit .js extensions,
+    // so plain ESM emit resolves correctly in Node without a bundler.
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src"]
+}

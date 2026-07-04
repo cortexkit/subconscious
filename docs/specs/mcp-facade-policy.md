@@ -1,17 +1,23 @@
-# MCP-Facade Tool-Surface Policy — Implementation Spec (v1)
+# MCP-Facade Tool-Surface Policy — Implementation Spec (v2)
 
 Implements §2/§3 of `docs/subc-mcp-gateway-design.md` for the generic-MCP-host
 path. Scope: `crates/subc-mcp` only. subc-core is untouched (thin-core §5 of the
 design doc holds).
+
+v2 incorporates the Oracle gate findings (bg_284e68fb): harness identity moved
+off `clientInfo.name` onto the existing trusted `--harness` flag, a normative
+raw-config schema + monotonic project-tier merge, search-mode dispatch pinned to
+a private binding table, meta-tool name reservation, the catalog-liveness
+exception, zero-tool provider route drop, and a concrete default-deny mechanism.
 
 ## 1. What v1 builds
 
 1. **Static-layer policy composition** (module-composed): the facade resolves
    its tool surface from config-home files at session attach.
 2. **Per-session sticky surface + pending-changes queue** with the drain
-   classes that are honest on this path (§4).
+   classes that are honest on this path (§5).
 3. **`surface_mode: "search"`** — the discover-on-demand meta-surface.
-4. **Per-tool description overrides** (model-facing description rewrite).
+4. **Per-tool description overrides** (global/harness tiers only; §4.3).
 
 Explicit non-goals for v1: `code` mode (QuickJS), caller-composed dynamic
 layers (agent-role/model/session — no trusted caller exists on this path;
@@ -19,121 +25,228 @@ layers (agent-role/model/session — no trusted caller exists on this path;
 `policy.set` wire op (no CK app yet; config files are the only writer, same
 read-only-consumer model as every other module).
 
-## 2. Layers and composition (facade path)
+## 2. Harness identity (v2: trusted flag, not client claim)
 
-Three static layers, deep-merged (later wins, `null` deletes, allow-then-deny
-within a layer):
+The harness layer keys on **`ShimHello.harness`** — the existing `--harness`
+CLI flag the USER writes into their own MCP client config
+(`subc-mcp shim --harness claude-code`), defaulting to `DEFAULT_HARNESS`.
 
-```
-global   ~/.config/cortexkit/mcp.jsonc          (top-level keys)
-harness  same files, `harness.<client>` section (keyed by MCP clientInfo.name)
-project  <root>/.cortexkit/mcp.jsonc            (top-level keys, then its own harness section)
-```
+Why not MCP `clientInfo.name`: (a) it is not available at attach — the shim
+sends `ShimHello` and the module attaches the session BEFORE MCP `initialize`
+flows; (b) it is host-claimed, and a host claiming an unknown name would dodge
+a restrictive harness profile. `--harness` is user-authored config (the same
+trust origin as the config files themselves), attach-time available, and
+host-unspoofable. No wire change needed — the field already exists.
 
-- The harness key is the `clientInfo.name` the host sends at MCP `initialize`
-  (e.g. `"claude-code"`, `"codex"`), lowercased. The shim already receives it;
-  it must be forwarded to the module in the attach payload.
-- An unknown/absent clientInfo.name simply means the harness layer contributes
-  nothing (global+project only). Not an error.
-- Project layer keeps the existing trust posture: it may only NARROW the
-  surface (deny/disable); privileged grants (enabling a module the global tier
-  disabled) are global-tier-only. Same per-tier-file trust model as config
-  unification.
+## 3. Raw config schema (normative)
 
-Resolved flat shape (persisted per session, from design doc §2.3):
+Both files (`~/.config/cortexkit/mcp.jsonc` global, `<root>/.cortexkit/mcp.jsonc`
+project) share one schema. This EXTENDS the existing `RawGatewayConfig`
+(version + providers) — existing fields keep their exact semantics.
 
 ```jsonc
 {
-  "surface_mode": "full",            // "full" | "search"
-  "refresh": "on-attach",            // §4
-  "tools": [ { "module_id", "bare_name", "exposed_name", "execution_mode", "enabled" } ],
-  "overrides": { "<exposed_name>": { "description": "…" } }
+  "version": 1,
+  "surface_mode": "full",            // "full" | "search"; absent = "full"
+  "refresh": "on-attach",            // "on-attach" | "immediate"; absent = "on-attach"
+                                     // "on-hard" | "on-soft" = RESERVED: parse error with
+                                     // "requires a bust-signal source; not available on the MCP path"
+  "providers": {
+    "<module_id>": {
+      "enabled": true,               // tri-state: absent | null (delete tier's setting) | bool
+      "namespace": "aft",            // exposed-name prefix (existing)
+      "tools": {
+        "default_enabled": true,     // existing
+        "overrides": {
+          "<bare_name>": {
+            "enabled": false,        // existing
+            "description": "…"       // NEW: model-facing description override
+          }
+        }
+      }
+    }
+  },
+  "harness": {                       // NEW: per-harness overlay sections
+    "<harness_name>": {
+      "surface_mode": "search",      // may override top-level
+      "refresh": "immediate",
+      "providers": { /* same provider schema */ }
+    }
+  }
 }
 ```
 
-## 3. Stickiness
+Unknown fields: rejected (fail-closed, existing posture). `harness` sections
+with names not matching the session's harness are ignored (not validated
+against a registry — free-form, lowercase-compared).
 
-The surface is resolved ONCE at shim-session attach and frozen for that
-session. Config edits during a live session do NOT change the served surface;
-they land in a pending change (§4). This mirrors the frozen-render-config
-discipline: a stable tool block is a cache-stability input for the host's own
-provider prefix cache.
+## 4. Composition algorithm (normative, monotonic)
 
-## 4. Refresh / drain classes — honest v1 set
+### 4.1 Order
 
-The ratified design names `immediate | on-hard | on-soft`. `on-hard`/`on-soft`
-require a bust-class signal source, which exists on the owned path (cache-core
-pass classes) but NOT here: the facade never sees the host's provider passes.
-Pretending otherwise would be a dead knob. v1 therefore ships:
+```
+1. global top-level
+2. global harness.<h> section
+3. project top-level          (narrowing-only, §4.2)
+4. project harness.<h> section (narrowing-only, §4.2)
+```
 
-- **`on-attach` (default)** — pending changes apply at the next shim-session
-  attach (new conversation/process). Zero mid-session cache damage ever; the
-  natural MCP analogue of "ride the next hard bust" (a fresh session IS a cold
-  cache).
-- **`immediate`** — pending changes apply on the next config re-read tick: the
-  module updates the session surface and emits `notifications/tools/list_changed`
-  through the shim. The host re-fetches; its next request pays the prefix bust.
-  For freshness-over-economics users and ephemeral use.
+Steps 1-2 use the existing later-wins merge (`merge_gateway_config` semantics:
+`Missing` no-op, `Null` deletes/resets, `Value` sets). Both are user-authored
+files in the user's home — full trust, may grant or narrow.
 
-`on-hard`/`on-soft` are RESERVED words in the schema (rejected with a clear
-"requires a bust-signal source; not available on the MCP path" error, so the
-future owned-path/ai-proxy integration can claim them without a breaking
-change).
+### 4.2 Project tier is narrowing-only (v2, closes the grant hole)
 
-Pending-change detection: mtime-based config re-read (the same mechanism MC
-uses for its config), evaluated lazily on request activity — no watcher thread.
+The project file is in-repo = untrusted (same per-tier-file trust model as
+config unification). Its merge is a RESTRICTED operator applied AFTER the
+global baseline is fully composed:
 
-## 5. `surface_mode: "search"`
+- `enabled`: may set `false`. `true` and `null` are DROPPED (with a WARN log
+  naming the field) when the baseline has the provider disabled — a project
+  cannot enable a provider the user disabled, and cannot null-delete a deny.
+  Setting `true` on an already-enabled provider is a no-op (allowed, harmless).
+- `tools.default_enabled`: may set `false`; `true`/`null` dropped unless the
+  baseline already has it `true`.
+- `tools.overrides.<t>.enabled`: may set `false`; `true`/`null` dropped unless
+  already enabled in the baseline.
+- `tools.overrides.<t>.description`: DROPPED at project tier entirely (WARN).
+  An in-repo file rewriting model-facing tool descriptions is a prompt-injection
+  channel (Oracle finding; same class as AFT dropping privileged fields from
+  project config).
+- `namespace`: DROPPED at project tier (renaming affects collision handling and
+  model-facing names — identity-adjacent, global-only).
+- `surface_mode` / `refresh`: project may set `surface_mode:"search"` (strictly
+  narrowing exposure) and `refresh:"on-attach"`; `"full"` when global says
+  `"search"` and `"immediate"` when global says `"on-attach"` are DROPPED
+  (widening/faster-churn respectively).
 
-When `search`, the facade exposes exactly two MCP tools instead of the resolved
-list:
+The result is monotone: for every tool, exposed(project applied) ⊆
+exposed(global baseline), and no model-facing string is project-controlled.
 
+### 4.3 Description overrides
+
+Global/harness tiers only (§4.2). Applied to the MCP `Tool.description` served
+to the host. The schema is never overridable (schema comes from the provider
+manifest verbatim — existing behavior).
+
+## 5. Stickiness, refresh, and the liveness exception
+
+### 5.1 Frozen policy at attach
+
+The RESOLVED POLICY is computed once at shim-session attach (the existing
+`attach_session` → config read → `desired_session_from_catalog` flow already
+does this — v1 formalizes it) and frozen for the session.
+
+### 5.2 The liveness exception (explicit, Oracle S5)
+
+POLICY is frozen; LIVENESS is not. Catalog changes (provider registers,
+provider GOODBYE/dies) continue to mutate the served surface immediately and
+emit `tools/list_changed`, exactly as today. Rationale: a dead provider's tools
+are not servable regardless of policy, and a newly-live provider that the
+frozen policy enables was always intended to be present (its absence was an
+outage, not a decision). The frozen object is the POLICY (which tools WOULD be
+exposed); the served list is `frozen_policy ∩ live_catalog`.
+
+### 5.3 Refresh modes
+
+Config-file edits during a live session do not change the frozen policy;
+they become a PENDING change applied per the session's `refresh` mode:
+
+- **`on-attach` (default)** — applies at the next shim-session attach (new
+  conversation/process). Zero mid-session churn; the MCP analogue of
+  "ride the next hard bust" (a fresh session IS a cold cache). Requires no
+  persisted queue: config is the durable source; recompute at attach.
+- **`immediate`** — the module re-reads config lazily on request activity
+  (mtime check, no watcher thread). On change: recompute the policy, update
+  the session's frozen policy in place, emit `tools/list_changed`. The host
+  re-fetches and its next request pays the prefix bust. Sequencing note: the
+  recompute happens BEFORE dispatching the request that triggered the mtime
+  check, so a call to a just-disabled tool fails closed (`unknown tool`) even
+  within the triggering request.
+
+`on-hard` / `on-soft` remain reserved (§3) for the owned-path integration.
+
+## 6. `surface_mode: "search"`
+
+When the resolved mode is `search`:
+
+- `tools/list` returns EXACTLY two tools: `tools_search` and `tools_invoke`.
+- **The outer `tools/call` dispatch accepts ONLY those two names** (Oracle S6).
+  The resolved per-tool bindings move to a PRIVATE table reachable only through
+  `tools_invoke` — a direct `tools/call` on a resolved tool name returns the
+  same error as a nonexistent tool. No bypass.
 - `tools_search { query: string, limit?: number }` → ranked matches over the
-  resolved set: `[{ name, description, input_schema, execution_mode }]`.
-  Matching is name+description substring/token match (no embedding dependency —
-  the resolved sets are small enough that lexical is honest).
-- `tools_invoke { name: string, arguments: object }` → validates `name` is in
-  the resolved set (fail-closed `unknown_tool` otherwise, including for tools
-  that exist in the catalog but are policy-disabled — indistinguishable from
-  absent), then routes exactly as a direct call.
+  resolved enabled set: `[{ name, description, input_schema, execution_mode }]`.
+  Lexical matching (name + description substring/token). Deterministic order
+  (rank, then name) — the result feeds model context.
+- `tools_invoke { name: string, arguments: object }` → looks up the private
+  table; on hit, routes exactly as a direct call (same translate-free
+  RouteToolCallRequest path, same error envelopes). On miss — including
+  policy-disabled, catalog-dead, and never-existed — returns the identical
+  `invalid_params("unknown tool '<name>'")` error (§8: "indistinguishable"
+  means this exact single error path, not a family of similar messages).
 
-The resolved policy still gates everything: `search` changes exposure, never
-membership. `tools/list` under `search` returns only the two meta-tools.
+### 6.1 Meta-tool name reservation (Oracle S7)
 
-## 6. Trust invariants (restating, load-bearing)
+`tools_search` and `tools_invoke` are RESERVED exposed names in every mode.
+The collision pass (existing fail-closed machinery) treats a provider tool
+resolving to either name as a collision → that provider tool is excluded and
+an ERROR is logged (fail-closed on the colliding tool, not the whole session —
+consistent with existing per-collision handling).
+
+## 7. Zero-tool providers get no route (Oracle S9)
+
+If a provider's resolved callable tool set is empty (all tools policy-disabled
+or provider disabled), `desired_session_from_catalog` EXCLUDES it: no route is
+opened, so it can never send reverse requests into the session. The reverse
+relay's surface is thereby policy-bounded: only providers with at least one
+exposed tool hold a route. (Today an all-tools-filtered provider still gets a
+route; v2 closes that.)
+
+## 8. Trust invariants (restated, load-bearing)
 
 - The facade path takes NO policy from the wire. Hosts and agents cannot widen
-  their own surface (an agent asking `tools_invoke` for a policy-disabled tool
-  gets `unknown_tool`).
-- The principal story is unchanged: the facade's binds are `reserved:subc-mcp`;
-  provider modules keep their own policy mapping (AFT: forced-restrict,
-  bash-deny). Facade policy NARROWS on top of that; it never grants.
-- Collision handling stays fail-closed (existing behavior).
+  their own surface. Policy-disabled and nonexistent tools are served by ONE
+  shared error path.
+- Project tier is narrowing-only and controls no model-facing string (§4.2).
+- Principal story unchanged: facade binds are `reserved:subc-mcp`; provider
+  modules keep their own policy mapping (AFT: forced-restrict, bash-deny).
+  Facade policy narrows on top; it never grants.
+- Collision handling stays fail-closed; meta-tool names reserved.
 
-## 7. Interlock: MC dual-envelope + ctx_reduce via facade (separate contract)
+## 9. Default-deny for agent-internal modules (Oracle S10)
 
-The facade will front MC's agent-facing tools eventually, but `ctx_reduce`
-exposure through the facade is GATED on the session-identity mapping design:
-shim sessions are process-ephemeral while MC's drops queue keys on the durable
-wire session-id (ai-proxy's key). Routing an agent's ctx_reduce from a shim
-session into the right ai-proxy-session queue needs the project_root →
-active-session resolution (Mode-4 territory). v1 of THIS spec therefore ships
-with `magic-context.*` default-disabled in the facade's global config, and the
-MC-side dual-envelope work is limited to routing hygiene (typed envelope
-dispatch + fail-loud unknown shapes). The convergence design is its own
-follow-up.
+The facade ships a built-in constant `FACADE_DEFAULT_DISABLED: &[&str] =
+&["magic-context", "llm-runner"]` — modules whose tool surfaces are
+agent-internal control planes, not host-facing tools. Semantics: these are
+treated as `enabled: absent → false` at baseline; the GLOBAL tier may
+explicitly enable them (`"magic-context": { "enabled": true }`), the project
+tier cannot (§4.2). This is a facade-local default, not a manifest change —
+revisit as a manifest capability flag (`facade_exposable`) if the list grows.
 
-## 8. Tests (gate)
+Rationale for the two entries: `magic-context`'s `ctx_reduce` requires the
+shim-ephemeral → durable-session mapping that does not exist yet (the Mode-4
+convergence design); `llm-runner`'s session ops are consumer APIs, not tools.
 
-- Composition: global-only; global+harness override; project narrows; project
-  attempts-to-grant is dropped; null-deletes; unknown clientInfo.
+## 10. Tests (gate)
+
+- Composition: global-only; global harness-section override; project narrows;
+  project attempts-to-grant dropped WITH warn; project description-override
+  dropped; project namespace dropped; null-deletes at global tier; null-at-
+  project-tier dropped when it would widen; unknown harness name ignored;
+  reserved refresh values rejected with the documented error.
 - Stickiness: mid-session config edit does not change served surface
-  (`on-attach`); `immediate` emits list_changed and serves the new surface;
-  pending survives module restart (config is the durable source — recompute on
-  attach, no persisted queue state needed).
-- Search mode: search finds enabled tools only; invoke routes and returns real
-  results over the live daemon; policy-disabled and nonexistent tools are
-  indistinguishable (`unknown_tool`); tools/list shows exactly the two
-  meta-tools.
+  (`on-attach`); `immediate` recomputes + emits list_changed + just-disabled
+  tool fails closed within the triggering request; provider death/rejoin still
+  mutates the served list in BOTH modes (liveness exception).
+- Search mode: tools/list = exactly the two meta-tools; direct tools/call on a
+  resolved name fails with the unknown-tool error; tools_search returns only
+  enabled tools, deterministic order; tools_invoke routes a real call over the
+  live daemon; disabled/dead/nonexistent are one error path.
+- Reservation: provider tool colliding with tools_search/tools_invoke is
+  excluded fail-closed with an error log.
+- Zero-tool provider: gets no route; sends no reverse requests.
+- Default-deny: magic-context absent from surface by default; global-tier
+  enable exposes it; project-tier enable does not.
 - E2E: real daemon + fake-aft-stub + real shim, both modes, per the existing
   conformance-test pattern.

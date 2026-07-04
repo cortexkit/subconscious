@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    SupervisorEntry,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus,
 };
 use subc_protocol::{
     manifest::{
@@ -127,6 +127,10 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 module_id: "aft-tools".to_string(),
             },
         ),
+        (
+            "client_control_request_supervisor_health",
+            ClientControlRequest::SupervisorHealth {},
+        ),
     ]
 }
 
@@ -138,6 +142,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 protocol_ver: PROTOCOL_VERSION,
                 subc_ops: thin_core_ops(),
                 capabilities: vec!["manifest_registration_v1".to_string()],
+                connected_clients: 2,
             },
         ),
         (
@@ -182,6 +187,13 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 metrics: Some(serde_json::json!({"queue_depth": 3})),
             },
         ),
+        (
+            "client_control_response_supervisor_health",
+            ClientControlResponse::SupervisorHealth {
+                generation: 7,
+                modules: vec![supervisor_health_entry()],
+            },
+        ),
     ]
 }
 
@@ -196,6 +208,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.reload".to_string(),
         "supervisor.set_enabled".to_string(),
         "supervisor.health_probe".to_string(),
+        "supervisor.health".to_string(),
     ]
 }
 
@@ -221,6 +234,20 @@ fn supervisor_entry() -> SupervisorEntry {
         state: "running".to_string(),
         enabled: true,
         live: true,
+        health: SupervisorHealthStatus::Degraded,
+        last_probe_ms: Some(1_700_000_000_000),
+    }
+}
+
+fn supervisor_health_entry() -> SupervisorHealthEntry {
+    SupervisorHealthEntry {
+        module_id: "aft-tools".to_string(),
+        status: SupervisorHealthStatus::Degraded,
+        detail: Some("warming model".to_string()),
+        metrics: Some(serde_json::json!({"queue_depth": 3})),
+        consecutive_failures: 0,
+        last_action: Some("report".to_string()),
+        last_action_ms: Some(1_700_000_000_100),
     }
 }
 

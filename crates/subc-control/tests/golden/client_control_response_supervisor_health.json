@@ -1,0 +1,17 @@
+{
+  "generation": 7,
+  "modules": [
+    {
+      "consecutive_failures": 0,
+      "detail": "warming model",
+      "last_action": "report",
+      "last_action_ms": 1700000000100,
+      "metrics": {
+        "queue_depth": 3
+      },
+      "module_id": "aft-tools",
+      "status": "degraded"
+    }
+  ],
+  "op": "supervisor.health"
+}

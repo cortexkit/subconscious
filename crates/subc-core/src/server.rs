@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 use crate::{
     forwarding::{CloseReason, ConnectionCloseReceiver},
+    observability::ConnectedClients,
     read_frame,
     router::{FrameSink, RouteCtx, Router},
     write_frame, FrameIoError, RouterError,
@@ -31,6 +32,7 @@ pub struct ServerAuth {
     daemon_ver: Arc<str>,
     deadline: Duration,
     unauthenticated: Arc<Semaphore>,
+    connected_clients: ConnectedClients,
 }
 
 impl ServerAuth {
@@ -61,7 +63,13 @@ impl ServerAuth {
             daemon_ver: Arc::from(daemon_ver.into()),
             deadline,
             unauthenticated: Arc::new(Semaphore::new(max_unauthenticated.max(1))),
+            connected_clients: ConnectedClients::new(),
         }
+    }
+
+    pub fn with_connected_clients(mut self, connected_clients: ConnectedClients) -> Self {
+        self.connected_clients = connected_clients;
+        self
     }
 }
 
@@ -193,6 +201,7 @@ where
 
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
+    let _connected_client = auth.connected_clients.open(connection_id);
     let close_receiver = connection.take_close_receiver();
     debug!(
         connection_id = connection_id.get(),

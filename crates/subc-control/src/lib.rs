@@ -36,6 +36,7 @@ pub mod ops {
     pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
     pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
     pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
+    pub const SUPERVISOR_HEALTH: &str = "supervisor.health";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -68,6 +69,8 @@ pub enum ClientControlRequest {
     SupervisorSetEnabled { module_id: String, enabled: bool },
     #[serde(rename = "supervisor.health_probe")]
     SupervisorHealthProbe { module_id: String },
+    #[serde(rename = "supervisor.health")]
+    SupervisorHealth {},
 }
 
 /// subc's channel-0 response body for client control RPCs.
@@ -79,6 +82,7 @@ pub enum ClientControlResponse {
         protocol_ver: u8,
         subc_ops: Vec<String>,
         capabilities: Vec<String>,
+        connected_clients: u64,
     },
     #[serde(rename = "catalog.list")]
     CatalogList {
@@ -109,6 +113,11 @@ pub enum ClientControlResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metrics: Option<serde_json::Value>,
     },
+    #[serde(rename = "supervisor.health")]
+    SupervisorHealth {
+        generation: u64,
+        modules: Vec<SupervisorHealthEntry>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +140,34 @@ pub struct SupervisorEntry {
     pub state: String,
     pub enabled: bool,
     pub live: bool,
+    pub health: SupervisorHealthStatus,
+    #[serde(default)]
+    pub last_probe_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorHealthStatus {
+    Ok,
+    Degraded,
+    Failing,
+    Unresponsive,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SupervisorHealthEntry {
+    pub module_id: String,
+    pub status: SupervisorHealthStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<serde_json::Value>,
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub last_action: Option<String>,
+    #[serde(default)]
+    pub last_action_ms: Option<u64>,
 }
 
 #[cfg(test)]

@@ -13,8 +13,8 @@ use std::{
 };
 
 use subc_core::{
-    serve_listener, ControlHandler, ForwardingTable, ModuleProcessLiveness, Registry, Router,
-    ServerAuth, SupervisorHandle,
+    serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
+    Registry, Router, ServerAuth, SupervisorHandle,
 };
 use subc_transport::{
     authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
@@ -111,7 +111,9 @@ async fn start_test_daemon_inner(
     write_atomic(&connection_file_path, &conn).unwrap();
 
     let registry = Arc::new(Registry::default());
-    let mut handler = ControlHandler::new(Arc::clone(&registry));
+    let connected_clients = ConnectedClients::new();
+    let mut handler = ControlHandler::new(Arc::clone(&registry))
+        .with_connected_clients(connected_clients.clone());
     if let Some(process_liveness) = process_liveness {
         handler = handler.with_process_liveness(process_liveness);
     }
@@ -124,7 +126,8 @@ async fn start_test_daemon_inner(
     let control = Arc::new(handler);
     let forwarding = control.forwarding();
     let router = Arc::new(Router::with_control_handler(control));
-    let auth = ServerAuth::new(conn.key, conn.daemon_id, conn.daemon_ver);
+    let auth = ServerAuth::new(conn.key, conn.daemon_id, conn.daemon_ver)
+        .with_connected_clients(connected_clients);
     let task = tokio::spawn(serve_listener(listener, router, auth));
 
     TestDaemon {

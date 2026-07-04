@@ -2,6 +2,7 @@
   "capabilities": [
     "manifest_registration_v1"
   ],
+  "connected_clients": 2,
   "op": "server.describe",
   "protocol_ver": 1,
   "subc_ops": [
@@ -13,6 +14,7 @@
     "supervisor.restart",
     "supervisor.reload",
     "supervisor.set_enabled",
-    "supervisor.health_probe"
+    "supervisor.health_probe",
+    "supervisor.health"
   ]
 }

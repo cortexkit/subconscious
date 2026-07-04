@@ -11,6 +11,7 @@ pub mod control;
 pub mod daemon_config;
 pub mod forwarding;
 pub mod identity;
+pub mod observability;
 pub mod registry;
 pub mod router;
 pub mod server;
@@ -26,6 +27,7 @@ pub use forwarding::{ForwardingError, ForwardingTable, ModuleEndpointId};
 // in subc-transport (with the authenticated stream). Re-exported here so the
 // `subc_core::{Frame, read_frame, write_frame, ...}` surface stays stable.
 pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
+pub use observability::ConnectedClients;
 pub use registry::{ChannelState, ConnectionId, ModuleRegistration, Registry, RegistryError};
 pub use router::{
     Backend, EchoBackend, ForwardBackend, FrameSink, RouteCtx, Router, RouterConnection,
@@ -38,7 +40,7 @@ pub use server::{
 pub use subc_protocol::{Frame, FrameBuildError};
 pub use subc_transport::{read_frame, write_frame, FrameIoError, ReadStage};
 pub use supervise::{
-    ExitKind, ExitReport, ModuleProcessLiveness, ModuleSpec, ModuleState, ModuleStatus,
-    RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorHandle,
-    SupervisorProcessLiveness, SUBC_ARG,
+    ExitKind, ExitReport, HealthAction, HealthConfig, ModuleHealthStatus, ModuleProcessLiveness,
+    ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError, SupervisedModule,
+    Supervisor, SupervisorHandle, SupervisorProcessLiveness, SUBC_ARG,
 };

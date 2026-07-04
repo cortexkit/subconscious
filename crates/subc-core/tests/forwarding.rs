@@ -12,11 +12,13 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind};
+use subc_control::{
+    ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind, SupervisorHealthStatus,
+};
 use subc_core::{
-    read_frame, write_frame, ExitKind, ForwardingTable, Frame, ModuleSpec, ModuleState,
-    ModuleStatus, Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle,
-    SupervisorProcessLiveness,
+    read_frame, write_frame, ExitKind, ForwardingTable, Frame, HealthAction, HealthConfig,
+    ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SupervisedModule, Supervisor,
+    SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{
     manifest::{
@@ -205,6 +207,222 @@ async fn supervisor_health_probe_carries_degraded_report_verbatim() {
     .await;
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_prober_restarts_unresponsive_module_and_recovers_ok() {
+    let server = TestServer::start().await;
+    let supervisor =
+        supervisor(&server, 2, Duration::from_millis(10)).with_health_config(health_config(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            2,
+            HealthAction::Report,
+            HealthAction::Report,
+            false,
+        ));
+    let module_id = "fake-aft-prober-recover";
+    let marker = server.temp_dir.join("health-first-wedge");
+    let (module, _events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "prober-recover",
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1".to_string()),
+            (
+                "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH",
+                marker.to_string_lossy().into_owned(),
+            ),
+        ],
+    )
+    .await;
+
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.restart_count >= 1
+            && status.health.status == SupervisorHealthStatus::Ok
+            && status.live
+    })
+    .await;
+    assert_eq!(status.restart_count, 1);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_prober_failing_restart_exhausts_budget_to_disabled() {
+    let server = TestServer::start().await;
+    let supervisor =
+        supervisor(&server, 1, Duration::from_millis(10)).with_health_config(health_config(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            1,
+            HealthAction::Report,
+            HealthAction::Restart,
+            false,
+        ));
+    let module_id = "fake-aft-failing-budget";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "failing"),
+            ("FAKE_AFT_HEALTH_DETAIL", "permanent failure"),
+        ],
+    )
+    .await;
+
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Disabled && status.restart_count == 1 && !status.live
+    })
+    .await;
+    assert_eq!(status.health.status, SupervisorHealthStatus::Failing);
+    assert_eq!(status.health.last_action.as_deref(), Some("disabled"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_prober_degraded_report_is_not_restarted_and_is_observable() {
+    let server = TestServer::start().await;
+    let supervisor =
+        supervisor(&server, 2, Duration::from_millis(10)).with_health_config(health_config(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            2,
+            HealthAction::Report,
+            HealthAction::Report,
+            false,
+        ));
+    let module_id = "fake-aft-prober-degraded";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "degraded"),
+            ("FAKE_AFT_HEALTH_DETAIL", "warming cache"),
+        ],
+    )
+    .await;
+
+    wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.health.status == SupervisorHealthStatus::Degraded
+    })
+    .await;
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &control_request_frame(122, ClientControlRequest::SupervisorHealth {}),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let frame = read_frame_timeout(&mut client).await;
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorHealth { modules, .. } => {
+            let entry = modules
+                .into_iter()
+                .find(|entry| entry.module_id == module_id)
+                .expect("module health entry");
+            assert_eq!(entry.status, SupervisorHealthStatus::Degraded);
+            assert_eq!(entry.detail.as_deref(), Some("warming cache"));
+            assert_eq!(entry.last_action.as_deref(), Some("report"));
+        }
+        other => panic!("unexpected supervisor.health response: {other:?}"),
+    }
+    write_frame(
+        &mut client,
+        &control_request_frame(123, ClientControlRequest::SupervisorList {}),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let frame = read_frame_timeout(&mut client).await;
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorList { modules, .. } => {
+            let entry = modules
+                .into_iter()
+                .find(|entry| entry.module_id == module_id)
+                .expect("module supervisor entry");
+            assert_eq!(entry.health, SupervisorHealthStatus::Degraded);
+            assert!(entry.last_probe_ms.is_some());
+        }
+        other => panic!("unexpected supervisor.list response: {other:?}"),
+    }
+    assert_eq!(module.status().unwrap().restart_count, 0);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_advertising_module_is_unknown_and_never_probed() {
+    let server = TestServer::start().await;
+    let supervisor =
+        supervisor(&server, 1, Duration::from_millis(10)).with_health_config(health_config(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            1,
+            HealthAction::Report,
+            HealthAction::Report,
+            false,
+        ));
+    let module_id = "fake-aft-no-health-ad";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "no-health-ad").await;
+
+    assert_no_stub_event_within(&events_path, Duration::from_millis(120), |event| {
+        event["kind"] == "health_check"
+    })
+    .await;
+    let status = module.status().unwrap();
+    assert_eq!(status.health.status, SupervisorHealthStatus::Unknown);
+    assert_eq!(status.health.last_probe_ms, None);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_describe_connected_clients_tracks_auth_connections() {
+    let server = TestServer::start().await;
+    let mut first = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    assert_eq!(connected_client_count(&mut first, 130).await, 1);
+
+    let second = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut corr = 131;
+    loop {
+        if connected_client_count(&mut first, corr).await == 2 {
+            break;
+        }
+        corr += 1;
+        assert!(
+            Instant::now() < deadline,
+            "connected_clients did not increment after peer authentication"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    drop(second);
+
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        corr += 1;
+        if connected_client_count(&mut first, corr).await == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connected_clients did not decrement after peer disconnect"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4468,6 +4686,41 @@ fn supervisor_with_drain_timeout(
     .with_handle(server.supervisor_handle.clone())
     .with_drain_timeout(drain_timeout)
     .with_connection_file_path(server.connection_file_path.clone())
+}
+
+fn health_config(
+    cadence: Duration,
+    deadline: Duration,
+    failure_threshold: u32,
+    on_degraded: HealthAction,
+    on_failing: HealthAction,
+    critical: bool,
+) -> HealthConfig {
+    HealthConfig {
+        cadence,
+        deadline,
+        failure_threshold,
+        on_degraded,
+        on_failing,
+        critical,
+    }
+}
+
+async fn connected_client_count(stream: &mut TcpStream, corr: u64) -> u64 {
+    write_frame(
+        stream,
+        &control_request_frame(corr, ClientControlRequest::ServerDescribe {}),
+    )
+    .await
+    .unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_frame_timeout(stream).await;
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::ServerDescribe {
+            connected_clients, ..
+        } => connected_clients,
+        other => panic!("unexpected server.describe response: {other:?}"),
+    }
 }
 
 async fn spawn_stub(

@@ -24,8 +24,8 @@ use tracing::{error, info, warn};
 use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
-    ControlHandler, ForwardingTable, ModuleSpec, Registry, RestartPolicy, Router, Supervisor,
-    SupervisorHandle, SupervisorProcessLiveness,
+    ConnectedClients, ControlHandler, ForwardingTable, ModuleSpec, Registry, RestartPolicy, Router,
+    Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use std::sync::Arc;
 
@@ -218,6 +218,7 @@ async fn serve_bound_daemon(
     let registry = Arc::new(Registry::default());
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
+    let connected_clients = ConnectedClients::new();
     let control = Arc::new(
         ControlHandler::with_forwarding(
             Arc::clone(&registry),
@@ -225,6 +226,7 @@ async fn serve_bound_daemon(
         )
         .with_process_liveness(process_liveness.clone())
         .with_supervisor(supervisor_handle.clone())
+        .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config),
     );
     let forwarding = control.forwarding();
@@ -233,7 +235,8 @@ async fn serve_bound_daemon(
         bound.connection_info.key.clone(),
         bound.connection_info.daemon_id,
         bound.connection_info.daemon_ver.clone(),
-    );
+    )
+    .with_connected_clients(connected_clients);
     let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
         .with_process_liveness(process_liveness)
         .with_forwarding(forwarding)
@@ -246,6 +249,7 @@ async fn serve_bound_daemon(
 
     for configured in configured_modules {
         let enabled = configured.enabled;
+        let health = configured.health;
         let module_id = configured.module_id.clone();
         let spec = ModuleSpec {
             module_id: configured.module_id,
@@ -254,7 +258,7 @@ async fn serve_bound_daemon(
             env: configured.env,
             reserved: configured.reserved,
         };
-        match supervisor.supervise_configured(spec, enabled) {
+        match supervisor.supervise_configured_with_health(spec, enabled, health) {
             Ok(_) => {
                 info!(module_id = %module_id, enabled, "configured module supervised");
             }

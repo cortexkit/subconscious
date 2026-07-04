@@ -3,7 +3,7 @@ use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    SupervisorEntry,
+    SupervisorEntry, SupervisorHealthEntry,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
@@ -26,7 +26,7 @@ use crate::{
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
     supervise::{ModuleProcessLiveness, SupervisorHandle},
-    Frame, ProjectRootId,
+    ConnectedClients, Frame, ProjectRootId,
 };
 
 /// Lowest envelope version this subc build will negotiate.
@@ -51,6 +51,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_RELOAD,
     ops::SUPERVISOR_SET_ENABLED,
     ops::SUPERVISOR_HEALTH_PROBE,
+    ops::SUPERVISOR_HEALTH,
 ];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
@@ -78,6 +79,7 @@ pub struct ControlHandler {
     /// Central storage policy. When set, each registering module receives its
     /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
     storage_config: Option<crate::daemon_config::StorageConfig>,
+    connected_clients: ConnectedClients,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -201,6 +203,7 @@ impl ControlHandler {
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             storage_config: None,
+            connected_clients: ConnectedClients::new(),
         }
     }
 
@@ -237,6 +240,11 @@ impl ControlHandler {
 
     pub fn with_supervisor(mut self, supervisor: SupervisorHandle) -> Self {
         self.supervisor = supervisor;
+        self
+    }
+
+    pub fn with_connected_clients(mut self, connected_clients: ConnectedClients) -> Self {
+        self.connected_clients = connected_clients;
         self
     }
 
@@ -699,6 +707,7 @@ impl ControlHandler {
             ClientControlRequest::SupervisorHealthProbe { module_id } => {
                 self.handle_supervisor_health_probe(frame, module_id).await
             }
+            ClientControlRequest::SupervisorHealth {} => self.handle_supervisor_health(frame),
         }
     }
 
@@ -707,6 +716,7 @@ impl ControlHandler {
             protocol_ver: PROTOCOL_VERSION,
             subc_ops: subc_ops(),
             capabilities: self.subc_capabilities.as_ref().to_vec(),
+            connected_clients: self.connected_clients.count(),
         };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -1063,6 +1073,8 @@ impl ControlHandler {
                     state: status.state.to_string(),
                     enabled: status.enabled,
                     live: status.live,
+                    health: status.health.status,
+                    last_probe_ms: status.health.last_probe_ms,
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;
@@ -1074,6 +1086,45 @@ impl ControlHandler {
             &frame,
             &response,
             "ClientControlResponse::SupervisorList",
+        )?])
+    }
+
+    fn handle_supervisor_health(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        let generation = self
+            .registry
+            .generation()
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let modules = self
+            .supervisor
+            .list()
+            .into_iter()
+            .map(|module| {
+                let status = module.status().map_err(|err| {
+                    RouterError::backend(
+                        0,
+                        frame.header.corr,
+                        format!("failed to read supervisor health: {err}"),
+                    )
+                })?;
+                Ok(SupervisorHealthEntry {
+                    module_id: status.module_id,
+                    status: status.health.status,
+                    detail: status.health.detail,
+                    metrics: status.health.metrics,
+                    consecutive_failures: status.health.consecutive_failures,
+                    last_action: status.health.last_action,
+                    last_action_ms: status.health.last_action_ms,
+                })
+            })
+            .collect::<Result<Vec<_>, RouterError>>()?;
+        let response = ClientControlResponse::SupervisorHealth {
+            generation,
+            modules,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorHealth",
         )?])
     }
 

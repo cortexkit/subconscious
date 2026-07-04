@@ -671,6 +671,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_RELOAD,
         ops::SUPERVISOR_SET_ENABLED,
         ops::SUPERVISOR_HEALTH_PROBE,
+        ops::SUPERVISOR_HEALTH,
     ])
 }
 

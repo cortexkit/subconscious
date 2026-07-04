@@ -10,6 +10,8 @@ use std::{
 use serde::Deserialize;
 use subc_jsonc::jsonc_to_json;
 
+use crate::{HealthAction, HealthConfig};
+
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
@@ -78,6 +80,7 @@ pub struct ConfiguredModule {
     /// the credential vault) from being impersonated by another key-holder while the
     /// real process is down or restarting. Defaults to false.
     pub reserved: bool,
+    pub health: HealthConfig,
 }
 
 #[derive(Debug)]
@@ -97,6 +100,10 @@ pub enum DaemonConfigError {
     UnsupportedVersion {
         path: PathBuf,
         version: u32,
+    },
+    InvalidValue {
+        path: PathBuf,
+        message: String,
     },
 }
 
@@ -133,6 +140,32 @@ struct RawModuleConfig {
     enabled: bool,
     #[serde(default)]
     reserved: bool,
+    #[serde(default)]
+    health: Option<RawHealthConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawHealthConfig {
+    #[serde(default)]
+    cadence_ms: Option<u64>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+    #[serde(default)]
+    failure_threshold: Option<u32>,
+    #[serde(default)]
+    on_degraded: Option<RawHealthAction>,
+    #[serde(default)]
+    on_failing: Option<RawHealthAction>,
+    #[serde(default)]
+    critical: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawHealthAction {
+    Report,
+    Restart,
+    Alert,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -200,15 +233,23 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
     let modules = raw
         .modules
         .into_iter()
-        .map(|(module_id, module)| ConfiguredModule {
-            module_id,
-            program: module.program,
-            args: module.args,
-            env: module.env.into_iter().collect(),
-            enabled: module.enabled,
-            reserved: module.reserved,
+        .map(|(module_id, module)| {
+            let health = module
+                .health
+                .map(|health| parse_health_config(health, path, &module_id))
+                .transpose()?
+                .unwrap_or_default();
+            Ok(ConfiguredModule {
+                module_id,
+                program: module.program,
+                args: module.args,
+                env: module.env.into_iter().collect(),
+                enabled: module.enabled,
+                reserved: module.reserved,
+                health,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, DaemonConfigError>>()?;
 
     let storage = raw.storage.map(|s| match s {
         RawStorageConfig::Sqlite { data_home } => StorageConfig::Sqlite {
@@ -226,6 +267,78 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
 
 fn default_enabled() -> bool {
     true
+}
+
+fn parse_health_config(
+    raw: RawHealthConfig,
+    path: &Path,
+    module_id: &str,
+) -> Result<HealthConfig, DaemonConfigError> {
+    let defaults = HealthConfig::default();
+    let cadence = positive_millis(
+        raw.cadence_ms,
+        defaults.cadence,
+        path,
+        module_id,
+        "cadence_ms",
+    )?;
+    let deadline = positive_millis(
+        raw.deadline_ms,
+        defaults.deadline,
+        path,
+        module_id,
+        "deadline_ms",
+    )?;
+    let failure_threshold = match raw.failure_threshold {
+        Some(0) => {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!("module '{module_id}' health.failure_threshold must be positive"),
+            })
+        }
+        Some(value) => value,
+        None => defaults.failure_threshold,
+    };
+
+    Ok(HealthConfig {
+        cadence,
+        deadline,
+        failure_threshold,
+        on_degraded: raw
+            .on_degraded
+            .map(health_action)
+            .unwrap_or(defaults.on_degraded),
+        on_failing: raw
+            .on_failing
+            .map(health_action)
+            .unwrap_or(defaults.on_failing),
+        critical: raw.critical,
+    })
+}
+
+fn positive_millis(
+    value: Option<u64>,
+    default: std::time::Duration,
+    path: &Path,
+    module_id: &str,
+    field: &str,
+) -> Result<std::time::Duration, DaemonConfigError> {
+    match value {
+        Some(0) => Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!("module '{module_id}' health.{field} must be positive"),
+        }),
+        Some(value) => Ok(std::time::Duration::from_millis(value)),
+        None => Ok(default),
+    }
+}
+
+fn health_action(action: RawHealthAction) -> HealthAction {
+    match action {
+        RawHealthAction::Report => HealthAction::Report,
+        RawHealthAction::Restart => HealthAction::Restart,
+        RawHealthAction::Alert => HealthAction::Alert,
+    }
 }
 
 /// Platform data home for per-module storage: `$XDG_DATA_HOME`, else
@@ -278,6 +391,9 @@ impl fmt::Display for DaemonConfigError {
                 "invalid daemon config {}: version {version} is unsupported (expected {SUPPORTED_CONFIG_VERSION})",
                 path.display()
             ),
+            Self::InvalidValue { path, message } => {
+                write!(f, "invalid daemon config {}: {message}", path.display())
+            }
         }
     }
 }
@@ -287,7 +403,9 @@ impl Error for DaemonConfigError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::InvalidJson { source, .. } => Some(source),
-            Self::InvalidJsonc { .. } | Self::UnsupportedVersion { .. } => None,
+            Self::InvalidJsonc { .. }
+            | Self::UnsupportedVersion { .. }
+            | Self::InvalidValue { .. } => None,
         }
     }
 }
@@ -394,7 +512,66 @@ mod tests {
         assert_eq!(config.modules[0].args, ["module"]);
         assert_eq!(config.modules[0].env, [("A".to_string(), "B".to_string())]);
         assert!(config.modules[0].enabled);
+        assert_eq!(config.modules[0].health, HealthConfig::default());
         assert!(!config.modules[1].enabled);
+    }
+
+    #[test]
+    fn health_config_parses_and_ignores_unknown_fields() {
+        let config = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "modules": {
+                "aft": {
+                  "program": "aft",
+                  "health": {
+                    "cadence_ms": 100,
+                    "deadline_ms": 20,
+                    "failure_threshold": 2,
+                    "on_degraded": "report",
+                    "on_failing": "restart",
+                    "critical": true,
+                    "future": "ignored"
+                  }
+                }
+              }
+            }
+            "#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap();
+
+        let health = config.modules[0].health;
+        assert_eq!(health.cadence, std::time::Duration::from_millis(100));
+        assert_eq!(health.deadline, std::time::Duration::from_millis(20));
+        assert_eq!(health.failure_threshold, 2);
+        assert_eq!(health.on_degraded, HealthAction::Report);
+        assert_eq!(health.on_failing, HealthAction::Restart);
+        assert!(health.critical);
+    }
+
+    #[test]
+    fn health_config_rejects_bad_enum_and_non_positive_numbers() {
+        let bad_enum = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": { "aft": { "program": "aft", "health": { "on_failing": "page" } } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(bad_enum, DaemonConfigError::InvalidJson { .. }));
+
+        let zero = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": { "aft": { "program": "aft", "health": { "cadence_ms": 0 } } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(zero, DaemonConfigError::InvalidValue { .. }));
     }
 
     #[test]

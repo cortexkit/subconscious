@@ -63,6 +63,7 @@ const FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_SUBC_ERROR";
 const FAKE_AFT_TOOLS_ENV: &str = "FAKE_AFT_TOOLS";
 const FAKE_AFT_ADVERTISE_HEALTH_ENV: &str = "FAKE_AFT_ADVERTISE_HEALTH";
 const FAKE_AFT_HEALTH_NEVER_REPLY_ENV: &str = "FAKE_AFT_HEALTH_NEVER_REPLY";
+const FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH_ENV: &str = "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH";
 const FAKE_AFT_HEALTH_STATUS_ENV: &str = "FAKE_AFT_HEALTH_STATUS";
 const FAKE_AFT_HEALTH_DETAIL_ENV: &str = "FAKE_AFT_HEALTH_DETAIL";
 const FAKE_AFT_HEALTH_METRICS_ENV: &str = "FAKE_AFT_HEALTH_METRICS";
@@ -1223,7 +1224,8 @@ impl StubConfig {
             toolcall_subc_error: env_flag(FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV),
             tools,
             advertise_health: env_flag(FAKE_AFT_ADVERTISE_HEALTH_ENV),
-            health_never_reply: env_flag(FAKE_AFT_HEALTH_NEVER_REPLY_ENV),
+            health_never_reply: env_flag(FAKE_AFT_HEALTH_NEVER_REPLY_ENV)
+                || health_never_reply_first_spawn()?,
             health_status: health_status_from_env()?,
             health_detail: env::var(FAKE_AFT_HEALTH_DETAIL_ENV)
                 .ok()
@@ -1352,6 +1354,21 @@ fn fail_registration_after_first() -> Result<bool, StubError> {
     }
     fs::write(&path, b"first registration consumed\n").map_err(StubError::Io)?;
     Ok(false)
+}
+
+fn health_never_reply_first_spawn() -> Result<bool, StubError> {
+    let Some(path) = env::var_os(FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH_ENV).map(PathBuf::from)
+    else {
+        return Ok(false);
+    };
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(StubError::Io)?;
+    }
+    fs::write(&path, b"first health wedge consumed\n").map_err(StubError::Io)?;
+    Ok(true)
 }
 
 #[derive(Debug)]

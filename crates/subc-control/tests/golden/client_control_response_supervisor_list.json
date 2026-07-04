@@ -3,6 +3,8 @@
   "modules": [
     {
       "enabled": true,
+      "health": "degraded",
+      "last_probe_ms": 1700000000000,
       "live": true,
       "module_id": "aft-tools",
       "state": "running"

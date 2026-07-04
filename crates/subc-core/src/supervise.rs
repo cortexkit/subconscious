@@ -5,21 +5,28 @@ use std::{
     path::PathBuf,
     process::ExitStatus,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::Value;
+use subc_control::SupervisorHealthStatus;
+use subc_protocol::{
+    session::{HealthReport, HealthStatus, ModuleControlRequest, MODULE_CONTROL_OP_HEALTH_CHECK},
+    Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+};
 use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-    time::{sleep, timeout, Instant},
+    time::{sleep, timeout, timeout_at, Instant},
 };
-use tracing::{debug, error, warn};
-
-use subc_protocol::{Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
+use tracing::{debug, error, info, warn};
 
 use crate::{
-    forwarding::{CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleDrainTarget},
+    forwarding::{
+        CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
+        ModuleDrainTarget, PendingModuleControlRpc,
+    },
     registry::RegistryError,
     Frame, Registry,
 };
@@ -94,11 +101,82 @@ impl Default for RestartPolicy {
     }
 }
 
+const DEFAULT_HEALTH_CADENCE: Duration = Duration::from_secs(30);
+const DEFAULT_HEALTH_DEADLINE: Duration = Duration::from_secs(5);
+const DEFAULT_HEALTH_FAILURE_THRESHOLD: u32 = 3;
+const MAX_HEALTH_METRICS_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthAction {
+    Report,
+    Restart,
+    Alert,
+}
+
+impl fmt::Display for HealthAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Report => "report",
+            Self::Restart => "restart",
+            Self::Alert => "alert",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthConfig {
+    pub cadence: Duration,
+    pub deadline: Duration,
+    pub failure_threshold: u32,
+    pub on_degraded: HealthAction,
+    pub on_failing: HealthAction,
+    pub critical: bool,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            cadence: DEFAULT_HEALTH_CADENCE,
+            deadline: DEFAULT_HEALTH_DEADLINE,
+            failure_threshold: DEFAULT_HEALTH_FAILURE_THRESHOLD,
+            on_degraded: HealthAction::Report,
+            on_failing: HealthAction::Report,
+            critical: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleHealthStatus {
+    pub status: SupervisorHealthStatus,
+    pub last_probe_ms: Option<u64>,
+    pub detail: Option<String>,
+    pub metrics: Option<Value>,
+    pub consecutive_failures: u32,
+    pub last_action: Option<String>,
+    pub last_action_ms: Option<u64>,
+}
+
+impl Default for ModuleHealthStatus {
+    fn default() -> Self {
+        Self {
+            status: SupervisorHealthStatus::Unknown,
+            last_probe_ms: None,
+            detail: None,
+            metrics: None,
+            consecutive_failures: 0,
+            last_action: None,
+            last_action_ms: None,
+        }
+    }
+}
+
 /// Typed lifecycle state for a supervised module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleState {
     Starting,
     Running,
+    Unresponsive,
     Restarting,
     Draining,
     Stopped,
@@ -111,6 +189,7 @@ impl fmt::Display for ModuleState {
         f.write_str(match self {
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Unresponsive => "unresponsive",
             Self::Restarting => "restarting",
             Self::Draining => "draining",
             Self::Stopped => "stopped",
@@ -137,7 +216,7 @@ pub struct ExitReport {
 
 /// Point-in-time module status answerable by subc without forwarding to the
 /// module process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
     pub module_id: String,
     pub state: ModuleState,
@@ -148,9 +227,10 @@ pub struct ModuleStatus {
     pub restart_count: u32,
     pub pid: Option<u32>,
     pub last_exit: Option<ExitReport>,
+    pub health: ModuleHealthStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
     state: ModuleState,
     enabled: bool,
@@ -158,6 +238,7 @@ struct SupervisorSnapshot {
     restart_count: u32,
     pid: Option<u32>,
     last_exit: Option<ExitReport>,
+    health: ModuleHealthStatus,
 }
 
 impl SupervisorSnapshot {
@@ -181,6 +262,7 @@ impl SupervisorSnapshot {
             restart_count: 0,
             pid: None,
             last_exit: None,
+            health: ModuleHealthStatus::default(),
         }
     }
 }
@@ -246,6 +328,7 @@ impl ModuleProcessLiveness for SupervisorProcessLiveness {
 struct SupervisorRuntimeConfig {
     restart_policy: RestartPolicy,
     drain_timeout: Duration,
+    health: HealthConfig,
     connection_file_path: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
     /// The shared handle, so every spawn path (initial, restart, reload) records the
@@ -383,6 +466,7 @@ pub struct Supervisor {
     forwarding: Option<Arc<ForwardingTable>>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: Option<SupervisorHandle>,
+    health: HealthConfig,
 }
 
 impl Supervisor {
@@ -395,6 +479,7 @@ impl Supervisor {
             forwarding: None,
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
             supervisor_handle: None,
+            health: HealthConfig::default(),
         }
     }
 
@@ -423,6 +508,11 @@ impl Supervisor {
 
     pub fn with_handle(mut self, supervisor_handle: SupervisorHandle) -> Self {
         self.supervisor_handle = Some(supervisor_handle);
+        self
+    }
+
+    pub fn with_health_config(mut self, health: HealthConfig) -> Self {
+        self.health = health;
         self
     }
 
@@ -491,10 +581,60 @@ impl Supervisor {
         }
     }
 
+    pub fn supervise_configured_with_health(
+        &self,
+        spec: ModuleSpec,
+        enabled: bool,
+        health: HealthConfig,
+    ) -> Result<SupervisedModule, SuperviseError> {
+        validate_spec(&spec)?;
+
+        let mut runtime = self.runtime_config();
+        runtime.health = health;
+        if !enabled {
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
+            return Ok(self.supervised_module(spec, runtime, snapshot, None));
+        }
+
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        match spawn_child(
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+        ) {
+            Ok(child) => {
+                set_running(&snapshot, child.id())?;
+                self.process_liveness
+                    .track(spec.module_id.clone(), Arc::clone(&snapshot));
+                Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
+            }
+            Err(err) => {
+                if health.critical {
+                    error!(
+                        module_id = %spec.module_id,
+                        program = %spec.program.display(),
+                        error = %err,
+                        "critical configured module failed to spawn; marking failed and alerting"
+                    );
+                } else {
+                    error!(
+                        module_id = %spec.module_id,
+                        program = %spec.program.display(),
+                        error = %err,
+                        "configured module failed to spawn; marking failed and continuing"
+                    );
+                }
+                let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::failed()));
+                Ok(self.supervised_module(spec, runtime, snapshot, None))
+            }
+        }
+    }
+
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
         SupervisorRuntimeConfig {
             restart_policy: self.restart_policy,
             drain_timeout: self.drain_timeout,
+            health: self.health,
             connection_file_path: self.connection_file_path.clone(),
             forwarding: self.forwarding.clone(),
             supervisor_handle: self.supervisor_handle.clone(),
@@ -596,6 +736,7 @@ impl SupervisedModule {
             restart_count: snapshot.restart_count,
             pid: snapshot.pid,
             last_exit: snapshot.last_exit,
+            health: snapshot.health,
         })
     }
 
@@ -609,6 +750,7 @@ impl SupervisedModule {
             ModuleState::Stopped | ModuleState::Failed => return Ok(()),
             ModuleState::Starting
             | ModuleState::Running
+            | ModuleState::Unresponsive
             | ModuleState::Restarting
             | ModuleState::Draining
             | ModuleState::Disabled => {}
@@ -845,6 +987,524 @@ fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct HealthProbeRuntime {
+    registered_connection: Option<crate::ConnectionId>,
+    advertised: bool,
+    next_probe_at: Option<Instant>,
+    probe_index: u64,
+}
+
+impl HealthProbeRuntime {
+    fn refresh_registration(
+        &mut self,
+        spec: &ModuleSpec,
+        runtime: &SupervisorRuntimeConfig,
+        registry: &Registry,
+        snapshot: &SharedSnapshot,
+    ) {
+        let registration = match registry.get_module(&spec.module_id) {
+            Ok(registration) => registration,
+            Err(err) => {
+                warn!(module_id = %spec.module_id, error = %err, "health prober could not read registry");
+                self.advertised = false;
+                self.next_probe_at = None;
+                return;
+            }
+        };
+
+        let Some(registration) = registration else {
+            self.registered_connection = None;
+            self.advertised = false;
+            self.next_probe_at = None;
+            return;
+        };
+
+        let advertised = registration
+            .control_ops
+            .iter()
+            .any(|op| op == MODULE_CONTROL_OP_HEALTH_CHECK);
+        if !advertised {
+            self.registered_connection = Some(registration.connection_id);
+            self.advertised = false;
+            self.next_probe_at = None;
+            let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                state.health.status = SupervisorHealthStatus::Unknown;
+                state.health.consecutive_failures = 0;
+                state.health.last_probe_ms = None;
+                state.health.detail = None;
+                state.health.metrics = None;
+            });
+            return;
+        }
+
+        let reregistered = self.registered_connection != Some(registration.connection_id);
+        self.registered_connection = Some(registration.connection_id);
+        self.advertised = true;
+        if reregistered || self.next_probe_at.is_none() {
+            self.probe_index = 0;
+            self.next_probe_at = Some(
+                Instant::now() + jittered_health_delay(&spec.module_id, 0, runtime.health.cadence),
+            );
+            let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                state.health.status = SupervisorHealthStatus::Unknown;
+                state.health.consecutive_failures = 0;
+                state.health.detail = None;
+                state.health.metrics = None;
+            });
+        }
+    }
+
+    fn wake_after(&self) -> Duration {
+        if !self.advertised {
+            return REGISTRY_RELEASE_POLL;
+        }
+        self.next_probe_at
+            .map(|next| next.saturating_duration_since(Instant::now()))
+            .unwrap_or(REGISTRY_RELEASE_POLL)
+    }
+
+    fn due(&self) -> bool {
+        self.advertised
+            && self
+                .next_probe_at
+                .is_some_and(|next| Instant::now() >= next)
+    }
+
+    fn schedule_next(&mut self, spec: &ModuleSpec, cadence: Duration) {
+        self.probe_index = self.probe_index.wrapping_add(1);
+        self.next_probe_at = Some(
+            Instant::now() + jittered_health_delay(&spec.module_id, self.probe_index, cadence),
+        );
+    }
+}
+
+#[derive(Debug)]
+struct HealthProbeError {
+    message: String,
+}
+
+impl HealthProbeError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for HealthProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+async fn run_health_probe_cycle(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+) {
+    let now_ms = unix_ms_now();
+    match probe_module_health(spec, runtime).await {
+        Ok(report) => {
+            handle_health_report(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                report,
+                now_ms,
+            )
+            .await;
+        }
+        Err(err) => {
+            handle_health_probe_failure(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                err,
+                now_ms,
+            )
+            .await;
+        }
+    }
+}
+
+async fn probe_module_health(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+) -> Result<HealthReport, HealthProbeError> {
+    let Some(forwarding) = runtime.forwarding.as_ref() else {
+        return Err(HealthProbeError::new(
+            "supervisor was not configured with a forwarding table",
+        ));
+    };
+    let deadline = Instant::now() + runtime.health.deadline;
+    let pending = forwarding
+        .begin_module_control_rpc_for(&spec.module_id, MODULE_CONTROL_OP_HEALTH_CHECK, deadline)
+        .map_err(|err| HealthProbeError::new(format!("failed to begin health.check RPC: {err}")))?;
+    let PendingModuleControlRpc {
+        endpoint,
+        module_sink,
+        negotiated_ver,
+        corr,
+        receiver,
+    } = pending;
+    let body = serde_json::to_vec(&ModuleControlRequest::HealthCheck {})
+        .map_err(|err| HealthProbeError::new(format!("failed to encode health.check: {err}")))?;
+    let frame = Frame::build_with_version(
+        negotiated_ver,
+        FrameType::Request,
+        control_flags(),
+        0,
+        corr,
+        body,
+    )
+    .map_err(|err| HealthProbeError::new(format!("failed to build health.check frame: {err}")))?;
+
+    if let Err(err) = module_sink.send(frame).await {
+        let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
+        return Err(HealthProbeError::new(format!(
+            "failed to send health.check: {err}"
+        )));
+    }
+
+    match timeout_at(deadline, receiver).await {
+        Ok(Ok(ModuleControlRpcOutcome::Response(response))) => {
+            response.health_report().ok_or_else(|| {
+                HealthProbeError::new("health.check RPC returned a non-health response")
+            })
+        }
+        Ok(Ok(ModuleControlRpcOutcome::Rejected(body))) => Err(HealthProbeError::new(format!(
+            "health.check rejected: {}",
+            body.message
+        ))),
+        Ok(Ok(ModuleControlRpcOutcome::ModuleGone(message))) => Err(HealthProbeError::new(message)),
+        Ok(Ok(ModuleControlRpcOutcome::MalformedResponse(message))) => {
+            Err(HealthProbeError::new(message))
+        }
+        Ok(Ok(ModuleControlRpcOutcome::UnexpectedOp { expected, actual })) => {
+            Err(HealthProbeError::new(format!(
+                "expected module-control op '{expected}', got '{actual}'"
+            )))
+        }
+        Ok(Err(_)) => Err(HealthProbeError::new(
+            "health.check waiter was canceled before the module responded",
+        )),
+        Err(_) => {
+            let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
+            Err(HealthProbeError::new(format!(
+                "module did not answer health.check within {:?}",
+                runtime.health.deadline
+            )))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_health_report(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+    report: HealthReport,
+    now_ms: u64,
+) {
+    let status = supervisor_health_status(report.status);
+    let detail = report.detail.clone();
+    let metrics = truncate_health_metrics(report.metrics);
+    let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.health.status = status;
+        state.health.last_probe_ms = Some(now_ms);
+        state.health.detail = detail.clone();
+        state.health.metrics = metrics.clone();
+        state.health.consecutive_failures = 0;
+    });
+
+    let action = match report.status {
+        HealthStatus::Ok => return,
+        HealthStatus::Degraded => runtime.health.on_degraded,
+        HealthStatus::Failing => runtime.health.on_failing,
+    };
+    apply_l3_health_action(
+        spec,
+        runtime,
+        registry,
+        process_liveness,
+        snapshot,
+        child,
+        status,
+        detail.as_deref(),
+        action,
+        now_ms,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_health_probe_failure(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+    err: HealthProbeError,
+    now_ms: u64,
+) {
+    let threshold = runtime.health.failure_threshold.max(1);
+    let mut failures = 0;
+    let detail = err.to_string();
+    let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.health.last_probe_ms = Some(now_ms);
+        state.health.consecutive_failures = state.health.consecutive_failures.saturating_add(1);
+        state.health.detail = Some(detail.clone());
+        state.health.metrics = None;
+        failures = state.health.consecutive_failures;
+    });
+
+    if failures < threshold {
+        warn!(
+            module_id = %spec.module_id,
+            consecutive_failures = failures,
+            threshold,
+            detail = %detail,
+            "health.check probe failed"
+        );
+        return;
+    }
+
+    let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.state = ModuleState::Unresponsive;
+        state.health.status = SupervisorHealthStatus::Unresponsive;
+    });
+    if runtime.health.critical {
+        error!(
+            module_id = %spec.module_id,
+            status = "unresponsive",
+            detail = %detail,
+            "critical module health alert"
+        );
+    } else {
+        warn!(
+            module_id = %spec.module_id,
+            status = "unresponsive",
+            detail = %detail,
+            "module health threshold breached"
+        );
+    }
+    if let Err(err) = health_restart_child(
+        spec,
+        runtime,
+        registry,
+        process_liveness,
+        snapshot,
+        child,
+        SupervisorHealthStatus::Unresponsive,
+        Some(&detail),
+        now_ms,
+    )
+    .await
+    {
+        error!(module_id = %spec.module_id, error = %err, "health-triggered restart failed");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_l3_health_action(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+    status: SupervisorHealthStatus,
+    detail: Option<&str>,
+    action: HealthAction,
+    now_ms: u64,
+) {
+    record_health_action(snapshot, &spec.module_id, action.to_string(), now_ms);
+    match action {
+        HealthAction::Report => {
+            info!(
+                module_id = %spec.module_id,
+                status = ?status,
+                detail,
+                "module reported non-ok health"
+            );
+        }
+        HealthAction::Alert => {
+            error!(
+                module_id = %spec.module_id,
+                status = ?status,
+                detail,
+                "module health alert"
+            );
+        }
+        HealthAction::Restart => {
+            if let Err(err) = health_restart_child(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                status,
+                detail,
+                now_ms,
+            )
+            .await
+            {
+                error!(module_id = %spec.module_id, error = %err, "health-triggered restart failed");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn health_restart_child(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<Child>,
+    status: SupervisorHealthStatus,
+    detail: Option<&str>,
+    now_ms: u64,
+) -> Result<(), SuperviseError> {
+    if !lock_snapshot(snapshot)?.enabled {
+        return Err(SuperviseError::Disabled {
+            module_id: spec.module_id.clone(),
+        });
+    }
+
+    if lock_snapshot(snapshot)?.restart_count >= runtime.restart_policy.max_restarts {
+        record_health_action(snapshot, &spec.module_id, "disabled".to_string(), now_ms);
+        error!(
+            module_id = %spec.module_id,
+            status = ?status,
+            detail,
+            restart_count = runtime.restart_policy.max_restarts,
+            "health restart budget exhausted; disabling module"
+        );
+        begin_forwarding_drain_if_configured(
+            spec,
+            runtime,
+            snapshot,
+            Some(false),
+            "health-disable",
+        )
+        .await?;
+        drain_optional_child(
+            &spec.module_id,
+            registry,
+            snapshot,
+            child,
+            runtime.drain_timeout,
+            ModuleState::Disabled,
+            Some(false),
+        )
+        .await?;
+        process_liveness.untrack_if_current(&spec.module_id, snapshot);
+        return Ok(());
+    }
+
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.restart_count += 1;
+        state.state = ModuleState::Unresponsive;
+        state.health.status = status;
+        state.health.last_action = Some(HealthAction::Restart.to_string());
+        state.health.last_action_ms = Some(now_ms);
+    })?;
+    warn!(
+        module_id = %spec.module_id,
+        status = ?status,
+        detail,
+        restart_count = lock_snapshot(snapshot)?.restart_count,
+        "health-triggered module restart"
+    );
+
+    begin_forwarding_drain_if_configured(spec, runtime, snapshot, Some(true), "health-restart")
+        .await?;
+    drain_optional_child(
+        &spec.module_id,
+        registry,
+        snapshot,
+        child,
+        runtime.drain_timeout,
+        ModuleState::Restarting,
+        Some(true),
+    )
+    .await?;
+    sleep(runtime.restart_policy.backoff).await;
+    process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+    let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
+    *child = Some(next_child);
+    Ok(())
+}
+
+fn record_health_action(snapshot: &SharedSnapshot, module_id: &str, action: String, now_ms: u64) {
+    let _ = update_snapshot(snapshot, Some(module_id), |state| {
+        state.health.last_action = Some(action);
+        state.health.last_action_ms = Some(now_ms);
+    });
+}
+
+fn supervisor_health_status(status: HealthStatus) -> SupervisorHealthStatus {
+    match status {
+        HealthStatus::Ok => SupervisorHealthStatus::Ok,
+        HealthStatus::Degraded => SupervisorHealthStatus::Degraded,
+        HealthStatus::Failing => SupervisorHealthStatus::Failing,
+    }
+}
+
+fn truncate_health_metrics(metrics: Option<Value>) -> Option<Value> {
+    let metrics = metrics?;
+    match serde_json::to_vec(&metrics) {
+        Ok(encoded) if encoded.len() > MAX_HEALTH_METRICS_BYTES => Some(serde_json::json!({
+            "truncated": true,
+            "original_bytes": encoded.len(),
+        })),
+        Ok(_) | Err(_) => Some(metrics),
+    }
+}
+
+fn jittered_health_delay(module_id: &str, probe_index: u64, cadence: Duration) -> Duration {
+    if cadence.is_zero() {
+        return Duration::ZERO;
+    }
+    let cadence_ms = cadence.as_millis() as u64;
+    if cadence_ms == 0 {
+        return cadence;
+    }
+    let jitter_span = (cadence_ms / 10).max(1);
+    let hash = module_id.as_bytes().iter().fold(
+        probe_index.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        |acc, byte| {
+            acc.wrapping_mul(1099511628211)
+                .wrapping_add(u64::from(*byte))
+        },
+    );
+    cadence + Duration::from_millis(hash % jitter_span)
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 async fn supervise_loop(
     spec: ModuleSpec,
     runtime: SupervisorRuntimeConfig,
@@ -854,8 +1514,12 @@ async fn supervise_loop(
     mut child: Option<Child>,
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
+    let mut health_probe = HealthProbeRuntime::default();
     loop {
         if child.is_some() {
+            health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
+            let probe_sleep = sleep(health_probe.wake_after());
+            tokio::pin!(probe_sleep);
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
                 wait_result = active_child.wait() => {
@@ -928,6 +1592,21 @@ async fn supervise_loop(
                         &mut child,
                     ).await {
                         return;
+                    }
+                }
+                _ = &mut probe_sleep => {
+                    if health_probe.due() {
+                        run_health_probe_cycle(
+                            &spec,
+                            &runtime,
+                            &registry,
+                            &process_liveness,
+                            &snapshot,
+                            &mut child,
+                        ).await;
+                        if child.is_some() {
+                            health_probe.schedule_next(&spec, runtime.health.cadence);
+                        }
                     }
                 }
             }

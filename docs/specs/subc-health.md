@@ -11,9 +11,15 @@ daemon.
 - **L1 wire responsive** — PING answered by the module SDK's frame loop.
   Subsumed by L2 (a wedged loop fails both); not probed separately.
 - **L2 request-path responsive** — a typed `health.check` control request that
-  flows through the module's REAL dispatch machinery (spawn-per-request, the
-  same path consumer requests take). Catches the alive-but-wedged class: a
-  module accepting connections whose handler path is stuck.
+  flows through the module's REAL data dispatch machinery. Catches the
+  alive-but-wedged class: a module accepting connections whose handler path is
+  stuck. IMPLEMENTATION REQUIREMENT (not current behavior): today both SDKs
+  handle module-control requests INLINE in the frame loop while data requests
+  are spawned per-request — an inline health answer would be dishonest (a
+  wedged handler pool would still answer). The SDKs MUST route `health.check`
+  through the same per-request spawn path as data-plane requests, and the
+  non-vacuity test (§10: wedged data handler ⇒ health.check also unanswerable)
+  gates the claim.
 - **L3 domain health** — module-defined: stuck runs, failing model loads,
   locked-out credentials. Modules self-report via the same op's reply; subc
   carries the report as a typed shape and never interprets domain detail.
@@ -23,23 +29,30 @@ daemon.
 New module-control-plane op, daemon → module on the module control channel:
 
 ```jsonc
-// request
+// request (ModuleControlRequest, tagged like route.bind)
 { "op": "health.check" }
-// reply
+// reply (ModuleControlResponse, tagged)
 {
+  "op": "health.check",
   "status": "ok" | "degraded" | "failing",
-  "detail": "<opaque human-readable string, optional>",
-  "metrics": { /* opaque JSON object, optional — CK-app/diagnostic fodder */ }
+  "detail": "<human-readable string>",   // optional; absent when omitted (never null)
+  "metrics": { /* JSON object */ }        // optional; opaque to the core; ≤16 KiB
+                                          // serialized or the prober truncates it
+                                          // from supervisor.health (status still acts)
 }
 ```
 
 Rules:
-- Reply must be CHEAP (no I/O behind it beyond in-memory state). Deadline is
-  enforced by the prober, not the module.
+- Tagged exactly like the existing module-control shapes (two-implementer
+  determinism). Timestamps anywhere in this feature are Unix ms.
+- Reply must be CHEAP (in-memory state only). Deadline is enforced by the
+  prober, not the module.
 - `status` is the ONLY field subc acts on. `detail`/`metrics` are carried
   opaque (thin core) and surfaced via `supervisor.health` / logs.
 - A module that cannot answer within the deadline is L2-unresponsive — that is
   a stronger signal than any self-report and is evaluated first.
+- The op is advertised via the HELLO `control_ops` grant (§4); it is never
+  part of the baseline set.
 
 `Tool.description: Option<String>` rides the same protocol release (unrelated
 field, batched to avoid two wire bumps).
@@ -65,13 +78,26 @@ path is the entire point (it proves the path consumers use).
   don't synchronize. Probe deadline default 5s.
 - `consecutive_failures >= threshold` (default 3) ⇒ L2-unresponsive ⇒ the
   module enters `Unresponsive` state and the configured action fires.
-- Probing uses the existing module control channel; a probe in flight never
-  blocks data-plane forwarding (it's an ordinary control request).
-- Modules without the SDK default (old builds) fail probes benignly: a module
-  that answers data-plane traffic but not health.check would be misclassified,
-  so the prober treats an `unknown op`-class error reply as OK-but-unaware
-  (probe satisfied at L1½: the dispatch loop answered). Only timeout/silence
-  counts as failure. This makes rollout safe with mixed module versions.
+- Probes do NOT consume data-plane flow-control credits (they are control
+  frames, not route Requests). They DO share the module connection's socket
+  egress queue — the guarantee is "no credit consumption", not total
+  isolation.
+- ROLLOUT IS CAPABILITY-GATED, never unknown-op-probed: today's modules
+  deserialize module-control ops into a closed enum and reply with an error
+  (or worse, a TS module treats it as an unexpected-request failure) — probing
+  an old module could destabilize it. `health.check` is an OPTIONAL advertised
+  module-control op: new SDKs advertise it in the HELLO `control_ops` grant
+  list; it is NOT added to the null-means-baseline set (old modules sending
+  `control_ops: null` must not appear to support it). The prober only probes
+  modules that advertised the op; everything else reports health `unknown`
+  (OK-but-unaware) and is never sent the op. Mixed fleets are safe by
+  construction.
+- NEW MACHINERY REQUIRED: the daemon's only daemon→module request today is the
+  route.bind relay, whose correlation tracking and response parsing are
+  route-bind-specific. The prober needs a small GENERIC module-control RPC
+  facility in subc-core: per-module corr allocator, pending map with deadline,
+  response demux by tagged `op`, cancel on module death. The route-bind relay
+  can migrate onto it later; v1 only requires health.check to use it.
 
 ## 5. Escalation ladder (mechanism, not policy language)
 
@@ -89,8 +115,17 @@ L3 "degraded"/"failing"  → per-module configured action (closed set):
   failing breaks context infra and must not be quiet; quota failing degrades
   quietly). v1 alert = ERROR-level daemon log line + status in
   supervisor.health; the CK app subscribes later.
-- Anti-flap: L3-triggered restarts consume the same crash budget as crashes;
-  a module that reports `failing` forever does not restart-loop forever.
+- Anti-flap: health-triggered restarts INCREMENT the module's restart counter
+  (today's explicit restart paths RESET it — the health path must not reuse
+  them as-is, or `on_failing: restart` loops forever). A health restart
+  consumes crash budget exactly like a crash; budget exhaustion lands in
+  Disabled + alert-grade surfacing.
+- Drain-restart on an UNRESPONSIVE module is bounded: forwarding drain waits
+  on in-flight counts only up to the existing `drain_timeout`, then
+  force-releases routes, and child shutdown waits-with-timeout then kills.
+  Worst case ≈ drain_timeout + child kill timeout; the spec accepts that
+  wedged in-flight requests are force-torn-down (their consumers get the
+  standard route-gone GOODBYE).
 
 Explicit non-goals for v1 (out, by decision): time-windowed conditions
 ("degraded >5min"), trend analysis, cross-module correlation, any rule
@@ -116,7 +151,12 @@ smarter lives in the daemon.
 
 Absent = defaults (30s/5s/3, report/report, critical:false). `critical:true`
 additionally escalates L2-unresponsive and spawn-failure to `alert`-grade
-surfacing (the note-#298 resolution: per-module, not global fatal).
+surfacing (per-module criticality, not global fatal).
+
+Parser note: daemon_config's existing convention IGNORES unknown fields
+(forward-compat) — the health block follows that convention (no global
+posture flip); values inside a PRESENT health block are validated (bad enum,
+non-positive cadence ⇒ config parse error, fail-loud at boot).
 
 ## 7. Observability surfaces
 
@@ -124,17 +164,23 @@ surfacing (the note-#298 resolution: per-module, not global fatal).
   + `last_probe_ms`.
 - New channel-0 op `supervisor.health`: full report per module (status, last
   report's opaque detail/metrics, consecutive failures, last action taken).
-- Consumer-population observability: the daemon logs (INFO) connected-client
-  count transitions and exposes `connected_clients` in server.describe — a
-  fleet that fails to return after a daemon restart becomes visible instead
-  of silently absent.
+- Consumer-population observability: the daemon maintains an authenticated-
+  connection counter (new — no such counter exists today), logs (INFO) count
+  transitions, and exposes `connected_clients` in server.describe. VISIBILITY
+  ONLY: it makes a fleet that fails to return after a daemon restart
+  observable; the repair for that class lives client-side (the 0.3.2
+  reconnect classifier).
 
 ## 8. Daemon self-check
 
-- Internal watchdog task: heartbeats the main accept loop and the router's
-  forwarding path (a self-request through a loopback control connection)
-  every 60s; a miss logs ERROR with diagnostics. launchd (KeepAlive) remains
-  the outer restart layer; the CK app becomes the outside observer later.
+- Internal watchdog task: every 60s, a loopback self-request (the daemon
+  authenticates to itself with its own key — sound, and accept spawns a task
+  per connection so the probe cannot deadlock the loop it watches) drives a
+  channel-0 `server.describe`. SCOPE: this proves accept + auth + control
+  dispatch; it deliberately does NOT prove the data-plane forwarding path
+  (that would need a resident test module — out of v1). A miss logs ERROR
+  with diagnostics. launchd (KeepAlive) remains the outer restart layer; the
+  CK app becomes the outside observer later.
 - Connection-file integrity check rides the watchdog (file present, 0600,
   parses, matches the live port/key).
 
@@ -151,14 +197,20 @@ surfacing (the note-#298 resolution: per-module, not global fatal).
 
 ## 10. Tests (gate)
 
-- SDK: default health.check answered through the dispatch path (test: a
-  handler whose data-path is deliberately wedged fails health.check too — the
-  probe must NOT be answerable while dispatch is wedged; non-vacuity for L2).
+- SDK (both Rust and TS): default health.check answered through the per-
+  request spawn path (non-vacuity: a handler whose data-path is deliberately
+  wedged — e.g. all handler permits held — must fail health.check too).
 - Prober: wedged-module (stub with stuck handler) detected in N×cadence,
-  drain-restart fired, recovery observed; old-module (no health op) treated
-  as OK-but-unaware; probe timeout does not disturb in-flight data requests.
-- Ladder: on_degraded=restart consumes crash budget (no infinite loop);
-  critical module's unresponsive state logs alert-grade.
-- Config: schema parse, defaults, unknown fields rejected.
+  drain-restart fired within drain_timeout bounds, recovery observed;
+  NON-ADVERTISING module is never sent the op and reports health unknown
+  (assert zero health.check frames on its wire); probe timeout does not
+  disturb in-flight data requests.
+- Generic module-control RPC: response demux by op, deadline expiry, cancel
+  on module death, no interference with a concurrent route.bind relay.
+- Ladder: on_failing=restart increments restart count (no reset), exhausts
+  crash budget into Disabled (no infinite loop); critical module's
+  unresponsive state logs alert-grade.
+- Config: health block parse + validation errors fail boot; absent block =
+  defaults; unknown fields inside follow the parser's ignore convention.
 - supervisor.health end-to-end over a live daemon with a degraded-reporting
-  stub.
+  stub; oversized metrics truncated without losing status.

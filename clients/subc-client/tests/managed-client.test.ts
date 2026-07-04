@@ -44,6 +44,9 @@ interface FakeStats {
 
 interface FakeDaemonOptions {
   stats: FakeStats;
+  // Daemon-side HMAC key — a daemon started with a different key models the
+  // key rotation that happens on every real daemon restart.
+  key?: Uint8Array;
   // "delay-body": reply with the frame HEADER immediately, then the body after
   //   `delayBodyMs` — so the client's read loop is mid-frame (bytes present) when a
   //   short request deadline fires, deterministically exercising timeout arbitration.
@@ -139,6 +142,66 @@ describe("SubcClient managed call", () => {
       expect(firstStats.dataRequests).toBe(1);
       expect(secondStats.dataRequests).toBe(1);
       expect(sleeps).toEqual([]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("recovers across a daemon restart that rotates the key (stale-file auth race is transient)", async () => {
+    // The daemon rotates its key on every restart but keeps its fixed port. A
+    // client racing the restart reads the pre-rotation connection file, connects
+    // successfully (port unchanged), and fails the HMAC handshake. That proof
+    // mismatch must be retried-with-re-read (the next attempt picks up the
+    // rotated file), not treated as a permanent impostor verdict — permanent
+    // treatment turns every daemon restart into a fleet-wide wedge that only a
+    // host-app restart clears.
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const first = await startFakeDaemon({ stats, closeAfterDataResponses: 1 });
+    writeConnectionFile(connFile, first.port);
+
+    let staleWindowRemaining = 0;
+    const rotatedKey = Uint8Array.from(Array(32).fill(0x99));
+    let rotatedPort = 0;
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      sleep: async () => {
+        // Each reconnect backoff sleep consumes one "stale window" tick; when the
+        // window closes, the rotated file lands on disk — modelling the client
+        // racing ahead of the daemon's file publish.
+        if (staleWindowRemaining > 0) {
+          staleWindowRemaining -= 1;
+          if (staleWindowRemaining === 0) writeConnectionFile(connFile, rotatedPort, rotatedKey);
+        }
+      },
+    });
+
+    try {
+      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+        method: "echo",
+        params: { n: 1 },
+      });
+      await waitFor(() => clientClosedErr(client) !== null, "client to observe first daemon close");
+      await first.stop();
+
+      // Restart: new daemon, ROTATED key. The old file (old key) stays on disk for
+      // the first two reconnect attempts — both connect fine and fail auth.
+      const restartStats = newStats();
+      const second = await startFakeDaemon({ stats: restartStats, key: rotatedKey });
+      rotatedPort = second.port;
+      writeConnectionFile(connFile, second.port); // old KEY, new port: connects, proof mismatch
+      staleWindowRemaining = 2;
+
+      await expect(client.call("managed-provider", "echo", { n: 2 })).resolves.toEqual({
+        method: "echo",
+        params: { n: 2 },
+      });
+      expect(restartStats.dataRequests).toBe(1);
+      // The recovery consumed the stale window: at least one auth-failed attempt
+      // happened before the rotated file landed (proving AuthError was retried).
+      expect(staleWindowRemaining).toBe(0);
     } finally {
       client.close();
     }
@@ -466,7 +529,7 @@ async function startFakeDaemon(options: FakeDaemonOptions): Promise<FakeDaemon> 
 async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions): Promise<void> {
   const reader = new SocketReader(socket);
   const deadline = Date.now() + 5_000;
-  await authenticateFakeServer(reader, socket, deadline);
+  await authenticateFakeServer(reader, socket, deadline, options.key ?? KEY);
   let routeChannel = 41;
 
   for (;;) {
@@ -552,11 +615,16 @@ function errorFrame(request: Frame, body: { code: string; message: string }): Fr
   );
 }
 
-async function authenticateFakeServer(reader: SocketReader, socket: Socket, deadline: number): Promise<void> {
+async function authenticateFakeServer(
+  reader: SocketReader,
+  socket: Socket,
+  deadline: number,
+  key: Uint8Array = KEY,
+): Promise<void> {
   const hello = await readAuthMessage<{ client_nonce: number[]; role: string }>(reader, deadline);
   expect(hello.role).toBe("client");
   const clientNonce = Uint8Array.from(hello.client_nonce);
-  const serverProof = computeProof(KEY, SERVER_PROOF_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
+  const serverProof = computeProof(key, SERVER_PROOF_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
   await writeAuthMessage(
     socket,
     {
@@ -569,7 +637,7 @@ async function authenticateFakeServer(reader: SocketReader, socket: Socket, dead
   );
 
   const auth = await readAuthMessage<{ client_auth: number[] }>(reader, deadline);
-  const expected = computeProof(KEY, CLIENT_AUTH_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
+  const expected = computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
   expect(Buffer.from(auth.client_auth).equals(Buffer.from(expected))).toBe(true);
 }
 
@@ -702,13 +770,13 @@ function tempConnectionFile(): { dir: string; connFile: string } {
   return { dir, connFile: join(dir, "subc-connection.json") };
 }
 
-function writeConnectionFile(path: string, port: number): void {
+function writeConnectionFile(path: string, port: number, key: Uint8Array = KEY): void {
   writeFileSync(
     path,
     JSON.stringify({
       schema: 1,
       endpoints: [{ host: "127.0.0.1", port }],
-      key: Array.from(KEY),
+      key: Array.from(key),
       daemon_id: Array.from(DAEMON_ID),
       pid: process.pid,
       daemon_ver: "fake-subc",

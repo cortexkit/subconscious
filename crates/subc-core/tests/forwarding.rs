@@ -274,12 +274,17 @@ async fn health_prober_failing_restart_exhausts_budget_to_disabled() {
     )
     .await;
 
-    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
-        status.state == ModuleState::Disabled && status.restart_count == 1 && !status.live
+    // Health fields ride the same poll predicate: Disabled and the health
+    // stamp are separate writes, so asserting them after a state-only wait
+    // reads a mid-transition snapshot (flaked once in CI on ubuntu).
+    wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Disabled
+            && status.restart_count == 1
+            && !status.live
+            && status.health.status == SupervisorHealthStatus::Failing
+            && status.health.last_action.as_deref() == Some("disabled")
     })
     .await;
-    assert_eq!(status.health.status, SupervisorHealthStatus::Failing);
-    assert_eq!(status.health.last_action.as_deref(), Some("disabled"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

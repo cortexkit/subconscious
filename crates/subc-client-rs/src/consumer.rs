@@ -1,9 +1,16 @@
 use std::{
     collections::HashMap,
     error::Error,
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -19,7 +26,7 @@ use subc_transport::{
 use tokio::{
     io::{AsyncWriteExt, BufWriter},
     net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpStream},
-    sync::{mpsc, oneshot, Notify, Semaphore},
+    sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{sleep, Instant},
 };
@@ -36,6 +43,7 @@ const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const DEFAULT_RESTORED_DEBOUNCE: Duration = Duration::from_millis(250);
 const EGRESS_BUFFER: usize = 128;
 const DEFAULT_ROUTE_WINDOW: usize = 1024;
+const DEFAULT_SUBSCRIPTION_EVENT_BUFFER: usize = 128;
 
 /// Capped exponential backoff used for reconnects and transient route-open retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +142,37 @@ impl Default for CallOptions {
     }
 }
 
+/// Options for [`SubcConsumer::subscribe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscribeOptions {
+    pub priority: Priority,
+    /// Maximum number of events buffered for the caller before the subscription is dropped.
+    /// The reader task never awaits a slow event consumer; if this bounded channel fills,
+    /// `closed()` resolves with [`CallError::SubscriptionBackpressure`].
+    pub event_buffer: usize,
+    pub route_retry: RetryBackoff,
+    /// Maximum real-time limit for retrying route.open attempts when the target is temporarily absent.
+    pub route_retry_deadline: Duration,
+    /// Deadline for opening the managed route and queuing the held-open request.
+    /// The subscription itself has no response timeout once the request is sent.
+    pub route_open_timeout: Duration,
+    /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
+    pub consumer_identity: Option<ConsumerIdentity>,
+}
+
+impl Default for SubscribeOptions {
+    fn default() -> Self {
+        Self {
+            priority: Priority::Interactive,
+            event_buffer: DEFAULT_SUBSCRIPTION_EVENT_BUFFER,
+            route_retry: RetryBackoff::default(),
+            route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
+            route_open_timeout: DEFAULT_CALL_TIMEOUT,
+            consumer_identity: None,
+        }
+    }
+}
+
 /// Minimal connection lifecycle signal. It is useful for logging and route-cache invalidation,
 /// but callers must not use the consumer epoch as proof that a target provider is current.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +184,100 @@ pub enum ConnectionState {
 /// Managed Rust consumer for subc route calls.
 pub struct SubcConsumer {
     shared: Arc<Shared>,
+}
+
+/// A live subscription to a provider event stream.
+///
+/// The event receiver yields each `StreamData` payload for the held-open request's
+/// correlation id. Await [`Subscription::closed`] to learn whether the provider ended
+/// the stream cleanly (`StreamEnd`) or the stream was rejected by an Error frame,
+/// route GOODBYE, connection drop, or local backpressure. Dropping the subscription
+/// sends a best-effort Cancel frame, the same as calling [`Subscription::unsubscribe`].
+pub struct Subscription {
+    events: mpsc::Receiver<Vec<u8>>,
+    closed: SubscriptionClosed,
+    cancel: SubscriptionCancel,
+}
+
+impl Subscription {
+    /// Receive event payloads emitted as `StreamData` frames for this subscription.
+    pub fn events(&mut self) -> &mut mpsc::Receiver<Vec<u8>> {
+        &mut self.events
+    }
+
+    /// Future that resolves when the subscription reaches a terminal state.
+    ///
+    /// It resolves with `Ok(())` on `StreamEnd` or local unsubscribe, and returns a
+    /// [`CallError`] for module Error frames, route teardown, connection loss, or
+    /// event-channel backpressure. Await it after the event receiver returns `None`
+    /// to distinguish a clean end from an error.
+    pub fn closed(&mut self) -> &mut SubscriptionClosed {
+        &mut self.closed
+    }
+
+    /// Cancel the held-open request.
+    ///
+    /// This sends a best-effort header-only Cancel frame for the subscription's
+    /// `(channel, corr)` and settles [`Subscription::closed`] promptly with `Ok(())`.
+    /// The provider may still send a terminal frame later; it is ignored because the
+    /// local subscription is already closed.
+    pub fn unsubscribe(&self) {
+        self.cancel.unsubscribe();
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.cancel.unsubscribe();
+    }
+}
+
+/// Future returned by [`Subscription::closed`].
+pub struct SubscriptionClosed {
+    rx: oneshot::Receiver<Result<(), CallError>>,
+}
+
+impl Unpin for SubscriptionClosed {}
+
+impl Future for SubscriptionClosed {
+    type Output = Result<(), CallError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.rx).poll(cx) {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(CallError::outcome_unknown(
+                "subscription closed result channel dropped",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct SubscriptionCancel {
+    shared: Arc<Shared>,
+    key: PendingKey,
+    priority: Priority,
+    cancelled: AtomicBool,
+}
+
+impl SubscriptionCancel {
+    fn new(shared: Arc<Shared>, key: PendingKey, priority: Priority) -> Self {
+        Self {
+            shared,
+            key,
+            priority,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn unsubscribe(&self) {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.shared
+            .unsubscribe_subscription(self.key, self.priority);
+    }
 }
 
 impl SubcConsumer {
@@ -234,6 +367,85 @@ impl SubcConsumer {
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Err(err) if err.is_not_sent() && Instant::now() < call_deadline => {
+                    self.shared
+                        .invalidate_route(&route_key, Some(route.generation));
+                    self.shared.ensure_connected_for_call().await?;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Open a held-open subscription on a managed route.
+    ///
+    /// This opens or reuses the same `(target, identity, consumer_identity)` route as
+    /// [`SubcConsumer::call`], sends one Request that the provider keeps open, and
+    /// returns a [`Subscription`] whose event receiver yields each matching
+    /// `StreamData` payload. The request holds one route flow-control permit until
+    /// `StreamEnd`, an Error frame, route teardown, connection loss, local
+    /// backpressure, or [`Subscription::unsubscribe`]. Reconnects reject the
+    /// subscription; callers that need durable replay should resubscribe with their
+    /// own cursor after observing the failure.
+    pub async fn subscribe(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        body: Vec<u8>,
+        opts: SubscribeOptions,
+    ) -> Result<Subscription, CallError> {
+        let open_deadline = Instant::now() + opts.route_open_timeout;
+        let route_opts = CallOptions {
+            timeout: opts.route_open_timeout,
+            priority: opts.priority,
+            route_retry: opts.route_retry,
+            route_retry_deadline: opts.route_retry_deadline,
+            consumer_identity: opts.consumer_identity.clone(),
+        };
+        let consumer_identity = route_open_consumer_identity(&route_opts);
+        let route_key = RouteKey::new(&target, &identity, consumer_identity.as_ref());
+
+        loop {
+            let route = self
+                .shared
+                .ensure_route(
+                    &route_key,
+                    &target,
+                    &identity,
+                    &consumer_identity,
+                    &route_opts,
+                    open_deadline,
+                )
+                .await?;
+            let permit = match Arc::clone(&route.sem).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Err(CallError::not_sent("route flow-control semaphore closed"));
+                }
+            };
+
+            if !self.shared.route_is_current(&route_key, &route) {
+                drop(permit);
+                self.shared
+                    .sleep_until_retry(open_deadline, opts.route_retry.base)
+                    .await?;
+                continue;
+            }
+
+            match self
+                .shared
+                .send_subscription(
+                    Some(route.generation),
+                    route.channel,
+                    body.clone(),
+                    opts.priority,
+                    opts.event_buffer,
+                    permit,
+                )
+                .await
+            {
+                Ok(subscription) => return Ok(subscription),
+                Err(err) if err.is_not_sent() && Instant::now() < open_deadline => {
                     self.shared
                         .invalidate_route(&route_key, Some(route.generation));
                     self.shared.ensure_connected_for_call().await?;
@@ -364,7 +576,7 @@ impl Error for ConsumerError {
     }
 }
 
-/// Managed call failure that distinguishes whether the request body was sent.
+/// Managed call or subscription failure.
 #[derive(Debug)]
 pub enum CallError {
     /// The request body was not accepted by the writer path, or route.open failed before data send.
@@ -374,6 +586,11 @@ pub enum CallError {
     /// The target module handler returned an Error frame. Application-level rejections
     /// are returned as ordinary successful response bytes and do not produce this variant.
     Module(ErrorBody),
+    /// A subscription event receiver stopped keeping up with its bounded channel.
+    ///
+    /// The reader task must never await a slow consumer while it is dispatching frames
+    /// for the whole connection, so a full event channel terminates only that subscription.
+    SubscriptionBackpressure(Box<dyn Error + Send + Sync>),
 }
 
 impl CallError {
@@ -388,6 +605,10 @@ impl CallError {
     fn is_not_sent(&self) -> bool {
         matches!(self, Self::NotSent(_))
     }
+
+    fn subscription_backpressure(reason: impl Into<String>) -> Self {
+        Self::SubscriptionBackpressure(Box::new(SimpleError(reason.into())))
+    }
 }
 
 impl fmt::Display for CallError {
@@ -396,6 +617,9 @@ impl fmt::Display for CallError {
             Self::NotSent(err) => write!(f, "request not sent: {err}"),
             Self::OutcomeUnknown(err) => write!(f, "request outcome unknown: {err}"),
             Self::Module(body) => write!(f, "module error {}: {}", body.code, body.message),
+            Self::SubscriptionBackpressure(err) => {
+                write!(f, "subscription event channel backpressure: {err}")
+            }
         }
     }
 }
@@ -403,7 +627,9 @@ impl fmt::Display for CallError {
 impl Error for CallError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::NotSent(err) | Self::OutcomeUnknown(err) => Some(err.as_ref()),
+            Self::NotSent(err)
+            | Self::OutcomeUnknown(err)
+            | Self::SubscriptionBackpressure(err) => Some(err.as_ref()),
             Self::Module(_) => None,
         }
     }
@@ -941,13 +1167,7 @@ impl Shared {
                     "connection changed before request registration",
                 ));
             }
-            inner.pending.insert(
-                key,
-                PendingEntry {
-                    accepted: false,
-                    tx,
-                },
-            );
+            inner.pending.insert(key, PendingEntry::unary(tx));
         }
         let mut registration = PendingRegistration::new(Arc::clone(self), key);
 
@@ -985,6 +1205,161 @@ impl Shared {
         }
     }
 
+    async fn send_subscription(
+        self: &Arc<Self>,
+        expected_generation: Option<u64>,
+        channel: u16,
+        body: Vec<u8>,
+        priority: Priority,
+        event_buffer: usize,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Subscription, CallError> {
+        let (generation, corr, writer) = {
+            let mut inner = self.lock_inner();
+            if inner.closed {
+                return Err(CallError::not_sent("consumer closed"));
+            }
+            let generation = inner.generation;
+            if expected_generation.is_some_and(|expected| expected != generation) {
+                return Err(CallError::not_sent("route generation is stale before send"));
+            }
+            let Some(writer) = inner.writer.clone() else {
+                return Err(CallError::not_sent("subc connection is down before send"));
+            };
+            let corr = inner.next_corr;
+            inner.next_corr = inner.next_corr.saturating_add(1).max(1);
+            (generation, corr, writer)
+        };
+
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, priority, false),
+            channel,
+            corr,
+            body,
+        )
+        .map_err(|err| CallError::not_sent(format!("failed to build request frame: {err}")))?;
+        let key = PendingKey {
+            generation,
+            channel,
+            corr,
+        };
+        let (events_tx, events_rx) = mpsc::channel(event_buffer.max(1));
+        let (closed_tx, closed_rx) = oneshot::channel();
+        {
+            let mut inner = self.lock_inner();
+            if inner.closed || inner.generation != generation || inner.writer.is_none() {
+                return Err(CallError::not_sent(
+                    "connection changed before subscription registration",
+                ));
+            }
+            inner.pending.insert(
+                key,
+                PendingEntry::subscription(events_tx, closed_tx, permit, priority),
+            );
+        }
+        let mut registration = PendingRegistration::new(Arc::clone(self), key);
+
+        if writer
+            .send(WriteCommand {
+                frame,
+                pending: Some(key),
+            })
+            .await
+            .is_err()
+        {
+            let accepted = registration.remove_pending().unwrap_or(false);
+            return Err(classify_failure(
+                accepted,
+                "writer task closed before accepting subscription request",
+            ));
+        }
+
+        registration.disarm();
+        Ok(Subscription {
+            events: events_rx,
+            closed: SubscriptionClosed { rx: closed_rx },
+            cancel: SubscriptionCancel::new(Arc::clone(self), key, priority),
+        })
+    }
+
+    fn unsubscribe_subscription(&self, key: PendingKey, priority: Priority) {
+        let entry = self.lock_inner().pending.remove(&key);
+        if let Some(entry) = entry {
+            entry.settle_subscription_result(Ok(()));
+            self.send_cancel(key.generation, key.channel, key.corr, priority);
+        }
+    }
+
+    fn route_stream_data(&self, key: PendingKey, body: Vec<u8>) {
+        let overflow = {
+            let mut inner = self.lock_inner();
+            let Some(entry) = inner.pending.get(&key) else {
+                return;
+            };
+            match entry.try_send_stream_data(body) {
+                Ok(()) | Err(StreamDataDelivery::NotSubscription) => return,
+                Err(StreamDataDelivery::Full) => {
+                    let priority = entry
+                        .subscription_priority()
+                        .unwrap_or(Priority::Interactive);
+                    let entry = inner.pending.remove(&key);
+                    entry.map(|entry| {
+                        (
+                            entry,
+                            priority,
+                            "subscription event channel filled; reader dropped the stream instead of blocking",
+                        )
+                    })
+                }
+                Err(StreamDataDelivery::Closed) => {
+                    let priority = entry
+                        .subscription_priority()
+                        .unwrap_or(Priority::Interactive);
+                    let entry = inner.pending.remove(&key);
+                    entry.map(|entry| {
+                        (
+                            entry,
+                            priority,
+                            "subscription event receiver closed before the stream ended",
+                        )
+                    })
+                }
+            }
+        };
+
+        if let Some((entry, priority, reason)) = overflow {
+            entry.settle_call_error(CallError::subscription_backpressure(reason));
+            self.send_cancel(key.generation, key.channel, key.corr, priority);
+        }
+    }
+
+    fn send_cancel(&self, generation: u64, channel: u16, corr: u64, priority: Priority) {
+        let writer = {
+            let inner = self.lock_inner();
+            if inner.closed || inner.generation != generation {
+                return;
+            }
+            inner.writer.clone()
+        };
+        let Some(writer) = writer else {
+            return;
+        };
+        let Ok(frame) = Frame::build(
+            FrameType::Cancel,
+            Flags::new(false, priority, false),
+            channel,
+            corr,
+            Vec::new(),
+        ) else {
+            return;
+        };
+        let _ = writer.try_send(WriteCommand {
+            frame,
+            pending: None,
+        });
+    }
+
     fn mark_pending_accepted(&self, key: PendingKey) -> bool {
         let mut inner = self.lock_inner();
         if inner.closed || inner.generation != key.generation {
@@ -1000,7 +1375,7 @@ impl Shared {
     fn settle_pending(&self, key: PendingKey, terminal: PendingTerminal) {
         let entry = self.lock_inner().pending.remove(&key);
         if let Some(entry) = entry {
-            let _ = entry.tx.send(PendingResult::Terminal(terminal));
+            entry.settle_terminal(terminal);
         }
     }
 
@@ -1156,7 +1531,7 @@ impl Shared {
     fn fail_channel_pending(&self, generation: u64, channel: u16, reason: &str) {
         let entries = {
             let mut inner = self.lock_inner();
-            drain_pending_channel(&mut inner.pending, generation, channel)
+            drain_pending_channel(&mut inner.pending, generation, channel, true)
         };
         settle_pending_entries(entries, reason.to_string());
     }
@@ -1169,10 +1544,11 @@ impl Shared {
         loop {
             let has_inflight = {
                 let inner = self.lock_inner();
-                inner
-                    .pending
-                    .keys()
-                    .any(|k| k.generation == generation && k.channel == channel)
+                inner.pending.iter().any(|(key, entry)| {
+                    key.generation == generation
+                        && key.channel == channel
+                        && !entry.is_subscription()
+                })
             };
             if !has_inflight || Instant::now() >= deadline {
                 return;
@@ -1412,6 +1788,10 @@ impl From<CallError> for SharedCallFailure {
                     body.code, body.message
                 ),
             },
+            CallError::SubscriptionBackpressure(err) => Self {
+                kind: FailureKind::OutcomeUnknown,
+                message: err.to_string(),
+            },
         }
     }
 }
@@ -1431,7 +1811,118 @@ struct PendingKey {
 
 struct PendingEntry {
     accepted: bool,
-    tx: oneshot::Sender<PendingResult>,
+    completion: PendingCompletion,
+}
+
+enum PendingCompletion {
+    Unary(oneshot::Sender<PendingResult>),
+    Subscription {
+        events: mpsc::Sender<Vec<u8>>,
+        closed: oneshot::Sender<Result<(), CallError>>,
+        _permit: OwnedSemaphorePermit,
+        priority: Priority,
+    },
+}
+
+enum StreamDataDelivery {
+    NotSubscription,
+    Full,
+    Closed,
+}
+
+impl PendingEntry {
+    fn unary(tx: oneshot::Sender<PendingResult>) -> Self {
+        Self {
+            accepted: false,
+            completion: PendingCompletion::Unary(tx),
+        }
+    }
+
+    fn subscription(
+        events: mpsc::Sender<Vec<u8>>,
+        closed: oneshot::Sender<Result<(), CallError>>,
+        permit: OwnedSemaphorePermit,
+        priority: Priority,
+    ) -> Self {
+        Self {
+            accepted: false,
+            completion: PendingCompletion::Subscription {
+                events,
+                closed,
+                _permit: permit,
+                priority,
+            },
+        }
+    }
+
+    fn is_subscription(&self) -> bool {
+        matches!(&self.completion, PendingCompletion::Subscription { .. })
+    }
+
+    fn subscription_priority(&self) -> Option<Priority> {
+        match &self.completion {
+            PendingCompletion::Subscription { priority, .. } => Some(*priority),
+            PendingCompletion::Unary(_) => None,
+        }
+    }
+
+    fn try_send_stream_data(&self, body: Vec<u8>) -> Result<(), StreamDataDelivery> {
+        let PendingCompletion::Subscription { events, .. } = &self.completion else {
+            return Err(StreamDataDelivery::NotSubscription);
+        };
+        events.try_send(body).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => StreamDataDelivery::Full,
+            mpsc::error::TrySendError::Closed(_) => StreamDataDelivery::Closed,
+        })
+    }
+
+    fn settle_terminal(self, terminal: PendingTerminal) {
+        match self.completion {
+            PendingCompletion::Unary(tx) => {
+                let _ = tx.send(PendingResult::Terminal(terminal));
+            }
+            PendingCompletion::Subscription { closed, .. } => {
+                let result = match terminal {
+                    PendingTerminal::Response { .. } | PendingTerminal::StreamEnd => Ok(()),
+                    PendingTerminal::Error { body } => Err(CallError::Module(body)),
+                };
+                let _ = closed.send(result);
+            }
+        }
+    }
+
+    fn settle_failure(self, reason: String) {
+        let accepted = self.accepted;
+        self.settle_call_error(classify_failure(accepted, reason));
+    }
+
+    fn settle_call_error(self, err: CallError) {
+        match self.completion {
+            PendingCompletion::Unary(tx) => {
+                let _ = tx.send(PendingResult::Failure {
+                    accepted: self.accepted,
+                    reason: err.to_string(),
+                });
+            }
+            PendingCompletion::Subscription { closed, .. } => {
+                let _ = closed.send(Err(err));
+            }
+        }
+    }
+
+    fn settle_subscription_result(self, result: Result<(), CallError>) {
+        match self.completion {
+            PendingCompletion::Subscription { closed, .. } => {
+                let _ = closed.send(result);
+            }
+            PendingCompletion::Unary(tx) => {
+                let _ = tx.send(PendingResult::Failure {
+                    accepted: self.accepted,
+                    reason: "subscription cancel matched a unary request".to_string(),
+                });
+            }
+        }
+    }
 }
 
 struct PendingRegistration {
@@ -1595,7 +2086,8 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
             shared.settle_pending(key, PendingTerminal::Error { body });
         }
         FrameType::StreamEnd => shared.settle_pending(key, PendingTerminal::StreamEnd),
-        FrameType::StreamData | FrameType::Push => {}
+        FrameType::StreamData => shared.route_stream_data(key, frame.body),
+        FrameType::Push => {}
         FrameType::Goodbye if frame.header.channel == 0 => {
             shared.handle_generation_drop(generation, "subc sent GOODBYE".to_string());
             return false;
@@ -1604,7 +2096,7 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
             shared.invalidate_routes_for_channel(generation, frame.header.channel);
             let pending = {
                 let mut inner = shared.lock_inner();
-                drain_pending_channel(&mut inner.pending, generation, frame.header.channel)
+                drain_pending_channel(&mut inner.pending, generation, frame.header.channel, true)
             };
             settle_pending_entries(pending, "route closed by subc".to_string());
         }
@@ -1734,10 +2226,7 @@ fn classify_failure(accepted: bool, reason: impl Into<String>) -> CallError {
 
 fn settle_pending_entries(entries: Vec<PendingEntry>, reason: String) {
     for entry in entries {
-        let _ = entry.tx.send(PendingResult::Failure {
-            accepted: entry.accepted,
-            reason: reason.clone(),
-        });
+        entry.settle_failure(reason.clone());
     }
 }
 
@@ -1759,11 +2248,16 @@ fn drain_pending_channel(
     pending: &mut HashMap<PendingKey, PendingEntry>,
     generation: u64,
     channel: u16,
+    include_subscriptions: bool,
 ) -> Vec<PendingEntry> {
     let keys = pending
-        .keys()
-        .copied()
-        .filter(|key| key.generation == generation && key.channel == channel)
+        .iter()
+        .filter_map(|(key, entry)| {
+            (key.generation == generation
+                && key.channel == channel
+                && (include_subscriptions || !entry.is_subscription()))
+            .then_some(*key)
+        })
         .collect::<Vec<_>>();
     keys.into_iter()
         .filter_map(|key| pending.remove(&key))
@@ -1971,5 +2465,42 @@ mod tests {
         let key = RouteKey::new(&target, &identity, None);
         assert_eq!(key.project_root, PathBuf::from("/tmp/project"));
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
+    }
+
+    #[test]
+    fn drain_pending_channel_can_skip_subscriptions() {
+        let mut pending = HashMap::new();
+        let generation = 7;
+        let channel = 11;
+        let unary_key = PendingKey {
+            generation,
+            channel,
+            corr: 1,
+        };
+        let subscription_key = PendingKey {
+            generation,
+            channel,
+            corr: 2,
+        };
+        let (unary_tx, _unary_rx) = oneshot::channel();
+        pending.insert(unary_key, PendingEntry::unary(unary_tx));
+
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (closed_tx, _closed_rx) = oneshot::channel();
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test semaphore permit should be available");
+        pending.insert(
+            subscription_key,
+            PendingEntry::subscription(events_tx, closed_tx, permit, Priority::Interactive),
+        );
+
+        let drained = drain_pending_channel(&mut pending, generation, channel, false);
+        assert_eq!(drained.len(), 1);
+        assert!(pending.contains_key(&subscription_key));
+
+        let drained = drain_pending_channel(&mut pending, generation, channel, true);
+        assert_eq!(drained.len(), 1);
+        assert!(pending.is_empty());
     }
 }

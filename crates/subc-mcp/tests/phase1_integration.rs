@@ -39,7 +39,7 @@ use subc_protocol::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool as ProviderTool, TrustTier,
     },
-    session::{ModuleControlRequest, ModuleControlResponse},
+    session::{HealthStatus as ControlHealthStatus, ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
@@ -2681,6 +2681,33 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
         text.contains("fake-aft tool read called"),
         "aft provider should still serve tool calls after mcp registers: {body:?}"
     );
+
+    match control_rpc_on_stream(
+        &mut client,
+        2_004,
+        ClientControlRequest::SupervisorHealthProbe {
+            module_id: "mcp".to_string(),
+        },
+    )
+    .await
+    {
+        ClientControlResponse::SupervisorHealthProbe {
+            module_id,
+            status,
+            metrics,
+            ..
+        } => {
+            assert_eq!(module_id, "mcp");
+            assert_eq!(status, ControlHealthStatus::Ok);
+            let metrics = metrics.expect("health metrics should be present");
+            assert!(
+                metrics.get("active_relay_routes").is_some()
+                    && metrics.get("pending_reverse_requests").is_some(),
+                "expected relay metrics in health report: {metrics:?}"
+            );
+        }
+        other => panic!("unexpected supervisor.health_probe response: {other:?}"),
+    }
 
     mcp.stop().await.unwrap();
     provider.stop().await.unwrap();

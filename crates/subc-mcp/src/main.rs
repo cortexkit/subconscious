@@ -38,6 +38,10 @@ use subc_protocol::{
         Bindings, ConsumerRole, ExecutionMode, IdentityBinding, ModuleManifest, ProviderRole,
         StorageBinding, StorageKind, StorageScope, Tool as ManifestTool, TrustTier,
     },
+    session::{
+        HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
+        MODULE_CONTROL_OP_HEALTH_CHECK,
+    },
     BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Priority, RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
     SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
@@ -268,6 +272,15 @@ impl ReverseRelay {
             ttl: reverse_relay_ttl_from_env(),
             max_pending_per_session: REVERSE_RELAY_PENDING_PER_SESSION,
         }
+    }
+
+    async fn health_metrics(&self) -> serde_json::Value {
+        let active_relay_routes = self.routes.lock().await.len();
+        let pending_reverse_requests = self.pending.lock().await.len();
+        serde_json::json!({
+            "active_relay_routes": active_relay_routes,
+            "pending_reverse_requests": pending_reverse_requests,
+        })
     }
 
     async fn register_route(&self, route_channel: u16, session: Arc<RelaySession>) {
@@ -1219,9 +1232,11 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 
 async fn run_module(args: ModuleArgs) -> Result<()> {
     require_spawn_attestation()?;
-    let mut subc_stream = connect_authenticated(&args.subc_connection_file).await?;
-    send_supervision_hello_if_configured(&mut subc_stream).await?;
+    let subc_stream = connect_authenticated(&args.subc_connection_file).await?;
     let subc = SubcClient::start(subc_stream);
+    let _supervision_task =
+        start_supervision_connection_if_configured(&args.subc_connection_file, subc.relay())
+            .await?;
 
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
@@ -1253,7 +1268,10 @@ async fn run_module(args: ModuleArgs) -> Result<()> {
     }
 }
 
-async fn send_supervision_hello_if_configured(stream: &mut TcpStream) -> Result<()> {
+async fn start_supervision_connection_if_configured(
+    connection_file_path: &Path,
+    relay: Arc<ReverseRelay>,
+) -> Result<Option<JoinHandle<()>>> {
     let module_id = match env::var(SUBC_MODULE_ID_ENV) {
         Ok(module_id) if !module_id.trim().is_empty() => module_id,
         Ok(_) => {
@@ -1261,7 +1279,7 @@ async fn send_supervision_hello_if_configured(stream: &mut TcpStream) -> Result<
                 "{SUBC_MODULE_ID_ENV} must not be empty when set"
             )))
         }
-        Err(env::VarError::NotPresent) => return Ok(()),
+        Err(env::VarError::NotPresent) => return Ok(None),
         Err(env::VarError::NotUnicode(value)) => {
             return Err(other_error(format!(
                 "{SUBC_MODULE_ID_ENV} must be valid UTF-8, got '{}'",
@@ -1270,10 +1288,22 @@ async fn send_supervision_hello_if_configured(stream: &mut TcpStream) -> Result<
         }
     };
 
+    let mut stream = connect_authenticated(connection_file_path).await?;
+    send_supervision_hello(&mut stream, &module_id).await?;
+    let task_module_id = module_id.clone();
+    let task = tokio::spawn(async move {
+        if let Err(error) = supervision_control_loop(stream, relay, task_module_id).await {
+            eprintln!("subc-mcp module: supervision control loop failed: {error}");
+        }
+    });
+    Ok(Some(task))
+}
+
+async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Result<()> {
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: supervision_manifest(module_id.clone()),
+        manifest: supervision_manifest(module_id.to_owned()),
         protocol_ver: PROTOCOL_VERSION,
-        control_ops: None,
+        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_owned()]),
         // Echo the one-time launch nonce subc injects for a reserved module; absent
         // (None) when this module is not reserved.
         launch_nonce: env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
@@ -1346,6 +1376,150 @@ async fn send_supervision_hello_if_configured(stream: &mut TcpStream) -> Result<
             "unexpected supervision HELLO_ACK frame type for module_id={module_id}: {ty:?}"
         ))),
     }
+}
+
+/// Reads and answers daemon-to-module control RPCs on the dedicated supervision
+/// socket. Sending the reply from this same task proves the supervision read
+/// loop is alive instead of only proving that some unrelated writer task runs.
+async fn supervision_control_loop(
+    mut stream: TcpStream,
+    relay: Arc<ReverseRelay>,
+    module_id: String,
+) -> Result<()> {
+    loop {
+        let Some(frame) = read_frame(&mut stream).await.map_err(|source| {
+            other_error(format!(
+                "failed to read supervision control frame for module_id={module_id}: {source}"
+            ))
+        })?
+        else {
+            eprintln!("subc-mcp module: supervision connection closed for module_id={module_id}");
+            return Ok(());
+        };
+
+        let Some(reply) = handle_supervision_control_frame(&frame, &relay).await? else {
+            return Ok(());
+        };
+        write_frame(&mut stream, &reply).await.map_err(|source| {
+            other_error(format!(
+                "failed to write supervision control reply for module_id={module_id}: {source}"
+            ))
+        })?;
+        stream.flush().await.map_err(|source| {
+            other_error(format!(
+                "failed to flush supervision control reply for module_id={module_id}: {source}"
+            ))
+        })?;
+    }
+}
+
+async fn handle_supervision_control_frame(
+    frame: &SubcFrame,
+    relay: &ReverseRelay,
+) -> Result<Option<SubcFrame>> {
+    if frame.header.ty == FrameType::Goodbye && frame.header.channel == 0 {
+        return Ok(None);
+    }
+
+    if frame.header.ty != FrameType::Request || frame.header.channel != 0 {
+        return supervision_error_frame(
+            frame,
+            "unsupported_control_frame",
+            format!(
+                "supervision connection only accepts channel-0 Request frames, got {:?} on channel {}",
+                frame.header.ty, frame.header.channel
+            ),
+        )
+        .map(Some);
+    }
+
+    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+        Ok(request) => request,
+        Err(error) => {
+            let (code, message) = supervision_decode_error(&frame.body, error);
+            return supervision_error_frame(frame, code, message).map(Some);
+        }
+    };
+
+    match request {
+        ModuleControlRequest::HealthCheck {} => {
+            let report = HealthReport {
+                status: HealthStatus::Ok,
+                detail: None,
+                metrics: Some(relay.health_metrics().await),
+            };
+            let body =
+                serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(|source| {
+                    other_error(format!("failed to encode health.check response: {source}"))
+                })?;
+            Ok(Some(supervision_response_frame(frame, body)?))
+        }
+        other => supervision_error_frame(
+            frame,
+            "unexpected_control_op",
+            format!("supervision connection does not handle {other:?}"),
+        )
+        .map(Some),
+    }
+}
+
+#[derive(Deserialize)]
+struct ModuleControlOpProbe {
+    op: Option<String>,
+}
+
+fn supervision_decode_error(body: &[u8], error: serde_json::Error) -> (&'static str, String) {
+    match serde_json::from_slice::<ModuleControlOpProbe>(body) {
+        Ok(ModuleControlOpProbe { op: Some(op) }) if op == MODULE_CONTROL_OP_HEALTH_CHECK => (
+            "invalid_control_body",
+            format!("malformed health.check request body: {error}"),
+        ),
+        Ok(ModuleControlOpProbe { op: Some(op) }) if op == "route.bind" => (
+            "unexpected_control_op",
+            format!("supervision connection does not handle route.bind: {error}"),
+        ),
+        Ok(ModuleControlOpProbe { op: Some(op) }) => (
+            "unknown_control_op",
+            format!("unsupported module-control op '{op}': {error}"),
+        ),
+        _ => (
+            "invalid_control_body",
+            format!("malformed module-control request body: {error}"),
+        ),
+    }
+}
+
+fn supervision_response_frame(request: &SubcFrame, body: Vec<u8>) -> Result<SubcFrame> {
+    SubcFrame::build_with_version(
+        request.header.ver,
+        FrameType::Response,
+        control_flags(),
+        0,
+        request.header.corr,
+        body,
+    )
+    .map_err(|source| other_error(format!("failed to build health.check response: {source}")))
+}
+
+fn supervision_error_frame(
+    request: &SubcFrame,
+    code: &str,
+    message: impl Into<String>,
+) -> Result<SubcFrame> {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: code.to_owned(),
+        message: message.into(),
+    })
+    .map_err(|source| other_error(format!("failed to encode supervision ERROR: {source}")))?;
+    SubcFrame::build_with_version(
+        request.header.ver,
+        FrameType::Error,
+        control_flags(),
+        request.header.channel,
+        request.header.corr,
+        body,
+    )
+    .map_err(|source| other_error(format!("failed to build supervision ERROR: {source}")))
 }
 
 fn supervision_manifest(module_id: String) -> ModuleManifest {

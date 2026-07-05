@@ -14,6 +14,7 @@ use std::{
 use serde_json::{json, Value};
 use subc_client_rs::{
     CallError, CallOptions, CloseRouteOptions, ConsumerOptions, RetryBackoff, SubcConsumer,
+    SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -648,6 +649,181 @@ async fn subc_consumer_close_route_releases_the_route_and_reopens_fresh() {
     daemon.kill_and_wait();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_subscribe_streaming_contract() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-subscribe");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let events_path = temp_dir.join("provider.jsonl");
+    let provider = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &events_path,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let identity = consumer_identity("subscribe");
+
+    let mut stream = consumer
+        .subscribe(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"stream_many","count":3}"#.to_vec(),
+            fast_subscribe_options(),
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.push(
+            timeout(EVENT_TIMEOUT, stream.events().recv())
+                .await
+                .expect("stream event should arrive")
+                .expect("stream event channel should remain open"),
+        );
+    }
+    assert_eq!(
+        events,
+        vec![
+            b"stream-event-0".to_vec(),
+            b"stream-event-1".to_vec(),
+            b"stream-event-2".to_vec(),
+        ]
+    );
+    assert!(
+        timeout(EVENT_TIMEOUT, stream.closed())
+            .await
+            .expect("stream should close")
+            .is_ok(),
+        "StreamEnd should resolve subscription.closed() successfully"
+    );
+
+    let mut error_stream = consumer
+        .subscribe(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"error"}"#.to_vec(),
+            fast_subscribe_options(),
+        )
+        .await
+        .unwrap();
+    match timeout(EVENT_TIMEOUT, error_stream.closed())
+        .await
+        .expect("error terminal should close")
+    {
+        Err(CallError::Module(body)) => assert_eq!(body.code, "example_error"),
+        other => panic!("Error terminal should reject closed() with ErrorBody, got {other:?}"),
+    }
+
+    let mut cancellable = consumer
+        .subscribe(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"cancel","tag":"unsubscribe"}"#.to_vec(),
+            fast_subscribe_options(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "cancel_waiting" && event["tag"] == "unsubscribe"
+    })
+    .await;
+    cancellable.unsubscribe();
+    assert!(
+        timeout(EVENT_TIMEOUT, cancellable.closed())
+            .await
+            .expect("unsubscribe should settle promptly")
+            .is_ok(),
+        "unsubscribe should settle closed() as a local clean close"
+    );
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "cancelled" && event["tag"] == "unsubscribe"
+    })
+    .await;
+
+    let mut overflow_opts = fast_subscribe_options();
+    overflow_opts.event_buffer = 1;
+    let mut overflow = consumer
+        .subscribe(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"stream_many","count":4}"#.to_vec(),
+            overflow_opts,
+        )
+        .await
+        .unwrap();
+    let overflow_closed = timeout(EVENT_TIMEOUT, overflow.closed())
+        .await
+        .expect("overflow should close the subscription");
+    assert!(
+        matches!(overflow_closed, Err(CallError::SubscriptionBackpressure(_))),
+        "full event channel should close with SubscriptionBackpressure, got {overflow_closed:?}"
+    );
+
+    let mut route_gone = consumer
+        .subscribe(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"cancel","tag":"route-goodbye"}"#.to_vec(),
+            fast_subscribe_options(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "cancel_waiting" && event["tag"] == "route-goodbye"
+    })
+    .await;
+    drop(provider);
+    let route_gone_closed = timeout(EVENT_TIMEOUT, route_gone.closed())
+        .await
+        .expect("provider route teardown should close the subscription");
+    assert!(
+        matches!(route_gone_closed, Err(CallError::OutcomeUnknown(_))),
+        "route GOODBYE should reject closed(), got {route_gone_closed:?}"
+    );
+
+    let restarted_events = temp_dir.join("provider-restarted.jsonl");
+    let _restarted_provider = spawn_provider(
+        &module_bin,
+        &daemon.connection_file,
+        CONSUMER_MODULE_A,
+        &restarted_events,
+    );
+    wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
+    let after = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_A),
+            identity,
+            br#"{"kind":"unary","value":"after-route-goodbye"}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(&after)["echo"]["value"], "after-route-goodbye");
+
+    daemon.kill_and_wait();
+}
+
 fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> LiveDaemon {
     let child = spawn_daemon_child(daemon_bin, runtime_dir, config_dir);
     LiveDaemon {
@@ -752,6 +928,19 @@ fn bounded_absence_options() -> CallOptions {
         },
         route_retry_deadline: Duration::from_millis(300),
         ..CallOptions::default()
+    }
+}
+
+fn fast_subscribe_options() -> SubscribeOptions {
+    SubscribeOptions {
+        route_retry: RetryBackoff {
+            base: Duration::from_millis(50),
+            cap: Duration::from_millis(250),
+            max_attempts: 20,
+        },
+        route_retry_deadline: Duration::from_secs(5),
+        route_open_timeout: Duration::from_secs(8),
+        ..SubscribeOptions::default()
     }
 }
 

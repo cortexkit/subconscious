@@ -3,7 +3,11 @@ name: Release
 # Per-crate release. Tag format: `<crate>-v<version>` (e.g. subc-transport-v0.1.0).
 # Each PUBLISHABLE crate (subc-protocol, subc-transport) versions and publishes
 # independently — they are leaf crates with no inter-crate publish-order
-# dependency. subc-core is publish=false (the daemon, never published).
+# dependency. subc-core is publish=false (the daemon, never published to
+# crates.io) — its release lane instead uploads BINARY artifacts (subc-core,
+# subc-probe, fake-aft-stub, subc-mcp) to a GitHub release so sibling repos'
+# CI (e.g. AFT's subc e2e lane) can fetch a pinned daemon without a source
+# checkout. Tag `subc-core-v<version>` to cut one.
 on:
   push:
     tags:
@@ -28,8 +32,67 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
+  # Daemon binary artifacts for sibling-repo CI. Runs only for subc-core tags;
+  # the crates.io publish job below skips those (subc-core is publish=false).
+  binaries:
+    name: Binary artifacts (${{ matrix.target.name }})
+    if: startsWith(github.ref_name, 'subc-core-v')
+    needs: verify
+    permissions:
+      contents: write
+    # linux-x64 only in CI: Blacksmith has no macOS runners and GitHub-hosted
+    # macOS is billing-blocked for this free-plan private org (see ci.yml).
+    # darwin-arm64 assets are built + uploaded from the dev box by
+    # scripts/release-darwin-binaries.sh against the same tag.
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: linux-x64
+            runner: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Version-match guard
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#subc-core-v}"
+          CARGO_VERSION=$(grep '^version' crates/subc-core/Cargo.toml | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag wants ${VERSION} but crates/subc-core/Cargo.toml has ${CARGO_VERSION}"
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: cargo build --release -p subc-core -p subc-mcp --bin subc-core --bin subc-probe --bin fake-aft-stub --bin subc-mcp
+
+      # Asset naming: <bin>-<target>.tar.gz containing the bare binary, plus a
+      # .sha256 sidecar per asset — consumers pin the tag and verify the digest.
+      - name: Package + checksum
+        run: |
+          mkdir -p dist
+          for bin in subc-core subc-probe fake-aft-stub subc-mcp; do
+            tar -C target/release -czf "dist/${bin}-${{ matrix.target.name }}.tar.gz" "$bin"
+            shasum -a 256 "dist/${bin}-${{ matrix.target.name }}.tar.gz" | awk '{print $1}' > "dist/${bin}-${{ matrix.target.name }}.tar.gz.sha256"
+          done
+          ls -la dist/
+
+      - name: Upload to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "subc daemon binaries for sibling-repo CI (subc-core, subc-probe, fake-aft-stub, subc-mcp)." \
+            2>/dev/null || true
+          gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+
   publish:
     name: Publish to crates.io
+    # subc-core tags cut binary releases (above), never a crates.io publish.
+    if: ${{ !startsWith(github.ref_name, 'subc-core-v') }}
     # Blacksmith runner (not GitHub-hosted): the owning org is on the free plan,
     # where GitHub blocks private-repo Actions jobs at the zero spending limit.
     # See ci.yml for the full rationale.

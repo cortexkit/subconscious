@@ -49,7 +49,11 @@ jobs:
       matrix:
         target:
           - name: linux-x64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            # 22.04 deliberately: the binary's glibc floor is set by the BUILD
+            # image (24.04 produced GLIBC_2.39-requiring assets that failed on
+            # GitHub's default ubuntu-22.04 runners, glibc 2.35). Consumers run
+            # these binaries on arbitrary CI images; keep the floor low.
+            runner: blacksmith-2vcpu-ubuntu-2204
     runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v5

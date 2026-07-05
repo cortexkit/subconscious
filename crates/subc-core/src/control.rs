@@ -1,4 +1,9 @@
-use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use subc_control::{
@@ -8,8 +13,9 @@ use subc_control::{
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
     session::{
-        HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlResponse,
-        MODULE_CONTROL_OP_HEALTH_CHECK,
+        HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
+        ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
+        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
@@ -25,7 +31,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
-    supervise::{ModuleProcessLiveness, SupervisorHandle},
+    supervise::{ModuleProcessLiveness, ReservedHelloRejection, SupervisorHandle},
     ConnectedClients, Frame, ProjectRootId,
 };
 
@@ -53,6 +59,8 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_HEALTH_PROBE,
     ops::SUPERVISOR_HEALTH,
 ];
+
+const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[MODULE_TO_SUBC_OP_CATALOG_UPDATE];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 
@@ -306,23 +314,51 @@ impl ControlHandler {
                     .map_err(RouterError::Forwarding)?
                     .is_some()
                 {
+                    if !is_known_module_request_op(&frame.body) {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "unsupported_control_frame",
+                            "module-originated channel-0 REQUEST is not supported",
+                        )?]);
+                    }
+                    let request = match parse_module_control_request_from_module(&frame.body) {
+                        Ok(request) => request,
+                        Err((err, ControlRequestBodyError::UnknownOp)) => {
+                            return Ok(vec![control_error_frame(
+                                &frame,
+                                "unsupported_control_frame",
+                                format!("unsupported module-originated channel-0 REQUEST: {err}"),
+                            )?])
+                        }
+                        Err((err, ControlRequestBodyError::InvalidBody)) => {
+                            return Ok(vec![control_error_frame(
+                                &frame,
+                                "invalid_control_body",
+                                format!("malformed module control body: {err}"),
+                            )?])
+                        }
+                    };
+                    return self.handle_module_control_request(ctx.connection_id, frame, request);
+                }
+
+                if is_known_module_request_op(&frame.body) {
                     return Ok(vec![control_error_frame(
                         &frame,
-                        "unsupported_control_frame",
-                        "module-originated channel-0 REQUEST is not supported",
+                        "not_registered",
+                        "catalog.update requires an active module registration owned by this connection",
                     )?]);
                 }
 
                 let request = match parse_client_control_request(&frame.body) {
                     Ok(request) => request,
-                    Err((err, ClientControlRequestBodyError::UnknownOp)) => {
+                    Err((err, ControlRequestBodyError::UnknownOp)) => {
                         return Ok(vec![control_error_frame(
                             &frame,
                             "unknown_control_op",
                             format!("unknown client control op: {err}"),
                         )?])
                     }
-                    Err((err, ClientControlRequestBodyError::InvalidBody)) => {
+                    Err((err, ControlRequestBodyError::InvalidBody)) => {
                         return Ok(vec![control_error_frame(
                             &frame,
                             "invalid_control_body",
@@ -553,17 +589,26 @@ impl ControlHandler {
         // nonce and always passes. This blocks a key-holder from impersonating a
         // security-boundary module (e.g. the credential vault) while the real one is
         // down/restarting and its registration slot is momentarily free.
-        if !self
+        if let Some(rejection) = self
             .supervisor
-            .reserved_hello_authorized(&hello.manifest.module_id, hello.launch_nonce.as_deref())
+            .reserved_hello_rejection(&hello.manifest.module_id, hello.launch_nonce.as_deref())
         {
+            let message = match rejection {
+                ReservedHelloRejection::Exact { module_id } => format!(
+                    "module_id '{module_id}' is reserved; HELLO without a valid launch nonce is rejected"
+                ),
+                ReservedHelloRejection::Prefix {
+                    prefix,
+                    owner_module_id,
+                } => format!(
+                    "module_id '{}' matches reserved prefix '{prefix}' owned by '{owner_module_id}'; HELLO without the owner launch nonce is rejected",
+                    hello.manifest.module_id
+                ),
+            };
             return Ok(vec![control_error_frame(
                 &frame,
                 "reserved_module",
-                format!(
-                    "module_id '{}' is reserved; HELLO without a valid launch nonce is rejected",
-                    hello.manifest.module_id
-                ),
+                message,
             )?]);
         }
 
@@ -649,7 +694,7 @@ impl ControlHandler {
 
         let ack = ModuleHelloAckBody {
             negotiated_ver,
-            subc_ops: subc_ops(),
+            subc_ops: module_subc_ops(),
             subc_capabilities: self.subc_capabilities.as_ref().to_vec(),
             storage: self
                 .storage_config
@@ -714,6 +759,68 @@ impl ControlHandler {
             }
             ClientControlRequest::SupervisorHealth {} => self.handle_supervisor_health(frame),
         }
+    }
+
+    fn handle_module_control_request(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        request: ModuleControlRequestFromModule,
+    ) -> Result<Vec<Frame>, RouterError> {
+        match request {
+            ModuleControlRequestFromModule::CatalogUpdate { provides } => {
+                self.handle_catalog_update(connection_id, frame, provides)
+            }
+        }
+    }
+
+    fn handle_catalog_update(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        provides: Vec<ProviderRole>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(registration) = self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "catalog.update requires an active module registration owned by this connection",
+            )?]);
+        };
+
+        if let Some(message) =
+            catalog_update_frozen_field_message(&registration.manifest, &provides)
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "catalog_update_frozen_field",
+                message,
+            )?]);
+        }
+
+        let updated = self
+            .registry
+            .replace_provides_for_connection(connection_id, provides)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        if updated.is_none() {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "catalog.update requires an active module registration owned by this connection",
+            )?]);
+        }
+
+        let response = ModuleControlResponseToModule::CatalogUpdate {};
+        control_response_body_frame(
+            &frame,
+            &response,
+            "ModuleControlResponseToModule::CatalogUpdate",
+        )
+        .map(|frame| vec![frame])
     }
 
     fn handle_server_describe(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
@@ -1741,6 +1848,14 @@ fn subc_ops() -> Vec<String> {
         .collect()
 }
 
+fn module_subc_ops() -> Vec<String> {
+    SUBC_CONTROL_OPS
+        .iter()
+        .chain(MODULE_TO_SUBC_CONTROL_OPS.iter())
+        .map(|op| (*op).to_string())
+        .collect()
+}
+
 #[cfg(test)]
 fn module_baseline_control_ops() -> Vec<String> {
     MODULE_BASELINE_CONTROL_OPS
@@ -1802,7 +1917,7 @@ fn is_routable_role(role: &ProviderRole) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClientControlRequestBodyError {
+enum ControlRequestBodyError {
     UnknownOp,
     InvalidBody,
 }
@@ -1822,19 +1937,99 @@ fn is_known_module_push_op(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+fn is_known_module_request_op(body: &[u8]) -> bool {
+    serde_json::from_slice::<ControlOpProbe>(body)
+        .map(|probe| MODULE_TO_SUBC_CONTROL_OPS.contains(&probe.op.as_str()))
+        .unwrap_or(false)
+}
+
 fn parse_client_control_request(
     body: &[u8],
-) -> Result<ClientControlRequest, (serde_json::Error, ClientControlRequestBodyError)> {
+) -> Result<ClientControlRequest, (serde_json::Error, ControlRequestBodyError)> {
     serde_json::from_slice::<ClientControlRequest>(body).map_err(|err| {
         let classification = match serde_json::from_slice::<ControlOpProbe>(body) {
             Ok(probe) if SUBC_CONTROL_OPS.contains(&probe.op.as_str()) => {
-                ClientControlRequestBodyError::InvalidBody
+                ControlRequestBodyError::InvalidBody
             }
-            Ok(_) => ClientControlRequestBodyError::UnknownOp,
-            Err(_) => ClientControlRequestBodyError::InvalidBody,
+            Ok(_) => ControlRequestBodyError::UnknownOp,
+            Err(_) => ControlRequestBodyError::InvalidBody,
         };
         (err, classification)
     })
+}
+
+fn parse_module_control_request_from_module(
+    body: &[u8],
+) -> Result<ModuleControlRequestFromModule, (serde_json::Error, ControlRequestBodyError)> {
+    serde_json::from_slice::<ModuleControlRequestFromModule>(body).map_err(|err| {
+        let classification = match serde_json::from_slice::<ControlOpProbe>(body) {
+            Ok(probe) if MODULE_TO_SUBC_CONTROL_OPS.contains(&probe.op.as_str()) => {
+                ControlRequestBodyError::InvalidBody
+            }
+            Ok(_) => ControlRequestBodyError::UnknownOp,
+            Err(_) => ControlRequestBodyError::InvalidBody,
+        };
+        (err, classification)
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProviderRoleKind {
+    ToolProvider,
+    PipelineStage,
+    ManagementSurface,
+    InternalService,
+}
+
+fn provider_role_kind(role: &ProviderRole) -> ProviderRoleKind {
+    match role {
+        ProviderRole::ToolProvider { .. } => ProviderRoleKind::ToolProvider,
+        ProviderRole::PipelineStage { .. } => ProviderRoleKind::PipelineStage,
+        ProviderRole::ManagementSurface { .. } => ProviderRoleKind::ManagementSurface,
+        ProviderRole::InternalService { .. } => ProviderRoleKind::InternalService,
+    }
+}
+
+fn provider_role_kind_set(roles: &[ProviderRole]) -> BTreeSet<ProviderRoleKind> {
+    roles.iter().map(provider_role_kind).collect()
+}
+
+fn catalog_update_frozen_field_message(
+    registered: &ModuleManifest,
+    provides: &[ProviderRole],
+) -> Option<String> {
+    let old_has_provides = !registered.provides.is_empty();
+    let new_has_provides = !provides.is_empty();
+    if old_has_provides != new_has_provides {
+        return Some(format!(
+            "catalog.update cannot change module '{}' between supervision-only and routable; routability is fixed at HELLO",
+            registered.module_id
+        ));
+    }
+
+    if provider_role_kind_set(&registered.provides) != provider_role_kind_set(provides) {
+        return Some(format!(
+            "catalog.update cannot change provider role kinds for module '{}'; role kinds are fixed at HELLO",
+            registered.module_id
+        ));
+    }
+
+    let registered_concurrency = manifest_concurrency(registered);
+    let candidate = ModuleManifest {
+        provides: provides.to_vec(),
+        ..registered.clone()
+    };
+    let candidate_concurrency = manifest_concurrency(&candidate);
+    if candidate_concurrency != registered_concurrency {
+        return Some(format!(
+            "catalog.update cannot change module '{}' concurrency from {:?} to {:?}; concurrency is fixed at HELLO",
+            registered.module_id, registered_concurrency, candidate_concurrency
+        ));
+    }
+
+    // control_ops live beside the manifest in the HELLO body, not inside
+    // ModuleManifest, so a provides-only catalog.update cannot change them.
+    None
 }
 
 fn manifest_provides_routable_role(manifest: &ModuleManifest) -> bool {
@@ -2290,6 +2485,9 @@ mod tests {
         assert!(ack
             .subc_ops
             .contains(&ops::SUPERVISOR_SET_ENABLED.to_string()));
+        assert!(ack
+            .subc_ops
+            .contains(&MODULE_TO_SUBC_OP_CATALOG_UPDATE.to_string()));
 
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.negotiated_ver, PROTOCOL_VERSION);
@@ -2835,6 +3033,83 @@ mod tests {
             .unwrap();
         assert_eq!(ok[0].header.ty, FrameType::HelloAck);
         assert!(registry.get_module("vault").unwrap().is_some());
+    }
+
+    #[test]
+    fn reserved_prefix_hello_uses_delimiter_sensitive_owner_nonce() {
+        let registry = Arc::new(Registry::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("federation", "owner-nonce".to_string());
+        supervisor.set_reserved_prefixes("federation", &["fed:".to_string()]);
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor);
+
+        let squat = handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame("fed:peerA:tool", PROTOCOL_VERSION, 1),
+            )
+            .unwrap();
+        assert_eq!(squat[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&squat[0])["code"], "reserved_module");
+        assert!(parse_error(&squat[0])["message"]
+            .as_str()
+            .unwrap()
+            .contains("fed:"));
+
+        let accepted_peer = handler
+            .handle_control(
+                ConnectionId::new(2),
+                hello_frame_with_nonce("fed:peerA:tool", PROTOCOL_VERSION, 2, Some("owner-nonce")),
+            )
+            .unwrap();
+        assert_eq!(accepted_peer[0].header.ty, FrameType::HelloAck);
+
+        let accepted_short = handler
+            .handle_control(
+                ConnectionId::new(3),
+                hello_frame_with_nonce("fed:x", PROTOCOL_VERSION, 3, Some("owner-nonce")),
+            )
+            .unwrap();
+        assert_eq!(accepted_short[0].header.ty, FrameType::HelloAck);
+
+        for (conn, module_id) in [(4, "fedx:tool"), (5, "fed"), (6, "FED:x")] {
+            let response = handler
+                .handle_control(
+                    ConnectionId::new(conn),
+                    hello_frame(module_id, PROTOCOL_VERSION, conn),
+                )
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::HelloAck, "{module_id}");
+        }
+    }
+
+    #[test]
+    fn exact_reserved_module_takes_precedence_over_reserved_prefix() {
+        let registry = Arc::new(Registry::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("federation", "owner-nonce".to_string());
+        supervisor.set_reserved_prefixes("federation", &["fed:".to_string()]);
+        supervisor.set_reserved_nonce("fed:special", "exact-nonce".to_string());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor);
+
+        let owner_nonce = handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame_with_nonce("fed:special", PROTOCOL_VERSION, 1, Some("owner-nonce")),
+            )
+            .unwrap();
+        assert_eq!(owner_nonce[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&owner_nonce[0])["code"], "reserved_module");
+        assert!(registry.get_module("fed:special").unwrap().is_none());
+
+        let exact_nonce = handler
+            .handle_control(
+                ConnectionId::new(2),
+                hello_frame_with_nonce("fed:special", PROTOCOL_VERSION, 2, Some("exact-nonce")),
+            )
+            .unwrap();
+        assert_eq!(exact_nonce[0].header.ty, FrameType::HelloAck);
+        assert!(registry.get_module("fed:special").unwrap().is_some());
     }
 
     #[test]

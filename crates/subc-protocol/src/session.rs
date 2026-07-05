@@ -8,9 +8,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{BindIdentity, Principal, RouteTarget};
+use crate::{manifest::ProviderRole, BindIdentity, Principal, RouteTarget};
 
 pub const MODULE_CONTROL_OP_HEALTH_CHECK: &str = "health.check";
+pub const MODULE_TO_SUBC_OP_CATALOG_UPDATE: &str = "catalog.update";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +71,26 @@ pub enum ModuleControlResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metrics: Option<Value>,
     },
+}
+
+/// Module-originated channel-0 control RPC body.
+///
+/// This is intentionally separate from [`ModuleControlRequest`]: that enum is the
+/// daemon-to-module direction (`route.bind`, `health.check`), while these bodies
+/// are sent by an already-registered module to subc on a `REQUEST` frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op")]
+pub enum ModuleControlRequestFromModule {
+    #[serde(rename = "catalog.update")]
+    CatalogUpdate { provides: Vec<ProviderRole> },
+}
+
+/// subc's channel-0 response body for module-originated control RPCs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op")]
+pub enum ModuleControlResponseToModule {
+    #[serde(rename = "catalog.update")]
+    CatalogUpdate {},
 }
 
 impl From<HealthReport> for ModuleControlResponse {

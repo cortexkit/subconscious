@@ -7,6 +7,7 @@
     "server.describe",
     "catalog.list",
     "route.open",
-    "route.poll"
+    "route.poll",
+    "catalog.update"
   ]
 }

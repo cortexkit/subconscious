@@ -3092,6 +3092,7 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
         args,
         env,
         reserved: false,
+        reserved_prefixes: Vec::new(),
     }
 }
 
@@ -3113,6 +3114,7 @@ fn mcp_module_spec(
             xdg_config_home.display().to_string(),
         )],
         reserved: false,
+        reserved_prefixes: Vec::new(),
     }
 }
 

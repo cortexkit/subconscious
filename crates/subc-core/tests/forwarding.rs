@@ -4827,6 +4827,7 @@ where
         args: Vec::new(),
         env,
         reserved: false,
+        reserved_prefixes: Vec::new(),
     }
 }
 

@@ -1,0 +1,27 @@
+{
+  "op": "catalog.update",
+  "provides": [
+    {
+      "concurrency": "module_managed",
+      "emits_push": true,
+      "identity_scope": [
+        "project",
+        "session"
+      ],
+      "role": "tool_provider",
+      "sub_supervises": true,
+      "tools": [
+        {
+          "execution_mode": "pure",
+          "name": "memory.read",
+          "schema": {
+            "required": [
+              "id"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

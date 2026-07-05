@@ -169,6 +169,7 @@ impl SubcConsumer {
         opts: CallOptions,
     ) -> Result<Vec<u8>, CallError> {
         let call_deadline = Instant::now() + opts.timeout;
+        let mut retried_unknown_channel = false;
         let consumer_identity = route_open_consumer_identity(&opts);
         let route_key = RouteKey::new(&target, &identity, consumer_identity.as_ref());
 
@@ -215,6 +216,22 @@ impl SubcConsumer {
             match response {
                 Ok(TerminalFrame::Response { body, .. }) => return Ok(body),
                 Ok(TerminalFrame::StreamEnd) => return Ok(Vec::new()),
+                // unknown_channel is the daemon ROUTER refusing an unrouted channel:
+                // the request provably never reached a module, so one in-place retry
+                // cannot double-execute. The cached bind is dead (module restarted;
+                // its route-gone GOODBYE raced or was missed) — invalidate it so the
+                // retry re-opens instead of resending into the same dead channel.
+                // Parity with the TS client's retry-once in call().
+                Ok(TerminalFrame::Error { body, .. })
+                    if body.code == "unknown_channel"
+                        && !retried_unknown_channel
+                        && Instant::now() < call_deadline =>
+                {
+                    retried_unknown_channel = true;
+                    self.shared
+                        .invalidate_route(&route_key, Some(route.generation));
+                    continue;
+                }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Err(err) if err.is_not_sent() && Instant::now() < call_deadline => {
                     self.shared

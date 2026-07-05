@@ -52,7 +52,10 @@ interface FakeDaemonOptions {
   //   short request deadline fires, deterministically exercising timeout arbitration.
   // "silent-hold": accept the data request and never reply, keeping the socket
   //   healthy — a genuine deadline with no drop.
-  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold";
+  // "unknown-channel-once": reject the FIRST data request with the daemon
+  //   router's unknown_channel ERROR (a stale bind after a module restart), then
+  //   serve subsequent requests normally — the re-opened route works.
+  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "unknown-channel-once" | "unknown-channel-always";
   delayBodyMs?: number;
   routeOpenError?: { code: string; message: string };
   // Reject the first N route.open requests with this code (a booting-target
@@ -294,6 +297,54 @@ describe("SubcClient managed call", () => {
         code: "module_boom",
       });
       expect(stats.dataRequests).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("evicts the cached route and retries once in place on unknown_channel", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, dataMode: "unknown-channel-once" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      // First call: the daemon router rejects the stale bind with unknown_channel;
+      // the client must evict the cached route, re-open, and retry once in place —
+      // the caller sees success, not the terminal error.
+      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+        method: "echo",
+        params: { n: 1 },
+      });
+      // Two route.opens (initial + post-eviction reopen), two data requests
+      // (rejected + retried), all on ONE connection (no reconnect).
+      expect(stats.routeOpens).toBe(2);
+      expect(stats.dataRequests).toBe(2);
+      expect(stats.connections).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a second unknown_channel on the same call surfaces terminal instead of looping", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    // EVERY data request rejects with unknown_channel: the retry-once budget must
+    // surface the terminal error on the second rejection instead of retrying
+    // forever against a daemon that keeps refusing.
+    const daemon = await startFakeDaemon({ stats, dataMode: "unknown-channel-always" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      await expect(client.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
+        kind: "terminal",
+        code: "unknown_channel",
+      });
+      // Exactly two attempts: original + the single in-place retry.
+      expect(stats.dataRequests).toBe(2);
+      expect(stats.routeOpens).toBe(2);
     } finally {
       client.close();
     }
@@ -584,6 +635,15 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       await writeAll(socket, full.subarray(HEADER_LEN), deadline);
     } else if (options.dataMode === "error") {
       await writeFrame(socket, errorFrame(frame, { code: "module_boom", message: "boom" }), deadline);
+    } else if (
+      options.dataMode === "unknown-channel-always" ||
+      (options.dataMode === "unknown-channel-once" && options.stats.dataRequests === 1)
+    ) {
+      await writeFrame(
+        socket,
+        errorFrame(frame, { code: "unknown_channel", message: `unknown channel ${frame.header.channel}` }),
+        deadline,
+      );
     } else {
       await writeFrame(socket, responseFrame(frame, body), deadline);
     }

@@ -355,12 +355,23 @@ export class SubcClient {
   ): Promise<Response> {
     const body = params === undefined ? { method } : { method, params };
 
+    let retriedUnknownChannel = false;
     for (;;) {
       const routeChannel = await this.cachedRouteChannel(moduleId, opts);
       try {
         return (await this.managedRequest(routeChannel, body, opts)) as Response;
       } catch (err) {
         if (!(err instanceof SubcCallError)) throw this.terminalCallError("managed call failed", err);
+        // unknown_channel is the daemon ROUTER refusing an unrouted channel — the
+        // request provably never reached a module, so one in-place retry cannot
+        // double-execute anything. The cached bind is dead (module restarted and
+        // its route-gone GOODBYE raced or was missed); evict it so the retry
+        // re-opens the route instead of resending into the same dead channel.
+        if (err.code === "unknown_channel" && !retriedUnknownChannel && !this.closeStarted) {
+          retriedUnknownChannel = true;
+          this.evictRouteChannel(routeChannel);
+          continue;
+        }
         if (err.kind === "not_sent") {
           try {
             await this.reconnectAfterDrop(err);
@@ -982,6 +993,10 @@ export class SubcClient {
     }
     if (frame.header.ty === FrameType.Goodbye) {
       this.failChannel(frame.header.channel, new SubcError("route closed by subc (GOODBYE)"));
+      // The route is gone daemon-side (module restart, drain, or provider close).
+      // Evict the cached bind so the NEXT managed call re-opens instead of
+      // resending into the dead channel and dying on a terminal unknown_channel.
+      this.evictRouteChannel(frame.header.channel);
       return;
     }
     // A terminal frame (Response/Error/StreamEnd) with no waiter is almost always
@@ -1039,6 +1054,20 @@ export class SubcClient {
       return new SubcError(parsed.message ?? "subc error", parsed.code);
     } catch {
       return new SubcError(Buffer.from(frame.body).toString("utf8") || "subc error");
+    }
+  }
+
+  /**
+   * Drop a dead channel from the managed-route cache so the next call re-opens.
+   * Only clears entries still pointing at THIS channel in the CURRENT socket
+   * generation; a route already re-opened (new channel) or re-created after a
+   * reconnect (new generation) is left alone.
+   */
+  private evictRouteChannel(channel: number): void {
+    for (const cached of this.routes.values()) {
+      if (cached.channel === channel && cached.generation === this.generation) {
+        cached.channel = null;
+      }
     }
   }
 

@@ -607,29 +607,34 @@ impl ControlHandler {
             }
         };
 
-        if manifest_provides_routable_role(&registration.manifest) {
-            if let Some(sink) = sink {
-                let concurrency = manifest_concurrency(&registration.manifest);
-                if let Err(err) = self.forwarding.register_module_connection(
-                    connection_id,
-                    registration.manifest.module_id.clone(),
-                    negotiated_ver,
-                    concurrency,
-                    sink,
-                ) {
-                    // Forwarding registration failed, so there is no forwarding
-                    // state to tear down; remove the registry entry and signal the
-                    // release watch directly (the no-forwarding case the helper's
-                    // doc-comment refers to).
-                    if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
-                        crate::supervise::notify_registration_release();
-                    }
-                    return Ok(vec![control_error_frame(
-                        &frame,
-                        forwarding_error_code(&err),
-                        err.to_string(),
-                    )?]);
+        if let Some(sink) = sink {
+            // The forwarding table's module store is also the daemon-to-module
+            // control-RPC lane, so every HELLO gets a live endpoint even when the
+            // manifest has no routable provider role. Non-routable modules still
+            // cannot receive route.bind in production: `handle_route_open` checks
+            // the registry manifest with `target_has_required_role` before the
+            // only production call to `begin_route_bind_relay_for` below that
+            // route.open path. The remaining direct relay callers are unit tests
+            // and benchmark harnesses that construct forwarding state explicitly.
+            let concurrency = manifest_concurrency(&registration.manifest);
+            if let Err(err) = self.forwarding.register_module_connection(
+                connection_id,
+                registration.manifest.module_id.clone(),
+                negotiated_ver,
+                concurrency,
+                sink,
+            ) {
+                // Forwarding registration failed, so there is no forwarding
+                // state to tear down. Remove the registry entry and signal the
+                // release watch directly.
+                if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
+                    crate::supervise::notify_registration_release();
                 }
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    forwarding_error_code(&err),
+                    err.to_string(),
+                )?]);
             }
         }
 
@@ -2079,6 +2084,23 @@ mod tests {
         Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
     }
 
+    fn non_routable_hello_frame_with_control_ops(
+        module_id: &str,
+        corr: u64,
+        control_ops: Option<Vec<String>>,
+    ) -> Frame {
+        let mut manifest = manifest(module_id, PROTOCOL_VERSION);
+        manifest.provides.clear();
+        let body = serde_json::to_vec(&ModuleHelloBody {
+            manifest,
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops,
+            launch_nonce: None,
+        })
+        .unwrap();
+        Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
+    }
+
     fn channel_request(channel: u16, corr: u64) -> Frame {
         Frame::build(
             FrameType::Request,
@@ -2507,6 +2529,124 @@ mod tests {
             serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
             ClientControlResponse::RouteOpen { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn supervision_only_module_health_probe_does_not_enable_route_open_and_cleans_up() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_health_probe_timeout(Duration::from_secs(5));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(35));
+        let responses = handler
+            .handle_control_frame(
+                &module_ctx,
+                non_routable_hello_frame_with_control_ops(
+                    "mcp",
+                    300,
+                    Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(responses[0].header.ty, FrameType::HelloAck);
+        assert!(registry
+            .get_module("mcp")
+            .unwrap()
+            .unwrap()
+            .manifest
+            .provides
+            .is_empty());
+
+        let (route_client_ctx, _route_client_rx) = route_ctx(ConnectionId::new(36));
+        let route_response = handler
+            .handle_control_frame(
+                &route_client_ctx,
+                route_open_frame(301, "mcp", unique_project_root("non-routable-mcp")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(route_response[0].header.ty, FrameType::Error);
+        assert_eq!(
+            parse_error(&route_response[0])["code"],
+            "target_unavailable"
+        );
+        assert!(parse_error(&route_response[0])["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not provide the requested target"));
+        assert!(module_rx.try_recv().is_err());
+
+        let (health_client_ctx, _health_client_rx) = route_ctx(ConnectionId::new(37));
+        let health_handler = handler.clone();
+        let health_task = tokio::spawn(async move {
+            health_handler
+                .handle_control_frame(
+                    &health_client_ctx,
+                    supervisor_health_probe_frame(302, "mcp"),
+                )
+                .await
+                .unwrap()
+        });
+        let health_frame = tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ModuleControlRequest>(&health_frame.body).unwrap(),
+            ModuleControlRequest::HealthCheck {}
+        );
+        handler
+            .handle_control_frame(
+                &module_ctx,
+                health_response(health_frame.header.corr, HealthStatus::Ok),
+            )
+            .await
+            .unwrap();
+        let health_response = health_task.await.unwrap();
+        assert_eq!(health_response[0].header.ty, FrameType::Response);
+        match serde_json::from_slice::<ClientControlResponse>(&health_response[0].body).unwrap() {
+            ClientControlResponse::SupervisorHealthProbe {
+                module_id, status, ..
+            } => {
+                assert_eq!(module_id, "mcp");
+                assert_eq!(status, HealthStatus::Ok);
+            }
+            other => panic!("unexpected health response: {other:?}"),
+        }
+
+        // Exercise the forwarding cleanup path directly while leaving the registry
+        // advertisement in place. If cleanup leaves a stale control sink behind,
+        // the next probe will enqueue onto it and wait for the long probe timeout
+        // instead of returning an immediate no-connection error.
+        forwarding
+            .cleanup_connection(module_ctx.connection_id)
+            .unwrap();
+        let (cleanup_probe_ctx, _cleanup_probe_rx) = route_ctx(ConnectionId::new(38));
+        let cleanup_response = tokio::time::timeout(
+            Duration::from_millis(200),
+            handler.handle_control_frame(
+                &cleanup_probe_ctx,
+                supervisor_health_probe_frame(303, "mcp"),
+            ),
+        )
+        .await
+        .expect("probe should fail immediately when the control lane is gone")
+        .unwrap();
+        assert_eq!(cleanup_response[0].header.ty, FrameType::Error);
+        assert_eq!(
+            parse_error(&cleanup_response[0])["code"],
+            "target_unavailable"
+        );
+        assert!(parse_error(&cleanup_response[0])["message"]
+            .as_str()
+            .unwrap()
+            .contains("no module connection"));
+
+        handler
+            .cleanup_connection(module_ctx.connection_id)
+            .unwrap();
     }
 
     #[tokio::test]

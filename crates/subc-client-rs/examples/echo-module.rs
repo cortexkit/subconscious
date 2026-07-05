@@ -52,6 +52,19 @@ impl ModuleHandler for EchoHandler {
                     message: error.to_string(),
                 },
             },
+            Some("stream_many") => {
+                let count = request.get("count").and_then(Value::as_u64).unwrap_or(3);
+                for index in 0..count {
+                    if let Err(error) = ctx.emit(format!("stream-event-{index}").into_bytes()).await
+                    {
+                        return HandlerOutcome::Error {
+                            code: "emit_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                }
+                HandlerOutcome::Streamed
+            }
             Some("sleep") => {
                 let ms = request.get("ms").and_then(Value::as_u64).unwrap_or(100);
                 self.record(json!({
@@ -70,16 +83,19 @@ impl ModuleHandler for EchoHandler {
                 }
             }
             Some("cancel") => {
+                let tag = request.get("tag").cloned().unwrap_or(Value::Null);
                 self.record(json!({
                     "kind": "cancel_waiting",
                     "channel": ctx.channel(),
                     "corr": ctx.corr(),
+                    "tag": tag.clone(),
                 }));
                 ctx.cancelled().await;
                 self.record(json!({
                     "kind": "cancelled",
                     "channel": ctx.channel(),
                     "corr": ctx.corr(),
+                    "tag": tag,
                 }));
                 HandlerOutcome::Error {
                     code: "cancelled".to_string(),

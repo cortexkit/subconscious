@@ -3,7 +3,7 @@
 pub mod consumer;
 pub use consumer::{
     CallError, CallOptions, CloseRouteOptions, ConnectionState, ConsumerError, ConsumerOptions,
-    RetryBackoff, SubcConsumer,
+    RetryBackoff, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
 };
 
 use std::{

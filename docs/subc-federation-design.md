@@ -20,7 +20,7 @@
 The v2 re-gate confirmed the architecture skeleton but rejected two v2 claims against the actual subc-core source and demanded mechanics for three hand-waved areas:
 - **(1, code-verified) Coarse re-HELLO is not viable, so v2's "accepted v1 coarseness" is withdrawn.** `Registry::register_with_control_ops` rejects a duplicate `module_id` (registry.rs:75), so refreshing a peer's catalog requires dropping the peer's whole connection first (disconnect → cleanup → reconnect → HELLO). That is not "briefly dropping routes": every in-flight cross-machine call on that peer dies on every catalog change, and catalog changes are routine (any module restart on the remote). Resolution: **subc-core primitive P1, non-disruptive catalog update** (§2.6).
 - **(2, code-verified) Peer-namespace squatting is real.** Reserved-nonce protection gates **exact** module ids only (supervise.rs `reserved_nonces` map); peer catalogs register as namespaced ids under the federation module's connections, so any local key-holder could HELLO-register a peer-namespaced id and become the apparent bridge for that peer. Resolution: **subc-core primitive P2, namespace-prefix reservation** (§2.6).
-- **(3) At-most-once was direction, not mechanics** → §6.1 now specifies the send-log schema, fsync barriers, the remote dedup ledger, and the end-to-end state machine (borrowing llm-runner's proven intent-log discipline).
+- **(3) At-most-once was direction, not mechanics** → §6.1 now specifies the send-log schema, fsync barriers, the remote dedup ledger, and the end-to-end state machine (standard WAL intent-log discipline).
 - **(4) Caller-identity and target-selection were conflated** → §5.4 now separates the two: the remote peer's identity (authenticated pubkey) selects the *policy*, while the local BindIdentity stamped on the bind is *profile-authored*, never remote-derived — and the serving module records both in the audit trail.
 - **(5) Cloud key-substitution MITM** — a malicious/compelled cloud could swap public keys at enrollment and become an undetectable middle → §5.3 now pins **TOFU + out-of-band verification codes** (Tailscale/Signal-style safety numbers) so key substitution is user-detectable, and manual pairing stays the trust anchor.
 
@@ -99,7 +99,7 @@ Both primitives are independently testable, land before the federation module ex
 
 ### 3.1 The federation module (the "trunk line")
 A subc module, supervised like any other, present on each **full** node. It is **mandated `reserved` + launch-nonce-bound** (§5.2) so a rogue local key-holder cannot impersonate it. On each machine it is simultaneously:
-- **A local provider (one loopback connection per peer)** that re-exports each peer's *exposed* catalog into the local catalog, namespaced by the **verified peer public key** (the human-readable name is display sugar; the authoritative namespace key is the pubkey, §5.2).
+- **A local provider (one loopback connection per (peer, remote module), §2.5)** that re-exports each peer's *exposed* catalog into the local catalog, namespaced by the **verified peer public key** (the human-readable name is display sugar; the authoritative namespace key is the pubkey, §5.2).
 - **A network bridge**: it establishes **Noise IK** sessions to peer federation modules (direct, or through the cloud relay), forwards opaque tool-call bodies, and translates channels between the local subc and the network leg.
 
 subc-core never knows a call left the machine. The opaque-body invariant holds end to end: the module maps **envelope channels** (like subc) but never parses tool **bodies**.
@@ -127,7 +127,7 @@ A **profile** is the federation membership + policy descriptor:
 ### 4.1 Catalog federation
 1. The federation module on A establishes a Noise session to peer B's federation module.
 2. A learns B's **exposed** catalog (the subset B's `federation_exposure` permits) and re-registers it into A's local subc under the `fed:<B-pubkey-fingerprint>:` namespace via a per-peer provider HELLO (prefix-reserved, §2.6 P2).
-3. Catalog changes on B propagate to A, which applies them in place via `catalog.update` (§2.6 P1) — in-flight routes to unchanged tools are undisturbed; removed tools get route-GOODBYE. Liveness/staleness is bounded and signed (§6.2).
+3. Catalog changes on B propagate to A, which applies them in place via `catalog.update` (§2.6 P1) on the affected (peer, module) connection — in-flight routes are undisturbed; a call to a since-removed tool gets a **module-side typed error, never a route-GOODBYE** (§2.6 P1). Liveness/staleness is bounded and signed (§6.2).
 
 ### 4.2 Cross-machine tool call (VPS agent calls a home tool)
 ```
@@ -202,6 +202,7 @@ Resolution — an explicit end-to-end state machine. The mechanics are standard 
   |---|---|---|
   | before intent fsync (incl. fed-module crash in the accept window) | `OutcomeUnknown` at the time — BUT on fed-module restart, recovery finds NO intent row, so the effect provably never left the machine; recovery emits a durable `not_sent` tombstone the consumer can query (or the caller simply re-invokes — no effect_id existed, nothing to duplicate) | re-invoke freely |
   | intent durable, send unconfirmed | `OutcomeUnknown`; recovery queries the SERVING ledger for the effect_id: ledger hit → settle with the recorded outcome; miss + peer reachable → provably not executed → `not_sent` tombstone; miss + peer unreachable → stays `unknown` until reachable | wait or surface |
+  The tombstone/settlement store is keyed by **effect_id** and queryable via a fed-module management op (`fed.effect_status{effect_id} → not_sent | outcome(...) | unknown`); the origin consumer (or its harness) correlates via the effect_id the fed-module returned at accept time. This is the durable correlation key the phase-0 test vectors exercise.
   | outcome durable | terminal Response/Error as normal | done |
   Phase-0 test vectors must cover each row (crash-cut style, mirroring the existing real_daemon patterns).
 - **Pure calls skip all of it** (re-send freely, no ledger row); `execution_mode` (§2.3) is the gate — the second axis doing its reliability job.
@@ -235,7 +236,7 @@ Closely analogous to **Tailscale**: a coordination server (identity, key distrib
 **RESOLVED by this revision:**
 - Exposure axis → dedicated `federation_exposure`, default deny-all (§2.3).
 - Data-plane transport → Noise IK E2E (Fork T closed; mTLS-at-module is out, WireGuard deferred to a possible general-fabric future) (§2.2).
-- Loopback-for-N-peers → one connection per peer (§2.5).
+- Loopback-for-N-peers → one connection per (peer, remote module) (§2.5; refined from v2's per-peer by the v3 re-gate topology decision).
 
 **STILL OPEN (for the re-gate + later calls):**
 - **Fork 3 — NAT specifics.** Lean: reachable peer is server, NAT'd peer holds the outbound tunnel, relay when neither is reachable. Open: hole-punching vs always-relay for home-behind-NAT; keepalive/reconnect tuning for the held tunnel.
@@ -264,7 +265,7 @@ Each phase is independently demonstrable; the data plane (1-3) is shared by the 
 - **F1 Tailscale-style split; cloud never sees payloads; Noise IK E2E data plane, per-device keys, cloud = public-key directory; NOT WireGuard/Tailscale-fabric (tool/agent scope, not general VPN)** — locked (§2.2, Ufuk).
 - **F2 default-deny `federation_exposure` (not `execution_mode`); per-peer allow-list via CK app; templates later; per-tool never-federatable floor; covers management surfaces; `execution_mode` retained only for the at-most-once reliability gate** — locked (§2.3, Ufuk).
 - **F5 one federation module, two profile sources** — locked (§2.4).
-- **Federation module = sole network endpoint; subc-core always loopback-only; one loopback connection per peer** — locked (§2.5, Ufuk).
+- **Federation module = sole network endpoint; subc-core always loopback-only; one loopback connection per (peer, remote module)** — locked (§2.5, Ufuk; topology granularity refined v4).
 - **Reserved + nonce-bound fed-module; namespace bound to peer pubkey** (§5.2); **end-to-end at-most-once w/ durable send-log + fencing** (§6.1); **keepalive + bounded staleness + GOODBYE-on-partition + signed generations** (§6.2); **local-injected BindIdentity** (§5.4); **relay auth-before-resource + quotas** (§5.5); **per-device keys + revocation** (§6.4); **cross-version negotiation** (§6.5) — drafted from council BLOCKERs.
 - **v3 (re-gate findings):** "zero subc-core change" premise DROPPED → two bounded primitives **P1 `catalog.update`** + **P2 namespace-prefix reservation** (§2.6); at-most-once MECHANICS pinned (§6.1); caller-identity/execution-identity SPLIT (§5.4); cloud key-substitution MITM → TOFU + verification codes (§5.3).
 - **v4 (v3 re-gate, 4/4 council):** P1 = provides-list-only, frozen fields rejected, NO tool-granular GOODBYE promise (module-side typed error for removed tools); P2 = delimiter-aware semantics + exact-over-prefix precedence + owner-module nonce mapping + HONEST same-user threat statement; §6.1 = incarnation epoch in effect_id + seq high-water fencing + recovery reconciliation + co-defined retention + fed-state→CallError mapping table; topology = one connection per (peer, remote module); partition classifier = fed-module reaper closing per-peer connections; cross-version = raw-doc filtering before typed decode; harness = first-class `fed:` class, AFT coordination required (phase-2 gate); TOFU = gated first contact + old-key-signed rotation + code binds long-term static keys. **Pending v4 re-gate; phase 0 gated on it.**

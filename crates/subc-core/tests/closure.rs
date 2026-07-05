@@ -644,6 +644,7 @@ fn stub_spec_with_env(module_id: &str, extra_env: Vec<(&str, String)>) -> Module
         args: Vec::new(),
         env,
         reserved: false,
+        reserved_prefixes: Vec::new(),
     }
 }
 

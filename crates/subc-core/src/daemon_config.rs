@@ -80,6 +80,10 @@ pub struct ConfiguredModule {
     /// the credential vault) from being impersonated by another key-holder while the
     /// real process is down or restarting. Defaults to false.
     pub reserved: bool,
+    /// Namespace prefixes owned by this reserved, supervised module. A HELLO for a
+    /// module id under one of these prefixes must echo this owner module's current
+    /// spawn nonce.
+    pub reserved_prefixes: Vec<String>,
     pub health: HealthConfig,
 }
 
@@ -140,6 +144,8 @@ struct RawModuleConfig {
     enabled: bool,
     #[serde(default)]
     reserved: bool,
+    #[serde(default)]
+    reserved_prefixes: Vec<String>,
     #[serde(default)]
     health: Option<RawHealthConfig>,
 }
@@ -246,10 +252,13 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 env: module.env.into_iter().collect(),
                 enabled: module.enabled,
                 reserved: module.reserved,
+                reserved_prefixes: module.reserved_prefixes,
                 health,
             })
         })
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
+
+    validate_reserved_prefixes(&modules, path)?;
 
     let storage = raw.storage.map(|s| match s {
         RawStorageConfig::Sqlite { data_home } => StorageConfig::Sqlite {
@@ -267,6 +276,79 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
 
 fn default_enabled() -> bool {
     true
+}
+
+fn validate_reserved_prefixes(
+    modules: &[ConfiguredModule],
+    path: &Path,
+) -> Result<(), DaemonConfigError> {
+    for module in modules {
+        if module.reserved_prefixes.is_empty() {
+            continue;
+        }
+        if !module.reserved {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "module '{}' reserved_prefixes require reserved=true so the owner is spawn-nonce protected",
+                    module.module_id
+                ),
+            });
+        }
+        for prefix in &module.reserved_prefixes {
+            if !prefix.ends_with(':') {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module '{}' reserved prefix '{}' must end with ':'",
+                        module.module_id, prefix
+                    ),
+                });
+            }
+        }
+    }
+
+    for module in modules {
+        for prefix in &module.reserved_prefixes {
+            if let Some(colliding) = modules
+                .iter()
+                .find(|candidate| candidate.module_id.starts_with(prefix))
+            {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "reserved prefix '{}' owned by '{}' collides with configured module id '{}'",
+                        prefix, module.module_id, colliding.module_id
+                    ),
+                });
+            }
+        }
+    }
+
+    for (left_index, left) in modules.iter().enumerate() {
+        for right in modules.iter().skip(left_index + 1) {
+            if left.module_id == right.module_id {
+                continue;
+            }
+            for left_prefix in &left.reserved_prefixes {
+                for right_prefix in &right.reserved_prefixes {
+                    if left_prefix.starts_with(right_prefix)
+                        || right_prefix.starts_with(left_prefix)
+                    {
+                        return Err(DaemonConfigError::InvalidValue {
+                            path: path.to_path_buf(),
+                            message: format!(
+                                "reserved prefixes '{}' owned by '{}' and '{}' owned by '{}' overlap",
+                                left_prefix, left.module_id, right_prefix, right.module_id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_health_config(
@@ -512,8 +594,96 @@ mod tests {
         assert_eq!(config.modules[0].args, ["module"]);
         assert_eq!(config.modules[0].env, [("A".to_string(), "B".to_string())]);
         assert!(config.modules[0].enabled);
+        assert!(config.modules[0].reserved_prefixes.is_empty());
         assert_eq!(config.modules[0].health, HealthConfig::default());
         assert!(!config.modules[1].enabled);
+    }
+
+    #[test]
+    fn reserved_prefixes_parse_for_reserved_modules() {
+        let config = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "modules": {
+                "federation": {
+                  "program": "fed",
+                  "reserved": true,
+                  "reserved_prefixes": ["fed:"]
+                }
+              }
+            }
+            "#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap();
+
+        assert_eq!(config.modules[0].reserved_prefixes, ["fed:".to_string()]);
+    }
+
+    #[test]
+    fn reserved_prefixes_reject_bad_boundaries_and_owners() {
+        let missing_delimiter = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": {
+                "federation": { "program": "fed", "reserved": true, "reserved_prefixes": ["fed"] }
+              }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing_delimiter,
+            DaemonConfigError::InvalidValue { .. }
+        ));
+
+        let non_reserved_owner = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": {
+                "federation": { "program": "fed", "reserved_prefixes": ["fed:"] }
+              }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            non_reserved_owner,
+            DaemonConfigError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn reserved_prefixes_reject_cross_owner_overlap_and_exact_id_collisions() {
+        let overlap = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": {
+                "fed-owner": { "program": "fed", "reserved": true, "reserved_prefixes": ["fed:"] },
+                "sub-owner": { "program": "fed-sub", "reserved": true, "reserved_prefixes": ["fed:sub:"] }
+              }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(overlap, DaemonConfigError::InvalidValue { .. }));
+
+        let exact_collision = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": {
+                "federation": { "program": "fed", "reserved": true, "reserved_prefixes": ["fed:"] },
+                "fed:special": { "program": "special" }
+              }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            exact_collision,
+            DaemonConfigError::InvalidValue { .. }
+        ));
     }
 
     #[test]

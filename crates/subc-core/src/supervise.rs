@@ -70,6 +70,11 @@ pub struct ModuleSpec {
     /// process can register this module_id (a security-boundary module like the
     /// credential vault must not be impersonable while it is down/restarting).
     pub reserved: bool,
+    /// Module-id prefixes this supervised module owns for reserved HELLO checks.
+    /// Prefixes come from daemon config and must end in `:` before they reach the
+    /// supervisor; the owner module's current spawn nonce authorizes claims under
+    /// each prefix.
+    pub reserved_prefixes: Vec<String>,
 }
 
 /// Bounded restart policy for crash exits.
@@ -352,6 +357,25 @@ pub struct SupervisorHandle {
     /// reserved_nonces because consumer route.open attestation applies to all spawned
     /// modules, while HELLO id-squatting protection remains opt-in via `reserved`.
     spawn_nonces: Arc<Mutex<HashMap<String, String>>>,
+    /// Reserved namespace prefixes mapped to the supervised owner module whose
+    /// current spawn nonce authorizes HELLO claims below the prefix.
+    ///
+    /// Per §2.6 this is not a same-user security barrier: a same-user process can
+    /// read the key file and launch nonce env. Like exact reserved ids, it prevents
+    /// accidental collisions and lower-trust processes from squatting protected
+    /// namespaces.
+    reserved_prefix_owners: Arc<Mutex<HashMap<String, String>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReservedHelloRejection {
+    Exact {
+        module_id: String,
+    },
+    Prefix {
+        prefix: String,
+        owner_module_id: String,
+    },
 }
 
 impl SupervisorHandle {
@@ -377,20 +401,70 @@ impl SupervisorHandle {
             .insert(module_id.to_string(), nonce);
     }
 
-    /// Whether a HELLO claiming `module_id` is authorized. A module with no reserved
-    /// nonce entry is not reserved and is always authorized (`true`). A reserved
-    /// module is authorized only when `presented` matches the expected nonce,
-    /// compared in constant time so a mismatch leaks no timing signal.
+    /// Record namespace prefixes owned by a supervised module.
+    pub fn set_reserved_prefixes(&self, owner_module_id: &str, prefixes: &[String]) {
+        let mut owners = self
+            .reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owners.retain(|_, owner| owner != owner_module_id);
+        for prefix in prefixes {
+            owners.insert(prefix.clone(), owner_module_id.to_string());
+        }
+    }
+
+    /// Whether a HELLO claiming `module_id` is authorized. An exact reserved id is
+    /// authorized only by its expected nonce; otherwise a matching reserved prefix
+    /// is authorized by the owner module's current spawn nonce. Non-reserved ids
+    /// with no matching prefix are always authorized.
     pub fn reserved_hello_authorized(&self, module_id: &str, presented: Option<&str>) -> bool {
+        self.reserved_hello_rejection(module_id, presented)
+            .is_none()
+    }
+
+    pub(crate) fn reserved_hello_rejection(
+        &self,
+        module_id: &str,
+        presented: Option<&str>,
+    ) -> Option<ReservedHelloRejection> {
         let nonces = self
             .reserved_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match nonces.get(module_id) {
-            None => true,
-            Some(expected) => {
-                presented.is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes()))
+        if let Some(expected) = nonces.get(module_id) {
+            if presented.is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes())) {
+                return None;
             }
+            return Some(ReservedHelloRejection::Exact {
+                module_id: module_id.to_string(),
+            });
+        }
+        drop(nonces);
+
+        let matched_prefix = self
+            .reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(prefix, owner)| (prefix.clone(), owner.clone()));
+        let (prefix, owner_module_id) = matched_prefix?;
+
+        let authorized = presented.is_some_and(|presented| {
+            self.spawn_nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&owner_module_id)
+                .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()))
+        });
+        if authorized {
+            None
+        } else {
+            Some(ReservedHelloRejection::Prefix {
+                prefix,
+                owner_module_id,
+            })
         }
     }
 
@@ -659,6 +733,7 @@ impl Supervisor {
             rx,
         ));
 
+        let module_id = spec.module_id.clone();
         let module = SupervisedModule {
             inner: Arc::new(SupervisedModuleInner {
                 module_id: spec.module_id,
@@ -669,6 +744,7 @@ impl Supervisor {
             }),
         };
         if let Some(supervisor_handle) = &self.supervisor_handle {
+            supervisor_handle.set_reserved_prefixes(&module_id, &spec.reserved_prefixes);
             supervisor_handle.insert(module.clone());
         }
         module

@@ -275,6 +275,7 @@ async fn serve_bound_daemon(
             args: configured.args,
             env: configured.env,
             reserved: configured.reserved,
+            reserved_prefixes: configured.reserved_prefixes,
         };
         match supervisor.supervise_configured_with_health(spec, enabled, health) {
             Ok(_) => {

@@ -7,7 +7,10 @@ use subc_protocol::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
-    session::{HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlResponse},
+    session::{
+        HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
+        ModuleControlResponse, ModuleControlResponseToModule,
+    },
     BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, Principal, RouteTarget,
     PROTOCOL_VERSION,
 };
@@ -61,6 +64,16 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             detail: Some("warming model".to_string()),
             metrics: Some(serde_json::json!({"queue_depth": 3})),
         },
+    );
+    assert_golden(
+        "module_control_request_from_module_catalog_update",
+        &ModuleControlRequestFromModule::CatalogUpdate {
+            provides: provider_roles(),
+        },
+    );
+    assert_golden(
+        "module_control_response_to_module_catalog_update",
+        &ModuleControlResponseToModule::CatalogUpdate {},
     );
     assert_golden(
         "tool_with_description",
@@ -154,6 +167,7 @@ fn module_hello_ack_body() -> ModuleHelloAckBody {
             "catalog.list".to_string(),
             "route.open".to_string(),
             "route.poll".to_string(),
+            "catalog.update".to_string(),
         ],
         subc_capabilities: vec!["manifest_registration_v1".to_string()],
         storage: None,
@@ -177,18 +191,7 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
         module_version: "1.2.3".to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "memory.read".to_string(),
-                description: None,
-                execution_mode: ExecutionMode::Pure,
-                schema: serde_json::json!({"type": "object", "required": ["id"]}),
-            }],
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: true,
-            sub_supervises: true,
-        }],
+        provides: provider_roles(),
         consumes: Vec::new(),
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
@@ -204,4 +207,19 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
             },
         },
     }
+}
+
+fn provider_roles() -> Vec<ProviderRole> {
+    vec![ProviderRole::ToolProvider {
+        tools: vec![Tool {
+            name: "memory.read".to_string(),
+            description: None,
+            execution_mode: ExecutionMode::Pure,
+            schema: serde_json::json!({"type": "object", "required": ["id"]}),
+        }],
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: true,
+        sub_supervises: true,
+    }]
 }

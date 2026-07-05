@@ -356,6 +356,7 @@ fn stub_spec<'a>(
         args: Vec::new(),
         env,
         reserved: false,
+        reserved_prefixes: Vec::new(),
     }
 }
 

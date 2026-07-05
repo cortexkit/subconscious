@@ -5,7 +5,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use subc_protocol::manifest::ModuleManifest;
+use subc_protocol::manifest::{ModuleManifest, ProviderRole};
 
 /// Per-connection identity assigned by [`crate::Router`] while serving a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,6 +105,44 @@ impl Registry {
 
     pub fn generation(&self) -> Result<u64, RegistryError> {
         Ok(self.lock_inner()?.generation)
+    }
+
+    pub fn get_module_by_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Option<ModuleRegistration>, RegistryError> {
+        Ok(self
+            .lock_inner()?
+            .modules
+            .values()
+            .find(|registration| registration.connection_id == connection_id)
+            .cloned())
+    }
+
+    /// Replace only the provider role list for the module owned by `connection_id`.
+    pub fn replace_provides_for_connection(
+        &self,
+        connection_id: ConnectionId,
+        provides: Vec<ProviderRole>,
+    ) -> Result<Option<ModuleRegistration>, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        let Some(module_id) = inner
+            .modules
+            .iter()
+            .find(|(_, registration)| registration.connection_id == connection_id)
+            .map(|(module_id, _)| module_id.clone())
+        else {
+            return Ok(None);
+        };
+
+        let registration = inner
+            .modules
+            .get_mut(&module_id)
+            .expect("module_id discovered from registry values must still exist");
+        registration.manifest.provides = provides;
+        let updated = registration.clone();
+        inner.bump_generation();
+        Ok(Some(updated))
     }
 
     /// Deregister every module owned by a dropped connection.

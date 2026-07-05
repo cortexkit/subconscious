@@ -108,6 +108,17 @@ id (router maps model → provider → account-set); `account` = a user label
 
 - NO thresholds, NO ordering, NO combination. Pure per-account data.
 
+- **Cold-start / absent-data invariant (pinned during the refresher spike):** an
+  absent `(provider, account)` in QTA's output means "no data yet" (pre-first-sweep
+  or never fetchable), and the router MUST treat it as unusable-for-ranking — never
+  as zero, healthy, or implicitly-full quota. QTA never fabricates a placeholder
+  window to avoid this; the router react implements against absence directly.
+
+- **Retry-After handling (graduation-scoped):** the spike ships class-based bounded
+  backoff only; honoring `429 Retry-After` lands with the structured fetch-error
+  change at graduation, and when it lands the value MUST be clamped (an unbounded
+  upstream-controlled delay could suppress refresh for hours — never honor it raw).
+
 ## 5. Router (alfonso-routing) — selection + the policy model
 
 ### 5a. The candidate-list contract (resolves the reactive-reroute fork → option A)

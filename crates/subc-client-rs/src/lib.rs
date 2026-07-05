@@ -11,8 +11,11 @@ use std::{
     env,
     error::Error,
     ffi::OsString,
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -21,8 +24,12 @@ pub use async_trait::async_trait;
 pub use subc_control::ConsumerIdentity;
 pub use subc_protocol::session::{HealthReport, HealthStatus};
 use subc_protocol::{
-    manifest::ModuleManifest,
-    session::{ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK},
+    manifest::{ModuleManifest, ProviderRole},
+    session::{
+        ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
+        ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
+        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+    },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV,
     SUBC_MODULE_ID_ENV,
@@ -34,17 +41,25 @@ use subc_transport::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
-    sync::{mpsc, Semaphore},
+    sync::{mpsc, oneshot, Semaphore},
+    time::timeout,
 };
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
+const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 const EGRESS_BUFFER: usize = 64;
 const HANDLER_TASK_CAPACITY: usize = 64;
 const HELLO_CORR: u64 = 1;
 
 type RequestKey = (u16, u64);
 type InFlight = Arc<Mutex<HashMap<RequestKey, CancellationToken>>>;
+type CatalogUpdateReply = oneshot::Sender<Result<(), CatalogUpdateError>>;
+type CatalogUpdateWaiter = oneshot::Receiver<Result<(), CatalogUpdateError>>;
+type CatalogUpdateRequest = (u64, mpsc::Sender<Frame>, CatalogUpdateWaiter);
+
+/// Future returned by [`serve_with_handle`] that runs the module until GOODBYE or EOF.
+pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleError>> + Send>>;
 
 #[derive(Clone)]
 struct RequestDispatcher {
@@ -60,6 +75,232 @@ impl RequestDispatcher {
         }
     }
 }
+
+/// Cloneable handle for module-originated control RPCs on channel 0.
+#[derive(Clone)]
+pub struct ModuleHandle {
+    shared: Arc<ModuleHandleShared>,
+}
+
+struct ModuleHandleShared {
+    negotiated_ver: u8,
+    supports_catalog_update: bool,
+    inner: Mutex<ModuleHandleState>,
+}
+
+struct ModuleHandleState {
+    writer: Option<mpsc::Sender<Frame>>,
+    next_corr: u64,
+    pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
+    closed: bool,
+}
+
+impl ModuleHandle {
+    fn new(ack: &ModuleHelloAckBody, writer: mpsc::Sender<Frame>) -> Self {
+        Self {
+            shared: Arc::new(ModuleHandleShared {
+                negotiated_ver: ack.negotiated_ver,
+                supports_catalog_update: ack
+                    .subc_ops
+                    .iter()
+                    .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
+                inner: Mutex::new(ModuleHandleState {
+                    writer: Some(writer),
+                    next_corr: HELLO_CORR + 1,
+                    pending_catalog_updates: HashMap::new(),
+                    closed: false,
+                }),
+            }),
+        }
+    }
+
+    /// Ask the daemon to replace this module's advertised provider roles in place.
+    ///
+    /// The returned result resolves when the daemon ACKs the update, rejects it with
+    /// a typed channel-0 Error frame, the request times out, or the connection dies.
+    pub async fn catalog_update(
+        &self,
+        provides: Vec<ProviderRole>,
+    ) -> Result<(), CatalogUpdateError> {
+        if !self.shared.supports_catalog_update {
+            return Err(CatalogUpdateError::NotSupported);
+        }
+
+        let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate { provides })
+            .map_err(|err| {
+                CatalogUpdateError::Protocol(format!(
+                    "failed to encode catalog.update request body: {err}"
+                ))
+            })?;
+        let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            corr,
+            body,
+        )
+        .map_err(|err| {
+            self.shared.remove_pending_catalog_update(corr);
+            CatalogUpdateError::Protocol(format!(
+                "failed to build catalog.update request frame: {err}"
+            ))
+        })?;
+
+        if writer.send(frame).await.is_err() {
+            self.shared.remove_pending_catalog_update(corr);
+            return Err(CatalogUpdateError::ConnectionClosed);
+        }
+
+        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(CatalogUpdateError::ConnectionClosed),
+            Err(_) => {
+                self.shared.remove_pending_catalog_update(corr);
+                Err(CatalogUpdateError::Timeout)
+            }
+        }
+    }
+
+    fn handle_control_reply(&self, frame: Frame) -> bool {
+        let Some(reply) = self.shared.take_pending_catalog_update(frame.header.corr) else {
+            return false;
+        };
+        let result = match frame.header.ty {
+            FrameType::Response => {
+                match serde_json::from_slice::<ModuleControlResponseToModule>(&frame.body) {
+                    Ok(ModuleControlResponseToModule::CatalogUpdate {}) => Ok(()),
+                    Err(err) => Err(CatalogUpdateError::Protocol(format!(
+                        "invalid catalog.update response body: {err}"
+                    ))),
+                }
+            }
+            FrameType::Error => match serde_json::from_slice::<ErrorBody>(&frame.body) {
+                Ok(body) => Err(match body.code.as_str() {
+                    "catalog_update_frozen_field" => CatalogUpdateError::FrozenField(body),
+                    "not_registered" => CatalogUpdateError::NotRegistered(body),
+                    _ => CatalogUpdateError::Rejected(body),
+                }),
+                Err(err) => Err(CatalogUpdateError::Protocol(format!(
+                    "invalid catalog.update error body: {err}"
+                ))),
+            },
+            ty => Err(CatalogUpdateError::Protocol(format!(
+                "unexpected catalog.update terminal frame: {ty:?}"
+            ))),
+        };
+        let _ = reply.send(result);
+        true
+    }
+
+    fn close_connection(&self) {
+        self.shared.close_connection();
+    }
+}
+
+impl ModuleHandleShared {
+    fn begin_catalog_update(&self) -> Result<CatalogUpdateRequest, CatalogUpdateError> {
+        let mut inner = self.lock_inner();
+        if inner.closed {
+            return Err(CatalogUpdateError::ConnectionClosed);
+        }
+        let Some(writer) = inner.writer.clone() else {
+            inner.closed = true;
+            return Err(CatalogUpdateError::ConnectionClosed);
+        };
+        let corr = next_module_control_corr(&mut inner);
+        let (tx, rx) = oneshot::channel();
+        inner.pending_catalog_updates.insert(corr, tx);
+        Ok((corr, writer, rx))
+    }
+
+    fn take_pending_catalog_update(&self, corr: u64) -> Option<CatalogUpdateReply> {
+        self.lock_inner().pending_catalog_updates.remove(&corr)
+    }
+
+    fn remove_pending_catalog_update(&self, corr: u64) {
+        self.lock_inner().pending_catalog_updates.remove(&corr);
+    }
+
+    fn close_connection(&self) {
+        let pending = {
+            let mut inner = self.lock_inner();
+            if inner.closed {
+                return;
+            }
+            inner.closed = true;
+            inner.writer = None;
+            inner
+                .pending_catalog_updates
+                .drain()
+                .map(|(_, reply)| reply)
+                .collect::<Vec<_>>()
+        };
+        for reply in pending {
+            let _ = reply.send(Err(CatalogUpdateError::ConnectionClosed));
+        }
+    }
+
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, ModuleHandleState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn next_module_control_corr(inner: &mut ModuleHandleState) -> u64 {
+    loop {
+        let corr = inner.next_corr;
+        inner.next_corr = inner.next_corr.wrapping_add(1).max(HELLO_CORR + 1);
+        if corr != HELLO_CORR && !inner.pending_catalog_updates.contains_key(&corr) {
+            return corr;
+        }
+    }
+}
+
+/// Errors returned by [`ModuleHandle::catalog_update`].
+#[derive(Debug)]
+pub enum CatalogUpdateError {
+    NotSupported,
+    FrozenField(ErrorBody),
+    NotRegistered(ErrorBody),
+    Rejected(ErrorBody),
+    Timeout,
+    ConnectionClosed,
+    Protocol(String),
+}
+
+impl fmt::Display for CatalogUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSupported => write!(
+                f,
+                "daemon HELLO_ACK did not advertise catalog.update support"
+            ),
+            Self::FrozenField(body) => {
+                write!(f, "catalog.update rejected frozen field: {}", body.message)
+            }
+            Self::NotRegistered(body) => write!(
+                f,
+                "catalog.update requires a registered module: {}",
+                body.message
+            ),
+            Self::Rejected(body) => write!(
+                f,
+                "catalog.update rejected by subc: {} ({})",
+                body.code, body.message
+            ),
+            Self::Timeout => write!(f, "catalog.update timed out waiting for an ACK"),
+            Self::ConnectionClosed => {
+                write!(f, "subc connection closed before catalog.update completed")
+            }
+            Self::Protocol(message) => write!(f, "catalog.update protocol error: {message}"),
+        }
+    }
+}
+
+impl Error for CatalogUpdateError {}
 
 /// Trait implemented by a module for its business logic. The serve functions in
 /// this crate own all wire-protocol plumbing.
@@ -222,44 +463,75 @@ pub async fn serve_with<H>(
 where
     H: ModuleHandler,
 {
+    let (_handle, serve_future) = serve_with_handle(connection_file, manifest, handler).await?;
+    serve_future.await
+}
+
+/// Connect, register the module, and return a cloneable handle plus the future that
+/// must be awaited or spawned to keep serving the connection.
+pub async fn serve_with_handle<H>(
+    connection_file: &Path,
+    manifest: ModuleManifest,
+    handler: H,
+) -> Result<(ModuleHandle, ModuleServeFuture), SubcModuleError>
+where
+    H: ModuleHandler,
+{
     let stream = connect_to_subc(connection_file).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
     let handler = Arc::new(handler);
 
-    let loop_result = module_loop(&mut read_half, tx.clone(), manifest, Arc::clone(&handler)).await;
-    drop(tx);
+    send_hello(&tx, manifest).await?;
+    let ack = expect_hello_ack(&mut read_half).await?;
+    handler.on_hello_ack(&ack).await;
 
-    let writer_result = writer.await.map_err(SubcModuleError::WriterTask);
-    match (loop_result, writer_result) {
-        (Err(loop_err), _) => Err(loop_err),
-        (Ok(()), Ok(Ok(()))) => Ok(()),
-        (Ok(()), Ok(Err(writer_err))) => Err(SubcModuleError::FrameIo(writer_err)),
-        (Ok(()), Err(join_err)) => Err(join_err),
-    }
+    let handle = ModuleHandle::new(&ack, tx.clone());
+    let serve_handle = handle.clone();
+    let serve_future = Box::pin(async move {
+        let loop_result =
+            module_loop(read_half, tx, Arc::clone(&handler), serve_handle.clone()).await;
+        serve_handle.close_connection();
+
+        let writer_result = writer.await.map_err(SubcModuleError::WriterTask);
+        match (loop_result, writer_result) {
+            (Err(loop_err), _) => Err(loop_err),
+            (Ok(()), Ok(Ok(()))) => Ok(()),
+            (Ok(()), Ok(Err(writer_err))) => Err(SubcModuleError::FrameIo(writer_err)),
+            (Ok(()), Err(join_err)) => Err(join_err),
+        }
+    });
+    Ok((handle, serve_future))
 }
 
 async fn module_loop<R, H>(
-    reader: &mut R,
+    mut reader: R,
     egress: mpsc::Sender<Frame>,
-    manifest: ModuleManifest,
     handler: Arc<H>,
+    module_handle: ModuleHandle,
 ) -> Result<(), SubcModuleError>
 where
     R: AsyncRead + Unpin,
     H: ModuleHandler,
 {
-    send_hello(&egress, manifest).await?;
-    let ack = expect_hello_ack(reader).await?;
-    handler.on_hello_ack(&ack).await;
-
     let dispatcher = RequestDispatcher::new();
     loop {
-        let Some(frame) = read_frame(reader).await.map_err(SubcModuleError::FrameIo)? else {
+        let Some(frame) = read_frame(&mut reader)
+            .await
+            .map_err(SubcModuleError::FrameIo)?
+        else {
             return Ok(());
         };
-        if !handle_frame(frame, &egress, Arc::clone(&handler), dispatcher.clone()).await? {
+        if !handle_frame(
+            frame,
+            &egress,
+            Arc::clone(&handler),
+            dispatcher.clone(),
+            module_handle.clone(),
+        )
+        .await?
+        {
             return Ok(());
         }
     }
@@ -270,6 +542,7 @@ async fn handle_frame<H>(
     egress: &mpsc::Sender<Frame>,
     handler: Arc<H>,
     dispatcher: RequestDispatcher,
+    module_handle: ModuleHandle,
 ) -> Result<bool, SubcModuleError>
 where
     H: ModuleHandler,
@@ -292,6 +565,14 @@ where
         FrameType::Goodbye => {
             cancel_channel(&dispatcher.in_flight, frame.header.channel)?;
             handler.on_route_gone(frame.header.channel).await;
+            Ok(true)
+        }
+        FrameType::Response if frame.header.channel == 0 => {
+            let _ = module_handle.handle_control_reply(frame);
+            Ok(true)
+        }
+        FrameType::Error if frame.header.channel == 0 => {
+            let _ = module_handle.handle_control_reply(frame);
             Ok(true)
         }
         FrameType::Cancel => {
@@ -782,6 +1063,8 @@ impl From<serde_json::Error> for SubcModuleError {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use serde_json::json;
+    use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, Tool};
     use tokio::{sync::Notify, time::timeout};
 
     use super::*;
@@ -831,15 +1114,106 @@ mod tests {
         .unwrap()
     }
 
+    fn catalog_update_response(corr: u64) -> Frame {
+        Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            corr,
+            serde_json::to_vec(&ModuleControlResponseToModule::CatalogUpdate {}).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn test_module_handle(subc_ops: &[&str]) -> (ModuleHandle, mpsc::Receiver<Frame>) {
+        let (tx, rx) = mpsc::channel(4);
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: subc_ops.iter().map(|op| (*op).to_string()).collect(),
+            subc_capabilities: Vec::new(),
+            storage: None,
+        };
+        (ModuleHandle::new(&ack, tx), rx)
+    }
+
+    fn test_provider_role(tool_names: &[&str]) -> ProviderRole {
+        ProviderRole::ToolProvider {
+            tools: tool_names
+                .iter()
+                .map(|name| Tool {
+                    name: (*name).to_string(),
+                    description: None,
+                    execution_mode: ExecutionMode::Pure,
+                    schema: json!({"type": "object"}),
+                })
+                .collect(),
+            identity_scope: vec![IdentityScope::Project],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_update_fails_fast_when_hello_ack_does_not_advertise_support() {
+        let (handle, mut rx) = test_module_handle(&[]);
+
+        let error = handle
+            .catalog_update(vec![test_provider_role(&["a"])])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CatalogUpdateError::NotSupported));
+        assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_update_demuxes_multiple_in_flight_requests() {
+        let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
+        let first_handle = handle.clone();
+        let second_handle = handle.clone();
+        let first = tokio::spawn(async move {
+            first_handle
+                .catalog_update(vec![test_provider_role(&["a"])])
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_handle
+                .catalog_update(vec![test_provider_role(&["b"])])
+                .await
+        });
+
+        let first_frame = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_frame = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_frame.header.ty, FrameType::Request);
+        assert_eq!(first_frame.header.channel, 0);
+        assert_eq!(second_frame.header.ty, FrameType::Request);
+        assert_eq!(second_frame.header.channel, 0);
+        assert_ne!(first_frame.header.corr, second_frame.header.corr);
+
+        assert!(handle.handle_control_reply(catalog_update_response(second_frame.header.corr)));
+        assert!(handle.handle_control_reply(catalog_update_response(first_frame.header.corr)));
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn default_health_check_answers_ok() {
         let (tx, mut rx) = mpsc::channel(4);
         let handler = Arc::new(EchoHandler);
         let dispatcher = RequestDispatcher::new();
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
 
-        assert!(handle_frame(health_request(77), &tx, handler, dispatcher,)
-            .await
-            .unwrap());
+        assert!(
+            handle_frame(health_request(77), &tx, handler, dispatcher, module_handle)
+                .await
+                .unwrap()
+        );
 
         let response = timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -864,6 +1238,7 @@ mod tests {
             release: Arc::clone(&release),
         });
         let dispatcher = RequestDispatcher::new();
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
 
         for corr in 0..HANDLER_TASK_CAPACITY as u64 {
             handle_frame(
@@ -871,6 +1246,7 @@ mod tests {
                 &tx,
                 Arc::clone(&handler),
                 dispatcher.clone(),
+                module_handle.clone(),
             )
             .await
             .unwrap();
@@ -884,7 +1260,7 @@ mod tests {
         .await
         .unwrap();
 
-        handle_frame(health_request(900), &tx, handler, dispatcher)
+        handle_frame(health_request(900), &tx, handler, dispatcher, module_handle)
             .await
             .unwrap();
         assert!(

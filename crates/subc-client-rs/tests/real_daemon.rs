@@ -13,12 +13,18 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_client_rs::{
-    CallError, CallOptions, CloseRouteOptions, ConsumerOptions, RetryBackoff, SubcConsumer,
-    SubscribeOptions,
+    async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
+    ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler, RequestCtx, RetryBackoff,
+    SubcConsumer, SubcModuleError, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
-    session::HealthStatus, BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget,
+    manifest::{
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+    },
+    session::HealthStatus,
+    BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, read_frame, write_frame};
 use tokio::{
@@ -73,6 +79,15 @@ impl LiveDaemon {
 
     fn restart(&mut self, daemon_bin: &Path) {
         self.child = spawn_daemon_child(daemon_bin, &self.runtime_dir, &self.config_dir);
+    }
+}
+
+struct EchoModuleHandler;
+
+#[async_trait]
+impl ModuleHandler for EchoModuleHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
     }
 }
 
@@ -221,6 +236,133 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     .await;
 
     let _ = daemon.child.kill();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_routes() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-module-handle-update");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let module_id = "subc-client-rs-handle-catalog-update";
+    let (handle, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest(module_id, &["a", "b"]),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+
+    let initial_modules = catalog_modules(&daemon.connection_file, Some(module_id), 10_001).await;
+    assert_eq!(module_tool_names(&initial_modules[0]), vec!["a", "b"]);
+
+    let mut client = connect_authed_client(&daemon.connection_file)
+        .await
+        .unwrap();
+    let route_channel = open_route(&mut client, module_id, 10_002).await;
+
+    handle
+        .catalog_update(vec![tool_provider_role(&["a", "c"])])
+        .await
+        .unwrap();
+
+    let updated_modules = catalog_modules(&daemon.connection_file, Some(module_id), 10_003).await;
+    assert_eq!(module_tool_names(&updated_modules[0]), vec!["a", "c"]);
+
+    write_frame(
+        &mut client,
+        &data_request(route_channel, 10_004, b"after-update"),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.channel, route_channel);
+    assert_eq!(response.header.corr, 10_004);
+    assert_eq!(response.body, b"after-update");
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn module_handle_catalog_update_surfaces_frozen_field_rejections() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-module-handle-frozen");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let module_id = "subc-client-rs-handle-frozen-field";
+    let (handle, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest(module_id, &["a"]),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+
+    let error = handle.catalog_update(Vec::new()).await.unwrap_err();
+    assert!(matches!(error, CatalogUpdateError::FrozenField(_)));
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn module_handle_catalog_update_fails_fast_after_connection_death() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "subc-core"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-module-handle-death");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let module_id = "subc-client-rs-handle-connection-death";
+    let (handle, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest(module_id, &["a"]),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+
+    let result = timeout(
+        Duration::from_secs(1),
+        handle.catalog_update(vec![tool_provider_role(&["a"])]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(CatalogUpdateError::ConnectionClosed)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -822,6 +964,71 @@ async fn subc_consumer_subscribe_streaming_contract() {
     assert_eq!(json_body(&after)["echo"]["value"], "after-route-goodbye");
 
     daemon.kill_and_wait();
+}
+
+async fn spawn_inline_module(
+    connection_file: &Path,
+    manifest: ModuleManifest,
+) -> (
+    ModuleHandle,
+    tokio::task::JoinHandle<Result<(), SubcModuleError>>,
+) {
+    let (handle, serve_future) = serve_with_handle(connection_file, manifest, EchoModuleHandler)
+        .await
+        .unwrap();
+    (handle, tokio::spawn(serve_future))
+}
+
+fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifest {
+    ModuleManifest {
+        module_id: module_id.to_string(),
+        module_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: vec![tool_provider_role(tool_names)],
+        consumes: Vec::new(),
+        scheduled_tasks: Vec::new(),
+        bindings: Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: false,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: vec![IdentityScope::Project],
+                optional: vec![IdentityScope::Session],
+            },
+        },
+    }
+}
+
+fn tool_provider_role(tool_names: &[&str]) -> ProviderRole {
+    ProviderRole::ToolProvider {
+        tools: tool_names
+            .iter()
+            .map(|name| Tool {
+                name: (*name).to_string(),
+                description: None,
+                execution_mode: ExecutionMode::Pure,
+                schema: json!({ "type": "object" }),
+            })
+            .collect(),
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: false,
+        sub_supervises: false,
+    }
+}
+
+fn module_tool_names(module: &Value) -> Vec<&str> {
+    module["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|role| role["tools"].as_array().unwrap().iter())
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect()
 }
 
 fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> LiveDaemon {

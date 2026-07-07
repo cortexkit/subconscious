@@ -735,9 +735,17 @@ impl ControlHandler {
                 target,
                 identity,
                 consumer_identity,
+                consumer_capabilities,
             } => {
-                self.handle_route_open(ctx, frame, target, identity, consumer_identity)
-                    .await
+                self.handle_route_open(
+                    ctx,
+                    frame,
+                    target,
+                    identity,
+                    consumer_identity,
+                    consumer_capabilities,
+                )
+                .await
             }
             ClientControlRequest::RoutePoll {
                 route_channel,
@@ -909,6 +917,7 @@ impl ControlHandler {
         target: RouteTarget,
         mut identity: BindIdentity,
         consumer_identity: Option<ConsumerIdentity>,
+        consumer_capabilities: Option<Vec<String>>,
     ) -> Result<Vec<Frame>, RouterError> {
         let target_module_id = target_module_id(&target).to_string();
         debug!(
@@ -1053,6 +1062,7 @@ impl ControlHandler {
             target,
             identity,
             principal: Some(principal),
+            consumer_capabilities,
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(
@@ -2348,6 +2358,15 @@ mod tests {
     }
 
     fn route_open_frame(corr: u64, module_id: &str, project_root: std::path::PathBuf) -> Frame {
+        route_open_frame_with_consumer_capabilities(corr, module_id, project_root, None)
+    }
+
+    fn route_open_frame_with_consumer_capabilities(
+        corr: u64,
+        module_id: &str,
+        project_root: std::path::PathBuf,
+        consumer_capabilities: Option<Vec<String>>,
+    ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
@@ -2358,6 +2377,7 @@ mod tests {
                 session: "session".to_string(),
             },
             consumer_identity: None,
+            consumer_capabilities,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
@@ -2723,6 +2743,108 @@ mod tests {
             .unwrap();
         let route_response = route_task.await.unwrap();
         assert_eq!(route_response.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
+            ClientControlResponse::RouteOpen { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_open_relays_consumer_capabilities_verbatim() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(37));
+        handler
+            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
+            .await
+            .unwrap();
+
+        let expected = vec!["elicitation".to_string(), "roots".to_string()];
+        let expected_for_request = expected.clone();
+        let project_root = unique_project_root("consumer-capabilities-present");
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(38));
+        let route_handler = handler.clone();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(
+                    &client_ctx,
+                    route_open_frame_with_consumer_capabilities(
+                        401,
+                        "aft",
+                        project_root,
+                        Some(expected_for_request),
+                    ),
+                )
+                .await
+                .unwrap()
+        });
+        let bind_frame = tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
+        let ModuleControlRequest::RouteBind {
+            consumer_capabilities,
+            ..
+        } = bind
+        else {
+            panic!("expected route.bind request, got {bind:?}");
+        };
+        assert_eq!(consumer_capabilities, Some(expected.clone()));
+
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind_frame.header.corr))
+            .await
+            .unwrap();
+        let route_response = route_task.await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
+            ClientControlResponse::RouteOpen { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_open_without_consumer_capabilities_relays_none() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(39));
+        handler
+            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
+            .await
+            .unwrap();
+
+        let project_root = unique_project_root("consumer-capabilities-absent");
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(40));
+        let route_handler = handler.clone();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(&client_ctx, route_open_frame(402, "aft", project_root))
+                .await
+                .unwrap()
+        });
+        let bind_frame = tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
+        let ModuleControlRequest::RouteBind {
+            consumer_capabilities,
+            ..
+        } = bind
+        else {
+            panic!("expected route.bind request, got {bind:?}");
+        };
+        assert_eq!(consumer_capabilities, None);
+
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind_frame.header.corr))
+            .await
+            .unwrap();
+        let route_response = route_task.await.unwrap();
         assert!(matches!(
             serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
             ClientControlResponse::RouteOpen { .. }

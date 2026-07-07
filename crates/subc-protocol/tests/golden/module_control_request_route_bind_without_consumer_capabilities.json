@@ -1,8 +1,4 @@
 {
-  "consumer_capabilities": [
-    "elicitation",
-    "roots"
-  ],
   "identity": {
     "harness": "opencode",
     "project_root": "/tmp/subc/project",

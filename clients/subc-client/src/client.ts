@@ -98,6 +98,8 @@ export interface ConsumerIdentity {
 export interface RouteOpenOptions {
   /** Optional override for the consumer identity; by default the SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used when both are non-empty. Set null to send route.open without consumer_identity. */
   consumerIdentity?: ConsumerIdentity | null;
+  /** Optional consumer-declared reverse-request capabilities for this route.open. This is a declaration, not a verified privilege; providers must treat an omitted field as no reverse-request capability. Known MCP method-family values today are "elicitation", "sampling", and "roots". */
+  consumerCapabilities?: string[];
 }
 
 export interface CatalogEntry {
@@ -321,11 +323,13 @@ export class SubcClient {
   /** Open a route to a provider (channel-0 route.open); returns the route channel. */
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<number> {
     const consumerIdentity = routeOpenConsumerIdentity(opts);
+    const consumerCapabilities = opts.consumerCapabilities;
     const body = this.encode({
       op: "route.open",
       target,
       identity,
       ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
+      ...(consumerCapabilities !== undefined ? { consumer_capabilities: consumerCapabilities } : {}),
     });
     const reply = await this.controlRpc(body);
     const parsed = this.parseJson(reply) as { op: string; route_channel?: number };

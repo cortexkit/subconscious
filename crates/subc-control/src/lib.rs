@@ -56,6 +56,15 @@ pub enum ClientControlRequest {
         identity: BindIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_identity: Option<ConsumerIdentity>,
+        /// Consumer-declared reverse-request capabilities for the route. This is
+        /// an unverified declaration, not a privilege grant; if a consumer
+        /// over-declares, providers may still send reverse requests that later
+        /// time out or deny. Providers must treat an absent field as no
+        /// reverse-request capability. The vocabulary is open strings; known MCP
+        /// method-family values today are "elicitation", "sampling", and
+        /// "roots".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consumer_capabilities: Option<Vec<String>>,
     },
     #[serde(rename = "route.poll")]
     RoutePoll { route_channel: u16, kind: PollKind },
@@ -200,16 +209,18 @@ mod tests {
                 session: "session-1".to_string(),
             },
             consumer_identity: None,
+            consumer_capabilities: None,
         };
 
         let body = serde_json::to_value(request).unwrap();
         assert_eq!(body["op"], "route.open");
         assert_eq!(body["target"]["kind"], "tool_provider");
         assert!(body.get("consumer_identity").is_none());
+        assert!(body.get("consumer_capabilities").is_none());
     }
 
     #[test]
-    fn route_open_without_consumer_identity_still_decodes() {
+    fn route_open_without_optional_fields_still_decodes() {
         let body = serde_json::json!({
             "op": "route.open",
             "target": { "kind": "tool_provider", "module_id": "aft" },
@@ -222,11 +233,14 @@ mod tests {
 
         let decoded: ClientControlRequest = serde_json::from_value(body).unwrap();
         let ClientControlRequest::RouteOpen {
-            consumer_identity, ..
+            consumer_identity,
+            consumer_capabilities,
+            ..
         } = decoded
         else {
             panic!("decoded wrong request variant");
         };
         assert_eq!(consumer_identity, None);
+        assert_eq!(consumer_capabilities, None);
     }
 }

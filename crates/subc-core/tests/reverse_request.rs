@@ -864,6 +864,7 @@ async fn open_route(
                     session: session.to_string(),
                 },
                 consumer_identity: None,
+                consumer_capabilities: None,
             },
         ))
         .await;

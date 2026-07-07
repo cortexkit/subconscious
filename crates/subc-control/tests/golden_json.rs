@@ -89,6 +89,22 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     module_id: "subc-mcp".to_string(),
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
+                consumer_capabilities: Some(vec!["elicitation".to_string(), "roots".to_string()]),
+            },
+        ),
+        (
+            "client_control_request_route_open_without_consumer_capabilities",
+            ClientControlRequest::RouteOpen {
+                target: RouteTarget::InternalService {
+                    module_id: "llm-runner".to_string(),
+                    service_id: "llm".to_string(),
+                },
+                identity: bind_identity(),
+                consumer_identity: Some(ConsumerIdentity {
+                    module_id: "subc-mcp".to_string(),
+                    launch_nonce: "0123456789abcdef".to_string(),
+                }),
+                consumer_capabilities: None,
             },
         ),
         (

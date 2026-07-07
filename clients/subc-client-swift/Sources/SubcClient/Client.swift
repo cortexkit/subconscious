@@ -34,7 +34,10 @@ public struct SessionEvent {
 /// A durable resubscribe position: replay strictly AFTER this (wal_seq, sub_index).
 public typealias SubscribeCursor = (walSeq: UInt64, subIndex: UInt32)
 
-public struct SubcError: Error { public let message: String }
+public struct SubcError: Error {
+    public let message: String
+    public init(message: String) { self.message = message }
+}
 
 public final class SubcClient {
     private let transport: Transport

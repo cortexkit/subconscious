@@ -2,8 +2,19 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
+    @StateObject private var roomsVM = RoomsViewModel()
 
     var body: some View {
+        TabView {
+            chatTab
+                .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
+            RoomsView(vm: roomsVM)
+                .tabItem { Label("Rooms", systemImage: "person.3") }
+        }
+        .frame(minWidth: 760, minHeight: 480)
+    }
+
+    private var chatTab: some View {
         HStack(spacing: 0) {
             sidebar
             Divider()
@@ -15,7 +26,6 @@ struct ContentView: View {
                 composer
             }
         }
-        .frame(minWidth: 760, minHeight: 480)
     }
 
     // MARK: - Sidebar (session picker)
@@ -161,11 +171,14 @@ struct ContentView: View {
 
     private var composer: some View {
         HStack(spacing: 8) {
-            TextField("Message…", text: $vm.input, onCommit: vm.send)
+            // Same single-trigger rule as the rooms composer: Return submits via
+            // onSubmit only (dual onCommit+shortcut paths double-fire; here it was
+            // masked by isRunning, but the structure was the same bug).
+            TextField("Message…", text: $vm.input)
                 .textFieldStyle(.roundedBorder)
                 .disabled(vm.isRunning)
+                .onSubmit(vm.send)
             Button("Send", action: vm.send)
-                .keyboardShortcut(.return, modifiers: [])
                 .disabled(vm.isRunning || vm.input.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding(10)

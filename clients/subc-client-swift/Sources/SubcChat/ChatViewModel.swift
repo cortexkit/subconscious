@@ -58,7 +58,7 @@ final class ChatViewModel: ObservableObject {
     @Published var input: String = ""
     @Published var model: String = MODEL_PRESETS[0]
     @Published var connectionFile: String =
-        "/tmp/llmr-swift-rig/runtime/subc-connection.json"
+        NSString(string: "~/.local/share/cortexkit/run/subc-connection.json").expandingTildeInPath
     @Published var isRunning: Bool = false
     @Published var status: String = "idle"
 
@@ -139,6 +139,7 @@ final class ChatViewModel: ObservableObject {
         let root = projectRoot
         let session = sessions[idx].id
         let priorCursor = sessions[idx].cursor
+        sawEventThisTurn = false
 
         work.async { [weak self] in
             do {
@@ -169,7 +170,14 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// True once any event arrived for the in-flight turn. When a turn finishes with
+    /// ZERO events despite a stored cursor, the cursor points into a different WAL
+    /// (e.g. a wiped dev rig) and every fresh event sorts below it — self-heal by
+    /// clearing it so the next send resubscribes from the start.
+    private var sawEventThisTurn = false
+
     private func apply(_ event: SessionEvent, sessionId: String, assistantMsgId: UUID) {
+        sawEventThisTurn = true
         guard let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
               let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == assistantMsgId })
         else { return }
@@ -212,6 +220,22 @@ final class ChatViewModel: ObservableObject {
 
     private func finishTurn(sessionId: String, assistantMsgId: UUID, cursor: SubscribeCursor?) {
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            if !sawEventThisTurn, sessions[sIdx].cursor != nil {
+                // Stale-cursor self-heal: zero events + a stored cursor means the
+                // cursor belongs to a different WAL (rig wipe / daemon switch).
+                sessions[sIdx].cursorWalSeq = nil
+                sessions[sIdx].cursorSubIndex = nil
+                if let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == assistantMsgId }) {
+                    sessions[sIdx].messages[mIdx].text =
+                        "(no events arrived — stored cursor was stale and has been reset; send again)"
+                    sessions[sIdx].messages[mIdx].isError = true
+                    sessions[sIdx].messages[mIdx].pending = false
+                }
+                isRunning = false
+                status = "idle"
+                persist()
+                return
+            }
             if let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == assistantMsgId }) {
                 if sessions[sIdx].messages[mIdx].text.isEmpty {
                     sessions[sIdx].messages[mIdx].text = "(the model returned no text)"

@@ -1,8 +1,4 @@
 {
-  "consumer_capabilities": [
-    "elicitation",
-    "roots"
-  ],
   "consumer_identity": {
     "launch_nonce": "0123456789abcdef",
     "module_id": "subc-mcp"

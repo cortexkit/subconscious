@@ -51,6 +51,15 @@ pub enum ModuleControlRequest {
         identity: BindIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
+        /// Consumer-declared reverse-request capabilities for the route. This is
+        /// an unverified declaration, not a privilege grant; if a consumer
+        /// over-declares, providers may still send reverse requests that later
+        /// time out or deny. Providers must treat an absent field as no
+        /// reverse-request capability. The vocabulary is open strings; known MCP
+        /// method-family values today are "elicitation", "sampling", and
+        /// "roots".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consumer_capabilities: Option<Vec<String>>,
     },
     #[serde(rename = "health.check")]
     HealthCheck {},

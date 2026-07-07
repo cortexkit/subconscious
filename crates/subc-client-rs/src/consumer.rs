@@ -105,6 +105,11 @@ pub struct CloseRouteOptions {
     /// when absent, SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables
     /// identify the route for a supervised consumer.
     pub consumer_identity: Option<ConsumerIdentity>,
+    /// Consumer-declared reverse-request capabilities for the route being closed.
+    /// This is a declaration, not a verified privilege; providers treat an absent
+    /// field as no reverse-request capability. Known MCP method-family values
+    /// today are "elicitation", "sampling", and "roots".
+    pub consumer_capabilities: Option<Vec<String>>,
 }
 
 impl Default for CloseRouteOptions {
@@ -113,6 +118,7 @@ impl Default for CloseRouteOptions {
             drain: false,
             drain_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
+            consumer_capabilities: None,
         }
     }
 }
@@ -128,6 +134,11 @@ pub struct CallOptions {
     pub route_retry_deadline: Duration,
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
+    /// Consumer-declared reverse-request capabilities for route.open. This is a
+    /// declaration, not a verified privilege; providers treat an absent field as
+    /// no reverse-request capability. Known MCP method-family values today are
+    /// "elicitation", "sampling", and "roots".
+    pub consumer_capabilities: Option<Vec<String>>,
 }
 
 impl Default for CallOptions {
@@ -138,6 +149,7 @@ impl Default for CallOptions {
             route_retry: RetryBackoff::default(),
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
             consumer_identity: None,
+            consumer_capabilities: None,
         }
     }
 }
@@ -158,6 +170,11 @@ pub struct SubscribeOptions {
     pub route_open_timeout: Duration,
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
+    /// Consumer-declared reverse-request capabilities for route.open. This is a
+    /// declaration, not a verified privilege; providers treat an absent field as
+    /// no reverse-request capability. Known MCP method-family values today are
+    /// "elicitation", "sampling", and "roots".
+    pub consumer_capabilities: Option<Vec<String>>,
 }
 
 impl Default for SubscribeOptions {
@@ -169,6 +186,7 @@ impl Default for SubscribeOptions {
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
             route_open_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
+            consumer_capabilities: None,
         }
     }
 }
@@ -304,19 +322,25 @@ impl SubcConsumer {
         let call_deadline = Instant::now() + opts.timeout;
         let mut retried_unknown_channel = false;
         let consumer_identity = route_open_consumer_identity(&opts);
-        let route_key = RouteKey::new(&target, &identity, consumer_identity.as_ref());
+        let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let route_key = RouteKey::new(
+            &target,
+            &identity,
+            consumer_identity.as_ref(),
+            consumer_capabilities.as_deref(),
+        );
+
+        let route_open = RouteOpenParams {
+            target: &target,
+            identity: &identity,
+            consumer_identity: &consumer_identity,
+            consumer_capabilities: &consumer_capabilities,
+        };
 
         loop {
             let route = self
                 .shared
-                .ensure_route(
-                    &route_key,
-                    &target,
-                    &identity,
-                    &consumer_identity,
-                    &opts,
-                    call_deadline,
-                )
+                .ensure_route(&route_key, &route_open, &opts, call_deadline)
                 .await?;
             let permit = match Arc::clone(&route.sem).acquire_owned().await {
                 Ok(permit) => permit,
@@ -379,7 +403,7 @@ impl SubcConsumer {
 
     /// Open a held-open subscription on a managed route.
     ///
-    /// This opens or reuses the same `(target, identity, consumer_identity)` route as
+    /// This opens or reuses the same `(target, identity, consumer_identity, consumer_capabilities)` route as
     /// [`SubcConsumer::call`], sends one Request that the provider keeps open, and
     /// returns a [`Subscription`] whose event receiver yields each matching
     /// `StreamData` payload. The request holds one route flow-control permit until
@@ -401,21 +425,28 @@ impl SubcConsumer {
             route_retry: opts.route_retry,
             route_retry_deadline: opts.route_retry_deadline,
             consumer_identity: opts.consumer_identity.clone(),
+            consumer_capabilities: opts.consumer_capabilities.clone(),
         };
         let consumer_identity = route_open_consumer_identity(&route_opts);
-        let route_key = RouteKey::new(&target, &identity, consumer_identity.as_ref());
+        let consumer_capabilities = route_open_consumer_capabilities(&route_opts);
+        let route_key = RouteKey::new(
+            &target,
+            &identity,
+            consumer_identity.as_ref(),
+            consumer_capabilities.as_deref(),
+        );
+
+        let route_open = RouteOpenParams {
+            target: &target,
+            identity: &identity,
+            consumer_identity: &consumer_identity,
+            consumer_capabilities: &consumer_capabilities,
+        };
 
         loop {
             let route = self
                 .shared
-                .ensure_route(
-                    &route_key,
-                    &target,
-                    &identity,
-                    &consumer_identity,
-                    &route_opts,
-                    open_deadline,
-                )
+                .ensure_route(&route_key, &route_open, &route_opts, open_deadline)
                 .await?;
             let permit = match Arc::clone(&route.sem).acquire_owned().await {
                 Ok(permit) => permit,
@@ -456,7 +487,7 @@ impl SubcConsumer {
         }
     }
 
-    /// Tear down ONE route, keyed by its (target, identity) — the parity of the TS
+    /// Tear down ONE route, keyed by its route-open identity tuple — the parity of the TS
     /// client's `closeRoute`. For a long-lived consumer that opens unbounded distinct
     /// routes (one per session), this releases a route on session-end without dropping
     /// the whole consumer: it drops the cached route, settles in-flight requests on it
@@ -474,7 +505,13 @@ impl SubcConsumer {
         opts: CloseRouteOptions,
     ) {
         let consumer_identity = close_route_consumer_identity(&opts);
-        let key = RouteKey::new(&target, &identity, consumer_identity.as_ref());
+        let consumer_capabilities = close_route_consumer_capabilities(&opts);
+        let key = RouteKey::new(
+            &target,
+            &identity,
+            consumer_identity.as_ref(),
+            consumer_capabilities.as_deref(),
+        );
         self.shared.close_route(&key, &opts).await;
     }
 
@@ -925,9 +962,7 @@ impl Shared {
     async fn ensure_route(
         self: &Arc<Self>,
         key: &RouteKey,
-        target: &RouteTarget,
-        identity: &BindIdentity,
-        consumer_identity: &Option<ConsumerIdentity>,
+        route_open: &RouteOpenParams<'_>,
         opts: &CallOptions,
         call_deadline: Instant,
     ) -> Result<RouteState, CallError> {
@@ -967,14 +1002,7 @@ impl Shared {
                 RouteOpenAction::Lead => {
                     let mut guard = OpeningGuard::new(Arc::clone(self), key.clone());
                     let result = self
-                        .open_route_with_retry(
-                            key,
-                            target,
-                            identity,
-                            consumer_identity,
-                            opts,
-                            call_deadline,
-                        )
+                        .open_route_with_retry(key, route_open, opts, call_deadline)
                         .await
                         .map_err(SharedCallFailure::from);
                     guard.finish(result.clone());
@@ -987,9 +1015,7 @@ impl Shared {
     async fn open_route_with_retry(
         self: &Arc<Self>,
         key: &RouteKey,
-        target: &RouteTarget,
-        identity: &BindIdentity,
-        consumer_identity: &Option<ConsumerIdentity>,
+        route_open: &RouteOpenParams<'_>,
         opts: &CallOptions,
         call_deadline: Instant,
     ) -> Result<RouteState, CallError> {
@@ -999,9 +1025,10 @@ impl Shared {
             attempt = attempt.saturating_add(1);
             self.ensure_connected_for_call().await?;
             let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
-                target: target.clone(),
-                identity: identity.clone(),
-                consumer_identity: consumer_identity.clone(),
+                target: route_open.target.clone(),
+                identity: route_open.identity.clone(),
+                consumer_identity: route_open.consumer_identity.clone(),
+                consumer_capabilities: route_open.consumer_capabilities.clone(),
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
             let remaining = remaining_duration(route_deadline)?;
@@ -1620,6 +1647,13 @@ enum RouteOpenAction {
     Lead,
 }
 
+struct RouteOpenParams<'a> {
+    target: &'a RouteTarget,
+    identity: &'a BindIdentity,
+    consumer_identity: &'a Option<ConsumerIdentity>,
+    consumer_capabilities: &'a Option<Vec<String>>,
+}
+
 struct OpeningGuard {
     shared: Arc<Shared>,
     key: RouteKey,
@@ -1668,6 +1702,7 @@ struct RouteKey {
     harness: String,
     session: String,
     consumer_identity: Option<ConsumerIdentityKey>,
+    consumer_capabilities: Option<ConsumerCapabilitiesKey>,
 }
 
 impl RouteKey {
@@ -1675,6 +1710,7 @@ impl RouteKey {
         target: &RouteTarget,
         identity: &BindIdentity,
         consumer_identity: Option<&ConsumerIdentity>,
+        consumer_capabilities: Option<&[String]>,
     ) -> Self {
         Self {
             target: RouteTargetKey::from(target),
@@ -1682,6 +1718,7 @@ impl RouteKey {
             harness: identity.harness.clone(),
             session: identity.session.clone(),
             consumer_identity: consumer_identity.map(ConsumerIdentityKey::from),
+            consumer_capabilities: consumer_capabilities.map(ConsumerCapabilitiesKey::from_slice),
         }
     }
 
@@ -1711,6 +1748,20 @@ impl From<&ConsumerIdentity> for ConsumerIdentityKey {
             module_id: value.module_id.clone(),
             launch_nonce: value.launch_nonce.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ConsumerCapabilitiesKey {
+    values: Vec<String>,
+}
+
+impl ConsumerCapabilitiesKey {
+    fn from_slice(values: &[String]) -> Self {
+        let mut values = values.to_vec();
+        values.sort();
+        values.dedup();
+        Self { values }
     }
 }
 
@@ -2203,6 +2254,14 @@ fn close_route_consumer_identity(opts: &CloseRouteOptions) -> Option<ConsumerIde
         .or_else(consumer_identity_from_env)
 }
 
+fn route_open_consumer_capabilities(opts: &CallOptions) -> Option<Vec<String>> {
+    opts.consumer_capabilities.clone()
+}
+
+fn close_route_consumer_capabilities(opts: &CloseRouteOptions) -> Option<Vec<String>> {
+    opts.consumer_capabilities.clone()
+}
+
 fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
     let module_id = std::env::var(SUBC_MODULE_ID_ENV)
         .ok()
@@ -2409,6 +2468,7 @@ mod tests {
                 session: "s".into(),
             },
             None,
+            None,
         );
         // Simulate an in-flight lead open: an openings entry exists, not yet closed,
         // with no cached route (channel hasn't been installed yet).
@@ -2445,6 +2505,7 @@ mod tests {
                 session: "s".into(),
             },
             None,
+            None,
         );
         shared
             .close_route(&absent, &CloseRouteOptions::default())
@@ -2462,9 +2523,38 @@ mod tests {
             harness: "h".into(),
             session: "s".into(),
         };
-        let key = RouteKey::new(&target, &identity, None);
+        let key = RouteKey::new(&target, &identity, None, None);
         assert_eq!(key.project_root, PathBuf::from("/tmp/project"));
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
+    }
+
+    #[test]
+    fn route_key_canonicalizes_consumer_capabilities() {
+        let target = RouteTarget::ToolProvider {
+            module_id: "aft".into(),
+        };
+        let identity = BindIdentity {
+            project_root: PathBuf::from("/tmp/project"),
+            harness: "h".into(),
+            session: "s".into(),
+        };
+        let left = RouteKey::new(
+            &target,
+            &identity,
+            None,
+            Some(&["sampling".to_string(), "elicitation".to_string()]),
+        );
+        let right = RouteKey::new(
+            &target,
+            &identity,
+            None,
+            Some(&[
+                "elicitation".to_string(),
+                "sampling".to_string(),
+                "sampling".to_string(),
+            ]),
+        );
+        assert_eq!(left, right);
     }
 
     #[test]

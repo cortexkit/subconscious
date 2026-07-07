@@ -473,6 +473,7 @@ where
             session: format!("closure-{}", corr),
         },
         consumer_identity: None,
+        consumer_capabilities: None,
     };
     write_frame(client, &control_request_frame(corr, request))
         .await

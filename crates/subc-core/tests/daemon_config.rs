@@ -390,6 +390,7 @@ where
                 session: format!("session-{corr}"),
             },
             consumer_identity: None,
+            consumer_capabilities: None,
         },
     )
     .await

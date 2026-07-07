@@ -76,6 +76,34 @@ public final class SubcClient {
         }
     }
 
+    /// Fetch a tool provider's tool definitions from the catalog, shaped for
+    /// llm-runner's `session.send` `tools` array: `{name, description,
+    /// input_schema, module}`. The catalog's `execution_mode` is intentionally
+    /// dropped — llm-runner's Tool field of that name is a different enum
+    /// (dispatch parallelism, not effect class) and rejects the catalog's
+    /// values; omitting it applies the serve side's default.
+    public func toolProviderTools(moduleId: String) throws -> [[String: Any]] {
+        let body = try JSONSerialization.data(withJSONObject: ["op": "catalog.list"])
+        let reply = try request(channel: 0, body: body)
+        guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
+              let modules = obj["modules"] as? [[String: Any]],
+              let entry = modules.first(where: { ($0["module_id"] as? String) == moduleId })
+        else { return [] }
+        let roles = entry["roles"] as? [[String: Any]] ?? []
+        guard let provider = roles.first(where: { ($0["role"] as? String) == "tool_provider" }),
+              let tools = provider["tools"] as? [[String: Any]]
+        else { return [] }
+        return tools.compactMap { tool in
+            guard let name = tool["name"] as? String else { return nil }
+            return [
+                "name": name,
+                "description": tool["description"] as? String ?? "",
+                "input_schema": tool["schema"] as? [String: Any] ?? ["type": "object"],
+                "module": moduleId,
+            ]
+        }
+    }
+
     /// Open a route to a management-surface module (channel-0 route.open).
     /// Returns the assigned route channel. `projectRoot` must be an existing path
     /// (subc canonicalizes it via cortexkit-paths and rejects non-existent paths).
@@ -132,6 +160,7 @@ public final class SubcClient {
         prompt: String,
         provider: String,
         model: String,
+        tools: [[String: Any]] = [],
         fromCursor: SubscribeCursor? = nil,
         sendId: String = UUID().uuidString,
         onEvent: (SessionEvent) -> Void
@@ -170,7 +199,7 @@ public final class SubcClient {
             "params": [
                 "prompt": prompt,
                 "model": ["provider": provider, "model": model],
-                "tools": [],
+                "tools": tools,
                 "send_id": sendId,
             ],
         ])
@@ -305,6 +334,19 @@ private func extractText(type: String, unit: [String: Any]) -> String? {
             (block["type"] as? String) == "text" ? block["text"] as? String : nil
         }.joined()
         return text.isEmpty ? nil : text
+    case "tool_call":
+        // Render as `name(compact-args)` so the transcript shows what ran. The
+        // input can be large (e.g. a write); cap it for the caption.
+        if let call = unit["call"] as? [String: Any], let name = call["tool_name"] as? String {
+            var args = ""
+            if let input = call["input"],
+               let data = try? JSONSerialization.data(withJSONObject: input),
+               let s = String(data: data, encoding: .utf8) {
+                args = s.count > 200 ? String(s.prefix(200)) + "…" : s
+            }
+            return "\(name)(\(args))"
+        }
+        return nil
     case "tool_result":
         return (unit["result"] as? [String: Any])?["output"].flatMap { ($0 as? [String: Any])?["text"] as? String }
     default:

@@ -103,6 +103,11 @@ struct ContentView: View {
             TextField("provider/model", text: $vm.model)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 220)
+            Toggle(isOn: $vm.toolsEnabled) {
+                Image(systemName: "wrench.and.screwdriver")
+            }
+            .toggleStyle(.button)
+            .help("Give the model aft's tools (read/edit/grep/… against this chat's project folder)")
             Circle()
                 .fill(vm.status == "error" ? Color.red : (vm.isRunning ? Color.orange : Color.green))
                 .frame(width: 8, height: 8)

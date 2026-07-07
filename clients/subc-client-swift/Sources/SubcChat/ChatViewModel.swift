@@ -61,6 +61,9 @@ final class ChatViewModel: ObservableObject {
         NSString(string: "~/.local/share/cortexkit/run/subc-connection.json").expandingTildeInPath
     @Published var isRunning: Bool = false
     @Published var status: String = "idle"
+    /// When on, each send carries the aft module's current tool definitions so the
+    /// model can call tools (executed via subc → aft against this chat's project root).
+    @Published var toolsEnabled: Bool = true
 
     private let projectRoot = NSTemporaryDirectory() + "ck-chat-project"
     private let work = DispatchQueue(label: "subc-chat.client", qos: .userInitiated)
@@ -141,17 +144,27 @@ final class ChatViewModel: ObservableObject {
         let priorCursor = sessions[idx].cursor
         sawEventThisTurn = false
 
+        let wantTools = toolsEnabled
         work.async { [weak self] in
             do {
                 let client = try SubcClient.connect(connectionFilePath: cf)
+                // Tool defs come from the live catalog each turn, so the surface
+                // tracks whatever the aft module currently exposes.
+                let tools = wantTools ? (try? client.toolProviderTools(moduleId: "aft")) ?? [] : []
                 let next = try client.runSessionTurn(
                     moduleId: "llm-runner",
                     projectRoot: root,
-                    harness: "ck-chat",
+                    // "runner" (not "ck-chat") until aft admits a first-party CK-app
+                    // harness identity: llm-runner propagates this harness verbatim to
+                    // the tool-plane bind, and aft's admission allowlist rejects unknown
+                    // harnesses with config_divergence, which would surface as
+                    // tool-plane-unavailable results on every tool call.
+                    harness: "runner",
                     session: session,
                     prompt: prompt,
                     provider: provider,
                     model: modelId,
+                    tools: tools,
                     fromCursor: priorCursor
                 ) { event in
                     DispatchQueue.main.async {
@@ -185,7 +198,20 @@ final class ChatViewModel: ObservableObject {
 
         switch event.type {
         case "run_started": status = "\(shortModel(model)) working…"
-        case "tool_call": status = "\(shortModel(model)) calling tool…"
+        case "tool_call":
+            status = "\(shortModel(model)) calling tool…"
+            // Show the call in the transcript as a caption bubble above the
+            // still-pending assistant answer.
+            if let call = event.text {
+                sessions[sIdx].messages.insert(
+                    ChatMessage(role: .system, text: "⚙ \(call)"), at: mIdx)
+            }
+        case "tool_result":
+            if let result = event.text {
+                let capped = result.count > 300 ? String(result.prefix(300)) + "…" : result
+                sessions[sIdx].messages.insert(
+                    ChatMessage(role: .system, text: "→ \(capped)"), at: mIdx)
+            }
         case "text_delta":
             // Live token streaming: append the coalesced delta as it arrives.
             if let delta = event.text {

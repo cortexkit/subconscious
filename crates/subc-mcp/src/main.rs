@@ -737,6 +737,16 @@ struct ShimHello {
     project_root: PathBuf,
     harness: String,
     shim_session_id: String,
+    /// Per-launch conversation token minted by a wrapper (e.g. the ck-claude
+    /// launcher exporting CK_INSTANCE_TOKEN). When present it becomes the bind
+    /// identity's `session` VERBATIM, so conversation-scoped modules can
+    /// correlate this MCP session with the same launch's provider-wire traffic
+    /// (ai-proxy resolves the token to its conversation key). Absent for
+    /// unwrapped hosts; the module then falls back to a synthetic per-process
+    /// session id. Optional and serde-defaulted: old shims and old modules
+    /// interoperate without a schema bump.
+    #[serde(default)]
+    instance_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1242,6 +1252,7 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
         project_root,
         harness: args.harness,
         shim_session_id: generated_id("shim")?,
+        instance_token: instance_token_from_env(),
     };
     write_json_message(&mut stream, &hello, MAX_SHIM_CONTROL_MESSAGE_LEN).await?;
 
@@ -1692,7 +1703,7 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
     let identity = BindIdentity {
         project_root: hello.project_root.clone(),
         harness: hello.harness.clone(),
-        session: generated_session_id(&hello.shim_session_id)?,
+        session: bind_session_from_hello(hello)?,
     };
 
     let relay_session = Arc::new(RelaySession::new(identity.session.clone()));
@@ -3719,6 +3730,63 @@ fn generated_session_id(shim_session_id: &str) -> Result<String> {
     ))
 }
 
+/// Environment variable a launch wrapper sets to name the conversation this
+/// process belongs to (mirrored on the provider wire as an x-ck-instance
+/// header by the same wrapper).
+const INSTANCE_TOKEN_ENV: &str = "CK_INSTANCE_TOKEN";
+
+/// The bind session for a shim attach. A wrapper-minted instance token becomes
+/// the session VERBATIM so conversation-scoped modules (magic-context via
+/// ai-proxy's session.resolve) can correlate this MCP session with the same
+/// launch's provider-wire traffic. The module re-validates rather than
+/// trusting the shim: the shim is an unauthenticated-content byte pipe from
+/// the module's perspective, and an oversized or charset-hostile value must
+/// not become a bind identity. Invalid or absent → the synthetic per-process
+/// session id (today's behavior).
+fn bind_session_from_hello(hello: &ShimHello) -> Result<String> {
+    match hello.instance_token.as_deref() {
+        Some(token) if valid_instance_token(token) => Ok(token.to_string()),
+        Some(_) => {
+            eprintln!(
+                "subc-mcp module: ignoring invalid instance token from shim hello; using synthetic session id"
+            );
+            generated_session_id(&hello.shim_session_id)
+        }
+        None => generated_session_id(&hello.shim_session_id),
+    }
+}
+
+/// Shared validity rule for instance tokens, matching ai-proxy's validation of
+/// the x-ck-instance header form so both consumers accept the same tokens:
+/// non-empty, at most [`MAX_INSTANCE_TOKEN_LEN`] bytes, charset [A-Za-z0-9._-].
+/// The token is otherwise OPAQUE — never parsed for shape.
+fn valid_instance_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_INSTANCE_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Maximum accepted instance-token length in bytes, matching ai-proxy's
+/// validation of the header form so both consumers accept the same tokens.
+const MAX_INSTANCE_TOKEN_LEN: usize = 128;
+
+/// Read the wrapper-minted conversation token from the environment. Invalid
+/// values are dropped with a warning rather than failing the shim: a bad token
+/// only costs conversation correlation, not tool access.
+fn instance_token_from_env() -> Option<String> {
+    let raw = env::var(INSTANCE_TOKEN_ENV).ok()?;
+    if valid_instance_token(&raw) {
+        Some(raw)
+    } else {
+        eprintln!(
+            "subc-mcp shim: ignoring {INSTANCE_TOKEN_ENV}: must be non-empty, at most {MAX_INSTANCE_TOKEN_LEN} bytes, charset [A-Za-z0-9._-]"
+        );
+        None
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -4335,5 +4403,57 @@ mod tests {
             "unexpected error: {err}"
         );
         let _ = fs::remove_file(&path);
+    }
+
+    fn shim_hello_with_token(instance_token: Option<&str>) -> ShimHello {
+        ShimHello {
+            schema: SHIM_SCHEMA_VERSION,
+            project_root: PathBuf::from("/tmp/instance-token-test"),
+            harness: "mcp:claude-code".to_owned(),
+            shim_session_id: "shim-abc123".to_owned(),
+            instance_token: instance_token.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn valid_instance_token_becomes_bind_session_verbatim() {
+        let token = "53fa73e8-1c2d-4f00-9a51-instance.token_1";
+        let session = bind_session_from_hello(&shim_hello_with_token(Some(token))).unwrap();
+        assert_eq!(session, token);
+    }
+
+    #[test]
+    fn absent_instance_token_falls_back_to_synthetic_session() {
+        let session = bind_session_from_hello(&shim_hello_with_token(None)).unwrap();
+        assert!(
+            session.starts_with("session-shim-abc123-"),
+            "expected synthetic id, got {session}"
+        );
+    }
+
+    #[test]
+    fn invalid_instance_tokens_fall_back_to_synthetic_session() {
+        let oversized = "a".repeat(MAX_INSTANCE_TOKEN_LEN + 1);
+        for bad in ["", "has space", "semi;colon", "uni\u{241f}code", &oversized] {
+            let session = bind_session_from_hello(&shim_hello_with_token(Some(bad))).unwrap();
+            assert!(
+                session.starts_with("session-shim-abc123-"),
+                "token {bad:?} must not become a bind session; got {session}"
+            );
+        }
+    }
+
+    #[test]
+    fn shim_hello_without_instance_token_field_still_decodes() {
+        // Old-shim compatibility: the field is serde-defaulted, so a hello
+        // serialized before the field existed decodes with None.
+        let old_wire = serde_json::json!({
+            "schema": SHIM_SCHEMA_VERSION,
+            "project_root": "/tmp/x",
+            "harness": "mcp:claude-code",
+            "shim_session_id": "shim-old"
+        });
+        let hello: ShimHello = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(hello.instance_token, None);
     }
 }

@@ -308,7 +308,21 @@ final class ChatViewModel: ObservableObject {
         guard let data = try? Data(contentsOf: storeURL()),
               let decoded = try? JSONDecoder().decode([ChatSession].self, from: data)
         else { return [] }
-        return decoded
+        // An empty assistant bubble in the store is a turn that was interrupted
+        // mid-flight (app quit / route torn down before the terminal arrived) —
+        // label it instead of rendering a blank bubble.
+        return decoded.map { session in
+            var s = session
+            s.messages = s.messages.map { m in
+                var m = m
+                if m.role == .assistant, m.text.isEmpty, !m.pending {
+                    m.text = "(turn interrupted before a response arrived)"
+                    m.isError = true
+                }
+                return m
+            }
+            return s
+        }
     }
 
     private func persist() {

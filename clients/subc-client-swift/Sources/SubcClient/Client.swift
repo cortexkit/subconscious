@@ -210,6 +210,14 @@ public final class SubcClient {
         var lastCursor: SubscribeCursor? = fromCursor
         while true {
             let frame = try readFrame()
+            // A GOODBYE for either of this turn's routes means the daemon tore the
+            // channel down (module restart/drain). Fail loudly: silently ignoring it
+            // leaves this drain blocked forever on a channel that will never speak.
+            if frame.header.ty == .goodbye,
+               frame.header.channel == subChannel || frame.header.channel == cmdChannel {
+                throw SubcError(message:
+                    "route closed by daemon mid-turn (module restarted or drained) — resend to reopen")
+            }
             if frame.header.corr == sendCorr {
                 if frame.header.ty == .error {
                     let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"

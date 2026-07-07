@@ -108,6 +108,22 @@ struct ContentView: View {
             }
             .toggleStyle(.button)
             .help("Give the model aft's tools (read/edit/grep/… against this chat's project folder)")
+            Button {
+                vm.pickProjectRoot()
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "folder")
+                    Text((vm.activeProjectRoot as NSString).lastPathComponent)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .frame(maxWidth: 110)
+                }
+            }
+            .buttonStyle(.borderless)
+            .disabled(!vm.canPickProjectRoot)
+            .help(vm.canPickProjectRoot
+                ? "Choose the project folder tools operate on (fixed after the first message): \(vm.activeProjectRoot)"
+                : "Project folder (fixed once the session has messages): \(vm.activeProjectRoot)")
             Circle()
                 .fill(vm.status == "error" ? Color.red : (vm.isRunning ? Color.orange : Color.green))
                 .frame(width: 8, height: 8)

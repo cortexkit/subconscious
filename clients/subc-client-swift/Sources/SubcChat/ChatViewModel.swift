@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import SubcClient
@@ -18,7 +19,11 @@ struct ChatMessage: Identifiable, Codable {
 
 /// A durable conversation: one subc session id (a lineage on the module side) plus the
 /// app's local view of its transcript and resubscribe cursor.
-struct ChatSession: Identifiable, Codable {
+    struct ChatSession: Identifiable, Codable {
+        /// The project folder aft tools operate on. Part of the module-side bind
+        /// identity, so it is fixed once the session has messages. Sessions from
+        /// before this field decode as nil and fall back to the sandbox folder.
+        var projectRoot: String?
     let id: String
     var title: String
     var messages: [ChatMessage]
@@ -65,12 +70,37 @@ final class ChatViewModel: ObservableObject {
     /// model can call tools (executed via subc → aft against this chat's project root).
     @Published var toolsEnabled: Bool = true
 
-    private let projectRoot = NSTemporaryDirectory() + "ck-chat-project"
+    /// Fallback sandbox for sessions without a chosen folder.
+    private let sandboxRoot = NSTemporaryDirectory() + "ck-chat-project"
+
+    /// The active session's effective project root (chosen folder or sandbox).
+    var activeProjectRoot: String {
+        activeIndex.flatMap { sessions[$0].projectRoot } ?? sandboxRoot
+    }
+
+    /// Whether the active session's folder can still be changed (no messages yet —
+    /// project_root is part of the module-side bind identity once a send happens).
+    var canPickProjectRoot: Bool {
+        activeIndex.map { sessions[$0].messages.isEmpty } ?? false
+    }
+
+    func pickProjectRoot() {
+        guard let idx = activeIndex, sessions[idx].messages.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use as project folder"
+        if panel.runModal() == .OK, let url = panel.url {
+            sessions[idx].projectRoot = url.path
+            persist()
+        }
+    }
     private let work = DispatchQueue(label: "subc-chat.client", qos: .userInitiated)
 
     init() {
         try? FileManager.default.createDirectory(
-            atPath: projectRoot, withIntermediateDirectories: true)
+            atPath: sandboxRoot, withIntermediateDirectories: true)
         sessions = Self.loadSessions()
         if let first = sessions.first {
             activeId = first.id
@@ -139,7 +169,11 @@ final class ChatViewModel: ObservableObject {
         let parts = modelHandle.split(separator: "/", maxSplits: 1).map(String.init)
         let provider = parts.first ?? "anthropic"
         let modelId = parts.count > 1 ? parts[1] : modelHandle
-        let root = projectRoot
+        let root = sessions[idx].projectRoot ?? {
+            try? FileManager.default.createDirectory(
+                atPath: sandboxRoot, withIntermediateDirectories: true)
+            return sandboxRoot
+        }()
         let session = sessions[idx].id
         let priorCursor = sessions[idx].cursor
         sawEventThisTurn = false

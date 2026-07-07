@@ -503,6 +503,20 @@ where
         match (loop_result, writer_result) {
             (Err(loop_err), _) => Err(loop_err),
             (Ok(()), Ok(Ok(()))) => Ok(()),
+            // The read loop already saw the daemon go away; the writer failing
+            // to flush its remaining frames to that dead socket (BrokenPipe on
+            // Unix, ConnectionReset on Windows) is part of the same terminal,
+            // not a distinct fault.
+            (Ok(()), Ok(Err(FrameIoError::Io(err))))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                Ok(())
+            }
             (Ok(()), Ok(Err(writer_err))) => Err(SubcModuleError::FrameIo(writer_err)),
             (Ok(()), Err(join_err)) => Err(join_err),
         }
@@ -522,11 +536,25 @@ where
 {
     let dispatcher = RequestDispatcher::new();
     loop {
-        let Some(frame) = read_frame(&mut reader)
-            .await
-            .map_err(SubcModuleError::FrameIo)?
-        else {
-            return Ok(());
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            // Clean EOF: the daemon closed the connection.
+            Ok(None) => return Ok(()),
+            // A reset/abort on the read path also means the daemon is gone. On
+            // Unix a killed daemon closes the socket with FIN (clean EOF above),
+            // but Windows sends RST on process death, surfacing here as
+            // ConnectionReset. Both are the same "serve until the daemon goes
+            // away" terminal, so normalize to a clean exit for a
+            // platform-independent serve() contract.
+            Err(FrameIoError::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(SubcModuleError::FrameIo(err)),
         };
         if !handle_frame(
             frame,

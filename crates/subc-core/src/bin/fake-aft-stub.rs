@@ -600,6 +600,7 @@ async fn handle_control_request(
             target,
             identity,
             principal,
+            consumer_capabilities,
         } => {
             record_event(
                 config,
@@ -611,6 +612,7 @@ async fn handle_control_request(
                     "target": target,
                     "identity": identity,
                     "principal": principal,
+                    "consumer_capabilities": consumer_capabilities,
                 }),
             )?;
             if config.bind_never_reply {

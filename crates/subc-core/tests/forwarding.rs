@@ -2320,6 +2320,7 @@ async fn route_open_invalid_project_root_returns_error_without_provider_attach()
             session: "ses-invalid-project-root".to_string(),
         },
         consumer_identity: None,
+        consumer_capabilities: None,
     };
     write_frame(&mut client, &control_request_frame(481, request))
         .await
@@ -4296,6 +4297,7 @@ fn attach_request_with_consumer_identity(
             session: session.to_string(),
         },
         consumer_identity,
+        consumer_capabilities: None,
     }
 }
 

@@ -224,6 +224,8 @@ export interface RouteBindRequest {
   target: RouteTarget;
   identity: BindIdentity;
   principal?: Principal;
+  /** Consumer-declared reverse-request capabilities for this bind. This is a declaration, not a verified privilege; providers must treat an omitted field as no reverse-request capability. Known MCP method-family values today are "elicitation", "sampling", and "roots". */
+  consumer_capabilities?: string[];
 }
 
 export type BindDecision =
@@ -601,6 +603,7 @@ export class SubcProvider {
       target: request.target as RouteTarget,
       identity: request.identity as BindIdentity,
       principal: request.principal as Principal | undefined,
+      consumer_capabilities: request.consumer_capabilities as string[] | undefined,
     };
 
     const decision = await this.opts.onBind?.(bindRequest);

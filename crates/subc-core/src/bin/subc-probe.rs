@@ -293,6 +293,7 @@ async fn route_open(
             session: args.session.clone(),
         },
         consumer_identity: None,
+        consumer_capabilities: None,
     };
     let response = control_rpc(stream, serde_json::to_vec(&request)?).await?;
     match response.header.ty {

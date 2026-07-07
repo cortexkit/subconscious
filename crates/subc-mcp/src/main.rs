@@ -124,6 +124,20 @@ impl ReverseCapabilities {
         }
     }
 
+    fn declared_consumer_capabilities(self) -> Option<Vec<String>> {
+        let mut declared = Vec::new();
+        if self.elicitation {
+            declared.push("elicitation".to_string());
+        }
+        if self.sampling {
+            declared.push("sampling".to_string());
+        }
+        if self.roots {
+            declared.push("roots".to_string());
+        }
+        (!declared.is_empty()).then_some(declared)
+    }
+
     fn supports(self, capability: ReverseCapability) -> bool {
         match capability {
             ReverseCapability::Elicitation => self.elicitation,
@@ -170,6 +184,18 @@ impl RelaySession {
         });
         state.peer = Some(peer);
         state.capabilities = Some(capabilities);
+    }
+
+    fn consumer_capabilities(&self) -> Option<Vec<String>> {
+        let state = self.peer_state.read().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "subc-mcp module: warning: recovering from poisoned reverse-relay peer-state read lock"
+            );
+            poisoned.into_inner()
+        });
+        state
+            .capabilities
+            .and_then(ReverseCapabilities::declared_consumer_capabilities)
     }
 
     fn peer_for_capability(
@@ -1672,7 +1698,14 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
     let relay_session = Arc::new(RelaySession::new(identity.session.clone()));
     let mut routes = HashMap::new();
     for provider in &desired.providers {
-        match open_provider_route(subc, &provider.module_id, &identity).await {
+        match open_provider_route(
+            subc,
+            &provider.module_id,
+            &identity,
+            relay_session.consumer_capabilities(),
+        )
+        .await
+        {
             Ok(route_channel) => {
                 subc.relay()
                     .register_route(route_channel, Arc::clone(&relay_session))
@@ -1743,6 +1776,7 @@ async fn open_provider_route(
     subc: &SubcClient,
     module_id: &str,
     identity: &BindIdentity,
+    consumer_capabilities: Option<Vec<String>>,
 ) -> Result<u16> {
     let request = ClientControlRequest::RouteOpen {
         target: RouteTarget::ToolProvider {
@@ -1750,6 +1784,7 @@ async fn open_provider_route(
         },
         identity: identity.clone(),
         consumer_identity: consumer_identity_from_env(),
+        consumer_capabilities,
     };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr();
@@ -2675,17 +2710,23 @@ async fn reconcile_session_from_catalog(
             routes.insert(provider.module_id.clone(), *route_channel);
             continue;
         }
-        let route_channel =
-            match open_provider_route(subc, &provider.module_id, &state.identity).await {
-                Ok(route_channel) => route_channel,
-                Err(error) => {
-                    for route_channel in &opened_routes {
-                        subc.relay().drop_route(*route_channel).await;
-                    }
-                    let _ = send_route_goodbyes(subc, opened_routes).await;
-                    return Err(error);
+        let route_channel = match open_provider_route(
+            subc,
+            &provider.module_id,
+            &state.identity,
+            relay_session.consumer_capabilities(),
+        )
+        .await
+        {
+            Ok(route_channel) => route_channel,
+            Err(error) => {
+                for route_channel in &opened_routes {
+                    subc.relay().drop_route(*route_channel).await;
                 }
-            };
+                let _ = send_route_goodbyes(subc, opened_routes).await;
+                return Err(error);
+            }
+        };
         subc.relay()
             .register_route(route_channel, Arc::clone(relay_session))
             .await;
@@ -3876,6 +3917,68 @@ mod tests {
         parse_shim_args(vec![OsString::from("--harness"), OsString::from(harness)]).unwrap()
     }
 
+    async fn connected_tcp_stream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let (server, _) = server.unwrap();
+        (client.unwrap(), server)
+    }
+
+    async fn assert_open_provider_route_consumer_capabilities(
+        declared: Option<Vec<String>>,
+        expected: Option<Vec<String>>,
+    ) {
+        let (client_stream, mut server_stream) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(client_stream);
+        let identity = BindIdentity {
+            project_root: PathBuf::from("/tmp/subc-mcp-route-open"),
+            harness: DEFAULT_HARNESS.to_string(),
+            session: "shim-session".to_string(),
+        };
+        let expected_for_server = expected.clone();
+        let server = tokio::spawn(async move {
+            let frame = read_frame(&mut server_stream).await.unwrap().unwrap();
+            let request: ClientControlRequest = serde_json::from_slice(&frame.body).unwrap();
+            let ClientControlRequest::RouteOpen {
+                target,
+                consumer_capabilities,
+                ..
+            } = request
+            else {
+                panic!("unexpected control request: {request:?}");
+            };
+            assert_eq!(
+                target,
+                RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                }
+            );
+            assert_eq!(consumer_capabilities, expected_for_server);
+
+            let body =
+                serde_json::to_vec(&ClientControlResponse::RouteOpen { route_channel: 7 }).unwrap();
+            let response = build_frame(
+                FrameType::Response,
+                control_flags(),
+                0,
+                frame.header.corr,
+                body,
+            )
+            .unwrap();
+            write_frame(&mut server_stream, &response).await.unwrap();
+            server_stream.flush().await.unwrap();
+        });
+
+        let route_channel = open_provider_route(&subc, "aft", &identity, declared)
+            .await
+            .unwrap();
+        assert_eq!(route_channel, 7);
+        server.await.unwrap();
+    }
+
     #[test]
     fn shim_harness_bare_token_gets_mcp_prefix() {
         assert_eq!(shim_args("claude-code").harness, "mcp:claude-code");
@@ -4129,6 +4232,28 @@ mod tests {
             DEFAULT_HARNESS,
         );
         assert!(global_enabled.provider_enabled("magic-context"));
+    }
+
+    #[tokio::test]
+    async fn open_provider_route_stamps_declared_elicitation_capability() {
+        assert_open_provider_route_consumer_capabilities(
+            ReverseCapabilities {
+                elicitation: true,
+                ..ReverseCapabilities::default()
+            }
+            .declared_consumer_capabilities(),
+            Some(vec!["elicitation".to_string()]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn open_provider_route_omits_consumer_capabilities_when_none_are_declared() {
+        assert_open_provider_route_consumer_capabilities(
+            ReverseCapabilities::default().declared_consumer_capabilities(),
+            None,
+        )
+        .await;
     }
 
     #[tokio::test]

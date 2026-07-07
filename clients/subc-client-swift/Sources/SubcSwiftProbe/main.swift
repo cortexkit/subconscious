@@ -140,6 +140,29 @@ do {
             FileHandle.standardError.write(Data("[swift-probe] TOOLUSE FAILED: expected both a tool_call and a tool_result event\n".utf8))
             exit(1)
         }
+    } else if args.count >= 5, args[2] == "convotools" {
+        // Repro harness for the chat app's exact turn shape: SAME session across
+        // turns, cursor threaded, aft tools bound, fresh connection per turn.
+        let (provider, modelId) = splitModel(args.count >= 6 ? args[5] : "anthropic/claude-haiku-4-5")
+        let session = "swift-convotools-\(UUID().uuidString)"
+        var cursor: SubscribeCursor? = nil
+        for (i, prompt) in [args[3], args[4]].enumerated() {
+            print("--- TURN \(i + 1) (cursor=\(cursor.map { "\($0.walSeq):\($0.subIndex)" } ?? "start"))")
+            var finalLen = 0
+            let turnClient = try SubcClient.connect(connectionFilePath: args[1])
+            let tools = try turnClient.toolProviderTools(moduleId: "aft")
+            cursor = try turnClient.runSessionTurn(
+                moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
+                session: session, prompt: prompt, provider: provider, model: modelId,
+                tools: tools, fromCursor: cursor
+            ) { ev in
+                if ev.type == "text_delta" { return }
+                print("  [event] seq=\(ev.walSeq):\(ev.subIndex) \(ev.type)")
+                if ev.type == "assistant_message", let t = ev.text { finalLen = t.count }
+            }
+            turnClient.close()
+            print("[turn \(i + 1)] DONE finalLen=\(finalLen) cursor=\(cursor.map { "\($0.walSeq):\($0.subIndex)" } ?? "nil")")
+        }
     } else if catalog.contains(where: { $0.moduleId == "ai-provider-quota" }) {
         let ch = try client.routeOpenManagementSurface(
             moduleId: "ai-provider-quota", projectRoot: projectRoot, harness: "swift-probe", session: "p1")

@@ -405,6 +405,11 @@ pub struct RouteBindRequest {
     pub target: RouteTarget,
     pub identity: BindIdentity,
     pub principal: Option<Principal>,
+    /// Consumer-declared reverse-request capabilities for this bind. This is a
+    /// declaration, not a verified privilege; providers treat an absent field as
+    /// no reverse-request capability. Known MCP method-family values today are
+    /// "elicitation", "sampling", and "roots".
+    pub consumer_capabilities: Option<Vec<String>>,
 }
 
 /// Decision returned by [`ModuleHandler::on_bind`].
@@ -753,12 +758,14 @@ where
             target,
             identity,
             principal,
+            consumer_capabilities,
         } => {
             let req = RouteBindRequest {
                 route_channel,
                 target,
                 identity,
                 principal,
+                consumer_capabilities,
             };
             let decision = handler.on_bind(&req).await;
             match decision.kind {

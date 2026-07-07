@@ -44,6 +44,21 @@ describe("SubcClient route.open consumer identity", () => {
       consumer_identity: { module_id: "subc-mcp", launch_nonce: "nonce-123" },
     });
   });
+
+  test("serializes consumer_capabilities in snake_case when provided", async () => {
+    delete process.env[SUBC_MODULE_ID_ENV];
+    delete process.env[SUBC_LAUNCH_NONCE_ENV];
+
+    const { client, captured } = routeOpenHarness();
+    await client.routeOpen(TARGET, IDENTITY, { consumerCapabilities: ["elicitation", "roots"] });
+
+    expect(captured()).toEqual({
+      op: "route.open",
+      target: TARGET,
+      identity: IDENTITY,
+      consumer_capabilities: ["elicitation", "roots"],
+    });
+  });
 });
 
 function routeOpenHarness(): { client: SubcClient; captured: () => unknown } {

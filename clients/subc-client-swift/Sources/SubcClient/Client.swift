@@ -83,13 +83,18 @@ public final class SubcClient {
         moduleId: String,
         projectRoot: String,
         harness: String,
-        session: String
+        session: String,
+        consumerCapabilities: [String]? = nil
     ) throws -> UInt16 {
-        let body = try JSONSerialization.data(withJSONObject: [
+        var payload: [String: Any] = [
             "op": "route.open",
             "target": ["kind": "management_surface", "module_id": moduleId],
             "identity": ["project_root": projectRoot, "harness": harness, "session": session],
-        ])
+        ]
+        if let consumerCapabilities = consumerCapabilities {
+            payload["consumer_capabilities"] = consumerCapabilities
+        }
+        let body = try JSONSerialization.data(withJSONObject: payload)
         let reply = try request(channel: 0, body: body)
         guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
               let ch = obj["route_channel"] as? Int else {

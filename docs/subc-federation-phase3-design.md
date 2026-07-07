@@ -232,17 +232,32 @@ dial timer starts only after `connect_accept` arrives; the initiator's
 
 ### 5.4 Dial policy — deterministic single initiator [C#2]
 
-**NEW rule (phase 2 has no tie-break; its topology was asymmetric by
-reachability):** for any two devices that can see each other — same-account,
-discovered, **verified or not** — the device with the **lexicographically
-lower pubkey is the sole dial initiator**; the other side never originates
-`connect_request`. The §5.6 pairing window authorizes a device to RECEIVE and
-respond to unverified offers; it never overrides initiator selection (if the
-windowed device is the lower pubkey, it initiates as usual; the window only
-gates its willingness to answer). On `connect_offer/accept` the initiator
-tries candidates in order **lan → public → relay** with a short per-candidate
-timeout (~2s, post-accept only), Noise-handshake failure short-circuiting to
-the next candidate immediately.
+**Rule (refined during the E drill — reachability-aware):** dialing is
+permitted by REACHABILITY, arbitrated by pubkey. Either side may dial a
+peer's **public or LAN** candidate it has discovered (subject to the hygiene
+rules below); the **lexicographically lower pubkey** device is the PREFERRED
+initiator and the only side that initiates **relay** establishment (§7.1
+pipes are paid resources; exactly one side may open them). Determinism is
+enforced where it actually matters — at completion, not at dial time: the
+single-session-per-peer arbitration below deterministically resolves any
+double-completion, so simultaneous dials are safe by construction.
+
+Rationale: the original sole-initiator form was reachability-blind. With a
+NAT'd lower-pubkey device and a public higher-pubkey device, the only
+physically available direct path (NAT'd side dials the public side) was
+forbidden by pubkey order, deadlocking direct connection pre-relay and
+pushing ~half of NAT+public pairs onto the relay for no physical reason.
+The safety property C#2 actually needs is no-eviction-on-double-win, and
+that is owned by the handshake-time arbitration, not by dial-time
+self-restraint.
+
+The §5.6 pairing window authorizes a device to RECEIVE and respond to
+unverified offers; it never widens dial permission (a windowed device dials
+only per the reachability rule above; the window only gates its willingness
+to answer). On `connect_offer/accept` the dialer tries candidates in order
+**lan → public** (relay only for the lower-pubkey side) with a short
+per-candidate timeout (~2s, post-accept only), Noise-handshake failure
+short-circuiting to the next candidate immediately.
 
 **Single-session-per-peer invariant:** after a Noise handshake completes,
 the sides exchange an authenticated `connection_attempt_id`; a second

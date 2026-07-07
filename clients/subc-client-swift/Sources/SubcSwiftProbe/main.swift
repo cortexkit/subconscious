@@ -37,7 +37,7 @@ do {
         var finalText = ""
         var deltaCount = 0
         _ = try client.runSessionTurn(
-            moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
+            moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
             session: "swift-chat-\(UUID().uuidString)",
             prompt: args[3], provider: provider, model: modelId
         ) { ev in
@@ -66,7 +66,7 @@ do {
             // SAME session id + the threaded cursor carry the durable lineage.
             let turnClient = try SubcClient.connect(connectionFilePath: args[1])
             cursor = try turnClient.runSessionTurn(
-                moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
+                moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
                 session: session, prompt: prompt, provider: provider, model: modelId,
                 fromCursor: cursor
             ) { ev in
@@ -90,7 +90,7 @@ do {
             do {
                 let turnClient = try SubcClient.connect(connectionFilePath: args[1])
                 cursor = try turnClient.runSessionTurn(
-                    moduleId: "llm-runner", projectRoot: projectRoot, harness: "swift-probe",
+                    moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
                     session: session, prompt: args[3], provider: provider, model: modelId,
                     fromCursor: cursor
                 ) { ev in
@@ -102,6 +102,43 @@ do {
             } catch {
                 print("[turn \(i + 1)] ERROR model=\(model): \(error)")
             }
+        }
+    } else if args.count >= 4, args[2] == "tooluse" {
+        // Tool-calling proof through the Swift client: fetch aft's tool defs from
+        // the catalog, hand them to the turn, and print the tool_call/tool_result
+        // events the run emits.
+        let (provider, modelId) = splitModel(args.count >= 5 ? args[4] : "anthropic/claude-haiku-4-5")
+        let tools = try client.toolProviderTools(moduleId: "aft")
+        print("[swift-probe] aft tools from catalog: \(tools.count)")
+        var finalText = ""
+        var sawToolCall = false
+        var sawToolResult = false
+        _ = try client.runSessionTurn(
+            moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
+            session: "swift-tooluse-\(UUID().uuidString)",
+            prompt: args[3], provider: provider, model: modelId, tools: tools
+        ) { ev in
+            switch ev.type {
+            case "tool_call":
+                sawToolCall = true
+                print("  [tool_call] \(ev.text ?? "?")")
+            case "tool_result":
+                sawToolResult = true
+                print("  [tool_result] \((ev.text ?? "").prefix(120))")
+            case "assistant_message":
+                if let t = ev.text { finalText = t }
+            case "error":
+                print("    ERROR class=\(ev.errorClass ?? "?") msg=\(ev.text ?? "")")
+            case "text_delta":
+                break
+            default:
+                print("  [event] \(ev.type)")
+            }
+        }
+        print("[swift-probe] tool_call=\(sawToolCall) tool_result=\(sawToolResult) FINAL: \(finalText)")
+        if !sawToolCall || !sawToolResult {
+            FileHandle.standardError.write(Data("[swift-probe] TOOLUSE FAILED: expected both a tool_call and a tool_result event\n".utf8))
+            exit(1)
         }
     } else if catalog.contains(where: { $0.moduleId == "ai-provider-quota" }) {
         let ch = try client.routeOpenManagementSurface(

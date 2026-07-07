@@ -36,8 +36,8 @@ live profile reload, signaling-DO sharding.
 
 Phase 3 introduces mechanisms phase 2 does not have. These are NEW and
 specified as such (the v1 draft wrongly presented three of them as inherited):
-the dial-initiator rule (§6.2), transport-reconnect semantics over a relay
-(§7.2-§7.3), and multi-carrier session management (§6.2). [C#2][C#3][C#4]
+the dial-initiator rule and multi-carrier session management (§5.4), and
+transport-reconnect semantics over a relay (§7.2-§7.3). [C#2][C#3][C#4]
 
 ## 3. Architecture overview
 
@@ -60,7 +60,12 @@ the dial-initiator rule (§6.2), transport-reconnect semantics over a relay
 Cloud pieces, all small, split by ownership:
 
 1. **Account service** (CKCRED-owned) — the human-identity root: login flows
-   (GitHub, Google, Apple, email magic link), our `account_id`s, our JWTs.
+   (GitHub, Google, Apple, email magic link), our `account_id`s, our JWTs +
+   JWKS. Ownership boundary: CKCRED owns everything up to "a valid CortexKit
+   JWT names this account_id"; everything device-shaped — `/v1/device/enroll`,
+   device tokens, the device registry, the account signing key, deltas and
+   tombstones — is FED's rendezvous, which verifies the CKCRED JWT via JWKS
+   and owns the rest.
 2. **Rendezvous** (FED-owned) — per-account device registry + signaling
    (Worker + one Durable Object per account).
 3. **Relay** (FED-owned) — dumb ciphertext forwarder for the double-NAT case.
@@ -80,7 +85,7 @@ identity path. All four methods ship day 1:
 |---|---|---|
 | GitHub | native OAuth device flow (RFC 8628) | zero scopes; identity only |
 | Google | native device flow | identity/email scopes only |
-| Apple | web OIDC + hosted callback page displaying a paste-code | Apple has NO device flow; our Worker hosts the redirect target; fully native later in the CK app |
+| Apple | web OIDC + hosted callback page displaying a paste-code | Apple has NO device flow; our Worker hosts the redirect target; fully native later in the CK app. Safety constraints on the hosted page: it displays a one-time short-TTL paste code bound to the initiating CLI's nonce — never a provider token or CK JWT in the URL, page, or logs; the redirect target is the fixed first-party domain (no open redirect); the page shows the logging-in account identity as anti-phishing copy |
 | Email magic link / code | Cloudflare Email Service + code storage in the account DO + rate limits | |
 
 - **This is CortexKit's account primitive**, not a fed-only login: one
@@ -117,9 +122,11 @@ identity path. All four methods ship day 1:
    nothing. Custody: 0600 next to the device key; vault integration is a
    fast-follow, not a v1 gate. [C-Q1][#10]
 6. On revoke/rotate: the old token is atomically invalidated, all of that
-   device's live control-WS sessions are closed immediately, and unconsumed
-   relay grants derived from it are invalidated (no two-valid-token window).
-   [#10]
+   device's live control-WS sessions AND live relay pipes are closed
+   immediately, and unconsumed relay grants derived from it are invalidated
+   (no two-valid-token window). The RelayDO validates token version not only
+   at WS upgrade but on an ongoing basis (per heartbeat interval), so a
+   revoked device cannot keep an already-open pipe alive. [#10]
 
 ### 4.2 What "same account" grants (locked)
 
@@ -188,7 +195,9 @@ verify-code would match (same key, possibly attacker-held).
   observed source IP + the device's configured listen port; a device-supplied
   `public` value is overwritten, never trusted. [#9]
 - Candidates carry server-issued `generation` / `observed_at` / `expires_at`;
-  a device's WS writes may only mutate its **own** row. [#15]
+  a device's WS writes may only mutate its **own** row, and candidate updates
+  are coalesced/rate-limited by the DO (a flapping device cannot churn its
+  peers' dial state faster than the coalescing window). [#15]
 - All security-relevant times (`last_seen_ms`, token/grant expiries, candidate
   freshness) are **server-authoritative** (Cloudflare wall-clock); devices
   never make TTL/trust decisions on local wall-clock. The fed-module's reaper
@@ -206,7 +215,10 @@ duplicate-rejected grant).
 - `hello {device_token, challenge_sig}` → `registry_snapshot` + tombstone/delta backlog
 - `registry_delta` (signed; device added/removed/online/candidates-changed)
 - `connect_request {to: pubkey, offer_nonce}` → relayed as signed
-  `connect_offer {from, candidates, offer_nonce, snapshot_hash}` → answered by
+  `connect_offer {from, candidates, offer_nonce, snapshot_hash}` (offers and
+  `device_added` join events share the tombstone backlog retention: offline
+  devices receive signed join events on next `hello`, retained ≥ 30 days) →
+  answered by
   `connect_accept {candidates, offer_nonce}`; accept candidates must be a
   subset of the answerer's current registry row (the DO stamps the snapshot
   hash). Stale/expired offers are ignored. [#15]
@@ -221,9 +233,13 @@ dial timer starts only after `connect_accept` arrives; the initiator's
 ### 5.4 Dial policy — deterministic single initiator [C#2]
 
 **NEW rule (phase 2 has no tie-break; its topology was asymmetric by
-reachability):** for any pair of paired devices, the device with the
-**lexicographically lower pubkey is the sole dial initiator**; the other side
-never originates `connect_request`. On `connect_offer/accept` the initiator
+reachability):** for any two devices that can see each other — same-account,
+discovered, **verified or not** — the device with the **lexicographically
+lower pubkey is the sole dial initiator**; the other side never originates
+`connect_request`. The §5.6 pairing window authorizes a device to RECEIVE and
+respond to unverified offers; it never overrides initiator selection (if the
+windowed device is the lower pubkey, it initiates as usual; the window only
+gates its willingness to answer). On `connect_offer/accept` the initiator
 tries candidates in order **lan → public → relay** with a short per-candidate
 timeout (~2s, post-accept only), Noise-handshake failure short-circuiting to
 the next candidate immediately.
@@ -361,8 +377,9 @@ through cloud outages (§5.5), and `[rendezvous]`-absent remains exact phase-2.
 
 - **3a-0** (CKCRED, parallel): account service skeleton — GitHub device flow
   first, our JWT + JWKS; Google/Apple/email follow within the phase. FED
-  consumes only the JWKS + `/v1/device/enroll` contract, so 3a-1 can start
-  against a `FakeVerifier` immediately.
+  consumes only the JWKS (JWT-in → account_id-out), so 3a-1 can start against
+  a `FakeVerifier` immediately. `/v1/device/enroll` and everything
+  device-shaped is FED's (§3 ownership boundary).
 - **3a-1** (FED): rendezvous Worker + AccountDO — enroll (PoP challenge,
   atomic uniqueness), signed registry/deltas/tombstones, signaling (seq,
   nonces, rate limits), server-stamped candidates. Miniflare/workerd tests,

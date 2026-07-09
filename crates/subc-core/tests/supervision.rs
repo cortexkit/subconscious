@@ -249,6 +249,44 @@ async fn restart_cap_marks_module_failed_without_infinite_loop() {
     assert!(!status.live);
 }
 
+/// A clean child exit of an ENABLED module must not kill the supervision task:
+/// the command channel has to stay open so a later operator restart can revive
+/// the module. Regression for a production wedge where a module that exited 0
+/// became permanently unrestartable ("supervisor command channel is closed")
+/// and only a full daemon restart recovered it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_exit_keeps_supervision_task_alive_for_operator_restart() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 2, Duration::from_millis(10));
+    let module_id = "fake-aft-clean-exit";
+    let module = supervisor
+        .spawn(stub_spec(
+            &server,
+            module_id,
+            [("FAKE_AFT_CLEAN_EXIT_AFTER_MS", "0")],
+        ))
+        .unwrap();
+
+    let stopped = wait_for_status(&module, Duration::from_secs(2), |status| {
+        status.state == ModuleState::Stopped && !status.process_alive
+    })
+    .await;
+    assert!(!stopped.live);
+
+    // The load-bearing assertion: the supervision task must still answer
+    // commands after the clean exit, and restart must fully revive the module.
+    module
+        .restart()
+        .await
+        .expect("restart after clean exit must reach a live supervision task");
+
+    let running = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+    assert!(running.process_alive);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_stops_child_and_releases_registration() {
     let server = TestServer::start().await;

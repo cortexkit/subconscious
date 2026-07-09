@@ -1599,6 +1599,14 @@ async fn supervise_loop(
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
                 wait_result = active_child.wait() => {
+                    // Every arm below that gives up on the CHILD must keep the
+                    // supervision task itself alive (child = None, loop
+                    // continues into command-serving mode). Returning here
+                    // closes the command channel, which makes the module
+                    // permanently unrestartable in-band: a clean child exit
+                    // of an enabled module once wedged the fleet this way
+                    // ('supervisor command channel is closed') and required a
+                    // full daemon restart to recover.
                     let exit_report = match wait_result {
                         Ok(status) => classify_exit(&status),
                         Err(err) => {
@@ -1610,7 +1618,8 @@ async fn supervise_loop(
                                 &snapshot,
                             );
                             error!(module_id = %spec.module_id, error = %err, "failed to wait for supervised module");
-                            return;
+                            child = None;
+                            continue;
                         }
                     };
 
@@ -1625,7 +1634,7 @@ async fn supervise_loop(
                             if registration_released {
                                 process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                             }
-                            return;
+                            child = None;
                         }
                         NextAction::Restart => {
                             sleep(runtime.restart_policy.backoff).await;
@@ -1636,7 +1645,8 @@ async fn supervise_loop(
                             ).await {
                                 fail_snapshot(&snapshot, Some(&spec.module_id), None);
                                 error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
-                                return;
+                                child = None;
+                                continue;
                             }
 
                             match spawn_and_mark_running(&spec, &runtime, &snapshot) {
@@ -1648,7 +1658,7 @@ async fn supervise_loop(
                                     fail_snapshot(&snapshot, Some(&spec.module_id), None);
                                     process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                                     error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
-                                    return;
+                                    child = None;
                                 }
                             }
                         }

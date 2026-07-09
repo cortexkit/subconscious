@@ -1,9 +1,52 @@
-# subc Continuous Health: Probing, Reporting, Self-Repair (v1)
+# subc Continuous Health: Probing, Reporting, Self-Repair (v1, amended)
 
 Layered health for the daemon and its modules. Mechanism lives in subc-core's
 Supervisor (the actor that already holds restart authority); judgment stays
 module-side (domain health) or user-side (alerts). No rule engine in the
 daemon.
+
+## 0. v2 doctrine amendment (2026-07-09, supersedes the §1 L2 honesty mechanism)
+
+Ruling after a production false-positive kill: under machine-wide CPU
+saturation, a busy-but-healthy module missed 3×5s probes on the dispatch
+path, the prober escalated to a health restart, and the respawn warm turned a
+15s load spike into a multi-minute route-unavailable outage.
+
+The generic split, for every module:
+
+- **subc detects total wreckage only.** The daemon's probe answers one
+  question: can this module reply at all? A module that cannot answer a
+  probe on its supervision lane is dead-or-wrecked and gets restarted. The
+  daemon never infers "dispatch is slow" from probe latency — that inference
+  is what converted load spikes into kill decisions.
+- **Modules own an internal health runner.** `health.check` is served from a
+  dedicated insulated lane/thread (the subc-mcp supervision-connection
+  pattern) so the reply is prompt even when the tokio workers are starved.
+  Honesty is structural, not transport-borne: the insulated reporter is a
+  MECHANICAL mapper over signals stamped by the real dispatch path — a
+  monotonic dispatch-loop heartbeat plus oldest-queued-request and
+  oldest-in-flight ages, read as atomics. It never forms its own opinion. A
+  wedged dispatch stops stamping; the stale stamp makes the prompt reply say
+  `unresponsive: dispatch heartbeat Ns stale`. The v1 requirement that the
+  probe reply itself ride the per-request spawn path is RETIRED (it was the
+  false-dead vector); the non-vacuity property it protected is preserved by
+  the stamped-signal contract instead: a wedged data path MUST surface as a
+  stale heartbeat in the report.
+- **Restart policy keys on the split**: lane death / process exit / probe
+  transport timeout → restart fast (total wreckage). Reported-unresponsive
+  (stale heartbeat) → restart per existing threshold (the module itself
+  attests its dispatch is wedged). Reported-degraded (slow but moving) →
+  report/alert only, never kill.
+- **`module_warming`**: post-respawn route-unavailability is a typed,
+  retryable state distinct from `reloading`, so clients distinguish
+  retry-soon from stuck. Modules shrink the window with lazy root/domain
+  warm-on-bind rather than upfront warm.
+
+Adoption is incremental: modules move to the insulated-lane + stamped-signal
+shape as they touch health code (AFT first; its dispatch-liveness gauges
+already carry the queue/in-flight ages). Until a module adopts, the v1
+dispatch-path probe semantics below remain its contract, with the §5 ladder
+softened by the restart-policy split above.
 
 ## 1. The layers
 

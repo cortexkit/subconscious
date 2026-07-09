@@ -364,12 +364,11 @@ fn print_module_table(modules: &[Value]) {
                 display_field(module, "state"),
                 display_field(module, "enabled"),
                 display_field(module, "live"),
-                display_first_field(module, &["pid", "process_pid"]),
-                display_first_field(module, &["restarts", "restart_count"]),
+                display_field(module, "health"),
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["id", "state", "enabled", "live", "pid", "restarts"], rows);
+    print_table(&["id", "state", "enabled", "live", "health"], rows);
 }
 
 fn print_status_table(module: &Value, health: Option<&Value>) {
@@ -397,8 +396,6 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             "state",
             "enabled",
             "live",
-            "pid",
-            "restarts",
             "health",
             "failures",
             "last_action",
@@ -410,13 +407,11 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             display_field(module, "state"),
             display_field(module, "enabled"),
             display_field(module, "live"),
-            display_first_field(module, &["pid", "process_pid"]),
-            display_first_field(module, &["restarts", "restart_count"]),
             health_status,
             failures,
             last_action,
             detail,
-            metrics,
+            truncate_cell(&metrics),
         ]],
     );
 }
@@ -430,11 +425,11 @@ fn print_health_table(modules: &[Value]) {
                 display_field(module, "status"),
                 display_field(module, "consecutive_failures"),
                 display_field(module, "last_action"),
-                display_field(module, "last_action_ms"),
                 display_field(module, "detail"),
                 module
                     .get("metrics")
                     .map(display_json_value)
+                    .map(|metrics| truncate_cell(&metrics))
                     .unwrap_or_else(|| "-".to_string()),
             ]
         })
@@ -445,12 +440,22 @@ fn print_health_table(modules: &[Value]) {
             "status",
             "failures",
             "last_action",
-            "last_action_ms",
             "detail",
             "metrics",
         ],
         rows,
     );
+}
+
+/// Cap a table cell so one module's large opaque metrics blob cannot make the
+/// whole table unreadable; `--json` is the full-fidelity view.
+fn truncate_cell(cell: &str) -> String {
+    const MAX: usize = 120;
+    if cell.chars().count() <= MAX {
+        return cell.to_string();
+    }
+    let head: String = cell.chars().take(MAX).collect();
+    format!("{head}… (--json for full)")
 }
 
 fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
@@ -504,12 +509,6 @@ fn find_module<'a>(value: &'a Value, module_id: &str) -> Option<&'a Value> {
             .and_then(Value::as_str)
             .is_some_and(|id| id == module_id)
     })
-}
-
-fn display_first_field(value: &Value, keys: &[&str]) -> String {
-    keys.iter()
-        .find_map(|key| value.get(*key).map(display_json_value))
-        .unwrap_or_else(|| "-".to_string())
 }
 
 fn display_field(value: &Value, key: &str) -> String {

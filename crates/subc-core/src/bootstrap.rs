@@ -212,7 +212,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
 /// user agent does not pass login-shell ulimits through, so the raise must
 /// happen in-process.
 #[cfg(unix)]
-const NOFILE_TARGET: u64 = 8192;
+const NOFILE_TARGET: u64 = 65536;
 
 /// Raise RLIMIT_NOFILE to `NOFILE_TARGET` (clamped to the hard limit).
 /// Best-effort: failure is logged and never fatal, since the daemon can run

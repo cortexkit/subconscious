@@ -432,6 +432,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlimit"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f35ee2729c56bb610f6dba436bf78135f728b7373bdffae2ec815b2d3eb98cc3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rmcp"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -639,6 +648,7 @@ dependencies = [
  "cortexkit-paths",
  "fs4",
  "getrandom",
+ "rlimit",
  "serde",
  "serde_json",
  "subc-control",

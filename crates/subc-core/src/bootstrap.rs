@@ -205,6 +205,74 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     }
 }
 
+/// Target soft limit for open file descriptors, applied to the daemon before any
+/// module is spawned so children inherit it. Multi-root modules (one process
+/// aggregating every project root's sqlite stores, index caches, watchers, and
+/// LSP pipes) trivially exceed the macOS default soft limit of 256; a launchd
+/// user agent does not pass login-shell ulimits through, so the raise must
+/// happen in-process.
+#[cfg(unix)]
+const NOFILE_TARGET: u64 = 8192;
+
+/// Raise RLIMIT_NOFILE to `NOFILE_TARGET` (clamped to the hard limit).
+/// Best-effort: failure is logged and never fatal, since the daemon can run
+/// under the inherited limit — modules with few roots just have less headroom.
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    match rlimit::Resource::NOFILE.get() {
+        Ok((soft, hard)) => {
+            if soft >= NOFILE_TARGET {
+                return;
+            }
+            let target = NOFILE_TARGET.min(hard);
+            match rlimit::Resource::NOFILE.set(target, hard) {
+                Ok(()) => info!(
+                    previous_soft = soft,
+                    new_soft = target,
+                    hard,
+                    "raised open-file soft limit for daemon and module children"
+                ),
+                Err(err) => warn!(
+                    soft,
+                    hard,
+                    error = %err,
+                    "could not raise open-file soft limit; multi-root modules may exhaust descriptors"
+                ),
+            }
+        }
+        Err(err) => warn!(error = %err, "could not read open-file limit"),
+    }
+}
+
+/// CRT stdio-stream target on Windows (the `_setmaxstdio` maximum). Win32
+/// HANDLEs — what Rust `File`, tokio sockets, and SQLite's Win32 VFS actually
+/// consume — have a per-process quota in the millions and need no raise; the
+/// C-runtime stream table (default 512) is the only low ceiling, and it is
+/// per-process rather than inherited, so supervised modules linking the CRT
+/// must raise their own. Raising it here covers the daemon itself.
+#[cfg(windows)]
+fn raise_nofile_limit() {
+    const MAXSTDIO_TARGET: u32 = 8192;
+    let current = rlimit::getmaxstdio();
+    if current >= MAXSTDIO_TARGET {
+        return;
+    }
+    match rlimit::setmaxstdio(MAXSTDIO_TARGET) {
+        Ok(new_max) => info!(
+            previous = current,
+            new_max, "raised CRT stdio-stream limit for daemon"
+        ),
+        Err(err) => warn!(
+            current,
+            error = %err,
+            "could not raise CRT stdio-stream limit"
+        ),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn raise_nofile_limit() {}
+
 pub async fn run_with_daemon_config_path(
     config: BootstrapConfig,
     daemon_config_path: impl AsRef<Path>,
@@ -218,6 +286,8 @@ async fn serve_bound_daemon(
     storage_config: Option<daemon_config::StorageConfig>,
     watchdog_config: DaemonSelfWatchdogConfig,
 ) -> Result<(), BootstrapError> {
+    raise_nofile_limit();
+
     info!(
         connection_file = %bound.connection_file_path.display(),
         endpoints = ?bound.connection_info.endpoints,

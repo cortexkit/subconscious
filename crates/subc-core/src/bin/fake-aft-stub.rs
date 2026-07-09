@@ -39,6 +39,9 @@ use tokio::{
 
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
+/// Exit 0 after the delay: exercises the supervisor's clean-exit arm, which
+/// must keep the supervision command channel alive for later operator restarts.
+const FAKE_AFT_CLEAN_EXIT_AFTER_MS_ENV: &str = "FAKE_AFT_CLEAN_EXIT_AFTER_MS";
 const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
 const FAKE_AFT_BIND_NEVER_REPLY_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY";
 const FAKE_AFT_MALFORMED_BIND_REPLY_ENV: &str = "FAKE_AFT_MALFORMED_BIND_REPLY";
@@ -156,13 +159,17 @@ where
     send_hello(&writer, &config).await?;
     expect_hello_ack(read_half).await?;
 
-    if let Some(crash_after) = config.crash_after {
-        let crash = sleep(crash_after);
-        tokio::pin!(crash);
+    if let Some((exit_after, exit_code)) = config
+        .crash_after
+        .map(|after| (after, 2))
+        .or_else(|| config.clean_exit_after.map(|after| (after, 0)))
+    {
+        let exit_timer = sleep(exit_after);
+        tokio::pin!(exit_timer);
         loop {
             tokio::select! {
-                _ = &mut crash => {
-                    std::process::exit(2);
+                _ = &mut exit_timer => {
+                    std::process::exit(exit_code);
                 }
                 frame = read_frame(read_half) => {
                     if !handle_frame(frame?, &config, &mut state, &writer).await? {
@@ -1109,6 +1116,7 @@ struct StubConfig {
     connection_file_path: PathBuf,
     module_id: String,
     crash_after: Option<Duration>,
+    clean_exit_after: Option<Duration>,
     reject_attach: bool,
     bind_never_reply: bool,
     malformed_bind_reply: Option<MalformedBindReply>,
@@ -1167,6 +1175,14 @@ impl StubConfig {
                     .map_err(|source| StubError::InvalidCrashAfter { raw, source })
             })
             .transpose()?;
+        let clean_exit_after = env::var(FAKE_AFT_CLEAN_EXIT_AFTER_MS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .map(Duration::from_millis)
+                    .map_err(|source| StubError::InvalidCrashAfter { raw, source })
+            })
+            .transpose()?;
         let events_path = env::var_os(FAKE_AFT_EVENTS_PATH_ENV).map(PathBuf::from);
         let concurrency = concurrency_from_env()?;
         let role = role_from_env()?;
@@ -1204,6 +1220,7 @@ impl StubConfig {
             connection_file_path,
             module_id,
             crash_after,
+            clean_exit_after,
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
             bind_never_reply: env_flag(FAKE_AFT_BIND_NEVER_REPLY_ENV),
             malformed_bind_reply: malformed_bind_reply_from_env()?,

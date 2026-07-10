@@ -13,6 +13,7 @@
     "supervisor.list",
     "supervisor.restart",
     "supervisor.reload",
+    "supervisor.rescan",
     "supervisor.set_enabled",
     "supervisor.health_probe",
     "supervisor.health"

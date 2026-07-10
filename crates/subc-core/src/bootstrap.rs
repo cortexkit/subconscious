@@ -25,7 +25,7 @@ use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
     ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig,
-    ForwardingTable, ModuleSpec, Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
+    ForwardingTable, Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
 use std::sync::Arc;
@@ -54,6 +54,8 @@ pub struct BootstrapConfig {
     pub daemon_ver: String,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
+    daemon_config_path: Option<PathBuf>,
+    configured_port: Option<u16>,
     watchdog_config: DaemonSelfWatchdogConfig,
 }
 
@@ -65,6 +67,8 @@ impl BootstrapConfig {
             daemon_ver: DAEMON_VERSION.to_owned(),
             configured_modules: Vec::new(),
             storage_config: None,
+            daemon_config_path: None,
+            configured_port: None,
             watchdog_config: DaemonSelfWatchdogConfig::default(),
         }
     }
@@ -76,8 +80,9 @@ impl BootstrapConfig {
     pub fn from_env_with_daemon_config_path(
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
+        let daemon_config_path = daemon_config_path.as_ref().to_path_buf();
         let daemon_config =
-            daemon_config::load(daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+            daemon_config::load(&daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
         let config_port = daemon_config.as_ref().and_then(|config| config.port);
         let storage_config = daemon_config
             .as_ref()
@@ -106,15 +111,18 @@ impl BootstrapConfig {
 
         Ok(Self::new(connection_file_path(), port)
             .with_configured_modules(configured_modules)
-            .with_storage_config(storage_config))
+            .with_storage_config(storage_config)
+            .with_daemon_config_source(daemon_config_path, config_port))
     }
 
     pub fn with_daemon_config_path(
         self,
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
+        let daemon_config_path = daemon_config_path.as_ref().to_path_buf();
         let daemon_config =
-            daemon_config::load(daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+            daemon_config::load(&daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+        let configured_port = daemon_config.as_ref().and_then(|config| config.port);
         let storage_config = daemon_config
             .as_ref()
             .and_then(|config| config.storage.clone());
@@ -123,7 +131,8 @@ impl BootstrapConfig {
             .unwrap_or_default();
         Ok(self
             .with_configured_modules(configured_modules)
-            .with_storage_config(storage_config))
+            .with_storage_config(storage_config)
+            .with_daemon_config_source(daemon_config_path, configured_port))
     }
 
     pub fn with_configured_modules(
@@ -141,6 +150,16 @@ impl BootstrapConfig {
         storage_config: Option<daemon_config::StorageConfig>,
     ) -> Self {
         self.storage_config = storage_config;
+        self
+    }
+
+    fn with_daemon_config_source(
+        mut self,
+        daemon_config_path: PathBuf,
+        configured_port: Option<u16>,
+    ) -> Self {
+        self.daemon_config_path = Some(daemon_config_path);
+        self.configured_port = configured_port;
         self
     }
 
@@ -193,6 +212,8 @@ pub async fn run() -> Result<(), BootstrapError> {
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
     let configured_modules = config.configured_modules.clone();
     let storage_config = config.storage_config.clone();
+    let daemon_config_path = config.daemon_config_path.clone();
+    let configured_port = config.configured_port;
     let watchdog_config = config.watchdog_config.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
@@ -200,7 +221,15 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
             Ok(())
         }
         Outcome::Bound(bound) => {
-            serve_bound_daemon(bound, configured_modules, storage_config, watchdog_config).await
+            serve_bound_daemon(
+                bound,
+                configured_modules,
+                storage_config,
+                daemon_config_path,
+                configured_port,
+                watchdog_config,
+            )
+            .await
         }
     }
 }
@@ -284,6 +313,8 @@ async fn serve_bound_daemon(
     bound: BoundDaemon,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
+    daemon_config_path: Option<PathBuf>,
+    configured_port: Option<u16>,
     watchdog_config: DaemonSelfWatchdogConfig,
 ) -> Result<(), BootstrapError> {
     raise_nofile_limit();
@@ -299,29 +330,27 @@ async fn serve_bound_daemon(
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
     let connected_clients = ConnectedClients::new();
-    let control = Arc::new(
-        ControlHandler::with_forwarding(
-            Arc::clone(&registry),
-            Arc::new(ForwardingTable::default()),
-        )
+    let forwarding = Arc::new(ForwardingTable::default());
+    let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
         .with_process_liveness(process_liveness.clone())
-        .with_supervisor(supervisor_handle.clone())
+        .with_forwarding(Arc::clone(&forwarding))
+        .with_handle(supervisor_handle.clone())
+        .with_connection_file_path(bound.connection_file_path.clone());
+    let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
+        .with_process_liveness(process_liveness)
+        .with_supervisor(supervisor_handle)
         .with_connected_clients(connected_clients.clone())
-        .with_storage_config(storage_config),
-    );
-    let forwarding = control.forwarding();
-    let router = Arc::new(Router::with_control_handler(control));
+        .with_storage_config(storage_config);
+    if let Some(config_path) = daemon_config_path {
+        control = control.with_supervisor_rescan(supervisor.clone(), config_path, configured_port);
+    }
+    let router = Arc::new(Router::with_control_handler(Arc::new(control)));
     let auth = ServerAuth::new(
         bound.connection_info.key.clone(),
         bound.connection_info.daemon_id,
         bound.connection_info.daemon_ver.clone(),
     )
     .with_connected_clients(connected_clients);
-    let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
-        .with_process_liveness(process_liveness)
-        .with_forwarding(forwarding)
-        .with_handle(supervisor_handle)
-        .with_connection_file_path(bound.connection_file_path.clone());
 
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
@@ -339,15 +368,8 @@ async fn serve_bound_daemon(
         let enabled = configured.enabled;
         let health = configured.health;
         let module_id = configured.module_id.clone();
-        let spec = ModuleSpec {
-            module_id: configured.module_id,
-            program: configured.program,
-            args: configured.args,
-            env: configured.env,
-            reserved: configured.reserved,
-            reserved_prefixes: configured.reserved_prefixes,
-        };
-        match supervisor.supervise_configured_with_health(spec, enabled, health) {
+        match supervisor.supervise_configured_with_health(configured.module_spec(), enabled, health)
+        {
             Ok(_) => {
                 info!(module_id = %module_id, enabled, "configured module supervised");
             }

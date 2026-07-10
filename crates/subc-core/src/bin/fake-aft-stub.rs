@@ -851,16 +851,24 @@ fn tool_call_response_body(
     tool_call: &ToolCallRouteRequest,
 ) -> Result<Vec<u8>, StubError> {
     let is_error = config.toolcall_error;
-    let text = config.toolcall_result.clone().unwrap_or_else(|| {
-        if is_error {
-            format!("fake-aft tool error: {}", tool_call.name)
-        } else {
-            format!(
-                "fake-aft tool {} called with {}",
-                tool_call.name, tool_call.arguments
-            )
-        }
-    });
+    // Expose process facts only from this test stub so real-daemon tests can prove
+    // dynamic supervision behavior without adding test fields to production APIs.
+    let text = if tool_call.name == "_test.launch_nonce" {
+        config.launch_nonce.clone().unwrap_or_default()
+    } else if tool_call.name == "_test.pid" {
+        std::process::id().to_string()
+    } else {
+        config.toolcall_result.clone().unwrap_or_else(|| {
+            if is_error {
+                format!("fake-aft tool error: {}", tool_call.name)
+            } else {
+                format!(
+                    "fake-aft tool {} called with {}",
+                    tool_call.name, tool_call.arguments
+                )
+            }
+        })
+    };
     serde_json::to_vec(&json!({
         "content": [
             {
@@ -1175,8 +1183,8 @@ struct StubConfig {
     health_status: HealthStatus,
     health_detail: Option<String>,
     health_metrics: Option<Value>,
-    /// The launch nonce subc injected (reserved modules only); echoed in HELLO. A
-    /// real supervised module reads this from the SUBC_LAUNCH_NONCE env var.
+    /// The launch nonce subc injected for spawn attestation and reserved HELLOs.
+    /// A real supervised module reads this from the SUBC_LAUNCH_NONCE env var.
     launch_nonce: Option<String>,
 }
 

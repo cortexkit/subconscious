@@ -36,7 +36,7 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 const QUOTA_MODULE_ID: &str = "ai-provider-quota";
 const CK_HARNESS: &str = "ck";
-const USAGE: &str = "usage: ck [--subc <connection-file>] [--json] <command>\n\ncommands:\n  ck module list\n  ck module status <id>\n  ck module restart <id>\n  ck module stop <id>\n  ck module start <id>\n  ck health\n  ck daemon\n  ck quota [<provider-id>]";
+const USAGE: &str = "usage: ck [--subc <connection-file>] [--json] <command>\n\ncommands:\n  ck module list\n  ck module status <id>\n  ck module restart <id>\n  ck module rescan\n  ck module stop <id>\n  ck module start <id>\n  ck health\n  ck daemon\n  ck quota [<provider-id>]";
 
 #[tokio::main]
 async fn main() {
@@ -62,6 +62,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Module(ModuleCommand::Restart { module_id }) => {
             module_restart(&mut client, &module_id, args.json).await
         }
+        Command::Module(ModuleCommand::Rescan) => module_rescan(&mut client, args.json).await,
         Command::Module(ModuleCommand::Stop { module_id }) => {
             module_set_enabled(&mut client, &module_id, false, args.json).await
         }
@@ -93,6 +94,7 @@ enum ModuleCommand {
     List,
     Status { module_id: String },
     Restart { module_id: String },
+    Rescan,
     Stop { module_id: String },
     Start { module_id: String },
 }
@@ -332,6 +334,18 @@ async fn module_restart(
         })
         .await?;
     print_ack_with_state(client, module_id, ack, "restart", json_output).await
+}
+
+async fn module_rescan(client: &mut CkClient, json_output: bool) -> Result<(), CkError> {
+    let result = client
+        .rpc_value(ClientControlRequest::SupervisorRescan {})
+        .await?;
+    if json_output {
+        print_json(&result)?;
+    } else {
+        print_rescan_table(&result);
+    }
+    Ok(())
 }
 
 async fn module_set_enabled(
@@ -764,7 +778,8 @@ fn parse_rfc3339_to_utc_secs(raw: &str) -> Option<u64> {
     let rest = rest.trim_start();
     let offset_secs = if rest.is_empty() || rest.starts_with('Z') || rest.starts_with('z') {
         0
-    } else if let Some(sign) = rest.chars().next().filter(|c| *c == '+' || *c == '-') {
+    } else {
+        let sign = rest.chars().next().filter(|c| *c == '+' || *c == '-')?;
         let tail = &rest[1..];
         let (oh, om) = parse_hh_mm_offset(tail)?;
         let mag = (oh as i64) * 3600 + (om as i64) * 60;
@@ -773,8 +788,6 @@ fn parse_rfc3339_to_utc_secs(raw: &str) -> Option<u64> {
         } else {
             mag
         }
-    } else {
-        return None;
     };
 
     let days = civil_to_days(year, month, day)?;
@@ -883,6 +896,39 @@ fn print_module_table(modules: &[Value]) {
         })
         .collect::<Vec<_>>();
     print_table(&["id", "state", "enabled", "live", "health"], rows);
+}
+
+fn print_rescan_table(result: &Value) {
+    let module_ids = |field: &str| {
+        result
+            .get(field)
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|ids| !ids.is_empty())
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let rows = vec![
+        vec!["added".to_string(), module_ids("added")],
+        vec!["removed".to_string(), module_ids("removed")],
+        vec![
+            "changed-pending-reload".to_string(),
+            module_ids("changed_pending_reload"),
+        ],
+        vec![
+            "unchanged".to_string(),
+            result
+                .get("unchanged")
+                .and_then(Value::as_u64)
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ],
+    ];
+    print_table(&["change", "modules / count"], rows);
 }
 
 fn print_status_table(module: &Value, health: Option<&Value>) {
@@ -1114,6 +1160,9 @@ fn parse_command(positionals: &[String]) -> Result<Command, CkError> {
             Ok(Command::Module(ModuleCommand::Restart {
                 module_id: module_id.clone(),
             }))
+        }
+        [domain, verb] if domain == "module" && verb == "rescan" => {
+            Ok(Command::Module(ModuleCommand::Rescan))
         }
         [domain, verb, module_id] if domain == "module" && verb == "stop" => {
             Ok(Command::Module(ModuleCommand::Stop {

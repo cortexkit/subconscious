@@ -34,6 +34,7 @@ pub mod ops {
     pub const SUPERVISOR_LIST: &str = "supervisor.list";
     pub const SUPERVISOR_RESTART: &str = "supervisor.restart";
     pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
+    pub const SUPERVISOR_RESCAN: &str = "supervisor.rescan";
     pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
     pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
     pub const SUPERVISOR_HEALTH: &str = "supervisor.health";
@@ -74,6 +75,8 @@ pub enum ClientControlRequest {
     SupervisorRestart { module_id: String },
     #[serde(rename = "supervisor.reload")]
     SupervisorReload { module_id: String },
+    #[serde(rename = "supervisor.rescan")]
+    SupervisorRescan {},
     #[serde(rename = "supervisor.set_enabled")]
     SupervisorSetEnabled { module_id: String, enabled: bool },
     #[serde(rename = "supervisor.health_probe")]
@@ -113,6 +116,11 @@ pub enum ClientControlResponse {
     },
     #[serde(rename = "supervisor.ack")]
     SupervisorAck { module_id: String, applied: bool },
+    #[serde(rename = "supervisor.rescan")]
+    SupervisorRescan {
+        #[serde(flatten)]
+        result: SupervisorRescanResult,
+    },
     #[serde(rename = "supervisor.health_probe")]
     SupervisorHealthProbe {
         module_id: String,
@@ -141,6 +149,14 @@ pub struct CatalogEntry {
     pub module_id: String,
     pub roles: Vec<ProviderRole>,
     pub control_ops: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorRescanResult {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed_pending_reload: Vec<String>,
+    pub unchanged: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

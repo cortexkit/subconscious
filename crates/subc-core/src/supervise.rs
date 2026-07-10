@@ -16,7 +16,7 @@ use subc_protocol::{
 };
 use tokio::{
     process::{Child, Command},
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex},
     task::JoinHandle,
     time::{sleep, timeout, timeout_at, Instant},
 };
@@ -341,6 +341,12 @@ struct SupervisorRuntimeConfig {
     supervisor_handle: Option<SupervisorHandle>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupervisedConfiguration {
+    spec: ModuleSpec,
+    health: HealthConfig,
+}
+
 /// Shared daemon lookup table for supervised module handles.
 ///
 /// Shared by clone between the [`Supervisor`] (which spawns processes) and the
@@ -365,6 +371,10 @@ pub struct SupervisorHandle {
     /// accidental collisions and lower-trust processes from squatting protected
     /// namespaces.
     reserved_prefix_owners: Arc<Mutex<HashMap<String, String>>>,
+    /// Serializes module-set reconciliation with operator lifecycle commands. Without
+    /// this daemon-wide ordering, a rescan could retire or update a module while a
+    /// concurrent reload still held its old handle and launch specification.
+    operation_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +420,27 @@ impl SupervisorHandle {
         owners.retain(|_, owner| owner != owner_module_id);
         for prefix in prefixes {
             owners.insert(prefix.clone(), owner_module_id.to_string());
+        }
+    }
+
+    fn apply_identity_configuration(&self, spec: &ModuleSpec) {
+        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
+        let spawn_nonce = self
+            .spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&spec.module_id)
+            .cloned();
+        let mut reserved_nonces = self
+            .reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if spec.reserved {
+            if let Some(nonce) = spawn_nonce {
+                reserved_nonces.insert(spec.module_id.clone(), nonce);
+            }
+        } else {
+            reserved_nonces.remove(&spec.module_id);
         }
     }
 
@@ -527,6 +558,29 @@ impl SupervisorHandle {
         let mut modules = modules.values().cloned().collect::<Vec<_>>();
         modules.sort_by(|left, right| left.module_id().cmp(right.module_id()));
         modules
+    }
+
+    pub(crate) fn retire(&self, module_id: &str) -> Option<SupervisedModule> {
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(module_id);
+        self.reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(module_id);
+        self.reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, owner| owner != module_id);
+        self.modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(module_id)
+    }
+
+    pub(crate) fn operation_lock(&self) -> Arc<AsyncMutex<()>> {
+        Arc::clone(&self.operation_lock)
     }
 }
 
@@ -722,6 +776,10 @@ impl Supervisor {
         snapshot: SharedSnapshot,
         child: Option<Child>,
     ) -> SupervisedModule {
+        let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
+            spec: spec.clone(),
+            health: runtime.health,
+        }));
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
@@ -736,15 +794,16 @@ impl Supervisor {
         let module_id = spec.module_id.clone();
         let module = SupervisedModule {
             inner: Arc::new(SupervisedModuleInner {
-                module_id: spec.module_id,
+                module_id: module_id.clone(),
                 registry: Arc::clone(&self.registry),
                 snapshot,
+                configuration,
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
             }),
         };
         if let Some(supervisor_handle) = &self.supervisor_handle {
-            supervisor_handle.set_reserved_prefixes(&module_id, &spec.reserved_prefixes);
+            supervisor_handle.apply_identity_configuration(&spec);
             supervisor_handle.insert(module.clone());
         }
         module
@@ -767,6 +826,7 @@ struct SupervisedModuleInner {
     module_id: String,
     registry: Arc<Registry>,
     snapshot: SharedSnapshot,
+    configuration: Arc<Mutex<SupervisedConfiguration>>,
     commands: mpsc::Sender<SupervisorCommand>,
     monitor: Mutex<Option<JoinHandle<()>>>,
 }
@@ -819,6 +879,30 @@ impl SupervisedModule {
     /// Drain the module and stop monitoring it.
     pub async fn drain(&self) -> Result<(), SuperviseError> {
         self.stop().await
+    }
+
+    pub(crate) async fn retire(&self) -> Result<(), SuperviseError> {
+        match self.state()? {
+            ModuleState::Stopped | ModuleState::Failed => return Ok(()),
+            ModuleState::Starting
+            | ModuleState::Running
+            | ModuleState::Unresponsive
+            | ModuleState::Restarting
+            | ModuleState::Draining
+            | ModuleState::Disabled => {}
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::Retire { reply: reply_tx })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?
     }
 
     pub async fn stop(&self) -> Result<(), SuperviseError> {
@@ -889,6 +973,55 @@ impl SupervisedModule {
             module_id: self.inner.module_id.clone(),
         })?
     }
+
+    pub(crate) fn configuration(&self) -> Result<(ModuleSpec, HealthConfig), SuperviseError> {
+        let configuration =
+            self.inner
+                .configuration
+                .lock()
+                .map_err(|_| SuperviseError::StatePoisoned {
+                    module_id: Some(self.inner.module_id.clone()),
+                })?;
+        Ok((configuration.spec.clone(), configuration.health))
+    }
+
+    pub(crate) async fn update_configuration(
+        &self,
+        spec: ModuleSpec,
+        health: HealthConfig,
+    ) -> Result<(), SuperviseError> {
+        if spec.module_id != self.inner.module_id {
+            return Err(SuperviseError::InvalidSpec {
+                reason: "a supervised module's module_id cannot be changed".to_string(),
+            });
+        }
+        validate_spec(&spec)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::UpdateConfiguration {
+                spec: spec.clone(),
+                health,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?;
+        let mut configuration =
+            self.inner
+                .configuration
+                .lock()
+                .map_err(|_| SuperviseError::StatePoisoned {
+                    module_id: Some(self.inner.module_id.clone()),
+                })?;
+        configuration.spec = spec;
+        configuration.health = health;
+        Ok(())
+    }
 }
 
 impl Drop for SupervisedModuleInner {
@@ -913,6 +1046,9 @@ enum SupervisorCommand {
     Drain {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
+    Retire {
+        reply: oneshot::Sender<Result<(), SuperviseError>>,
+    },
     Restart {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
@@ -922,6 +1058,11 @@ enum SupervisorCommand {
     SetEnabled {
         enabled: bool,
         reply: oneshot::Sender<Result<bool, SuperviseError>>,
+    },
+    UpdateConfiguration {
+        spec: ModuleSpec,
+        health: HealthConfig,
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -1053,7 +1194,7 @@ impl Error for SuperviseError {
     }
 }
 
-fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
+pub(crate) fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
     if spec.module_id.trim().is_empty() {
         return Err(SuperviseError::InvalidSpec {
             reason: "module_id must not be empty".to_string(),
@@ -1582,8 +1723,8 @@ fn unix_ms_now() -> u64 {
 }
 
 async fn supervise_loop(
-    spec: ModuleSpec,
-    runtime: SupervisorRuntimeConfig,
+    mut spec: ModuleSpec,
+    mut runtime: SupervisorRuntimeConfig,
     registry: Arc<Registry>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     snapshot: SharedSnapshot,
@@ -1670,8 +1811,8 @@ async fn supervise_loop(
                     };
                     if !handle_supervisor_command(
                         command,
-                        &spec,
-                        &runtime,
+                        &mut spec,
+                        &mut runtime,
                         &registry,
                         &process_liveness,
                         &snapshot,
@@ -1702,8 +1843,8 @@ async fn supervise_loop(
             };
             if !handle_supervisor_command(
                 command,
-                &spec,
-                &runtime,
+                &mut spec,
+                &mut runtime,
                 &registry,
                 &process_liveness,
                 &snapshot,
@@ -1724,8 +1865,8 @@ enum NextAction {
 
 async fn handle_supervisor_command(
     command: SupervisorCommand,
-    spec: &ModuleSpec,
-    runtime: &SupervisorRuntimeConfig,
+    spec: &mut ModuleSpec,
+    runtime: &mut SupervisorRuntimeConfig,
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
@@ -1742,6 +1883,35 @@ async fn handle_supervisor_command(
                 ModuleState::Stopped,
                 None,
             )
+            .await;
+            let registration_released = result.is_ok();
+            let _ = reply.send(result);
+            if registration_released {
+                process_liveness.untrack_if_current(&spec.module_id, snapshot);
+            }
+            false
+        }
+        SupervisorCommand::Retire { reply } => {
+            let result = async {
+                begin_forwarding_drain_if_configured(
+                    spec,
+                    runtime,
+                    snapshot,
+                    None,
+                    "supervisor retire",
+                )
+                .await?;
+                drain_optional_child(
+                    &spec.module_id,
+                    registry,
+                    snapshot,
+                    child,
+                    runtime.drain_timeout,
+                    ModuleState::Stopped,
+                    None,
+                )
+                .await
+            }
             .await;
             let registration_released = result.is_ok();
             let _ = reply.send(result);
@@ -1774,6 +1944,19 @@ async fn handle_supervisor_command(
             )
             .await;
             let _ = reply.send(result);
+            true
+        }
+        SupervisorCommand::UpdateConfiguration {
+            spec: next_spec,
+            health,
+            reply,
+        } => {
+            if let Some(handle) = &runtime.supervisor_handle {
+                handle.apply_identity_configuration(&next_spec);
+            }
+            *spec = next_spec;
+            runtime.health = health;
+            let _ = reply.send(());
             true
         }
     }

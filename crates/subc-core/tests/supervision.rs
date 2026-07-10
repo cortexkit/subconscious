@@ -263,7 +263,7 @@ async fn clean_exit_keeps_supervision_task_alive_for_operator_restart() {
         .spawn(stub_spec(
             &server,
             module_id,
-            [("FAKE_AFT_CLEAN_EXIT_AFTER_MS", "0")],
+            [("FAKE_AFT_CLEAN_EXIT_AFTER_MS", "100")],
         ))
         .unwrap();
 

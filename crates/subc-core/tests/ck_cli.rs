@@ -165,41 +165,7 @@ async fn quota_table_renders_providers_and_used_percent() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
     let module_id = "ai-provider-quota";
-    let fixture = serde_json::json!([
-        {
-            "provider": "anthropic",
-            "status": "healthy",
-            "windows": [
-                {
-                    "window_name": "5h",
-                    "remaining_percent": 70.0,
-                    "resets_at": "4102444800"
-                },
-                {
-                    "window_name": "weekly",
-                    "remaining_percent": 55.0,
-                    "resets_at": "4102531200"
-                }
-            ]
-        },
-        {
-            "provider": "openai",
-            "status": "degraded",
-            "detail": "rate limit probe failed for secondary account",
-            "windows": [
-                {
-                    "window_name": "5h",
-                    "remaining_percent": 90.0,
-                    "resets_at": "4102444800"
-                },
-                {
-                    "window_name": "weekly",
-                    "remaining_percent": 80.0,
-                    "resets_at": "4102531200"
-                }
-            ]
-        }
-    ]);
+    let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
     let output = ck_with_subc(&server.connection_file_path, ["quota"]);
@@ -207,13 +173,22 @@ async fn quota_table_renders_providers_and_used_percent() {
     let stdout = text(&output.stdout);
     assert!(stdout.contains("anthropic"), "stdout:\n{stdout}");
     assert!(stdout.contains("openai"), "stdout:\n{stdout}");
+    assert!(stdout.contains("work"), "account column, stdout:\n{stdout}");
     assert!(
-        stdout.contains("    30"),
-        "expected 30% used (100-70) in table, stdout:\n{stdout}"
+        stdout.contains("    42"),
+        "expected usedPercent 42.0 in table, stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("rate limit probe failed"),
-        "degraded detail should appear, stdout:\n{stdout}"
+        stdout.contains("rate limit probe failed for secondary account"),
+        "degraded error should appear, stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Bonus credits"),
+        "extraRateWindows title should appear, stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("cookie jar unreadable"),
+        "error-only entry should appear, stdout:\n{stdout}"
     );
 
     module.stop().await.unwrap();
@@ -224,18 +199,7 @@ async fn quota_filters_by_provider_id() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
     let module_id = "ai-provider-quota";
-    let fixture = serde_json::json!([
-        {
-            "provider": "anthropic",
-            "status": "healthy",
-            "windows": [{ "window_name": "5h", "remaining_percent": 50.0 }]
-        },
-        {
-            "provider": "openai",
-            "status": "healthy",
-            "windows": [{ "window_name": "5h", "remaining_percent": 40.0 }]
-        }
-    ]);
+    let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
     let output = ck_with_subc(&server.connection_file_path, ["quota", "anthropic"]);
@@ -247,8 +211,8 @@ async fn quota_filters_by_provider_id() {
         "stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("    50"),
-        "expected 50% used (100-50), stdout:\n{stdout}"
+        stdout.contains("    42"),
+        "expected usedPercent 42.0, stdout:\n{stdout}"
     );
 
     module.stop().await.unwrap();
@@ -259,18 +223,7 @@ async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
     let module_id = "ai-provider-quota";
-    let fixture = serde_json::json!([
-        {
-            "provider": "anthropic",
-            "status": "healthy",
-            "windows": [{ "window_name": "5h", "remaining_percent": 50.0 }]
-        },
-        {
-            "provider": "openai",
-            "status": "healthy",
-            "windows": [{ "window_name": "5h", "remaining_percent": 40.0 }]
-        }
-    ]);
+    let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
     let output = ck_with_subc(&server.connection_file_path, ["quota", "unknown-id"]);
@@ -282,6 +235,7 @@ async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
     );
     assert!(stderr.contains("anthropic"), "stderr:\n{stderr}");
     assert!(stderr.contains("openai"), "stderr:\n{stderr}");
+    assert!(stderr.contains("grok"), "stderr:\n{stderr}");
 
     module.stop().await.unwrap();
 }
@@ -291,20 +245,18 @@ async fn quota_json_emits_wrapped_reply_verbatim() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
     let module_id = "ai-provider-quota";
-    let fixture = serde_json::json!([
-        {
-            "provider": "anthropic",
-            "status": "healthy",
-            "windows": [{ "window_name": "5h", "remaining_percent": 88.0 }]
-        }
-    ]);
+    let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
     let output = ck_with_subc(&server.connection_file_path, ["quota", "--json"]);
     let value = assert_json_success(output);
     let result = value["result"].as_array().expect("result array");
-    assert_eq!(result.len(), 1);
+    assert_eq!(result.len(), 3);
     assert_eq!(result[0]["provider"], "anthropic");
+    assert!(result[0]["usage"]["primary"]["usedPercent"]
+        .as_f64()
+        .is_some());
+    assert_eq!(result[2]["error"].as_str(), Some("cookie jar unreadable"));
 
     module.stop().await.unwrap();
 }
@@ -426,6 +378,55 @@ fn stub_spec(module_id: &str) -> ModuleSpec {
         reserved: false,
         reserved_prefixes: Vec::new(),
     }
+}
+
+fn quota_wire_fixture() -> Value {
+    serde_json::json!([
+        {
+            "provider": "anthropic",
+            "account": "work",
+            "source": "vault",
+            "usage": {
+                "primary": {
+                    "usedPercent": 42.0,
+                    "resetsAt": "2099-06-15T14:30:00Z",
+                    "windowMinutes": 300
+                },
+                "secondary": {
+                    "usedPercent": 17.5,
+                    "resetsAt": "2099-06-22T08:00:00+00:00",
+                    "windowMinutes": 10080
+                },
+                "extraRateWindows": [
+                    {
+                        "title": "Bonus credits",
+                        "id": "bonus-1",
+                        "window": {
+                            "usedPercent": 5.0,
+                            "resetsAt": "2099-07-01T00:00:00Z",
+                            "windowMinutes": 43200
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "provider": "openai",
+            "account": "personal",
+            "error": "rate limit probe failed for secondary account",
+            "usage": {
+                "primary": {
+                    "usedPercent": 88.0,
+                    "resetsAt": "2099-06-15T18:00:00Z",
+                    "windowMinutes": 300
+                }
+            }
+        },
+        {
+            "provider": "grok",
+            "error": "cookie jar unreadable"
+        }
+    ])
 }
 
 async fn spawn_quota_stub(

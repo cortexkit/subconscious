@@ -521,79 +521,156 @@ fn provider_ids_sorted(providers: &[Value]) -> Vec<String> {
     ids
 }
 
+fn account_label(entry: &Value) -> String {
+    entry
+        .get("account")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+fn entry_error_detail(entry: &Value) -> Option<String> {
+    entry
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn print_quota_table(providers: &[Value], filter: Option<&str>) {
     let mut rows = Vec::new();
     let mut sorted = providers.to_vec();
     sorted.sort_by_key(provider_id);
 
-    for provider in &sorted {
-        let id = provider_id(provider);
+    for entry in &sorted {
+        let id = provider_id(entry);
         if filter.is_some_and(|wanted| wanted != id) {
             continue;
         }
-        let status = display_field(provider, "status");
-        let detail = provider
-            .get("detail")
-            .or_else(|| provider.get("message"))
-            .map(display_json_value)
-            .filter(|value| value != "-")
-            .unwrap_or_else(|| status.clone());
-        let windows = provider
-            .get("windows")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if windows.is_empty() {
+        let account = account_label(entry);
+        let error_detail = entry_error_detail(entry);
+        let window_rows = quota_window_rows_for_entry(entry);
+
+        if window_rows.is_empty() {
+            let detail = error_detail
+                .as_deref()
+                .map(truncate_cell)
+                .unwrap_or_else(|| "-".to_string());
             rows.push(vec![
                 id,
+                account,
                 "-".to_string(),
                 "-".to_string(),
                 "-".to_string(),
-                truncate_cell(&detail),
+                detail,
             ]);
             continue;
         }
-        for (idx, window) in windows.iter().enumerate() {
-            let label = window_label(window);
-            let used = format_used_percent(window);
-            let resets = format_resets_at(window);
-            let used = format!("{:>6}", used);
+
+        for (idx, (label, window)) in window_rows.iter().enumerate() {
+            let used = format!("{:>6}", format_used_percent_rate_window(window));
+            let resets = format_resets_at_rate_window(window);
             let status_cell = if idx == 0 {
-                truncate_cell(&detail)
+                error_detail
+                    .as_deref()
+                    .map(truncate_cell)
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
             let provider_cell = if idx == 0 { id.clone() } else { String::new() };
-            rows.push(vec![provider_cell, label, used, resets, status_cell]);
+            let account_cell = if idx == 0 {
+                account.clone()
+            } else {
+                String::new()
+            };
+            rows.push(vec![
+                provider_cell,
+                account_cell,
+                label.clone(),
+                used,
+                resets,
+                status_cell,
+            ]);
         }
     }
 
     print_table(
-        &["provider", "window", "used%", "resets", "status/detail"],
+        &[
+            "provider",
+            "account",
+            "window",
+            "used%",
+            "resets",
+            "status/detail",
+        ],
         rows,
     );
 }
 
-fn window_label(window: &Value) -> String {
-    window
-        .get("window_name")
-        .or_else(|| window.get("label"))
-        .or_else(|| window.get("window"))
-        .map(display_json_value)
-        .unwrap_or_else(|| "-".to_string())
+fn quota_window_rows_for_entry(entry: &Value) -> Vec<(String, Value)> {
+    let mut rows = Vec::new();
+    let usage = entry.get("usage").and_then(Value::as_object);
+    let Some(usage) = usage else {
+        return rows;
+    };
+
+    for slot in ["primary", "secondary", "tertiary"] {
+        if let Some(window) = usage.get(slot).filter(|w| !w.is_null()) {
+            rows.push((rate_window_label(window, slot), window.clone()));
+        }
+    }
+
+    if let Some(extras) = usage.get("extraRateWindows").and_then(Value::as_array) {
+        for extra in extras {
+            let label = extra_window_label(extra);
+            if let Some(window) = extra.get("window").filter(|w| !w.is_null()) {
+                rows.push((label, window.clone()));
+            } else {
+                rows.push((label, Value::Null));
+            }
+        }
+    }
+
+    rows.into_iter()
+        .map(|(label, window)| {
+            if window.is_null() {
+                (label, json!({}))
+            } else {
+                (label, window)
+            }
+        })
+        .collect()
 }
 
-fn format_used_percent(window: &Value) -> String {
-    let used = window
-        .get("used_percent")
-        .or_else(|| window.get("used_pct"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            window
-                .get("remaining_percent")
-                .and_then(Value::as_f64)
-                .map(|remaining| 100.0 - remaining)
-        });
+fn extra_window_label(extra: &Value) -> String {
+    extra
+        .get("title")
+        .or_else(|| extra.get("id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "extra".to_string())
+}
+
+fn rate_window_label(window: &Value, slot: &str) -> String {
+    if let Some(minutes) = window.get("windowMinutes").and_then(Value::as_i64) {
+        return label_from_window_minutes(minutes);
+    }
+    slot.to_string()
+}
+
+fn label_from_window_minutes(minutes: i64) -> String {
+    match minutes {
+        300 => "5h".to_string(),
+        10_080 => "week".to_string(),
+        _ => format!("{minutes}m"),
+    }
+}
+
+fn format_used_percent_rate_window(window: &Value) -> String {
+    let used = window.get("usedPercent").and_then(Value::as_f64);
     match used {
         Some(value) => {
             let rounded = (value * 10.0).round() / 10.0;
@@ -607,21 +684,20 @@ fn format_used_percent(window: &Value) -> String {
     }
 }
 
-fn format_resets_at(window: &Value) -> String {
+fn format_resets_at_rate_window(window: &Value) -> String {
     let raw = window
-        .get("resets_at")
-        .or_else(|| window.get("reset_at"))
-        .or_else(|| window.get("resets"))
-        .map(display_json_value)
-        .unwrap_or_else(|| "-".to_string());
-    if raw == "-" {
-        return raw;
-    }
+        .get("resetsAt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let Some(raw) = raw else {
+        return "-".to_string();
+    };
     format_reset_timestamp(&raw).unwrap_or(raw)
 }
 
 fn format_reset_timestamp(raw: &str) -> Option<String> {
-    let secs = parse_timestamp_secs(raw)?;
+    let secs = parse_rfc3339_to_utc_secs(raw)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let local = utc_parts_from_epoch_secs(secs);
     let now_local = utc_parts_from_epoch_secs(now);
@@ -639,23 +715,85 @@ fn format_reset_timestamp(raw: &str) -> Option<String> {
     }
 }
 
-fn parse_timestamp_secs(raw: &str) -> Option<u64> {
-    if let Ok(value) = raw.parse::<u64>() {
-        return Some(if value > 1_000_000_000_000 {
-            value / 1000
-        } else {
-            value
-        });
+fn parse_rfc3339_to_utc_secs(raw: &str) -> Option<u64> {
+    if raw.len() < 19 {
+        return None;
     }
-    if let Ok(value) = raw.parse::<i64>() {
-        let value = value as u64;
-        return Some(if value > 1_000_000_000_000 {
-            value / 1000
-        } else {
-            value
-        });
+    let bytes = raw.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
     }
-    None
+    let year: i32 = raw[0..4].parse().ok()?;
+    let month: u32 = raw[5..7].parse().ok()?;
+    let day: u32 = raw[8..10].parse().ok()?;
+    let hour: u32 = raw[11..13].parse().ok()?;
+    let minute: u32 = raw[14..16].parse().ok()?;
+    let second: u32 = raw[17..19].parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let rest = raw[19..].trim_start();
+    let offset_secs = if rest.is_empty() || rest.starts_with('Z') || rest.starts_with('z') {
+        0
+    } else if let Some(sign) = rest.chars().next().filter(|c| *c == '+' || *c == '-') {
+        let tail = &rest[1..];
+        let (oh, om) = parse_hh_mm_offset(tail)?;
+        let mag = (oh as i64) * 3600 + (om as i64) * 60;
+        if sign == '+' {
+            -mag
+        } else {
+            mag
+        }
+    } else {
+        return None;
+    };
+
+    let days = civil_to_days(year, month, day)?;
+    let secs_of_day = (hour as u64) * 3600 + (minute as u64) * 60 + (second as u64);
+    let utc = (days as i64) * 86_400 + secs_of_day as i64 + offset_secs;
+    if utc < 0 {
+        return None;
+    }
+    Some(utc as u64)
+}
+
+fn parse_hh_mm_offset(tail: &str) -> Option<(u32, u32)> {
+    let (h, m) = if let Some((h, m)) = tail.split_once(':') {
+        (h, m)
+    } else if tail.len() >= 4 {
+        (&tail[..2], &tail[2..])
+    } else {
+        return None;
+    };
+    let oh: u32 = h.parse().ok()?;
+    let om: u32 = m.parse().ok()?;
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some((oh, om))
+}
+
+fn civil_to_days(year: i32, month: u32, day: u32) -> Option<i32> {
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 12)
+    } else {
+        (year, month)
+    };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m as i32 - 3) + 2) / 5 + day as i32 - 1 + yoe * 365 + yoe / 4 - yoe / 100;
+    Some(era * 146097 + doy - 719468)
 }
 
 struct LocalTimeParts {

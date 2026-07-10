@@ -160,6 +160,155 @@ async fn module_restart_stop_start_json_drive_supervisor() {
     module.stop().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_table_renders_providers_and_used_percent() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module_id = "ai-provider-quota";
+    let fixture = serde_json::json!([
+        {
+            "provider": "anthropic",
+            "status": "healthy",
+            "windows": [
+                {
+                    "window_name": "5h",
+                    "remaining_percent": 70.0,
+                    "resets_at": "4102444800"
+                },
+                {
+                    "window_name": "weekly",
+                    "remaining_percent": 55.0,
+                    "resets_at": "4102531200"
+                }
+            ]
+        },
+        {
+            "provider": "openai",
+            "status": "degraded",
+            "detail": "rate limit probe failed for secondary account",
+            "windows": [
+                {
+                    "window_name": "5h",
+                    "remaining_percent": 90.0,
+                    "resets_at": "4102444800"
+                },
+                {
+                    "window_name": "weekly",
+                    "remaining_percent": 80.0,
+                    "resets_at": "4102531200"
+                }
+            ]
+        }
+    ]);
+    let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["quota"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("anthropic"), "stdout:\n{stdout}");
+    assert!(stdout.contains("openai"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("    30"),
+        "expected 30% used (100-70) in table, stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rate limit probe failed"),
+        "degraded detail should appear, stdout:\n{stdout}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_filters_by_provider_id() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module_id = "ai-provider-quota";
+    let fixture = serde_json::json!([
+        {
+            "provider": "anthropic",
+            "status": "healthy",
+            "windows": [{ "window_name": "5h", "remaining_percent": 50.0 }]
+        },
+        {
+            "provider": "openai",
+            "status": "healthy",
+            "windows": [{ "window_name": "5h", "remaining_percent": 40.0 }]
+        }
+    ]);
+    let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["quota", "anthropic"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("anthropic"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("openai")),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("    50"),
+        "expected 50% used (100-50), stdout:\n{stdout}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module_id = "ai-provider-quota";
+    let fixture = serde_json::json!([
+        {
+            "provider": "anthropic",
+            "status": "healthy",
+            "windows": [{ "window_name": "5h", "remaining_percent": 50.0 }]
+        },
+        {
+            "provider": "openai",
+            "status": "healthy",
+            "windows": [{ "window_name": "5h", "remaining_percent": 40.0 }]
+        }
+    ]);
+    let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["quota", "unknown-id"]);
+    assert_exit(&output, 1);
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("unknown provider 'unknown-id'"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("anthropic"), "stderr:\n{stderr}");
+    assert!(stderr.contains("openai"), "stderr:\n{stderr}");
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_json_emits_wrapped_reply_verbatim() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module_id = "ai-provider-quota";
+    let fixture = serde_json::json!([
+        {
+            "provider": "anthropic",
+            "status": "healthy",
+            "windows": [{ "window_name": "5h", "remaining_percent": 88.0 }]
+        }
+    ]);
+    let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["quota", "--json"]);
+    let value = assert_json_success(output);
+    let result = value["result"].as_array().expect("result array");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["provider"], "anthropic");
+
+    module.stop().await.unwrap();
+}
+
 #[test]
 fn discovery_failure_lists_tried_paths_and_exits_2() {
     let runtime = TempDir::new("ck-empty-runtime");
@@ -277,6 +426,37 @@ fn stub_spec(module_id: &str) -> ModuleSpec {
         reserved: false,
         reserved_prefixes: Vec::new(),
     }
+}
+
+async fn spawn_quota_stub(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+    fixture: &Value,
+) -> SupervisedModule {
+    let fixture_json = serde_json::to_string(fixture).unwrap();
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: module_id.to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env: vec![
+                ("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()),
+                (
+                    "FAKE_AFT_ROLE".to_string(),
+                    "management_surface".to_string(),
+                ),
+                ("FAKE_AFT_USAGE_GET_FIXTURE".to_string(), fixture_json),
+            ],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {
+        entry.state == "running" && entry.enabled && entry.live
+    })
+    .await;
+    module
 }
 
 async fn wait_for_supervisor_entry(

@@ -64,6 +64,7 @@ const FAKE_AFT_TOOLCALL_RESULT_ENV: &str = "FAKE_AFT_TOOLCALL_RESULT";
 const FAKE_AFT_TOOLCALL_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_ERROR";
 const FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV: &str = "FAKE_AFT_TOOLCALL_SUBC_ERROR";
 const FAKE_AFT_TOOLS_ENV: &str = "FAKE_AFT_TOOLS";
+const FAKE_AFT_USAGE_GET_FIXTURE_ENV: &str = "FAKE_AFT_USAGE_GET_FIXTURE";
 const FAKE_AFT_ADVERTISE_HEALTH_ENV: &str = "FAKE_AFT_ADVERTISE_HEALTH";
 const FAKE_AFT_HEALTH_NEVER_REPLY_ENV: &str = "FAKE_AFT_HEALTH_NEVER_REPLY";
 const FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH_ENV: &str = "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH";
@@ -523,6 +524,8 @@ async fn emit_response(
                 .await;
         }
         tool_call_response_body(config, &tool_call)?
+    } else if let Some(usage_body) = usage_get_response_body(config, &frame.body)? {
+        usage_body
     } else {
         frame.body
     };
@@ -970,6 +973,32 @@ fn parse_tool_call(body: &[u8]) -> Option<ToolCallRouteRequest> {
     Some(parsed)
 }
 
+#[derive(Debug, Deserialize)]
+struct ManagementRouteRequest {
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default, rename = "params")]
+    _params: Value,
+}
+
+fn usage_get_response_body(config: &StubConfig, body: &[u8]) -> Result<Option<Vec<u8>>, StubError> {
+    let Some(fixture) = config.usage_get_fixture.as_ref() else {
+        return Ok(None);
+    };
+    let request =
+        serde_json::from_slice::<ManagementRouteRequest>(body).map_err(StubError::Json)?;
+    let is_usage_get = request.op.as_deref() == Some("usage.get")
+        || request.method.as_deref() == Some("usage.get");
+    if !is_usage_get {
+        return Ok(None);
+    }
+    serde_json::to_vec(&json!({ "result": fixture }))
+        .map(Some)
+        .map_err(StubError::Json)
+}
+
 fn lock_in_flight(
     in_flight: &InFlightRegistry,
 ) -> Result<std::sync::MutexGuard<'_, HashMap<InFlightKey, oneshot::Sender<()>>>, StubError> {
@@ -1051,6 +1080,10 @@ fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> 
                 ManagementOperation {
                     name: "bus.publish".to_string(),
                     kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
+                    name: "usage.get".to_string(),
+                    kind: ManagementOperationKind::Query,
                 },
             ],
             config_schema: json!({"type": "object"}),
@@ -1136,6 +1169,7 @@ struct StubConfig {
     toolcall_error: bool,
     toolcall_subc_error: bool,
     tools: Vec<String>,
+    usage_get_fixture: Option<Value>,
     advertise_health: bool,
     health_never_reply: bool,
     health_status: HealthStatus,
@@ -1242,6 +1276,11 @@ impl StubConfig {
             toolcall_error: env_flag(FAKE_AFT_TOOLCALL_ERROR_ENV),
             toolcall_subc_error: env_flag(FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV),
             tools,
+            usage_get_fixture: env::var(FAKE_AFT_USAGE_GET_FIXTURE_ENV)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|raw| serde_json::from_str::<Value>(&raw).map_err(StubError::Json))
+                .transpose()?,
             advertise_health: env_flag(FAKE_AFT_ADVERTISE_HEALTH_ENV),
             health_never_reply: env_flag(FAKE_AFT_HEALTH_NEVER_REPLY_ENV)
                 || health_never_reply_first_spawn()?,

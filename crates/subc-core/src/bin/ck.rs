@@ -663,8 +663,17 @@ fn rate_window_label(window: &Value, slot: &str) -> String {
 
 fn label_from_window_minutes(minutes: i64) -> String {
     match minutes {
-        300 => "5h".to_string(),
-        10_080 => "week".to_string(),
+        m if m >= 1440 && m % 1440 == 0 => {
+            let days = m / 1440;
+            if days == 7 {
+                "week".to_string()
+            } else if days == 1 {
+                "day".to_string()
+            } else {
+                format!("{days}d")
+            }
+        }
+        m if m >= 60 && m % 60 == 0 => format!("{}h", m / 60),
         _ => format!("{minutes}m"),
     }
 }
@@ -743,7 +752,16 @@ fn parse_rfc3339_to_utc_secs(raw: &str) -> Option<u64> {
         return None;
     }
 
-    let rest = raw[19..].trim_start();
+    // Skip fractional seconds (".466665") — some providers emit them.
+    let mut rest = &raw[19..];
+    if rest.starts_with('.') {
+        let end = rest[1..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    let rest = rest.trim_start();
     let offset_secs = if rest.is_empty() || rest.starts_with('Z') || rest.starts_with('z') {
         0
     } else if let Some(sign) = rest.chars().next().filter(|c| *c == '+' || *c == '-') {

@@ -3,7 +3,7 @@ import SubcClient
 
 // Spike probe for the native Swift subc client.
 //   subc-swift-probe <cf>                          -> catalog.list + quota usage.get
-//   subc-swift-probe <cf> chat <prompt> [model]    -> one llm-runner turn (subscribe+send+drain)
+//   subc-swift-probe <cf> chat <prompt> [model]    -> one broca turn (subscribe+send+drain)
 //   subc-swift-probe <cf> convo <p1> <p2> [model]  -> TWO turns on one session, cursor-threaded
 //                                                     (proves multi-turn context, the GUI path)
 
@@ -37,7 +37,7 @@ do {
         var finalText = ""
         var deltaCount = 0
         _ = try client.runSessionTurn(
-            moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
+            moduleId: "broca", projectRoot: projectRoot, harness: "runner",
             session: "swift-chat-\(UUID().uuidString)",
             prompt: args[3], provider: provider, model: modelId
         ) { ev in
@@ -66,7 +66,7 @@ do {
             // SAME session id + the threaded cursor carry the durable lineage.
             let turnClient = try SubcClient.connect(connectionFilePath: args[1])
             cursor = try turnClient.runSessionTurn(
-                moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
+                moduleId: "broca", projectRoot: projectRoot, harness: "runner",
                 session: session, prompt: prompt, provider: provider, model: modelId,
                 fromCursor: cursor
             ) { ev in
@@ -90,7 +90,7 @@ do {
             do {
                 let turnClient = try SubcClient.connect(connectionFilePath: args[1])
                 cursor = try turnClient.runSessionTurn(
-                    moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
+                    moduleId: "broca", projectRoot: projectRoot, harness: "runner",
                     session: session, prompt: args[3], provider: provider, model: modelId,
                     fromCursor: cursor
                 ) { ev in
@@ -114,7 +114,7 @@ do {
         var sawToolCall = false
         var sawToolResult = false
         _ = try client.runSessionTurn(
-            moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
+            moduleId: "broca", projectRoot: projectRoot, harness: "runner",
             session: "swift-tooluse-\(UUID().uuidString)",
             prompt: args[3], provider: provider, model: modelId, tools: tools
         ) { ev in
@@ -152,7 +152,7 @@ do {
             let turnClient = try SubcClient.connect(connectionFilePath: args[1])
             let tools = try turnClient.toolProviderTools(moduleId: "aft")
             cursor = try turnClient.runSessionTurn(
-                moduleId: "llm-runner", projectRoot: projectRoot, harness: "runner",
+                moduleId: "broca", projectRoot: projectRoot, harness: "runner",
                 session: session, prompt: prompt, provider: provider, model: modelId,
                 tools: tools, fromCursor: cursor
             ) { ev in

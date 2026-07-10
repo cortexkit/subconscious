@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let hosting = NSHostingController(rootView: ContentView())
         window = NSWindow(contentViewController: hosting)
-        window.title = "CortexKit Chat — subc + llm-runner"
+        window.title = "CortexKit Chat — subc + broca"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.setContentSize(NSSize(width: 720, height: 560))
         window.center()

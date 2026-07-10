@@ -87,7 +87,7 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 8) {
             Text("CortexKit Chat").font(.headline)
-            Text("llm-runner over subc").font(.caption).foregroundColor(.secondary)
+            Text("broca over subc").font(.caption).foregroundColor(.secondary)
             Spacer()
             // Model picker: known-good presets, plus a free-text field for any catalog model.
             Menu {

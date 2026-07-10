@@ -52,7 +52,7 @@ let MODEL_PRESETS: [String] = [
     "ollama-cloud/deepseek-v3.2",
 ]
 
-/// Drives the native Swift subc client against llm-runner sessions and renders streamed
+/// Drives the native Swift subc client against broca sessions and renders streamed
 /// turns as chat. Multi-session: a left sidebar picks among durable sessions (persisted
 /// locally), each a stable subc session id whose module-side lineage preserves context.
 /// The blocking client runs off the main thread; events marshal back to the main actor.
@@ -186,10 +186,10 @@ final class ChatViewModel: ObservableObject {
                 // tracks whatever the aft module currently exposes.
                 let tools = wantTools ? (try? client.toolProviderTools(moduleId: "aft")) ?? [] : []
                 let next = try client.runSessionTurn(
-                    moduleId: "llm-runner",
+                    moduleId: "broca",
                     projectRoot: root,
                     // "runner" (not "ck-chat") until aft admits a first-party CK-app
-                    // harness identity: llm-runner propagates this harness verbatim to
+                    // harness identity: broca propagates this harness verbatim to
                     // the tool-plane bind, and aft's admission allowlist rejects unknown
                     // harnesses with config_divergence, which would surface as
                     // tool-plane-unavailable results on every tool call.

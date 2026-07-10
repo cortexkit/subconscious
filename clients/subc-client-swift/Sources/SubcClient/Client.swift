@@ -2,7 +2,7 @@ import Foundation
 
 // Consumer-side channel-0 control RPC + the session data/stream plane over a
 // connected + authenticated transport. Mirrors clients/subc-client/src/client.ts,
-// subc-probe.rs, and llm-runner's llmr-subc SubcConnection.
+// subc-probe.rs, and broca's subc-consumer connection.
 //
 // Spike scope: a synchronous, single-socket demonstration. The production client
 // swaps the blocking transport for an async Network.framework connection with a
@@ -77,9 +77,9 @@ public final class SubcClient {
     }
 
     /// Fetch a tool provider's tool definitions from the catalog, shaped for
-    /// llm-runner's `session.send` `tools` array: `{name, description,
+    /// broca's `session.send` `tools` array: `{name, description,
     /// input_schema, module}`. The catalog's `execution_mode` is intentionally
-    /// dropped — llm-runner's Tool field of that name is a different enum
+    /// dropped — broca's Tool field of that name is a different enum
     /// (dispatch parallelism, not effect class) and rejects the catalog's
     /// values; omitting it applies the serve side's default.
     public func toolProviderTools(moduleId: String) throws -> [[String: Any]] {
@@ -142,7 +142,7 @@ public final class SubcClient {
         return obj
     }
 
-    /// Drive one llm-runner session turn end-to-end: subscribe (dedicated route),
+    /// Drive one broca session turn end-to-end: subscribe (dedicated route),
     /// send the prompt (command route), then drain the control stream to the run's
     /// terminal, invoking `onEvent` for each decoded control unit.
     ///

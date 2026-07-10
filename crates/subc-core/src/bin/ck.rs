@@ -15,18 +15,16 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
-use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
-use subc_control::ClientControlRequest;
+use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_core::{read_frame, write_frame, Frame};
-use subc_protocol::{Flags, FrameType, Priority};
+use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file, ConnectionFileError, ConnectionInfo};
 use tokio::{net::TcpStream, time};
 
@@ -36,7 +34,9 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_FILE_NAME: &str = "subc-connection.json";
 const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
-const USAGE: &str = "usage: ck [--subc <connection-file>] [--json] <command>\n\ncommands:\n  ck module list\n  ck module status <id>\n  ck module restart <id>\n  ck module stop <id>\n  ck module start <id>\n  ck health\n  ck daemon";
+const QUOTA_MODULE_ID: &str = "ai-provider-quota";
+const CK_HARNESS: &str = "ck";
+const USAGE: &str = "usage: ck [--subc <connection-file>] [--json] <command>\n\ncommands:\n  ck module list\n  ck module status <id>\n  ck module restart <id>\n  ck module stop <id>\n  ck module start <id>\n  ck health\n  ck daemon\n  ck quota [<provider-id>]";
 
 #[tokio::main]
 async fn main() {
@@ -70,6 +70,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }
         Command::Health => health(&mut client, args.json).await,
         Command::Daemon => daemon(&mut client, args.json).await,
+        Command::Quota { provider_id } => {
+            quota(&mut client, provider_id.as_deref(), args.json).await
+        }
     }
 }
 
@@ -83,6 +86,7 @@ enum Command {
     Module(ModuleCommand),
     Health,
     Daemon,
+    Quota { provider_id: Option<String> },
 }
 
 enum ModuleCommand {
@@ -197,6 +201,93 @@ impl CkClient {
                 "timed out after {RESPONSE_TIMEOUT:?} waiting for a frame"
             ))),
         }
+    }
+
+    async fn catalog_list(&mut self) -> Result<Vec<CatalogEntry>, CkError> {
+        let value = self
+            .rpc_value(ClientControlRequest::CatalogList { module_id: None })
+            .await?;
+        match serde_json::from_value::<ClientControlResponse>(value)? {
+            ClientControlResponse::CatalogList { modules, .. } => Ok(modules),
+            other => Err(CkError::Message(format!(
+                "unexpected catalog.list response: {other:?}"
+            ))),
+        }
+    }
+
+    async fn route_open_management(
+        &mut self,
+        module_id: &str,
+        project_root: PathBuf,
+    ) -> Result<u16, CkError> {
+        let request = ClientControlRequest::RouteOpen {
+            target: RouteTarget::ManagementSurface {
+                module_id: module_id.to_string(),
+            },
+            identity: BindIdentity {
+                project_root,
+                harness: CK_HARNESS.to_string(),
+                session: "quota".to_string(),
+            },
+            consumer_identity: None,
+            consumer_capabilities: None,
+        };
+        let value = self.rpc_value(request).await?;
+        match serde_json::from_value::<ClientControlResponse>(value)? {
+            ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+            other => Err(CkError::Message(format!(
+                "unexpected route.open response: {other:?}"
+            ))),
+        }
+    }
+
+    async fn route_request_value(
+        &mut self,
+        route_channel: u16,
+        body: Value,
+    ) -> Result<Value, CkError> {
+        let corr = self.next_corr;
+        self.next_corr = self.next_corr.saturating_add(1);
+        let body = serde_json::to_vec(&body)?;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            route_channel,
+            corr,
+            body,
+        )
+        .map_err(|source| CkError::Message(source.to_string()))?;
+        write_frame(&mut self.stream, &frame)
+            .await
+            .map_err(|source| CkError::Message(source.to_string()))?;
+
+        loop {
+            let reply = self.next_frame().await?;
+            if reply.header.channel != route_channel || reply.header.corr != corr {
+                continue;
+            }
+            return match reply.header.ty {
+                FrameType::Response => Ok(serde_json::from_slice(&reply.body)?),
+                FrameType::Error => Err(CkError::Rejected(decode_error_body(&reply.body))),
+                ty => Err(CkError::Message(format!(
+                    "unexpected route response frame {ty:?}"
+                ))),
+            };
+        }
+    }
+
+    async fn route_goodbye(&mut self, route_channel: u16) {
+        let frame = match Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Passive, false),
+            route_channel,
+            0,
+            Vec::new(),
+        ) {
+            Ok(frame) => frame,
+            Err(_) => return,
+        };
+        let _ = write_frame(&mut self.stream, &frame).await;
     }
 }
 
@@ -353,6 +444,273 @@ async fn supervisor_health(client: &mut CkClient) -> Result<Value, CkError> {
     client
         .rpc_value(ClientControlRequest::SupervisorHealth {})
         .await
+}
+
+async fn quota(
+    client: &mut CkClient,
+    provider_filter: Option<&str>,
+    json_output: bool,
+) -> Result<(), CkError> {
+    ensure_quota_module_registered(client).await?;
+    let project_root = env::current_dir()
+        .map_err(|source| CkError::Message(format!("current directory: {source}")))?;
+    let route_channel = client
+        .route_open_management(QUOTA_MODULE_ID, project_root)
+        .await?;
+    let body = client
+        .route_request_value(
+            route_channel,
+            json!({ "method": "usage.get", "params": {} }),
+        )
+        .await?;
+    client.route_goodbye(route_channel).await;
+
+    let providers = usage_providers_from_body(&body)?;
+    if let Some(filter) = provider_filter {
+        if !providers.iter().any(|p| provider_id(p) == filter) {
+            let ids = provider_ids_sorted(&providers);
+            return Err(CkError::Rejected(format!(
+                "unknown provider '{filter}'; valid ids: {}",
+                ids.join(", ")
+            )));
+        }
+    }
+
+    if json_output {
+        print_json(&body)?;
+    } else {
+        print_quota_table(&providers, provider_filter);
+    }
+    Ok(())
+}
+
+async fn ensure_quota_module_registered(client: &mut CkClient) -> Result<(), CkError> {
+    let catalog = client.catalog_list().await?;
+    if catalog
+        .iter()
+        .any(|entry| entry.module_id == QUOTA_MODULE_ID)
+    {
+        return Ok(());
+    }
+    Err(CkError::Rejected(format!(
+        "module '{QUOTA_MODULE_ID}' is not registered — is it enabled in subc.jsonc?"
+    )))
+}
+
+fn usage_providers_from_body(body: &Value) -> Result<Vec<Value>, CkError> {
+    body.get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| CkError::Message(format!("unexpected usage.get reply: {body}")))
+}
+
+fn provider_id(provider: &Value) -> String {
+    provider
+        .get("provider")
+        .or_else(|| provider.get("provider_id"))
+        .or_else(|| provider.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn provider_ids_sorted(providers: &[Value]) -> Vec<String> {
+    let mut ids = providers.iter().map(provider_id).collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn print_quota_table(providers: &[Value], filter: Option<&str>) {
+    let mut rows = Vec::new();
+    let mut sorted = providers.to_vec();
+    sorted.sort_by_key(provider_id);
+
+    for provider in &sorted {
+        let id = provider_id(provider);
+        if filter.is_some_and(|wanted| wanted != id) {
+            continue;
+        }
+        let status = display_field(provider, "status");
+        let detail = provider
+            .get("detail")
+            .or_else(|| provider.get("message"))
+            .map(display_json_value)
+            .filter(|value| value != "-")
+            .unwrap_or_else(|| status.clone());
+        let windows = provider
+            .get("windows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if windows.is_empty() {
+            rows.push(vec![
+                id,
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                truncate_cell(&detail),
+            ]);
+            continue;
+        }
+        for (idx, window) in windows.iter().enumerate() {
+            let label = window_label(window);
+            let used = format_used_percent(window);
+            let resets = format_resets_at(window);
+            let used = format!("{:>6}", used);
+            let status_cell = if idx == 0 {
+                truncate_cell(&detail)
+            } else {
+                String::new()
+            };
+            let provider_cell = if idx == 0 { id.clone() } else { String::new() };
+            rows.push(vec![provider_cell, label, used, resets, status_cell]);
+        }
+    }
+
+    print_table(
+        &["provider", "window", "used%", "resets", "status/detail"],
+        rows,
+    );
+}
+
+fn window_label(window: &Value) -> String {
+    window
+        .get("window_name")
+        .or_else(|| window.get("label"))
+        .or_else(|| window.get("window"))
+        .map(display_json_value)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_used_percent(window: &Value) -> String {
+    let used = window
+        .get("used_percent")
+        .or_else(|| window.get("used_pct"))
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            window
+                .get("remaining_percent")
+                .and_then(Value::as_f64)
+                .map(|remaining| 100.0 - remaining)
+        });
+    match used {
+        Some(value) => {
+            let rounded = (value * 10.0).round() / 10.0;
+            if (rounded - rounded.round()).abs() < f64::EPSILON {
+                format!("{:.0}", rounded)
+            } else {
+                format!("{rounded:.1}")
+            }
+        }
+        None => "-".to_string(),
+    }
+}
+
+fn format_resets_at(window: &Value) -> String {
+    let raw = window
+        .get("resets_at")
+        .or_else(|| window.get("reset_at"))
+        .or_else(|| window.get("resets"))
+        .map(display_json_value)
+        .unwrap_or_else(|| "-".to_string());
+    if raw == "-" {
+        return raw;
+    }
+    format_reset_timestamp(&raw).unwrap_or(raw)
+}
+
+fn format_reset_timestamp(raw: &str) -> Option<String> {
+    let secs = parse_timestamp_secs(raw)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let local = utc_parts_from_epoch_secs(secs);
+    let now_local = utc_parts_from_epoch_secs(now);
+    if local.year == now_local.year && local.month == now_local.month && local.day == now_local.day
+    {
+        Some(format!("{:02}:{:02}", local.hour, local.minute))
+    } else {
+        Some(format!(
+            "{} {:02} {:02}:{:02}",
+            month_abbr(local.month),
+            local.day,
+            local.hour,
+            local.minute
+        ))
+    }
+}
+
+fn parse_timestamp_secs(raw: &str) -> Option<u64> {
+    if let Ok(value) = raw.parse::<u64>() {
+        return Some(if value > 1_000_000_000_000 {
+            value / 1000
+        } else {
+            value
+        });
+    }
+    if let Ok(value) = raw.parse::<i64>() {
+        let value = value as u64;
+        return Some(if value > 1_000_000_000_000 {
+            value / 1000
+        } else {
+            value
+        });
+    }
+    None
+}
+
+struct LocalTimeParts {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+}
+
+fn utc_parts_from_epoch_secs(secs: u64) -> LocalTimeParts {
+    let days = (secs / 86_400) as i32;
+    let rem = (secs % 86_400) as u32;
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let (year, month, day) = civil_from_days(days);
+    LocalTimeParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+    }
+}
+
+fn civil_from_days(mut z: i32) -> (i32, u32, u32) {
+    z += 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
+}
+
+fn month_abbr(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "???",
+    }
 }
 
 fn print_module_table(modules: &[Value]) {
@@ -613,6 +971,10 @@ fn parse_command(positionals: &[String]) -> Result<Command, CkError> {
         }
         [command] if command == "health" => Ok(Command::Health),
         [command] if command == "daemon" => Ok(Command::Daemon),
+        [domain] if domain == "quota" => Ok(Command::Quota { provider_id: None }),
+        [domain, provider_id] if domain == "quota" => Ok(Command::Quota {
+            provider_id: Some(provider_id.clone()),
+        }),
         [] => Err(CkError::Usage(format!("missing command\n{USAGE}"))),
         _ => Err(CkError::Usage(format!(
             "unknown command '{}'; expected a supported <domain> <verb>\n{USAGE}",

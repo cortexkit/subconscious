@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -8,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    SupervisorEntry, SupervisorHealthEntry,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorRescanResult,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
@@ -31,8 +32,8 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
-    supervise::{ModuleProcessLiveness, ReservedHelloRejection, SupervisorHandle},
-    ConnectedClients, Frame, ProjectRootId,
+    supervise::{validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SupervisorHandle},
+    ConnectedClients, Frame, ProjectRootId, Supervisor,
 };
 
 /// Lowest envelope version this subc build will negotiate.
@@ -55,6 +56,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_LIST,
     ops::SUPERVISOR_RESTART,
     ops::SUPERVISOR_RELOAD,
+    ops::SUPERVISOR_RESCAN,
     ops::SUPERVISOR_SET_ENABLED,
     ops::SUPERVISOR_HEALTH_PROBE,
     ops::SUPERVISOR_HEALTH,
@@ -74,6 +76,14 @@ const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone)]
+struct SupervisorRescanContext {
+    supervisor: Supervisor,
+    config_path: PathBuf,
+    configured_port: Option<u16>,
+    storage_config: Option<crate::daemon_config::StorageConfig>,
+}
+
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
 pub struct ControlHandler {
@@ -87,6 +97,7 @@ pub struct ControlHandler {
     /// Central storage policy. When set, each registering module receives its
     /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
     storage_config: Option<crate::daemon_config::StorageConfig>,
+    rescan: Option<SupervisorRescanContext>,
     connected_clients: ConnectedClients,
 }
 
@@ -211,6 +222,7 @@ impl ControlHandler {
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             storage_config: None,
+            rescan: None,
             connected_clients: ConnectedClients::new(),
         }
     }
@@ -248,6 +260,21 @@ impl ControlHandler {
 
     pub fn with_supervisor(mut self, supervisor: SupervisorHandle) -> Self {
         self.supervisor = supervisor;
+        self
+    }
+
+    pub fn with_supervisor_rescan(
+        mut self,
+        supervisor: Supervisor,
+        config_path: impl Into<PathBuf>,
+        configured_port: Option<u16>,
+    ) -> Self {
+        self.rescan = Some(SupervisorRescanContext {
+            supervisor,
+            config_path: config_path.into(),
+            configured_port,
+            storage_config: self.storage_config.clone(),
+        });
         self
     }
 
@@ -758,6 +785,7 @@ impl ControlHandler {
             ClientControlRequest::SupervisorReload { module_id } => {
                 self.handle_supervisor_reload(frame, module_id).await
             }
+            ClientControlRequest::SupervisorRescan {} => self.handle_supervisor_rescan(frame).await,
             ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
                 self.handle_supervisor_set_enabled(frame, module_id, enabled)
                     .await
@@ -1255,6 +1283,8 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
     ) -> Result<Vec<Frame>, RouterError> {
+        let operation_lock = self.supervisor.operation_lock();
+        let _operation_guard = operation_lock.lock().await;
         let Some(module) = self.supervisor.get(&module_id) else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -1292,6 +1322,8 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
     ) -> Result<Vec<Frame>, RouterError> {
+        let operation_lock = self.supervisor.operation_lock();
+        let _operation_guard = operation_lock.lock().await;
         let Some(module) = self.supervisor.get(&module_id) else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -1324,12 +1356,207 @@ impl ControlHandler {
         )?])
     }
 
+    async fn handle_supervisor_rescan(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        let Some(context) = self.rescan.clone() else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "rescan_unavailable",
+                "the daemon was not started with a reloadable config path".to_string(),
+            )?]);
+        };
+
+        let operation_lock = self.supervisor.operation_lock();
+        let _operation_guard = operation_lock.lock().await;
+        let loaded = match crate::daemon_config::load(&context.config_path) {
+            Ok(config) => config,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_daemon_config",
+                    format!("supervisor rescan rejected daemon config: {err}"),
+                )?])
+            }
+        };
+        let (configured_port, storage_config, modules) = loaded
+            .map(|config| (config.port, config.storage, config.modules))
+            .unwrap_or((None, None, Vec::new()));
+
+        if configured_port != context.configured_port || storage_config != context.storage_config {
+            warn!(
+                config_path = %context.config_path.display(),
+                "daemon config changed outside the modules section; restart the daemon to apply those changes"
+            );
+        }
+
+        for configured in &modules {
+            if let Err(err) = validate_spec(&configured.module_spec()) {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_daemon_config",
+                    format!("supervisor rescan rejected daemon config: {err}"),
+                )?]);
+            }
+        }
+
+        let result = match self
+            .reconcile_supervised_modules(&context.supervisor, modules)
+            .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                return Ok(vec![control_error_frame(&frame, "rescan_failed", message)?])
+            }
+        };
+        let response = ClientControlResponse::SupervisorRescan { result };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorRescan",
+        )?])
+    }
+
+    async fn reconcile_supervised_modules(
+        &self,
+        supervisor: &Supervisor,
+        configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
+    ) -> Result<SupervisorRescanResult, String> {
+        let mut current = BTreeMap::new();
+        for module in self.supervisor.list() {
+            let (spec, health) = module.configuration().map_err(|err| {
+                format!(
+                    "failed to read configuration for module_id '{}': {err}",
+                    module.module_id()
+                )
+            })?;
+            let enabled = module
+                .status()
+                .map_err(|err| {
+                    format!(
+                        "failed to read status for module_id '{}': {err}",
+                        module.module_id()
+                    )
+                })?
+                .enabled;
+            current.insert(
+                module.module_id().to_string(),
+                (module, spec, health, enabled),
+            );
+        }
+        let configured = configured_modules
+            .into_iter()
+            .map(|module| (module.module_id.clone(), module))
+            .collect::<BTreeMap<_, _>>();
+
+        let added = configured
+            .keys()
+            .filter(|module_id| !current.contains_key(*module_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = current
+            .keys()
+            .filter(|module_id| !configured.contains_key(*module_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut changed_pending_reload = Vec::new();
+        let mut configuration_changes = BTreeSet::new();
+        let mut enabled_changes = BTreeSet::new();
+        let mut unchanged = 0_u32;
+
+        for (module_id, configured_module) in &configured {
+            let Some((_, current_spec, current_health, current_enabled)) = current.get(module_id)
+            else {
+                continue;
+            };
+            let configuration_changed = *current_spec != configured_module.module_spec()
+                || *current_health != configured_module.health;
+            let enabled_changed = *current_enabled != configured_module.enabled;
+            if configuration_changed {
+                configuration_changes.insert(module_id.clone());
+                changed_pending_reload.push(module_id.clone());
+            }
+            if enabled_changed {
+                enabled_changes.insert(module_id.clone());
+            }
+            if !configuration_changed && !enabled_changed {
+                unchanged = unchanged.saturating_add(1);
+            }
+        }
+
+        for module_id in &removed {
+            let module = &current
+                .get(module_id)
+                .expect("removed module came from current supervisor state")
+                .0;
+            module.retire().await.map_err(|err| {
+                format!("failed to retire module_id '{module_id}' during rescan: {err}")
+            })?;
+            self.supervisor.retire(module_id);
+        }
+
+        for module_id in configured.keys() {
+            let Some((module, _, _, _)) = current.get(module_id) else {
+                continue;
+            };
+            let configured_module = configured
+                .get(module_id)
+                .expect("configured module id came from configured map");
+            if configuration_changes.contains(module_id) {
+                module
+                    .update_configuration(
+                        configured_module.module_spec(),
+                        configured_module.health,
+                    )
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "failed to update module_id '{module_id}' configuration during rescan: {err}"
+                        )
+                    })?;
+            }
+            if enabled_changes.contains(module_id) {
+                module
+                    .set_enabled(configured_module.enabled)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "failed to apply module_id '{module_id}' enabled={} during rescan: {err}",
+                            configured_module.enabled
+                        )
+                    })?;
+            }
+        }
+
+        for module_id in &added {
+            let configured_module = configured
+                .get(module_id)
+                .expect("added module id came from configured map");
+            supervisor
+                .supervise_configured_with_health(
+                    configured_module.module_spec(),
+                    configured_module.enabled,
+                    configured_module.health,
+                )
+                .map_err(|err| {
+                    format!("failed to add module_id '{module_id}' during rescan: {err}")
+                })?;
+        }
+
+        Ok(SupervisorRescanResult {
+            added,
+            removed,
+            changed_pending_reload,
+            unchanged,
+        })
+    }
+
     async fn handle_supervisor_set_enabled(
         &self,
         frame: Frame,
         module_id: String,
         enabled: bool,
     ) -> Result<Vec<Frame>, RouterError> {
+        let operation_lock = self.supervisor.operation_lock();
+        let _operation_guard = operation_lock.lock().await;
         let Some(module) = self.supervisor.get(&module_id) else {
             return Ok(vec![control_error_frame(
                 &frame,

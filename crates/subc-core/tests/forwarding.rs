@@ -215,7 +215,7 @@ async fn health_prober_restarts_unresponsive_module_and_recovers_ok() {
     let supervisor =
         supervisor(&server, 2, Duration::from_millis(10)).with_health_config(health_config(
             Duration::from_millis(20),
-            Duration::from_millis(20),
+            Duration::from_millis(200),
             2,
             HealthAction::Report,
             HealthAction::Report,

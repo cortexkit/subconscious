@@ -41,8 +41,8 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const USAGE: &str = "usage: subc-probe --subc <connection-file> [--module-id <id>] \
 [--root <path>] [--harness <name>] [--session <id>] [--tool <name>] \
-[--args <json-object>] [--list-only] [--supervisor-restart <module-id>]
-             [--supervisor-disable <module-id>] [--supervisor-enable <module-id>]
+[--args <json-object>] [--list-only] [--supervisor-rescan]
+             [--supervisor-restart <module-id>] [--supervisor-disable <module-id>] [--supervisor-enable <module-id>]
              [--supervisor-health] [--health-probe <module-id>]";
 
 #[tokio::main]
@@ -62,6 +62,7 @@ struct ProbeArgs {
     tool: Option<String>,
     args: Value,
     list_only: bool,
+    supervisor_rescan: bool,
     supervisor_restart: Option<String>,
     supervisor_set_enabled: Option<(String, bool)>,
     supervisor_health: bool,
@@ -97,6 +98,26 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
         .await
         .map_err(|source| ProbeError::Message(format!("authenticate: {source}")))?;
     eprintln!("[probe] authenticated");
+
+    if args.supervisor_rescan {
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorRescan {})?;
+        let response = control_rpc(&mut stream, body).await?;
+        match response.header.ty {
+            FrameType::Response => {
+                let value: Value = serde_json::from_slice(&response.body)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            FrameType::Error => {
+                return Err(ProbeError::Rejected(decode_error_body(&response.body)))
+            }
+            ty => {
+                return Err(ProbeError::Message(format!(
+                    "unexpected supervisor.rescan frame {ty:?}"
+                )))
+            }
+        }
+    }
 
     // Operator op: drain + respawn a single supervised module, then exit.
     // Used to roll one module onto a freshly built binary without restarting
@@ -470,6 +491,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
     let mut tool = None;
     let mut args_value = json!({});
     let mut list_only = false;
+    let mut supervisor_rescan = false;
     let mut supervisor_restart = None;
     let mut supervisor_set_enabled = None;
     let mut supervisor_health = false;
@@ -494,6 +516,8 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
                 .map_err(|e| ProbeError::Message(format!("--args is not valid JSON: {e}")))?;
         } else if arg == OsStr::new("--list-only") {
             list_only = true;
+        } else if arg == OsStr::new("--supervisor-rescan") {
+            supervisor_rescan = true;
         } else if arg == OsStr::new("--supervisor-restart") {
             supervisor_restart = Some(take_str(&mut args, "--supervisor-restart")?);
         } else if arg == OsStr::new("--supervisor-disable") {
@@ -531,6 +555,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
         tool,
         args: args_value,
         list_only,
+        supervisor_rescan,
         supervisor_restart,
         supervisor_set_enabled,
         supervisor_health,

@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorRescanResult,
 };
 use subc_protocol::{
     manifest::{
@@ -131,6 +131,10 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             },
         ),
         (
+            "client_control_request_supervisor_rescan",
+            ClientControlRequest::SupervisorRescan {},
+        ),
+        (
             "client_control_request_supervisor_set_enabled",
             ClientControlRequest::SupervisorSetEnabled {
                 module_id: "aft-tools".to_string(),
@@ -195,6 +199,17 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             },
         ),
         (
+            "client_control_response_supervisor_rescan",
+            ClientControlResponse::SupervisorRescan {
+                result: SupervisorRescanResult {
+                    added: vec!["new-tools".to_string()],
+                    removed: vec!["old-tools".to_string()],
+                    changed_pending_reload: vec!["aft-tools".to_string()],
+                    unchanged: 3,
+                },
+            },
+        ),
+        (
             "client_control_response_supervisor_health_probe",
             ClientControlResponse::SupervisorHealthProbe {
                 module_id: "aft-tools".to_string(),
@@ -222,6 +237,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.list".to_string(),
         "supervisor.restart".to_string(),
         "supervisor.reload".to_string(),
+        "supervisor.rescan".to_string(),
         "supervisor.set_enabled".to_string(),
         "supervisor.health_probe".to_string(),
         "supervisor.health".to_string(),

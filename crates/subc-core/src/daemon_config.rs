@@ -10,7 +10,7 @@ use std::{
 use serde::Deserialize;
 use subc_jsonc::jsonc_to_json;
 
-use crate::{HealthAction, HealthConfig};
+use crate::{HealthAction, HealthConfig, ModuleSpec};
 
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
@@ -85,6 +85,19 @@ pub struct ConfiguredModule {
     /// spawn nonce.
     pub reserved_prefixes: Vec<String>,
     pub health: HealthConfig,
+}
+
+impl ConfiguredModule {
+    pub fn module_spec(&self) -> ModuleSpec {
+        ModuleSpec {
+            module_id: self.module_id.clone(),
+            program: self.program.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            reserved: self.reserved,
+            reserved_prefixes: self.reserved_prefixes.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]

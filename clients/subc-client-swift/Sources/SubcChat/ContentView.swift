@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
     @StateObject private var roomsVM = RoomsViewModel()
+    @StateObject private var observeVM = ObserveViewModel()
 
     var body: some View {
         TabView {
@@ -10,6 +11,12 @@ struct ContentView: View {
                 .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
             RoomsView(vm: roomsVM)
                 .tabItem { Label("Rooms", systemImage: "person.3") }
+            ObserveView(vm: observeVM, lane: .athena)
+                .tabItem { Label("Athena", systemImage: "person.2.wave.2") }
+            ObserveView(vm: observeVM, lane: .gather)
+                .tabItem { Label("Gathers", systemImage: "doc.text.magnifyingglass") }
+            ObserveView(vm: observeVM, lane: .checks)
+                .tabItem { Label("Checks", systemImage: "checkmark.seal") }
         }
         .frame(minWidth: 760, minHeight: 480)
     }

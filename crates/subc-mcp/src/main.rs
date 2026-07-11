@@ -683,6 +683,13 @@ fn service_error_to_reverse_error(error: ServiceError) -> ErrorData {
 
 #[tokio::main]
 async fn main() {
+    // Side-effect-free provenance probe, evaluated before any runtime arg
+    // parsing or I/O so `ck-subc-mcp --version` never reaches shim/module setup.
+    if env::args_os().nth(1).is_some_and(|arg| arg == "--version") {
+        println!("ck-subc-mcp {}", env!("CARGO_PKG_VERSION"));
+        process::exit(0);
+    }
+
     let code = match run_from_env().await {
         Ok(()) => 0,
         Err(error) => {

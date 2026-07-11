@@ -120,19 +120,19 @@ struct ObserveView: View {
                         section("Sentinels", s.joined(separator: ", "))
                     }
                     if let attempts = d.attempts, !attempts.isEmpty {
-                        Text("Members").font(.caption).bold()
-                        ForEach(attempts) { a in
-                            HStack(spacing: 6) {
-                                stateChip(a.state ?? "?")
-                                Text(a.model?.label ?? a.subjectKey ?? "member").font(.system(size: 12))
-                                Spacer()
-                                if let sid = a.sessionId {
-                                    Button("transcript") {
-                                        vm.openTranscript(sessionId: sid, projectRoot: a.projectRoot)
-                                    }
-                                    .font(.caption2)
-                                }
-                            }
+                        // Panel members are the fanout/merge attempts; classify and
+                        // gather attempts are pipeline stages, not members (both often
+                        // route to the same model, so unsplit they read as duplicate
+                        // "members"). Split by phase, keeping both visible.
+                        let members = attempts.filter { ["fanout", "merge"].contains($0.phase ?? "") }
+                        let pipeline = attempts.filter { !["fanout", "merge"].contains($0.phase ?? "") }
+                        if !pipeline.isEmpty {
+                            Text("Pipeline").font(.caption).bold()
+                            ForEach(pipeline) { a in attemptRow(a, showPhase: true) }
+                        }
+                        if !members.isEmpty {
+                            Text("Members").font(.caption).bold()
+                            ForEach(members) { a in attemptRow(a, showPhase: false) }
                         }
                     }
                     if let ev = d.evidence, let c = ev.count, c > 0 {
@@ -184,6 +184,23 @@ struct ObserveView: View {
     }
 
     // MARK: Shared bits
+
+    private func attemptRow(_ a: ConsultAttempt, showPhase: Bool) -> some View {
+        HStack(spacing: 6) {
+            stateChip(a.state ?? "?")
+            if showPhase, let p = a.phase {
+                Text(p).font(.caption2).foregroundColor(.secondary)
+            }
+            Text(a.model?.label ?? a.subjectKey ?? "member").font(.system(size: 12))
+            Spacer()
+            if let sid = a.sessionId {
+                Button("transcript") {
+                    vm.openTranscript(sessionId: sid, projectRoot: a.projectRoot)
+                }
+                .font(.caption2)
+            }
+        }
+    }
 
     private func section(_ label: String, _ text: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {

@@ -4,8 +4,8 @@ name: Release
 # Each PUBLISHABLE crate (subc-protocol, subc-transport) versions and publishes
 # independently — they are leaf crates with no inter-crate publish-order
 # dependency. subc-core is publish=false (the daemon, never published to
-# crates.io) — its release lane instead uploads BINARY artifacts (subc-core,
-# subc-probe, ck, fake-aft-stub, subc-mcp) to a GitHub release so sibling repos'
+# crates.io) — its release lane instead uploads BINARY artifacts (ck-subc,
+# subc-probe, ck, fake-aft-stub, ck-subc-mcp) to a GitHub release so sibling repos'
 # CI (e.g. AFT's subc e2e lane) can fetch a pinned daemon without a source
 # checkout. Tag `subc-core-v<version>` to cut one.
 on:
@@ -89,7 +89,7 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
-            --notes "subc daemon binaries for sibling-repo CI (subc-core, subc-probe, ck, fake-aft-stub, subc-mcp)." \
+            --notes "subc daemon binaries for sibling-repo CI (ck-subc, subc-probe, ck, fake-aft-stub, ck-subc-mcp)." \
             2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
 

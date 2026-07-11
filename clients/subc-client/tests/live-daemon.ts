@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 export const ROOT = join(import.meta.dir, "..", "..", "..");
-export const DAEMON = join(ROOT, "target", "debug", "subc-core");
+export const DAEMON = join(ROOT, "target", "debug", "ck-subc");
 export const CONN_NAME = "subc-connection.json";
 
 let buildChecked = false;
@@ -33,7 +33,7 @@ export function ensureSubcCoreBuilt(): void {
     }
   }
   if (!existsSync(DAEMON)) {
-    throw new Error(`subc-core binary was not produced at ${DAEMON}`);
+    throw new Error(`ck-subc binary was not produced at ${DAEMON}`);
   }
   buildChecked = true;
 }

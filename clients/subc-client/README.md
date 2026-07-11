@@ -73,10 +73,11 @@ fails loud with an `AuthError` rather than connecting insecurely.
 bun test          # 23 unit + 2 live-handshake
 ```
 
-The live-handshake tests boot the real `subc-core` binary
-(`target/debug/subc-core`) and complete the handshake against it — the
+The live-handshake tests boot the real daemon binary
+(`target/debug/ck-subc`) and complete the handshake against it — the
 byte-identity authority for this client. They skip automatically when the binary
-is not built; run `cargo build -p subc-core` first (the CI lane does this).
+is not built; run `cargo build -p subc-core` first (the CI lane does this; the
+package builds the `ck-subc` executable).
 
 ## Layout
 

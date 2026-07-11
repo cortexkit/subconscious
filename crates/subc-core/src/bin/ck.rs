@@ -1252,6 +1252,13 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     command: Command::Help(top_help()),
                 })
             }
+            Some(arg) if arg == OsStr::new("--version") || arg == OsStr::new("-V") => {
+                return Ok(CkArgs {
+                    subc,
+                    json,
+                    command: Command::Help(format!("ck {}", env!("CARGO_PKG_VERSION"))),
+                })
+            }
             Some(arg) if arg.to_string_lossy().starts_with('-') => {
                 return Err(CkError::Usage(format!(
                     "unknown flag '{}'\n\n{}",

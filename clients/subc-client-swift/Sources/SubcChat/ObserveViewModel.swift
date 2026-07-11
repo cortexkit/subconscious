@@ -192,6 +192,11 @@ final class ObserveViewModel: ObservableObject {
             if let r = transcriptRoot, FileManager.default.fileExists(atPath: r) { return r }
             return callerDirectory
         }()
+        // alfonso-core surfaces its LOCAL session form; broca's lineage lives
+        // under the wrapped wire form (its consumer prefixes "alfonso:"). Bind
+        // with the wrapped string. Idempotent: once alfonso's next deploy hands
+        // us the full "alfonso:…" string verbatim, this no-ops.
+        let brocaSession = target.hasPrefix("alfonso:") ? target : "alfonso:\(target)"
         work.async { [weak self] in
             guard let self else { return }
             do {
@@ -203,10 +208,10 @@ final class ObserveViewModel: ObservableObject {
                     moduleId: "broca",
                     projectRoot: root,
                     harness: "runner",
-                    session: target)
+                    session: brocaSession)
                 var params: [String: Any] = ["limit": 400]
                 if let o = ordinal { params["from_ordinal"] = o }
-                params["session"] = ["project_root": root, "harness": "runner", "session": target]
+                params["session"] = ["project_root": root, "harness": "runner", "session": brocaSession]
                 let reply = try c.callManagement(routeChannel: ch, method: "session.read", params: params)
                 guard let result = reply["result"] as? [String: Any] else {
                     throw SubcError(message: "session.read: reply had no result")

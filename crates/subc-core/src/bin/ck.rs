@@ -37,7 +37,71 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
 const QUOTA_MODULE_ID: &str = "ai-provider-quota";
 const CK_HARNESS: &str = "ck";
 
-const TOP_HELP: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info\n\nany other domain dispatches to a ck-<domain> binary on PATH: 'ck fed …' runs 'ck-fed …'\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
+
+const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
+
+/// Top-level help with the externally-dispatched domains discovered from PATH
+/// (any executable named ck-<domain>), so 'ck' shows the REAL command surface
+/// of this machine, not just the built-ins.
+fn top_help() -> String {
+    let external = discover_external_domains();
+    let mut out = String::from(TOP_HELP_BASE);
+    if external.is_empty() {
+        out.push_str("\n\nany other domain dispatches to a ck-<domain> binary on PATH\n\n");
+    } else {
+        out.push_str("\n\ninstalled domains (dispatched to ck-<domain>):\n");
+        for domain in &external {
+            out.push_str(&format!("  {domain}\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str(TOP_HELP_TAIL);
+    out
+}
+
+/// Executables named `ck-<domain>` on PATH, deduped and sorted. The `ck-`
+/// prefix is also the fleet's supervised-daemon naming convention, so daemon
+/// binaries living in module data dirs are naturally absent (not on PATH).
+fn discover_external_domains() -> Vec<String> {
+    let Some(path_var) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let mut domains = Vec::new();
+    for dir in env::split_paths(&path_var) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(domain) = name.strip_prefix("ck-") else {
+                continue;
+            };
+            if domain.is_empty() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // fs::metadata (not DirEntry::metadata) so symlinked tools count:
+                // installed ck-* binaries are conventionally symlinks into
+                // target/release trees.
+                let executable = fs::metadata(entry.path())
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false);
+                if !executable {
+                    continue;
+                }
+            }
+            let domain = domain.strip_suffix(".exe").unwrap_or(domain);
+            domains.push(domain.to_string());
+        }
+    }
+    domains.sort();
+    domains.dedup();
+    domains
+}
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set";
 
@@ -109,7 +173,8 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
     match process::Command::new(&program).args(tail).status() {
         Ok(status) => process::exit(status.code().unwrap_or(1)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CkError::Usage(format!(
-            "unknown domain '{domain}' (no built-in command and no '{program}' on PATH)\n\n{TOP_HELP}"
+            "unknown domain '{domain}' (no built-in command and no '{program}' on PATH)\n\n{}",
+            top_help()
         ))),
         Err(err) => Err(CkError::Message(format!("failed to run {program}: {err}"))),
     }
@@ -130,7 +195,7 @@ enum Command {
     },
     /// Explicit help request (bare `ck`, `ck <domain>` with no verb, `ck help …`,
     /// `-h/--help`): prints to stdout and exits 0 without touching the daemon.
-    Help(&'static str),
+    Help(String),
     /// Unknown domain: git-style external dispatch to a `ck-<domain>` binary on
     /// PATH with the remaining args passed through verbatim.
     External {
@@ -1173,7 +1238,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                 return Ok(CkArgs {
                     subc,
                     json,
-                    command: Command::Help(TOP_HELP),
+                    command: Command::Help(top_help()),
                 })
             }
             Some(arg) if arg == OsStr::new("--subc") => {
@@ -1184,13 +1249,14 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                 return Ok(CkArgs {
                     subc,
                     json,
-                    command: Command::Help(TOP_HELP),
+                    command: Command::Help(top_help()),
                 })
             }
             Some(arg) if arg.to_string_lossy().starts_with('-') => {
                 return Err(CkError::Usage(format!(
-                    "unknown flag '{}'\n\n{TOP_HELP}",
-                    arg.to_string_lossy()
+                    "unknown flag '{}'\n\n{}",
+                    arg.to_string_lossy(),
+                    top_help()
                 )))
             }
             Some(arg) => {
@@ -1245,20 +1311,20 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         "help" => {
             let topic = tail.first().map(|t| t.to_string_lossy());
             Ok(Command::Help(match topic.as_deref() {
-                Some("module") => MODULE_HELP,
-                Some("quota") => QUOTA_HELP,
-                Some("health") => HEALTH_HELP,
-                Some("daemon") => DAEMON_HELP,
-                _ => TOP_HELP,
+                Some("module") => MODULE_HELP.into(),
+                Some("quota") => QUOTA_HELP.into(),
+                Some("health") => HEALTH_HELP.into(),
+                Some("daemon") => DAEMON_HELP.into(),
+                _ => top_help(),
             }))
         }
         "module" => {
             let verb = match tail.first() {
-                None => return Ok(Command::Help(MODULE_HELP)),
+                None => return Ok(Command::Help(MODULE_HELP.into())),
                 Some(v) => v.to_string_lossy().into_owned(),
             };
             if verb == "-h" || verb == "--help" || verb == "help" {
-                return Ok(Command::Help(MODULE_HELP));
+                return Ok(Command::Help(MODULE_HELP.into()));
             }
             let id = |n: usize| -> Result<String, CkError> {
                 tail.get(n)
@@ -1286,16 +1352,16 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         }
         "health" => match tail.first() {
             None => Ok(Command::Health),
-            Some(_) => Ok(Command::Help(HEALTH_HELP)),
+            Some(_) => Ok(Command::Help(HEALTH_HELP.into())),
         },
         "daemon" => match tail.first() {
             None => Ok(Command::Daemon),
-            Some(_) => Ok(Command::Help(DAEMON_HELP)),
+            Some(_) => Ok(Command::Help(DAEMON_HELP.into())),
         },
         "quota" => {
             let provider = tail.first().map(|t| t.to_string_lossy().into_owned());
             match provider.as_deref() {
-                Some("-h") | Some("--help") | Some("help") => Ok(Command::Help(QUOTA_HELP)),
+                Some("-h") | Some("--help") | Some("help") => Ok(Command::Help(QUOTA_HELP.into())),
                 _ => Ok(Command::Quota {
                     provider_id: provider,
                 }),
@@ -1310,7 +1376,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
 
 fn take_value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString, CkError> {
     args.next()
-        .ok_or_else(|| CkError::Usage(format!("{flag} requires a value\n\n{TOP_HELP}")))
+        .ok_or_else(|| CkError::Usage(format!("{flag} requires a value; run bare ck for usage")))
 }
 
 fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConnection, CkError> {

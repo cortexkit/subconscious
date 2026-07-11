@@ -96,7 +96,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
     let module_bin = ensure_binary(
@@ -243,7 +243,7 @@ async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_ro
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
 
@@ -301,7 +301,7 @@ async fn module_handle_catalog_update_surfaces_frozen_field_rejections() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
 
@@ -333,7 +333,7 @@ async fn module_handle_catalog_update_fails_fast_after_connection_death() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
 
@@ -370,7 +370,7 @@ async fn subc_consumer_reports_outcome_unknown_mid_call_then_reopens_after_resta
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
     let module_bin = ensure_binary(
@@ -478,7 +478,7 @@ async fn subc_consumer_retries_unknown_module_until_provider_registers_and_bound
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
     let module_bin = ensure_binary(
@@ -570,7 +570,7 @@ async fn subc_consumer_multiplexes_targets_and_classifies_reconnect_in_flight() 
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
     let module_bin = ensure_binary(
@@ -703,7 +703,7 @@ async fn subc_consumer_close_route_releases_the_route_and_reopens_fresh() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
     let module_bin = ensure_binary(
@@ -796,7 +796,7 @@ async fn subc_consumer_subscribe_streaming_contract() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "subc-core"),
+        binary_path(&workspace, "ck-subc"),
         &["build", "-p", "subc-core", "--bins"],
     );
     let module_bin = ensure_binary(

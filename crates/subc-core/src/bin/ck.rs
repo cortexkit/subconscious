@@ -36,7 +36,18 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 const QUOTA_MODULE_ID: &str = "ai-provider-quota";
 const CK_HARNESS: &str = "ck";
-const USAGE: &str = "usage: ck [--subc <connection-file>] [--json] <command>\n\ncommands:\n  ck module list\n  ck module status <id>\n  ck module restart <id>\n  ck module rescan\n  ck module stop <id>\n  ck module start <id>\n  ck health\n  ck daemon\n  ck quota [<provider-id>]";
+
+const TOP_HELP: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info\n\nany other domain dispatches to a ck-<domain> binary on PATH: 'ck fed …' runs 'ck-fed …'\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
+
+const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set";
+
+const QUOTA_HELP: &str = "ck quota — AI-provider quota and usage windows\n\nusage: ck [--json] quota [<provider-id>]\n\n  ck quota            all tracked providers\n  ck quota claude     one provider's windows in detail";
+
+const HEALTH_HELP: &str =
+    "ck health — one-line health for every supervised module\n\nusage: ck [--json] health";
+
+const DAEMON_HELP: &str =
+    "ck daemon — daemon version, uptime, and connection info\n\nusage: ck [--json] daemon";
 
 #[tokio::main]
 async fn main() {
@@ -51,6 +62,17 @@ async fn main() {
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let args = parse_args(argv)?;
+
+    // Help and external dispatch resolve without a daemon connection: help is
+    // static text, and an external ck-<domain> tool discovers its own connection.
+    if let Command::Help(text) = args.command {
+        println!("{text}");
+        return Ok(());
+    }
+    if let Command::External { domain, tail } = args.command {
+        return dispatch_external(&domain, &tail);
+    }
+
     let resolved = discover_connection_file(args.subc.as_deref())?;
     let mut client = CkClient::connect(resolved).await?;
 
@@ -74,6 +96,22 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Quota { provider_id } => {
             quota(&mut client, provider_id.as_deref(), args.json).await
         }
+        Command::Help(_) | Command::External { .. } => unreachable!("handled before connect"),
+    }
+}
+
+/// Git-style external dispatch: `ck <domain> …` runs `ck-<domain> …` from PATH,
+/// passing the tail through verbatim and propagating the child's exit code.
+/// Dispatcher-local flags (`--subc`, `--json`) given BEFORE the domain are not
+/// forwarded; an external tool parses its own flags from the tail.
+fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
+    let program = format!("ck-{domain}");
+    match process::Command::new(&program).args(tail).status() {
+        Ok(status) => process::exit(status.code().unwrap_or(1)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CkError::Usage(format!(
+            "unknown domain '{domain}' (no built-in command and no '{program}' on PATH)\n\n{TOP_HELP}"
+        ))),
+        Err(err) => Err(CkError::Message(format!("failed to run {program}: {err}"))),
     }
 }
 
@@ -87,7 +125,18 @@ enum Command {
     Module(ModuleCommand),
     Health,
     Daemon,
-    Quota { provider_id: Option<String> },
+    Quota {
+        provider_id: Option<String>,
+    },
+    /// Explicit help request (bare `ck`, `ck <domain>` with no verb, `ck help …`,
+    /// `-h/--help`): prints to stdout and exits 0 without touching the daemon.
+    Help(&'static str),
+    /// Unknown domain: git-style external dispatch to a `ck-<domain>` binary on
+    /// PATH with the remaining args passed through verbatim.
+    External {
+        domain: String,
+        tail: Vec<OsString>,
+    },
 }
 
 enum ModuleCommand {
@@ -1114,31 +1163,70 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
     let _program = args.next();
     let mut subc = None;
     let mut json = false;
-    let mut positionals = Vec::new();
 
-    while let Some(arg) = args.next() {
-        if arg == OsStr::new("--subc") {
-            subc = Some(PathBuf::from(take_value(&mut args, "--subc")?));
-        } else if arg == OsStr::new("--json") {
-            json = true;
-        } else if arg == OsStr::new("-h") || arg == OsStr::new("--help") {
-            return Err(CkError::Usage(USAGE.into()));
-        } else if arg.to_string_lossy().starts_with("--") {
-            return Err(CkError::Usage(format!(
-                "unknown argument '{}'\n{USAGE}",
-                arg.to_string_lossy()
-            )));
-        } else {
-            positionals.push(arg.into_string().map_err(|value| {
-                CkError::Usage(format!(
-                    "command arguments must be UTF-8, got '{}'\n{USAGE}",
-                    value.to_string_lossy()
-                ))
-            })?);
+    // Dispatcher-local flags are only parsed BEFORE the domain; everything from
+    // the first positional on is the command tail (an unknown domain forwards it
+    // verbatim to the external ck-<domain> binary, flags and all).
+    let domain: String = loop {
+        match args.next() {
+            None => {
+                return Ok(CkArgs {
+                    subc,
+                    json,
+                    command: Command::Help(TOP_HELP),
+                })
+            }
+            Some(arg) if arg == OsStr::new("--subc") => {
+                subc = Some(PathBuf::from(take_value(&mut args, "--subc")?));
+            }
+            Some(arg) if arg == OsStr::new("--json") => json = true,
+            Some(arg) if arg == OsStr::new("-h") || arg == OsStr::new("--help") => {
+                return Ok(CkArgs {
+                    subc,
+                    json,
+                    command: Command::Help(TOP_HELP),
+                })
+            }
+            Some(arg) if arg.to_string_lossy().starts_with('-') => {
+                return Err(CkError::Usage(format!(
+                    "unknown flag '{}'\n\n{TOP_HELP}",
+                    arg.to_string_lossy()
+                )))
+            }
+            Some(arg) => {
+                break arg.into_string().map_err(|value| {
+                    CkError::Usage(format!(
+                        "domain must be UTF-8, got '{}'",
+                        value.to_string_lossy()
+                    ))
+                })?
+            }
         }
-    }
+    };
 
-    let command = parse_command(&positionals)?;
+    let raw_tail: Vec<OsString> = args.collect();
+
+    // Built-in domains accept the dispatcher flags anywhere (`ck module list
+    // --subc <file>` is long-standing usage); an external domain's tail is
+    // forwarded verbatim so the ck-<domain> tool parses its own flags.
+    let tail = if is_builtin_domain(&domain) {
+        let mut positionals = Vec::new();
+        let mut iter = raw_tail.into_iter();
+        while let Some(arg) = iter.next() {
+            if arg == OsStr::new("--subc") {
+                subc = Some(PathBuf::from(take_value(&mut iter, "--subc")?));
+            } else if arg == OsStr::new("--json") {
+                json = true;
+            } else {
+                positionals.push(arg);
+            }
+        }
+        positionals
+    } else {
+        raw_tail
+    };
+
+    let command = parse_command(&domain, &tail)?;
     Ok(CkArgs {
         subc,
         json,
@@ -1146,51 +1234,83 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
     })
 }
 
-fn parse_command(positionals: &[String]) -> Result<Command, CkError> {
-    match positionals {
-        [domain, verb] if domain == "module" && verb == "list" => {
-            Ok(Command::Module(ModuleCommand::List))
-        }
-        [domain, verb, module_id] if domain == "module" && verb == "status" => {
-            Ok(Command::Module(ModuleCommand::Status {
-                module_id: module_id.clone(),
+fn is_builtin_domain(domain: &str) -> bool {
+    matches!(domain, "module" | "health" | "daemon" | "quota" | "help")
+}
+
+fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
+    // Built-in domains parse their verbs strictly and answer verbless/misused
+    // invocations with the DOMAIN's help, not the whole command tree.
+    match domain {
+        "help" => {
+            let topic = tail.first().map(|t| t.to_string_lossy());
+            Ok(Command::Help(match topic.as_deref() {
+                Some("module") => MODULE_HELP,
+                Some("quota") => QUOTA_HELP,
+                Some("health") => HEALTH_HELP,
+                Some("daemon") => DAEMON_HELP,
+                _ => TOP_HELP,
             }))
         }
-        [domain, verb, module_id] if domain == "module" && verb == "restart" => {
-            Ok(Command::Module(ModuleCommand::Restart {
-                module_id: module_id.clone(),
-            }))
+        "module" => {
+            let verb = match tail.first() {
+                None => return Ok(Command::Help(MODULE_HELP)),
+                Some(v) => v.to_string_lossy().into_owned(),
+            };
+            if verb == "-h" || verb == "--help" || verb == "help" {
+                return Ok(Command::Help(MODULE_HELP));
+            }
+            let id = |n: usize| -> Result<String, CkError> {
+                tail.get(n)
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .ok_or_else(|| {
+                        CkError::Usage(format!(
+                            "ck module {verb} needs a module id\n\n{MODULE_HELP}"
+                        ))
+                    })
+            };
+            let command = match verb.as_str() {
+                "list" => ModuleCommand::List,
+                "rescan" => ModuleCommand::Rescan,
+                "status" => ModuleCommand::Status { module_id: id(1)? },
+                "restart" => ModuleCommand::Restart { module_id: id(1)? },
+                "stop" => ModuleCommand::Stop { module_id: id(1)? },
+                "start" => ModuleCommand::Start { module_id: id(1)? },
+                other => {
+                    return Err(CkError::Usage(format!(
+                        "unknown verb 'module {other}'\n\n{MODULE_HELP}"
+                    )))
+                }
+            };
+            Ok(Command::Module(command))
         }
-        [domain, verb] if domain == "module" && verb == "rescan" => {
-            Ok(Command::Module(ModuleCommand::Rescan))
+        "health" => match tail.first() {
+            None => Ok(Command::Health),
+            Some(_) => Ok(Command::Help(HEALTH_HELP)),
+        },
+        "daemon" => match tail.first() {
+            None => Ok(Command::Daemon),
+            Some(_) => Ok(Command::Help(DAEMON_HELP)),
+        },
+        "quota" => {
+            let provider = tail.first().map(|t| t.to_string_lossy().into_owned());
+            match provider.as_deref() {
+                Some("-h") | Some("--help") | Some("help") => Ok(Command::Help(QUOTA_HELP)),
+                _ => Ok(Command::Quota {
+                    provider_id: provider,
+                }),
+            }
         }
-        [domain, verb, module_id] if domain == "module" && verb == "stop" => {
-            Ok(Command::Module(ModuleCommand::Stop {
-                module_id: module_id.clone(),
-            }))
-        }
-        [domain, verb, module_id] if domain == "module" && verb == "start" => {
-            Ok(Command::Module(ModuleCommand::Start {
-                module_id: module_id.clone(),
-            }))
-        }
-        [command] if command == "health" => Ok(Command::Health),
-        [command] if command == "daemon" => Ok(Command::Daemon),
-        [domain] if domain == "quota" => Ok(Command::Quota { provider_id: None }),
-        [domain, provider_id] if domain == "quota" => Ok(Command::Quota {
-            provider_id: Some(provider_id.clone()),
+        _ => Ok(Command::External {
+            domain: domain.to_string(),
+            tail: tail.to_vec(),
         }),
-        [] => Err(CkError::Usage(format!("missing command\n{USAGE}"))),
-        _ => Err(CkError::Usage(format!(
-            "unknown command '{}'; expected a supported <domain> <verb>\n{USAGE}",
-            positionals.join(" ")
-        ))),
     }
 }
 
 fn take_value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString, CkError> {
     args.next()
-        .ok_or_else(|| CkError::Usage(format!("{flag} requires a value\n{USAGE}")))
+        .ok_or_else(|| CkError::Usage(format!("{flag} requires a value\n\n{TOP_HELP}")))
 }
 
 fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConnection, CkError> {

@@ -5,6 +5,15 @@ edition = "2021"
 publish = false
 description = "subc daemon core: loopback TCP transport and opaque-byte splice router."
 
+# The crate/library name stays `subc-core` (path-dep'd by ck/subc-probe and
+# consumed as the `subc_core` lib), but the daemon EXECUTABLE is `ck-subc` for
+# fleet process-name uniformity (all supervised processes are ck-*). Declaring
+# this [[bin]] for src/main.rs suppresses the auto `subc-core` binary; the other
+# src/bin/*.rs auto-binaries (ck, subc-probe, fake-aft-stub) are unaffected.
+[[bin]]
+name = "ck-subc"
+path = "src/main.rs"
+
 [features]
 bench-harness = []
 

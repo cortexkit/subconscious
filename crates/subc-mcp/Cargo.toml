@@ -5,6 +5,12 @@ edition = "2021"
 publish = false
 description = "subc MCP integration skeleton: thin stdio shim and two-faced module (no MCP yet)."
 
+# Package stays `subc-mcp` (path-dep'd, `cargo build -p subc-mcp`); the
+# executable is `ck-subc-mcp` for fleet process-name uniformity.
+[[bin]]
+name = "ck-subc-mcp"
+path = "src/main.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

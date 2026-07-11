@@ -2806,7 +2806,7 @@ async fn mcp_module_without_spawn_attestation_exits_loud_before_serving() {
     let xdg_config_home = server.daemon.temp_dir.join("mcp-unattested-xdg-config");
     fs::create_dir_all(&xdg_config_home).unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"));
     command
         .arg("module")
         .arg("--subc")
@@ -3104,7 +3104,7 @@ fn mcp_module_spec(
 ) -> ModuleSpec {
     ModuleSpec {
         module_id: module_id.to_owned(),
-        program: PathBuf::from(env!("CARGO_BIN_EXE_subc-mcp")),
+        program: PathBuf::from(env!("CARGO_BIN_EXE_ck-subc-mcp")),
         args: vec![
             "module".to_string(),
             "--connection-file".to_string(),
@@ -3220,7 +3220,7 @@ fn module_command(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"));
     command
         .arg("module")
         .arg("--subc")
@@ -3260,7 +3260,7 @@ fn spawn_shim(
     project_root: &Path,
     xdg_config_home: &Path,
 ) -> ShimProcess {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_subc-mcp"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"));
     command
         .arg("shim")
         .arg("--module-connection-file")

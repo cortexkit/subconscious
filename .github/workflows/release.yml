@@ -70,14 +70,14 @@ jobs:
           fi
 
       - name: Build release binaries
-        run: cargo build --release -p subc-core -p subc-mcp --bin subc-core --bin subc-probe --bin ck --bin fake-aft-stub --bin subc-mcp
+        run: cargo build --release -p subc-core -p subc-mcp --bin ck-subc --bin subc-probe --bin ck --bin fake-aft-stub --bin ck-subc-mcp
 
       # Asset naming: <bin>-<target>.tar.gz containing the bare binary, plus a
       # .sha256 sidecar per asset — consumers pin the tag and verify the digest.
       - name: Package + checksum
         run: |
           mkdir -p dist
-          for bin in subc-core subc-probe ck fake-aft-stub subc-mcp; do
+          for bin in ck-subc subc-probe ck fake-aft-stub ck-subc-mcp; do
             tar -C target/release -czf "dist/${bin}-${{ matrix.target.name }}.tar.gz" "$bin"
             shasum -a 256 "dist/${bin}-${{ matrix.target.name }}.tar.gz" | awk '{print $1}' > "dist/${bin}-${{ matrix.target.name }}.tar.gz.sha256"
           done

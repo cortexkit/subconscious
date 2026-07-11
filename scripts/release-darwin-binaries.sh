@@ -10,7 +10,7 @@ set -euo pipefail
 
 TAG="${1:?usage: $0 subc-core-v<version>}"
 TARGET_NAME="darwin-arm64"
-BINS=(subc-core subc-probe ck fake-aft-stub subc-mcp)
+BINS=(ck-subc subc-probe ck fake-aft-stub ck-subc-mcp)
 REPO="cortexkit/subconscious"
 
 [[ "$TAG" =~ ^subc-core-v([0-9].*)$ ]] || { echo "tag must be subc-core-v<version>" >&2; exit 1; }
@@ -27,7 +27,7 @@ git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null || { echo "tag ${TAG} no
 }
 
 cargo build --release -p subc-core -p subc-mcp \
-  --bin subc-core --bin subc-probe --bin ck --bin fake-aft-stub --bin subc-mcp
+  --bin ck-subc --bin subc-probe --bin ck --bin fake-aft-stub --bin ck-subc-mcp
 
 DIST=$(mktemp -d)
 trap 'rm -rf "$DIST"' EXIT

@@ -88,8 +88,12 @@ struct ObserveView: View {
     private func consultRow(_ row: ConsultRow) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                stateChip(row.state ?? row.phase ?? "?")
+                stateChip(row.terminalReason ?? row.phase ?? "?")
                 Text(row.consultClass ?? "").font(.caption2).foregroundColor(.secondary)
+                if let s = row.sentinels, !s.isEmpty {
+                    Image(systemName: "flag.fill").font(.caption2).foregroundColor(.orange)
+                        .help(s.joined(separator: ", "))
+                }
                 Spacer()
                 if let ts = row.startedAtMs {
                     Text(Self.timeString(ts)).font(.caption2).foregroundColor(.secondary)
@@ -106,18 +110,21 @@ struct ObserveView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 if let d = vm.consultDetail {
-                    if let q = d.question {
+                    if let q = d.questionPreview {
                         section("Question", q)
                     }
-                    if let history = d.phaseHistory, !history.isEmpty {
-                        section("Phases", history.joined(separator: " → "))
+                    if let cp = d.currentPhase {
+                        section("Phase", "\(cp.phase ?? "?")" + (cp.round.map { $0 >= 0 ? " · round \($0)" : "" } ?? ""))
+                    }
+                    if let s = d.sentinels, !s.isEmpty {
+                        section("Sentinels", s.joined(separator: ", "))
                     }
                     if let attempts = d.attempts, !attempts.isEmpty {
                         Text("Members").font(.caption).bold()
                         ForEach(attempts) { a in
                             HStack(spacing: 6) {
                                 stateChip(a.state ?? "?")
-                                Text(a.memberLabel ?? a.model ?? "member").font(.system(size: 12))
+                                Text(a.model?.label ?? a.subjectKey ?? "member").font(.system(size: 12))
                                 Spacer()
                                 if let sid = a.sessionId {
                                     Button("transcript") {
@@ -126,16 +133,13 @@ struct ObserveView: View {
                                     .font(.caption2)
                                 }
                             }
-                            if let v = a.verdict, !v.isEmpty {
-                                Text(v).font(.system(size: 11)).foregroundColor(.secondary).lineLimit(4)
-                            }
                         }
                     }
-                    if let s = d.synthesis, !s.isEmpty {
-                        section("Synthesis", s)
+                    if let ev = d.evidence, let c = ev.count, c > 0 {
+                        section("Evidence", "\(c) unit(s)" + (ev.unitKinds.map { " — " + $0.map { "\($0.key): \($0.value)" }.sorted().joined(separator: ", ") } ?? ""))
                     }
-                    if let r = d.resultText, !r.isEmpty {
-                        section("Result", r)
+                    if let s = d.synthesis, s.present == true, let r = s.resultPreview, !r.isEmpty {
+                        section("Synthesis\(s.mechanical == true ? " (mechanical)" : "")", r)
                     }
                 } else if vm.selectedConsultId != nil {
                     ProgressView().padding(30)

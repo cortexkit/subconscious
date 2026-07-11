@@ -34,47 +34,96 @@ enum JSONKeyNormalizer {
 
 // MARK: - Athena consult rows (alfonso-core athena.list_consults / athena.get_consult)
 
+/// Row shape pinned from ALF's captured wire examples
+/// (alfonso .cortexkit/alfonso/docs/observe-ops-wire-examples.md, 2026-07-11).
 struct ConsultRow: Codable, Identifiable {
     var consultId: String
-    var state: String?
     var phase: String?
+    var terminalReason: String?
     var consultClass: String?
     var questionPreview: String?
     var startedAtMs: Int64?
     var finishedAtMs: Int64?
-    var memberCount: Int?
-    var sentinelFlags: [String]?
+    var ordinal: Int64?
+    var memberRoutes: [String]?
+    var sentinels: [String]?
+    var evidenceCount: Int?
+    var verdictCount: Int?
 
     enum CodingKeys: String, CodingKey {
-        case consultId, state, phase, questionPreview, startedAtMs, finishedAtMs, memberCount, sentinelFlags
+        case consultId, phase, terminalReason, questionPreview, startedAtMs, finishedAtMs,
+             ordinal, memberRoutes, sentinels, evidenceCount, verdictCount
         case consultClass = "class"
     }
 
     var id: String { consultId }
 }
 
+/// Attempt `model` is an object {provider, model} on the wire.
+struct AttemptModel: Codable {
+    var provider: String?
+    var model: String?
+
+    var label: String {
+        switch (provider, model) {
+        case let (.some(p), .some(m)): return "\(p)/\(m)"
+        case let (nil, .some(m)): return m
+        case let (.some(p), nil): return p
+        default: return "member"
+        }
+    }
+}
+
 struct ConsultAttempt: Codable, Identifiable {
     var attemptId: String?
-    var memberLabel: String?
-    var model: String?
+    var model: AttemptModel?
     var state: String?
+    var phase: String?
+    var round: Int?
     var sessionId: String?
     var projectRoot: String?
-    var verdict: String?
+    var subjectKey: String?
+    var startedAtMs: Int64?
+    var settledAtMs: Int64?
 
     var id: String { attemptId ?? sessionId ?? UUID().uuidString }
 }
 
+/// The store keeps no durable phase-transition history; the wire returns this
+/// honest current-phase tuple instead of a phaseHistory array.
+struct CurrentPhase: Codable {
+    var phase: String?
+    var round: Int?
+    var epoch: Int?
+    var enteredAtMs: Int64?
+}
+
+struct SynthesisInfo: Codable {
+    var present: Bool?
+    var mechanical: Bool?
+    var resultPreview: String?
+    var sentinels: [String]?
+}
+
+struct EvidenceInfo: Codable {
+    var count: Int?
+    var unitKinds: [String: Int]?
+}
+
 struct ConsultDetail: Codable {
     var consultId: String
-    var state: String?
     var phase: String?
-    var question: String?
-    var phaseHistory: [String]?
+    var terminalReason: String?
+    var questionPreview: String?
+    var currentPhase: CurrentPhase?
     var attempts: [ConsultAttempt]?
-    var evidenceUnitCount: Int?
-    var synthesis: String?
-    var resultText: String?
+    var evidence: EvidenceInfo?
+    var evidenceCount: Int?
+    var sentinels: [String]?
+    var synthesis: SynthesisInfo?
+    var memberRoutes: [String]?
+    var startedAtMs: Int64?
+    var finishedAtMs: Int64?
 }
 
 // MARK: - Recent runs (alfonso-core observe.recent_runs)
@@ -82,14 +131,16 @@ struct ConsultDetail: Codable {
 struct ObservedRun: Codable, Identifiable {
     var ordinal: Int64?
     var kind: String?
+    var runKey: String?
     var sessionId: String?
     var projectRoot: String?
     var model: String?
     var startedAtMs: Int64?
+    var finishedAtMs: Int64?
     var state: String?
     var preview: String?
 
-    var id: String { sessionId ?? "\(ordinal ?? 0)" }
+    var id: String { runKey ?? sessionId ?? "\(ordinal ?? 0)" }
 }
 
 // MARK: - Broca transcript (session.read)

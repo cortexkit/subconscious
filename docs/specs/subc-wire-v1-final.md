@@ -169,7 +169,13 @@ The first binding of any route slot gets epoch `1`.
   invoking `on_bound`. For HAND-ROLLED serve loops (no callback seam to
   rename) the same rule is stated as a testable invariant: no route-scoped
   egress frame for a binding may precede that binding's RouteBind ack in
-  the writer queue.
+  the writer queue. Handler-side convention (one convention, not per-handler
+  choice): handler-owned session state MAY be installed at `on_bind`
+  (decision time) — the SDK's serialized dispatch guarantees no request
+  reaches the handler before the ack, so decision-time install is safe and
+  cheap; only route-scoped EGRESS waits for `on_bound`. A rejected or
+  ack-failed bind gets its handler state cleaned via the existing
+  route-gone path.
 - **Single-winner bind resolution**: `Pending → Committed | Aborted |
   Rejected` is ONE write-locked transition. The arbitrating participants are
   DAEMON-SIDE ONLY: module reply, daemon relay deadline, owner teardown

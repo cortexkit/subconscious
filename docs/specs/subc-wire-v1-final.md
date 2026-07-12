@@ -143,25 +143,37 @@ The first binding of any route slot gets epoch `1`.
   Serialization is per-socket, so an immediate post-ack reverse Request
   relayed to the client could otherwise enter the client's FIFO AHEAD of the
   RouteOpen response, and §3.3 layer 2 would correctly drop it as an unknown
-  slot — losing legal traffic. Normative: on accepted bind, the daemon
-  commits AND enqueues the RouteOpen response to the client BEFORE relaying
-  any subsequent module frame for that route; client-egress capacity for the
-  RouteOpen response is reserved BEFORE `route.bind` is relayed to the
-  module, so the response enqueue cannot fail at commit time. Consumer-SDK
-  rule (normative, all three clients): the dispatcher installs the returned
-  handle into its channel→epoch map BEFORE resolving the `routeOpen` caller
-  and before reading the next frame off the socket.
+  slot — losing legal traffic. Normative recipe (the details are
+  load-bearing): BEFORE relaying `route.bind`, the daemon acquires an OWNED
+  client-egress permit (without holding the forwarding lock) and stores it
+  in the pending reservation together with a PREBUILT RouteOpen response
+  frame carrying the original client corr and negotiated version (the ack
+  handler otherwise possesses only the module's response). The Accepted
+  transition performs `commit_route_locked` and consumes that permit — table
+  publication and response-queue insertion happen with NO unlock between
+  them. Rejected/Aborted releases the permit exactly once. This ordering
+  guarantee is PER ROUTE-HANDLE: frames for unrelated routes may legally
+  appear before the RouteOpen response; only same-route traffic is ordered
+  behind it. Consumer-SDK rule (normative, all three clients): the
+  dispatcher installs the returned handle into its channel→epoch map BEFORE
+  resolving the `routeOpen` caller and before reading the next frame off
+  the socket.
 - **Single-winner bind resolution**: `Pending → Committed | Aborted |
-  Rejected` is ONE write-locked transition. Exactly one path (module ack,
-  module rejection, client timeout/cancel, drain, connection death) wins;
-  the winner alone performs commit/release/abort-GOODBYE, and every loser
-  observes the terminal result and performs NOTHING. In particular a
-  route.open timeout that fires after the module's ack has already committed
-  the route observes `Committed` and must not abort the now-live route (it
-  reports timeout to the caller; the client's failure to install the handle
-  then makes the route unused — released by normal close paths — but never
-  half-torn). The same single-winner arbitration applies to module-control
-  RPCs (whose completion path today ignores the stored deadline).
+  Rejected` is ONE write-locked transition. The arbitrating participants are
+  DAEMON-SIDE ONLY: module reply, daemon relay deadline, owner teardown
+  (drain), and connection death. Exactly one wins; the winner alone performs
+  commit/release/abort-GOODBYE, every loser observes the terminal result and
+  performs NOTHING. SDK-LOCAL timeout/cancel is NOT an arbitration
+  participant — it alters no daemon state (there is no concurrent channel-0
+  cancel path; the client's socket loop is serial). The SDK rule for a
+  locally-timed-out `route.open` (normative, all three clients): retain the
+  control-op identity; if a successful RouteOpen response later arrives, do
+  NOT silently drop it — the daemon has committed a live route — immediately
+  close it with a GOODBYE for the returned handle (escalating to connection
+  close if that GOODBYE cannot be queued), so a late-committed route is
+  never orphaned. The same single-winner arbitration applies to
+  module-control RPCs (whose completion path today ignores the stored
+  deadline).
 
 ### 3.2.1 Client API shape: the route handle (gate finding 4)
 
@@ -202,12 +214,19 @@ Therefore every endpoint (all three clients' consumer AND provider/serve
 loops, module serve loops via the SDKs) maintains its own `channel → epoch`
 map for live routes and validates every nonzero-channel ingress frame
 BEFORE dispatch or any lifecycle effect: epoch mismatch or unknown slot →
-silent drop (counter). In-flight request state is keyed by
-`(channel, epoch, corr)`, so a stale frame can never settle a new binding's
-request even if corr values collide across generations. Because the daemon
-rewrites the epoch to the receiving side's slot epoch at relay, an endpoint
-always compares against its own locally-known epoch — the two-spaces model
-holds.
+silent drop (counter). This OVERRIDES ordinary endpoint unknown-channel
+behavior: Request, Cancel, and Goodbye alike are dropped without an Error
+frame or lifecycle callback for uninstalled/mismatched handles — only the
+daemon's layer 1 emits `unknown_channel` (today's provider loops dispatch
+any nonzero Request and apply any Goodbye without a route map; that
+behavior ends). Provider-side handle liveness: the handle a provider SDK
+exposes to `on_bind` is TENTATIVE — it becomes live in the endpoint map
+only once the accepted RouteBind ack is queued; a rejected bind never
+installs it. In-flight request state is keyed by `(channel, epoch, corr)`,
+so a stale frame can never settle a new binding's request even if corr
+values collide across generations. Because the daemon rewrites the epoch to
+the receiving side's slot epoch at relay, an endpoint always compares
+against its own locally-known epoch — the two-spaces model holds.
 
 **Epoch-fenced release**: FRAME-DRIVEN, route-scoped release (GOODBYE
 handling, `release_client_route`, `release_module_route`) is a single
@@ -239,15 +258,19 @@ epoch E1 and the slot (or a fresh reservation) has since moved to E2,
 closing the connection would destroy E2 state from outside the fence.
 Normative: escalation is a write-locked
 `escalate_client_delivery_failure(connection, channel, expected_epoch)`
-with a slot-state predicate that covers BOTH frame provenances:
-
-- Failing frame from a LIVE binding: close only if the live binding's epoch
-  still equals `expected_epoch`.
-- Failing frame from an ALREADY-REMOVED binding (peer GOODBYEs are emitted
-  after removal, so a failed GOODBYE's binding is gone by construction):
-  close only if the slot is VACANT and the slot's `last_epoch` still equals
-  the frame's epoch — i.e. nothing newer has reserved or bound the slot. Any
-  later reservation or binding invalidates the escalation: log and drop.
+whose predicate is keyed on PUBLICATION, not reservation: the daemon
+maintains `last_published_epoch` per client slot, advanced ONLY by the
+locked commit-and-RouteOpen-enqueue transition (§3.2). Escalation closes
+iff `last_published_epoch == expected_epoch` — regardless of whether the
+failing frame came from a live or an already-removed binding (peer GOODBYEs
+are emitted after removal, so a failed GOODBYE's binding is gone by
+construction). An uncommitted or ABORTED successor reservation does NOT
+invalidate escalation (the endpoint still knows only the failing
+generation, and the close-on-failure reliability floor must hold); a
+COMMITTED/PUBLISHED successor does invalidate it (the endpoint has moved
+on; closing would destroy the successor from outside the fence). Keying on
+reservation-advanced `last_epoch` instead would create escalation
+false-negatives via aborted reservations — a reliability regression.
 
 When escalation does proceed, the connection is marked closing inside the
 forwarding table (under the same lock) BEFORE the out-of-band close
@@ -304,16 +327,22 @@ the live binding (or reservation) under the table lock:
   `status: null, live: false`; both always echo the REQUESTED handle.
 
 **Channel-0 correlation hygiene** (the control channel has no epoch, so
-corr is its only generation axis): channel-0 corr values are allocated from
-ONE shared monotonic allocator per connection/endpoint across ALL control
-uses (bind relays and module-control RPCs — today these are two independent
+corr is its only generation axis): each REQUEST-ORIGINATING endpoint has
+exactly ONE monotonic allocator for all channel-0 requests it originates —
+the daemon's bind relays and module-control RPCs share one allocator per
+target connection/endpoint (today these are two independent wrapping
 cursors, which lets a late route-bind rejection settle a health RPC that
-reused its corr, or vice versa). Corr values are NEVER reused within a
-connection's lifetime; if the u64 space were ever exhausted the connection
-is closed and re-established (unreachable in practice — the rule closes the
-analysis). Late responses to already-settled corrs are dropped, and a
-control Error settles only the entry whose corr it names in the
-single-allocator space.
+reused its corr); a client/module likewise mints all its outbound control
+corrs from one monotonic counter (today: subc-client-rs saturates at
+u64::MAX, subc-mcp and the module-control helper wrap — all become
+monotonic-no-reuse). The two DIRECTIONS are independent spaces: daemon-
+originated and peer-originated requests may use the same corr value
+simultaneously without collision, because responses correlate within the
+originator's space. Responses, Errors, Pongs, and acks ECHO corrs, never
+mint; uncorrelated Push/Goodbye use corr 0. Corr values are never reused
+within a connection's lifetime; on exhaustion, close and re-establish the
+connection (unreachable in practice — the rule closes the analysis). Late
+responses to already-settled corrs are dropped.
 
 Golden JSON vectors for the changed payloads are regenerated.
 
@@ -409,8 +438,8 @@ ships with the shedding implementation, not with flip-day.
 
 | Artifact | Change |
 |---|---|
-| `subc-protocol` | header codec 21B, `epoch` field, ver=2, flags field + decode errors, `RouteBind.epoch` |
-| `subc-control` | `RouteOpen` response `route_epoch: u32` |
+| `subc-protocol` | header codec 21B, `epoch` field, ver=2, flags field + decode errors, `RouteBind.epoch`, `RouteStatus.route_epoch` |
+| `subc-control` | `RouteOpen` response `route_epoch: u32`; `RoutePoll` request `route_epoch: u32` + response handle echo in every arm |
 | `subc-core` | per-slot epoch counters (connection + endpoint scoped), minting at reservation (`PendingRouteBindRelay` carries both epochs + client sink/version), synchronous commit-on-bind-ack under the write lock, epoch-fenced compare-and-remove release paths, epoch-fenced delivery-failure escalation + connection closing-mark, validation+rewrite in relay path, epoch fields on `GoodbyeTarget`/route-Error synthesis, `RouteStatus`/`RoutePoll` epoch validation + handle echo, allocator skip-live + retire-at-MAX, exact-version handshake |
 | `subc-transport` | prefix-first `read_frame` (`frame_io.rs` is the shared fixed-header reader: read+validate the 5-byte prefix, then the remaining header, preserving the body-size rejection before allocating `len` bytes) |
 | TS / Rust / Swift clients | envelope constants + codec; `RouteHandle {channel, epoch}` as the only route-scoped API currency (§3.2.1); endpoint-side ingress epoch validation + `(channel, epoch, corr)` in-flight keying (§3.3 layer 2); `routeOpen` epoch plumb; provider serve loop stamps + validates module-side epoch; call options expose an optional per-call admission class (default NORMAL — first consumer: synapse EXPEDITE on interactive embed queries) |
@@ -523,7 +552,18 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
   ordering); bind single-winner arbitration (timeout-fires-after-ack-commit
   observes Committed and aborts nothing; both lock-order interleavings);
   late cross-class channel-0 Error after timeout settles nothing (shared
-  monotonic corr allocator proof).
+  monotonic corr allocator proof); escalation publication-fence arms:
+  no-successor ⇒ close, ABORTED-successor-reservation ⇒ still close
+  (last_published_epoch unmoved), COMMITTED successor ⇒ suppress; egress
+  permit released exactly once on Rejected/Aborted (and receiver-closure
+  path); client-cleanup-vs-commit lock interleavings; SDK late-RouteOpen
+  cleanup (locally-timed-out open receiving a late success closes the
+  returned handle with GOODBYE, never orphans); endpoint unknown-slot
+  precedence (uninstalled-handle Request/Cancel/Goodbye dropped silently,
+  no Error, no callback); client death between commit and RouteOpen
+  enqueue is absorbed by owner-scoped cleanup (marked-closing connection
+  rejects the enqueue; module side torn down via normal route-gone
+  relay).
 - Endpoint-layer validation (all three clients): a frame carrying a stale
   epoch delivered PAST the daemon (harness-injected) is dropped by the client
   without settling in-flight state or firing handlers; in-flight keyed by

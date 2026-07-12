@@ -453,7 +453,11 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    route-plane seams (not SDK-carried, self-identified via source audit:
    AFT's module frame loop, broca's two seams, subc-mcp) land the
    endpoint-validation layer + `(channel, epoch)` state migration in their
-   own code. As of this writing (9 supervised modules): `ck-subc`,
+   own code — EXCEPT MC's TS shadow-sender (hand-rolled today), which
+   instead DELETES its private framing and migrates onto
+   `@cortexkit/subc-client` at the flip, inheriting the validation layer
+   (hardening a temporary fail-open lane privately would be waste). As of
+   this writing (9 supervised modules): `ck-subc`,
    `ck-subc-mcp`, `ck-aft` (hand-rolled serve loop + TS plugin transport +
    test drivers — three seams),
    `ck-mc`, `ck-thalamus` (live on every CC turn — a stale thalamus is a

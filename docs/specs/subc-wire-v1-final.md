@@ -211,7 +211,7 @@ without a wire change.
 | `subc-control` | `RouteOpen` response `route_epoch: u32` |
 | `subc-core` | per-slot epoch counters (connection + endpoint scoped), assignment at reserve/commit (`commit_route`), validation+rewrite in relay path (`lookup_data_route` callers), stamped daemon-originated frames, allocator skip-live + retire-at-MAX |
 | `subc-transport` | none beyond re-pin (framing reads len from frozen prefix; body offset via `HEADER_LEN`) |
-| TS / Rust / Swift clients | envelope constants + codec, route cache stores `(channel, epoch)`, stamp on every frame, `routeOpen` epoch plumb, provider serve loop stamps module-side epoch |
+| TS / Rust / Swift clients | envelope constants + codec, route cache stores `(channel, epoch)`, stamp on every frame, `routeOpen` epoch plumb, provider serve loop stamps module-side epoch; call options expose an optional per-call admission class (default NORMAL — first consumer: synapse EXPEDITE on interactive embed queries) |
 | `subc-mcp` + all modules | rebuild against bumped crates; hand-rolled channel-0 matches unaffected (body shapes unchanged except RouteBind/RouteOpen additive fields) |
 | Golden vectors | envelope/frame vectors regenerated for all three client languages; auth vectors unchanged (pre-envelope) |
 

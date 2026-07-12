@@ -379,8 +379,13 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    CI green on all three OSes, cross-checked with the Windows clippy target.
 2. Rebuild every fleet binary from the same protocol rev. The synchronized
    set is enumerated from the DAEMON'S LIVE ROSTER (`ck module list` +
-   connected consumers), never from design-round attendance. As of this
-   writing (9 supervised modules): `ck-subc`, `ck-subc-mcp`, `ck-aft`,
+   connected consumers), never from design-round attendance. Hand-rolled
+   route-plane seams (not SDK-carried, self-identified via source audit:
+   AFT's module frame loop, broca's two seams, subc-mcp) land the
+   endpoint-validation layer + `(channel, epoch)` state migration in their
+   own code. As of this writing (9 supervised modules): `ck-subc`,
+   `ck-subc-mcp`, `ck-aft` (hand-rolled serve loop + TS plugin transport +
+   test drivers — three seams),
    `ck-mc`, `ck-thalamus` (live on every CC turn — a stale thalamus is a
    USER-FACING outage, first-class participant), `ck-broca` (BOTH seams
    hand-rolled, not SDK-carried: broca-subc consumer + broca-module-serve

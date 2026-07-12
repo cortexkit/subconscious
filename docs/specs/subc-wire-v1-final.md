@@ -169,9 +169,14 @@ states are exclusive and `EXPEDITE+SHEDDABLE` dies by construction):
   skip-tolerant; recovery is consumer-level (cursor replay / skip-and-log).
   Terminal frames (`StreamEnd`, `Error`, `Response`) are structurally never
   sheddable, so streams always end or the connection closes. Known
-  consumers: broca display-lane deltas (lossy by contract), MC shadow-mirror
-  traffic (the 26GB retention incident class), ALF room hints (design-lossy,
-  poll-floor recovery).
+  consumers: broca display-lane deltas (lossy by contract), ALF room hints
+  (design-lossy, poll-floor recovery), future WAN/Cortex-App telemetry
+  pushes. MC's 26GB shadow-mirror retention incident is the *rationale* for
+  daemon-level shed semantics existing, but the mirror lane itself is NOT a
+  consumer: it sends Request-shaped frames (which stay on client-side
+  bounded-queue discipline, already shipped) and the lane is temporary by
+  design. Request-shed is deliberately not offered — it would require
+  synthetic-error machinery in the daemon.
 - `11` reserved-invalid — decode-rejected (`ReservedAdmissionClass`), same
   posture as priority `0b11`.
 
@@ -242,8 +247,12 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    CI green on all three OSes, cross-checked with the Windows clippy target.
 2. Rebuild every fleet binary from the same protocol rev: `ck-subc`,
    `ck-subc-mcp`, `ck-aft`, `ck-mc`, `ck-thalamus`, `ck-broca`, `ck-quota`,
-   `ck-credentials`, `ck-alfonso-core`, `ck-alfonso-routing`, `ck-synapse`,
-   fed module. Peers rebuild their own repos (peer-owns-repo rule) against
+   `ck-credentials`, `ck-alfonso-core`, `ck-alfonso-routing`, `ck-synapse`.
+   The fed module is NOT a restart participant (not live-supervised anywhere;
+   its only deployment site is the dormant Hetzner box) — it goes under
+   "rebuild before next deploy," and the ver-2 tripwire makes off-cycle
+   staleness fail loud on first HELLO rather than desync. Peers rebuild
+   their own repos (peer-owns-repo rule) against
    the bumped crates; publish `subc-protocol` + `subc-transport` in lockstep
    (republish-the-whole-chain rule) and `@cortexkit/subc-client` for the TS
    consumers.

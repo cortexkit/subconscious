@@ -258,7 +258,11 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    consumers.
 3. Stage binaries at their deploy paths, signed (macOS codesign rule).
 4. One window: stop daemon, swap binaries, `bootout`/`bootstrap` the launchd
-   service, restart OpenCode so plugin-side clients reload.
+   service, restart OpenCode so plugin-side clients reload. Two-artifact
+   participants (alfonso: Rust modules + TS plugin; AFT likewise) must land
+   both artifacts in the same window — a half-flip is loud-down under the
+   ver tripwire (correct, but down until both sides match), never a silent
+   desync.
 5. Verify: fleet re-registers (`ck module list`), health table all-ok,
    `UnsupportedVersion` counter zero (any nonzero = a stale binary, named by
    connection), one end-to-end tool call + one broca turn + one MC transform.

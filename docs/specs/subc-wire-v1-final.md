@@ -186,10 +186,17 @@ The first binding of any route slot gets epoch `1`.
 
 ### 3.2.1 Client API shape: the route handle (gate finding 4)
 
-All three clients expose the pair as ONE immutable value —
-`RouteHandle { channel: u16, epoch: u32 }` — and every route-scoped
-operation (request, subscribe, cancel, close, poll) takes the handle, never
-a bare channel. Managed route caches store handles; the close-beats-reopen
+Wire route identity is `(channel, epoch)`. Each SDK wraps it in an
+immutable `RouteHandle` that ADDITIONALLY carries an opaque, non-wire
+CONNECTION TOKEN minted uniquely for the live socket — epochs are scoped to
+a connection, so a handle from connection C1 must never act on C2, where
+the same `(channel, epoch)` pair can legitimately identify a different
+route after reconnect. Every route-scoped operation (request, subscribe,
+cancel, close, poll) takes the handle, never a bare channel, and requires
+token identity to match the SDK's current connection — otherwise it fails
+locally WITHOUT emitting any frame. The token changes on reconnect and is
+retained by callbacks, pending state, and reverse replies; only `channel`
+and `epoch` are serialized. Managed route caches store handles; the close-beats-reopen
 generation guards compare full handles. This is load-bearing, not
 ergonomics: an API that accepts a bare channel and looks up "the current
 epoch" at send time would stamp STALE application work with the NEW epoch
@@ -244,12 +251,16 @@ binding ONLY if the live epoch matches, returning distinct
 stale/absent/removed outcomes. A GOODBYE validated against E1 can therefore
 never tear down an E2 binding installed between its validation and its
 release — the TOCTOU is closed under the lock, not by ordering.
-OWNER-SCOPED teardown (`cleanup_connection`, endpoint drain) is a different
-shape and stays one: it first marks the owner closing/draining under the
-write lock, then removes that owner's exact current bindings and
-reservations in the same critical section — no caller-supplied epoch,
-because the owner identity itself is the fence (nothing can rebind into a
-marked owner). Peer-notification GOODBYEs are emitted only from
+OWNER-SCOPED teardown is a different shape and has two variants, no
+caller-supplied epoch in either — the owner identity plus a persistent mark
+is the fence: `cleanup_connection` marks the owner closing and removes its
+bindings and reservations in ONE locked transition. Endpoint DRAIN is
+deliberately two-phase (matching the implemented drain-to-quiescence):
+phase one marks the endpoint draining and aborts its reservations in a
+locked transition; after quiescence, phase two removes the endpoint's
+then-current live bindings in one later locked batch. The persistent
+draining mark rejects allocation and commit BETWEEN the phases — nothing
+can rebind into a draining endpoint, which is what makes the gap safe. Peer-notification GOODBYEs are emitted only from
 actually-removed bindings, stamped with each binding's epochs.
 
 **Reserved-slot ingress**: a reservation is NOT a data route. Until commit,

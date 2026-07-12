@@ -67,9 +67,11 @@ One constant, zero machinery.
 
 Two normative rules that make the tripwire actually fire (gate finding 6):
 
-- **Prefix-first reads.** Every frame reader (daemon `read_frame`, all three
-  clients) reads and validates the 5-byte frozen prefix BEFORE reading the
-  remainder of the header. A reader that pulls a fixed 21 bytes up front
+- **Prefix-first reads.** Every frame reader reads and validates the 5-byte
+  frozen prefix BEFORE reading the remainder of the header. Normatively this
+  lands in the SHARED `subc_transport::read_frame` (which the daemon, the
+  Rust SDK, and hand-rolled Rust seams like fed's CatalogClient all use) plus
+  each client library's own reader (TS `socket` reader, Swift). A reader that pulls a fixed 21 bytes up front
   would block forever on a stale sender's 17-byte pure-header frame (only 17
   bytes ever arrive) instead of erroring. Read 5, check `ver`, then read
   `HEADER_LEN - 5 + len`.
@@ -355,7 +357,10 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    the bumped crates; publish `subc-protocol` + `subc-transport` in lockstep
    (republish-the-whole-chain rule) and `@cortexkit/subc-client` for the TS
    consumers.
-3. Stage binaries at their deploy paths, signed (macOS codesign rule).
+3. Stage binaries at their deploy paths, signed (macOS codesign rule). Owners
+   with versioned staging rituals (AFT's `aft-stable`/`ck-aft` symlink +
+   NDJSON versioned cache) restage in the same window so a post-flip module
+   respawn cannot resolve a ver-1 binary.
 4. One window: stop daemon, swap binaries, `bootout`/`bootstrap` the launchd
    service, restart OpenCode so plugin-side clients reload. Two-artifact
    participants (alfonso: Rust modules + TS plugin; AFT likewise) must land

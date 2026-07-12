@@ -382,7 +382,11 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    connected consumers), never from design-round attendance. As of this
    writing (9 supervised modules): `ck-subc`, `ck-subc-mcp`, `ck-aft`,
    `ck-mc`, `ck-thalamus` (live on every CC turn — a stale thalamus is a
-   USER-FACING outage, first-class participant), `ck-broca`, `ck-quota`,
+   USER-FACING outage, first-class participant), `ck-broca` (BOTH seams
+   hand-rolled, not SDK-carried: broca-subc consumer + broca-module-serve
+   loop each land the endpoint-validation layer and RouteHandle migration in
+   broca-owned code; broca-session/broca-run/ck-import rebuild with it;
+   same user-facing class as thalamus), `ck-quota`,
    `ck-credentials`, `ck-alfonso-core`, `ck-alfonso-routing` — plus the
    plugin-side consumers reloading at the OpenCode restart (alfonso TS
    plugin, AFT plugin, MC shadow lane — the latter fail-open, batched free)

@@ -63,8 +63,20 @@ bodies at offset 17; the new reader consumes 21) and fail as confusing garbage
 mid-stream. With the byte bumped, the very first frame from a stale binary
 fails loud and named: `DecodeError::UnsupportedVersion { ver: 1 }` — an
 actionable "rebuild this binary" signal instead of a framing-corruption hunt.
-One constant, zero machinery. This is a deliberate deviation from the room
-synthesis (which kept ver=1), flagged for the gate.
+One constant, zero machinery.
+
+Two normative rules that make the tripwire actually fire (gate finding 6):
+
+- **Prefix-first reads.** Every frame reader (daemon `read_frame`, all three
+  clients) reads and validates the 5-byte frozen prefix BEFORE reading the
+  remainder of the header. A reader that pulls a fixed 21 bytes up front
+  would block forever on a stale sender's 17-byte pure-header frame (only 17
+  bytes ever arrive) instead of erroring. Read 5, check `ver`, then read
+  `HEADER_LEN - 5 + len`.
+- **Exact-version handshake.** HELLO negotiation requires `protocol_ver == 2`
+  exactly. The current `negotiate_version` clamps any offer above the
+  minimum; that clamping is removed — single supported version means
+  accept 2, reject everything else loudly.
 
 ## 3. Per-slot binding epoch
 
@@ -90,37 +102,113 @@ The first binding of any route slot gets epoch `1`.
 
 - The daemon owns all epoch counters, exactly as it owns channel allocation.
   Per connection (client side) and per endpoint (module side) it keeps a
-  lazily-populated `slot → last_epoch` map; binding a slot increments it.
+  lazily-populated `slot → last_epoch` map.
+- **Epochs are minted at RESERVATION time, not commit** (gate finding 5):
+  when the daemon reserves the client/module channel pair for a
+  `route.open`, it increments both slots' epoch counters and stores both
+  epochs in the pending reservation (`PendingRouteBindRelay`). The epochs
+  travel with the reservation into `commit_route` and into every abandonment
+  path (abort GOODBYEs for failed binds are stamped with the reserved
+  epoch). A reservation that is released without commit does NOT return the
+  epoch — the increment is consumed either way, so a later rebinding of the
+  slot is always distinguishable from the aborted reservation.
 - `route.open` response (`ClientControlResponse::RouteOpen`) gains
   `route_epoch: u32` next to `route_channel`.
 - `route.bind` (`ModuleControlRequest::RouteBind`) gains `epoch: u32` next to
   `route_channel` (the module-slot epoch).
 - Both sides stamp their `(channel, epoch)` pair into every frame header on
   that route. Channel-0 frames carry `epoch = 0`.
+- **Module emission window**: a module MUST NOT emit data-plane frames on a
+  bound channel before it has acked the `route.bind` carrying that epoch
+  (already true in practice — the module learns the channel from RouteBind);
+  this is now normative so the pre-commit window has no legal module
+  traffic.
 
-### 3.3 Validation (direction-agnostic, per-frame)
+### 3.2.1 Client API shape: the route handle (gate finding 4)
 
-At relay, for every data-plane frame (`lookup_data_route` ingress, both
-directions):
+All three clients expose the pair as ONE immutable value —
+`RouteHandle { channel: u16, epoch: u32 }` — and every route-scoped
+operation (request, subscribe, cancel, close, poll) takes the handle, never
+a bare channel. Managed route caches store handles; the close-beats-reopen
+generation guards compare full handles. This is load-bearing, not
+ergonomics: an API that accepts a bare channel and looks up "the current
+epoch" at send time would stamp STALE application work with the NEW epoch
+after a reuse, laundering exactly the frames the epoch exists to kill. The
+epoch a request carries must be the epoch its route was opened under.
+Internal callers holding bare channels today (`subc-mcp` binding table,
+fake-aft-stub, `ck`/`subc-probe`, Swift client) migrate to handles.
+
+### 3.3 Validation: two layers, both mandatory
+
+**Layer 1 — daemon relay** (`lookup_data_route` ingress, both directions):
 
 - Binding found for `(connection|endpoint, channel)` **and**
-  `frame.epoch == binding.<side>_epoch` → forward (rewriting channel+epoch).
+  `frame.epoch == binding.<side>_epoch` → forward (rewriting channel+epoch
+  to the binding's OTHER-side values).
 - Binding found, epoch mismatch → **DROP** the frame (debug log + counter,
   never an Error frame — erroring would inject into the *new* binding's corr
-  space, which is the confusion the epoch exists to prevent). This is the
-  stale-frame kill: late frames from a previous binding of a reused slot can
-  never reach the new tenant.
+  space, which is the confusion the epoch exists to prevent).
 - No binding → unchanged existing behavior (`unknown_channel` Error for
-  Requests, silent drop otherwise).
+  Requests, silent drop otherwise), with the Error frame stamping the
+  INGRESS frame's validated epoch (daemon-synthesized route Errors always
+  copy the epoch of the frame they answer; a mismatched frame produces no
+  Error at all).
+
+**Layer 2 — receiving endpoints** (gate finding 1, BLOCKER-driven): relay
+validation alone is insufficient because forwarding is not atomic with the
+table lookup — the daemon snapshots the binding, releases the table lock,
+then enqueues; a release+rebind can interleave, so a frame validated against
+epoch E1 can arrive at an endpoint after its slot was rebound to E2.
+Therefore every endpoint (all three clients' consumer AND provider/serve
+loops, module serve loops via the SDKs) maintains its own `channel → epoch`
+map for live routes and validates every nonzero-channel ingress frame
+BEFORE dispatch or any lifecycle effect: epoch mismatch or unknown slot →
+silent drop (counter). In-flight request state is keyed by
+`(channel, epoch, corr)`, so a stale frame can never settle a new binding's
+request even if corr values collide across generations. Because the daemon
+rewrites the epoch to the receiving side's slot epoch at relay, an endpoint
+always compares against its own locally-known epoch — the two-spaces model
+holds.
+
+**Epoch-fenced release** (gate finding 2, BLOCKER-driven): every release
+path (`release_client_route`, `release_module_route`, GOODBYE handling,
+`cleanup_connection`, drain) is a single write-locked compare-and-remove
+taking `expected_epoch`; it removes the binding ONLY if the live epoch
+matches, returning distinct stale/absent/removed outcomes. A GOODBYE
+validated against E1 can therefore never tear down an E2 binding installed
+between its validation and its release — the TOCTOU is closed under the
+lock, not by ordering. Peer-notification GOODBYEs are emitted only from the
+actually-removed binding, stamped with that binding's epochs.
 
 Direction-agnostic is load-bearing (AFT's pin, ALF concurring): reverse-lane
 Requests (module→client elicitation/sampling, `execute_effect`) are validated
-identically — a consent prompt surviving a rebind onto a new epoch is a
-cross-tenant delivery. Pure-header frames (`Cancel`, `Goodbye`, `Ping`,
-`Pong`) carry and are validated on epoch like any other frame; a stale-epoch
-`GOODBYE` is dropped, which also closes the late-GOODBYE-tears-down-the-new-
-binding race by construction. Daemon-originated frames (cleanup GOODBYEs,
-module-death propagation) are stamped with the target binding's current epoch.
+identically at both layers — a consent prompt surviving a rebind onto a new
+epoch is a cross-tenant delivery. Pure-header frames (`Cancel`, `Goodbye`,
+`Ping`, `Pong`) carry and are validated on epoch like any other frame.
+Daemon-originated frames (cleanup GOODBYEs, module-death propagation, drain
+GOODBYEs, abort-bind GOODBYEs) are all stamped with the target binding's (or
+reservation's) epoch — the carrying types (`GoodbyeTarget`, `RouterError`
+paths, `PendingRouteBindRelay`) gain epoch fields so no synthesized frame
+ever goes out unstamped.
+
+### 3.3.1 Route-referencing channel-0 operations (gate finding 3)
+
+Any channel-0 payload that references a route by channel number must carry
+the epoch alongside, and the daemon validates the pair atomically against
+the live binding (or reservation) under the table lock:
+
+- `ModuleControlPush::RouteStatus` gains `route_epoch: u32`; a status push
+  whose epoch does not match the current binding/reservation of that module
+  slot is dropped, never cached — a delayed status from a dead route can no
+  longer poison the status cache of the slot's new tenant.
+- `ClientControlRequest::RoutePoll` gains `route_epoch: u32`; a poll carrying
+  a stale epoch answers "unknown route" rather than reporting the new
+  binding's state to a holder of the old one.
+- Rule for the future: ANY new control op that names a route names it as
+  `(channel, epoch)`. A bare channel number in a control body is a spec
+  violation.
+
+Golden JSON vectors for both payloads are regenerated.
 
 ### 3.4 Allocator interaction and wrap
 
@@ -186,10 +274,15 @@ Composition rule (BROCA's sentence, normative): the admission class governs
 PRIORITY. SHEDDABLE remains illegal outside `Push`/`StreamData` regardless of
 priority bits.
 
-v1 daemon implementation MAY treat EXPEDITE as a no-op and MAY not yet
-implement shedding; the semantics are reserved and normative now so senders
-can stamp classes immediately and behavior can turn on daemon-side later
-without a wire change.
+Flip-day implementation posture (resolving the optional-vs-tested ambiguity):
+the daemon MAY treat EXPEDITE as a relay no-op and MAY NOT yet implement
+shedding — the semantics are reserved and normative now so senders can stamp
+classes immediately and daemon-side behavior can turn on later without a
+wire change. What IS mandatory at flip-day and tested (§10): decode
+acceptance/rejection of all class values, end-to-end class-bit preservation
+through relay, and — whenever shedding is implemented — the no-credit-effect
+and no-connection-close properties. The drop-under-pressure behavioral test
+ships with the shedding implementation, not with flip-day.
 
 ## 6. Decode-error taxonomy (additions)
 
@@ -209,10 +302,10 @@ without a wire change.
 |---|---|
 | `subc-protocol` | header codec 21B, `epoch` field, ver=2, flags field + decode errors, `RouteBind.epoch` |
 | `subc-control` | `RouteOpen` response `route_epoch: u32` |
-| `subc-core` | per-slot epoch counters (connection + endpoint scoped), assignment at reserve/commit (`commit_route`), validation+rewrite in relay path (`lookup_data_route` callers), stamped daemon-originated frames, allocator skip-live + retire-at-MAX |
+| `subc-core` | per-slot epoch counters (connection + endpoint scoped), minting at reservation (`PendingRouteBindRelay` carries both epochs), epoch-fenced compare-and-remove release paths, validation+rewrite in relay path, epoch fields on `GoodbyeTarget`/route-Error synthesis, `RouteStatus`/`RoutePoll` epoch validation, allocator skip-live + retire-at-MAX, prefix-first `read_frame`, exact-version handshake |
 | `subc-transport` | none beyond re-pin (framing reads len from frozen prefix; body offset via `HEADER_LEN`) |
-| TS / Rust / Swift clients | envelope constants + codec, route cache stores `(channel, epoch)`, stamp on every frame, `routeOpen` epoch plumb, provider serve loop stamps module-side epoch; call options expose an optional per-call admission class (default NORMAL — first consumer: synapse EXPEDITE on interactive embed queries) |
-| `subc-mcp` + all modules | rebuild against bumped crates; hand-rolled channel-0 matches unaffected (body shapes unchanged except RouteBind/RouteOpen additive fields) |
+| TS / Rust / Swift clients | envelope constants + codec; `RouteHandle {channel, epoch}` as the only route-scoped API currency (§3.2.1); endpoint-side ingress epoch validation + `(channel, epoch, corr)` in-flight keying (§3.3 layer 2); `routeOpen` epoch plumb; provider serve loop stamps + validates module-side epoch; call options expose an optional per-call admission class (default NORMAL — first consumer: synapse EXPEDITE on interactive embed queries) |
+| `subc-mcp` + all modules | rebuild against bumped crates; bare-channel internal tables (subc-mcp binding table, fake-aft-stub, `ck`, `subc-probe`) migrate to `RouteHandle`; hand-rolled channel-0 matches: RouteBind/RouteOpen/RouteStatus/RoutePoll gain epoch fields (additive), golden JSONs regenerated |
 | Golden vectors | envelope/frame vectors regenerated for all three client languages; auth vectors unchanged (pre-envelope) |
 
 `RouteTarget` (Tool/Management surface discriminator) is untouched — FED's
@@ -283,9 +376,22 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
   error).
 - Epoch lifecycle integration (subc-core): reuse-after-release delivers only
   current-epoch frames; stale-epoch frame on a reused slot is dropped and
-  counted; stale GOODBYE does not tear down the new binding; reverse-lane
-  Request with stale epoch is dropped (direction-agnostic proof); daemon
-  rewrite correctness (client epoch ≠ module epoch on the same binding).
+  counted; stale GOODBYE does not tear down the new binding (epoch-fenced
+  release proof: interleave release/rebind between lookup and release, assert
+  E2 survives); reverse-lane Request with stale epoch is dropped
+  (direction-agnostic proof); daemon rewrite correctness (client epoch ≠
+  module epoch on the same binding); abandoned-bind abort GOODBYE carries the
+  reserved epoch; stale RouteStatus push does not poison the status cache of
+  a reused slot; stale RoutePoll answers unknown-route.
+- Endpoint-layer validation (all three clients): a frame carrying a stale
+  epoch delivered PAST the daemon (harness-injected) is dropped by the client
+  without settling in-flight state or firing handlers; in-flight keyed by
+  (channel, epoch, corr) proof: same corr across two epochs settles only its
+  own generation.
+- Stale-binary tripwire: a v1 (17-byte) pure-header frame against the new
+  reader produces UnsupportedVersion{ver:1} promptly (prefix-first read
+  proof, non-blocking); HELLO offering protocol_ver=1 (or 3) is rejected
+  loudly — no clamping.
 - Allocator: never assigns live slot; retires at u32::MAX (unit-level with an
   injected counter).
 - Sheddable: daemon drop-under-pressure path drops SHEDDABLE Push/StreamData

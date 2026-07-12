@@ -245,14 +245,20 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
 
 1. Land the full change set on master (protocol + core + clients + vectors),
    CI green on all three OSes, cross-checked with the Windows clippy target.
-2. Rebuild every fleet binary from the same protocol rev: `ck-subc`,
-   `ck-subc-mcp`, `ck-aft`, `ck-mc`, `ck-thalamus`, `ck-broca`, `ck-quota`,
-   `ck-credentials`, `ck-alfonso-core`, `ck-alfonso-routing`, `ck-synapse`.
-   The fed module is NOT a restart participant (not live-supervised anywhere;
-   its only deployment site is the dormant Hetzner box) — it goes under
-   "rebuild before next deploy," and the ver-2 tripwire makes off-cycle
-   staleness fail loud on first HELLO rather than desync. Peers rebuild
-   their own repos (peer-owns-repo rule) against
+2. Rebuild every fleet binary from the same protocol rev. The synchronized
+   set is enumerated from the DAEMON'S LIVE ROSTER (`ck module list` +
+   connected consumers), never from design-round attendance. As of this
+   writing (9 supervised modules): `ck-subc`, `ck-subc-mcp`, `ck-aft`,
+   `ck-mc`, `ck-thalamus` (live on every CC turn — a stale thalamus is a
+   USER-FACING outage, first-class participant), `ck-broca`, `ck-quota`,
+   `ck-credentials`, `ck-alfonso-core`, `ck-alfonso-routing` — plus the
+   plugin-side consumers reloading at the OpenCode restart (alfonso TS
+   plugin, AFT plugin, MC shadow lane — the latter fail-open, batched free)
+   and the Swift client/chat app. Re-enumerate the roster at flip time.
+   "Rebuild before next deploy" class (not live-supervised, off-cycle safe
+   under the tripwire): fed module (dormant Hetzner box), `ck-synapse` (not
+   in prod subc.jsonc), cortexkit-e2e suite (repin + rebuild before its next
+   run). Peers rebuild their own repos (peer-owns-repo rule) against
    the bumped crates; publish `subc-protocol` + `subc-transport` in lockstep
    (republish-the-whole-chain rule) and `@cortexkit/subc-client` for the TS
    consumers.

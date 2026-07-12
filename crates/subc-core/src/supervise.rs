@@ -1386,11 +1386,25 @@ async fn probe_module_health(
     )
     .map_err(|err| HealthProbeError::new(format!("failed to build health.check frame: {err}")))?;
 
-    if let Err(err) = module_sink.send(frame).await {
-        let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
-        return Err(HealthProbeError::new(format!(
-            "failed to send health.check: {err}"
-        )));
+    // The enqueue itself must be bounded by the probe deadline: FrameSink.send
+    // blocks waiting for capacity when the module's egress queue is full, and an
+    // unbounded await here freezes the whole supervision actor (it stops polling
+    // Child::wait and supervisor commands), making the module unrecoverable
+    // in-band. On timeout the probe fails like any transport failure.
+    match timeout_at(deadline, module_sink.send(frame)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
+            return Err(HealthProbeError::new(format!(
+                "failed to send health.check: {err}"
+            )));
+        }
+        Err(_elapsed) => {
+            let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
+            return Err(HealthProbeError::new(
+                "health.check send timed out before enqueue (module egress full)",
+            ));
+        }
     }
 
     match timeout_at(deadline, receiver).await {

@@ -166,7 +166,10 @@ The first binding of any route slot gets epoch `1`.
   and only then invokes an optional `on_bound(RouteHandle)` callback, from
   which immediate route traffic (e.g. a reverse Request) may legally begin.
   Rejection or ack-queue failure discards the tentative state without
-  invoking `on_bound`.
+  invoking `on_bound`. For HAND-ROLLED serve loops (no callback seam to
+  rename) the same rule is stated as a testable invariant: no route-scoped
+  egress frame for a binding may precede that binding's RouteBind ack in
+  the writer queue.
 - **Single-winner bind resolution**: `Pending → Committed | Aborted |
   Rejected` is ONE write-locked transition. The arbitrating participants are
   DAEMON-SIDE ONLY: module reply, daemon relay deadline, owner teardown

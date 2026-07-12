@@ -399,10 +399,18 @@ fn parse_health_config(
         cadence,
         deadline,
         failure_threshold,
-        on_degraded: raw
-            .on_degraded
-            .map(health_action)
-            .unwrap_or(defaults.on_degraded),
+        on_degraded: match raw.on_degraded {
+            Some(RawHealthAction::Restart) => {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module '{module_id}' health.on_degraded may not be 'restart': a degraded module is slow-but-moving, so restarting it converts transient load into an outage. Use 'report' or 'alert' (Health-Path v2: only total wreckage or reported-unresponsiveness restarts)."
+                    ),
+                });
+            }
+            Some(action) => health_action(action),
+            None => defaults.on_degraded,
+        },
         on_failing: raw
             .on_failing
             .map(health_action)

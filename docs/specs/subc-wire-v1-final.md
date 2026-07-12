@@ -158,6 +158,15 @@ The first binding of any route slot gets epoch `1`.
   dispatcher installs the returned handle into its channel→epoch map BEFORE
   resolving the `routeOpen` caller and before reading the next frame off
   the socket.
+- **Provider bind sequence (`on_bind` is decision-only)**: `on_bind`
+  receives tentative bind metadata but MUST NOT emit route traffic — today's
+  callbacks run before the ack is queued, and pre-ack traffic would reach a
+  reservation and be dropped. After `on_bind` returns Accept, the provider
+  SDK queues the RouteBind ack, installs the handle into its endpoint map,
+  and only then invokes an optional `on_bound(RouteHandle)` callback, from
+  which immediate route traffic (e.g. a reverse Request) may legally begin.
+  Rejection or ack-queue failure discards the tentative state without
+  invoking `on_bound`.
 - **Single-winner bind resolution**: `Pending → Committed | Aborted |
   Rejected` is ONE write-locked transition. The arbitrating participants are
   DAEMON-SIDE ONLY: module reply, daemon relay deadline, owner teardown
@@ -219,10 +228,10 @@ behavior: Request, Cancel, and Goodbye alike are dropped without an Error
 frame or lifecycle callback for uninstalled/mismatched handles — only the
 daemon's layer 1 emits `unknown_channel` (today's provider loops dispatch
 any nonzero Request and apply any Goodbye without a route map; that
-behavior ends). Provider-side handle liveness: the handle a provider SDK
-exposes to `on_bind` is TENTATIVE — it becomes live in the endpoint map
-only once the accepted RouteBind ack is queued; a rejected bind never
-installs it. In-flight request state is keyed by `(channel, epoch, corr)`,
+behavior ends). Provider-side handle liveness: the metadata `on_bind` sees
+is TENTATIVE — the handle becomes live in the endpoint map only once the
+accepted RouteBind ack is queued, and route traffic legally begins at
+`on_bound` (§3.2); a rejected bind never installs it. In-flight request state is keyed by `(channel, epoch, corr)`,
 so a stale frame can never settle a new binding's request even if corr
 values collide across generations. Because the daemon rewrites the epoch to
 the receiving side's slot epoch at relay, an endpoint always compares
@@ -553,17 +562,26 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
   observes Committed and aborts nothing; both lock-order interleavings);
   late cross-class channel-0 Error after timeout settles nothing (shared
   monotonic corr allocator proof); escalation publication-fence arms:
-  no-successor ⇒ close, ABORTED-successor-reservation ⇒ still close
-  (last_published_epoch unmoved), COMMITTED successor ⇒ suppress; egress
-  permit released exactly once on Rejected/Aborted (and receiver-closure
-  path); client-cleanup-vs-commit lock interleavings; SDK late-RouteOpen
+  no successor or only an uncommitted/ABORTED successor reservation ⇒
+  close (last_published_epoch unmoved), committed-and-published successor
+  ⇒ suppress; egress permit released exactly once on Rejected/Aborted (and
+  receiver-closure path); client-cleanup-vs-Accepted exercises both lock
+  winners (cleanup-first marks closing and aborts before commit;
+  Accepted-first atomically commits-and-enqueues, then cleanup removes the
+  binding and notifies the module — commit and enqueue are one locked
+  transition, no interleaving exists between them); SDK late-RouteOpen
   cleanup (locally-timed-out open receiving a late success closes the
-  returned handle with GOODBYE, never orphans); endpoint unknown-slot
-  precedence (uninstalled-handle Request/Cancel/Goodbye dropped silently,
-  no Error, no callback); client death between commit and RouteOpen
-  enqueue is absorbed by owner-scoped cleanup (marked-closing connection
-  rejects the enqueue; module side torn down via normal route-gone
-  relay).
+  returned handle with GOODBYE, never orphans; if SDK egress is
+  full/closed and the GOODBYE cannot queue, the SDK closes the connection
+  and daemon owner-cleanup removes the committed route); endpoint
+  unknown-slot precedence (uninstalled-handle Request/Cancel/Goodbye
+  dropped silently, no Error, no callback); connection-token fencing (C2
+  reopening the same (channel, epoch) wire pair: C1's stale request, poll,
+  cancel, and GOODBYE emit NO frame — fail locally on token mismatch);
+  provider bind sequence (on_bind emits nothing; traffic begins at
+  on_bound after ack queue + handle install); channel-0 allocator
+  exhaustion (injected u64::MAX: each allocator emits MAX at most once
+  then closes/reconnects, never emits 0, never reuses).
 - Endpoint-layer validation (all three clients): a frame carrying a stale
   epoch delivered PAST the daemon (harness-injected) is dropped by the client
   without settling in-flight state or firing handlers; in-flight keyed by

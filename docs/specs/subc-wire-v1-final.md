@@ -126,15 +126,42 @@ The first binding of any route slot gets epoch `1`.
   before the module connection can process any subsequent frame — rather
   than waking a waiter that commits later. The pending reservation carries
   the client sink/negotiated version and both epochs so the commit needs no
-  second lookup. Rationale: SDKs invoke `on_bind` (which may synchronously
-  emit, e.g. an immediate reverse Request) before or immediately after
-  queueing the ack; if commit happened asynchronously after the ack is
-  relayed, a legal post-ack module frame could arrive pre-commit and be
-  dropped or misjudged. With synchronous commit, any frame the module sends
-  after its ack is ordered behind the commit on the same connection. SDK
-  rule (normative): the provider SDK publishes the route handle to module
-  code only after the RouteBind ack is queued ahead of any route traffic on
-  the connection.
+  second lookup (implementation note: extract a `commit_route_locked`
+  operating on `&mut ForwardingInner`; the existing `commit_route` and
+  `complete_pending_relay` already share the lock with no await points).
+  Rationale: SDKs invoke `on_bind` (which may synchronously emit, e.g. an
+  immediate reverse Request) before or immediately after queueing the ack;
+  if commit happened asynchronously, a legal post-ack module frame could
+  arrive pre-commit and be dropped or misjudged. With synchronous commit,
+  any frame the module sends after its ack is ordered behind the commit on
+  the same connection. SDK rule (normative): the provider SDK publishes the
+  route handle to module code only after the RouteBind ack is queued ahead
+  of any route traffic on the connection.
+- **Client-side publication ordering (the other half of the window)**:
+  committing before the module's next frame is not enough — the CLIENT must
+  also learn the handle before any post-ack module traffic reaches it.
+  Serialization is per-socket, so an immediate post-ack reverse Request
+  relayed to the client could otherwise enter the client's FIFO AHEAD of the
+  RouteOpen response, and §3.3 layer 2 would correctly drop it as an unknown
+  slot — losing legal traffic. Normative: on accepted bind, the daemon
+  commits AND enqueues the RouteOpen response to the client BEFORE relaying
+  any subsequent module frame for that route; client-egress capacity for the
+  RouteOpen response is reserved BEFORE `route.bind` is relayed to the
+  module, so the response enqueue cannot fail at commit time. Consumer-SDK
+  rule (normative, all three clients): the dispatcher installs the returned
+  handle into its channel→epoch map BEFORE resolving the `routeOpen` caller
+  and before reading the next frame off the socket.
+- **Single-winner bind resolution**: `Pending → Committed | Aborted |
+  Rejected` is ONE write-locked transition. Exactly one path (module ack,
+  module rejection, client timeout/cancel, drain, connection death) wins;
+  the winner alone performs commit/release/abort-GOODBYE, and every loser
+  observes the terminal result and performs NOTHING. In particular a
+  route.open timeout that fires after the module's ack has already committed
+  the route observes `Committed` and must not abort the now-live route (it
+  reports timeout to the caller; the client's failure to install the handle
+  then makes the route unused — released by normal close paths — but never
+  half-torn). The same single-winner arbitration applies to module-control
+  RPCs (whose completion path today ignores the stored deadline).
 
 ### 3.2.1 Client API shape: the route handle (gate finding 4)
 
@@ -182,15 +209,27 @@ rewrites the epoch to the receiving side's slot epoch at relay, an endpoint
 always compares against its own locally-known epoch — the two-spaces model
 holds.
 
-**Epoch-fenced release** (gate finding 2, BLOCKER-driven): every release
-path (`release_client_route`, `release_module_route`, GOODBYE handling,
-`cleanup_connection`, drain) is a single write-locked compare-and-remove
-taking `expected_epoch`; it removes the binding ONLY if the live epoch
-matches, returning distinct stale/absent/removed outcomes. A GOODBYE
-validated against E1 can therefore never tear down an E2 binding installed
-between its validation and its release — the TOCTOU is closed under the
-lock, not by ordering. Peer-notification GOODBYEs are emitted only from the
-actually-removed binding, stamped with that binding's epochs.
+**Epoch-fenced release**: FRAME-DRIVEN, route-scoped release (GOODBYE
+handling, `release_client_route`, `release_module_route`) is a single
+write-locked compare-and-remove taking `expected_epoch`; it removes the
+binding ONLY if the live epoch matches, returning distinct
+stale/absent/removed outcomes. A GOODBYE validated against E1 can therefore
+never tear down an E2 binding installed between its validation and its
+release — the TOCTOU is closed under the lock, not by ordering.
+OWNER-SCOPED teardown (`cleanup_connection`, endpoint drain) is a different
+shape and stays one: it first marks the owner closing/draining under the
+write lock, then removes that owner's exact current bindings and
+reservations in the same critical section — no caller-supplied epoch,
+because the owner identity itself is the fence (nothing can rebind into a
+marked owner). Peer-notification GOODBYEs are emitted only from
+actually-removed bindings, stamped with each binding's epochs.
+
+**Reserved-slot ingress**: a reservation is NOT a data route. Until commit,
+a client Request on a reserved slot gets the existing `unknown_channel`
+Error (stamped with the ingress epoch); every other frame — either
+direction — is dropped. Module traffic cannot legally exist pre-commit
+(§3.2's ordering), so a module frame on a reserved slot is always stale or
+misbehaving: drop.
 
 **Epoch-fenced escalation (delivery-failure close)**: the same fence
 governs the OTHER destructive reaction to a route frame — connection-close
@@ -199,15 +238,24 @@ closes the client connection; if the failing frame was snapshotted under
 epoch E1 and the slot (or a fresh reservation) has since moved to E2,
 closing the connection would destroy E2 state from outside the fence.
 Normative: escalation is a write-locked
-`escalate_client_delivery_failure(connection, channel, expected_epoch)` —
-it proceeds to close ONLY if the failing frame's epoch still matches the
-live binding for that slot; if a different live binding or pending
-reservation occupies the slot, the E1 failure is logged and dropped without
-closing. When escalation does proceed, the connection is marked closing
-inside the forwarding table (under the same lock) before the out-of-band
-close registry is signaled, and allocation/commit reject marked
-connections — so no new reservation can race into a connection that is
-being torn down.
+`escalate_client_delivery_failure(connection, channel, expected_epoch)`
+with a slot-state predicate that covers BOTH frame provenances:
+
+- Failing frame from a LIVE binding: close only if the live binding's epoch
+  still equals `expected_epoch`.
+- Failing frame from an ALREADY-REMOVED binding (peer GOODBYEs are emitted
+  after removal, so a failed GOODBYE's binding is gone by construction):
+  close only if the slot is VACANT and the slot's `last_epoch` still equals
+  the frame's epoch — i.e. nothing newer has reserved or bound the slot. Any
+  later reservation or binding invalidates the escalation: log and drop.
+
+When escalation does proceed, the connection is marked closing inside the
+forwarding table (under the same lock) BEFORE the out-of-band close
+registry is signaled (the two are separate lock domains; mark-then-signal
+is the required order), and allocation/commit reject marked connections —
+so no new reservation can race into a connection that is being torn down.
+Escalation call sites retain the failing frame's epoch (carried on
+`RouteBinding`/`GoodbyeTarget`/`RouterError`).
 
 Direction-agnostic is load-bearing (AFT's pin, ALF concurring): reverse-lane
 Requests (module→client elicitation/sampling, `execute_effect`) are validated
@@ -244,8 +292,30 @@ the live binding (or reservation) under the table lock:
 - Rule for the future: ANY new control op that names a route names it as
   `(channel, epoch)`. A bare channel number in a control body is a spec
   violation.
+- **Poll linearization**: the daemon answers `route.poll` from ONE locked
+  snapshot that performs the epoch validation AND reads the reported state
+  (binding, module identity, cached status) in the same critical section —
+  never validate-then-lookup as separate steps, which would let E1 validate,
+  E2 rebind, and E2's state be reported under E1's echoed handle. The status
+  cache is keyed by the full client handle `(channel, epoch)` (or
+  equivalently cleared exactly-at-generation on release), so a stale entry
+  can never answer for a successor. Absent/stale results are explicit:
+  status query → `status: null, live: null`; liveness query →
+  `status: null, live: false`; both always echo the REQUESTED handle.
 
-Golden JSON vectors for both payloads are regenerated.
+**Channel-0 correlation hygiene** (the control channel has no epoch, so
+corr is its only generation axis): channel-0 corr values are allocated from
+ONE shared monotonic allocator per connection/endpoint across ALL control
+uses (bind relays and module-control RPCs — today these are two independent
+cursors, which lets a late route-bind rejection settle a health RPC that
+reused its corr, or vice versa). Corr values are NEVER reused within a
+connection's lifetime; if the u64 space were ever exhausted the connection
+is closed and re-established (unreachable in practice — the rule closes the
+analysis). Late responses to already-settled corrs are dropped, and a
+control Error settles only the entry whose corr it names in the
+single-allocator space.
+
+Golden JSON vectors for the changed payloads are regenerated.
 
 ### 3.4 Allocator interaction and wrap
 
@@ -422,7 +492,10 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
 ## 10. Test plan (gate-relevant)
 
 - Golden vectors: 21-byte header encode/decode parity TS/Rust/Swift,
-  including epoch boundaries (0, 1, u32::MAX) and all admission classes.
+  including epoch boundaries (0, 1, u32::MAX). Parity covers NORMAL,
+  EXPEDITE, and SHEDDABLE on legal frame types; malformed vectors cover
+  class `11` and SHEDDABLE on every illegal frame type (decode-reject, not
+  round-trip).
 - Decode rejections: each new taxonomy entry, non-vacuous (asserts the exact
   error).
 - Epoch lifecycle integration (subc-core): reuse-after-release delivers only
@@ -435,10 +508,18 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
   reserved epoch; stale RouteStatus push does not poison the status cache of
   a reused slot; stale RoutePoll answers unknown-route; delayed E1 RoutePoll
   response on a reused corr does not settle an E2 poll (handle-echo proof);
-  E1-snapshot → E2-rebind → full-sink escalation does NOT close the
-  connection (epoch-fenced escalation proof, data frame and GOODBYE
-  variants); immediate post-ack reverse Request from a module arrives after
-  synchronous commit (no pre-commit drop).
+  poll snapshot linearization (E1-validate/E2-rebind interleave reports
+  under the correct handle, never E2 state under E1's echo); E1-snapshot →
+  E2-rebind → full-sink escalation does NOT close the connection
+  (epoch-fenced escalation proof, data frame and GOODBYE variants; plus the
+  removed-binding arm: no-reuse ⇒ close, E2-reservation/rebind ⇒ no close);
+  immediate post-ack reverse Request from a module is delivered to the
+  consumer AFTER the RouteOpen response installs the handle (end-to-end
+  through the actual consumer endpoint, not just daemon-side commit
+  ordering); bind single-winner arbitration (timeout-fires-after-ack-commit
+  observes Committed and aborts nothing; both lock-order interleavings);
+  late cross-class channel-0 Error after timeout settles nothing (shared
+  monotonic corr allocator proof).
 - Endpoint-layer validation (all three clients): a frame carrying a stale
   epoch delivered PAST the daemon (harness-injected) is dropped by the client
   without settling in-flight state or firing handlers; in-flight keyed by

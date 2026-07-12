@@ -129,14 +129,12 @@ The first binding of any route slot gets epoch `1`.
   second lookup (implementation note: extract a `commit_route_locked`
   operating on `&mut ForwardingInner`; the existing `commit_route` and
   `complete_pending_relay` already share the lock with no await points).
-  Rationale: SDKs invoke `on_bind` (which may synchronously emit, e.g. an
-  immediate reverse Request) before or immediately after queueing the ack;
-  if commit happened asynchronously, a legal post-ack module frame could
-  arrive pre-commit and be dropped or misjudged. With synchronous commit,
-  any frame the module sends after its ack is ordered behind the commit on
-  the same connection. SDK rule (normative): the provider SDK publishes the
-  route handle to module code only after the RouteBind ack is queued ahead
-  of any route traffic on the connection.
+  Rationale: after queueing the RouteBind ack, SDKs invoke `on_bound`,
+  which may synchronously emit an immediate reverse Request; if commit
+  happened asynchronously, that legal post-ack frame could arrive
+  pre-commit and be dropped or misjudged. With synchronous commit, any
+  frame the module sends after its ack is ordered behind the commit on the
+  same connection.
 - **Client-side publication ordering (the other half of the window)**:
   committing before the module's next frame is not enough — the CLIENT must
   also learn the handle before any post-ack module traffic reaches it.
@@ -165,17 +163,17 @@ The first binding of any route slot gets epoch `1`.
   SDK queues the RouteBind ack, installs the handle into its endpoint map,
   and only then invokes an optional `on_bound(RouteHandle)` callback, from
   which immediate route traffic (e.g. a reverse Request) may legally begin.
-  Rejection or ack-queue failure discards the tentative state without
-  invoking `on_bound`. For HAND-ROLLED serve loops (no callback seam to
+  On rejection or ack-queue failure, the handle is never installed and
+  `on_bound` is not invoked; the SDK directly runs the handler-state
+  cleanup routine with the tentative full handle, without relying on an
+  ingress GOODBYE. For HAND-ROLLED serve loops (no callback seam to
   rename) the same rule is stated as a testable invariant: no route-scoped
   egress frame for a binding may precede that binding's RouteBind ack in
   the writer queue. Handler-side convention (one convention, not per-handler
   choice): handler-owned session state MAY be installed at `on_bind`
   (decision time) — the SDK's serialized dispatch guarantees no request
   reaches the handler before the ack, so decision-time install is safe and
-  cheap; only route-scoped EGRESS waits for `on_bound`. A rejected or
-  ack-failed bind gets its handler state cleaned via the existing
-  route-gone path.
+  cheap; only route-scoped EGRESS waits for `on_bound`.
 - **Single-winner bind resolution**: `Pending → Committed | Aborted |
   Rejected` is ONE write-locked transition. The arbitrating participants are
   DAEMON-SIDE ONLY: module reply, daemon relay deadline, owner teardown
@@ -205,7 +203,14 @@ cancel, close, poll) takes the handle, never a bare channel, and requires
 token identity to match the SDK's current connection — otherwise it fails
 locally WITHOUT emitting any frame. The token changes on reconnect and is
 retained by callbacks, pending state, and reverse replies; only `channel`
-and `epoch` are serialized. Managed route caches store handles; the close-beats-reopen
+and `epoch` are serialized. Precisely: `RouteHandle` is an immutable SDK
+object carrying `channel`, `epoch`, and the opaque connection token; the
+token may be implemented as private state or object identity, is checked
+only by the SDK, and is never serialized or interpreted by the daemon (the
+daemon needs no token awareness — connection identity already separates its
+spaces). `on_bind` receives the tentative full handle; `on_bound`,
+route-cleanup callbacks, pending/provider state, and reverse-reply contexts
+all retain that full handle. Managed route caches store handles; the close-beats-reopen
 generation guards compare full handles. This is load-bearing, not
 ergonomics: an API that accepts a bare channel and looks up "the current
 epoch" at send time would stamp STALE application work with the NEW epoch
@@ -265,9 +270,10 @@ caller-supplied epoch in either — the owner identity plus a persistent mark
 is the fence: `cleanup_connection` marks the owner closing and removes its
 bindings and reservations in ONE locked transition. Endpoint DRAIN is
 deliberately two-phase (matching the implemented drain-to-quiescence):
-phase one marks the endpoint draining and aborts its reservations in a
-locked transition; after quiescence, phase two removes the endpoint's
-then-current live bindings in one later locked batch. The persistent
+phase one marks the endpoint draining, closes Request admission on every
+current live binding (so the in-flight count can only fall), and aborts its
+reservations in ONE locked transition; after quiescence, phase two removes
+the endpoint's then-current live bindings in one later locked batch. The persistent
 draining mark rejects allocation and commit BETWEEN the phases — nothing
 can rebind into a draining endpoint, which is what makes the gap safe. Peer-notification GOODBYEs are emitted only from
 actually-removed bindings, stamped with each binding's epochs.
@@ -582,9 +588,9 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
   observes Committed and aborts nothing; both lock-order interleavings);
   late cross-class channel-0 Error after timeout settles nothing (shared
   monotonic corr allocator proof); escalation publication-fence arms:
-  no successor or only an uncommitted/ABORTED successor reservation ⇒
-  close (last_published_epoch unmoved), committed-and-published successor
-  ⇒ suppress; egress permit released exactly once on Rejected/Aborted (and
+  removed-binding arms: no successor or only an uncommitted/ABORTED E2
+  successor reservation ⇒ close (last_published_epoch unmoved),
+  committed-and-published E2 successor ⇒ suppress; egress permit released exactly once on Rejected/Aborted (and
   receiver-closure path); client-cleanup-vs-Accepted exercises both lock
   winners (cleanup-first marks closing and aborts before commit;
   Accepted-first atomically commits-and-enqueues, then cleanup removes the
@@ -601,7 +607,17 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
   provider bind sequence (on_bind emits nothing; traffic begins at
   on_bound after ack queue + handle install); channel-0 allocator
   exhaustion (injected u64::MAX: each allocator emits MAX at most once
-  then closes/reconnects, never emits 0, never reuses).
+  then closes/reconnects, never emits 0, never reuses);
+  connection-token fencing extended to delayed reverse replies and stale
+  work captured by on_bound closures (local failure, no frame emitted);
+  aborted-reservation reuse forcing the same client and module slots
+  proves BOTH epochs advance; reserved-slot ingress proves client Request
+  → epoch-stamped unknown_channel and every other client/module frame →
+  silent drop; module-control deadline/reply arbitration exercises both
+  lock winners, including an after-deadline reply arriving before the
+  timer wakes; drain phase-gap closure (admission, reservation, and commit
+  all remain closed between drain phases; no rebind enters before phase
+  two).
 - Endpoint-layer validation (all three clients): a frame carrying a stale
   epoch delivered PAST the daemon (harness-injected) is dropped by the client
   without settling in-flight state or firing handlers; in-flight keyed by

@@ -16,8 +16,8 @@ use subc_protocol::{
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{ModuleControlRequest, ModuleControlResponse},
-    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
-    RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, RouteTarget,
+    PROTOCOL_VERSION,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -61,7 +61,9 @@ impl Deref for TestServer {
 #[derive(Debug, Clone, Copy)]
 struct RoutePair {
     client_channel: u16,
+    client_epoch: u32,
     module_channel: u16,
+    module_epoch: u32,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -97,6 +99,7 @@ async fn reverse_request_forwards_and_route_back_response_rewrites_channel() {
         .send(&data_frame(
             FrameType::Request,
             route.module_channel,
+            route.module_epoch,
             reverse_corr,
             reverse_body,
         ))
@@ -117,6 +120,7 @@ async fn reverse_request_forwards_and_route_back_response_rewrites_channel() {
         .send(&data_frame(
             FrameType::Response,
             route.client_channel,
+            route.client_epoch,
             reverse_corr,
             answer_body,
         ))
@@ -163,6 +167,7 @@ async fn reverse_request_does_not_consume_or_release_serial_forward_credit() {
         .send(&data_frame(
             FrameType::Request,
             route.client_channel,
+            route.client_epoch,
             first_corr,
             first_body,
         ))
@@ -182,6 +187,7 @@ async fn reverse_request_does_not_consume_or_release_serial_forward_credit() {
         .send(&data_frame(
             FrameType::Request,
             route.module_channel,
+            route.module_epoch,
             reverse_corr,
             reverse_body,
         ))
@@ -205,6 +211,7 @@ async fn reverse_request_does_not_consume_or_release_serial_forward_credit() {
         .send(&data_frame(
             FrameType::Response,
             route.client_channel,
+            route.client_epoch,
             reverse_corr,
             reverse_answer,
         ))
@@ -227,6 +234,7 @@ async fn reverse_request_does_not_consume_or_release_serial_forward_credit() {
         .send(&data_frame(
             FrameType::Request,
             route.client_channel,
+            route.client_epoch,
             second_corr,
             second_body,
         ))
@@ -249,6 +257,7 @@ async fn reverse_request_does_not_consume_or_release_serial_forward_credit() {
         .send(&data_frame(
             FrameType::Response,
             route.module_channel,
+            route.module_epoch,
             first_corr,
             first_response_body,
         ))
@@ -282,6 +291,7 @@ async fn reverse_request_does_not_consume_or_release_serial_forward_credit() {
         .send(&data_frame(
             FrameType::Response,
             route.module_channel,
+            route.module_epoch,
             second_corr,
             second_response_body,
         ))
@@ -339,6 +349,7 @@ async fn late_reverse_response_after_route_goodbye_is_dropped_and_sibling_route_
         .send(&data_frame(
             FrameType::Request,
             first.module_channel,
+            first.module_epoch,
             reverse_corr,
             reverse_body,
         ))
@@ -357,6 +368,7 @@ async fn late_reverse_response_after_route_goodbye_is_dropped_and_sibling_route_
         .send(&pure_header_frame(
             FrameType::Goodbye,
             first.client_channel,
+            first.client_epoch,
             322,
         ))
         .await;
@@ -373,38 +385,24 @@ async fn late_reverse_response_after_route_goodbye_is_dropped_and_sibling_route_
         .send(&data_frame(
             FrameType::Response,
             first.client_channel,
+            first.client_epoch,
             reverse_corr,
             late_answer,
         ))
         .await;
-    let stale_error = client
-        .inbox
-        .wait_for(
-            SETUP_TIMEOUT,
-            "unknown_channel Error for late client Response",
-            |frame| {
-                frame.header.ty == FrameType::Error
-                    && frame.header.channel == first.client_channel
-                    && frame.header.corr == reverse_corr
-            },
-        )
-        .await;
-    let stale_error_body: ErrorBody = serde_json::from_slice(&stale_error.body).unwrap();
-    assert_eq!(stale_error_body.code, "unknown_channel");
-    assert!(stale_error_body.message.contains("unknown channel"));
-
     let late_module_corr = 323;
     let late_module_body = br#"{"jsonrpc":"2.0","id":"teardown-module-late"}"#;
     module
         .send(&data_frame(
             FrameType::Response,
             first.module_channel,
+            first.module_epoch,
             late_module_corr,
             late_module_body,
         ))
         .await;
     module
-        .send(&pure_header_frame(FrameType::Ping, 0, 324))
+        .send(&pure_header_frame(FrameType::Ping, 0, 0, 324))
         .await;
     module
         .inbox
@@ -424,7 +422,7 @@ async fn late_reverse_response_after_route_goodbye_is_dropped_and_sibling_route_
             frame.header.corr == late_module_corr
         });
     client
-        .send(&pure_header_frame(FrameType::Ping, 0, 325))
+        .send(&pure_header_frame(FrameType::Ping, 0, 0, 325))
         .await;
     client
         .inbox
@@ -450,6 +448,7 @@ async fn late_reverse_response_after_route_goodbye_is_dropped_and_sibling_route_
         .send(&data_frame(
             FrameType::Request,
             second.client_channel,
+            second.client_epoch,
             live_corr,
             live_body,
         ))
@@ -473,6 +472,7 @@ async fn late_reverse_response_after_route_goodbye_is_dropped_and_sibling_route_
         .send(&data_frame(
             FrameType::Response,
             second.module_channel,
+            second.module_epoch,
             live_corr,
             live_response_body,
         ))
@@ -533,6 +533,7 @@ async fn equal_corr_forward_and_reverse_requests_do_not_cross_contaminate() {
         .send(&data_frame(
             FrameType::Request,
             route.client_channel,
+            route.client_epoch,
             shared_corr,
             forward_body,
         ))
@@ -557,6 +558,7 @@ async fn equal_corr_forward_and_reverse_requests_do_not_cross_contaminate() {
         .send(&data_frame(
             FrameType::Request,
             route.module_channel,
+            route.module_epoch,
             shared_corr,
             reverse_body,
         ))
@@ -580,6 +582,7 @@ async fn equal_corr_forward_and_reverse_requests_do_not_cross_contaminate() {
         .send(&data_frame(
             FrameType::Response,
             route.client_channel,
+            route.client_epoch,
             shared_corr,
             reverse_answer,
         ))
@@ -603,6 +606,7 @@ async fn equal_corr_forward_and_reverse_requests_do_not_cross_contaminate() {
         .send(&data_frame(
             FrameType::Response,
             route.module_channel,
+            route.module_epoch,
             shared_corr,
             forward_answer,
         ))
@@ -880,6 +884,7 @@ async fn open_route(
     let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
     let ModuleControlRequest::RouteBind {
         route_channel: module_channel,
+        epoch: module_epoch,
         target,
         identity,
         ..
@@ -903,11 +908,12 @@ async fn open_route(
     match serde_json::from_slice(&ack_frame.body).unwrap() {
         ClientControlResponse::RouteOpen {
             route_channel,
-            // WIRE-WAVE2: retain this epoch in the route test handle.
-            route_epoch: _route_epoch,
+            route_epoch: client_epoch,
         } => RoutePair {
             client_channel: route_channel,
+            client_epoch,
             module_channel,
+            module_epoch,
         },
         other => panic!("unexpected route.open response: {other:?}"),
     }
@@ -939,7 +945,7 @@ fn route_bind_ack(request: &Frame) -> Frame {
         request.header.ver,
         FrameType::Response,
         control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         request.header.corr,
         body,
@@ -955,15 +961,7 @@ fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
         launch_nonce: None,
     })
     .unwrap();
-    Frame::build(
-        FrameType::Hello,
-        control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
-        0,
-        corr,
-        body,
-    )
-    .unwrap()
+    Frame::build(FrameType::Hello, control_flags(), 0, 0, corr, body).unwrap()
 }
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
@@ -971,7 +969,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -979,24 +977,24 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     .unwrap()
 }
 
-fn data_frame(ty: FrameType, channel: u16, corr: u64, body: &[u8]) -> Frame {
+fn data_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         ty,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body.to_vec(),
     )
     .unwrap()
 }
 
-fn pure_header_frame(ty: FrameType, channel: u16, corr: u64) -> Frame {
+fn pure_header_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> Frame {
     let frame = Frame::build(
         ty,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         Vec::new(),
     )

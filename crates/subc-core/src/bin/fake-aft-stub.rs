@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     env,
     error::Error,
     ffi::OsString,
@@ -75,7 +75,7 @@ const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
 
-type InFlightKey = (u16, u64);
+type InFlightKey = (u16, u32, u64);
 type InFlightRegistry = Arc<Mutex<HashMap<InFlightKey, oneshot::Sender<()>>>>;
 
 #[tokio::main]
@@ -225,15 +225,8 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
         launch_nonce: config.launch_nonce.clone(),
     })
     .map_err(StubError::Json)?;
-    let frame = Frame::build(
-        FrameType::Hello,
-        control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
-        0,
-        HELLO_CORR,
-        body,
-    )
-    .map_err(StubError::FrameBuild)?;
+    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
+        .map_err(StubError::FrameBuild)?;
     send_outbound(writer, frame).await
 }
 
@@ -265,13 +258,20 @@ async fn handle_frame(
         return Ok(false);
     };
 
+    if frame.header.channel != 0
+        && state.bound_channels.get(&frame.header.channel).copied() != Some(frame.header.epoch)
+        && state.tentative_channels.get(&frame.header.channel).copied() != Some(frame.header.epoch)
+    {
+        return Ok(true);
+    }
+
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
             let pong = Frame::build_with_version(
                 frame.header.ver,
                 FrameType::Pong,
                 frame.header.flags,
-                0, // WIRE-WAVE2: thread the binding epoch.
+                0,
                 0,
                 frame.header.corr,
                 Vec::new(),
@@ -318,7 +318,11 @@ async fn handle_frame(
                 }),
             )?;
             let behavior = request_behavior(config, &frame.body);
-            let fanout_channels = state.bound_channels.iter().copied().collect::<Vec<_>>();
+            let fanout_channels = state
+                .bound_channels
+                .iter()
+                .map(|(&channel, &epoch)| (channel, epoch))
+                .collect::<Vec<_>>();
             let request_writer = writer.clone();
             let request_config = config.clone();
 
@@ -332,7 +336,7 @@ async fn handle_frame(
                 )
                 .await?;
             } else if behavior.cancellable {
-                let key = (frame.header.channel, frame.header.corr);
+                let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
                 let (cancel_tx, cancel_rx) = oneshot::channel();
                 {
                     let mut in_flight = lock_in_flight(&state.in_flight)?;
@@ -376,7 +380,7 @@ async fn handle_cancel(
     state: &StubState,
     writer: &mpsc::Sender<Frame>,
 ) -> Result<(), StubError> {
-    let key = (frame.header.channel, frame.header.corr);
+    let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
     let cancel_tx = {
         let mut in_flight = lock_in_flight(&state.in_flight)?;
         in_flight.remove(&key)
@@ -402,6 +406,7 @@ async fn handle_cancel(
             config,
             frame.header.ver,
             frame.header.channel,
+            frame.header.epoch,
             frame.header.corr,
         )
         .await?;
@@ -414,7 +419,7 @@ async fn handle_data_request(
     writer: mpsc::Sender<Frame>,
     frame: Frame,
     config: StubConfig,
-    fanout_channels: Vec<u16>,
+    fanout_channels: Vec<(u16, u32)>,
     delay: Duration,
 ) -> Result<(), StubError> {
     send_requested_pushes(
@@ -422,6 +427,7 @@ async fn handle_data_request(
         &config,
         frame.header.ver,
         frame.header.channel,
+        frame.header.epoch,
         &fanout_channels,
     )
     .await?;
@@ -432,6 +438,7 @@ async fn handle_data_request(
             &config,
             frame.header.ver,
             frame.header.channel,
+            frame.header.epoch,
             frame.header.corr,
         )
         .await?;
@@ -448,17 +455,18 @@ async fn handle_cancellable_data_request(
     writer: mpsc::Sender<Frame>,
     frame: Frame,
     config: StubConfig,
-    fanout_channels: Vec<u16>,
+    fanout_channels: Vec<(u16, u32)>,
     delay: Duration,
     in_flight: InFlightRegistry,
     cancel_rx: oneshot::Receiver<()>,
 ) -> Result<(), StubError> {
-    let key = (frame.header.channel, frame.header.corr);
+    let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
     send_requested_pushes(
         &writer,
         &config,
         frame.header.ver,
         frame.header.channel,
+        frame.header.epoch,
         &fanout_channels,
     )
     .await?;
@@ -469,6 +477,7 @@ async fn handle_cancellable_data_request(
             &config,
             frame.header.ver,
             frame.header.channel,
+            frame.header.epoch,
             frame.header.corr,
         )
         .await?;
@@ -495,14 +504,15 @@ async fn send_requested_pushes(
     config: &StubConfig,
     version: u8,
     request_channel: u16,
-    fanout_channels: &[u16],
+    request_epoch: u32,
+    fanout_channels: &[(u16, u32)],
 ) -> Result<(), StubError> {
     if config.fanout_on_request {
-        for channel in fanout_channels {
-            send_push(writer, version, *channel).await?;
+        for &(channel, epoch) in fanout_channels {
+            send_push(writer, version, channel, epoch).await?;
         }
     } else if config.push_on_request {
-        send_push(writer, version, request_channel).await?;
+        send_push(writer, version, request_channel, request_epoch).await?;
     }
 
     Ok(())
@@ -528,8 +538,15 @@ async fn emit_response(
             }),
         )?;
         if config.toolcall_subc_error {
-            return emit_tool_call_subc_error(writer, config, frame.header.ver, channel, corr)
-                .await;
+            return emit_tool_call_subc_error(
+                writer,
+                config,
+                frame.header.ver,
+                channel,
+                frame.header.epoch,
+                corr,
+            )
+            .await;
         }
         tool_call_response_body(config, &tool_call)?
     } else if let Some(usage_body) = usage_get_response_body(config, &frame.body)? {
@@ -541,8 +558,8 @@ async fn emit_response(
         frame.header.ver,
         FrameType::Response,
         frame.header.flags,
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        frame.header.epoch,
         corr,
         body,
     )
@@ -561,6 +578,7 @@ async fn emit_cancelled_error(
     config: &StubConfig,
     version: u8,
     channel: u16,
+    epoch: u32,
     corr: u64,
 ) -> Result<(), StubError> {
     let body = serde_json::to_vec(&ErrorBody {
@@ -572,8 +590,8 @@ async fn emit_cancelled_error(
         version,
         FrameType::Error,
         Flags::new(false, Priority::Passive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body,
     )
@@ -617,13 +635,13 @@ async fn handle_control_request(
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
-            // WIRE-WAVE2: retain this epoch in the stub route handle.
-            epoch: _epoch,
+            epoch,
             target,
             identity,
             principal,
             consumer_capabilities,
         } => {
+            state.tentative_channels.insert(route_channel, epoch);
             record_event(
                 config,
                 json!({
@@ -654,13 +672,14 @@ async fn handle_control_request(
                     frame.header.ver,
                     reply.frame_type(),
                     control_flags(),
-                    0, // WIRE-WAVE2: thread the binding epoch.
+                    0,
                     0,
                     frame.header.corr,
                     b"{malformed route.bind reply".to_vec(),
                 )
                 .map_err(StubError::FrameBuild)?;
                 send_outbound(writer, response).await?;
+                state.tentative_channels.remove(&route_channel);
                 record_event(
                     config,
                     json!({
@@ -683,13 +702,14 @@ async fn handle_control_request(
                     frame.header.ver,
                     FrameType::Error,
                     control_flags(),
-                    0, // WIRE-WAVE2: thread the binding epoch.
+                    0,
                     0,
                     frame.header.corr,
                     body,
                 )
                 .map_err(StubError::FrameBuild)?;
                 send_outbound(writer, response).await?;
+                state.tentative_channels.remove(&route_channel);
                 return Ok(());
             }
 
@@ -699,15 +719,16 @@ async fn handle_control_request(
                 frame.header.ver,
                 FrameType::Response,
                 control_flags(),
-                0, // WIRE-WAVE2: thread the binding epoch.
+                0,
                 0,
                 frame.header.corr,
                 body,
             )
             .map_err(StubError::FrameBuild)?;
             send_outbound(writer, response).await?;
-            state.bound_channels.insert(route_channel);
-            emit_status_update(writer, config, frame.header.ver, route_channel).await?;
+            state.tentative_channels.remove(&route_channel);
+            state.bound_channels.insert(route_channel, epoch);
+            emit_status_update(writer, config, frame.header.ver, route_channel, epoch).await?;
         }
         ModuleControlRequest::HealthCheck {} => {
             record_event(
@@ -730,7 +751,7 @@ async fn handle_control_request(
                 frame.header.ver,
                 FrameType::Response,
                 control_flags(),
-                0, // WIRE-WAVE2: thread the binding epoch.
+                0,
                 0,
                 frame.header.corr,
                 body,
@@ -758,14 +779,15 @@ async fn handle_route_goodbye(
         }),
     )?;
     state.bound_channels.remove(&route_channel);
+    state.tentative_channels.remove(&route_channel);
 
     if config.emit_after_detach {
         let stale = Frame::build_with_version(
             frame.header.ver,
             FrameType::Push,
             Flags::new(false, Priority::Passive, true),
-            route_channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            route_channel,
+            frame.header.epoch,
             u64::from(route_channel) + 9_000,
             b"stale-after-detach".to_vec(),
         )
@@ -787,13 +809,14 @@ async fn send_push(
     writer: &mpsc::Sender<Frame>,
     version: u8,
     channel: u16,
+    epoch: u32,
 ) -> Result<(), StubError> {
     let push = Frame::build_with_version(
         version,
         FrameType::Push,
         Flags::new(false, Priority::Passive, true),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         0,
         b"push-event".to_vec(),
     )
@@ -806,6 +829,7 @@ async fn emit_tool_call_progress(
     config: &StubConfig,
     version: u8,
     channel: u16,
+    epoch: u32,
     corr: u64,
 ) -> Result<(), StubError> {
     let body = serde_json::to_vec(&json!({
@@ -818,8 +842,8 @@ async fn emit_tool_call_progress(
         version,
         FrameType::Push,
         Flags::new(false, Priority::Passive, true),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body,
     )
@@ -840,6 +864,7 @@ async fn emit_tool_call_subc_error(
     config: &StubConfig,
     version: u8,
     channel: u16,
+    epoch: u32,
     corr: u64,
 ) -> Result<(), StubError> {
     let body = serde_json::to_vec(&ErrorBody {
@@ -851,8 +876,8 @@ async fn emit_tool_call_subc_error(
         version,
         FrameType::Error,
         Flags::new(false, Priority::Passive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body,
     )
@@ -906,27 +931,19 @@ async fn emit_status_update(
     config: &StubConfig,
     version: u8,
     route_channel: u16,
+    route_epoch: u32,
 ) -> Result<(), StubError> {
     let Some(status) = config.status.as_ref() else {
         return Ok(());
     };
     let body = serde_json::to_vec(&ModuleControlPush::RouteStatus {
         route_channel,
-        // WIRE-WAVE2: stamp the stub route handle epoch.
-        route_epoch: 0,
+        route_epoch,
         status: status.clone(),
     })
     .map_err(StubError::Json)?;
-    let push = Frame::build_with_version(
-        version,
-        FrameType::Push,
-        control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
-        0,
-        0,
-        body,
-    )
-    .map_err(StubError::FrameBuild)?;
+    let push = Frame::build_with_version(version, FrameType::Push, control_flags(), 0, 0, 0, body)
+        .map_err(StubError::FrameBuild)?;
     send_outbound(writer, push).await?;
     record_event(
         config,
@@ -1219,14 +1236,16 @@ struct StubConfig {
 }
 
 struct StubState {
-    bound_channels: BTreeSet<u16>,
+    bound_channels: BTreeMap<u16, u32>,
+    tentative_channels: BTreeMap<u16, u32>,
     in_flight: InFlightRegistry,
 }
 
 impl Default for StubState {
     fn default() -> Self {
         Self {
-            bound_channels: BTreeSet::new(),
+            bound_channels: BTreeMap::new(),
+            tentative_channels: BTreeMap::new(),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }

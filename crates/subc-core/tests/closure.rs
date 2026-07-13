@@ -244,7 +244,7 @@ async fn assert_opaque_round_trip(
     observed_frame_types.push(FrameType::Request);
     observed_frame_types.push(FrameType::Response);
 
-    let poll = route_poll_frame(case.corr_base + 1, ack.route_channel);
+    let poll = route_poll_frame(case.corr_base + 1, ack.route_channel, ack.route_epoch);
     write_frame(&mut client, &poll).await.unwrap();
     client.flush().await.unwrap();
     let poll_reply = read_frame_timeout(&mut client).await;
@@ -253,7 +253,12 @@ async fn assert_opaque_round_trip(
     observed_frame_types.push(FrameType::Request);
     observed_frame_types.push(poll_reply.header.ty);
 
-    let request = data_request(ack.route_channel, case.corr_base + 2, &case.payload);
+    let request = data_request(
+        ack.route_channel,
+        ack.route_epoch,
+        case.corr_base + 2,
+        &case.payload,
+    );
     observed_frame_types.push(request.header.ty);
     write_frame(&mut client, &request).await.unwrap();
     client.flush().await.unwrap();
@@ -310,7 +315,12 @@ async fn assert_bus_pubsub_rides_data_plane(
     observed_frame_types.extend([FrameType::Request, FrameType::Response]);
 
     let payload = br#"{"op":"bus.publish","topic":"memories.changed","body":{"id":"m-1"}}"#;
-    let request = data_request(publisher_ack.route_channel, 402, payload);
+    let request = data_request(
+        publisher_ack.route_channel,
+        publisher_ack.route_epoch,
+        402,
+        payload,
+    );
     observed_frame_types.push(request.header.ty);
     write_frame(&mut publisher, &request).await.unwrap();
     publisher.flush().await.unwrap();
@@ -411,7 +421,7 @@ async fn assert_unknown_domain_op_is_not_smuggled_into_channel0(
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         30,
         br#"{"op":"memory.list","args":{"this":"belongs on a route channel"}}"#.to_vec(),
@@ -455,6 +465,7 @@ where
 #[derive(Debug, Clone, Copy)]
 struct RouteOpenAck {
     route_channel: u16,
+    route_epoch: u32,
 }
 
 async fn open_route<S>(
@@ -488,9 +499,11 @@ where
     match serde_json::from_slice(&ack_frame.body).unwrap() {
         ClientControlResponse::RouteOpen {
             route_channel,
-            // WIRE-WAVE2: retain this epoch in the route test handle.
-            route_epoch: _route_epoch,
-        } => RouteOpenAck { route_channel },
+            route_epoch,
+        } => RouteOpenAck {
+            route_channel,
+            route_epoch,
+        },
         other => panic!("unexpected route.open response: {other:?}"),
     }
 }
@@ -500,7 +513,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -508,18 +521,17 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     .unwrap()
 }
 
-fn route_poll_frame(corr: u64, route_channel: u16) -> Frame {
+fn route_poll_frame(corr: u64, route_channel: u16, route_epoch: u32) -> Frame {
     let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
         route_channel,
-        // WIRE-WAVE2: pass the route test handle epoch.
-        route_epoch: 0,
+        route_epoch,
         kind: PollKind::Status,
     })
     .unwrap();
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -527,12 +539,12 @@ fn route_poll_frame(corr: u64, route_channel: u16) -> Frame {
     .unwrap()
 }
 
-fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
+fn data_request(channel: u16, epoch: u32, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body.to_vec(),
     )
@@ -545,7 +557,6 @@ fn assert_route_poll_status_none(frame: &Frame, corr: u64) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
-            // WIRE-WAVE2: assert the echoed route test handle.
             route_channel: _route_channel,
             route_epoch: _route_epoch,
             status: None,

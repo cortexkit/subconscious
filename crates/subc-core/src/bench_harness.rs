@@ -12,7 +12,7 @@ use subc_protocol::{
 use tokio::sync::mpsc;
 
 use crate::{
-    forwarding::{DataRoute, RouteBindRelayOutcome},
+    forwarding::{DataRoute, DataRouteState, RouteBindRelayOutcome},
     registry::ConnectionId,
     router::{ForwardBackend, FrameSink, RouteCtx, RouterError},
     ForwardingTable, Frame, Registry,
@@ -23,7 +23,9 @@ use crate::{
 pub struct BenchClientRoute {
     pub connection_id: ConnectionId,
     pub client_channel: u16,
+    pub client_epoch: u32,
     pub module_channel: u16,
+    pub module_epoch: u32,
     pub ctx: RouteCtx,
 }
 
@@ -85,13 +87,13 @@ fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {
 }
 
 /// Fixed small request body (bench measures forwarding locks, not parsing).
-pub fn bench_data_request_frame(client_channel: u16, corr: u64) -> Frame {
+pub fn bench_data_request_frame(client_channel: u16, client_epoch: u32, corr: u64) -> Frame {
     const PAYLOAD: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"read","params":{}}"#;
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        client_channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        client_channel,
+        client_epoch,
         corr,
         PAYLOAD.to_vec(),
     )
@@ -105,15 +107,19 @@ pub async fn bench_client_forward_op(
     route: &BenchClientRoute,
     corr: u64,
 ) -> Result<(), RouterError> {
-    let frame = bench_data_request_frame(route.client_channel, corr);
+    let frame = bench_data_request_frame(route.client_channel, route.client_epoch, corr);
     let channel = frame.header.channel;
     let binding = match forwarding
-        .lookup_data_route(route.connection_id, channel)
+        .lookup_data_route(route.connection_id, channel, frame.header.epoch)
         .map_err(RouterError::Forwarding)?
     {
-        DataRoute::Client(Some(binding)) => binding,
-        DataRoute::Client(None) | DataRoute::Module(_) => {
-            return Err(RouterError::UnknownChannel { channel, corr });
+        DataRoute::Client(DataRouteState::Bound(binding)) => binding,
+        DataRoute::Client(_) | DataRoute::Module(_) => {
+            return Err(RouterError::UnknownChannel {
+                channel,
+                epoch: frame.header.epoch,
+                corr,
+            });
         }
     };
     forward_backend.handle_bound(frame, binding).await
@@ -163,9 +169,18 @@ pub async fn build_bench_forwarding_setup(
     let mut client_routes = Vec::with_capacity(num_clients * routes_per_client);
     for client_index in 0..num_clients {
         let client_connection = ConnectionId::new(100 + client_index as u64);
-        for _route in 0..routes_per_client {
+        for route_index in 0..routes_per_client {
+            let (ctx, mut client_rx) = bench_route_ctx(client_connection);
             let pending = forwarding
-                .begin_route_bind_relay_for(client_connection, &module_id)
+                .begin_route_bind_relay_for(
+                    client_connection,
+                    ctx.egress.clone(),
+                    PROTOCOL_VERSION,
+                    route_index as u64 + 1,
+                    &module_id,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await
                 .expect("begin route bind");
             assert_eq!(pending.endpoint, endpoint);
             forwarding
@@ -175,22 +190,15 @@ pub async fn build_bench_forwarding_setup(
                     RouteBindRelayOutcome::Accepted,
                 )
                 .expect("complete relay");
-            let (ctx, mut client_rx) = bench_route_ctx(client_connection);
+            let route_open = client_rx.recv().await.expect("published route.open");
+            assert_eq!(route_open.header.corr, route_index as u64 + 1);
             tokio::spawn(async move { while client_rx.recv().await.is_some() {} });
-            forwarding
-                .commit_route(
-                    client_connection,
-                    ctx.egress.clone(),
-                    PROTOCOL_VERSION,
-                    endpoint,
-                    pending.client_channel,
-                    pending.module_channel,
-                )
-                .expect("commit route");
             client_routes.push(BenchClientRoute {
                 connection_id: client_connection,
                 client_channel: pending.client_channel,
+                client_epoch: pending.client_epoch,
                 module_channel: pending.module_channel,
+                module_epoch: pending.module_epoch,
                 ctx,
             });
         }
@@ -220,17 +228,17 @@ async fn bench_module_echo_drain(
         let corr = frame.header.corr;
         let body = frame.body.clone();
         let route = match forwarding
-            .lookup_data_route(module_connection, module_channel)
+            .lookup_data_route(module_connection, module_channel, frame.header.epoch)
             .expect("lookup_data_route")
         {
-            DataRoute::Module(Some(route)) => route,
-            DataRoute::Module(None) | DataRoute::Client(_) => continue,
+            DataRoute::Module(DataRouteState::Bound(route)) => route,
+            DataRoute::Module(_) | DataRoute::Client(_) => continue,
         };
         if let Ok(response) = Frame::build(
             FrameType::Response,
             frame.header.flags,
-            route.client_channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            route.client_channel,
+            route.client_epoch,
             corr,
             body,
         ) {

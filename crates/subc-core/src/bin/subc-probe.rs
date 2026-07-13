@@ -231,12 +231,15 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
     };
 
     // 4. route.open -> route_channel.
-    let route_channel = route_open(&mut stream, &module_id, &args).await?;
-    eprintln!("[probe] route.open '{module_id}' -> route_channel={route_channel}");
+    let route = route_open(&mut stream, &module_id, &args).await?;
+    eprintln!(
+        "[probe] route.open '{module_id}' -> route_channel={} epoch={}",
+        route.channel, route.epoch
+    );
 
     // 5. Tool call on the route channel.
     eprintln!("[probe] tools/call '{tool}' args={}", args.args);
-    let result = tool_call(&mut stream, route_channel, &tool, &args.args).await?;
+    let result = tool_call(&mut stream, route, &tool, &args.args).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -299,11 +302,17 @@ async fn supervisor_set_enabled(
     }
 }
 
+#[derive(Clone, Copy)]
+struct RouteHandle {
+    channel: u16,
+    epoch: u32,
+}
+
 async fn route_open(
     stream: &mut TcpStream,
     module_id: &str,
     args: &ProbeArgs,
-) -> Result<u16, ProbeError> {
+) -> Result<RouteHandle, ProbeError> {
     let request = ClientControlRequest::RouteOpen {
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
@@ -322,9 +331,11 @@ async fn route_open(
             match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
                 ClientControlResponse::RouteOpen {
                     route_channel,
-                    // WIRE-WAVE2: retain this epoch in the probe route handle.
-                    route_epoch: _route_epoch,
-                } => Ok(route_channel),
+                    route_epoch,
+                } => Ok(RouteHandle {
+                    channel: route_channel,
+                    epoch: route_epoch,
+                }),
                 other => Err(ProbeError::Message(format!(
                     "unexpected route.open response: {other:?}"
                 ))),
@@ -339,7 +350,7 @@ async fn route_open(
 
 async fn tool_call(
     stream: &mut TcpStream,
-    route_channel: u16,
+    route: RouteHandle,
     tool: &str,
     arguments: &Value,
 ) -> Result<Value, ProbeError> {
@@ -348,8 +359,8 @@ async fn tool_call(
     let request = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        route_channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        route.channel,
+        route.epoch,
         corr,
         body,
     )
@@ -388,7 +399,7 @@ async fn control_rpc(stream: &mut TcpStream, body: Vec<u8>) -> Result<Frame, Pro
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,

@@ -49,7 +49,7 @@ async fn happy_path_authenticates_then_round_trips_envelope_frame() -> TestResul
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(true, Priority::Interactive, true),
-        7, // WIRE-WAVE2: thread the binding epoch.
+        7,
         0,
         42,
         b"opaque post-auth envelope body".to_vec(),

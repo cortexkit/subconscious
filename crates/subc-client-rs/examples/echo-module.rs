@@ -69,7 +69,7 @@ impl ModuleHandler for EchoHandler {
                 let ms = request.get("ms").and_then(Value::as_u64).unwrap_or(100);
                 self.record(json!({
                     "kind": "sleep_started",
-                    "channel": ctx.channel(),
+                    "channel": ctx.route_handle().channel,
                     "corr": ctx.corr(),
                     "ms": ms,
                 }));
@@ -86,14 +86,14 @@ impl ModuleHandler for EchoHandler {
                 let tag = request.get("tag").cloned().unwrap_or(Value::Null);
                 self.record(json!({
                     "kind": "cancel_waiting",
-                    "channel": ctx.channel(),
+                    "channel": ctx.route_handle().channel,
                     "corr": ctx.corr(),
                     "tag": tag.clone(),
                 }));
                 ctx.cancelled().await;
                 self.record(json!({
                     "kind": "cancelled",
-                    "channel": ctx.channel(),
+                    "channel": ctx.route_handle().channel,
                     "corr": ctx.corr(),
                     "tag": tag,
                 }));
@@ -122,17 +122,19 @@ impl ModuleHandler for EchoHandler {
     async fn on_bind(&self, req: &subc_client_rs::RouteBindRequest) -> BindDecision {
         self.record(json!({
             "kind": "bind",
-            "route_channel": req.route_channel,
+            "route_channel": req.handle.channel,
+            "route_epoch": req.handle.epoch,
             "target": &req.target,
             "identity": &req.identity,
         }));
         BindDecision::accept()
     }
 
-    async fn on_route_gone(&self, channel: u16) {
+    async fn on_route_gone(&self, handle: &subc_client_rs::RouteHandle) {
         self.record(json!({
             "kind": "route_gone",
-            "route_channel": channel,
+            "route_channel": handle.channel,
+            "route_epoch": handle.epoch,
         }));
     }
 }

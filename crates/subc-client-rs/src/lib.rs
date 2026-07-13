@@ -3,7 +3,8 @@
 pub mod consumer;
 pub use consumer::{
     CallError, CallOptions, CloseRouteOptions, ConnectionState, ConsumerError, ConsumerOptions,
-    RetryBackoff, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
+    RetryBackoff, RoutePollResult, SubcConsumer, SubscribeOptions, Subscription,
+    SubscriptionClosed,
 };
 
 use std::{
@@ -16,13 +17,17 @@ use std::{
     io,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 pub use async_trait::async_trait;
 pub use subc_control::ConsumerIdentity;
 pub use subc_protocol::session::{HealthReport, HealthStatus};
+pub use subc_protocol::AdmissionClass;
 use subc_protocol::{
     manifest::{ModuleManifest, ProviderRole},
     session::{
@@ -51,9 +56,45 @@ const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 const EGRESS_BUFFER: usize = 64;
 const HANDLER_TASK_CAPACITY: usize = 64;
 const HELLO_CORR: u64 = 1;
+static NEXT_MODULE_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-type RequestKey = (u16, u64);
+type RequestKey = (u16, u32, u64);
 type InFlight = Arc<Mutex<HashMap<RequestKey, CancellationToken>>>;
+
+/// Immutable identity of one route binding on one live connection.
+///
+/// Only `channel` and `epoch` are serialized. The private connection token prevents
+/// work retained from an earlier connection from acting on a later connection that
+/// happens to reuse the same wire pair.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RouteHandle {
+    pub channel: u16,
+    pub epoch: u32,
+    connection_token: u64,
+}
+
+impl RouteHandle {
+    pub(crate) fn new(channel: u16, epoch: u32, connection_token: u64) -> Self {
+        Self {
+            channel,
+            epoch,
+            connection_token,
+        }
+    }
+
+    pub(crate) fn connection_token(self) -> u64 {
+        self.connection_token
+    }
+}
+
+impl fmt::Debug for RouteHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouteHandle")
+            .field("channel", &self.channel)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
 type CatalogUpdateReply = oneshot::Sender<Result<(), CatalogUpdateError>>;
 type CatalogUpdateWaiter = oneshot::Receiver<Result<(), CatalogUpdateError>>;
 type CatalogUpdateRequest = (u64, mpsc::Sender<Frame>, CatalogUpdateWaiter);
@@ -85,18 +126,27 @@ pub struct ModuleHandle {
 struct ModuleHandleShared {
     negotiated_ver: u8,
     supports_catalog_update: bool,
+    connection_token: u64,
+    live_routes: Mutex<HashMap<u16, RouteHandle>>,
+    dropped_route_frames: AtomicU64,
+    close_token: CancellationToken,
     inner: Mutex<ModuleHandleState>,
 }
 
 struct ModuleHandleState {
     writer: Option<mpsc::Sender<Frame>>,
-    next_corr: u64,
+    next_corr: Option<u64>,
     pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
     closed: bool,
 }
 
 impl ModuleHandle {
-    fn new(ack: &ModuleHelloAckBody, writer: mpsc::Sender<Frame>) -> Self {
+    fn new(
+        ack: &ModuleHelloAckBody,
+        writer: mpsc::Sender<Frame>,
+        connection_token: u64,
+        close_token: CancellationToken,
+    ) -> Self {
         Self {
             shared: Arc::new(ModuleHandleShared {
                 negotiated_ver: ack.negotiated_ver,
@@ -104,9 +154,13 @@ impl ModuleHandle {
                     .subc_ops
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
+                connection_token,
+                live_routes: Mutex::new(HashMap::new()),
+                dropped_route_frames: AtomicU64::new(0),
+                close_token,
                 inner: Mutex::new(ModuleHandleState {
                     writer: Some(writer),
-                    next_corr: HELLO_CORR + 1,
+                    next_corr: Some(HELLO_CORR + 1),
                     pending_catalog_updates: HashMap::new(),
                     closed: false,
                 }),
@@ -137,7 +191,7 @@ impl ModuleHandle {
             self.shared.negotiated_ver,
             FrameType::Request,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             corr,
             body,
@@ -162,6 +216,98 @@ impl ModuleHandle {
                 Err(CatalogUpdateError::Timeout)
             }
         }
+    }
+
+    /// Emit an uncorrelated Push on a live route.
+    pub async fn push(
+        &self,
+        handle: &RouteHandle,
+        body: Vec<u8>,
+        admission_class: Option<AdmissionClass>,
+    ) -> Result<(), SubcModuleError> {
+        self.validate_route(*handle)?;
+        let writer = self
+            .shared
+            .lock_inner()
+            .writer
+            .clone()
+            .ok_or(SubcModuleError::WriterClosed)?;
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Push,
+            data_flags().with_admission_class(admission_class.unwrap_or(AdmissionClass::Normal)),
+            handle.channel,
+            handle.epoch,
+            0,
+            body,
+        )
+        .map_err(SubcModuleError::FrameBuild)?;
+        send_outbound(&writer, frame).await
+    }
+
+    /// Number of unknown or stale route frames silently dropped by endpoint validation.
+    pub fn dropped_route_frames(&self) -> u64 {
+        self.shared.dropped_route_frames.load(Ordering::Relaxed)
+    }
+
+    fn validate_route(&self, handle: RouteHandle) -> Result<(), SubcModuleError> {
+        if handle.connection_token() != self.shared.connection_token {
+            return Err(SubcModuleError::StaleRouteHandle(handle));
+        }
+        let routes = self
+            .shared
+            .live_routes
+            .lock()
+            .map_err(|_| SubcModuleError::InFlightPoisoned)?;
+        if routes.get(&handle.channel) == Some(&handle) {
+            Ok(())
+        } else {
+            Err(SubcModuleError::StaleRouteHandle(handle))
+        }
+    }
+
+    fn install_route(&self, handle: RouteHandle) -> Result<(), SubcModuleError> {
+        self.shared
+            .live_routes
+            .lock()
+            .map_err(|_| SubcModuleError::InFlightPoisoned)?
+            .insert(handle.channel, handle);
+        Ok(())
+    }
+
+    fn remove_route(&self, handle: RouteHandle) -> Result<bool, SubcModuleError> {
+        let mut routes = self
+            .shared
+            .live_routes
+            .lock()
+            .map_err(|_| SubcModuleError::InFlightPoisoned)?;
+        if routes.get(&handle.channel) == Some(&handle) {
+            routes.remove(&handle.channel);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn validate_ingress(&self, channel: u16, epoch: u32) -> Result<bool, SubcModuleError> {
+        let handle = RouteHandle::new(channel, epoch, self.shared.connection_token);
+        let valid = self
+            .shared
+            .live_routes
+            .lock()
+            .map_err(|_| SubcModuleError::InFlightPoisoned)?
+            .get(&channel)
+            == Some(&handle);
+        if !valid {
+            self.shared
+                .dropped_route_frames
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(valid)
+    }
+
+    fn route_handle(&self, channel: u16, epoch: u32) -> RouteHandle {
+        RouteHandle::new(channel, epoch, self.shared.connection_token)
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
@@ -208,9 +354,27 @@ impl ModuleHandleShared {
         }
         let Some(writer) = inner.writer.clone() else {
             inner.closed = true;
+            self.close_token.cancel();
+            drop(inner);
+            self.clear_live_routes();
             return Err(CatalogUpdateError::ConnectionClosed);
         };
-        let corr = next_module_control_corr(&mut inner);
+        let Some(corr) = next_module_control_corr(&mut inner) else {
+            inner.closed = true;
+            inner.writer = None;
+            let pending = inner
+                .pending_catalog_updates
+                .drain()
+                .map(|(_, reply)| reply)
+                .collect::<Vec<_>>();
+            self.close_token.cancel();
+            drop(inner);
+            self.clear_live_routes();
+            for reply in pending {
+                let _ = reply.send(Err(CatalogUpdateError::ConnectionClosed));
+            }
+            return Err(CatalogUpdateError::ConnectionClosed);
+        };
         let (tx, rx) = oneshot::channel();
         inner.pending_catalog_updates.insert(corr, tx);
         Ok((corr, writer, rx))
@@ -232,14 +396,22 @@ impl ModuleHandleShared {
             }
             inner.closed = true;
             inner.writer = None;
+            self.close_token.cancel();
             inner
                 .pending_catalog_updates
                 .drain()
                 .map(|(_, reply)| reply)
                 .collect::<Vec<_>>()
         };
+        self.clear_live_routes();
         for reply in pending {
             let _ = reply.send(Err(CatalogUpdateError::ConnectionClosed));
+        }
+    }
+
+    fn clear_live_routes(&self) {
+        if let Ok(mut routes) = self.live_routes.lock() {
+            routes.clear();
         }
     }
 
@@ -250,14 +422,10 @@ impl ModuleHandleShared {
     }
 }
 
-fn next_module_control_corr(inner: &mut ModuleHandleState) -> u64 {
-    loop {
-        let corr = inner.next_corr;
-        inner.next_corr = inner.next_corr.wrapping_add(1).max(HELLO_CORR + 1);
-        if corr != HELLO_CORR && !inner.pending_catalog_updates.contains_key(&corr) {
-            return corr;
-        }
-    }
+fn next_module_control_corr(inner: &mut ModuleHandleState) -> Option<u64> {
+    let corr = inner.next_corr?;
+    inner.next_corr = corr.checked_add(1);
+    Some(corr)
 }
 
 /// Errors returned by [`ModuleHandle::catalog_update`].
@@ -317,18 +485,21 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// negotiated capabilities and any storage descriptor supplied by the daemon.
     async fn on_hello_ack(&self, _ack: &ModuleHelloAckBody) {}
 
-    /// Decide a route.bind. The default accepts every route.
+    /// Decide a route.bind. This hook is decision-only and must not emit route traffic.
     async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
         BindDecision::accept()
     }
+
+    /// Called after an accepted bind ACK is queued and the handle is installed.
+    async fn on_bound(&self, _handle: &RouteHandle) {}
 
     /// Return cheap in-memory health for the module. The default reports healthy.
     async fn health(&self) -> HealthReport {
         HealthReport::ok()
     }
 
-    /// A route channel was torn down by a per-route GOODBYE. The default is a no-op.
-    async fn on_route_gone(&self, _channel: u16) {}
+    /// A route was torn down, rejected, or abandoned before its bind ACK was queued.
+    async fn on_route_gone(&self, _handle: &RouteHandle) {}
 }
 
 /// The terminal result of a module request handler.
@@ -343,21 +514,22 @@ pub enum HandlerOutcome {
     Streamed,
 }
 
-/// Per-request context. Provides the route channel and correlation id, a way to
-/// emit interim stream data, and a cancellation signal.
+/// Per-request context. Retains the full route handle and correlation id, provides
+/// interim stream emission, and exposes a cancellation signal.
 #[derive(Clone)]
 pub struct RequestCtx {
-    channel: u16,
+    handle: RouteHandle,
     corr: u64,
     ver: u8,
     egress: mpsc::Sender<Frame>,
+    module_handle: ModuleHandle,
     cancelled: CancellationToken,
 }
 
 impl RequestCtx {
-    /// Route channel for this request.
-    pub fn channel(&self) -> u16 {
-        self.channel
+    /// Full route handle retained from ingress.
+    pub fn route_handle(&self) -> RouteHandle {
+        self.handle
     }
 
     /// Correlation id for this request.
@@ -368,11 +540,25 @@ impl RequestCtx {
     /// Emit an interim StreamData frame on this request's `(channel, corr)`. Once
     /// the request is cancelled or its route is gone, late emits are dropped.
     pub async fn emit(&self, body: Vec<u8>) -> Result<(), SubcModuleError> {
+        self.emit_with_admission(body, None).await
+    }
+
+    /// Emit StreamData with an explicit admission class. `None` means NORMAL.
+    pub async fn emit_with_admission(
+        &self,
+        body: Vec<u8>,
+        admission_class: Option<AdmissionClass>,
+    ) -> Result<(), SubcModuleError> {
+        self.module_handle.validate_route(self.handle)?;
         if self.cancelled.is_cancelled() {
             return Ok(());
         }
-        self.send_frame(FrameType::StreamData, data_flags(), body)
-            .await
+        self.send_frame(
+            FrameType::StreamData,
+            data_flags().with_admission_class(admission_class.unwrap_or(AdmissionClass::Normal)),
+            body,
+        )
+        .await
     }
 
     /// Completes when the other side sends Cancel for this request or the route
@@ -392,12 +578,13 @@ impl RequestCtx {
         flags: Flags,
         body: Vec<u8>,
     ) -> Result<(), SubcModuleError> {
+        self.module_handle.validate_route(self.handle)?;
         let frame = Frame::build_with_version(
             self.ver,
             frame_type,
             flags,
-            self.channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            self.handle.channel,
+            self.handle.epoch,
             self.corr,
             body,
         )
@@ -409,7 +596,7 @@ impl RequestCtx {
 /// Route-bind request delivered on channel 0.
 #[derive(Debug, Clone)]
 pub struct RouteBindRequest {
-    pub route_channel: u16,
+    pub handle: RouteHandle,
     pub target: RouteTarget,
     pub identity: BindIdentity,
     pub principal: Option<Principal>,
@@ -500,7 +687,13 @@ where
     let ack = expect_hello_ack(&mut read_half).await?;
     handler.on_hello_ack(&ack).await;
 
-    let handle = ModuleHandle::new(&ack, tx.clone());
+    let connection_token = NEXT_MODULE_CONNECTION_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        })
+        .map_err(|_| SubcModuleError::ConnectionTokenExhausted)?;
+    let close_token = CancellationToken::new();
+    let handle = ModuleHandle::new(&ack, tx.clone(), connection_token, close_token);
     let serve_handle = handle.clone();
     let serve_future = Box::pin(async move {
         let loop_result =
@@ -544,7 +737,11 @@ where
 {
     let dispatcher = RequestDispatcher::new();
     loop {
-        let frame = match read_frame(&mut reader).await {
+        let read = tokio::select! {
+            () = module_handle.shared.close_token.cancelled() => return Ok(()),
+            read = read_frame(&mut reader) => read,
+        };
+        let frame = match read {
             Ok(Some(frame)) => frame,
             // Clean EOF: the daemon closed the connection.
             Ok(None) => return Ok(()),
@@ -588,13 +785,18 @@ async fn handle_frame<H>(
 where
     H: ModuleHandler,
 {
+    if frame.header.channel != 0
+        && !module_handle.validate_ingress(frame.header.channel, frame.header.epoch)?
+    {
+        return Ok(true);
+    }
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
             let pong = Frame::build_with_version(
                 frame.header.ver,
                 FrameType::Pong,
                 frame.header.flags,
-                0, // WIRE-WAVE2: thread the binding epoch.
+                0,
                 0,
                 frame.header.corr,
                 Vec::new(),
@@ -605,8 +807,11 @@ where
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
-            cancel_channel(&dispatcher.in_flight, frame.header.channel)?;
-            handler.on_route_gone(frame.header.channel).await;
+            let handle = module_handle.route_handle(frame.header.channel, frame.header.epoch);
+            if module_handle.remove_route(handle)? {
+                cancel_handle(&dispatcher.in_flight, handle)?;
+                handler.on_route_gone(&handle).await;
+            }
             Ok(true)
         }
         FrameType::Response if frame.header.channel == 0 => {
@@ -622,11 +827,12 @@ where
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, egress, handler, dispatcher).await?;
+            handle_control_request(frame, egress, handler, dispatcher, module_handle.clone())
+                .await?;
             Ok(true)
         }
         FrameType::Request => {
-            spawn_data_request(frame, egress.clone(), handler, dispatcher)?;
+            spawn_data_request(frame, egress.clone(), handler, dispatcher, module_handle)?;
             Ok(true)
         }
         _ => Ok(true),
@@ -638,23 +844,25 @@ fn spawn_data_request<H>(
     egress: mpsc::Sender<Frame>,
     handler: Arc<H>,
     dispatcher: RequestDispatcher,
+    module_handle: ModuleHandle,
 ) -> Result<(), SubcModuleError>
 where
     H: ModuleHandler,
 {
-    let channel = frame.header.channel;
+    let handle = module_handle.route_handle(frame.header.channel, frame.header.epoch);
     let corr = frame.header.corr;
     let cancellation = CancellationToken::new();
     {
         let mut guard = lock_in_flight(&dispatcher.in_flight)?;
-        guard.insert((channel, corr), cancellation.clone());
+        guard.insert((handle.channel, handle.epoch, corr), cancellation.clone());
     }
 
     let ctx = RequestCtx {
-        channel,
+        handle,
         corr,
         ver: frame.header.ver,
         egress,
+        module_handle,
         cancelled: cancellation,
     };
     let body = frame.body;
@@ -663,14 +871,14 @@ where
     tokio::spawn(async move {
         let Ok(_permit) = permits.acquire_owned().await else {
             if let Ok(mut guard) = in_flight.lock() {
-                guard.remove(&(channel, corr));
+                guard.remove(&(handle.channel, handle.epoch, corr));
             }
             return;
         };
         let outcome = handler.handle(ctx.clone(), body).await;
         let _ = send_handler_outcome(&ctx, outcome).await;
         if let Ok(mut guard) = in_flight.lock() {
-            guard.remove(&(channel, corr));
+            guard.remove(&(handle.channel, handle.epoch, corr));
         }
     });
     Ok(())
@@ -686,12 +894,13 @@ where
     H: ModuleHandler,
 {
     let channel = frame.header.channel;
+    let epoch = frame.header.epoch;
     let corr = frame.header.corr;
     let ver = frame.header.ver;
     let cancellation = CancellationToken::new();
     {
         let mut guard = lock_in_flight(&dispatcher.in_flight)?;
-        guard.insert((channel, corr), cancellation.clone());
+        guard.insert((channel, epoch, corr), cancellation.clone());
     }
 
     let in_flight = Arc::clone(&dispatcher.in_flight);
@@ -699,7 +908,7 @@ where
     tokio::spawn(async move {
         let Ok(_permit) = permits.acquire_owned().await else {
             if let Ok(mut guard) = in_flight.lock() {
-                guard.remove(&(channel, corr));
+                guard.remove(&(channel, epoch, corr));
             }
             return;
         };
@@ -711,8 +920,8 @@ where
                     ver,
                     FrameType::Response,
                     control_flags(),
-                    channel, // WIRE-WAVE2: thread the binding epoch.
-                    0,
+                    channel,
+                    epoch,
                     corr,
                     body,
                 ) {
@@ -721,7 +930,7 @@ where
             }
         }
         if let Ok(mut guard) = in_flight.lock() {
-            guard.remove(&(channel, corr));
+            guard.remove(&(channel, epoch, corr));
         }
     });
     Ok(())
@@ -752,7 +961,7 @@ fn handle_cancel(frame: Frame, in_flight: &InFlight) -> Result<(), SubcModuleErr
     let cancellation = {
         let guard = lock_in_flight(in_flight)?;
         guard
-            .get(&(frame.header.channel, frame.header.corr))
+            .get(&(frame.header.channel, frame.header.epoch, frame.header.corr))
             .cloned()
     };
     if let Some(cancellation) = cancellation {
@@ -761,13 +970,13 @@ fn handle_cancel(frame: Frame, in_flight: &InFlight) -> Result<(), SubcModuleErr
     Ok(())
 }
 
-fn cancel_channel(in_flight: &InFlight, channel: u16) -> Result<(), SubcModuleError> {
+fn cancel_handle(in_flight: &InFlight, handle: RouteHandle) -> Result<(), SubcModuleError> {
     let cancelled = {
         let mut guard = lock_in_flight(in_flight)?;
         let keys = guard
             .keys()
             .copied()
-            .filter(|(request_channel, _)| *request_channel == channel)
+            .filter(|(channel, epoch, _)| *channel == handle.channel && *epoch == handle.epoch)
             .collect::<Vec<_>>();
         keys.into_iter()
             .filter_map(|key| guard.remove(&key))
@@ -784,6 +993,7 @@ async fn handle_control_request<H>(
     egress: &mpsc::Sender<Frame>,
     handler: Arc<H>,
     dispatcher: RequestDispatcher,
+    module_handle: ModuleHandle,
 ) -> Result<(), SubcModuleError>
 where
     H: ModuleHandler,
@@ -793,15 +1003,15 @@ where
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
-            // WIRE-WAVE2: retain this epoch in the provider route handle.
-            epoch: _epoch,
+            epoch,
             target,
             identity,
             principal,
             consumer_capabilities,
         } => {
+            let handle = module_handle.route_handle(route_channel, epoch);
             let req = RouteBindRequest {
-                route_channel,
+                handle,
                 target,
                 identity,
                 principal,
@@ -810,34 +1020,57 @@ where
             let decision = handler.on_bind(&req).await;
             match decision.kind {
                 BindDecisionKind::Accept => {
-                    let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
-                        .map_err(SubcModuleError::Json)?;
-                    let response = Frame::build_with_version(
-                        frame.header.ver,
-                        FrameType::Response,
-                        control_flags(),
-                        0, // WIRE-WAVE2: thread the binding epoch.
-                        0,
-                        frame.header.corr,
-                        body,
-                    )
-                    .map_err(SubcModuleError::FrameBuild)?;
-                    send_outbound(egress, response).await?;
+                    let response = match serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
+                        .map_err(SubcModuleError::Json)
+                        .and_then(|body| {
+                            Frame::build_with_version(
+                                frame.header.ver,
+                                FrameType::Response,
+                                control_flags(),
+                                0,
+                                0,
+                                frame.header.corr,
+                                body,
+                            )
+                            .map_err(SubcModuleError::FrameBuild)
+                        }) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            handler.on_route_gone(&handle).await;
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) = send_outbound(egress, response).await {
+                        handler.on_route_gone(&handle).await;
+                        return Err(err);
+                    }
+                    if let Err(err) = module_handle.install_route(handle) {
+                        handler.on_route_gone(&handle).await;
+                        return Err(err);
+                    }
+                    handler.on_bound(&handle).await;
                 }
                 BindDecisionKind::Reject { code, message } => {
-                    let body = serde_json::to_vec(&ErrorBody { code, message })
-                        .map_err(SubcModuleError::Json)?;
-                    let response = Frame::build_with_version(
-                        frame.header.ver,
-                        FrameType::Error,
-                        control_flags(),
-                        0, // WIRE-WAVE2: thread the binding epoch.
-                        0,
-                        frame.header.corr,
-                        body,
-                    )
-                    .map_err(SubcModuleError::FrameBuild)?;
-                    send_outbound(egress, response).await?;
+                    let result = serde_json::to_vec(&ErrorBody { code, message })
+                        .map_err(SubcModuleError::Json)
+                        .and_then(|body| {
+                            Frame::build_with_version(
+                                frame.header.ver,
+                                FrameType::Error,
+                                control_flags(),
+                                0,
+                                0,
+                                frame.header.corr,
+                                body,
+                            )
+                            .map_err(SubcModuleError::FrameBuild)
+                        });
+                    let result = match result {
+                        Ok(response) => send_outbound(egress, response).await,
+                        Err(err) => Err(err),
+                    };
+                    handler.on_route_gone(&handle).await;
+                    result?;
                 }
             }
         }
@@ -861,15 +1094,8 @@ async fn send_hello(
             .filter(|value| !value.is_empty()),
     })
     .map_err(SubcModuleError::Json)?;
-    let frame = Frame::build(
-        FrameType::Hello,
-        control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
-        0,
-        HELLO_CORR,
-        body,
-    )
-    .map_err(SubcModuleError::FrameBuild)?;
+    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
+        .map_err(SubcModuleError::FrameBuild)?;
     send_outbound(egress, frame).await
 }
 
@@ -1018,6 +1244,8 @@ pub enum SubcModuleError {
     FrameBuild(FrameBuildError),
     Json(serde_json::Error),
     WriterClosed,
+    StaleRouteHandle(RouteHandle),
+    ConnectionTokenExhausted,
     WriterTask(tokio::task::JoinError),
     InFlightPoisoned,
     ConnectionClosedBeforeHelloAck,
@@ -1072,6 +1300,8 @@ impl fmt::Display for SubcModuleError {
             Self::FrameBuild(err) => write!(f, "frame build error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::WriterClosed => write!(f, "module writer task closed"),
+            Self::StaleRouteHandle(handle) => write!(f, "stale route handle: {handle:?}"),
+            Self::ConnectionTokenExhausted => write!(f, "module connection token exhausted"),
             Self::WriterTask(err) => write!(f, "module writer task failed: {err}"),
             Self::InFlightPoisoned => write!(f, "in-flight registry lock poisoned"),
             Self::ConnectionClosedBeforeHelloAck => write!(f, "connection closed before HELLO_ACK"),
@@ -1101,6 +1331,8 @@ impl Error for SubcModuleError {
             | Self::NonUnicodeModuleIdEnv { .. }
             | Self::NoEndpoint { .. }
             | Self::WriterClosed
+            | Self::StaleRouteHandle(_)
+            | Self::ConnectionTokenExhausted
             | Self::InFlightPoisoned
             | Self::ConnectionClosedBeforeHelloAck
             | Self::UnexpectedHelloAck { .. }
@@ -1152,7 +1384,7 @@ mod tests {
         Frame::build(
             FrameType::Request,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             corr,
             serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
@@ -1164,8 +1396,8 @@ mod tests {
         Frame::build(
             FrameType::Request,
             data_flags(),
-            channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            channel,
+            1,
             corr,
             b"opaque".to_vec(),
         )
@@ -1176,7 +1408,7 @@ mod tests {
         Frame::build(
             FrameType::Response,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             corr,
             serde_json::to_vec(&ModuleControlResponseToModule::CatalogUpdate {}).unwrap(),
@@ -1192,7 +1424,7 @@ mod tests {
             subc_capabilities: Vec::new(),
             storage: None,
         };
-        (ModuleHandle::new(&ack, tx), rx)
+        (ModuleHandle::new(&ack, tx, 1, CancellationToken::new()), rx)
     }
 
     fn test_provider_role(tool_names: &[&str]) -> ProviderRole {
@@ -1298,6 +1530,9 @@ mod tests {
         });
         let dispatcher = RequestDispatcher::new();
         let (module_handle, _unused_rx) = test_module_handle(&[]);
+        module_handle
+            .install_route(RouteHandle::new(7, 1, 1))
+            .unwrap();
 
         for corr in 0..HANDLER_TASK_CAPACITY as u64 {
             handle_frame(
@@ -1328,5 +1563,208 @@ mod tests {
         );
 
         release.notify_waiters();
+    }
+
+    struct CountingHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for CountingHandler {
+        async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            HandlerOutcome::Response(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_validation_drops_stale_request_before_handler_dispatch() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingHandler {
+            calls: Arc::clone(&calls),
+        });
+        let dispatcher = RequestDispatcher::new();
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
+        module_handle
+            .install_route(RouteHandle::new(7, 2, 1))
+            .unwrap();
+        let stale = Frame::build(FrameType::Request, data_flags(), 7, 1, 55, Vec::new()).unwrap();
+
+        assert!(
+            handle_frame(stale, &tx, handler, dispatcher, module_handle.clone())
+                .await
+                .unwrap()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(module_handle.dropped_route_frames(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    struct BindOrderingHandler {
+        module_handle: ModuleHandle,
+        bind_emit_rejected: Arc<AtomicUsize>,
+        bound: Arc<AtomicUsize>,
+        cleanup: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for BindOrderingHandler {
+        async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(Vec::new())
+        }
+
+        async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
+            if matches!(
+                self.module_handle
+                    .push(&req.handle, b"too-early".to_vec(), None)
+                    .await,
+                Err(SubcModuleError::StaleRouteHandle(_))
+            ) {
+                self.bind_emit_rejected.fetch_add(1, Ordering::SeqCst);
+            }
+            BindDecision::accept()
+        }
+
+        async fn on_bound(&self, handle: &RouteHandle) {
+            self.bound.fetch_add(1, Ordering::SeqCst);
+            self.module_handle
+                .push(handle, b"bound".to_vec(), Some(AdmissionClass::Expedite))
+                .await
+                .unwrap();
+        }
+
+        async fn on_route_gone(&self, _handle: &RouteHandle) {
+            self.cleanup.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn route_bind_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
+        let body = serde_json::to_vec(&ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch,
+            target: RouteTarget::ToolProvider {
+                module_id: "provider".to_string(),
+            },
+            identity: BindIdentity {
+                project_root: PathBuf::from("/tmp/project"),
+                harness: "test".to_string(),
+                session: "bind".to_string(),
+            },
+            principal: None,
+            consumer_capabilities: None,
+        })
+        .unwrap();
+        Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn on_bound_runs_only_after_ack_queue_and_handle_install() {
+        let (module_handle, mut rx) = test_module_handle(&[]);
+        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        let bind_emit_rejected = Arc::new(AtomicUsize::new(0));
+        let bound = Arc::new(AtomicUsize::new(0));
+        let cleanup = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(BindOrderingHandler {
+            module_handle: module_handle.clone(),
+            bind_emit_rejected: Arc::clone(&bind_emit_rejected),
+            bound: Arc::clone(&bound),
+            cleanup: Arc::clone(&cleanup),
+        });
+
+        assert!(handle_frame(
+            route_bind_frame(8, 4, 90),
+            &tx,
+            handler,
+            RequestDispatcher::new(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap());
+        assert_eq!(bind_emit_rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(bound.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup.load(Ordering::SeqCst), 0);
+
+        let ack = rx.recv().await.unwrap();
+        let push = rx.recv().await.unwrap();
+        assert_eq!(ack.header.ty, FrameType::Response);
+        assert_eq!(ack.header.channel, 0);
+        assert_eq!(push.header.ty, FrameType::Push);
+        assert_eq!((push.header.channel, push.header.epoch), (8, 4));
+        assert_eq!(
+            push.header.flags.admission_class(),
+            Some(AdmissionClass::Expedite)
+        );
+
+        let captured = RouteHandle::new(8, 4, 1);
+        assert!(module_handle.remove_route(captured).unwrap());
+        let stale = module_handle
+            .push(&captured, Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(stale, SubcModuleError::StaleRouteHandle(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    struct RejectingHandler {
+        bound: Arc<AtomicUsize>,
+        cleanup: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for RejectingHandler {
+        async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(Vec::new())
+        }
+
+        async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
+            BindDecision::reject("no", "rejected")
+        }
+
+        async fn on_bound(&self, _handle: &RouteHandle) {
+            self.bound.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn on_route_gone(&self, _handle: &RouteHandle) {
+            self.cleanup.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_bind_cleans_up_without_installing_or_calling_on_bound() {
+        let (module_handle, mut rx) = test_module_handle(&[]);
+        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        let bound = Arc::new(AtomicUsize::new(0));
+        let cleanup = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(RejectingHandler {
+            bound: Arc::clone(&bound),
+            cleanup: Arc::clone(&cleanup),
+        });
+        handle_frame(
+            route_bind_frame(6, 3, 91),
+            &tx,
+            handler,
+            RequestDispatcher::new(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Error);
+        assert_eq!(bound.load(Ordering::SeqCst), 0);
+        assert_eq!(cleanup.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            module_handle.validate_route(RouteHandle::new(6, 3, 1)),
+            Err(SubcModuleError::StaleRouteHandle(_))
+        ));
+    }
+
+    #[test]
+    fn module_control_corr_is_monotonic_and_exhausts_without_wrap() {
+        let (module_handle, _rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
+        let mut inner = module_handle.shared.lock_inner();
+        inner.next_corr = Some(u64::MAX);
+        assert_eq!(next_module_control_corr(&mut inner), Some(u64::MAX));
+        assert_eq!(next_module_control_corr(&mut inner), None);
     }
 }

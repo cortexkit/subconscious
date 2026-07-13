@@ -8,12 +8,15 @@ use std::{
     },
 };
 
-use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse, ErrorBody};
-use tokio::sync::{oneshot, Semaphore};
+use subc_control::ClientControlResponse;
+use subc_protocol::{
+    manifest::Concurrency, session::ModuleControlResponse, ErrorBody, Flags, FrameType, Priority,
+};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use crate::{registry::ConnectionId, router::FrameSink};
+use crate::{registry::ConnectionId, router::FrameSink, Frame};
 
 /// Default per-channel request-credit window for modules that schedule internally.
 const DEFAULT_MODULE_MANAGED_WINDOW: usize = 32;
@@ -51,18 +54,28 @@ pub(crate) struct RouteBinding {
     pub client_sink: FrameSink,
     pub client_negotiated_ver: u8,
     pub client_channel: u16,
+    pub client_epoch: u32,
     pub module_id: String,
     pub module_endpoint: ModuleEndpointId,
     pub module_sink: FrameSink,
     pub module_negotiated_ver: u8,
     pub module_channel: u16,
+    pub module_epoch: u32,
     pub flow: Arc<ChannelFlow>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum DataRoute {
-    Client(Option<Arc<RouteBinding>>),
-    Module(Option<Arc<RouteBinding>>),
+    Client(DataRouteState),
+    Module(DataRouteState),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum DataRouteState {
+    Bound(Arc<RouteBinding>),
+    Reserved,
+    EpochMismatch,
+    Absent,
 }
 
 /// Which kind of peer a route GOODBYE is being delivered to. This decides what
@@ -103,6 +116,7 @@ pub(crate) struct GoodbyeTarget {
     pub sink: FrameSink,
     pub negotiated_ver: u8,
     pub channel: u16,
+    pub epoch: u32,
     pub kind: GoodbyeTargetKind,
 }
 
@@ -119,9 +133,10 @@ pub(crate) struct PendingRouteBindRelay {
     pub endpoint: ModuleEndpointId,
     pub module_sink: FrameSink,
     pub negotiated_ver: u8,
-    pub client_connection_id: ConnectionId,
     pub client_channel: u16,
+    pub client_epoch: u32,
     pub module_channel: u16,
+    pub module_epoch: u32,
     pub corr: u64,
     pub receiver: oneshot::Receiver<RouteBindRelayOutcome>,
 }
@@ -131,6 +146,7 @@ pub(crate) struct ModuleDrainTarget {
     pub endpoint: ModuleEndpointId,
     pub sink: FrameSink,
     pub negotiated_ver: u8,
+    pub abandoned_bindings: Vec<GoodbyeTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +154,12 @@ pub(crate) enum RouteBindRelayOutcome {
     Accepted,
     Rejected(ErrorBody),
     ModuleGone(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRelayCompletion {
+    pub settled: bool,
+    pub abandoned: Option<GoodbyeTarget>,
 }
 
 #[derive(Debug)]
@@ -156,6 +178,7 @@ pub(crate) enum ModuleControlRpcOutcome {
     ModuleGone(String),
     MalformedResponse(String),
     UnexpectedOp { expected: String, actual: String },
+    DeadlineElapsed,
 }
 
 #[derive(Debug)]
@@ -163,6 +186,42 @@ struct PendingModuleControlRpcEntry {
     expected_op: String,
     deadline: Instant,
     sender: oneshot::Sender<ModuleControlRpcOutcome>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RouteReservation {
+    client_key: ClientRouteKey,
+    module_key: ModuleRouteKey,
+    client_epoch: u32,
+    module_epoch: u32,
+}
+
+#[derive(Debug)]
+struct PendingRouteBindRelayEntry {
+    reservation: RouteReservation,
+    client_sink: FrameSink,
+    client_negotiated_ver: u8,
+    client_permit: mpsc::OwnedPermit<Frame>,
+    route_open_frame: Frame,
+    deadline: Instant,
+    relay_enqueued: bool,
+    sender: oneshot::Sender<RouteBindRelayOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RouteRelease {
+    Removed(GoodbyeTarget),
+    Stale,
+    Absent,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RoutePollSnapshot {
+    Bound {
+        module_id: String,
+        status: Option<String>,
+    },
+    Absent,
 }
 
 #[derive(Debug, Clone)]
@@ -179,16 +238,19 @@ struct ForwardingInner {
     endpoint_by_connection: HashMap<ConnectionId, ModuleEndpointId>,
     module_id_by_endpoint: HashMap<ModuleEndpointId, String>,
     draining_endpoints: HashSet<ModuleEndpointId>,
+    closing_connections: HashSet<ConnectionId>,
     next_generation: u64,
-    next_relay_corr: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
     reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
     next_client_channel: HashMap<ConnectionId, u16>,
     next_module_channel: HashMap<ModuleEndpointId, u16>,
+    client_slot_epochs: HashMap<ClientRouteKey, u32>,
+    module_slot_epochs: HashMap<ModuleRouteKey, u32>,
+    last_published_epoch: HashMap<ClientRouteKey, u32>,
     client_to_module: HashMap<ClientRouteKey, Arc<RouteBinding>>,
     module_to_client: HashMap<ModuleRouteKey, Arc<RouteBinding>>,
-    status: HashMap<ClientRouteKey, String>,
-    pending_relays: HashMap<(ModuleEndpointId, u64), oneshot::Sender<RouteBindRelayOutcome>>,
+    status: HashMap<(ClientRouteKey, u32), String>,
+    pending_relays: HashMap<(ModuleEndpointId, u64), PendingRouteBindRelayEntry>,
     next_control_corr: HashMap<ModuleEndpointId, u64>,
     pending_control_rpcs: HashMap<(ModuleEndpointId, u64), PendingModuleControlRpcEntry>,
 }
@@ -221,6 +283,7 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 pub struct ForwardingTable {
     inner: RwLock<ForwardingInner>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
+    stale_epoch_drops: AtomicUsize,
 }
 
 impl ForwardingTable {
@@ -277,6 +340,9 @@ impl ForwardingTable {
         sink: FrameSink,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         let mut inner = self.write_inner()?;
+        if inner.closing_connections.contains(&connection_id) {
+            return Err(ForwardingError::ConnectionClosing { connection_id });
+        }
         if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             let _ = remove_module_connection_locked(&mut inner, old_endpoint);
         }
@@ -292,9 +358,6 @@ impl ForwardingTable {
             .insert(endpoint, module_id.clone());
         inner.next_module_channel.insert(endpoint, 1);
         inner.next_control_corr.insert(endpoint, 1);
-        if inner.next_relay_corr == 0 {
-            inner.next_relay_corr = 1;
-        }
         inner.modules_by_id.insert(
             module_id.clone(),
             ModuleConnection {
@@ -307,12 +370,59 @@ impl ForwardingTable {
         Ok(endpoint)
     }
 
-    pub(crate) fn begin_route_bind_relay_for(
+    pub(crate) async fn begin_route_bind_relay_for(
         &self,
         client_connection_id: ConnectionId,
+        client_sink: FrameSink,
+        client_negotiated_ver: u8,
+        client_corr: u64,
+        module_id: &str,
+        deadline: Instant,
+    ) -> Result<PendingRouteBindRelay, ForwardingError> {
+        // Reserve egress capacity before taking the forwarding lock. The permit is
+        // held until the bind reaches one terminal state, so an accepted bind can
+        // publish its table entry and RouteOpen response in one critical section.
+        let client_permit =
+            client_sink
+                .reserve_owned()
+                .await
+                .map_err(|_| ForwardingError::ClientEgressClosed {
+                    connection_id: client_connection_id,
+                })?;
+        self.begin_route_bind_relay_inner(
+            client_connection_id,
+            client_sink,
+            client_negotiated_ver,
+            client_corr,
+            module_id,
+            deadline,
+            client_permit,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_route_bind_relay_for_test(
+        &self,
+        client_connection_id: ConnectionId,
+        client_sink: FrameSink,
+        client_corr: u64,
         module_id: &str,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
-        self.begin_route_bind_relay_inner(client_connection_id, module_id)
+        let permit =
+            client_sink
+                .try_reserve_owned()
+                .map_err(|_| ForwardingError::ClientEgressClosed {
+                    connection_id: client_connection_id,
+                })?;
+        self.begin_route_bind_relay_inner(
+            client_connection_id,
+            client_sink,
+            subc_protocol::PROTOCOL_VERSION,
+            client_corr,
+            module_id,
+            Instant::now() + std::time::Duration::from_secs(60),
+            permit,
+        )
     }
 
     pub(crate) fn begin_module_control_rpc_for(
@@ -332,7 +442,28 @@ impl ForwardingTable {
                 module_id: module_id.to_string(),
             });
         }
-        let corr = inner.allocate_control_corr(module.endpoint)?;
+        if inner
+            .closing_connections
+            .contains(&module.endpoint.connection_id)
+        {
+            return Err(ForwardingError::ConnectionClosing {
+                connection_id: module.endpoint.connection_id,
+            });
+        }
+        let corr = match inner.allocate_control_corr(module.endpoint) {
+            Ok(corr) => corr,
+            Err(err) => {
+                drop(inner);
+                self.request_connection_close(
+                    module.endpoint.connection_id,
+                    CloseReason::new(
+                        "control_correlation_exhausted",
+                        "daemon-originated channel-0 correlation space exhausted",
+                    ),
+                );
+                return Err(err);
+            }
+        };
         let (sender, receiver) = oneshot::channel();
         inner.pending_control_rpcs.insert(
             (module.endpoint, corr),
@@ -352,12 +483,23 @@ impl ForwardingTable {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn begin_route_bind_relay_inner(
         &self,
         client_connection_id: ConnectionId,
+        client_sink: FrameSink,
+        client_negotiated_ver: u8,
+        client_corr: u64,
         expected_module_id: &str,
+        deadline: Instant,
+        client_permit: mpsc::OwnedPermit<Frame>,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.write_inner()?;
+        if inner.closing_connections.contains(&client_connection_id) {
+            return Err(ForwardingError::ConnectionClosing {
+                connection_id: client_connection_id,
+            });
+        }
         let module = inner
             .modules_by_id
             .get(expected_module_id)
@@ -368,10 +510,31 @@ impl ForwardingTable {
                 module_id: expected_module_id.to_string(),
             });
         }
-        let client_channel = inner.allocate_client_channel(client_connection_id)?;
-        let module_channel = inner.allocate_module_channel(module.endpoint)?;
-        let corr = inner.allocate_relay_corr(module.endpoint)?;
+        if inner
+            .closing_connections
+            .contains(&module.endpoint.connection_id)
+        {
+            return Err(ForwardingError::ConnectionClosing {
+                connection_id: module.endpoint.connection_id,
+            });
+        }
 
+        let corr = match inner.allocate_control_corr(module.endpoint) {
+            Ok(corr) => corr,
+            Err(err) => {
+                drop(inner);
+                self.request_connection_close(
+                    module.endpoint.connection_id,
+                    CloseReason::new(
+                        "control_correlation_exhausted",
+                        "daemon-originated channel-0 correlation space exhausted",
+                    ),
+                );
+                return Err(err);
+            }
+        };
+        let (client_channel, client_epoch, module_channel, module_epoch) =
+            inner.allocate_route_slots(client_connection_id, module.endpoint)?;
         let client_key = ClientRouteKey {
             connection_id: client_connection_id,
             channel: client_channel,
@@ -380,112 +543,76 @@ impl ForwardingTable {
             endpoint: module.endpoint,
             channel: module_channel,
         };
+        let reservation = RouteReservation {
+            client_key,
+            module_key,
+            client_epoch,
+            module_epoch,
+        };
+        let response_body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            route_channel: client_channel,
+            route_epoch: client_epoch,
+        })
+        .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))?;
+        let route_open_frame = Frame::build_with_version(
+            client_negotiated_ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            client_corr,
+            response_body,
+        )
+        .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))?;
         let (sender, receiver) = oneshot::channel();
         inner.reserved_client.insert(client_key, module_key);
         inner.reserved_module.insert(module_key, client_key);
-        inner.pending_relays.insert((module.endpoint, corr), sender);
+        inner.pending_relays.insert(
+            (module.endpoint, corr),
+            PendingRouteBindRelayEntry {
+                reservation,
+                client_sink,
+                client_negotiated_ver,
+                client_permit,
+                route_open_frame,
+                deadline,
+                relay_enqueued: false,
+                sender,
+            },
+        );
 
         Ok(PendingRouteBindRelay {
             endpoint: module.endpoint,
             module_sink: module.sink,
             negotiated_ver: module.negotiated_ver,
-            client_connection_id,
             client_channel,
+            client_epoch,
             module_channel,
+            module_epoch,
             corr,
             receiver,
         })
     }
 
-    pub(crate) fn commit_route(
+    pub(crate) fn mark_route_bind_relay_enqueued(
         &self,
-        client_connection_id: ConnectionId,
-        client_sink: FrameSink,
-        client_negotiated_ver: u8,
         endpoint: ModuleEndpointId,
-        client_channel: u16,
-        module_channel: u16,
-    ) -> Result<(), ForwardingError> {
+        corr: u64,
+    ) -> Result<bool, ForwardingError> {
         let mut inner = self.write_inner()?;
-        let module_id = inner
-            .module_id_by_endpoint
-            .get(&endpoint)
-            .cloned()
-            .ok_or(ForwardingError::StaleModuleEndpoint)?;
-        if inner.draining_endpoints.contains(&endpoint) {
-            return Err(ForwardingError::ModuleReloading { module_id });
-        }
-
-        let client_key = ClientRouteKey {
-            connection_id: client_connection_id,
-            channel: client_channel,
+        let Some(pending) = inner.pending_relays.get_mut(&(endpoint, corr)) else {
+            return Ok(false);
         };
-        let module_key = ModuleRouteKey {
-            endpoint,
-            channel: module_channel,
-        };
-        if inner.reserved_client.remove(&client_key) != Some(module_key)
-            || inner.reserved_module.remove(&module_key) != Some(client_key)
-        {
-            return Err(ForwardingError::UnknownReservation {
-                client_channel,
-                module_channel,
-            });
-        }
-
-        let module = inner
-            .modules_by_id
-            .get(&module_id)
-            .filter(|module| module.endpoint == endpoint)
-            .cloned()
-            .ok_or(ForwardingError::StaleModuleEndpoint)?;
-
-        let binding = Arc::new(RouteBinding {
-            client_connection_id,
-            client_sink,
-            client_negotiated_ver,
-            client_channel,
-            module_id,
-            module_endpoint: endpoint,
-            module_sink: module.sink,
-            module_negotiated_ver: module.negotiated_ver,
-            module_channel,
-            flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
-        });
-        inner
-            .client_to_module
-            .insert(client_key, Arc::clone(&binding));
-        inner.module_to_client.insert(module_key, binding);
-        Ok(())
-    }
-
-    pub(crate) fn release_reserved_route(
-        &self,
-        client_connection_id: ConnectionId,
-        client_channel: u16,
-        endpoint: ModuleEndpointId,
-        module_channel: u16,
-    ) -> Result<(), ForwardingError> {
-        let mut inner = self.write_inner()?;
-        release_reserved_route_locked(
-            &mut inner,
-            ClientRouteKey {
-                connection_id: client_connection_id,
-                channel: client_channel,
-            },
-            ModuleRouteKey {
-                endpoint,
-                channel: module_channel,
-            },
-        );
-        Ok(())
+        pending.relay_enqueued = true;
+        Ok(true)
     }
 
     pub(crate) fn release_client_route(
         &self,
         client_connection_id: ConnectionId,
         client_channel: u16,
-    ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
+        expected_epoch: u32,
+    ) -> Result<RouteRelease, ForwardingError> {
         let mut inner = self.write_inner()?;
         Ok(release_client_route_locked(
             &mut inner,
@@ -493,6 +620,7 @@ impl ForwardingTable {
                 connection_id: client_connection_id,
                 channel: client_channel,
             },
+            expected_epoch,
         ))
     }
 
@@ -500,14 +628,15 @@ impl ForwardingTable {
         &self,
         module_connection_id: ConnectionId,
         module_channel: u16,
-    ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
+        expected_epoch: u32,
+    ) -> Result<RouteRelease, ForwardingError> {
         let mut inner = self.write_inner()?;
         let Some(endpoint) = inner
             .endpoint_by_connection
             .get(&module_connection_id)
             .copied()
         else {
-            return Ok(None);
+            return Ok(RouteRelease::Absent);
         };
         Ok(release_module_route_locked(
             &mut inner,
@@ -515,16 +644,30 @@ impl ForwardingTable {
                 endpoint,
                 channel: module_channel,
             },
+            expected_epoch,
         ))
     }
 
-    pub(crate) fn cancel_pending_relay(
+    pub(crate) fn abort_pending_relay(
         &self,
         endpoint: ModuleEndpointId,
         corr: u64,
-    ) -> Result<(), ForwardingError> {
-        self.write_inner()?.pending_relays.remove(&(endpoint, corr));
-        Ok(())
+        outcome: RouteBindRelayOutcome,
+    ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        let Some(pending) = inner.pending_relays.remove(&(endpoint, corr)) else {
+            return Ok(None);
+        };
+        release_reserved_route_locked(
+            &mut inner,
+            pending.reservation.client_key,
+            pending.reservation.module_key,
+        );
+        let target = pending
+            .relay_enqueued
+            .then(|| abandoned_route_target(&inner, &pending.reservation));
+        let _ = pending.sender.send(outcome);
+        Ok(target.flatten())
     }
 
     pub(crate) fn cancel_module_control_rpc(
@@ -543,16 +686,81 @@ impl ForwardingTable {
         connection_id: ConnectionId,
         corr: u64,
         outcome: RouteBindRelayOutcome,
-    ) -> Result<bool, ForwardingError> {
+    ) -> Result<PendingRelayCompletion, ForwardingError> {
         let mut inner = self.write_inner()?;
         let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
-            return Ok(false);
+            return Ok(PendingRelayCompletion {
+                settled: false,
+                abandoned: None,
+            });
         };
-        let Some(sender) = inner.pending_relays.remove(&(endpoint, corr)) else {
-            return Ok(false);
+        let Some(pending) = inner.pending_relays.remove(&(endpoint, corr)) else {
+            return Ok(PendingRelayCompletion {
+                settled: false,
+                abandoned: None,
+            });
         };
-        let _ = sender.send(outcome);
-        Ok(true)
+
+        if Instant::now() >= pending.deadline {
+            release_reserved_route_locked(
+                &mut inner,
+                pending.reservation.client_key,
+                pending.reservation.module_key,
+            );
+            let abandoned = matches!(outcome, RouteBindRelayOutcome::Accepted)
+                .then(|| abandoned_route_target(&inner, &pending.reservation))
+                .flatten();
+            let _ = pending
+                .sender
+                .send(RouteBindRelayOutcome::Rejected(ErrorBody {
+                    code: "module_timeout".to_string(),
+                    message: "route.bind response arrived after its daemon deadline".to_string(),
+                }));
+            return Ok(PendingRelayCompletion {
+                settled: true,
+                abandoned,
+            });
+        }
+
+        match outcome {
+            RouteBindRelayOutcome::Accepted if pending.client_sink.is_closed() => {
+                release_reserved_route_locked(
+                    &mut inner,
+                    pending.reservation.client_key,
+                    pending.reservation.module_key,
+                );
+                let abandoned = pending
+                    .relay_enqueued
+                    .then(|| abandoned_route_target(&inner, &pending.reservation))
+                    .flatten();
+                let _ = pending.sender.send(RouteBindRelayOutcome::ModuleGone(
+                    "client egress closed before route publication".to_string(),
+                ));
+                return Ok(PendingRelayCompletion {
+                    settled: true,
+                    abandoned,
+                });
+            }
+            RouteBindRelayOutcome::Accepted => {
+                let abandoned = commit_route_locked(&mut inner, pending)?;
+                return Ok(PendingRelayCompletion {
+                    settled: true,
+                    abandoned,
+                });
+            }
+            terminal => {
+                release_reserved_route_locked(
+                    &mut inner,
+                    pending.reservation.client_key,
+                    pending.reservation.module_key,
+                );
+                let _ = pending.sender.send(terminal);
+            }
+        }
+        Ok(PendingRelayCompletion {
+            settled: true,
+            abandoned: None,
+        })
     }
 
     pub(crate) fn pending_module_control_op(
@@ -584,7 +792,12 @@ impl ForwardingTable {
         let Some(pending) = inner.pending_control_rpcs.remove(&(endpoint, corr)) else {
             return Ok(false);
         };
-        let _deadline = pending.deadline;
+        if Instant::now() >= pending.deadline {
+            let _ = pending
+                .sender
+                .send(ModuleControlRpcOutcome::DeadlineElapsed);
+            return Ok(true);
+        }
         let outcome = match actual_op {
             Some(actual) if actual != pending.expected_op => {
                 ModuleControlRpcOutcome::UnexpectedOp {
@@ -620,34 +833,117 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
         channel: u16,
+        epoch: u32,
     ) -> Result<DataRoute, ForwardingError> {
         let inner = self.read_inner()?;
-        if let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() {
-            return Ok(DataRoute::Module(
-                inner
-                    .module_to_client
-                    .get(&ModuleRouteKey { endpoint, channel })
-                    .cloned(),
-            ));
-        }
-
-        Ok(DataRoute::Client(
-            inner
-                .client_to_module
-                .get(&ClientRouteKey {
+        let state =
+            if let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() {
+                let key = ModuleRouteKey { endpoint, channel };
+                match inner.module_to_client.get(&key) {
+                    Some(route) if route.module_epoch == epoch => {
+                        DataRouteState::Bound(Arc::clone(route))
+                    }
+                    Some(_) => {
+                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
+                        DataRouteState::EpochMismatch
+                    }
+                    None if inner.reserved_module.contains_key(&key)
+                        && inner.module_slot_epochs.get(&key).copied() == Some(epoch) =>
+                    {
+                        DataRouteState::Reserved
+                    }
+                    None if inner.reserved_module.contains_key(&key) => {
+                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
+                        DataRouteState::EpochMismatch
+                    }
+                    None => DataRouteState::Absent,
+                }
+            } else {
+                let key = ClientRouteKey {
                     connection_id,
                     channel,
-                })
-                .cloned(),
-        ))
+                };
+                match inner.client_to_module.get(&key) {
+                    Some(route) if route.client_epoch == epoch => {
+                        DataRouteState::Bound(Arc::clone(route))
+                    }
+                    Some(_) => {
+                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
+                        DataRouteState::EpochMismatch
+                    }
+                    None if inner.reserved_client.contains_key(&key)
+                        && inner.client_slot_epochs.get(&key).copied() == Some(epoch) =>
+                    {
+                        DataRouteState::Reserved
+                    }
+                    None if inner.reserved_client.contains_key(&key) => {
+                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
+                        DataRouteState::EpochMismatch
+                    }
+                    None => DataRouteState::Absent,
+                }
+            };
+        Ok(
+            if inner.endpoint_by_connection.contains_key(&connection_id) {
+                DataRoute::Module(state)
+            } else {
+                DataRoute::Client(state)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stale_epoch_drop_count(&self) -> usize {
+        self.stale_epoch_drops.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_client_slot_epoch(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        last_epoch: u32,
+    ) {
+        let mut inner = self.write_inner().expect("forwarding lock");
+        inner.client_slot_epochs.insert(
+            ClientRouteKey {
+                connection_id,
+                channel,
+            },
+            last_epoch,
+        );
+        inner.next_client_channel.insert(connection_id, channel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_module_slot_epoch(
+        &self,
+        endpoint: ModuleEndpointId,
+        channel: u16,
+        last_epoch: u32,
+    ) {
+        let mut inner = self.write_inner().expect("forwarding lock");
+        inner
+            .module_slot_epochs
+            .insert(ModuleRouteKey { endpoint, channel }, last_epoch);
+        inner.next_module_channel.insert(endpoint, channel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_control_corr(&self, endpoint: ModuleEndpointId, next_corr: u64) {
+        self.write_inner()
+            .expect("forwarding lock")
+            .next_control_corr
+            .insert(endpoint, next_corr);
     }
 
     pub(crate) fn cache_status(
         &self,
         endpoint: ModuleEndpointId,
         module_channel: u16,
+        module_epoch: u32,
         status: String,
-    ) -> Result<(), ForwardingError> {
+    ) -> Result<bool, ForwardingError> {
         let mut inner = self.write_inner()?;
         if !inner.module_id_by_endpoint.contains_key(&endpoint) {
             return Err(ForwardingError::StaleModuleEndpoint);
@@ -657,76 +953,67 @@ impl ForwardingTable {
             endpoint,
             channel: module_channel,
         };
-        let client_key = inner
-            .module_to_client
-            .get(&module_key)
-            .map(|route| ClientRouteKey {
-                connection_id: route.client_connection_id,
-                channel: route.client_channel,
-            })
-            .or_else(|| inner.reserved_module.get(&module_key).copied());
-
-        if let Some(client_key) = client_key {
-            inner.status.insert(client_key, status);
+        let handle = if let Some(route) = inner.module_to_client.get(&module_key) {
+            (route.module_epoch == module_epoch).then_some((
+                ClientRouteKey {
+                    connection_id: route.client_connection_id,
+                    channel: route.client_channel,
+                },
+                route.client_epoch,
+            ))
+        } else if let Some(client_key) = inner.reserved_module.get(&module_key).copied() {
+            (inner.module_slot_epochs.get(&module_key).copied() == Some(module_epoch)).then_some((
+                client_key,
+                inner
+                    .client_slot_epochs
+                    .get(&client_key)
+                    .copied()
+                    .unwrap_or(0),
+            ))
         } else {
-            warn!(
+            None
+        };
+
+        if let Some(handle) = handle {
+            inner.status.insert(handle, status);
+            Ok(true)
+        } else {
+            debug!(
                 module_channel,
+                module_epoch,
                 generation = endpoint.generation,
                 connection_id = endpoint.connection_id.get(),
-                "dropping status update for unbound module route channel"
+                "dropping stale status update for module route handle"
             );
+            Ok(false)
         }
-        Ok(())
     }
 
-    pub(crate) fn get_status(
+    pub(crate) fn route_poll_snapshot(
         &self,
         client_connection_id: ConnectionId,
         client_channel: u16,
-    ) -> Result<Option<String>, ForwardingError> {
-        Ok(self
-            .read_inner()?
-            .status
-            .get(&ClientRouteKey {
-                connection_id: client_connection_id,
-                channel: client_channel,
-            })
-            .cloned())
-    }
-
-    pub(crate) fn client_route_module_id(
-        &self,
-        client_connection_id: ConnectionId,
-        client_channel: u16,
-    ) -> Result<Option<String>, ForwardingError> {
+        client_epoch: u32,
+    ) -> Result<RoutePollSnapshot, ForwardingError> {
         let inner = self.read_inner()?;
-        let Some(route) = inner.client_to_module.get(&ClientRouteKey {
+        let client_key = ClientRouteKey {
             connection_id: client_connection_id,
             channel: client_channel,
-        }) else {
-            return Ok(None);
         };
-        Ok(inner
-            .module_id_by_endpoint
-            .contains_key(&route.module_endpoint)
-            .then(|| route.module_id.clone()))
-    }
-
-    pub(crate) fn client_route_is_bound_to_live_module(
-        &self,
-        client_connection_id: ConnectionId,
-        client_channel: u16,
-    ) -> Result<bool, ForwardingError> {
-        let inner = self.read_inner()?;
-        let Some(route) = inner.client_to_module.get(&ClientRouteKey {
-            connection_id: client_connection_id,
-            channel: client_channel,
-        }) else {
-            return Ok(false);
+        let Some(route) = inner.client_to_module.get(&client_key) else {
+            return Ok(RoutePollSnapshot::Absent);
         };
-        Ok(inner
-            .module_id_by_endpoint
-            .contains_key(&route.module_endpoint))
+        if route.client_epoch != client_epoch
+            || !inner
+                .module_id_by_endpoint
+                .contains_key(&route.module_endpoint)
+        {
+            return Ok(RoutePollSnapshot::Absent);
+        }
+        Ok(RoutePollSnapshot::Bound {
+            module_id: route.module_id.clone(),
+            status: inner.status.get(&(client_key, client_epoch)).cloned(),
+        })
     }
 
     pub fn active_binding_count(&self) -> Result<usize, ForwardingError> {
@@ -768,35 +1055,50 @@ impl ForwardingTable {
             .filter(|(pending_endpoint, _)| *pending_endpoint == endpoint)
             .copied()
             .collect::<Vec<_>>();
-        let pending = pending_keys
-            .into_iter()
-            .filter_map(|key| inner.pending_relays.remove(&key))
-            .collect::<Vec<_>>();
-
-        let reserved_module_keys = inner
-            .reserved_module
-            .keys()
-            .filter(|module_key| module_key.endpoint == endpoint)
-            .copied()
-            .collect::<Vec<_>>();
-        for module_key in reserved_module_keys {
-            if let Some(client_key) = inner.reserved_module.get(&module_key).copied() {
-                release_reserved_route_locked(&mut inner, client_key, module_key);
+        let mut abandoned_bindings = Vec::new();
+        for key in pending_keys {
+            let Some(pending) = inner.pending_relays.remove(&key) else {
+                continue;
+            };
+            release_reserved_route_locked(
+                &mut inner,
+                pending.reservation.client_key,
+                pending.reservation.module_key,
+            );
+            if pending.relay_enqueued {
+                if let Some(target) = abandoned_route_target(&inner, &pending.reservation) {
+                    abandoned_bindings.push(target);
+                }
             }
+            let _ = pending
+                .sender
+                .send(RouteBindRelayOutcome::Rejected(ErrorBody {
+                    code: "module_reloading".to_string(),
+                    message: format!("module_id '{module_id}' is reloading"),
+                }));
         }
 
-        let error = ErrorBody {
-            code: "module_reloading".to_string(),
-            message: format!("module_id '{module_id}' is reloading"),
-        };
-        for sender in pending {
-            let _ = sender.send(RouteBindRelayOutcome::Rejected(error.clone()));
+        let pending_control_keys = inner
+            .pending_control_rpcs
+            .keys()
+            .filter(|(pending_endpoint, _)| *pending_endpoint == endpoint)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in pending_control_keys {
+            if let Some(pending) = inner.pending_control_rpcs.remove(&key) {
+                let _ = pending
+                    .sender
+                    .send(ModuleControlRpcOutcome::ModuleGone(format!(
+                        "module '{module_id}' began draining during module-control RPC"
+                    )));
+            }
         }
 
         Ok(Some(ModuleDrainTarget {
             endpoint,
             sink: module.sink,
             negotiated_ver: module.negotiated_ver,
+            abandoned_bindings,
         }))
     }
 
@@ -833,15 +1135,17 @@ impl ForwardingTable {
         endpoint: ModuleEndpointId,
     ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
         let mut inner = self.write_inner()?;
-        let module_keys = inner
+        let routes = inner
             .module_to_client
-            .keys()
-            .filter(|module_key| module_key.endpoint == endpoint)
-            .copied()
+            .iter()
+            .filter(|(module_key, _)| module_key.endpoint == endpoint)
+            .map(|(module_key, route)| (*module_key, route.module_epoch))
             .collect::<Vec<_>>();
-        let mut released = Vec::with_capacity(module_keys.len());
-        for module_key in module_keys {
-            if let Some(target) = release_module_route_locked(&mut inner, module_key) {
+        let mut released = Vec::with_capacity(routes.len());
+        for (module_key, epoch) in routes {
+            if let RouteRelease::Removed(target) =
+                release_module_route_locked(&mut inner, module_key, epoch)
+            {
                 released.push(target);
             }
         }
@@ -874,54 +1178,98 @@ impl ForwardingTable {
         connection_id: ConnectionId,
     ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
         let mut inner = self.write_inner()?;
+        inner.closing_connections.insert(connection_id);
         if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             return Ok(remove_module_connection_locked(&mut inner, endpoint));
         }
 
-        let client_keys: Vec<ClientRouteKey> = inner
+        let routes = inner
             .client_to_module
-            .keys()
-            .filter(|key| key.connection_id == connection_id)
-            .copied()
-            .collect();
-        let mut released = Vec::with_capacity(client_keys.len());
-        for client_key in client_keys {
-            if let Some(route) = release_client_route_locked(&mut inner, client_key) {
-                released.push(route);
+            .iter()
+            .filter(|(key, _)| key.connection_id == connection_id)
+            .map(|(key, route)| (*key, route.client_epoch))
+            .collect::<Vec<_>>();
+        let mut released = Vec::with_capacity(routes.len());
+        for (client_key, epoch) in routes {
+            if let RouteRelease::Removed(target) =
+                release_client_route_locked(&mut inner, client_key, epoch)
+            {
+                released.push(target);
             }
         }
 
-        let reserved_client_keys: Vec<ClientRouteKey> = inner
-            .reserved_client
-            .keys()
-            .filter(|key| key.connection_id == connection_id)
-            .copied()
-            .collect();
-        for client_key in reserved_client_keys {
-            if let Some(module_key) = inner.reserved_client.get(&client_key).copied() {
-                let module_target = inner
-                    .module_id_by_endpoint
-                    .get(&module_key.endpoint)
-                    .and_then(|module_id| inner.modules_by_id.get(module_id))
-                    // Reserved (pre-commit) route torn down on client disconnect:
-                    // tells the SHARED module to drop the reservation → Module kind
-                    // (best-effort drop; never close the module).
-                    .map(|module| GoodbyeTarget {
-                        connection_id: module.endpoint.connection_id,
-                        sink: module.sink.clone(),
-                        negotiated_ver: module.negotiated_ver,
-                        channel: module_key.channel,
-                        kind: GoodbyeTargetKind::Module,
-                    });
-                release_reserved_route_locked(&mut inner, client_key, module_key);
-                if let Some(module_target) = module_target {
-                    released.push(module_target);
+        let pending_keys = inner
+            .pending_relays
+            .iter()
+            .filter(|(_, pending)| pending.reservation.client_key.connection_id == connection_id)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in pending_keys {
+            let Some(pending) = inner.pending_relays.remove(&key) else {
+                continue;
+            };
+            release_reserved_route_locked(
+                &mut inner,
+                pending.reservation.client_key,
+                pending.reservation.module_key,
+            );
+            if pending.relay_enqueued {
+                if let Some(target) = abandoned_route_target(&inner, &pending.reservation) {
+                    released.push(target);
                 }
             }
+            let _ = pending.sender.send(RouteBindRelayOutcome::ModuleGone(
+                "client connection closed during route.bind relay".to_string(),
+            ));
+        }
+
+        let orphaned = inner
+            .reserved_client
+            .iter()
+            .filter(|(key, _)| key.connection_id == connection_id)
+            .map(|(client, module)| (*client, *module))
+            .collect::<Vec<_>>();
+        for (client_key, module_key) in orphaned {
+            release_reserved_route_locked(&mut inner, client_key, module_key);
         }
         inner.next_client_channel.remove(&connection_id);
+        inner
+            .client_slot_epochs
+            .retain(|key, _| key.connection_id != connection_id);
+        inner
+            .last_published_epoch
+            .retain(|key, _| key.connection_id != connection_id);
+        inner
+            .status
+            .retain(|(key, _), _| key.connection_id != connection_id);
 
         Ok(released)
+    }
+
+    pub(crate) fn escalate_client_delivery_failure(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        expected_epoch: u32,
+        reason: CloseReason,
+    ) -> Result<bool, ForwardingError> {
+        let should_close = {
+            let mut inner = self.write_inner()?;
+            let key = ClientRouteKey {
+                connection_id,
+                channel,
+            };
+            if inner.last_published_epoch.get(&key).copied() != Some(expected_epoch) {
+                false
+            } else {
+                inner.closing_connections.insert(connection_id);
+                true
+            }
+        };
+        if should_close {
+            self.request_connection_close(connection_id, reason);
+        }
+        Ok(should_close)
     }
 
     fn read_inner(&self) -> Result<RwLockReadGuard<'_, ForwardingInner>, ForwardingError> {
@@ -942,113 +1290,96 @@ impl ForwardingTable {
 }
 
 impl ForwardingInner {
-    fn allocate_client_channel(
+    fn allocate_route_slots(
         &mut self,
         connection_id: ConnectionId,
-    ) -> Result<u16, ForwardingError> {
-        let mut candidate = self
-            .next_client_channel
-            .get(&connection_id)
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        for _ in 1..=u16::MAX {
-            if candidate == 0 {
-                candidate = 1;
-            }
+        endpoint: ModuleEndpointId,
+    ) -> Result<(u16, u32, u16, u32), ForwardingError> {
+        let client_start = *self.next_client_channel.entry(connection_id).or_insert(1);
+        let mut client_channel = client_start;
+        let client_channel = loop {
             let key = ClientRouteKey {
                 connection_id,
-                channel: candidate,
+                channel: client_channel,
             };
-            if !self.reserved_client.contains_key(&key) && !self.client_to_module.contains_key(&key)
-            {
-                let next = next_channel(candidate);
-                self.next_client_channel.insert(connection_id, next);
-                return Ok(candidate);
+            let eligible = !self.client_to_module.contains_key(&key)
+                && !self.reserved_client.contains_key(&key)
+                && self.client_slot_epochs.get(&key).copied().unwrap_or(0) < u32::MAX;
+            if eligible {
+                break client_channel;
             }
-            candidate = candidate.wrapping_add(1);
-        }
-        Err(ForwardingError::ClientRouteChannelExhausted { connection_id })
-    }
+            client_channel = next_channel(client_channel);
+            if client_channel == client_start {
+                return Err(ForwardingError::ClientRouteChannelExhausted { connection_id });
+            }
+        };
 
-    fn allocate_module_channel(
-        &mut self,
-        endpoint: ModuleEndpointId,
-    ) -> Result<u16, ForwardingError> {
-        let mut candidate = self
-            .next_module_channel
-            .get(&endpoint)
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        for _ in 1..=u16::MAX {
-            if candidate == 0 {
-                candidate = 1;
-            }
+        let module_start = *self.next_module_channel.entry(endpoint).or_insert(1);
+        let mut module_channel = module_start;
+        let module_channel = loop {
             let key = ModuleRouteKey {
                 endpoint,
-                channel: candidate,
+                channel: module_channel,
             };
-            // Released module channels are eligible for reuse within this endpoint generation.
-            // A buggy live module emitting frames for an old route after reuse can still
-            // misdeliver; a per-route epoch/tombstone design is a separate protocol change.
-            if !self.reserved_module.contains_key(&key) && !self.module_to_client.contains_key(&key)
-            {
-                let next = next_channel(candidate);
-                self.next_module_channel.insert(endpoint, next);
-                return Ok(candidate);
+            let eligible = !self.module_to_client.contains_key(&key)
+                && !self.reserved_module.contains_key(&key)
+                && self.module_slot_epochs.get(&key).copied().unwrap_or(0) < u32::MAX;
+            if eligible {
+                break module_channel;
             }
-            candidate = candidate.wrapping_add(1);
-        }
-        Err(ForwardingError::ModuleRouteChannelExhausted { endpoint })
-    }
+            module_channel = next_channel(module_channel);
+            if module_channel == module_start {
+                return Err(ForwardingError::ModuleRouteChannelExhausted { endpoint });
+            }
+        };
 
-    fn allocate_relay_corr(&mut self, endpoint: ModuleEndpointId) -> Result<u64, ForwardingError> {
-        let mut candidate = self.next_relay_corr.max(1);
-        for _ in 0..u64::MAX {
-            if candidate == 0 {
-                candidate = 1;
-            }
-            if !self.pending_relays.contains_key(&(endpoint, candidate))
-                && !self
-                    .pending_control_rpcs
-                    .contains_key(&(endpoint, candidate))
-            {
-                self.next_relay_corr = candidate.wrapping_add(1);
-                if self.next_relay_corr == 0 {
-                    self.next_relay_corr = 1;
-                }
-                return Ok(candidate);
-            }
-            candidate = candidate.wrapping_add(1);
-        }
-        Err(ForwardingError::RelayCorrelationExhausted)
+        let client_key = ClientRouteKey {
+            connection_id,
+            channel: client_channel,
+        };
+        let module_key = ModuleRouteKey {
+            endpoint,
+            channel: module_channel,
+        };
+        let client_epoch = self
+            .client_slot_epochs
+            .get(&client_key)
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        let module_epoch = self
+            .module_slot_epochs
+            .get(&module_key)
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        self.client_slot_epochs.insert(client_key, client_epoch);
+        self.module_slot_epochs.insert(module_key, module_epoch);
+        self.next_client_channel
+            .insert(connection_id, next_channel(client_channel));
+        self.next_module_channel
+            .insert(endpoint, next_channel(module_channel));
+        Ok((client_channel, client_epoch, module_channel, module_epoch))
     }
 
     fn allocate_control_corr(
         &mut self,
         endpoint: ModuleEndpointId,
     ) -> Result<u64, ForwardingError> {
-        let mut candidate = self.next_control_corr.get(&endpoint).copied().unwrap_or(1);
-        for _ in 0..u64::MAX {
-            if candidate == 0 {
-                candidate = 1;
-            }
-            if !self.pending_relays.contains_key(&(endpoint, candidate))
-                && !self
-                    .pending_control_rpcs
-                    .contains_key(&(endpoint, candidate))
-            {
-                let mut next = candidate.wrapping_add(1);
-                if next == 0 {
-                    next = 1;
-                }
-                self.next_control_corr.insert(endpoint, next);
-                return Ok(candidate);
-            }
-            candidate = candidate.wrapping_add(1);
+        let candidate = self.next_control_corr.get(&endpoint).copied().unwrap_or(1);
+        if candidate == 0 {
+            self.closing_connections.insert(endpoint.connection_id);
+            return Err(ForwardingError::RelayCorrelationExhausted);
         }
-        Err(ForwardingError::RelayCorrelationExhausted)
+        self.next_control_corr.insert(
+            endpoint,
+            if candidate == u64::MAX {
+                0
+            } else {
+                candidate + 1
+            },
+        );
+        Ok(candidate)
     }
 }
 
@@ -1072,27 +1403,36 @@ fn release_reserved_route_locked(
     if inner.reserved_module.get(&module_key).copied() == Some(client_key) {
         inner.reserved_module.remove(&module_key);
     }
-    inner.status.remove(&client_key);
+    inner.status.retain(|(key, _), _| *key != client_key);
 }
 
 fn release_client_route_locked(
     inner: &mut ForwardingInner,
     client_key: ClientRouteKey,
-) -> Option<GoodbyeTarget> {
-    let route = inner.client_to_module.remove(&client_key)?;
+    expected_epoch: u32,
+) -> RouteRelease {
+    let Some(route) = inner.client_to_module.get(&client_key) else {
+        return RouteRelease::Absent;
+    };
+    if route.client_epoch != expected_epoch {
+        return RouteRelease::Stale;
+    }
+    let route = inner
+        .client_to_module
+        .remove(&client_key)
+        .expect("route checked under the same forwarding lock");
     route.flow.close();
     inner.module_to_client.remove(&ModuleRouteKey {
         endpoint: route.module_endpoint,
         channel: route.module_channel,
     });
-    inner.status.remove(&client_key);
-    // Notifies the SHARED module that this client's route is gone → Module kind
-    // (best-effort drop on backpressure; never close the module).
-    Some(GoodbyeTarget {
+    inner.status.remove(&(client_key, expected_epoch));
+    RouteRelease::Removed(GoodbyeTarget {
         connection_id: route.module_endpoint.connection_id,
         sink: route.module_sink.clone(),
         negotiated_ver: route.module_negotiated_ver,
         channel: route.module_channel,
+        epoch: route.module_epoch,
         kind: GoodbyeTargetKind::Module,
     })
 }
@@ -1100,23 +1440,147 @@ fn release_client_route_locked(
 fn release_module_route_locked(
     inner: &mut ForwardingInner,
     module_key: ModuleRouteKey,
-) -> Option<GoodbyeTarget> {
-    let route = inner.module_to_client.remove(&module_key)?;
+    expected_epoch: u32,
+) -> RouteRelease {
+    let Some(route) = inner.module_to_client.get(&module_key) else {
+        return RouteRelease::Absent;
+    };
+    if route.module_epoch != expected_epoch {
+        return RouteRelease::Stale;
+    }
+    let route = inner
+        .module_to_client
+        .remove(&module_key)
+        .expect("route checked under the same forwarding lock");
     route.flow.close();
     let client_key = ClientRouteKey {
         connection_id: route.client_connection_id,
         channel: route.client_channel,
     };
     inner.client_to_module.remove(&client_key);
-    inner.status.remove(&client_key);
-    // Notifies the CLIENT that its route is gone (module-side teardown) → Client
-    // kind (escalate to closing the client on backpressure).
-    Some(GoodbyeTarget {
+    inner.status.remove(&(client_key, route.client_epoch));
+    RouteRelease::Removed(GoodbyeTarget {
         connection_id: route.client_connection_id,
         sink: route.client_sink.clone(),
         negotiated_ver: route.client_negotiated_ver,
         channel: route.client_channel,
+        epoch: route.client_epoch,
         kind: GoodbyeTargetKind::Client,
+    })
+}
+
+fn commit_route_locked(
+    inner: &mut ForwardingInner,
+    pending: PendingRouteBindRelayEntry,
+) -> Result<Option<GoodbyeTarget>, ForwardingError> {
+    let reservation = pending.reservation;
+    if inner
+        .closing_connections
+        .contains(&reservation.client_key.connection_id)
+    {
+        return Err(ForwardingError::ConnectionClosing {
+            connection_id: reservation.client_key.connection_id,
+        });
+    }
+    let module_id = inner
+        .module_id_by_endpoint
+        .get(&reservation.module_key.endpoint)
+        .cloned()
+        .ok_or(ForwardingError::StaleModuleEndpoint)?;
+    if inner
+        .draining_endpoints
+        .contains(&reservation.module_key.endpoint)
+    {
+        return Err(ForwardingError::ModuleReloading { module_id });
+    }
+    if inner.reserved_client.remove(&reservation.client_key) != Some(reservation.module_key)
+        || inner.reserved_module.remove(&reservation.module_key) != Some(reservation.client_key)
+    {
+        return Err(ForwardingError::UnknownReservation {
+            client_channel: reservation.client_key.channel,
+            module_channel: reservation.module_key.channel,
+        });
+    }
+    let module = inner
+        .modules_by_id
+        .get(&module_id)
+        .filter(|module| module.endpoint == reservation.module_key.endpoint)
+        .cloned()
+        .ok_or(ForwardingError::StaleModuleEndpoint)?;
+    let binding = Arc::new(RouteBinding {
+        client_connection_id: reservation.client_key.connection_id,
+        client_sink: pending.client_sink,
+        client_negotiated_ver: pending.client_negotiated_ver,
+        client_channel: reservation.client_key.channel,
+        client_epoch: reservation.client_epoch,
+        module_id,
+        module_endpoint: reservation.module_key.endpoint,
+        module_sink: module.sink,
+        module_negotiated_ver: module.negotiated_ver,
+        module_channel: reservation.module_key.channel,
+        module_epoch: reservation.module_epoch,
+        flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
+    });
+    inner
+        .client_to_module
+        .insert(reservation.client_key, Arc::clone(&binding));
+    inner
+        .module_to_client
+        .insert(reservation.module_key, binding);
+    let previous_published = inner
+        .last_published_epoch
+        .insert(reservation.client_key, reservation.client_epoch);
+
+    // OwnedPermit::send cannot fail, but its returned sender reveals a receiver
+    // that closed after reservation and before this locked publication point.
+    let client_sender = pending.client_permit.send(pending.route_open_frame);
+    if client_sender.is_closed() {
+        let abandoned = pending
+            .relay_enqueued
+            .then(|| abandoned_route_target(inner, &reservation))
+            .flatten();
+        if let Some(route) = inner.client_to_module.remove(&reservation.client_key) {
+            route.flow.close();
+        }
+        inner.module_to_client.remove(&reservation.module_key);
+        inner
+            .status
+            .remove(&(reservation.client_key, reservation.client_epoch));
+        match previous_published {
+            Some(epoch) => {
+                inner
+                    .last_published_epoch
+                    .insert(reservation.client_key, epoch);
+            }
+            None => {
+                inner.last_published_epoch.remove(&reservation.client_key);
+            }
+        }
+        let _ = pending.sender.send(RouteBindRelayOutcome::ModuleGone(
+            "client egress closed during route publication".to_string(),
+        ));
+        return Ok(abandoned);
+    }
+
+    let _ = pending.sender.send(RouteBindRelayOutcome::Accepted);
+    Ok(None)
+}
+
+fn abandoned_route_target(
+    inner: &ForwardingInner,
+    reservation: &RouteReservation,
+) -> Option<GoodbyeTarget> {
+    let module_id = inner
+        .module_id_by_endpoint
+        .get(&reservation.module_key.endpoint)?;
+    let module = inner.modules_by_id.get(module_id)?;
+    (module.endpoint == reservation.module_key.endpoint).then(|| GoodbyeTarget {
+        connection_id: module.endpoint.connection_id,
+        sink: module.sink.clone(),
+        negotiated_ver: module.negotiated_ver,
+        channel: reservation.module_key.channel,
+        epoch: reservation.module_epoch,
+        kind: GoodbyeTargetKind::Module,
     })
 }
 
@@ -1132,6 +1596,9 @@ fn remove_module_connection_locked(
     inner.endpoint_by_connection.remove(&endpoint.connection_id);
     inner.next_module_channel.remove(&endpoint);
     inner.next_control_corr.remove(&endpoint);
+    inner
+        .module_slot_epochs
+        .retain(|key, _| key.endpoint != endpoint);
     let reserved_module_keys: Vec<ModuleRouteKey> = inner
         .reserved_module
         .keys()
@@ -1154,11 +1621,13 @@ fn remove_module_connection_locked(
         .into_iter()
         .filter_map(|key| inner.pending_relays.remove(&key))
         .collect();
-    for sender in pending {
+    for pending in pending {
         let module_label = module_id.as_deref().unwrap_or("unknown");
-        let _ = sender.send(RouteBindRelayOutcome::ModuleGone(format!(
-            "module '{module_label}' connection closed during route.bind relay"
-        )));
+        let _ = pending
+            .sender
+            .send(RouteBindRelayOutcome::ModuleGone(format!(
+                "module '{module_label}' connection closed during route.bind relay"
+            )));
     }
 
     let pending_control_keys: Vec<_> = inner
@@ -1180,15 +1649,16 @@ fn remove_module_connection_locked(
             )));
     }
 
-    let module_keys: Vec<ModuleRouteKey> = inner
+    let module_routes = inner
         .module_to_client
-        .keys()
-        .filter(|module_key| module_key.endpoint == endpoint)
-        .copied()
-        .collect();
-    let mut released = Vec::with_capacity(module_keys.len());
-    for module_key in module_keys {
-        if let Some(target) = release_module_route_locked(inner, module_key) {
+        .iter()
+        .filter(|(module_key, _)| module_key.endpoint == endpoint)
+        .map(|(module_key, route)| (*module_key, route.module_epoch))
+        .collect::<Vec<_>>();
+    let mut released = Vec::with_capacity(module_routes.len());
+    for (module_key, epoch) in module_routes {
+        if let RouteRelease::Removed(target) = release_module_route_locked(inner, module_key, epoch)
+        {
             released.push(target);
         }
     }
@@ -1300,6 +1770,13 @@ pub enum ForwardingError {
         endpoint: ModuleEndpointId,
     },
     RelayCorrelationExhausted,
+    ConnectionClosing {
+        connection_id: ConnectionId,
+    },
+    ClientEgressClosed {
+        connection_id: ConnectionId,
+    },
+    RouteOpenBuild(String),
     Poisoned,
 }
 
@@ -1330,7 +1807,20 @@ impl fmt::Display for ForwardingError {
                 endpoint.connection_id.get()
             ),
             Self::RelayCorrelationExhausted => {
-                write!(f, "no route.bind relay correlation ids are available")
+                write!(f, "module control correlation ids are exhausted")
+            }
+            Self::ConnectionClosing { connection_id } => write!(
+                f,
+                "connection {} is closing and cannot accept route allocation",
+                connection_id.get()
+            ),
+            Self::ClientEgressClosed { connection_id } => write!(
+                f,
+                "client connection {} egress is closed",
+                connection_id.get()
+            ),
+            Self::RouteOpenBuild(message) => {
+                write!(f, "failed to prebuild route.open response: {message}")
             }
             Self::Poisoned => write!(f, "forwarding table lock was poisoned"),
         }
@@ -1341,6 +1831,8 @@ impl Error for ForwardingError {}
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use tokio::sync::mpsc;
 
@@ -1377,8 +1869,14 @@ mod tests {
             }
         }
 
+        let (exhausted_tx, _exhausted_rx) = mpsc::channel(1);
         let err = forwarding
-            .begin_route_bind_relay_for(exhausted_client, "route-limit-provider")
+            .begin_route_bind_relay_for_test(
+                exhausted_client,
+                FrameSink::new(exhausted_tx),
+                1,
+                "route-limit-provider",
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1386,8 +1884,14 @@ mod tests {
                 if connection_id == exhausted_client
         ));
 
+        let (second_tx, _second_rx) = mpsc::channel(1);
         let pending = forwarding
-            .begin_route_bind_relay_for(second_client, "route-limit-provider")
+            .begin_route_bind_relay_for_test(
+                second_client,
+                FrameSink::new(second_tx),
+                2,
+                "route-limit-provider",
+            )
             .unwrap();
         assert_eq!(pending.client_channel, 1);
     }
@@ -1408,23 +1912,26 @@ mod tests {
             )
             .unwrap();
 
+        let (client_tx, _client_rx) = mpsc::channel(1);
+        let client_sink = FrameSink::new(client_tx);
         let mut wrapped_channel = None;
         for index in 0..=usize::from(u16::MAX) {
             let pending = forwarding
-                .begin_route_bind_relay_for(client, "slot-reuse-provider")
+                .begin_route_bind_relay_for_test(
+                    client,
+                    client_sink.clone(),
+                    index as u64 + 1,
+                    "slot-reuse-provider",
+                )
                 .unwrap();
             if index == usize::from(u16::MAX) {
                 wrapped_channel = Some(pending.module_channel);
             }
             forwarding
-                .cancel_pending_relay(pending.endpoint, pending.corr)
-                .unwrap();
-            forwarding
-                .release_reserved_route(
-                    pending.client_connection_id,
-                    pending.client_channel,
+                .abort_pending_relay(
                     pending.endpoint,
-                    pending.module_channel,
+                    pending.corr,
+                    RouteBindRelayOutcome::ModuleGone("test abort".to_string()),
                 )
                 .unwrap();
         }
@@ -1452,5 +1959,493 @@ mod tests {
             .unwrap()
             .next_client_channel
             .contains_key(&client));
+    }
+
+    fn route_fixture(
+        module_id: &str,
+    ) -> (
+        ForwardingTable,
+        ConnectionId,
+        ModuleEndpointId,
+        ConnectionId,
+        FrameSink,
+        mpsc::Receiver<Frame>,
+    ) {
+        let forwarding = ForwardingTable::default();
+        let module_connection = ConnectionId::new(100);
+        let client_connection = ConnectionId::new(200);
+        let (module_tx, _module_rx) = mpsc::channel(8);
+        let endpoint = forwarding
+            .register_module_connection(
+                module_connection,
+                module_id.to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let (client_tx, client_rx) = mpsc::channel(8);
+        (
+            forwarding,
+            module_connection,
+            endpoint,
+            client_connection,
+            FrameSink::new(client_tx),
+            client_rx,
+        )
+    }
+
+    fn test_ping(corr: u64) -> Frame {
+        Frame::build(
+            FrameType::Ping,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            corr,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn begin_test_route(
+        forwarding: &ForwardingTable,
+        client_connection: ConnectionId,
+        client_sink: FrameSink,
+        corr: u64,
+        module_id: &str,
+    ) -> PendingRouteBindRelay {
+        forwarding
+            .begin_route_bind_relay_for_test(client_connection, client_sink, corr, module_id)
+            .unwrap()
+    }
+
+    #[test]
+    fn aborted_reservation_consumes_both_epochs_and_reuse_advances_them() {
+        let (forwarding, _, endpoint, client, sink, _client_rx) = route_fixture("epoch-abort");
+        let first = begin_test_route(&forwarding, client, sink.clone(), 1, "epoch-abort");
+        assert_eq!((first.client_epoch, first.module_epoch), (1, 1));
+        forwarding
+            .abort_pending_relay(
+                first.endpoint,
+                first.corr,
+                RouteBindRelayOutcome::ModuleGone("abort".into()),
+            )
+            .unwrap();
+        forwarding.inject_client_slot_epoch(client, first.client_channel, first.client_epoch);
+        forwarding.inject_module_slot_epoch(endpoint, first.module_channel, first.module_epoch);
+
+        let second = begin_test_route(&forwarding, client, sink, 2, "epoch-abort");
+        assert_eq!(second.client_channel, first.client_channel);
+        assert_eq!(second.module_channel, first.module_channel);
+        assert_eq!((second.client_epoch, second.module_epoch), (2, 2));
+    }
+
+    #[test]
+    fn stale_release_cannot_remove_reused_successor_and_status_is_epoch_fenced() {
+        let (forwarding, module_connection, endpoint, client, sink, mut client_rx) =
+            route_fixture("epoch-release");
+        let first = begin_test_route(&forwarding, client, sink.clone(), 10, "epoch-release");
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                first.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        assert_eq!(client_rx.try_recv().unwrap().header.corr, 10);
+        assert!(matches!(
+            forwarding
+                .release_client_route(client, first.client_channel, first.client_epoch)
+                .unwrap(),
+            RouteRelease::Removed(_)
+        ));
+        forwarding.inject_client_slot_epoch(client, first.client_channel, first.client_epoch);
+        forwarding.inject_module_slot_epoch(endpoint, first.module_channel, first.module_epoch);
+
+        let second = begin_test_route(&forwarding, client, sink, 11, "epoch-release");
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                second.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        assert_eq!(client_rx.try_recv().unwrap().header.corr, 11);
+        assert!(matches!(
+            forwarding
+                .release_client_route(client, second.client_channel, first.client_epoch)
+                .unwrap(),
+            RouteRelease::Stale
+        ));
+        assert!(!forwarding
+            .cache_status(
+                endpoint,
+                second.module_channel,
+                first.module_epoch,
+                "stale".into(),
+            )
+            .unwrap());
+        assert!(forwarding
+            .cache_status(
+                endpoint,
+                second.module_channel,
+                second.module_epoch,
+                "current".into(),
+            )
+            .unwrap());
+        match forwarding
+            .route_poll_snapshot(client, second.client_channel, second.client_epoch)
+            .unwrap()
+        {
+            RoutePollSnapshot::Bound { status, .. } => {
+                assert_eq!(status.as_deref(), Some("current"));
+            }
+            RoutePollSnapshot::Absent => panic!("successor binding was removed"),
+        }
+    }
+
+    #[test]
+    fn max_epoch_reservation_retires_only_that_slot() {
+        let (forwarding, _, endpoint, client, sink, _client_rx) = route_fixture("epoch-max");
+        forwarding.inject_client_slot_epoch(client, 7, u32::MAX - 1);
+        forwarding.inject_module_slot_epoch(endpoint, 9, u32::MAX - 1);
+        let final_use = begin_test_route(&forwarding, client, sink.clone(), 20, "epoch-max");
+        assert_eq!(
+            (final_use.client_channel, final_use.client_epoch),
+            (7, u32::MAX)
+        );
+        assert_eq!(
+            (final_use.module_channel, final_use.module_epoch),
+            (9, u32::MAX)
+        );
+        forwarding
+            .abort_pending_relay(
+                endpoint,
+                final_use.corr,
+                RouteBindRelayOutcome::ModuleGone("abort".into()),
+            )
+            .unwrap();
+        forwarding.inject_client_slot_epoch(client, 7, u32::MAX);
+        forwarding.inject_module_slot_epoch(endpoint, 9, u32::MAX);
+        let next = begin_test_route(&forwarding, client, sink, 21, "epoch-max");
+        assert_ne!(next.client_channel, 7);
+        assert_ne!(next.module_channel, 9);
+        assert_eq!((next.client_epoch, next.module_epoch), (1, 1));
+    }
+
+    #[test]
+    fn bind_and_module_control_share_monotonic_corr_and_deadline_arbitration() {
+        let (forwarding, module_connection, endpoint, client, sink, _client_rx) =
+            route_fixture("corr-shared");
+        let bind = begin_test_route(&forwarding, client, sink, 30, "corr-shared");
+        assert_eq!(bind.corr, 1);
+        forwarding
+            .abort_pending_relay(
+                endpoint,
+                bind.corr,
+                RouteBindRelayOutcome::ModuleGone("abort".into()),
+            )
+            .unwrap();
+        let rpc = forwarding
+            .begin_module_control_rpc_for(
+                "corr-shared",
+                "health.check",
+                Instant::now() - Duration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!(rpc.corr, 2);
+        assert!(forwarding
+            .complete_module_control_rpc(
+                module_connection,
+                rpc.corr,
+                Some("health.check"),
+                ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                    status: subc_protocol::session::HealthStatus::Ok,
+                    detail: None,
+                    metrics: None,
+                }),
+            )
+            .unwrap());
+        assert!(matches!(
+            rpc.receiver.blocking_recv().unwrap(),
+            ModuleControlRpcOutcome::DeadlineElapsed
+        ));
+    }
+
+    #[test]
+    fn correlation_exhaustion_emits_max_once_then_closes_endpoint() {
+        let (forwarding, _, endpoint, _, _, _) = route_fixture("corr-max");
+        let mut close = forwarding.register_connection_close(endpoint.connection_id);
+        forwarding.inject_control_corr(endpoint, u64::MAX);
+        let final_rpc = forwarding
+            .begin_module_control_rpc_for(
+                "corr-max",
+                "health.check",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(final_rpc.corr, u64::MAX);
+        forwarding
+            .cancel_module_control_rpc(endpoint, final_rpc.corr)
+            .unwrap();
+        assert!(matches!(
+            forwarding.begin_module_control_rpc_for(
+                "corr-max",
+                "health.check",
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(ForwardingError::RelayCorrelationExhausted)
+        ));
+        assert!(close.try_recv().is_ok());
+    }
+
+    #[test]
+    fn publication_epoch_controls_delivery_failure_escalation() {
+        fn setup_successor(
+            commit_successor: Option<bool>,
+        ) -> (ForwardingTable, ConnectionId, u16, u32) {
+            let (forwarding, module_connection, endpoint, client, sink, mut client_rx) =
+                route_fixture("escalation");
+            let first = begin_test_route(&forwarding, client, sink.clone(), 40, "escalation");
+            forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    first.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap();
+            client_rx.try_recv().unwrap();
+            assert!(matches!(
+                forwarding
+                    .release_client_route(client, first.client_channel, first.client_epoch)
+                    .unwrap(),
+                RouteRelease::Removed(_)
+            ));
+            if let Some(commit_successor) = commit_successor {
+                forwarding.inject_client_slot_epoch(
+                    client,
+                    first.client_channel,
+                    first.client_epoch,
+                );
+                forwarding.inject_module_slot_epoch(
+                    endpoint,
+                    first.module_channel,
+                    first.module_epoch,
+                );
+                let successor = begin_test_route(&forwarding, client, sink, 41, "escalation");
+                if commit_successor {
+                    forwarding
+                        .complete_pending_relay(
+                            module_connection,
+                            successor.corr,
+                            RouteBindRelayOutcome::Accepted,
+                        )
+                        .unwrap();
+                    client_rx.try_recv().unwrap();
+                } else {
+                    forwarding
+                        .abort_pending_relay(
+                            endpoint,
+                            successor.corr,
+                            RouteBindRelayOutcome::ModuleGone("abort".into()),
+                        )
+                        .unwrap();
+                }
+            }
+            (forwarding, client, first.client_channel, first.client_epoch)
+        }
+
+        let (no_successor, client, channel, epoch) = setup_successor(None);
+        let mut close = no_successor.register_connection_close(client);
+        assert!(no_successor
+            .escalate_client_delivery_failure(
+                client,
+                channel,
+                epoch,
+                CloseReason::new("delivery", "failed"),
+            )
+            .unwrap());
+        assert!(close.try_recv().is_ok());
+
+        let (aborted, client, channel, epoch) = setup_successor(Some(false));
+        let mut close = aborted.register_connection_close(client);
+        assert!(aborted
+            .escalate_client_delivery_failure(
+                client,
+                channel,
+                epoch,
+                CloseReason::new("delivery", "failed"),
+            )
+            .unwrap());
+        assert!(close.try_recv().is_ok());
+
+        let (published, client, channel, epoch) = setup_successor(Some(true));
+        let mut close = published.register_connection_close(client);
+        assert!(!published
+            .escalate_client_delivery_failure(
+                client,
+                channel,
+                epoch,
+                CloseReason::new("delivery", "stale failure"),
+            )
+            .unwrap());
+        assert!(close.try_recv().is_err());
+    }
+
+    #[test]
+    fn cleanup_and_accepted_resolution_have_one_lock_winner() {
+        let (forwarding, module_connection, _, client, sink, mut client_rx) =
+            route_fixture("cleanup-race");
+        let pending = begin_test_route(&forwarding, client, sink, 45, "cleanup-race");
+        forwarding
+            .mark_route_bind_relay_enqueued(pending.endpoint, pending.corr)
+            .unwrap();
+        let released = forwarding.cleanup_connection(client).unwrap();
+        assert_eq!(released.len(), 1);
+        let completion = forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        assert!(!completion.settled);
+        assert!(client_rx.try_recv().is_err());
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+
+        let (forwarding, module_connection, _, client, sink, mut client_rx) =
+            route_fixture("accepted-race");
+        let pending = begin_test_route(&forwarding, client, sink, 46, "accepted-race");
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        assert_eq!(client_rx.try_recv().unwrap().header.corr, 46);
+        let released = forwarding.cleanup_connection(client).unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn drain_marks_block_reservation_commit_and_live_request_admission_until_phase_two() {
+        let (forwarding, module_connection, _, client, sink, mut client_rx) =
+            route_fixture("drain-gap");
+        let live = begin_test_route(&forwarding, client, sink.clone(), 47, "drain-gap");
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                live.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        client_rx.try_recv().unwrap();
+        let binding = match forwarding
+            .lookup_data_route(client, live.client_channel, live.client_epoch)
+            .unwrap()
+        {
+            DataRoute::Client(DataRouteState::Bound(binding)) => binding,
+            other => panic!("expected live route, got {other:?}"),
+        };
+
+        let pending = begin_test_route(&forwarding, client, sink.clone(), 48, "drain-gap");
+        forwarding
+            .mark_route_bind_relay_enqueued(pending.endpoint, pending.corr)
+            .unwrap();
+        let control_rpc = forwarding
+            .begin_module_control_rpc_for(
+                "drain-gap",
+                "health.check",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        let target = forwarding.begin_module_drain("drain-gap").unwrap().unwrap();
+        assert!(matches!(
+            control_rpc.receiver.blocking_recv().unwrap(),
+            ModuleControlRpcOutcome::ModuleGone(_)
+        ));
+        assert_eq!(target.abandoned_bindings.len(), 1);
+        assert!(binding.flow.sem.is_closed());
+        assert!(
+            !forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    pending.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap()
+                .settled
+        );
+        assert!(matches!(
+            forwarding.begin_route_bind_relay_for_test(client, sink, 49, "drain-gap"),
+            Err(ForwardingError::ModuleReloading { .. })
+        ));
+        let released = forwarding
+            .release_module_endpoint_routes(target.endpoint)
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_route_permit_is_released_on_rejection_and_abort() {
+        let forwarding = ForwardingTable::default();
+        let module_connection = ConnectionId::new(300);
+        let client = ConnectionId::new(301);
+        let (module_tx, _module_rx) = mpsc::channel(1);
+        let endpoint = forwarding
+            .register_module_connection(
+                module_connection,
+                "permit".into(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let sink = FrameSink::new(client_tx);
+        let rejected = begin_test_route(&forwarding, client, sink.clone(), 50, "permit");
+        assert!(sink.try_send(test_ping(999)).is_err());
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                rejected.corr,
+                RouteBindRelayOutcome::Rejected(ErrorBody {
+                    code: "no".into(),
+                    message: "rejected".into(),
+                }),
+            )
+            .unwrap();
+        sink.try_send(test_ping(1000)).unwrap();
+        assert_eq!(client_rx.try_recv().unwrap().header.corr, 1000);
+
+        let aborted = begin_test_route(&forwarding, client, sink.clone(), 51, "permit");
+        assert!(sink.try_send(test_ping(1001)).is_err());
+        forwarding
+            .abort_pending_relay(
+                endpoint,
+                aborted.corr,
+                RouteBindRelayOutcome::ModuleGone("abort".into()),
+            )
+            .unwrap();
+        sink.try_send(test_ping(1002)).unwrap();
+        assert_eq!(client_rx.try_recv().unwrap().header.corr, 1002);
+
+        let receiver_closed = begin_test_route(&forwarding, client, sink, 52, "permit");
+        forwarding
+            .mark_route_bind_relay_enqueued(endpoint, receiver_closed.corr)
+            .unwrap();
+        drop(client_rx);
+        let completion = forwarding
+            .complete_pending_relay(
+                module_connection,
+                receiver_closed.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        assert!(completion.abandoned.is_some());
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
     }
 }

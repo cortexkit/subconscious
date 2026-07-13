@@ -354,7 +354,7 @@ fn control_request_frame() -> Result<Frame, WatchdogTickError> {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         1,
         body,

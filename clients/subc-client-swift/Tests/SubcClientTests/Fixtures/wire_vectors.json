@@ -5,7 +5,7 @@
       "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
       "domain": "subc-server-v1",
       "client_nonce_hex": "abababababababababababababababababababababababababababababababab",
-      "server_nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "server_nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
       "daemon_id_hex": "000102030405060708090a0b0c0d0e0f",
       "expected_proof_hex": "ea06076a980bc7558e45017df86de89f3d2fc09861f8460795dea31eadf40527"
     },
@@ -14,7 +14,7 @@
       "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
       "domain": "subc-client-v1",
       "client_nonce_hex": "abababababababababababababababababababababababababababababababab",
-      "server_nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "server_nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
       "daemon_id_hex": "000102030405060708090a0b0c0d0e0f",
       "expected_proof_hex": "a3bc64784dbd94c4f52799e0c66f7b2b8183aa4655594630245c5d4a2fa387a9"
     }

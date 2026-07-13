@@ -149,7 +149,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
         other => panic!("unexpected health response: {other:?}"),
     }
 
-    let route_channel = open_route(&mut client, MODULE_ID, 100).await;
+    let (route_channel, route_epoch) = open_route(&mut client, MODULE_ID, 100).await;
     wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
         event["kind"] == "bind" && event["route_channel"].as_u64() == Some(u64::from(route_channel))
     })
@@ -157,7 +157,12 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
 
     write_frame(
         &mut client,
-        &data_request(route_channel, 101, br#"{"kind":"unary","value":42}"#),
+        &data_request(
+            route_channel,
+            route_epoch,
+            101,
+            br#"{"kind":"unary","value":42}"#,
+        ),
     )
     .await
     .unwrap();
@@ -172,7 +177,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
 
     write_frame(
         &mut client,
-        &data_request(route_channel, 102, br#"{"kind":"error"}"#),
+        &data_request(route_channel, route_epoch, 102, br#"{"kind":"error"}"#),
     )
     .await
     .unwrap();
@@ -186,7 +191,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
 
     write_frame(
         &mut client,
-        &data_request(route_channel, 103, br#"{"kind":"stream"}"#),
+        &data_request(route_channel, route_epoch, 103, br#"{"kind":"stream"}"#),
     )
     .await
     .unwrap();
@@ -203,7 +208,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
 
     write_frame(
         &mut client,
-        &data_request(route_channel, 104, br#"{"kind":"cancel"}"#),
+        &data_request(route_channel, route_epoch, 104, br#"{"kind":"cancel"}"#),
     )
     .await
     .unwrap();
@@ -212,7 +217,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
         event["kind"] == "cancel_waiting" && event["corr"].as_u64() == Some(104)
     })
     .await;
-    write_frame(&mut client, &cancel_frame(route_channel, 104))
+    write_frame(&mut client, &cancel_frame(route_channel, route_epoch, 104))
         .await
         .unwrap();
     client.flush().await.unwrap();
@@ -225,7 +230,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     let cancelled_body: ErrorBody = serde_json::from_slice(&cancelled.body).unwrap();
     assert_eq!(cancelled_body.code, "cancelled");
 
-    write_frame(&mut client, &goodbye_frame(route_channel, 105))
+    write_frame(&mut client, &goodbye_frame(route_channel, route_epoch, 105))
         .await
         .unwrap();
     client.flush().await.unwrap();
@@ -269,7 +274,7 @@ async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_ro
     let mut client = connect_authed_client(&daemon.connection_file)
         .await
         .unwrap();
-    let route_channel = open_route(&mut client, module_id, 10_002).await;
+    let (route_channel, route_epoch) = open_route(&mut client, module_id, 10_002).await;
 
     handle
         .catalog_update(vec![tool_provider_role(&["a", "c"])])
@@ -281,7 +286,7 @@ async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_ro
 
     write_frame(
         &mut client,
-        &data_request(route_channel, 10_004, b"after-update"),
+        &data_request(route_channel, route_epoch, 10_004, b"after-update"),
     )
     .await
     .unwrap();
@@ -890,7 +895,7 @@ async fn subc_consumer_subscribe_streaming_contract() {
         event["kind"] == "cancel_waiting" && event["tag"] == "unsubscribe"
     })
     .await;
-    cancellable.unsubscribe();
+    cancellable.unsubscribe().unwrap();
     assert!(
         timeout(EVENT_TIMEOUT, cancellable.closed())
             .await
@@ -1244,7 +1249,7 @@ async fn catalog_modules(path: &Path, module_id: Option<&str>, corr: u64) -> Vec
     response["modules"].as_array().cloned().unwrap_or_default()
 }
 
-async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> u16
+async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> (u16, u32)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1267,9 +1272,14 @@ where
     )
     .await;
     assert_eq!(response["op"], "route.open");
-    response["route_channel"]
-        .as_u64()
-        .expect("route.open must return route_channel") as u16
+    (
+        response["route_channel"]
+            .as_u64()
+            .expect("route.open must return route_channel") as u16,
+        response["route_epoch"]
+            .as_u64()
+            .expect("route.open must return route_epoch") as u32,
+    )
 }
 
 async fn control_rpc_on_stream<S>(stream: &mut S, corr: u64, request: Value) -> Value
@@ -1322,7 +1332,7 @@ fn control_request_frame(corr: u64, body: Vec<u8>) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -1330,36 +1340,36 @@ fn control_request_frame(corr: u64, body: Vec<u8>) -> Frame {
     .unwrap()
 }
 
-fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
+fn data_request(channel: u16, epoch: u32, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body.to_vec(),
     )
     .unwrap()
 }
 
-fn cancel_frame(channel: u16, corr: u64) -> Frame {
+fn cancel_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
     Frame::build(
         FrameType::Cancel,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         Vec::new(),
     )
     .unwrap()
 }
 
-fn goodbye_frame(channel: u16, corr: u64) -> Frame {
+fn goodbye_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
     Frame::build(
         FrameType::Goodbye,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         Vec::new(),
     )

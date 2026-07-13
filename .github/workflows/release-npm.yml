@@ -56,8 +56,11 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       # Trusted publishing (OIDC) requires npm >= 11.5.1; Node 22 ships npm 10.x.
+      # Pinned to the npm 11 line: npm 12 raised its node floor past what
+      # setup-node's "22" resolves to, so @latest can break the release out
+      # from under us on an npm major.
       - name: Upgrade npm to a trusted-publishing-capable version
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
 
       - uses: oven-sh/setup-bun@v2
         with:

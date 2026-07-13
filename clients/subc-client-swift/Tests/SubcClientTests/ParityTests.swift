@@ -22,6 +22,7 @@ private struct FrameVector: Decodable {
     let ty: UInt8
     let flags: UInt8
     let channel: UInt16
+    let epoch: UInt32
     let corr: UInt64
     let bodyHex: String
     let expectedHeaderHex: String
@@ -123,6 +124,7 @@ final class ParityTests: XCTestCase {
                 ty: ty,
                 flags: vector.flags,
                 channel: vector.channel,
+                epoch: vector.epoch,
                 corr: vector.corr
             )
 
@@ -132,7 +134,14 @@ final class ParityTests: XCTestCase {
                 "Rust header mismatch for vector \(vector.name)"
             )
             XCTAssertEqual(
-                encodeFrame(ty: ty, flags: vector.flags, channel: vector.channel, corr: vector.corr, body: body).lowerHexString(),
+                encodeFrame(
+                    ty: ty,
+                    flags: vector.flags,
+                    channel: vector.channel,
+                    epoch: vector.epoch,
+                    corr: vector.corr,
+                    body: body
+                ).lowerHexString(),
                 vector.expectedFrameHex,
                 "Rust frame mismatch for vector \(vector.name)"
             )
@@ -151,6 +160,7 @@ final class ParityTests: XCTestCase {
                 ty: ty,
                 flags: vector.flags,
                 channel: vector.channel,
+                epoch: vector.epoch,
                 corr: vector.corr
             )
 
@@ -160,6 +170,7 @@ final class ParityTests: XCTestCase {
             XCTAssertEqual(decoded.ty, header.ty, "ty round-trip mismatch for \(vector.name)")
             XCTAssertEqual(decoded.flags, header.flags, "flags round-trip mismatch for \(vector.name)")
             XCTAssertEqual(decoded.channel, header.channel, "channel round-trip mismatch for \(vector.name)")
+            XCTAssertEqual(decoded.epoch, header.epoch, "epoch round-trip mismatch for \(vector.name)")
             XCTAssertEqual(decoded.corr, header.corr, "corr round-trip mismatch for \(vector.name)")
         }
     }

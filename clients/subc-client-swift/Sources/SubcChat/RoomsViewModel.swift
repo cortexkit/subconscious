@@ -140,7 +140,7 @@ final class RoomsViewModel: ObservableObject {
 
     private let work = DispatchQueue(label: "subc-rooms.client", qos: .userInitiated)
     private var client: SubcClient?
-    private var routeChannel: UInt16?
+    private var routeHandle: RouteHandle?
     private var listTimer: Timer?
     private var readTimer: Timer?
     private var lastSeq: UInt64 = 0
@@ -209,17 +209,17 @@ final class RoomsViewModel: ObservableObject {
 
     // MARK: Wire plumbing
 
-    private func ensureRouteBlocking() throws -> (SubcClient, UInt16) {
-        if let c = client, let ch = routeChannel { return (c, ch) }
+    private func ensureRouteBlocking() throws -> (SubcClient, RouteHandle) {
+        if let client, let routeHandle { return (client, routeHandle) }
         let c = try SubcClient.connect(connectionFilePath: connectionFile)
-        let ch = try c.routeOpenManagementSurface(
+        let route = try c.routeOpenManagementSurface(
             moduleId: "alfonso-core",
             projectRoot: callerDirectory,
             harness: harness,
             session: sessionId)
         client = c
-        routeChannel = ch
-        return (c, ch)
+        routeHandle = route
+        return (c, route)
     }
 
     /// Invoke one rooms.* op with the identity triple merged in, unwrapping the
@@ -229,8 +229,8 @@ final class RoomsViewModel: ObservableObject {
         merged["harness"] = harness
         merged["sessionId"] = sessionId
         merged["callerDirectory"] = callerDirectory
-        let (c, ch) = try ensureRouteBlocking()
-        let reply = try c.callManagement(routeChannel: ch, method: method, params: merged)
+        let (client, route) = try ensureRouteBlocking()
+        let reply = try client.callManagement(route: route, method: method, params: merged)
         guard let result = reply["result"] else {
             throw SubcError(message: "\(method): reply had no result field")
         }
@@ -253,7 +253,7 @@ final class RoomsViewModel: ObservableObject {
                     guard let self else { return }
                     self.client?.close()
                     self.client = nil
-                    self.routeChannel = nil
+                    self.routeHandle = nil
                     self.connected = false
                     self.status = "\(label) failed: \(shortError(error))"
                 }

@@ -70,3 +70,25 @@ public final class POSIXTransport: Transport {
 
     public func close() { Darwin.close(fd) }
 }
+
+public enum FrameReadError: Error, Equatable {
+    case bodyTooLarge(len: UInt32, max: Int)
+}
+
+/// Read one frame without committing to a version-specific header length until
+/// the frozen prefix has been validated. This makes a stale 17-byte pure-header
+/// frame fail on its version byte instead of waiting for four bytes that will
+/// never arrive.
+func readFrame(from transport: Transport) throws -> Frame {
+    let prefix = try transport.readExact(FROZEN_PREFIX_LEN)
+    let bodyLength = try decodeFrozenPrefix(prefix)
+    guard UInt64(bodyLength) <= UInt64(MAX_FRAME_BODY_LEN) else {
+        throw FrameReadError.bodyTooLarge(len: bodyLength, max: MAX_FRAME_BODY_LEN)
+    }
+
+    var headerBytes = prefix
+    headerBytes.append(try transport.readExact(HEADER_LEN - FROZEN_PREFIX_LEN))
+    let header = try decodeHeader(headerBytes)
+    let body = bodyLength > 0 ? try transport.readExact(Int(bodyLength)) : Data()
+    return Frame(header: header, body: body)
+}

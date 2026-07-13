@@ -833,7 +833,11 @@ where
     )
     .await?
     {
-        ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+        ClientControlResponse::RouteOpen {
+            route_channel,
+            // WIRE-WAVE2: retain this epoch in the route test handle.
+            route_epoch: _route_epoch,
+        } => Ok(route_channel),
         other => panic!("unexpected route.open response: {other:?}"),
     }
 }
@@ -898,6 +902,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -909,7 +914,8 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body.to_vec(),
     )

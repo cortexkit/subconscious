@@ -47,6 +47,7 @@ pub enum ModuleControlRequest {
     #[serde(rename = "route.bind")]
     RouteBind {
         route_channel: u16,
+        epoch: u32,
         target: RouteTarget,
         identity: BindIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,5 +135,9 @@ impl ModuleControlResponse {
 #[serde(tag = "op")]
 pub enum ModuleControlPush {
     #[serde(rename = "route.status")]
-    RouteStatus { route_channel: u16, status: String },
+    RouteStatus {
+        route_channel: u16,
+        route_epoch: u32,
+        status: String,
+    },
 }

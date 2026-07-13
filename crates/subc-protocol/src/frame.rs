@@ -17,15 +17,16 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Build a v1 frame, filling `len` from the opaque body bytes.
+    /// Build a current-version frame, filling `len` from the opaque body bytes.
     pub fn build(
         ty: FrameType,
         flags: Flags,
         channel: u16,
+        epoch: u32,
         corr: u64,
         body: Vec<u8>,
     ) -> Result<Self, FrameBuildError> {
-        Self::build_with_version(PROTOCOL_VERSION, ty, flags, channel, corr, body)
+        Self::build_with_version(PROTOCOL_VERSION, ty, flags, channel, epoch, corr, body)
     }
 
     /// Build a frame for an already-negotiated envelope version, filling `len`
@@ -35,6 +36,7 @@ impl Frame {
         ty: FrameType,
         flags: Flags,
         channel: u16,
+        epoch: u32,
         corr: u64,
         body: Vec<u8>,
     ) -> Result<Self, FrameBuildError> {
@@ -58,6 +60,7 @@ impl Frame {
                 ty,
                 flags,
                 channel,
+                epoch,
                 corr,
             },
             body,
@@ -113,6 +116,7 @@ mod tests {
             FrameType::Request,
             Flags::new(false, crate::Priority::Interactive, false),
             1,
+            0,
             7,
             body,
         )
@@ -130,6 +134,7 @@ mod tests {
             FrameType::Request,
             Flags::new(false, crate::Priority::Interactive, false),
             1,
+            0,
             7,
             body,
         )

@@ -3,12 +3,15 @@
 //! `read_frame`/`write_frame` are the post-handshake continuation of
 //! [`authenticate_client`](crate::authenticate_client)/`authenticate_server` on
 //! the same socket: once the connection is authenticated, both peers exchange
-//! [`Frame`]s (the 17-byte envelope header + opaque body). The framing codec is
+//! [`Frame`]s (the 21-byte envelope header + opaque body). The framing codec is
 //! shared by subc-core and modules (AFT) so the wire cannot drift.
 
 use std::{error::Error, fmt, io};
 
-use subc_protocol::{decode_header, DecodeError, Frame, HEADER_LEN, MAX_FRAME_BODY_LEN};
+use subc_protocol::{
+    decode_header, DecodeError, Frame, FROZEN_PREFIX_LEN, HEADER_LEN, MAX_FRAME_BODY_LEN,
+    PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Which part of a frame was being read when EOF arrived.
@@ -47,13 +50,25 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Option<Frame>, FrameIoError
 where
     R: AsyncRead + Unpin,
 {
-    // v1 uses the current 17-byte fixed header. A v2 reader would first read the
-    // 5-byte frozen prefix (`len` + `ver`), then read the version-specific
-    // remainder before decoding.
-    let mut header_bytes = [0u8; HEADER_LEN];
-    if !read_exact_or_clean_eof(reader, &mut header_bytes, ReadStage::Header).await? {
+    let mut prefix = [0u8; FROZEN_PREFIX_LEN];
+    if !read_exact_or_clean_eof(reader, &mut prefix, ReadStage::Header).await? {
         return Ok(None);
     }
+    let ver = prefix[4];
+    if ver != PROTOCOL_VERSION {
+        return Err(FrameIoError::DecodeHeader(
+            DecodeError::UnsupportedVersion { ver },
+        ));
+    }
+
+    let mut header_bytes = [0u8; HEADER_LEN];
+    header_bytes[..FROZEN_PREFIX_LEN].copy_from_slice(&prefix);
+    read_exact_or_unexpected_eof(
+        reader,
+        &mut header_bytes[FROZEN_PREFIX_LEN..],
+        ReadStage::Header,
+    )
+    .await?;
 
     let header = decode_header(&header_bytes).map_err(FrameIoError::DecodeHeader)?;
     if header.len > MAX_FRAME_BODY_LEN {
@@ -211,6 +226,7 @@ mod tests {
             FrameType::Request,
             Flags::new(true, Priority::Interactive, false),
             channel,
+            1,
             corr,
             body.to_vec(),
         )
@@ -255,6 +271,27 @@ mod tests {
         drop(client);
 
         assert!(read_frame(&mut server).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_v1_pure_header_is_rejected_from_prefix_without_waiting() {
+        let (mut client, mut server) = duplex(64);
+        let mut stale_header = [0u8; 17];
+        stale_header[4] = 1;
+        stale_header[5] = FrameType::Ping as u8;
+        client.write_all(&stale_header).await.unwrap();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_frame(&mut server),
+        )
+        .await
+        .expect("prefix-first reader must not wait for the missing v2 header bytes")
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameIoError::DecodeHeader(DecodeError::UnsupportedVersion { ver: 1 })
+        ));
     }
 
     #[tokio::test]

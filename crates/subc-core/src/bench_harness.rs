@@ -90,7 +90,8 @@ pub fn bench_data_request_frame(client_channel: u16, corr: u64) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        client_channel,
+        client_channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         PAYLOAD.to_vec(),
     )
@@ -228,7 +229,8 @@ async fn bench_module_echo_drain(
         if let Ok(response) = Frame::build(
             FrameType::Response,
             frame.header.flags,
-            route.client_channel,
+            route.client_channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             body,
         ) {

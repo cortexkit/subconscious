@@ -1380,6 +1380,7 @@ async fn probe_module_health(
         negotiated_ver,
         FrameType::Request,
         control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -2401,7 +2402,8 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
             released.negotiated_ver,
             FrameType::Goodbye,
             control_flags(),
-            released.channel,
+            released.channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             Vec::new(),
         ) {
@@ -2450,6 +2452,7 @@ fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &M
         target.negotiated_ver,
         FrameType::Goodbye,
         control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         0,
         Vec::new(),

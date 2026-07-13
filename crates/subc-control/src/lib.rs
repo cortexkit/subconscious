@@ -68,7 +68,11 @@ pub enum ClientControlRequest {
         consumer_capabilities: Option<Vec<String>>,
     },
     #[serde(rename = "route.poll")]
-    RoutePoll { route_channel: u16, kind: PollKind },
+    RoutePoll {
+        route_channel: u16,
+        route_epoch: u32,
+        kind: PollKind,
+    },
     #[serde(rename = "supervisor.list")]
     SupervisorList {},
     #[serde(rename = "supervisor.restart")]
@@ -103,9 +107,14 @@ pub enum ClientControlResponse {
         subc_ops: Vec<String>,
     },
     #[serde(rename = "route.open")]
-    RouteOpen { route_channel: u16 },
+    RouteOpen {
+        route_channel: u16,
+        route_epoch: u32,
+    },
     #[serde(rename = "route.poll")]
     RoutePoll {
+        route_channel: u16,
+        route_epoch: u32,
         status: Option<String>,
         live: Option<bool>,
     },
@@ -204,11 +213,13 @@ mod tests {
     fn route_poll_uses_kind_field() {
         let body = serde_json::to_value(ClientControlRequest::RoutePoll {
             route_channel: 7,
+            route_epoch: 11,
             kind: PollKind::Status,
         })
         .unwrap();
 
         assert_eq!(body["op"], "route.poll");
+        assert_eq!(body["route_epoch"], 11);
         assert_eq!(body["kind"], "status");
         assert!(body.get("op").is_some());
     }

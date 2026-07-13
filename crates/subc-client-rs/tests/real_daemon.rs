@@ -1322,6 +1322,7 @@ fn control_request_frame(corr: u64, body: Vec<u8>) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -1333,7 +1334,8 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body.to_vec(),
     )
@@ -1344,7 +1346,8 @@ fn cancel_frame(channel: u16, corr: u64) -> Frame {
     Frame::build(
         FrameType::Cancel,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         Vec::new(),
     )
@@ -1355,7 +1358,8 @@ fn goodbye_frame(channel: u16, corr: u64) -> Frame {
     Frame::build(
         FrameType::Goodbye,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         Vec::new(),
     )

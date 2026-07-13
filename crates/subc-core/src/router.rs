@@ -415,7 +415,8 @@ impl EchoBackend {
             frame.header.ver,
             FrameType::Response,
             frame.header.flags,
-            frame.header.channel,
+            frame.header.channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             frame.header.corr,
             frame.body,
         )
@@ -594,7 +595,8 @@ fn error_frame(channel: u16, corr: u64, code: &str, message: String) -> Option<F
     Frame::build(
         FrameType::Error,
         Flags::new(false, Priority::Passive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body,
     )
@@ -659,7 +661,8 @@ mod tests {
         Frame::build(
             FrameType::Request,
             Flags::new(true, Priority::Interactive, false),
-            channel,
+            channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             body.to_vec(),
         )
@@ -670,6 +673,7 @@ mod tests {
         Frame::build(
             FrameType::Ping,
             Flags::new(false, Priority::Passive, false),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             corr,
             Vec::new(),
@@ -787,7 +791,8 @@ mod tests {
         let terminal = Frame::build(
             FrameType::Response,
             Flags::new(false, Priority::Interactive, true),
-            pending.module_channel,
+            pending.module_channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             701,
             b"terminal".to_vec(),
         )
@@ -856,7 +861,8 @@ mod tests {
         let goodbye = Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Passive, true),
-            pending.module_channel,
+            pending.module_channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             801,
             Vec::new(),
         )

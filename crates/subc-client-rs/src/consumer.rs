@@ -1045,7 +1045,12 @@ impl Shared {
                                 "failed to decode route.open response: {err}"
                             ))
                         })?;
-                    let ClientControlResponse::RouteOpen { route_channel } = response else {
+                    let ClientControlResponse::RouteOpen {
+                        route_channel,
+                        // WIRE-WAVE2: retain this epoch in the consumer route handle.
+                        route_epoch: _route_epoch,
+                    } = response
+                    else {
                         return Err(CallError::not_sent(
                             "route.open returned an unexpected control response",
                         ));
@@ -1176,7 +1181,8 @@ impl Shared {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, priority, false),
-            channel,
+            channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             body,
         )
@@ -1261,7 +1267,8 @@ impl Shared {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, priority, false),
-            channel,
+            channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             body,
         )
@@ -1375,7 +1382,8 @@ impl Shared {
         let Ok(frame) = Frame::build(
             FrameType::Cancel,
             Flags::new(false, priority, false),
-            channel,
+            channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             Vec::new(),
         ) else {
@@ -1601,7 +1609,8 @@ impl Shared {
         let Ok(frame) = Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Interactive, false),
-            channel,
+            channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             Vec::new(),
         ) else {
@@ -2156,6 +2165,7 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
                 frame.header.ver,
                 FrameType::Pong,
                 frame.header.flags,
+                0, // WIRE-WAVE2: thread the binding epoch.
                 0,
                 frame.header.corr,
                 Vec::new(),

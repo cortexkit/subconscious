@@ -92,6 +92,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         "module_control_push_route_status",
         &ModuleControlPush::RouteStatus {
             route_channel: 42,
+            route_epoch: 7,
             status: "indexing".to_string(),
         },
     );
@@ -181,6 +182,7 @@ fn module_hello_ack_body() -> ModuleHelloAckBody {
 fn module_control_request(consumer_capabilities: Option<Vec<String>>) -> ModuleControlRequest {
     ModuleControlRequest::RouteBind {
         route_channel: 42,
+        epoch: 7,
         target: RouteTarget::ToolProvider {
             module_id: "aft-tools".to_string(),
         },

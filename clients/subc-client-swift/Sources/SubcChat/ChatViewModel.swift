@@ -199,7 +199,8 @@ final class ChatViewModel: ObservableObject {
                     provider: provider,
                     model: modelId,
                     tools: tools,
-                    fromCursor: priorCursor
+                    fromCursor: priorCursor,
+                    admissionClass: .normal
                 ) { event in
                     DispatchQueue.main.async {
                         self?.apply(event, sessionId: session, assistantMsgId: assistantMsgId)

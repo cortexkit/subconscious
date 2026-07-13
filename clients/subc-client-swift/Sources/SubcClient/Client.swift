@@ -1,14 +1,8 @@
 import Foundation
 
-// Consumer-side channel-0 control RPC + the session data/stream plane over a
-// connected + authenticated transport. Mirrors clients/subc-client/src/client.ts,
-// subc-probe.rs, and broca's subc-consumer connection.
-//
-// Spike scope: a synchronous, single-socket demonstration. The production client
-// swaps the blocking transport for an async Network.framework connection with a
-// background read task and per-(channel, corr) registration, which is what lets
-// subscribe streams and concurrent in-flight requests share one connection. The
-// wire bytes (frames, bodies, demux key) are identical; only the I/O model changes.
+// Consumer-side channel-0 control RPC + session data/stream plane over one
+// authenticated transport. This client is synchronous, but every route identity
+// still carries the full wire generation and connection token.
 
 public struct CatalogEntry {
     public let moduleId: String
@@ -20,14 +14,13 @@ public struct CatalogEntry {
 public struct SessionEvent {
     public let walSeq: UInt64
     public let subIndex: UInt32
-    public let type: String        // run_started | step_started | assistant_message | tool_call | tool_result | step_finished | run_finished | error | text_delta | ...
-    public let text: String?       // assistant text (assistant_message), tool result text, the error message (error), or a live token delta (text_delta)
-    public let runId: String?      // present on run_started (the run this episode belongs to)
-    public let errorClass: String? // present on type=="error": transient | permanent | auth | context_overflow | provider_unavailable
-    public let errorStatus: Int?   // present on type=="error" when the provider supplied an HTTP status
-    public let finishReason: String? // present on type=="run_finished": completed | max_steps | cancelled | interrupted | error
-    /// True for a durable CONTROL unit (carries a cursor); false for a live DISPLAY event
-    /// (token delta, lossy, no cursor). Only control events advance the resubscribe cursor.
+    public let type: String
+    public let text: String?
+    public let runId: String?
+    public let errorClass: String?
+    public let errorStatus: Int?
+    public let finishReason: String?
+    /// Durable CONTROL units carry cursors; lossy DISPLAY events do not.
     public let isControl: Bool
 }
 
@@ -39,12 +32,74 @@ public struct SubcError: Error {
     public init(message: String) { self.message = message }
 }
 
+public enum ClientLocalError: Error, Equatable, CustomStringConvertible {
+    case staleConnectionToken
+    case routeNotLive(channel: UInt16, epoch: UInt32)
+    case illegalAdmissionClass(AdmissionClass, FrameType)
+    case correlationExhausted
+
+    public var description: String {
+        switch self {
+        case .staleConnectionToken:
+            "route handle belongs to a different connection"
+        case let .routeNotLive(channel, epoch):
+            "route handle is not live: channel=\(channel), epoch=\(epoch)"
+        case let .illegalAdmissionClass(admissionClass, frameType):
+            "admission class \(admissionClass) is illegal for frame type \(frameType)"
+        case .correlationExhausted:
+            "connection correlation space is exhausted"
+        }
+    }
+}
+
+final class ConnectionToken: @unchecked Sendable {}
+
+/// Immutable route identity. The connection token is intentionally opaque and
+/// never appears on the wire; it prevents a pre-reconnect handle from acting on
+/// a later socket that happens to reuse the same channel and epoch numbers.
+public struct RouteHandle: Hashable, Sendable {
+    public let channel: UInt16
+    public let epoch: UInt32
+    fileprivate let connectionToken: ConnectionToken
+
+    init(channel: UInt16, epoch: UInt32, connectionToken: ConnectionToken) {
+        self.channel = channel
+        self.epoch = epoch
+        self.connectionToken = connectionToken
+    }
+
+    public static func == (lhs: RouteHandle, rhs: RouteHandle) -> Bool {
+        lhs.channel == rhs.channel
+            && lhs.epoch == rhs.epoch
+            && lhs.connectionToken === rhs.connectionToken
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(channel)
+        hasher.combine(epoch)
+        hasher.combine(ObjectIdentifier(connectionToken))
+    }
+}
+
+private struct InFlightKey: Hashable {
+    let channel: UInt16
+    let epoch: UInt32
+    let corr: UInt64
+}
+
 public final class SubcClient {
     private let transport: Transport
-    private var nextCorr: UInt64 = 1
+    private let connectionToken = ConnectionToken()
+    private var liveEpochs: [UInt16: UInt32] = [:]
+    private var nextCorr: UInt64
+    private var corrExhausted = false
+    private var inFlight: Set<InFlightKey> = []
+    private var abandonedRouteOpens: Set<UInt64> = []
+    public private(set) var droppedIngressFrames: UInt64 = 0
 
-    private init(transport: Transport) {
+    init(transport: Transport, nextCorr: UInt64 = 1) {
         self.transport = transport
+        self.nextCorr = nextCorr == 0 ? 1 : nextCorr
     }
 
     /// Read the connection file, connect to the first endpoint, run the HMAC
@@ -60,31 +115,29 @@ public final class SubcClient {
     }
 
     /// List modules subc knows about (channel-0 catalog.list).
-    public func catalogList() throws -> [CatalogEntry] {
+    public func catalogList(admissionClass: AdmissionClass = .normal) throws -> [CatalogEntry] {
         let body = try JSONSerialization.data(withJSONObject: ["op": "catalog.list"])
-        let reply = try request(channel: 0, body: body)
+        let reply = try controlRequest(body: body, admissionClass: admissionClass)
         guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
             throw SubcError(message: "catalog.list reply was not a JSON object")
         }
         let modules = obj["modules"] as? [[String: Any]] ?? []
-        return modules.map { m in
+        return modules.map { module in
             CatalogEntry(
-                moduleId: m["module_id"] as? String ?? "?",
-                roles: rolesOf(m["roles"]),
-                controlOps: m["control_ops"] as? [String] ?? []
+                moduleId: module["module_id"] as? String ?? "?",
+                roles: rolesOf(module["roles"]),
+                controlOps: module["control_ops"] as? [String] ?? []
             )
         }
     }
 
-    /// Fetch a tool provider's tool definitions from the catalog, shaped for
-    /// broca's `session.send` `tools` array: `{name, description,
-    /// input_schema, module}`. The catalog's `execution_mode` is intentionally
-    /// dropped — broca's Tool field of that name is a different enum
-    /// (dispatch parallelism, not effect class) and rejects the catalog's
-    /// values; omitting it applies the serve side's default.
-    public func toolProviderTools(moduleId: String) throws -> [[String: Any]] {
+    /// Fetch a tool provider's definitions in broca's `session.send` shape.
+    public func toolProviderTools(
+        moduleId: String,
+        admissionClass: AdmissionClass = .normal
+    ) throws -> [[String: Any]] {
         let body = try JSONSerialization.data(withJSONObject: ["op": "catalog.list"])
-        let reply = try request(channel: 0, body: body)
+        let reply = try controlRequest(body: body, admissionClass: admissionClass)
         guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
               let modules = obj["modules"] as? [[String: Any]],
               let entry = modules.first(where: { ($0["module_id"] as? String) == moduleId })
@@ -104,54 +157,112 @@ public final class SubcClient {
         }
     }
 
-    /// Open a route to a management-surface module (channel-0 route.open).
-    /// Returns the assigned route channel. `projectRoot` must be an existing path
-    /// (subc canonicalizes it via cortexkit-paths and rejects non-existent paths).
+    /// Open a management-surface route and publish its full handle before any
+    /// subsequent ingress frame can be read.
     public func routeOpenManagementSurface(
         moduleId: String,
         projectRoot: String,
         harness: String,
         session: String,
-        consumerCapabilities: [String]? = nil
-    ) throws -> UInt16 {
+        consumerCapabilities: [String]? = nil,
+        admissionClass: AdmissionClass = .normal
+    ) throws -> RouteHandle {
+        try validateRequestAdmission(admissionClass)
         var payload: [String: Any] = [
             "op": "route.open",
             "target": ["kind": "management_surface", "module_id": moduleId],
             "identity": ["project_root": projectRoot, "harness": harness, "session": session],
         ]
-        if let consumerCapabilities = consumerCapabilities {
+        if let consumerCapabilities {
             payload["consumer_capabilities"] = consumerCapabilities
         }
         let body = try JSONSerialization.data(withJSONObject: payload)
-        let reply = try request(channel: 0, body: body)
-        guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
-              let ch = obj["route_channel"] as? Int else {
-            throw SubcError(message: "route.open returned no route_channel")
+        let corr = try allocateCorr()
+        let key = InFlightKey(channel: 0, epoch: 0, corr: corr)
+        inFlight.insert(key)
+        defer { inFlight.remove(key) }
+        try writeControlRequest(corr: corr, body: body, admissionClass: admissionClass)
+
+        while true {
+            let frame: Frame
+            do {
+                frame = try nextIngressFrame()
+            } catch {
+                // A local read timeout/failure can race a daemon-side commit. Retain
+                // the corr so a later successful response becomes an immediate
+                // GOODBYE instead of orphaning the route.
+                abandonedRouteOpens.insert(corr)
+                throw error
+            }
+            guard frame.header.channel == 0, frame.header.epoch == 0,
+                  frame.header.corr == corr
+            else { continue }
+            switch frame.header.ty {
+            case .response:
+                // Installation occurs in this dispatch turn, before return and
+                // before the socket reader asks for another frame.
+                return try installRouteOpen(frame.body)
+            case .error:
+                throw remoteError(prefix: "route.open rejected", body: frame.body)
+            default:
+                continue
+            }
         }
-        return UInt16(ch)
     }
 
-    /// Invoke a management operation on an open route channel and return the
-    /// decoded JSON result (unwrapping the serve side's `{ result: ... }` envelope).
-    public func callManagement(routeChannel: UInt16, method: String, params: [String: Any] = [:]) throws -> [String: Any] {
+    /// Invoke one management operation using the generation-fenced route handle.
+    public func callManagement(
+        route: RouteHandle,
+        method: String,
+        params: [String: Any] = [:],
+        admissionClass: AdmissionClass = .normal
+    ) throws -> [String: Any] {
         let body = try JSONSerialization.data(withJSONObject: ["method": method, "params": params])
-        let reply = try request(channel: routeChannel, body: body)
+        let reply = try routeRequest(route: route, body: body, admissionClass: admissionClass)
         guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
             throw SubcError(message: "\(method) reply was not a JSON object")
         }
         return obj
     }
 
-    /// Drive one broca session turn end-to-end: subscribe (dedicated route),
-    /// send the prompt (command route), then drain the control stream to the run's
-    /// terminal, invoking `onEvent` for each decoded control unit.
-    ///
-    /// This is the spike-level synchronous proof of subscribe streaming: a subscribe
-    /// is a Request whose corr yields a series of StreamData frames (one per control
-    /// unit) ending in StreamEnd, distinct from a request/response's single terminal.
-    /// Subscribing BEFORE sending captures the run from seq 1 (the attach barrier
-    /// replays the projection from start). The read loop demultiplexes by corr: the
-    /// send's Response vs the subscribe's StreamData stream.
+    /// Send a route-scoped CANCEL. The caller supplies the corr of the operation
+    /// being cancelled; the handle supplies the immutable route generation.
+    public func cancel(
+        route: RouteHandle,
+        corr: UInt64,
+        admissionClass: AdmissionClass = .normal
+    ) throws {
+        try ensureCurrent(route)
+        try validateAdmission(admissionClass, for: .cancel)
+        let flags = buildFlags(
+            binary: false,
+            priority: .interactive,
+            last: false,
+            admissionClass: admissionClass
+        )
+        try transport.writeAll(encodeFrame(
+            ty: .cancel,
+            flags: flags,
+            channel: route.channel,
+            epoch: route.epoch,
+            corr: corr,
+            body: Data()
+        ))
+    }
+
+    /// Close one live route. A stale or foreign handle fails before any write.
+    public func closeRoute(
+        _ route: RouteHandle,
+        admissionClass: AdmissionClass = .normal
+    ) throws {
+        try ensureCurrent(route)
+        try validateAdmission(admissionClass, for: .goodbye)
+        try writeGoodbye(route, admissionClass: admissionClass)
+        liveEpochs.removeValue(forKey: route.channel)
+    }
+
+    /// Drive one broca session turn end-to-end using dedicated command and
+    /// subscribe handles.
     public func runSessionTurn(
         moduleId: String,
         projectRoot: String,
@@ -163,37 +274,43 @@ public final class SubcClient {
         tools: [[String: Any]] = [],
         fromCursor: SubscribeCursor? = nil,
         sendId: String = UUID().uuidString,
+        admissionClass: AdmissionClass = .normal,
         onEvent: (SessionEvent) -> Void
     ) throws -> SubscribeCursor? {
-        let cmdChannel = try routeOpenManagementSurface(moduleId: moduleId, projectRoot: projectRoot, harness: harness, session: session)
-        let subChannel = try routeOpenManagementSurface(moduleId: moduleId, projectRoot: projectRoot, harness: harness, session: session)
+        let commandRoute = try routeOpenManagementSurface(
+            moduleId: moduleId,
+            projectRoot: projectRoot,
+            harness: harness,
+            session: session,
+            admissionClass: admissionClass
+        )
+        let subscribeRoute = try routeOpenManagementSurface(
+            moduleId: moduleId,
+            projectRoot: projectRoot,
+            harness: harness,
+            session: session,
+            admissionClass: admissionClass
+        )
 
-        // Subscribe FIRST (from the start of the lineage), without waiting — its corr
-        // produces the StreamData stream we drain below.
-        let subCorr = nextCorr; nextCorr += 1
-        // A continuing turn resubscribes from the prior turn's last cursor (replays
-        // strictly AFTER it), so the prior episode is never re-delivered; the first
-        // turn attaches from "start" on the empty lineage. The `from` wire shape is an
-        // untagged enum: a bare string ("start"/"live") or a { wal_seq, sub_index } object.
+        let subscribeCorr = try allocateCorr()
         let fromValue: Any
-        if let c = fromCursor {
-            fromValue = ["wal_seq": c.walSeq, "sub_index": c.subIndex]
+        if let cursor = fromCursor {
+            fromValue = ["wal_seq": cursor.walSeq, "sub_index": cursor.subIndex]
         } else {
             fromValue = "start"
         }
-        let subBody = try JSONSerialization.data(withJSONObject: [
+        let subscribeBody = try JSONSerialization.data(withJSONObject: [
             "method": "session.subscribe",
             "params": ["from": fromValue],
         ])
-        try writeRequest(channel: subChannel, corr: subCorr, body: subBody)
+        try beginRouteRequest(
+            route: subscribeRoute,
+            corr: subscribeCorr,
+            body: subscribeBody,
+            admissionClass: admissionClass
+        )
 
-        // Then send the prompt on the command route (its own corr → one Response).
-        // A continuing turn needs no append flag: the module auto-appends on a fresh
-        // run identity. `send_id` is the idempotency key — the module derives the run
-        // id from it, so a lost-response retry of the SAME logical send maps to the
-        // same run instead of appending a duplicate turn (retries must reuse the id
-        // verbatim; a new logical send must mint a new one).
-        let sendCorr = nextCorr; nextCorr += 1
+        let sendCorr = try allocateCorr()
         let sendBody = try JSONSerialization.data(withJSONObject: [
             "method": "session.send",
             "params": [
@@ -203,34 +320,58 @@ public final class SubcClient {
                 "send_id": sendId,
             ],
         ])
-        try writeRequest(channel: cmdChannel, corr: sendCorr, body: sendBody)
+        try beginRouteRequest(
+            route: commandRoute,
+            corr: sendCorr,
+            body: sendBody,
+            admissionClass: admissionClass
+        )
 
-        // Drain: demux frames by corr. The send Response is the admission ack; the
-        // subscribe corr carries the StreamData control units until the run's terminal.
+        let subscribeKey = InFlightKey(
+            channel: subscribeRoute.channel,
+            epoch: subscribeRoute.epoch,
+            corr: subscribeCorr
+        )
+        let sendKey = InFlightKey(
+            channel: commandRoute.channel,
+            epoch: commandRoute.epoch,
+            corr: sendCorr
+        )
+        inFlight.formUnion([subscribeKey, sendKey])
+        defer {
+            inFlight.remove(subscribeKey)
+            inFlight.remove(sendKey)
+        }
+
         var lastCursor: SubscribeCursor? = fromCursor
         while true {
-            let frame = try readFrame()
-            // A GOODBYE for either of this turn's routes means the daemon tore the
-            // channel down (module restart/drain). Fail loudly: silently ignoring it
-            // leaves this drain blocked forever on a channel that will never speak.
+            let frame = try nextIngressFrame()
+            let frameHandle = (frame.header.channel, frame.header.epoch)
             if frame.header.ty == .goodbye,
-               frame.header.channel == subChannel || frame.header.channel == cmdChannel {
+               frameHandle == (subscribeRoute.channel, subscribeRoute.epoch)
+                || frameHandle == (commandRoute.channel, commandRoute.epoch)
+            {
                 throw SubcError(message:
                     "route closed by daemon mid-turn (module restarted or drained) — resend to reopen")
             }
-            if frame.header.corr == sendCorr {
+
+            let key = InFlightKey(
+                channel: frame.header.channel,
+                epoch: frame.header.epoch,
+                corr: frame.header.corr
+            )
+            guard inFlight.contains(key) else { continue }
+            if key == sendKey {
                 if frame.header.ty == .error {
-                    let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"
-                    throw SubcError(message: "session.send rejected: \(msg)")
+                    throw remoteError(prefix: "session.send rejected", body: frame.body)
                 }
-                continue // Response = admission ack; the stream carries the run
+                if frame.header.ty == .response { inFlight.remove(sendKey) }
+                continue
             }
-            guard frame.header.corr == subCorr else { continue }
+            guard key == subscribeKey else { continue }
             switch frame.header.ty {
             case .streamData:
                 if let event = try decodeStreamEvent(frame.body) {
-                    // Only durable CONTROL events carry a cursor and advance the resubscribe
-                    // position; live DISPLAY deltas are lossy and must not move the cursor.
                     if event.isControl { lastCursor = (event.walSeq, event.subIndex) }
                     onEvent(event)
                     if event.type == "run_finished" { return lastCursor }
@@ -238,47 +379,249 @@ public final class SubcClient {
             case .streamEnd:
                 return lastCursor
             case .error:
-                let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"
-                throw SubcError(message: "subscribe stream error: \(msg)")
-            default:
-                continue // interim push, ignore
-            }
-        }
-    }
-
-    public func close() { transport.close() }
-
-    // Send a Request on `channel` and read frames until the terminal
-    // (Response/Error) carrying THIS request's corr. Frames for other correlations
-    // are skipped — the demux-by-corr discipline the production client generalizes
-    // to full (channel, corr) keying for concurrent in-flight requests.
-    private func request(channel: UInt16, body: Data) throws -> Data {
-        let corr = nextCorr; nextCorr += 1
-        try writeRequest(channel: channel, corr: corr, body: body)
-        while true {
-            let frame = try readFrame()
-            guard frame.header.corr == corr else { continue }
-            switch frame.header.ty {
-            case .response:
-                return frame.body
-            case .error:
-                let msg = String(data: frame.body, encoding: .utf8) ?? "<binary>"
-                throw SubcError(message: "request on channel \(channel) rejected: \(msg)")
+                throw remoteError(prefix: "subscribe stream error", body: frame.body)
             default:
                 continue
             }
         }
     }
 
-    private func writeRequest(channel: UInt16, corr: UInt64, body: Data) throws {
-        let flags = buildFlags(binary: false, priority: .interactive, last: false)
-        try transport.writeAll(encodeFrame(ty: .request, flags: flags, channel: channel, corr: corr, body: body))
+    /// Close the connection and invalidate every handle minted by it.
+    public func close() {
+        liveEpochs.removeAll()
+        transport.close()
     }
 
-    private func readFrame() throws -> Frame {
-        let header = try decodeHeader(try transport.readExact(HEADER_LEN))
-        let body = header.len > 0 ? try transport.readExact(Int(header.len)) : Data()
-        return Frame(header: header, body: body)
+    private func controlRequest(body: Data, admissionClass: AdmissionClass) throws -> Data {
+        try validateRequestAdmission(admissionClass)
+        let corr = try allocateCorr()
+        let key = InFlightKey(channel: 0, epoch: 0, corr: corr)
+        inFlight.insert(key)
+        defer { inFlight.remove(key) }
+        try writeControlRequest(corr: corr, body: body, admissionClass: admissionClass)
+        while true {
+            let frame = try nextIngressFrame()
+            guard frame.header.channel == 0, frame.header.epoch == 0,
+                  frame.header.corr == corr
+            else { continue }
+            switch frame.header.ty {
+            case .response:
+                return frame.body
+            case .error:
+                throw remoteError(prefix: "control request rejected", body: frame.body)
+            default:
+                continue
+            }
+        }
+    }
+
+    private func routeRequest(
+        route: RouteHandle,
+        body: Data,
+        admissionClass: AdmissionClass
+    ) throws -> Data {
+        try ensureCurrent(route)
+        try validateRequestAdmission(admissionClass)
+        let corr = try allocateCorr()
+        let key = InFlightKey(channel: route.channel, epoch: route.epoch, corr: corr)
+        inFlight.insert(key)
+        defer { inFlight.remove(key) }
+        try beginRouteRequest(
+            route: route,
+            corr: corr,
+            body: body,
+            admissionClass: admissionClass
+        )
+        while true {
+            let frame = try nextIngressFrame()
+            let frameKey = InFlightKey(
+                channel: frame.header.channel,
+                epoch: frame.header.epoch,
+                corr: frame.header.corr
+            )
+            if frame.header.ty == .goodbye,
+               frame.header.channel == route.channel,
+               frame.header.epoch == route.epoch
+            {
+                throw SubcError(message: "route closed while request was in flight")
+            }
+            guard frameKey == key else { continue }
+            switch frame.header.ty {
+            case .response:
+                return frame.body
+            case .error:
+                throw remoteError(
+                    prefix: "request on route \(route.channel):\(route.epoch) rejected",
+                    body: frame.body
+                )
+            default:
+                continue
+            }
+        }
+    }
+
+    private func beginRouteRequest(
+        route: RouteHandle,
+        corr: UInt64,
+        body: Data,
+        admissionClass: AdmissionClass
+    ) throws {
+        try ensureCurrent(route)
+        try validateRequestAdmission(admissionClass)
+        let flags = buildFlags(
+            binary: false,
+            priority: .interactive,
+            last: false,
+            admissionClass: admissionClass
+        )
+        try transport.writeAll(encodeFrame(
+            ty: .request,
+            flags: flags,
+            channel: route.channel,
+            epoch: route.epoch,
+            corr: corr,
+            body: body
+        ))
+    }
+
+    private func writeControlRequest(
+        corr: UInt64,
+        body: Data,
+        admissionClass: AdmissionClass
+    ) throws {
+        let flags = buildFlags(
+            binary: false,
+            priority: .interactive,
+            last: false,
+            admissionClass: admissionClass
+        )
+        try transport.writeAll(encodeFrame(
+            ty: .request,
+            flags: flags,
+            channel: 0,
+            epoch: 0,
+            corr: corr,
+            body: body
+        ))
+    }
+
+    private func nextIngressFrame() throws -> Frame {
+        while true {
+            let frame = try readFrame(from: transport)
+            if frame.header.channel == 0 {
+                if try consumeLateRouteOpen(frame) { continue }
+                return frame
+            }
+            guard liveEpochs[frame.header.channel] == frame.header.epoch else {
+                droppedIngressFrames &+= 1
+                continue
+            }
+            if frame.header.ty == .goodbye {
+                liveEpochs.removeValue(forKey: frame.header.channel)
+            }
+            return frame
+        }
+    }
+
+    private func consumeLateRouteOpen(_ frame: Frame) throws -> Bool {
+        guard abandonedRouteOpens.contains(frame.header.corr),
+              frame.header.channel == 0, frame.header.epoch == 0
+        else { return false }
+        guard frame.header.ty == .response || frame.header.ty == .error else { return false }
+        abandonedRouteOpens.remove(frame.header.corr)
+        guard frame.header.ty == .response else { return true }
+
+        let route = try installRouteOpen(frame.body)
+        do {
+            try writeGoodbye(route, admissionClass: .normal)
+            liveEpochs.removeValue(forKey: route.channel)
+        } catch {
+            // A committed late route must not remain orphaned if its GOODBYE
+            // cannot be queued; owner cleanup on connection close is the floor.
+            close()
+            throw error
+        }
+        return true
+    }
+
+    private func installRouteOpen(_ body: Data) throws -> RouteHandle {
+        guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let channelNumber = object["route_channel"] as? NSNumber,
+              let epochNumber = object["route_epoch"] as? NSNumber,
+              channelNumber.int64Value > 0,
+              channelNumber.uint64Value <= UInt64(UInt16.max),
+              epochNumber.int64Value > 0,
+              epochNumber.uint64Value <= UInt64(UInt32.max)
+        else {
+            throw SubcError(message: "route.open returned no valid route_channel/route_epoch")
+        }
+        let route = RouteHandle(
+            channel: UInt16(channelNumber.uint64Value),
+            epoch: UInt32(epochNumber.uint64Value),
+            connectionToken: connectionToken
+        )
+        liveEpochs[route.channel] = route.epoch
+        return route
+    }
+
+    private func ensureCurrent(_ route: RouteHandle) throws {
+        guard route.connectionToken === connectionToken else {
+            throw ClientLocalError.staleConnectionToken
+        }
+        guard liveEpochs[route.channel] == route.epoch else {
+            throw ClientLocalError.routeNotLive(channel: route.channel, epoch: route.epoch)
+        }
+    }
+
+    private func validateRequestAdmission(_ admissionClass: AdmissionClass) throws {
+        try validateAdmission(admissionClass, for: .request)
+    }
+
+    private func validateAdmission(_ admissionClass: AdmissionClass, for frameType: FrameType) throws {
+        if admissionClass == .sheddable,
+           frameType != .push, frameType != .streamData
+        {
+            throw ClientLocalError.illegalAdmissionClass(admissionClass, frameType)
+        }
+    }
+
+    private func writeGoodbye(
+        _ route: RouteHandle,
+        admissionClass: AdmissionClass
+    ) throws {
+        let flags = buildFlags(
+            binary: false,
+            priority: .passive,
+            last: false,
+            admissionClass: admissionClass
+        )
+        try transport.writeAll(encodeFrame(
+            ty: .goodbye,
+            flags: flags,
+            channel: route.channel,
+            epoch: route.epoch,
+            corr: 0,
+            body: Data()
+        ))
+    }
+
+    private func allocateCorr() throws -> UInt64 {
+        guard !corrExhausted else {
+            close()
+            throw ClientLocalError.correlationExhausted
+        }
+        let corr = nextCorr
+        if corr == UInt64.max {
+            corrExhausted = true
+        } else {
+            nextCorr += 1
+        }
+        return corr
+    }
+
+    private func remoteError(prefix: String, body: Data) -> SubcError {
+        let message = String(data: body, encoding: .utf8) ?? "<binary>"
+        return SubcError(message: "\(prefix): \(message)")
     }
 }
 

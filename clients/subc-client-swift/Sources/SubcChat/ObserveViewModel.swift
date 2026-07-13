@@ -30,7 +30,7 @@ final class ObserveViewModel: ObservableObject {
 
     private let work = DispatchQueue(label: "subc-observe.client", qos: .userInitiated)
     private var client: SubcClient?
-    private var alfonsoChannel: UInt16?
+    private var alfonsoRoute: RouteHandle?
     private var timer: Timer?
 
     let connectionFile =
@@ -74,17 +74,17 @@ final class ObserveViewModel: ObservableObject {
 
     // MARK: Wire plumbing (alfonso-core route, mirrors RoomsViewModel)
 
-    private func ensureAlfonsoBlocking() throws -> (SubcClient, UInt16) {
-        if let c = client, let ch = alfonsoChannel { return (c, ch) }
+    private func ensureAlfonsoBlocking() throws -> (SubcClient, RouteHandle) {
+        if let client, let alfonsoRoute { return (client, alfonsoRoute) }
         let c = try SubcClient.connect(connectionFilePath: connectionFile)
-        let ch = try c.routeOpenManagementSurface(
+        let route = try c.routeOpenManagementSurface(
             moduleId: "alfonso-core",
             projectRoot: callerDirectory,
             harness: harness,
             session: sessionId)
         client = c
-        alfonsoChannel = ch
-        return (c, ch)
+        alfonsoRoute = route
+        return (c, route)
     }
 
     private func alfonsoCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
@@ -92,8 +92,8 @@ final class ObserveViewModel: ObservableObject {
         merged["harness"] = harness
         merged["sessionId"] = sessionId
         merged["callerDirectory"] = callerDirectory
-        let (c, ch) = try ensureAlfonsoBlocking()
-        let reply = try c.callManagement(routeChannel: ch, method: method, params: merged)
+        let (client, route) = try ensureAlfonsoBlocking()
+        let reply = try client.callManagement(route: route, method: method, params: merged)
         guard let result = reply["result"] else {
             throw SubcError(message: "\(method): reply had no result field")
         }
@@ -136,7 +136,7 @@ final class ObserveViewModel: ObservableObject {
                     } else {
                         self.client?.close()
                         self.client = nil
-                        self.alfonsoChannel = nil
+                        self.alfonsoRoute = nil
                         self.status = "poll failed: \(msg)"
                     }
                 }
@@ -204,7 +204,7 @@ final class ObserveViewModel: ObservableObject {
                 // session identity, so the shared alfonso route cannot be reused.
                 let c = try SubcClient.connect(connectionFilePath: self.connectionFile)
                 defer { c.close() }
-                let ch = try c.routeOpenManagementSurface(
+                let route = try c.routeOpenManagementSurface(
                     moduleId: "broca",
                     projectRoot: root,
                     harness: "runner",
@@ -212,7 +212,7 @@ final class ObserveViewModel: ObservableObject {
                 var params: [String: Any] = ["limit": 400]
                 if let o = ordinal { params["from_ordinal"] = o }
                 params["session"] = ["project_root": root, "harness": "runner", "session": brocaSession]
-                let reply = try c.callManagement(routeChannel: ch, method: "session.read", params: params)
+                let reply = try c.callManagement(route: route, method: "session.read", params: params)
                 guard let result = reply["result"] as? [String: Any] else {
                     throw SubcError(message: "session.read: reply had no result")
                 }

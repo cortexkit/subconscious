@@ -2,7 +2,7 @@
 import PackageDescription
 
 // Native Swift subc client. Byte-for-byte parity with @cortexkit/subc-client (TS)
-// and subc-client-rs (Rust): the handshake proof construction, the 17-byte
+// and subc-client-rs (Rust): the handshake proof construction, the 21-byte
 // envelope layout, and the frame codec must produce identical bytes. This is the
 // wire layer for native CortexKit apps (macOS first), so it is held to the same
 // golden-vector parity bar as the other two clients.

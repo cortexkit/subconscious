@@ -470,7 +470,8 @@ impl ControlHandler {
                 released.negotiated_ver,
                 FrameType::Goodbye,
                 control_flags(),
-                released.channel,
+                released.channel, // WIRE-WAVE2: thread the binding epoch.
+                0,
                 0,
                 Vec::new(),
             ) {
@@ -535,7 +536,8 @@ impl ControlHandler {
             negotiated_ver,
             FrameType::Goodbye,
             control_flags(),
-            module_channel,
+            module_channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             Vec::new(),
         ) {
@@ -741,6 +743,8 @@ impl ControlHandler {
             FrameType::HelloAck,
             control_flags(),
             0,
+            // WIRE-WAVE2: channel-0 frames always use epoch 0.
+            0,
             frame.header.corr,
             body,
         )
@@ -776,8 +780,9 @@ impl ControlHandler {
             }
             ClientControlRequest::RoutePoll {
                 route_channel,
+                route_epoch,
                 kind,
-            } => self.handle_route_poll(ctx, frame, route_channel, kind),
+            } => self.handle_route_poll(ctx, frame, route_channel, route_epoch, kind),
             ClientControlRequest::SupervisorList {} => self.handle_supervisor_list(frame),
             ClientControlRequest::SupervisorRestart { module_id } => {
                 self.handle_supervisor_restart(frame, module_id).await
@@ -1087,6 +1092,8 @@ impl ControlHandler {
 
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
+            // WIRE-WAVE2: replace with the module-slot reservation epoch.
+            epoch: 0,
             target,
             identity,
             principal: Some(principal),
@@ -1103,6 +1110,7 @@ impl ControlHandler {
             negotiated_ver,
             FrameType::Request,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             relay_corr,
             relay_body,
@@ -1145,6 +1153,8 @@ impl ControlHandler {
                 reservation.disarm();
                 let response = ClientControlResponse::RouteOpen {
                     route_channel: client_channel,
+                    // WIRE-WAVE2: replace with the client-slot reservation epoch.
+                    route_epoch: 0,
                 };
                 Ok(vec![control_response_body_frame(
                     &frame,
@@ -1647,6 +1657,7 @@ impl ControlHandler {
             negotiated_ver,
             FrameType::Request,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             probe_corr,
             probe_body,
@@ -1807,6 +1818,8 @@ impl ControlHandler {
         match update {
             ModuleControlPush::RouteStatus {
                 route_channel,
+                // WIRE-WAVE2: validate the pushed epoch against the route binding.
+                route_epoch: _route_epoch,
                 status,
             } => {
                 self.forwarding
@@ -1822,6 +1835,7 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: Frame,
         route_channel: u16,
+        route_epoch: u32,
         kind: PollKind,
     ) -> Result<Vec<Frame>, RouterError> {
         let response = match kind {
@@ -1840,6 +1854,9 @@ impl ControlHandler {
                 };
                 let live = route_bound_to_live_module && process_running;
                 ClientControlResponse::RoutePoll {
+                    route_channel,
+                    // WIRE-WAVE2: validate this requested epoch in the locked route snapshot.
+                    route_epoch,
                     status: None,
                     live: Some(live),
                 }
@@ -1850,7 +1867,13 @@ impl ControlHandler {
                     .get_status(ctx.connection_id, route_channel)
                     .map_err(RouterError::Forwarding)?;
 
-                ClientControlResponse::RoutePoll { status, live: None }
+                ClientControlResponse::RoutePoll {
+                    route_channel,
+                    // WIRE-WAVE2: validate this requested epoch in the locked route snapshot.
+                    route_epoch,
+                    status,
+                    live: None,
+                }
             }
         };
 
@@ -2308,6 +2331,7 @@ fn pong(frame: &Frame) -> Result<Frame, RouterError> {
         response_version(frame),
         FrameType::Pong,
         frame.header.flags,
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         frame.header.corr,
         Vec::new(),
@@ -2342,6 +2366,7 @@ fn control_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, Ro
         response_version(frame),
         FrameType::Error,
         control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         frame.header.corr,
         body,
@@ -2366,6 +2391,7 @@ fn control_response_body_frame<T: Serialize>(
         response_version(frame),
         FrameType::Response,
         control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         frame.header.corr,
         body,
@@ -2513,7 +2539,15 @@ mod tests {
             launch_nonce,
         })
         .unwrap();
-        Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
     }
 
     fn non_routable_hello_frame_with_control_ops(
@@ -2530,14 +2564,23 @@ mod tests {
             launch_nonce: None,
         })
         .unwrap();
-        Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
     }
 
     fn channel_request(channel: u16, corr: u64) -> Frame {
         Frame::build(
             FrameType::Request,
             Flags::new(true, Priority::Interactive, false),
-            channel,
+            channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             b"opaque".to_vec(),
         )
@@ -2570,10 +2613,20 @@ mod tests {
     fn route_poll_frame(corr: u64, kind: PollKind, route_channel: u16) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
             route_channel,
+            // WIRE-WAVE2: tests use the placeholder epoch until bindings carry epochs.
+            route_epoch: 0,
             kind,
         })
         .unwrap();
-        Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
     }
 
     fn supervisor_health_probe_frame(corr: u64, module_id: &str) -> Frame {
@@ -2581,7 +2634,15 @@ mod tests {
             module_id: module_id.to_string(),
         })
         .unwrap();
-        Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
     }
 
     fn route_open_frame(corr: u64, module_id: &str, project_root: std::path::PathBuf) -> Frame {
@@ -2607,7 +2668,15 @@ mod tests {
             consumer_capabilities,
         })
         .unwrap();
-        Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
     }
 
     fn health_response(corr: u64, status: HealthStatus) -> Frame {
@@ -2617,12 +2686,28 @@ mod tests {
             metrics: Some(json!({"queue_depth": 3})),
         })
         .unwrap();
-        Frame::build(FrameType::Response, control_flags(), 0, corr, body).unwrap()
+        Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
     }
 
     fn route_bind_ack(corr: u64) -> Frame {
         let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
-        Frame::build(FrameType::Response, control_flags(), 0, corr, body).unwrap()
+        Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
     }
 
     fn unique_project_root(label: &str) -> std::path::PathBuf {
@@ -2643,6 +2728,8 @@ mod tests {
             ClientControlResponse::RoutePoll {
                 status: None,
                 live: Some(live),
+                // WIRE-WAVE2: assert the echoed handle once test bindings carry epochs.
+                ..
             } => assert_eq!(live, expected_live),
             other => panic!("unexpected route.poll response: {other:?}"),
         }
@@ -2805,7 +2892,15 @@ mod tests {
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.control_ops, module_baseline_control_ops());
 
-        let frame = Frame::build(FrameType::Request, control_flags(), 0, 77, Vec::new()).unwrap();
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            77,
+            Vec::new(),
+        )
+        .unwrap();
         assert!(handler
             .guard_module_control_op(&frame, "aft", "route.bind")
             .unwrap()
@@ -2845,7 +2940,15 @@ mod tests {
                 "future.synthetic".to_string(),
             ]
         );
-        let frame = Frame::build(FrameType::Request, control_flags(), 0, 78, Vec::new()).unwrap();
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            78,
+            Vec::new(),
+        )
+        .unwrap();
         assert!(handler
             .guard_module_control_op(&frame, "aft", "future.synthetic")
             .unwrap()
@@ -3293,6 +3396,7 @@ mod tests {
         let unknown = Frame::build(
             FrameType::Push,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             5,
             serde_json::to_vec(&json!({"op": "route.future.v2", "extra": 1})).unwrap(),
@@ -3308,6 +3412,7 @@ mod tests {
         let malformed = Frame::build(
             FrameType::Push,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             6,
             serde_json::to_vec(&json!({"op": "route.status"})).unwrap(),
@@ -3493,6 +3598,7 @@ mod tests {
         let malformed = Frame::build(
             FrameType::Hello,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             3,
             b"{not json".to_vec(),
@@ -3503,7 +3609,15 @@ mod tests {
         assert_eq!(error[0].header.ty, FrameType::Error);
         assert_eq!(parse_error(&error[0])["code"], "invalid_hello");
 
-        let ping = Frame::build(FrameType::Ping, control_flags(), 0, 4, Vec::new()).unwrap();
+        let ping = Frame::build(
+            FrameType::Ping,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            4,
+            Vec::new(),
+        )
+        .unwrap();
         let pong = handler.handle_control(conn, ping).unwrap();
         assert_eq!(pong[0].header.ty, FrameType::Pong);
         assert_eq!(pong[0].header.corr, 4);
@@ -3547,6 +3661,8 @@ mod tests {
                 &ctx,
                 route_poll_frame(41, PollKind::Liveness, route_channel),
                 route_channel,
+                // WIRE-WAVE2: pass the route test handle epoch.
+                0,
                 PollKind::Liveness,
             )
             .unwrap();
@@ -3568,6 +3684,8 @@ mod tests {
                 &ctx,
                 route_poll_frame(42, PollKind::Liveness, route_channel),
                 route_channel,
+                // WIRE-WAVE2: pass the route test handle epoch.
+                0,
                 PollKind::Liveness,
             )
             .unwrap();
@@ -3589,6 +3707,8 @@ mod tests {
                 &ctx,
                 route_poll_frame(43, PollKind::Liveness, route_channel),
                 route_channel,
+                // WIRE-WAVE2: pass the route test handle epoch.
+                0,
                 PollKind::Liveness,
             )
             .unwrap();
@@ -3603,6 +3723,7 @@ mod tests {
         let request = Frame::build(
             FrameType::Request,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             55,
             br#"{"op":"route.nope","route_channel":1}"#.to_vec(),
@@ -3630,8 +3751,15 @@ mod tests {
                 br#"{"op":"route.poll","route_channel":"bad","kind":"status"}"#.as_slice(),
             ),
         ] {
-            let request =
-                Frame::build(FrameType::Request, control_flags(), 0, corr, body.to_vec()).unwrap();
+            let request = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0, // WIRE-WAVE2: thread the binding epoch.
+                0,
+                corr,
+                body.to_vec(),
+            )
+            .unwrap();
             let response = handler.handle_control_frame(&ctx, request).await.unwrap();
 
             assert_eq!(response.len(), 1);
@@ -3658,7 +3786,15 @@ mod tests {
         assert_eq!(ack.negotiated_ver, PROTOCOL_VERSION);
         let channel = 1;
 
-        let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 0, 12, Vec::new()).unwrap();
+        let goodbye = Frame::build(
+            FrameType::Goodbye,
+            control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            12,
+            Vec::new(),
+        )
+        .unwrap();
         router.route_for_connection(&ctx, goodbye).await.unwrap();
         assert!(rx.try_recv().is_err());
         assert!(registry.get_module("aft").unwrap().is_none());
@@ -3701,6 +3837,7 @@ mod tests {
         let request = Frame::build(
             FrameType::Request,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             21,
             b"opaque".to_vec(),

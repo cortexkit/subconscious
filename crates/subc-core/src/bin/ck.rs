@@ -288,6 +288,7 @@ impl CkClient {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             corr,
             body,
@@ -350,7 +351,11 @@ impl CkClient {
         };
         let value = self.rpc_value(request).await?;
         match serde_json::from_value::<ClientControlResponse>(value)? {
-            ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+            ClientControlResponse::RouteOpen {
+                route_channel,
+                // WIRE-WAVE2: retain this epoch in the CLI route handle.
+                route_epoch: _route_epoch,
+            } => Ok(route_channel),
             other => Err(CkError::Message(format!(
                 "unexpected route.open response: {other:?}"
             ))),
@@ -368,7 +373,8 @@ impl CkClient {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
-            route_channel,
+            route_channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             body,
         )
@@ -396,7 +402,8 @@ impl CkClient {
         let frame = match Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Passive, false),
-            route_channel,
+            route_channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             Vec::new(),
         ) {

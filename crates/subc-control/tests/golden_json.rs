@@ -111,6 +111,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             "client_control_request_route_poll",
             ClientControlRequest::RoutePoll {
                 route_channel: 42,
+                route_epoch: 7,
                 kind: PollKind::Status,
             },
         ),
@@ -175,11 +176,16 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
         ),
         (
             "client_control_response_route_open",
-            ClientControlResponse::RouteOpen { route_channel: 42 },
+            ClientControlResponse::RouteOpen {
+                route_channel: 42,
+                route_epoch: 7,
+            },
         ),
         (
             "client_control_response_route_poll",
             ClientControlResponse::RoutePoll {
+                route_channel: 42,
+                route_epoch: 7,
                 status: Some("indexing".to_string()),
                 live: None,
             },

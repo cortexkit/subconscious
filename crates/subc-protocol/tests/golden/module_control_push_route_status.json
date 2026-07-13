@@ -1,5 +1,6 @@
 {
   "op": "route.status",
   "route_channel": 42,
+  "route_epoch": 7,
   "status": "indexing"
 }

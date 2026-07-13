@@ -302,6 +302,8 @@ async fn open_route(
     match serde_json::from_slice(&ack_frame.body).unwrap() {
         ClientControlResponse::RouteOpen {
             route_channel: client_channel,
+            // WIRE-WAVE2: retain this epoch in the route test handle.
+            route_epoch: _route_epoch,
         } => RoutePair {
             client_channel,
             module_channel: route_channel,
@@ -341,13 +343,29 @@ fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
         launch_nonce: None,
     })
     .unwrap();
-    Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
+    Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
 }
 
 fn catalog_update_frame(corr: u64, provides: Vec<ProviderRole>) -> Frame {
     let body =
         serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate { provides }).unwrap();
-    Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+    Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
 }
 
 fn route_bind_ack(request: &Frame) -> Frame {
@@ -356,6 +374,7 @@ fn route_bind_ack(request: &Frame) -> Frame {
         request.header.ver,
         FrameType::Response,
         control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         request.header.corr,
         body,
@@ -365,14 +384,23 @@ fn route_bind_ack(request: &Frame) -> Frame {
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     let body = serde_json::to_vec(&request).unwrap();
-    Frame::build(FrameType::Request, control_flags(), 0, corr, body).unwrap()
+    Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
 }
 
 fn data_frame(ty: FrameType, channel: u16, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         ty,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body.to_vec(),
     )

@@ -320,7 +320,11 @@ async fn route_open(
     match response.header.ty {
         FrameType::Response => {
             match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
-                ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+                ClientControlResponse::RouteOpen {
+                    route_channel,
+                    // WIRE-WAVE2: retain this epoch in the probe route handle.
+                    route_epoch: _route_epoch,
+                } => Ok(route_channel),
                 other => Err(ProbeError::Message(format!(
                     "unexpected route.open response: {other:?}"
                 ))),
@@ -344,7 +348,8 @@ async fn tool_call(
     let request = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        route_channel,
+        route_channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body,
     )
@@ -383,6 +388,7 @@ async fn control_rpc(stream: &mut TcpStream, body: Vec<u8>) -> Result<Frame, Pro
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,

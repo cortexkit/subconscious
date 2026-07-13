@@ -1538,6 +1538,7 @@ fn supervision_response_frame(request: &SubcFrame, body: Vec<u8>) -> Result<Subc
         request.header.ver,
         FrameType::Response,
         control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         request.header.corr,
         body,
@@ -1559,7 +1560,8 @@ fn supervision_error_frame(
         request.header.ver,
         FrameType::Error,
         control_flags(),
-        request.header.channel,
+        request.header.channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         request.header.corr,
         body,
     )
@@ -1812,7 +1814,11 @@ async fn open_provider_route(
     match response.header.ty {
         FrameType::Response if response.header.channel == 0 => {
             match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
-                ClientControlResponse::RouteOpen { route_channel } => Ok(route_channel),
+                ClientControlResponse::RouteOpen {
+                    route_channel,
+                    // WIRE-WAVE2: retain this epoch in the MCP route binding.
+                    route_epoch: _route_epoch,
+                } => Ok(route_channel),
                 other => Err(other_error(format!(
                     "unexpected route.open response body: {other:?}"
                 ))),
@@ -3823,8 +3829,11 @@ fn build_frame(
             body.len()
         )));
     }
-    SubcFrame::build(ty, flags, channel, corr, body)
-        .map_err(|source| other_error(format!("failed to build frame: {source}")))
+    SubcFrame::build(
+        ty, flags, channel, // WIRE-WAVE2: thread the binding epoch.
+        0, corr, body,
+    )
+    .map_err(|source| other_error(format!("failed to build frame: {source}")))
 }
 
 fn control_flags() -> Flags {
@@ -4033,8 +4042,12 @@ mod tests {
             );
             assert_eq!(consumer_capabilities, expected_for_server);
 
-            let body =
-                serde_json::to_vec(&ClientControlResponse::RouteOpen { route_channel: 7 }).unwrap();
+            let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                route_channel: 7,
+                // WIRE-WAVE2: return the MCP test route handle epoch.
+                route_epoch: 0,
+            })
+            .unwrap();
             let response = build_frame(
                 FrameType::Response,
                 control_flags(),

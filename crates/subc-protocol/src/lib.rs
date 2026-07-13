@@ -2,7 +2,7 @@
 //!
 //! This crate is the single source of truth for the subc <-> module wire,
 //! shared by subc-core and AFT. It defines the **envelope** (the fixed
-//! 17-byte routing header subc splices on), the canonical subc-generated body
+//! 21-byte routing header subc splices on), the canonical subc-generated body
 //! schemas such as [`ErrorBody`], and the capability manifest. JSON-RPC request
 //! and response bodies remain module-owned opaque payloads to subc.
 //!
@@ -10,13 +10,14 @@
 //!
 //! ```text
 //!  offset  size  field     type    purpose
-//!    0      4    len       u32     # of BODY bytes after this 17-byte header
+//!    0      4    len       u32     # of BODY bytes after this 21-byte header
 //!    4      1    ver       u8      envelope version
 //!    5      1    type      u8      frame kind (see FrameType)
-//!    6      1    flags     u8      bit0 BINARY · bits1-2 PRIORITY · bit3 LAST · 4-7 reserved
+//!    6      1    flags     u8      bit0 BINARY · bits1-2 PRIORITY · bit3 LAST · bits4-5 ADMISSION · bits6-7 reserved
 //!    7      2    channel   u16     route = (component, session); 0 = subc itself
-//!    9      8    corr      u64     correlation id; CANCEL carries the target call's corr
-//!   17 -> body
+//!    9      4    epoch     u32     per-slot binding epoch; 0 on channel 0
+//!   13      8    corr      u64     correlation id; CANCEL carries the target call's corr
+//!   21 -> body
 //! ```
 //!
 //! Little-endian (same-machine, native, no byte-swap on the hot path).
@@ -87,7 +88,10 @@ pub enum RouteTarget {
 }
 
 /// Envelope protocol version this build speaks.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
+
+/// Oldest envelope protocol version this build accepts.
+pub const MIN_SUPPORTED_VERSION: u8 = 2;
 
 /// Env var subc sets on each supervised child telling it the module_id it is
 /// supervised under, so it can register under that id.
@@ -99,15 +103,15 @@ pub const SUBC_MODULE_ID_ENV: &str = "SUBC_MODULE_ID";
 /// last injected for that id. Non-reserved modules never receive it.
 pub const SUBC_LAUNCH_NONCE_ENV: &str = "SUBC_LAUNCH_NONCE";
 
-/// Fixed header length for `PROTOCOL_VERSION` 1.
-pub const HEADER_LEN: usize = 17;
+/// Fixed header length for `PROTOCOL_VERSION` 2.
+pub const HEADER_LEN: usize = 21;
 
 /// Bytes of the frozen prefix (`len` u32 + `ver` u8) that are stable across
 /// every envelope version. A reader needs only these to learn the version and
 /// thus the full header length.
 pub const FROZEN_PREFIX_LEN: usize = 5;
 
-/// Maximum v1 frame body accepted before allocation.
+/// Maximum frame body accepted before allocation.
 ///
 /// This 64 MiB starting cap prevents a malformed header from forcing an
 /// unbounded allocation. Future protocol versions can negotiate or encode a
@@ -222,18 +226,40 @@ impl Priority {
     }
 }
 
+/// Admission behavior carried in `flags` bits 4-5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AdmissionClass {
+    Normal = 0,
+    Expedite = 1,
+    Sheddable = 2,
+}
+
+impl AdmissionClass {
+    fn from_bits(bits: u8) -> Option<Self> {
+        Some(match bits {
+            0 => Self::Normal,
+            1 => Self::Expedite,
+            2 => Self::Sheddable,
+            _ => return None,
+        })
+    }
+}
+
 const FLAG_BINARY: u8 = 0b0000_0001; // bit 0
 const FLAG_PRIORITY_MASK: u8 = 0b0000_0110; // bits 1-2
 const FLAG_PRIORITY_SHIFT: u8 = 1;
 const FLAG_LAST: u8 = 0b0000_1000; // bit 3
-const FLAG_RESERVED_MASK: u8 = 0b1111_0000; // bits 4-7 must be zero
+const FLAG_ADMISSION_MASK: u8 = 0b0011_0000; // bits 4-5
+const FLAG_ADMISSION_SHIFT: u8 = 4;
+const FLAG_RESERVED_MASK: u8 = 0b1100_0000; // bits 6-7 must be zero
 
-/// The `flags` byte (offset 6): `bit0 BINARY · bits1-2 PRIORITY · bit3 LAST`.
+/// The `flags` byte (offset 6): binary, priority, last, admission, then reserved bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flags(pub u8);
 
 impl Flags {
-    /// Build flags from typed components.
+    /// Build flags with the default [`AdmissionClass::Normal`] class.
     pub fn new(binary: bool, priority: Priority, last: bool) -> Self {
         let mut b = 0u8;
         if binary {
@@ -244,6 +270,13 @@ impl Flags {
             b |= FLAG_LAST;
         }
         Flags(b)
+    }
+
+    /// Return these flags with a typed admission class.
+    pub fn with_admission_class(mut self, admission_class: AdmissionClass) -> Self {
+        self.0 =
+            (self.0 & !FLAG_ADMISSION_MASK) | ((admission_class as u8) << FLAG_ADMISSION_SHIFT);
+        self
     }
 
     /// Body is raw bytes (bulk lane) rather than JSON-RPC.
@@ -261,7 +294,12 @@ impl Flags {
         Priority::from_bits((self.0 & FLAG_PRIORITY_MASK) >> FLAG_PRIORITY_SHIFT)
     }
 
-    /// True if any reserved bit (4-7) is set — a malformed/forward frame.
+    /// Decode the admission-class bits, or `None` if they hold `0b11`.
+    pub fn admission_class(self) -> Option<AdmissionClass> {
+        AdmissionClass::from_bits((self.0 & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT)
+    }
+
+    /// True if either reserved bit (6-7) is set.
     pub fn has_reserved_bits(self) -> bool {
         self.0 & FLAG_RESERVED_MASK != 0
     }
@@ -278,14 +316,16 @@ pub struct EnvelopeHeader {
     pub ty: FrameType,
     /// Flag bits.
     pub flags: Flags,
-    /// Route = (component, session); 0 = subc itself.
+    /// Sender-local route slot; 0 is the control channel.
     pub channel: u16,
+    /// Sender-local binding epoch; 0 is reserved for the control channel.
+    pub epoch: u32,
     /// Correlation id.
     pub corr: u64,
 }
 
 impl EnvelopeHeader {
-    /// Serialize the header to its fixed 17-byte little-endian form.
+    /// Serialize the header to its fixed 21-byte little-endian form.
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut buf = [0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(&self.len.to_le_bytes());
@@ -293,7 +333,8 @@ impl EnvelopeHeader {
         buf[5] = self.ty as u8;
         buf[6] = self.flags.0;
         buf[7..9].copy_from_slice(&self.channel.to_le_bytes());
-        buf[9..17].copy_from_slice(&self.corr.to_le_bytes());
+        buf[9..13].copy_from_slice(&self.epoch.to_le_bytes());
+        buf[13..21].copy_from_slice(&self.corr.to_le_bytes());
         buf
     }
 }
@@ -309,10 +350,16 @@ pub enum DecodeError {
     TooShortForHeader { have: usize, need: usize },
     /// `type` byte is not a known `FrameType`.
     UnknownFrameType { byte: u8 },
-    /// A reserved flag bit (4-7) is set.
+    /// A reserved flag bit (6-7) is set.
     ReservedFlagBits { flags: u8 },
     /// Priority bits 1-2 hold the reserved value `0b11`.
     ReservedPriorityBits { flags: u8 },
+    /// Admission bits 4-5 hold the reserved value `0b11`.
+    ReservedAdmissionClass { flags: u8 },
+    /// SHEDDABLE is set on a frame type that must be delivered.
+    SheddableIllegalFrameType { ty: FrameType, flags: u8 },
+    /// Channel 0 carried an epoch other than its reserved epoch 0.
+    NonzeroEpochOnControlChannel { epoch: u32 },
     /// A pure-header frame declared body bytes.
     PureHeaderFrameWithBody { ty: FrameType, len: u32 },
 }
@@ -337,6 +384,16 @@ impl fmt::Display for DecodeError {
             Self::ReservedPriorityBits { flags } => {
                 write!(f, "reserved priority bits set in flags 0b{flags:08b}")
             }
+            Self::ReservedAdmissionClass { flags } => {
+                write!(f, "reserved admission class set in flags 0b{flags:08b}")
+            }
+            Self::SheddableIllegalFrameType { ty, flags } => write!(
+                f,
+                "SHEDDABLE admission class is illegal on {ty:?} in flags 0b{flags:08b}"
+            ),
+            Self::NonzeroEpochOnControlChannel { epoch } => {
+                write!(f, "control channel carried nonzero epoch {epoch}")
+            }
             Self::PureHeaderFrameWithBody { ty, len } => {
                 write!(
                     f,
@@ -353,7 +410,7 @@ impl Error for DecodeError {}
 /// frozen prefix: read `ver`, then learn the full header length here.
 fn header_len_for_version(ver: u8) -> Option<usize> {
     match ver {
-        1 => Some(HEADER_LEN),
+        PROTOCOL_VERSION => Some(HEADER_LEN),
         _ => None,
     }
 }
@@ -388,12 +445,27 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     if flags.priority().is_none() {
         return Err(DecodeError::ReservedPriorityBits { flags: bytes[6] });
     }
+    let admission_class = flags
+        .admission_class()
+        .ok_or(DecodeError::ReservedAdmissionClass { flags: bytes[6] })?;
+    if admission_class == AdmissionClass::Sheddable
+        && !matches!(ty, FrameType::Push | FrameType::StreamData)
+    {
+        return Err(DecodeError::SheddableIllegalFrameType {
+            ty,
+            flags: bytes[6],
+        });
+    }
     if ty.is_pure_header() && len != 0 {
         return Err(DecodeError::PureHeaderFrameWithBody { ty, len });
     }
     let channel = u16::from_le_bytes([bytes[7], bytes[8]]);
+    let epoch = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+    if channel == 0 && epoch != 0 {
+        return Err(DecodeError::NonzeroEpochOnControlChannel { epoch });
+    }
     let corr = u64::from_le_bytes([
-        bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], bytes[16],
+        bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
     ]);
 
     Ok(EnvelopeHeader {
@@ -402,6 +474,7 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
         ty,
         flags,
         channel,
+        epoch,
         corr,
     })
 }
@@ -411,12 +484,24 @@ mod tests {
     use super::*;
 
     fn hdr(len: u32, ty: FrameType, flags: Flags, channel: u16, corr: u64) -> EnvelopeHeader {
+        hdr_with_epoch(len, ty, flags, channel, u32::from(channel != 0), corr)
+    }
+
+    fn hdr_with_epoch(
+        len: u32,
+        ty: FrameType,
+        flags: Flags,
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+    ) -> EnvelopeHeader {
         EnvelopeHeader {
             len,
             ver: PROTOCOL_VERSION,
             ty,
             flags,
             channel,
+            epoch,
             corr,
         }
     }
@@ -509,22 +594,32 @@ mod tests {
 
     #[test]
     fn flags_round_trip() {
-        let f = Flags::new(true, Priority::Background, true);
+        let f = Flags::new(true, Priority::Background, true)
+            .with_admission_class(AdmissionClass::Expedite);
         assert!(f.is_binary());
         assert!(f.is_last());
         assert_eq!(f.priority(), Some(Priority::Background));
+        assert_eq!(f.admission_class(), Some(AdmissionClass::Expedite));
         let h = hdr(8, FrameType::StreamData, f, 1, 1);
         assert_eq!(decode_header(&h.encode()).unwrap().flags, f);
     }
 
     #[test]
     fn little_endian_and_frozen_prefix_layout() {
-        // len = 1 occupies byte 0; ver sits at byte 4 (the frozen prefix).
-        let h = hdr(1, FrameType::Request, Flags(0), 0, 0);
+        let h = hdr_with_epoch(
+            0x0403_0201,
+            FrameType::Request,
+            Flags(0),
+            0x0605,
+            0x0a09_0807,
+            0x1211_100f_0e0d_0c0b,
+        );
         let buf = h.encode();
-        assert_eq!(buf[0], 1);
-        assert_eq!(buf[1..4], [0, 0, 0]);
-        assert_eq!(buf[4], PROTOCOL_VERSION); // ver @ offset 4
+        assert_eq!(&buf[0..4], &[1, 2, 3, 4]);
+        assert_eq!(buf[4], PROTOCOL_VERSION);
+        assert_eq!(&buf[7..9], &[5, 6]);
+        assert_eq!(&buf[9..13], &[7, 8, 9, 10]);
+        assert_eq!(&buf[13..21], &[11, 12, 13, 14, 15, 16, 17, 18]);
         assert_eq!(buf.len(), HEADER_LEN);
     }
 
@@ -538,22 +633,25 @@ mod tests {
 
     #[test]
     fn reject_too_short_for_header() {
-        // Valid 5-byte prefix (ver = 1) but header truncated.
+        // Valid 5-byte prefix but the v2 header is truncated.
         let mut b = [0u8; 10];
         b[4] = PROTOCOL_VERSION;
         assert_eq!(
             decode_header(&b),
-            Err(DecodeError::TooShortForHeader { have: 10, need: 17 })
+            Err(DecodeError::TooShortForHeader {
+                have: 10,
+                need: HEADER_LEN
+            })
         );
     }
 
     #[test]
     fn reject_unsupported_version() {
         let mut b = [0u8; HEADER_LEN];
-        b[4] = 2; // no header layout known for ver 2
+        b[4] = 1;
         assert_eq!(
             decode_header(&b),
-            Err(DecodeError::UnsupportedVersion { ver: 2 })
+            Err(DecodeError::UnsupportedVersion { ver: 1 })
         );
     }
 
@@ -607,6 +705,90 @@ mod tests {
                 ty: FrameType::Ping,
                 len: 1
             })
+        );
+    }
+
+    #[test]
+    fn epoch_boundaries_round_trip() {
+        for (channel, epoch) in [(0, 0), (1, 1), (u16::MAX, u32::MAX)] {
+            let h = hdr_with_epoch(
+                0,
+                FrameType::Request,
+                Flags::new(false, Priority::Passive, false),
+                channel,
+                epoch,
+                9,
+            );
+            assert_eq!(decode_header(&h.encode()).unwrap(), h);
+        }
+    }
+
+    #[test]
+    fn admission_classes_accept_three_values_and_reject_reserved_value() {
+        for (ty, admission_class) in [
+            (FrameType::Request, AdmissionClass::Normal),
+            (FrameType::Request, AdmissionClass::Expedite),
+            (FrameType::Push, AdmissionClass::Sheddable),
+            (FrameType::StreamData, AdmissionClass::Sheddable),
+        ] {
+            let flags = Flags::new(false, Priority::Interactive, false)
+                .with_admission_class(admission_class);
+            let h = hdr(0, ty, flags, 1, 2);
+            assert_eq!(decode_header(&h.encode()).unwrap().flags, flags);
+        }
+
+        let mut h = hdr(
+            0,
+            FrameType::Push,
+            Flags::new(false, Priority::Passive, false),
+            1,
+            2,
+        )
+        .encode();
+        h[6] |= 0b0011_0000;
+        assert_eq!(
+            decode_header(&h),
+            Err(DecodeError::ReservedAdmissionClass { flags: h[6] })
+        );
+    }
+
+    #[test]
+    fn sheddable_rejected_on_every_illegal_frame_type() {
+        let flags = Flags::new(false, Priority::Passive, false)
+            .with_admission_class(AdmissionClass::Sheddable);
+        for ty in [
+            FrameType::Request,
+            FrameType::Response,
+            FrameType::StreamEnd,
+            FrameType::Error,
+            FrameType::Cancel,
+            FrameType::Ping,
+            FrameType::Pong,
+            FrameType::Hello,
+            FrameType::HelloAck,
+            FrameType::Goodbye,
+        ] {
+            let h = hdr(0, ty, flags, 1, 2);
+            assert_eq!(
+                decode_header(&h.encode()),
+                Err(DecodeError::SheddableIllegalFrameType { ty, flags: flags.0 })
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_epoch_on_control_channel_is_rejected() {
+        let h = hdr_with_epoch(
+            0,
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            u32::MAX,
+            2,
+        );
+        assert_eq!(
+            decode_header(&h.encode()),
+            Err(DecodeError::NonzeroEpochOnControlChannel { epoch: u32::MAX })
         );
     }
 }

@@ -225,8 +225,15 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
         launch_nonce: config.launch_nonce.clone(),
     })
     .map_err(StubError::Json)?;
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, HELLO_CORR, body)
-        .map_err(StubError::FrameBuild)?;
+    let frame = Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
+        HELLO_CORR,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
     send_outbound(writer, frame).await
 }
 
@@ -264,6 +271,7 @@ async fn handle_frame(
                 frame.header.ver,
                 FrameType::Pong,
                 frame.header.flags,
+                0, // WIRE-WAVE2: thread the binding epoch.
                 0,
                 frame.header.corr,
                 Vec::new(),
@@ -533,7 +541,8 @@ async fn emit_response(
         frame.header.ver,
         FrameType::Response,
         frame.header.flags,
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body,
     )
@@ -563,7 +572,8 @@ async fn emit_cancelled_error(
         version,
         FrameType::Error,
         Flags::new(false, Priority::Passive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body,
     )
@@ -607,6 +617,8 @@ async fn handle_control_request(
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
+            // WIRE-WAVE2: retain this epoch in the stub route handle.
+            epoch: _epoch,
             target,
             identity,
             principal,
@@ -642,6 +654,7 @@ async fn handle_control_request(
                     frame.header.ver,
                     reply.frame_type(),
                     control_flags(),
+                    0, // WIRE-WAVE2: thread the binding epoch.
                     0,
                     frame.header.corr,
                     b"{malformed route.bind reply".to_vec(),
@@ -670,6 +683,7 @@ async fn handle_control_request(
                     frame.header.ver,
                     FrameType::Error,
                     control_flags(),
+                    0, // WIRE-WAVE2: thread the binding epoch.
                     0,
                     frame.header.corr,
                     body,
@@ -685,6 +699,7 @@ async fn handle_control_request(
                 frame.header.ver,
                 FrameType::Response,
                 control_flags(),
+                0, // WIRE-WAVE2: thread the binding epoch.
                 0,
                 frame.header.corr,
                 body,
@@ -715,6 +730,7 @@ async fn handle_control_request(
                 frame.header.ver,
                 FrameType::Response,
                 control_flags(),
+                0, // WIRE-WAVE2: thread the binding epoch.
                 0,
                 frame.header.corr,
                 body,
@@ -748,7 +764,8 @@ async fn handle_route_goodbye(
             frame.header.ver,
             FrameType::Push,
             Flags::new(false, Priority::Passive, true),
-            route_channel,
+            route_channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             u64::from(route_channel) + 9_000,
             b"stale-after-detach".to_vec(),
         )
@@ -775,7 +792,8 @@ async fn send_push(
         version,
         FrameType::Push,
         Flags::new(false, Priority::Passive, true),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         b"push-event".to_vec(),
     )
@@ -800,7 +818,8 @@ async fn emit_tool_call_progress(
         version,
         FrameType::Push,
         Flags::new(false, Priority::Passive, true),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body,
     )
@@ -832,7 +851,8 @@ async fn emit_tool_call_subc_error(
         version,
         FrameType::Error,
         Flags::new(false, Priority::Passive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body,
     )
@@ -892,11 +912,21 @@ async fn emit_status_update(
     };
     let body = serde_json::to_vec(&ModuleControlPush::RouteStatus {
         route_channel,
+        // WIRE-WAVE2: stamp the stub route handle epoch.
+        route_epoch: 0,
         status: status.clone(),
     })
     .map_err(StubError::Json)?;
-    let push = Frame::build_with_version(version, FrameType::Push, control_flags(), 0, 0, body)
-        .map_err(StubError::FrameBuild)?;
+    let push = Frame::build_with_version(
+        version,
+        FrameType::Push,
+        control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
+        0,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
     send_outbound(writer, push).await?;
     record_event(
         config,

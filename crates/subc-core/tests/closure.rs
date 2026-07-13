@@ -411,6 +411,7 @@ async fn assert_unknown_domain_op_is_not_smuggled_into_channel0(
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         30,
         br#"{"op":"memory.list","args":{"this":"belongs on a route channel"}}"#.to_vec(),
@@ -485,7 +486,11 @@ where
     assert_eq!(ack_frame.header.channel, 0);
     assert_eq!(ack_frame.header.corr, corr);
     match serde_json::from_slice(&ack_frame.body).unwrap() {
-        ClientControlResponse::RouteOpen { route_channel } => RouteOpenAck { route_channel },
+        ClientControlResponse::RouteOpen {
+            route_channel,
+            // WIRE-WAVE2: retain this epoch in the route test handle.
+            route_epoch: _route_epoch,
+        } => RouteOpenAck { route_channel },
         other => panic!("unexpected route.open response: {other:?}"),
     }
 }
@@ -495,6 +500,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -505,12 +511,15 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
 fn route_poll_frame(corr: u64, route_channel: u16) -> Frame {
     let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
         route_channel,
+        // WIRE-WAVE2: pass the route test handle epoch.
+        route_epoch: 0,
         kind: PollKind::Status,
     })
     .unwrap();
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -522,7 +531,8 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body.to_vec(),
     )
@@ -535,6 +545,9 @@ fn assert_route_poll_status_none(frame: &Frame, corr: u64) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
+            // WIRE-WAVE2: assert the echoed route test handle.
+            route_channel: _route_channel,
+            route_epoch: _route_epoch,
             status: None,
             live: None,
         } => {}

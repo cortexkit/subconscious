@@ -137,6 +137,7 @@ impl ModuleHandle {
             self.shared.negotiated_ver,
             FrameType::Request,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             corr,
             body,
@@ -391,9 +392,16 @@ impl RequestCtx {
         flags: Flags,
         body: Vec<u8>,
     ) -> Result<(), SubcModuleError> {
-        let frame =
-            Frame::build_with_version(self.ver, frame_type, flags, self.channel, self.corr, body)
-                .map_err(SubcModuleError::FrameBuild)?;
+        let frame = Frame::build_with_version(
+            self.ver,
+            frame_type,
+            flags,
+            self.channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
+            self.corr,
+            body,
+        )
+        .map_err(SubcModuleError::FrameBuild)?;
         send_outbound(&self.egress, frame).await
     }
 }
@@ -586,6 +594,7 @@ where
                 frame.header.ver,
                 FrameType::Pong,
                 frame.header.flags,
+                0, // WIRE-WAVE2: thread the binding epoch.
                 0,
                 frame.header.corr,
                 Vec::new(),
@@ -702,7 +711,8 @@ where
                     ver,
                     FrameType::Response,
                     control_flags(),
-                    channel,
+                    channel, // WIRE-WAVE2: thread the binding epoch.
+                    0,
                     corr,
                     body,
                 ) {
@@ -783,6 +793,8 @@ where
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
+            // WIRE-WAVE2: retain this epoch in the provider route handle.
+            epoch: _epoch,
             target,
             identity,
             principal,
@@ -804,6 +816,7 @@ where
                         frame.header.ver,
                         FrameType::Response,
                         control_flags(),
+                        0, // WIRE-WAVE2: thread the binding epoch.
                         0,
                         frame.header.corr,
                         body,
@@ -818,6 +831,7 @@ where
                         frame.header.ver,
                         FrameType::Error,
                         control_flags(),
+                        0, // WIRE-WAVE2: thread the binding epoch.
                         0,
                         frame.header.corr,
                         body,
@@ -847,8 +861,15 @@ async fn send_hello(
             .filter(|value| !value.is_empty()),
     })
     .map_err(SubcModuleError::Json)?;
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, HELLO_CORR, body)
-        .map_err(SubcModuleError::FrameBuild)?;
+    let frame = Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
+        HELLO_CORR,
+        body,
+    )
+    .map_err(SubcModuleError::FrameBuild)?;
     send_outbound(egress, frame).await
 }
 
@@ -1131,6 +1152,7 @@ mod tests {
         Frame::build(
             FrameType::Request,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             corr,
             serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
@@ -1142,7 +1164,8 @@ mod tests {
         Frame::build(
             FrameType::Request,
             data_flags(),
-            channel,
+            channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             corr,
             b"opaque".to_vec(),
         )
@@ -1153,6 +1176,7 @@ mod tests {
         Frame::build(
             FrameType::Response,
             control_flags(),
+            0, // WIRE-WAVE2: thread the binding epoch.
             0,
             corr,
             serde_json::to_vec(&ModuleControlResponseToModule::CatalogUpdate {}).unwrap(),

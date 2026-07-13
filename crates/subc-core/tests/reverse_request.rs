@@ -901,7 +901,11 @@ async fn open_route(
         })
         .await;
     match serde_json::from_slice(&ack_frame.body).unwrap() {
-        ClientControlResponse::RouteOpen { route_channel } => RoutePair {
+        ClientControlResponse::RouteOpen {
+            route_channel,
+            // WIRE-WAVE2: retain this epoch in the route test handle.
+            route_epoch: _route_epoch,
+        } => RoutePair {
             client_channel: route_channel,
             module_channel,
         },
@@ -935,6 +939,7 @@ fn route_bind_ack(request: &Frame) -> Frame {
         request.header.ver,
         FrameType::Response,
         control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         request.header.corr,
         body,
@@ -950,7 +955,15 @@ fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
         launch_nonce: None,
     })
     .unwrap();
-    Frame::build(FrameType::Hello, control_flags(), 0, corr, body).unwrap()
+    Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
 }
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
@@ -958,6 +971,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -969,7 +983,8 @@ fn data_frame(ty: FrameType, channel: u16, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         ty,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body.to_vec(),
     )
@@ -980,7 +995,8 @@ fn pure_header_frame(ty: FrameType, channel: u16, corr: u64) -> Frame {
     let frame = Frame::build(
         ty,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         Vec::new(),
     )

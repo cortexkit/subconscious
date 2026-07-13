@@ -899,6 +899,7 @@ async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
     let module_ping = Frame::build(
         FrameType::Ping,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         503,
         Vec::new(),
@@ -916,6 +917,7 @@ async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
     let client_push = Frame::build(
         FrameType::Push,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         504,
         b"client ch0 push".to_vec(),
@@ -932,6 +934,7 @@ async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
     let client_ping = Frame::build(
         FrameType::Ping,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         505,
         Vec::new(),
@@ -4122,7 +4125,11 @@ where
     assert_eq!(ack_frame.header.channel, 0);
     assert_eq!(ack_frame.header.corr, corr);
     match serde_json::from_slice(&ack_frame.body).unwrap() {
-        ClientControlResponse::RouteOpen { route_channel } => RouteOpenAck { route_channel },
+        ClientControlResponse::RouteOpen {
+            route_channel,
+            // WIRE-WAVE2: retain this epoch in the route test handle.
+            route_epoch: _route_epoch,
+        } => RouteOpenAck { route_channel },
         other => panic!("unexpected route.open response: {other:?}"),
     }
 }
@@ -4250,6 +4257,7 @@ fn hello_frame_with_protocol(manifest: ModuleManifest, protocol_ver: u8, corr: u
     Frame::build(
         FrameType::Hello,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -4306,6 +4314,7 @@ fn attach_frame(corr: u64, attach: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -4317,7 +4326,8 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body.to_vec(),
     )
@@ -4328,7 +4338,8 @@ fn goodbye_frame(channel: u16, corr: u64) -> Frame {
     let frame = Frame::build(
         FrameType::Goodbye,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         Vec::new(),
     )
@@ -4342,7 +4353,8 @@ fn cancel_frame(channel: u16, corr: u64) -> Frame {
     let frame = Frame::build(
         FrameType::Cancel,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         Vec::new(),
     )
@@ -4357,6 +4369,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -4453,12 +4466,15 @@ fn assert_supervisor_ack(frame: &Frame, corr: u64, module_id: &str) -> bool {
 fn route_poll_frame(corr: u64, kind: PollKind, route_channel: u16) -> Frame {
     let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
         route_channel,
+        // WIRE-WAVE2: pass the route test handle epoch.
+        route_epoch: 0,
         kind,
     })
     .unwrap();
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -4571,6 +4587,9 @@ async fn wait_for_cached_status<S>(
         assert_eq!(frame.header.corr, poll_corr);
         match serde_json::from_slice(&frame.body).unwrap() {
             ClientControlResponse::RoutePoll {
+                // WIRE-WAVE2: assert the echoed route test handle.
+                route_channel: _route_channel,
+                route_epoch: _route_epoch,
                 status: Some(status),
                 live: None,
             } => {
@@ -4578,6 +4597,9 @@ async fn wait_for_cached_status<S>(
                 return;
             }
             ClientControlResponse::RoutePoll {
+                // WIRE-WAVE2: assert the echoed route test handle.
+                route_channel: _route_channel,
+                route_epoch: _route_epoch,
                 status: None,
                 live: None,
             } => {
@@ -4599,6 +4621,9 @@ fn assert_status_reply(frame: &Frame, corr: u64, expected_status: &str) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
+            // WIRE-WAVE2: assert the echoed route test handle.
+            route_channel: _route_channel,
+            route_epoch: _route_epoch,
             status: Some(status),
             live: None,
         } => assert_eq!(status, expected_status),
@@ -4612,6 +4637,9 @@ fn assert_status_none_reply(frame: &Frame, corr: u64) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
+            // WIRE-WAVE2: assert the echoed route test handle.
+            route_channel: _route_channel,
+            route_epoch: _route_epoch,
             status: None,
             live: None,
         } => {}
@@ -4625,6 +4653,9 @@ fn assert_liveness_reply(frame: &Frame, corr: u64, expected_live: bool) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
+            // WIRE-WAVE2: assert the echoed route test handle.
+            route_channel: _route_channel,
+            route_epoch: _route_epoch,
             status: None,
             live: Some(live),
         } => assert_eq!(live, expected_live),

@@ -531,7 +531,8 @@ impl ScriptedProvider {
             request.header.ver,
             FrameType::Response,
             request.header.flags,
-            request.header.channel,
+            request.header.channel, // WIRE-WAVE2: thread the binding epoch.
+            0,
             request.header.corr,
             body,
         )
@@ -746,6 +747,7 @@ async fn run_scripted_provider(
     let frame = Frame::build(
         FrameType::Hello,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         1,
         body,
@@ -761,65 +763,67 @@ async fn run_scripted_provider(
     let mut route_channel = None;
     loop {
         tokio::select! {
-            command = command_rx.recv() => {
-                match command {
-                    Some(ScriptedProviderCommand::Send(frame)) => {
-                        write_frame(&mut stream, &frame).await.unwrap();
-                        stream.flush().await.unwrap();
-                    }
-                    Some(ScriptedProviderCommand::Shutdown) | None => return,
-                }
-            }
-            frame = read_frame(&mut stream) => {
-                let Some(frame) = frame.unwrap() else {
-                    return;
-                };
-                match frame.header.ty {
-                    FrameType::Request if frame.header.channel == 0 => {
-                        let request: ModuleControlRequest = serde_json::from_slice(&frame.body).unwrap();
-                        match request {
-                            ModuleControlRequest::RouteBind { route_channel: next_route_channel, .. } => {
-                                route_channel = Some(next_route_channel);
-                                let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
-                                let response = Frame::build_with_version(
-                                    frame.header.ver,
-                                    FrameType::Response,
-                                    Flags::new(false, Priority::Passive, false),
-                                    0,
-                                    frame.header.corr,
-                                    body,
-                                )
-                                .unwrap();
-                                write_frame(&mut stream, &response).await.unwrap();
+                    command = command_rx.recv() => {
+                        match command {
+                            Some(ScriptedProviderCommand::Send(frame)) => {
+                                write_frame(&mut stream, &frame).await.unwrap();
                                 stream.flush().await.unwrap();
-                                let _ = events_tx.send(ScriptedProviderEvent::Bound { route_channel: next_route_channel }).await;
                             }
-                            ModuleControlRequest::HealthCheck {} => {}
+                            Some(ScriptedProviderCommand::Shutdown) | None => return,
                         }
                     }
-                    FrameType::Request if Some(frame.header.channel) == route_channel => {
-                        let _ = events_tx.send(ScriptedProviderEvent::RouteRequest(frame)).await;
+                    frame = read_frame(&mut stream) => {
+                        let Some(frame) = frame.unwrap() else {
+                            return;
+                        };
+                        match frame.header.ty {
+                            FrameType::Request if frame.header.channel == 0 => {
+                                let request: ModuleControlRequest = serde_json::from_slice(&frame.body).unwrap();
+                                match request {
+                                    ModuleControlRequest::RouteBind { route_channel: next_route_channel, .. } => {
+                                        route_channel = Some(next_route_channel);
+                                        let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
+                                        let response = Frame::build_with_version(
+                                            frame.header.ver,
+                                            FrameType::Response,
+                                            Flags::new(false, Priority::Passive, false),
+                                            0,
+                                            // WIRE-WAVE2: thread the binding epoch.
+        0,
+                                            frame.header.corr,
+                                            body,
+                                        )
+                                        .unwrap();
+                                        write_frame(&mut stream, &response).await.unwrap();
+                                        stream.flush().await.unwrap();
+                                        let _ = events_tx.send(ScriptedProviderEvent::Bound { route_channel: next_route_channel }).await;
+                                    }
+                                    ModuleControlRequest::HealthCheck {} => {}
+                                }
+                            }
+                            FrameType::Request if Some(frame.header.channel) == route_channel => {
+                                let _ = events_tx.send(ScriptedProviderEvent::RouteRequest(frame)).await;
+                            }
+                            FrameType::Response if Some(frame.header.channel) == route_channel => {
+                                let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+                                let _ = events_tx.send(ScriptedProviderEvent::ReverseResponse { corr: frame.header.corr, body }).await;
+                            }
+                            FrameType::Error if Some(frame.header.channel) == route_channel => {
+                                let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+                                let _ = events_tx.send(ScriptedProviderEvent::ReverseError { corr: frame.header.corr, body }).await;
+                            }
+                            FrameType::Cancel if Some(frame.header.channel) == route_channel => {
+                                let _ = events_tx.send(ScriptedProviderEvent::RouteCancel { corr: frame.header.corr, claimed: true }).await;
+                            }
+                            FrameType::Goodbye if Some(frame.header.channel) == route_channel => {
+                                let _ = events_tx.send(ScriptedProviderEvent::RouteGoodbye).await;
+                                return;
+                            }
+                            FrameType::Goodbye if frame.header.channel == 0 => return,
+                            _ => {}
+                        }
                     }
-                    FrameType::Response if Some(frame.header.channel) == route_channel => {
-                        let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
-                        let _ = events_tx.send(ScriptedProviderEvent::ReverseResponse { corr: frame.header.corr, body }).await;
-                    }
-                    FrameType::Error if Some(frame.header.channel) == route_channel => {
-                        let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
-                        let _ = events_tx.send(ScriptedProviderEvent::ReverseError { corr: frame.header.corr, body }).await;
-                    }
-                    FrameType::Cancel if Some(frame.header.channel) == route_channel => {
-                        let _ = events_tx.send(ScriptedProviderEvent::RouteCancel { corr: frame.header.corr, claimed: true }).await;
-                    }
-                    FrameType::Goodbye if Some(frame.header.channel) == route_channel => {
-                        let _ = events_tx.send(ScriptedProviderEvent::RouteGoodbye).await;
-                        return;
-                    }
-                    FrameType::Goodbye if frame.header.channel == 0 => return,
-                    _ => {}
                 }
-            }
-        }
     }
 }
 
@@ -3407,7 +3411,11 @@ where
     )
     .await
     {
-        ClientControlResponse::RouteOpen { route_channel } => route_channel,
+        ClientControlResponse::RouteOpen {
+            route_channel,
+            // WIRE-WAVE2: retain this epoch in the MCP route test handle.
+            route_epoch: _route_epoch,
+        } => route_channel,
         other => panic!("unexpected route.open response: {other:?}"),
     }
 }
@@ -3473,6 +3481,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         corr,
         body,
@@ -3484,7 +3493,8 @@ fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel,
+        channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         corr,
         body.to_vec(),
     )
@@ -3634,6 +3644,7 @@ async fn run_raw_provider(
     let frame = Frame::build(
         FrameType::Hello,
         Flags::new(false, Priority::Passive, false),
+        0, // WIRE-WAVE2: thread the binding epoch.
         0,
         1,
         body,
@@ -3649,68 +3660,74 @@ async fn run_raw_provider(
     let mut route_channel = None;
     loop {
         tokio::select! {
-            _ = &mut shutdown_rx => return,
-            frame = read_frame(&mut stream) => {
-                let Some(frame) = frame.unwrap() else {
-                    return;
-                };
-                match frame.header.ty {
-                    FrameType::Request if frame.header.channel == 0 => {
-                        let request: ModuleControlRequest = serde_json::from_slice(&frame.body).unwrap();
-                        match request {
-                            ModuleControlRequest::RouteBind { route_channel: next_route_channel, .. } => {
-                                route_channel = Some(next_route_channel);
-                                let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
-                                let response = Frame::build_with_version(
-                                    frame.header.ver,
-                                    FrameType::Response,
-                                    Flags::new(false, Priority::Passive, false),
-                                    0,
-                                    frame.header.corr,
-                                    body,
-                                )
-                                .unwrap();
-                                write_frame(&mut stream, &response).await.unwrap();
-                                stream.flush().await.unwrap();
+                    _ = &mut shutdown_rx => return,
+                    frame = read_frame(&mut stream) => {
+                        let Some(frame) = frame.unwrap() else {
+                            return;
+                        };
+                        match frame.header.ty {
+                            FrameType::Request if frame.header.channel == 0 => {
+                                let request: ModuleControlRequest = serde_json::from_slice(&frame.body).unwrap();
+                                match request {
+                                    ModuleControlRequest::RouteBind { route_channel: next_route_channel, .. } => {
+                                        route_channel = Some(next_route_channel);
+                                        let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
+                                        let response = Frame::build_with_version(
+                                            frame.header.ver,
+                                            FrameType::Response,
+                                            Flags::new(false, Priority::Passive, false),
+                                            0,
+                                            // WIRE-WAVE2: thread the binding epoch.
+        0,
+                                            frame.header.corr,
+                                            body,
+                                        )
+                                        .unwrap();
+                                        write_frame(&mut stream, &response).await.unwrap();
+                                        stream.flush().await.unwrap();
+                                    }
+                                    ModuleControlRequest::HealthCheck {} => {}
+                                }
                             }
-                            ModuleControlRequest::HealthCheck {} => {}
+                            FrameType::Request if Some(frame.header.channel) == route_channel => {
+                                match behavior {
+                                    RawProviderBehavior::MalformedProgress => {
+                                        let push = Frame::build_with_version(
+                                            frame.header.ver,
+                                            FrameType::Push,
+                                            Flags::new(false, Priority::Passive, true),
+                                            frame.header.channel,
+                                            // WIRE-WAVE2: thread the binding epoch.
+        0,
+                                            frame.header.corr,
+                                            b"{malformed progress".to_vec(),
+                                        )
+                                        .unwrap();
+                                        write_frame(&mut stream, &push).await.unwrap();
+                                        stream.flush().await.unwrap();
+                                    }
+                                    RawProviderBehavior::MalformedResult => {
+                                        let response = Frame::build_with_version(
+                                            frame.header.ver,
+                                            FrameType::Response,
+                                            frame.header.flags,
+                                            frame.header.channel,
+                                            // WIRE-WAVE2: thread the binding epoch.
+        0,
+                                            frame.header.corr,
+                                            b"{malformed tool result".to_vec(),
+                                        )
+                                        .unwrap();
+                                        write_frame(&mut stream, &response).await.unwrap();
+                                        stream.flush().await.unwrap();
+                                    }
+                                }
+                            }
+                            FrameType::Goodbye if frame.header.channel == 0 => return,
+                            _ => {}
                         }
                     }
-                    FrameType::Request if Some(frame.header.channel) == route_channel => {
-                        match behavior {
-                            RawProviderBehavior::MalformedProgress => {
-                                let push = Frame::build_with_version(
-                                    frame.header.ver,
-                                    FrameType::Push,
-                                    Flags::new(false, Priority::Passive, true),
-                                    frame.header.channel,
-                                    frame.header.corr,
-                                    b"{malformed progress".to_vec(),
-                                )
-                                .unwrap();
-                                write_frame(&mut stream, &push).await.unwrap();
-                                stream.flush().await.unwrap();
-                            }
-                            RawProviderBehavior::MalformedResult => {
-                                let response = Frame::build_with_version(
-                                    frame.header.ver,
-                                    FrameType::Response,
-                                    frame.header.flags,
-                                    frame.header.channel,
-                                    frame.header.corr,
-                                    b"{malformed tool result".to_vec(),
-                                )
-                                .unwrap();
-                                write_frame(&mut stream, &response).await.unwrap();
-                                stream.flush().await.unwrap();
-                            }
-                        }
-                    }
-                    FrameType::Goodbye if frame.header.channel == 0 => return,
-                    _ => {}
                 }
-            }
-        }
     }
 }
 

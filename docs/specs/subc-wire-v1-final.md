@@ -529,7 +529,9 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    hand-rolled, not SDK-carried: broca-subc consumer + broca-module-serve
    loop each land the endpoint-validation layer and RouteHandle migration in
    broca-owned code; broca-session/broca-run/ck-import rebuild with it;
-   same user-facing class as thalamus), `ck-quota`,
+   same user-facing class as thalamus), `ck-quota` (hand-rolled codec:
+   direct subc-protocol/transport deps, own frame loop — no SDK seam; epoch
+   threading is module-owned, verified via its real-daemon round-trip),
    `ck-credentials`, `ck-alfonso-core`, `ck-alfonso-routing` — plus the
    plugin-side consumers reloading at the OpenCode restart (alfonso TS
    plugin, AFT plugin, MC shadow lane — the latter fail-open, batched free)

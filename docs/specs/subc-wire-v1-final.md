@@ -532,7 +532,7 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    same user-facing class as thalamus), `ck-quota` (hand-rolled codec:
    direct subc-protocol/transport deps, own frame loop — no SDK seam; epoch
    threading is module-owned, verified via its real-daemon round-trip),
-   `ck-credentials`, `ck-alfonso-core`, `ck-alfonso-routing` — plus the
+   `ck-credentials` (hand-rolled codec: module + CLI admin client + probe, direct protocol/transport deps — layer-2 validation self-implemented), `ck-alfonso-core`, `ck-alfonso-routing` — plus the
    plugin-side consumers reloading at the OpenCode restart (alfonso TS
    plugin, AFT plugin, MC shadow lane — the latter fail-open, batched free)
    and the Swift client/chat app. Re-enumerate the roster at flip time.

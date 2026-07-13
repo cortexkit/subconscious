@@ -543,7 +543,13 @@ all-at-once, batched with a natural OpenCode restart window (ALF's ask).
    the bumped crates; publish `subc-protocol` + `subc-transport` in lockstep
    (republish-the-whole-chain rule) and `@cortexkit/subc-client` for the TS
    consumers.
-3. Stage binaries at their deploy paths, signed (macOS codesign rule). Owners
+3. Pre-staging grep for every module that constructs `ModuleManifest` by
+   hand: no `protocol_ver` LITERAL — declare `subc_protocol::PROTOCOL_VERSION`
+   instead. A stale hardcode is rejected at registration (loud, by design)
+   but surfaces one layer up as "module never appears in the catalog," which
+   costs a log dive to localize (FED hit this during staging). SDK-carried
+   HELLO is immune; the manifest field is author-supplied.
+4. Stage binaries at their deploy paths, signed (macOS codesign rule). Owners
    with versioned staging rituals (AFT's `aft-stable`/`ck-aft` symlink +
    NDJSON versioned cache) restage in the same window so a post-flip module
    respawn cannot resolve a ver-1 binary.

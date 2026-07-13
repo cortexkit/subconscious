@@ -15,15 +15,22 @@ import { debuglog } from "node:util";
 import { AuthError, authenticateClient } from "./auth.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
 import {
+  AdmissionClass,
   buildFrame,
   buildFlags,
-  decodeHeader,
   encodeFrame,
   FrameType,
-  HEADER_LEN,
   Priority,
   type Frame,
 } from "./envelope.js";
+import {
+  belongsToConnection,
+  createRouteHandle,
+  newConnectionToken,
+  RouteHandle,
+  sameRouteHandle,
+  StaleRouteHandleError,
+} from "./route-handle.js";
 import {
   SocketClosedError,
   SocketTimeoutError,
@@ -110,6 +117,7 @@ export interface CatalogEntry {
 
 export interface RequestOptions {
   priority?: Priority;
+  admissionClass?: AdmissionClass;
   timeoutMs?: number;
   /** Called for each interim PUSH / StreamData frame before the terminal reply. */
   onProgress?: (body: Uint8Array) => void;
@@ -126,6 +134,16 @@ export interface ManagedCallOptions extends RequestOptions {
 
 export interface SubscribeOptions {
   priority?: Priority;
+  admissionClass?: AdmissionClass;
+}
+
+export type RoutePollKind = "status" | "liveness";
+
+export interface RoutePollResult {
+  route_channel: number;
+  route_epoch: number;
+  status: string | null;
+  live: boolean | null;
 }
 
 export interface CloseRouteOptions {
@@ -135,7 +153,10 @@ export interface CloseRouteOptions {
    * Defaults to false: close immediately, aborting everything in flight.
    */
   drain?: boolean;
-  /** Consumer identity to use when looking up the route to close; only needed for routes opened with a non-default consumer identity. */
+}
+
+export interface ManagedCloseRouteOptions extends CloseRouteOptions {
+  /** Consumer identity used by the cached managed route. */
   consumerIdentity?: ConsumerIdentity | null;
 }
 
@@ -209,7 +230,7 @@ export class SubcError extends Error {
 }
 
 interface Pending {
-  channel: number;
+  handle: RouteHandle | null;
   resolve: (frame: Frame) => void;
   reject: (err: Error) => void;
   onProgress?: (body: Uint8Array) => void;
@@ -219,6 +240,10 @@ interface Pending {
   subscription?: boolean;
   /** Invoked when this pending settles (resolve or reject); used to await drain. */
   onSettle?: () => void;
+  /** Runs synchronously in dispatch before the response can settle its caller. */
+  acceptFrame?: (frame: Frame) => boolean;
+  /** Retained only when a local route.open deadline wins. */
+  onLateResponse?: (frame: Frame) => void;
 }
 
 export interface ConnectOptions {
@@ -263,12 +288,11 @@ interface CachedRoute {
   target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
   identity: BindIdentity;
   consumerIdentity?: ConsumerIdentity;
-  channel: number | null;
-  generation: number;
-  opening: Promise<number> | null;
+  handle: RouteHandle | null;
+  opening: Promise<RouteHandle> | null;
   /**
-   * Tombstone set by closeRoute. An in-flight openCachedRoute holds this exact
-   * object across its routeOpen await; if closeRoute flips this while the open is in
+   * Tombstone set by closeManagedRoute. An in-flight openCachedRoute holds this exact
+   * object across its routeOpen await; if closeManagedRoute flips this while the open is in
    * flight, the open must NOT install its channel (it GOODBYEs the channel it opened
    * and yields RouteClosed) — so a close can never be resurrected by a racing reopen.
    * Not a permanent tombstone: the map entry is deleted, so a later call for the same
@@ -280,7 +304,11 @@ interface CachedRoute {
 export class SubcClient {
   private nextCorr = 1n;
   private readonly pending = new Map<string, Pending>();
+  private readonly lateResponses = new Map<string, (frame: Frame) => void>();
   private readonly routes = new Map<string, CachedRoute>();
+  private readonly liveRoutes = new Map<number, RouteHandle>();
+  private connectionToken = newConnectionToken();
+  private ingressEpochDropCount = 0;
   private closedErr: Error | null = null;
   private closeStarted = false;
   private reconnecting: Promise<void> | null = null;
@@ -320,8 +348,8 @@ export class SubcClient {
     return parsed.modules ?? [];
   }
 
-  /** Open a route to a provider (channel-0 route.open); returns the route channel. */
-  async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<number> {
+    /** Open a route and return its connection-bound immutable handle. */
+  async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<RouteHandle> {
     const consumerIdentity = routeOpenConsumerIdentity(opts);
     const consumerCapabilities = opts.consumerCapabilities;
     const body = this.encode({
@@ -331,19 +359,43 @@ export class SubcClient {
       ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
       ...(consumerCapabilities !== undefined ? { consumer_capabilities: consumerCapabilities } : {}),
     });
-    const reply = await this.controlRpc(body);
-    const parsed = this.parseJson(reply) as { op: string; route_channel?: number };
-    if (typeof parsed.route_channel !== "number") {
-      throw new SubcError(`route.open returned no route_channel: ${JSON.stringify(parsed)}`);
-    }
-    return parsed.route_channel;
+
+    let installed: RouteHandle | null = null;
+    const install = (frame: Frame): boolean => {
+      if (frame.header.ty !== FrameType.Response) return true;
+      const parsed = this.parseJson(frame) as { route_channel?: number; route_epoch?: number };
+      if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number") {
+        throw new SubcError(`route.open returned no route handle: ${JSON.stringify(parsed)}`);
+      }
+      installed = this.installRoute(parsed.route_channel, parsed.route_epoch);
+      return true;
+    };
+    const closeLateRoute = (frame: Frame): void => {
+      if (frame.header.ty !== FrameType.Response) return;
+      try {
+        const parsed = this.parseJson(frame) as { route_channel?: number; route_epoch?: number };
+        if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number") return;
+        const lateHandle = this.installRoute(parsed.route_channel, parsed.route_epoch);
+        this.failHandle(lateHandle, new SubcError("late route.open was closed", "route_closed"));
+        this.liveRoutes.delete(lateHandle.channel);
+        this.sendRouteGoodbye(lateHandle, true);
+      } catch {
+        this.closeConnectionAfterCleanupFailure();
+      }
+    };
+
+    await this.controlRpc(body, install, closeLateRoute);
+    if (!installed) throw new SubcError("route.open response was not installed");
+    return installed;
   }
 
-  /** Send a data-plane request on a route channel and await its terminal reply. */
-  async request(routeChannel: number, body: unknown, opts: RequestOptions = {}): Promise<unknown> {
+    /** Send a data-plane request on exactly the supplied route generation. */
+  async request(handle: RouteHandle, body: unknown, opts: RequestOptions = {}): Promise<unknown> {
+    this.assertLiveHandle(handle);
     const bytes = body instanceof Uint8Array ? body : this.encode(body);
     const priority = opts.priority ?? Priority.Interactive;
-    const reply = await this.send(routeChannel, bytes, priority, opts.timeoutMs, opts.onProgress);
+    const admission = opts.admissionClass ?? AdmissionClass.Normal;
+    const reply = await this.send(handle, bytes, priority, admission, opts.timeoutMs, opts.onProgress);
     return this.parseJson(reply);
   }
 
@@ -361,9 +413,9 @@ export class SubcClient {
 
     let retriedUnknownChannel = false;
     for (;;) {
-      const routeChannel = await this.cachedRouteChannel(moduleId, opts);
+      const routeHandle = await this.cachedRouteHandle(moduleId, opts);
       try {
-        return (await this.managedRequest(routeChannel, body, opts)) as Response;
+        return (await this.managedRequest(routeHandle, body, opts)) as Response;
       } catch (err) {
         if (!(err instanceof SubcCallError)) throw this.terminalCallError("managed call failed", err);
         // unknown_channel is the daemon ROUTER refusing an unrouted channel — the
@@ -373,7 +425,7 @@ export class SubcClient {
         // re-opens the route instead of resending into the same dead channel.
         if (err.code === "unknown_channel" && !retriedUnknownChannel && !this.closeStarted) {
           retriedUnknownChannel = true;
-          this.evictRouteChannel(routeChannel);
+          this.evictRouteHandle(routeHandle);
           continue;
         }
         if (err.kind === "not_sent") {
@@ -396,43 +448,44 @@ export class SubcClient {
     }
   }
 
-  /**
-   * Open a held-open event subscription on a route channel. Sends one Request the
-   * provider keeps open, delivering each interim StreamData frame to `onEvent`; the
-   * returned `closed` settles on the StreamEnd terminal (resolve) or an Error / route
-   * GOODBYE (reject). Events ride this held-open request's correlation id — they are
-   * never unsolicited, so they are not dropped. Call `unsubscribe()` to cancel.
-   */
+    /** Open a held request on exactly one route generation. */
   subscribe(
-    routeChannel: number,
+    handle: RouteHandle,
     body: unknown,
     onEvent: (event: Uint8Array) => void,
     opts: SubscribeOptions = {},
   ): Subscription {
+    this.assertLiveHandle(handle);
     const bytes = body instanceof Uint8Array ? body : this.encode(body);
     const priority = opts.priority ?? Priority.Interactive;
-    const corr = this.nextCorr++;
-    const key = `${routeChannel}:${corr}`;
+    const admission = opts.admissionClass ?? AdmissionClass.Normal;
+    const corr = this.allocateCorr();
+    const key = pendingKey(handle, corr);
 
     const closed = new Promise<void>((resolve, reject) => {
       if (this.closedErr) {
         reject(this.closedErr);
         return;
       }
-      // No timeout: a subscription stays open indefinitely until StreamEnd, Error,
-      // route GOODBYE, or unsubscribe.
       this.pending.set(key, {
-        channel: routeChannel,
+        handle,
         resolve: () => resolve(),
         reject,
         onProgress: onEvent,
         timer: null,
         subscription: true,
       });
-      const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false), routeChannel, corr, bytes);
+      const frame = buildFrame(
+        FrameType.Request,
+        buildFlags(false, priority, false, admission),
+        handle.channel,
+        handle.epoch,
+        corr,
+        bytes,
+      );
       this.sock.write(encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch((err) => {
-        const p = this.pending.get(key);
-        if (p) this.rejectPending(key, p, err instanceof Error ? err : new SubcError(String(err)));
+        const pending = this.pending.get(key);
+        if (pending) this.rejectPending(key, pending, err instanceof Error ? err : new SubcError(String(err)));
       });
     });
 
@@ -440,77 +493,77 @@ export class SubcClient {
     const unsubscribe = (): void => {
       if (cancelled) return;
       cancelled = true;
-      // Pure-header Cancel on the held-open (channel, corr): the provider aborts its
-      // handler and ends with StreamEnd, which settles `closed`.
-      const cancel = buildFrame(FrameType.Cancel, buildFlags(false, priority, false), routeChannel, corr, EMPTY_BODY);
-      this.sock.write(encodeFrame(cancel), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => {
-        // Best-effort: if the socket is already gone, the read loop fails the
-        // pending waiter and `closed` rejects on its own.
-      });
+      this.cancel(handle, corr, priority);
     };
-
     return { unsubscribe, closed };
   }
 
-  /**
-   * Tear down ONE managed route (a route opened via `call()`), keyed by its
-   * (target, identity). Idempotent and never throws — callers over-call on
-   * session-end. The teardown:
-   *  - flips a tombstone on the cached route and removes it from the cache, so an
-   *    in-flight `openCachedRoute` for the same key will NOT install its channel
-   *    (the generation guard: close beats a racing reopen), and a later `call()`
-   *    opens a fresh route (this is NOT a permanent tombstone);
-   *  - settles in-flight requests on the channel as RouteClosed (managed requests
-   *    keep their at-most-once classification: outcome_unknown if already sent,
-   *    not_sent otherwise; subscriptions always abort);
-   *  - sends a best-effort route GOODBYE so subc releases the route and notifies
-   *    the module to free per-session resources.
-   * `opts.drain` waits for in-flight UNARY requests to settle before tearing down.
-   */
-  async closeRoute(
+  /** Send a pure-header cancellation for an in-flight request. */
+  cancel(handle: RouteHandle, corr: bigint, priority: Priority = Priority.Interactive): void {
+    this.assertLiveHandle(handle);
+    const cancel = buildFrame(
+      FrameType.Cancel,
+      buildFlags(false, priority, false),
+      handle.channel,
+      handle.epoch,
+      corr,
+      EMPTY_BODY,
+    );
+    this.sock.write(encodeFrame(cancel), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => undefined);
+  }
+
+  /** Poll status or liveness for exactly the supplied route generation. */
+  async routePoll(handle: RouteHandle, kind: RoutePollKind): Promise<RoutePollResult> {
+    this.assertLiveHandle(handle);
+    const body = this.encode({
+      op: "route.poll",
+      route_channel: handle.channel,
+      route_epoch: handle.epoch,
+      kind,
+    });
+    const reply = await this.controlRpc(body, (frame) => {
+      if (frame.header.ty !== FrameType.Response) return true;
+      const parsed = this.parseJson(frame) as Partial<RoutePollResult>;
+      return parsed.route_channel === handle.channel && parsed.route_epoch === handle.epoch;
+    });
+    return this.parseJson(reply) as RoutePollResult;
+  }
+
+    /** Tear down exactly the supplied route generation. */
+  async closeRoute(handle: RouteHandle, opts: CloseRouteOptions = {}): Promise<void> {
+    this.assertLiveHandle(handle);
+    for (const [key, cached] of this.routes) {
+      if (cached.handle && sameRouteHandle(cached.handle, handle)) {
+        cached.closed = true;
+        cached.handle = null;
+        this.routes.delete(key);
+      }
+    }
+    if (opts.drain) await this.drainUnaryOnHandle(handle);
+    this.failHandle(handle, new SubcError("route closed by closeRoute", "route_closed"));
+    if (this.liveRoutes.get(handle.channel) === handle) this.liveRoutes.delete(handle.channel);
+    this.sendRouteGoodbye(handle);
+  }
+
+  /** Close a cached managed route by its route-open identity tuple. */
+  async closeManagedRoute(
     target: Extract<RouteTarget, { kind: ManagedRouteKind }>,
     identity: BindIdentity,
-    opts: CloseRouteOptions = {},
+    opts: ManagedCloseRouteOptions = {},
   ): Promise<void> {
     const key = routeCacheKey(target, identity, routeOpenConsumerIdentity(opts));
     const cached = this.routes.get(key);
-    if (!cached) return; // never opened / already closed — idempotent no-op.
-    // Generation guard: an in-flight openCachedRoute holds this same object and
-    // re-checks `closed` before installing its channel, so flipping it here makes
-    // close win over a racing reopen. Removing the map entry lets a later call()
-    // create a fresh route for the key (not a permanent tombstone).
+    if (!cached) return;
     cached.closed = true;
     this.routes.delete(key);
-    const channel = cached.channel;
-    cached.channel = null;
-    // channel === null means the route was still opening (no channel installed yet);
-    // the racing open will see closed=true and GOODBYE whatever it opens, so there is
-    // nothing local to tear down here.
-    if (channel !== null) await this.closeRouteChannel(channel, opts);
+    const handle = cached.handle;
+    cached.handle = null;
+    if (handle) await this.closeRoute(handle, opts);
   }
 
-  /**
-   * Tear down ONE route by its channel number — the primitive for callers that
-   * opened a route with `routeOpen` directly (e.g. a tool route carrying raw
-   * {name, arguments}) and hold the channel themselves. Idempotent, never throws.
-   * Settles in-flight requests on the channel as RouteClosed and sends a best-effort
-   * route GOODBYE. `opts.drain` awaits in-flight UNARY requests first; subscriptions
-   * are always aborted (a held-open stream cannot be drained).
-   */
-  async closeRouteChannel(channel: number, opts: CloseRouteOptions = {}): Promise<void> {
-    if (channel === 0) return; // channel 0 is the control plane, never a route.
-    if (opts.drain) {
-      // Wait only for in-flight UNARY requests on this channel; subscriptions are
-      // aborted below (a held-open stream has no natural completion to drain to).
-      await this.drainUnaryOnChannel(channel);
-    }
-    // Settle anything still in flight on the channel (all of it in abort mode; only
-    // subscriptions + late stragglers after a drain). Managed requests are classified
-    // at-most-once via their classifyFailure; raw requests/subscriptions get a plain
-    // RouteClosed error.
-    this.failChannel(channel, new SubcError("route closed by closeRoute", "route_closed"));
-    // Best-effort GOODBYE: releases the route on the daemon and notifies the module.
-    this.sendRouteGoodbye(channel);
+    /** Alias retained for callers that name the operation by protocol channel; it still requires a full handle. */
+  async closeRouteChannel(handle: RouteHandle, opts: CloseRouteOptions = {}): Promise<void> {
+    await this.closeRoute(handle, opts);
   }
 
   close(): void {
@@ -519,17 +572,15 @@ export class SubcClient {
     this.sock.close();
   }
 
-  /** Resolve once every in-flight UNARY request on the channel (snapshot at call
-   * time) has settled. Subscriptions are excluded — they are aborted, not drained. */
-  private drainUnaryOnChannel(channel: number): Promise<void> {
+  private drainUnaryOnHandle(handle: RouteHandle): Promise<void> {
     const waiters: Promise<void>[] = [];
     for (const pending of this.pending.values()) {
-      if (pending.channel === channel && !pending.subscription) {
+      if (pending.handle === handle && !pending.subscription) {
         waiters.push(
           new Promise<void>((resolve) => {
-            const prev = pending.onSettle;
+            const previous = pending.onSettle;
             pending.onSettle = () => {
-              prev?.();
+              previous?.();
               resolve();
             };
           }),
@@ -539,13 +590,24 @@ export class SubcClient {
     return Promise.all(waiters).then(() => undefined);
   }
 
-  /** Send a best-effort header-only route GOODBYE for `channel`. One-way: the daemon
-   * releases the route and relays a route-gone GOODBYE to the module; no ack. */
-  private sendRouteGoodbye(channel: number): void {
-    if (this.closedErr) return; // connection already gone — the route died with it.
-    const goodbye = buildFrame(FrameType.Goodbye, buildFlags(false, Priority.Interactive, false), channel, 0n, EMPTY_BODY);
-    this.sock.write(encodeFrame(goodbye), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => {
-      // Best-effort: if the socket is already gone, the route is torn down anyway.
+  private sendRouteGoodbye(handle: RouteHandle, closeOnQueueFailure = false): void {
+    this.assertLiveConnection(handle);
+    if (this.closedErr) {
+      if (closeOnQueueFailure) this.closeConnectionAfterCleanupFailure();
+      return;
+    }
+    const goodbye = buildFrame(
+      FrameType.Goodbye,
+      buildFlags(false, Priority.Interactive, false),
+      handle.channel,
+      handle.epoch,
+      0n,
+      EMPTY_BODY,
+    );
+    const write = this.sock.writeTracked(encodeFrame(goodbye), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS);
+    if (!write.queued && closeOnQueueFailure) this.closeConnectionAfterCleanupFailure();
+    write.completed.catch(() => {
+      if (closeOnQueueFailure && !write.queued) this.closeConnectionAfterCleanupFailure();
     });
   }
 
@@ -563,39 +625,60 @@ export class SubcClient {
     return { sock, conn };
   }
 
-  private async controlRpc(body: Uint8Array): Promise<Frame> {
-    // Match the canonical probe: control requests go out Interactive on channel 0.
-    return this.send(0, body, Priority.Interactive, undefined, undefined);
+  private async controlRpc(
+    body: Uint8Array,
+    acceptFrame?: (frame: Frame) => boolean,
+    onLateResponse?: (frame: Frame) => void,
+  ): Promise<Frame> {
+    return this.send(null, body, Priority.Interactive, AdmissionClass.Normal, undefined, undefined, acceptFrame, onLateResponse);
   }
 
   private send(
-    channel: number,
+    handle: RouteHandle | null,
     body: Uint8Array,
     priority: Priority,
+    admission: AdmissionClass,
     timeoutMs: number | undefined,
     onProgress: ((body: Uint8Array) => void) | undefined,
+    acceptFrame?: (frame: Frame) => boolean,
+    onLateResponse?: (frame: Frame) => void,
   ): Promise<Frame> {
+    if (handle) this.assertLiveHandle(handle);
     if (this.closedErr) return Promise.reject(this.closedErr);
-    const corr = this.nextCorr++;
-    const key = `${channel}:${corr}`;
-    const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false), channel, corr, body);
+    let corr: bigint;
+    try {
+      corr = this.allocateCorr();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const key = pendingKey(handle, corr);
+    const channel = handle?.channel ?? 0;
+    const epoch = handle?.epoch ?? 0;
+    const frame = buildFrame(
+      FrameType.Request,
+      buildFlags(false, priority, false, admission),
+      channel,
+      epoch,
+      corr,
+      body,
+    );
 
     return new Promise<Frame>((resolve, reject) => {
       const ms = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
       const pending: Pending = {
-        channel,
+        handle,
         resolve,
         reject,
         onProgress,
         timer: null,
+        acceptFrame,
+        onLateResponse,
       };
-      pending.timer = setTimeout(() => {
-        this.arbitrateTimeout(key, pending, channel, corr, ms);
-      }, ms);
+      pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
       this.pending.set(key, pending);
-      this.sock.write(encodeFrame(frame), Date.now() + ms).catch((err) => {
-        const p = this.pending.get(key);
-        if (p) this.rejectPending(key, p, err instanceof Error ? err : new SubcError(String(err)));
+      this.sock.write(encodeFrame(frame), Date.now() + ms).catch((error) => {
+        const current = this.pending.get(key);
+        if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
       });
     });
   }
@@ -612,6 +695,7 @@ export class SubcClient {
    */
   private arbitrateTimeout(key: string, pending: Pending, channel: number, corr: bigint, ms: number): void {
     const settleAsTimeout = (): void => {
+      if (pending.onLateResponse) this.lateResponses.set(key, pending.onLateResponse);
       this.rejectPending(
         key,
         pending,
@@ -636,87 +720,90 @@ export class SubcClient {
     setImmediate(arbitrate);
   }
 
-  private async managedRequest(
-    routeChannel: number,
-    body: unknown,
-    opts: ManagedCallOptions,
-  ): Promise<unknown> {
+  private async managedRequest(handle: RouteHandle, body: unknown, opts: ManagedCallOptions): Promise<unknown> {
     const bytes = body instanceof Uint8Array ? body : this.encode(body);
     const priority = opts.priority ?? Priority.Interactive;
+    const admission = opts.admissionClass ?? AdmissionClass.Normal;
     try {
-      const reply = await this.sendManaged(routeChannel, bytes, priority, opts.timeoutMs, opts.onProgress);
+      const reply = await this.sendManaged(handle, bytes, priority, admission, opts.timeoutMs, opts.onProgress);
       return this.parseJson(reply);
-    } catch (err) {
-      if (err instanceof SubcCallError) throw err;
-      throw this.terminalCallError("managed call failed", err);
+    } catch (error) {
+      if (error instanceof SubcCallError) throw error;
+      throw this.terminalCallError("managed call failed", error);
     }
   }
 
   private sendManaged(
-    channel: number,
+    handle: RouteHandle,
     body: Uint8Array,
     priority: Priority,
+    admission: AdmissionClass,
     timeoutMs: number | undefined,
     onProgress: ((body: Uint8Array) => void) | undefined,
   ): Promise<Frame> {
+    try {
+      this.assertLiveHandle(handle);
+    } catch (error) {
+      return Promise.reject(this.notSentCallError("request used a stale route handle", error));
+    }
     if (this.closedErr) {
-      return Promise.reject(this.notSentCallError("request was not sent because the subc connection was already closed", this.closedErr));
+      return Promise.reject(
+        this.notSentCallError("request was not sent because the subc connection was already closed", this.closedErr),
+      );
     }
 
-    const corr = this.nextCorr++;
-    const key = `${channel}:${corr}`;
-    const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false), channel, corr, body);
+    let corr: bigint;
+    try {
+      corr = this.allocateCorr();
+    } catch (error) {
+      return Promise.reject(this.notSentCallError("request correlation allocator was exhausted", error));
+    }
+    const key = pendingKey(handle, corr);
+    const frame = buildFrame(
+      FrameType.Request,
+      buildFlags(false, priority, false, admission),
+      handle.channel,
+      handle.epoch,
+      corr,
+      body,
+    );
     let handedToSocket = false;
 
-    const classifyFailure = (err: Error): SubcCallError => {
-      // This is the load-bearing asymmetry: only the pre-write paths are NotSent.
-      // As soon as writeTracked reports that bytes were queued to Node's socket,
-      // those bytes may already be in the OS buffer or at the daemon. Any later
-      // close, write callback error, route GOODBYE, or timeout before a response is
-      // therefore OutcomeUnknown to avoid an unsafe double-mutation retry.
-      if (!handedToSocket) {
-        return this.notSentCallError("request bytes were not queued to the subc socket", err);
-      }
-      // A request-deadline timeout (arbitration expired without observing a drop)
-      // is refined from a real connection drop: the socket was NOT seen to fail, so
-      // the caller can skip a was-it-even-sent recovery path. Still outcome_unknown
-      // — queued-to-local-socket is not proof the daemon received or ran it.
-      if (err instanceof SubcError && err.code === REQUEST_DEADLINE_MARKER) {
+    const classifyFailure = (error: Error): SubcCallError => {
+      if (!handedToSocket) return this.notSentCallError("request bytes were not queued to the subc socket", error);
+      if (error instanceof SubcError && error.code === REQUEST_DEADLINE_MARKER) {
         return new SubcCallError(
           "outcome_unknown",
-          `managed call deadline exceeded after request bytes were queued to the local socket; no terminal response was observed; outcome unknown${causeMessage(err)}`,
+          `managed call deadline exceeded after request bytes were queued to the local socket; no terminal response was observed; outcome unknown${causeMessage(error)}`,
           DEADLINE_NO_DROP_CODE,
-          err,
+          error,
         );
       }
-      return this.outcomeUnknownCallError("connection dropped before the managed call returned a response", err);
+      return this.outcomeUnknownCallError("connection dropped before the managed call returned a response", error);
     };
 
     return new Promise<Frame>((resolve, reject) => {
       const ms = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
       const pending: Pending = {
-        channel,
+        handle,
         resolve,
         reject,
         onProgress,
         timer: null,
         classifyFailure,
       };
-      pending.timer = setTimeout(() => {
-        this.arbitrateTimeout(key, pending, channel, corr, ms);
-      }, ms);
+      pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, handle.channel, corr, ms), ms);
       this.pending.set(key, pending);
-
       const write = this.sock.writeTracked(encodeFrame(frame), Date.now() + ms);
       handedToSocket = write.queued;
-      write.completed.catch((err) => {
-        const p = this.pending.get(key);
-        if (p) this.rejectPending(key, p, err instanceof Error ? err : new SubcError(String(err)));
+      write.completed.catch((error) => {
+        const current = this.pending.get(key);
+        if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
       });
     });
   }
 
-  private async cachedRouteChannel(moduleId: string, opts: ManagedCallOptions): Promise<number> {
+  private async cachedRouteHandle(moduleId: string, opts: ManagedCallOptions): Promise<RouteHandle> {
     const identity = opts.identity ?? this.opts.identity;
     if (!identity) {
       throw new SubcCallError(
@@ -725,7 +812,6 @@ export class SubcClient {
         "missing_identity",
       );
     }
-
     const target = { kind: opts.targetKind ?? this.opts.targetKind, module_id: moduleId } as Extract<
       RouteTarget,
       { kind: ManagedRouteKind }
@@ -740,16 +826,12 @@ export class SubcClient {
         target,
         identity,
         consumerIdentity,
-        channel: null,
-        generation: 0,
+        handle: null,
         opening: null,
       };
       this.routes.set(key, cached);
     }
-
-    if (cached.channel !== null && cached.generation === this.generation && !this.closedErr) {
-      return cached.channel;
-    }
+    if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
     if (!cached.opening) {
       cached.opening = this.openCachedRoute(cached).finally(() => {
         cached.opening = null;
@@ -758,7 +840,7 @@ export class SubcClient {
     return cached.opening;
   }
 
-  private async openCachedRoute(cached: CachedRoute): Promise<number> {
+  private async openCachedRoute(cached: CachedRoute): Promise<RouteHandle> {
     const routeRetryDeadline = Date.now() + ROUTE_OPEN_RETRY_DEADLINE_MS;
     let routeRetryDelay = this.opts.reconnectBackoff.baseMs;
     let routeRetryAttempt = 0;
@@ -766,47 +848,33 @@ export class SubcClient {
       if (cached.closed) throw this.routeClosedDuringOpen();
       try {
         await this.ensureConnectedForManaged();
-      } catch (err) {
-        throw this.notSentRecoveryError("route.open could not run because reconnect failed", err);
+      } catch (error) {
+        throw this.notSentRecoveryError("route.open could not run because reconnect failed", error);
       }
-
-      if (cached.channel !== null && cached.generation === this.generation && !this.closedErr) {
-        return cached.channel;
-      }
+      if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
 
       try {
-        const channel = await this.routeOpen(cached.target, cached.identity, {
+        const handle = await this.routeOpen(cached.target, cached.identity, {
           consumerIdentity: cached.consumerIdentity ?? null,
         });
-        // Generation guard: a closeRoute may have flipped the tombstone WHILE this
-        // route.open was in flight. If so, close wins — do NOT install the channel
-        // into the (already-removed) cache entry; GOODBYE the channel we just opened
-        // so the daemon/module don't leak it, and fail as RouteClosed.
         if (cached.closed) {
-          this.sendRouteGoodbye(channel);
+          this.liveRoutes.delete(handle.channel);
+          this.sendRouteGoodbye(handle);
           throw this.routeClosedDuringOpen();
         }
-        cached.channel = channel;
-        cached.generation = this.generation;
-        return channel;
-      } catch (err) {
-        if (err instanceof SubcCallError && err.code === "route_closed") throw err;
-        if (!this.closeStarted && isConsumerReconnectTransient(err)) {
+        cached.handle = handle;
+        return handle;
+      } catch (error) {
+        if (error instanceof SubcCallError && error.code === "route_closed") throw error;
+        if (!this.closeStarted && isConsumerReconnectTransient(error)) {
           try {
-            await this.reconnectAfterDrop(err);
-          } catch (reconnectErr) {
-            throw this.notSentRecoveryError("route.open was not sent and reconnect failed", reconnectErr);
+            await this.reconnectAfterDrop(error);
+          } catch (reconnectError) {
+            throw this.notSentRecoveryError("route.open was not sent and reconnect failed", reconnectError);
           }
           continue;
         }
-        // A daemon-rejected route.open with a RETRYABLE code (target booting /
-        // reloading / momentarily absent) is retried IN-PLACE against the same live
-        // connection — never a socket reconnect, which would needlessly disrupt this
-        // connection's other routes — until the route-retry deadline. Past the
-        // deadline it surfaces as not_sent: provably pre-send (no data frame ever
-        // left the client) AND still transient, so the caller's own retry policy may
-        // safely re-attempt later. Reason and set kept in parity with subc-client-rs.
-        if (!this.closeStarted && err instanceof SubcError && isRetryableRouteOpenCode(err.code)) {
+        if (!this.closeStarted && error instanceof SubcError && isRetryableRouteOpenCode(error.code)) {
           routeRetryAttempt += 1;
           if (routeRetryAttempt < this.opts.reconnectBackoff.maxAttempts && Date.now() < routeRetryDeadline) {
             await this.opts.sleep(routeRetryDelay);
@@ -814,15 +882,11 @@ export class SubcClient {
             continue;
           }
           throw this.notSentCallError(
-            `route.open failed for module ${cached.moduleId}: ${err.code} (retry budget exhausted)`,
-            err,
+            `route.open failed for module ${cached.moduleId}: ${error.code} (retry budget exhausted)`,
+            error,
           );
         }
-        // A permanent route.open rejection (bad_consumer_identity, config_divergence,
-        // unknown_target, ...) is pre-send but would never succeed on retry, so it
-        // stays terminal — a not_sent class here would invite a retry storm against a
-        // request the daemon will always reject.
-        throw this.terminalCallError(`route.open failed for module ${cached.moduleId}`, err);
+        throw this.terminalCallError(`route.open failed for module ${cached.moduleId}`, error);
       }
     }
   }
@@ -897,33 +961,26 @@ export class SubcClient {
     this.currentConn = opened.conn;
     this.closedErr = null;
     this.generation += 1;
+    this.connectionToken = newConnectionToken();
+    this.liveRoutes.clear();
+    this.lateResponses.clear();
+    this.nextCorr = 1n;
     void this.readLoop(opened.sock, this.generation);
   }
 
   private async reopenCachedRoutes(): Promise<void> {
+    for (const cached of this.routes.values()) cached.handle = null;
     for (const cached of this.routes.values()) {
-      cached.channel = null;
-      cached.generation = 0;
-    }
-    for (const cached of this.routes.values()) {
-      if (cached.closed) continue; // closed concurrently with reconnect — don't reopen.
-      // Thread the route's consumer identity through the reopen, exactly as the
-      // lazy per-call path (openCachedRoute) does. Dropping it here would make a
-      // route reopened after a reconnect send route.open with no consumer_identity,
-      // so the daemon would re-stamp it with a different (weaker) principal than the
-      // one it was originally bound under — a silent post-reconnect trust downgrade.
-      const channel = await this.routeOpen(cached.target, cached.identity, {
+      if (cached.closed) continue;
+      const handle = await this.routeOpen(cached.target, cached.identity, {
         consumerIdentity: cached.consumerIdentity ?? null,
       });
-      // A closeRoute may have raced this reopen (flipping the tombstone during the
-      // route.open await). If so, GOODBYE the channel instead of installing it, so the
-      // closed route isn't silently re-established on the new connection.
       if (cached.closed) {
-        this.sendRouteGoodbye(channel);
+        this.liveRoutes.delete(handle.channel);
+        this.sendRouteGoodbye(handle);
         continue;
       }
-      cached.channel = channel;
-      cached.generation = this.generation;
+      cached.handle = handle;
     }
   }
 
@@ -944,41 +1001,41 @@ export class SubcClient {
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
     try {
       for (;;) {
-        // Header read waits indefinitely — idle time between frames is normal, and
-        // the reader is NOT "active" while parked here (a racing timeout must not
-        // grant grace just because the connection is idle between frames).
-        const headerBytes = await sock.readExact(HEADER_LEN, Number.POSITIVE_INFINITY);
-        // A frame is now arriving. Mark the reader active THROUGH dispatch so a
-        // timeout that fires mid-arrival grants the reply its bounded grace window
-        // instead of settling as a spurious timeout.
-        this.readerActive = true;
+        this.readerActive = false;
+        const frame = await sock.readFrame(
+          Number.POSITIVE_INFINITY,
+          Date.now() + BODY_READ_TIMEOUT_MS,
+          () => {
+            this.readerActive = true;
+          },
+        );
         try {
-          const header = decodeHeader(headerBytes);
-          const body =
-            header.len === 0
-              ? new Uint8Array(0)
-              : await sock.readExact(header.len, Date.now() + BODY_READ_TIMEOUT_MS);
-          // Drop a frame read off a socket this client has already replaced
-          // (reconnect): its pendings were settled by fail(), and dispatching it
-          // against the current pending map could match a re-used (channel, corr).
-          if (this.sock === sock && this.generation === generation) {
-            this.dispatch({ header, body });
-          }
+          if (this.sock === sock && this.generation === generation) this.dispatch(frame);
         } finally {
           this.readerActive = false;
         }
       }
-    } catch (err) {
+    } catch (error) {
       if (this.sock === sock && this.generation === generation) {
-        this.fail(err instanceof Error ? err : new SubcError(String(err)));
+        this.fail(error instanceof Error ? error : new SubcError(String(error)));
       }
     }
   }
 
   private dispatch(frame: Frame): void {
-    const key = `${frame.header.channel}:${frame.header.corr}`;
+    let handle: RouteHandle | null = null;
+    if (frame.header.channel !== 0) {
+      handle = this.liveRoutes.get(frame.header.channel) ?? null;
+      if (!handle || handle.epoch !== frame.header.epoch) {
+        this.ingressEpochDropCount += 1;
+        return;
+      }
+    }
+
+    const key = pendingKey(handle, frame.header.corr);
     const pending = this.pending.get(key);
     if (pending) {
+      if (pending.acceptFrame && !pending.acceptFrame(frame)) return;
       switch (frame.header.ty) {
         case FrameType.Push:
         case FrameType.StreamData:
@@ -995,36 +1052,34 @@ export class SubcClient {
           return;
       }
     }
-    if (frame.header.ty === FrameType.Goodbye) {
-      this.failChannel(frame.header.channel, new SubcError("route closed by subc (GOODBYE)"));
-      // The route is gone daemon-side (module restart, drain, or provider close).
-      // Evict the cached bind so the NEXT managed call re-opens instead of
-      // resending into the dead channel and dying on a terminal unknown_channel.
-      this.evictRouteChannel(frame.header.channel);
+
+    const late = this.lateResponses.get(key);
+    if (late && (frame.header.ty === FrameType.Response || frame.header.ty === FrameType.Error)) {
+      this.lateResponses.delete(key);
+      late(frame);
       return;
     }
-    // A terminal frame (Response/Error/StreamEnd) with no waiter is almost always
-    // a reply that arrived AFTER its request already settled — the fingerprint of a
-    // premature timeout under event-loop starvation (the reply raced the deadline
-    // and lost). Metadata-only debug log (never the body) so every future
-    // occurrence is a one-line diagnosis instead of an invisible drop. Enable with
-    // NODE_DEBUG=subc-client.
+
+    if (frame.header.ty === FrameType.Goodbye && handle) {
+      this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)"));
+      if (this.liveRoutes.get(handle.channel) === handle) this.liveRoutes.delete(handle.channel);
+      this.evictRouteHandle(handle);
+      return;
+    }
     if (
       frame.header.ty === FrameType.Response ||
       frame.header.ty === FrameType.Error ||
       frame.header.ty === FrameType.StreamEnd
     ) {
       debug(
-        "dropped terminal frame with no waiter: type=%d channel=%d corr=%s port=%s",
+        "dropped terminal frame with no waiter: type=%d channel=%d epoch=%d corr=%s port=%s",
         frame.header.ty,
         frame.header.channel,
+        frame.header.epoch,
         frame.header.corr,
         this.sock.localPort() ?? "?",
       );
-      return;
     }
-    // Unmatched Push or stray frame: no registered waiter. Drop it — v1 has no
-    // unsolicited-push consumers.
   }
 
   /**
@@ -1061,25 +1116,15 @@ export class SubcClient {
     }
   }
 
-  /**
-   * Drop a dead channel from the managed-route cache so the next call re-opens.
-   * Only clears entries still pointing at THIS channel in the CURRENT socket
-   * generation; a route already re-opened (new channel) or re-created after a
-   * reconnect (new generation) is left alone.
-   */
-  private evictRouteChannel(channel: number): void {
+  private evictRouteHandle(handle: RouteHandle): void {
     for (const cached of this.routes.values()) {
-      if (cached.channel === channel && cached.generation === this.generation) {
-        cached.channel = null;
-      }
+      if (cached.handle && sameRouteHandle(cached.handle, handle)) cached.handle = null;
     }
   }
 
-  private failChannel(channel: number, err: Error): void {
+  private failHandle(handle: RouteHandle, error: Error): void {
     for (const [key, pending] of this.pending) {
-      if (pending.channel === channel) {
-        this.rejectPending(key, pending, err);
-      }
+      if (pending.handle && sameRouteHandle(pending.handle, handle)) this.rejectPending(key, pending, error);
     }
   }
 
@@ -1107,6 +1152,50 @@ export class SubcClient {
     if (cause instanceof SubcCallError) return cause;
     if (isConsumerReconnectTransient(cause)) return this.notSentCallError(message, cause);
     return this.terminalCallError(message, cause);
+  }
+
+  /** Number of nonzero-channel ingress frames dropped by endpoint epoch validation. */
+  get droppedIngressFrames(): number {
+    return this.ingressEpochDropCount;
+  }
+
+  private installRoute(channel: number, epoch: number): RouteHandle {
+    const handle = createRouteHandle(channel, epoch, this.connectionToken);
+    this.liveRoutes.set(channel, handle);
+    return handle;
+  }
+
+  private isLiveHandle(handle: RouteHandle): boolean {
+    return belongsToConnection(handle, this.connectionToken) && this.liveRoutes.get(handle.channel) === handle;
+  }
+
+  private assertLiveConnection(handle: RouteHandle): void {
+    if (!belongsToConnection(handle, this.connectionToken)) throw new StaleRouteHandleError(handle);
+  }
+
+  private assertLiveHandle(handle: RouteHandle): void {
+    if (!this.isLiveHandle(handle)) throw new StaleRouteHandleError(handle);
+  }
+
+  private allocateCorr(): bigint {
+    const maximum = 0xffff_ffff_ffff_ffffn;
+    if (this.nextCorr > maximum) {
+      const error = new SubcError("channel-0 correlation id allocator exhausted", "corr_exhausted");
+      this.fail(error);
+      this.sock.close();
+      this.scheduleReconnectAfterDrop(error);
+      throw error;
+    }
+    const corr = this.nextCorr;
+    this.nextCorr += 1n;
+    return corr;
+  }
+
+  private closeConnectionAfterCleanupFailure(): void {
+    const error = new SubcError("late route cleanup could not be queued", "late_route_cleanup_failed");
+    this.fail(error);
+    this.sock.close();
+    this.scheduleReconnectAfterDrop(error);
   }
 
   private encode(value: unknown): Uint8Array {
@@ -1210,4 +1299,8 @@ function errorCode(err: unknown): string | undefined {
 function causeMessage(cause: unknown): string {
   if (cause === undefined) return "";
   return `: ${cause instanceof Error ? cause.message : String(cause)}`;
+}
+
+function pendingKey(handle: RouteHandle | null, corr: bigint): string {
+  return handle ? `${handle.channel}:${handle.epoch}:${corr}` : `0:0:${corr}`;
 }

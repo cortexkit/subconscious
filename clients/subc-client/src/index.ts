@@ -21,7 +21,11 @@ export {
   type SubscribeOptions,
   type Subscription,
   type CloseRouteOptions,
+  type ManagedCloseRouteOptions,
+  type RoutePollKind,
+  type RoutePollResult,
 } from "./client.js";
+export { RouteHandle, StaleRouteHandleError } from "./route-handle.js";
 export {
   readConnectionFile,
   ConnectionFileError,
@@ -31,6 +35,7 @@ export {
 export {
   FrameType,
   Priority,
+  AdmissionClass,
   PROTOCOL_VERSION,
   HEADER_LEN,
   buildFrame,
@@ -40,6 +45,7 @@ export {
   decodeHeader,
   encodeHeader,
   DecodeError,
+  type DecodeErrorCode,
   type Frame,
   type EnvelopeHeader,
 } from "./envelope.js";
@@ -60,6 +66,7 @@ export {
   managementSurfaceManifest,
   jsonProviderHandler,
   type ProviderRequestContext,
+  type ProviderEmitOptions,
   type BindDecision,
   type Principal,
   type BindingsInput,

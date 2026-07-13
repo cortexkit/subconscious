@@ -77,7 +77,7 @@ describe("SubcClient.closeRoute", () => {
     expect(daemon.state.routeOpens).toBe(1);
     const channel = daemon.state.openedChannels[0]!;
 
-    await client.closeRoute(MGMT_TARGET, IDENTITY);
+    await client.closeManagedRoute(MGMT_TARGET, IDENTITY);
     await waitFor(() => daemon.state.goodbyeChannels.includes(channel), "module GOODBYE for the closed route");
 
     // A later call for the SAME key opens a FRESH route — closeRoute is not a tombstone.
@@ -89,14 +89,14 @@ describe("SubcClient.closeRoute", () => {
   test("is an idempotent no-op when the route was never opened (and when called twice)", async () => {
     const { client, daemon } = await connectClient();
     // Never opened.
-    await expect(client.closeRoute(MGMT_TARGET, IDENTITY)).resolves.toBeUndefined();
+    await expect(client.closeManagedRoute(MGMT_TARGET, IDENTITY)).resolves.toBeUndefined();
     expect(daemon.state.goodbyeChannels).toEqual([]);
 
     await client.call("managed-provider", "echo", { n: 1 });
-    await client.closeRoute(MGMT_TARGET, IDENTITY);
+    await client.closeManagedRoute(MGMT_TARGET, IDENTITY);
     await waitFor(() => daemon.state.goodbyeChannels.length >= 1, "the route GOODBYE (one-way, best-effort)");
     // Second close is a no-op (entry already gone) — must not throw or double-GOODBYE.
-    await expect(client.closeRoute(MGMT_TARGET, IDENTITY)).resolves.toBeUndefined();
+    await expect(client.closeManagedRoute(MGMT_TARGET, IDENTITY)).resolves.toBeUndefined();
     await new Promise((r) => setTimeout(r, 30)); // give a stray second GOODBYE a chance to (wrongly) arrive.
     expect(daemon.state.goodbyeChannels.length).toBe(1);
     client.close();
@@ -104,10 +104,10 @@ describe("SubcClient.closeRoute", () => {
 
   test("closeRouteChannel tears down a raw routeOpen'd channel (the tool-route path)", async () => {
     const { client, daemon } = await connectClient();
-    const channel = await client.routeOpen(TOOL_TARGET, IDENTITY);
-    await client.request(channel, { name: "status", arguments: {} });
-    await client.closeRouteChannel(channel);
-    await waitFor(() => daemon.state.goodbyeChannels.includes(channel), "GOODBYE for the raw tool route");
+    const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+    await client.request(handle, { name: "status", arguments: {} });
+    await client.closeRouteChannel(handle);
+    await waitFor(() => daemon.state.goodbyeChannels.includes(handle.channel), "GOODBYE for the raw tool route");
     client.close();
   });
 
@@ -126,7 +126,7 @@ describe("SubcClient.closeRoute", () => {
 
     // Close while the open is in flight: channel is null, so closeRoute flips the
     // tombstone + removes the entry; the racing open must discard its channel.
-    await client.closeRoute(MGMT_TARGET, IDENTITY);
+    await client.closeManagedRoute(MGMT_TARGET, IDENTITY);
 
     // Release the gated route.open: the open completes, sees the tombstone, GOODBYEs
     // the channel it opened, and fails the call as RouteClosed.
@@ -145,17 +145,17 @@ describe("SubcClient.closeRoute", () => {
 
   test("drain waits for an in-flight unary to settle before tearing the route down", async () => {
     const { client, daemon } = await connectClient();
-    const channel = await client.routeOpen(TOOL_TARGET, IDENTITY);
+    const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
 
     // Gate the data response so the unary stays in flight.
     const dataGate = deferred<void>();
     daemon.state.dataGate = dataGate.promise;
-    const reqPromise = client.request(channel, { name: "slow", arguments: {} });
-    await waitFor(() => daemon.state.openedChannels.includes(channel), "route open");
+    const reqPromise = client.request(handle, { name: "slow", arguments: {} });
+    await waitFor(() => daemon.state.openedChannels.includes(handle.channel), "route open");
 
     // closeRouteChannel({ drain: true }) must NOT resolve while the unary is unsettled.
     let closeResolved = false;
-    const closePromise = client.closeRouteChannel(channel, { drain: true }).then(() => {
+    const closePromise = client.closeRouteChannel(handle, { drain: true }).then(() => {
       closeResolved = true;
     });
     await new Promise((r) => setTimeout(r, 30));
@@ -166,7 +166,7 @@ describe("SubcClient.closeRoute", () => {
     await reqPromise;
     await closePromise;
     expect(closeResolved).toBe(true);
-    await waitFor(() => daemon.state.goodbyeChannels.includes(channel), "GOODBYE after drain completes");
+    await waitFor(() => daemon.state.goodbyeChannels.includes(handle.channel), "GOODBYE after drain completes");
     client.close();
   });
 });
@@ -228,7 +228,7 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
         const channel = nextChannel++;
         state.openedChannels.push(channel);
         if (state.routeOpenGate) await state.routeOpenGate;
-        await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: channel }), deadline);
+        await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: channel, route_epoch: 1 }), deadline);
       }
       continue;
     }
@@ -240,13 +240,7 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
 }
 
 function responseFrame(request: Frame, body: unknown): Frame {
-  return buildFrame(
-    FrameType.Response,
-    buildFlags(false, Priority.Interactive, false),
-    request.header.channel,
-    request.header.corr,
-    encodeJson(body),
-  );
+  return buildFrame(FrameType.Response, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
 }
 
 async function authenticate(reader: SocketReader, socket: Socket, deadline: number): Promise<void> {

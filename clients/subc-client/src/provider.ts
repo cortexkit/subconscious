@@ -1,20 +1,32 @@
 import { Buffer } from "node:buffer";
 
 import { AuthError, authenticateClient } from "./auth.js";
-import { DEFAULT_RECONNECT_BACKOFF, type BindIdentity, type ReconnectBackoff, type RouteTarget } from "./client.js";
+import {
+  DEFAULT_RECONNECT_BACKOFF,
+  type BindIdentity,
+  type ReconnectBackoff,
+  type RequestOptions,
+  type RouteTarget,
+} from "./client.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
 import {
+  AdmissionClass,
   buildFlags,
   buildFrame,
   buildFrameWithVersion,
-  decodeHeader,
   encodeFrame,
   FrameType,
-  HEADER_LEN,
   Priority,
   PROTOCOL_VERSION,
   type Frame,
 } from "./envelope.js";
+import {
+  belongsToConnection,
+  createRouteHandle,
+  newConnectionToken,
+  RouteHandle,
+  StaleRouteHandleError,
+} from "./route-handle.js";
 import {
   SocketClosedError,
   SocketTimeoutError,
@@ -181,12 +193,14 @@ export interface ManagementSurfaceManifestOptions {
  * events and `signal` to learn when the consumer cancelled or the route went away.
  */
 export interface ProviderRequestContext {
+  /** The immutable route generation that received this request. */
+  readonly handle: RouteHandle;
   /**
    * Emit an interim event as a StreamData frame on this request's (channel, corr).
    * The consumer receives it via its subscription `onEvent`. A no-op once the
    * request has been aborted (cancelled or route-gone).
    */
-  emit(body: Uint8Array): Promise<void>;
+  emit(body: Uint8Array, opts?: ProviderEmitOptions): Promise<void>;
   /** Aborts when the consumer sends Cancel for this request, or the route is torn down. */
   signal: AbortSignal;
   /**
@@ -207,7 +221,7 @@ export interface ProviderRequestContext {
  * events via `ctx.emit`). Throwing produces an Error terminal.
  */
 export type ProviderHandler = (
-  routeChannel: number,
+  handle: RouteHandle,
   body: Uint8Array,
   ctx: ProviderRequestContext,
 ) => Promise<Uint8Array | void> | Uint8Array | void;
@@ -220,12 +234,17 @@ export type Principal =
   | { kind: "unverified" };
 
 export interface RouteBindRequest {
-  route_channel: number;
+  handle: RouteHandle;
   target: RouteTarget;
   identity: BindIdentity;
   principal?: Principal;
   /** Consumer-declared reverse-request capabilities for this bind. This is a declaration, not a verified privilege; providers must treat an omitted field as no reverse-request capability. Known MCP method-family values today are "elicitation", "sampling", and "roots". */
   consumer_capabilities?: string[];
+}
+
+export interface ProviderEmitOptions {
+  priority?: Priority;
+  admissionClass?: AdmissionClass;
 }
 
 export type BindDecision =
@@ -250,7 +269,9 @@ export interface SubcProviderConnectOptions {
   handshakeTimeoutMs?: number;
   controlOps?: string[] | null;
   onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision;
-  onRouteGone?: (routeChannel: number) => void | Promise<void>;
+  /** Runs only after an accepted bind ack is queued and the handle is installed. */
+  onBound?: (handle: RouteHandle) => void | Promise<void>;
+  onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
   /** Backoff for provider reconnect after an unexpected socket drop. */
   reconnectBackoff?: ReconnectBackoff;
   /** Injectable sleep for timer-free reconnect and debounce tests. */
@@ -275,7 +296,9 @@ interface NormalizedSubcProviderConnectOptions {
   handshakeTimeoutMs?: number;
   controlOps?: string[] | null;
   onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision;
-  onRouteGone?: (routeChannel: number) => void | Promise<void>;
+  /** Runs only after an accepted bind ack is queued and the handle is installed. */
+  onBound?: (handle: RouteHandle) => void | Promise<void>;
+  onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   restoredDebounceMs: number;
@@ -388,11 +411,11 @@ export function managementSurfaceManifest(opts: ManagementSurfaceManifestOptions
 }
 
 export function jsonProviderHandler<Request = unknown, Response = unknown>(
-  handler: (routeChannel: number, request: Request) => Promise<Response> | Response,
+  handler: (handle: RouteHandle, request: Request) => Promise<Response> | Response,
 ): ProviderHandler {
-  return async (routeChannel, body) => {
+  return async (handle, body) => {
     const request = JSON.parse(Buffer.from(body).toString("utf8")) as Request;
-    const response = await handler(routeChannel, request);
+    const response = await handler(handle, request);
     return encodeJson(response);
   };
 }
@@ -406,6 +429,11 @@ export class SubcProvider {
   // A socket drop only makes the reply path stale; handlers may still finish their
   // durable work, and their late sends are ignored by the generation guard.
   private readonly inflight = new Map<string, AbortController>();
+  private readonly pending = new Map<string, { resolve: (frame: Frame) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly liveRoutes = new Map<number, RouteHandle>();
+  private connectionToken = newConnectionToken();
+  private nextCorr = 1n;
+  private ingressEpochDropCount = 0;
   private readonly requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
   private reconnecting: Promise<void> | null = null;
   private generation = 1;
@@ -435,12 +463,97 @@ export class SubcProvider {
     this.enqueueConnectionState({ state: "connected", epoch: this.connectionEpoch });
   }
 
+  /** Number of nonzero-channel ingress frames rejected by endpoint validation. */
+  get droppedIngressFrames(): number {
+    return this.ingressEpochDropCount;
+  }
+
   get conn(): ConnectionInfo {
     return this.currentConn;
   }
 
   currentEpoch(): number {
     return this.connectionEpoch;
+  }
+
+  /** Send a reverse request on exactly one installed route generation. */
+  async request(handle: RouteHandle, body: Uint8Array, opts: RequestOptions = {}): Promise<Uint8Array> {
+    this.assertLiveHandle(handle);
+    const corr = this.allocateCorr();
+    const key = routeKey(handle, corr);
+    const timeoutMs = opts.timeoutMs ?? WRITE_TIMEOUT_MS;
+    const frame = buildFrame(
+      FrameType.Request,
+      buildFlags(
+        false,
+        opts.priority ?? Priority.Interactive,
+        false,
+        opts.admissionClass ?? AdmissionClass.Normal,
+      ),
+      handle.channel,
+      handle.epoch,
+      corr,
+      body,
+    );
+    return await new Promise<Uint8Array>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(key)) reject(new SubcProviderError("reverse request timed out", "request_timeout"));
+      }, timeoutMs);
+      this.pending.set(key, {
+        resolve: (response) => resolve(response.body),
+        reject,
+        timer,
+      });
+      this.sendOn(this.sock, this.generation, frame).catch((error) => {
+        const pending = this.pending.get(key);
+        if (!pending) return;
+        this.pending.delete(key);
+        clearTimeout(pending.timer);
+        reject(error instanceof Error ? error : new SubcProviderError(String(error)));
+      });
+    });
+  }
+
+  /** Emit an unsolicited Push after onBound has published the route. */
+  async push(handle: RouteHandle, body: Uint8Array, opts: ProviderEmitOptions = {}): Promise<void> {
+    this.assertLiveHandle(handle);
+    await this.sendOn(
+      this.sock,
+      this.generation,
+      buildFrame(
+        FrameType.Push,
+        buildFlags(
+          false,
+          opts.priority ?? Priority.Interactive,
+          false,
+          opts.admissionClass ?? AdmissionClass.Normal,
+        ),
+        handle.channel,
+        handle.epoch,
+        0n,
+        body,
+      ),
+    );
+  }
+
+  cancel(handle: RouteHandle, corr: bigint): void {
+    this.assertLiveHandle(handle);
+    void this.sendOn(
+      this.sock,
+      this.generation,
+      buildFrame(FrameType.Cancel, controlFlags(), handle.channel, handle.epoch, corr, new Uint8Array(0)),
+    );
+  }
+
+  closeRoute(handle: RouteHandle): void {
+    this.assertLiveHandle(handle);
+    this.liveRoutes.delete(handle.channel);
+    this.abortHandle(handle);
+    void this.sendOn(
+      this.sock,
+      this.generation,
+      buildFrame(FrameType.Goodbye, controlFlags(), handle.channel, handle.epoch, 0n, new Uint8Array(0)),
+    );
   }
 
   /** Read the connection file, authenticate as a client, register the manifest with HELLO, and serve frames. */
@@ -463,7 +576,7 @@ export class SubcProvider {
       this.cancelRestoredDebounce();
       const sock = this.sock;
       try {
-        await sendFrame(sock, buildFrame(FrameType.Goodbye, controlFlags(), 0, 0n, new Uint8Array(0)));
+        await sendFrame(sock, buildFrame(FrameType.Goodbye, controlFlags(), 0, 0, 0n, new Uint8Array(0)));
       } catch {
         // The daemon may already have closed the connection; close() remains best-effort.
       } finally {
@@ -493,22 +606,16 @@ export class SubcProvider {
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
     try {
       for (;;) {
-        // Header read waits indefinitely — idle time between frames is normal.
-        const headerBytes = await sock.readExact(HEADER_LEN, Number.POSITIVE_INFINITY);
-        const header = decodeHeader(headerBytes);
-        const body =
-          header.len === 0
-            ? new Uint8Array(0)
-            : await sock.readExact(header.len, Date.now() + BODY_READ_TIMEOUT_MS);
-        const keepGoing = await this.dispatch({ header, body }, sock, generation);
+        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, Date.now() + BODY_READ_TIMEOUT_MS);
+        const keepGoing = await this.dispatch(frame, sock, generation);
         if (!keepGoing) {
           if (this.sock === sock && this.generation === generation) this.closeStarted = true;
           break;
         }
       }
-    } catch (err) {
+    } catch (error) {
       if (this.sock === sock && this.generation === generation && !this.closeStarted) {
-        this.handleUnexpectedDrop(sock, generation, err instanceof Error ? err : new SubcProviderError(String(err)));
+        this.handleUnexpectedDrop(sock, generation, error instanceof Error ? error : new SubcProviderError(String(error)));
         return;
       }
     } finally {
@@ -520,6 +627,35 @@ export class SubcProvider {
   }
 
   private async dispatch(frame: Frame, sock: SubcSocket, generation: number): Promise<boolean> {
+    let handle: RouteHandle | null = null;
+    if (frame.header.channel !== 0) {
+      handle = this.liveRoutes.get(frame.header.channel) ?? null;
+      if (!handle || handle.epoch !== frame.header.epoch) {
+        this.ingressEpochDropCount += 1;
+        return true;
+      }
+    }
+
+    if (handle) {
+      const pendingKey = routeKey(handle, frame.header.corr);
+      const pending = this.pending.get(pendingKey);
+      if (pending) {
+        if (frame.header.ty === FrameType.Push || frame.header.ty === FrameType.StreamData) return true;
+        if (frame.header.ty === FrameType.Response || frame.header.ty === FrameType.StreamEnd) {
+          this.pending.delete(pendingKey);
+          clearTimeout(pending.timer);
+          pending.resolve(frame);
+          return true;
+        }
+        if (frame.header.ty === FrameType.Error) {
+          this.pending.delete(pendingKey);
+          clearTimeout(pending.timer);
+          pending.reject(providerErrorFromFrame(frame));
+          return true;
+        }
+      }
+    }
+
     switch (frame.header.ty) {
       case FrameType.Ping:
         if (frame.header.channel === 0) {
@@ -531,6 +667,7 @@ export class SubcProvider {
               FrameType.Pong,
               frame.header.flags,
               0,
+              0,
               frame.header.corr,
               new Uint8Array(0),
             ),
@@ -538,24 +675,21 @@ export class SubcProvider {
         }
         return true;
       case FrameType.Goodbye:
-        if (frame.header.channel === 0) return false;
-        // The route is gone: abort in-flight requests on that route so streaming
-        // handlers unwind, then notify the provider owner.
-        this.abortChannel(generation, frame.header.channel);
-        await this.opts.onRouteGone?.(frame.header.channel);
+        if (!handle) return false;
+        this.liveRoutes.delete(handle.channel);
+        this.abortHandle(handle);
+        await this.opts.onRouteGone?.(handle);
         return true;
       case FrameType.Cancel:
-        // The consumer cancelled one request: abort the matching handler. Its
-        // streaming handler observes ctx.signal and ends with a StreamEnd terminal.
-        this.inflight.get(routeKey(generation, frame.header.channel, frame.header.corr))?.abort();
+        if (handle) this.inflight.get(routeKey(handle, frame.header.corr))?.abort();
         return true;
       case FrameType.Request:
         if (frame.header.channel === 0) {
           await this.handleControlRequest(frame, sock, generation);
-        } else {
-          void this.handleDataRequest(frame, sock, generation).catch((err) => {
+        } else if (handle) {
+          void this.handleDataRequest(frame, handle, sock, generation).catch((error) => {
             if (!this.closeStarted && this.sock === sock && this.generation === generation) {
-              console.warn("SubcProvider handler failed after its request was dispatched", err);
+              console.warn("SubcProvider handler failed after its request was dispatched", error);
             }
           });
         }
@@ -565,19 +699,27 @@ export class SubcProvider {
     }
   }
 
-  /** Abort every in-flight request on a route channel for the current socket generation. */
-  private abortChannel(generation: number, channel: number): void {
-    const prefix = `${generation}:${channel}:`;
+  private abortHandle(handle: RouteHandle): void {
+    const prefix = `${handle.channel}:${handle.epoch}:`;
     for (const [key, controller] of this.inflight) {
       if (key.startsWith(prefix)) controller.abort();
+    }
+    for (const [key, pending] of this.pending) {
+      if (!key.startsWith(prefix)) continue;
+      this.pending.delete(key);
+      clearTimeout(pending.timer);
+      pending.reject(new StaleRouteHandleError(handle));
     }
   }
 
-  private abortGeneration(generation: number): void {
-    const prefix = `${generation}:`;
-    for (const [key, controller] of this.inflight) {
-      if (key.startsWith(prefix)) controller.abort();
+  private abortGeneration(_generation: number): void {
+    this.abortAllInflight();
+    for (const [key, pending] of this.pending) {
+      this.pending.delete(key);
+      clearTimeout(pending.timer);
+      pending.reject(new SubcProviderError("provider connection dropped", "connection_dropped"));
     }
+    this.liveRoutes.clear();
   }
 
   private abortAllInflight(): void {
@@ -585,11 +727,19 @@ export class SubcProvider {
   }
 
   private async handleControlRequest(frame: Frame, sock: SubcSocket, generation: number): Promise<void> {
-    const request = parseJson(frame.body) as Partial<RouteBindRequest> & { op?: string };
+    const request = parseJson(frame.body) as {
+      op?: string;
+      route_channel?: unknown;
+      epoch?: unknown;
+      target?: unknown;
+      identity?: unknown;
+      principal?: unknown;
+      consumer_capabilities?: unknown;
+    };
     if (request.op === HEALTH_CHECK_OP) {
-      void this.handleHealthRequest(frame, sock, generation).catch((err) => {
+      void this.handleHealthRequest(frame, sock, generation).catch((error) => {
         if (!this.closeStarted && this.sock === sock && this.generation === generation) {
-          console.warn("SubcProvider health handler failed after its request was dispatched", err);
+          console.warn("SubcProvider health handler failed after its request was dispatched", error);
         }
       });
       return;
@@ -598,82 +748,154 @@ export class SubcProvider {
       throw new SubcProviderError(`unsupported module control request ${request.op ?? "<missing op>"}`);
     }
 
+    const tentative = createRouteHandle(
+      numberField(request.route_channel, "route_channel"),
+      numberField(request.epoch, "epoch"),
+      this.connectionToken,
+    );
     const bindRequest: RouteBindRequest = {
-      route_channel: numberField(request.route_channel, "route_channel"),
+      handle: tentative,
       target: request.target as RouteTarget,
       identity: request.identity as BindIdentity,
       principal: request.principal as Principal | undefined,
       consumer_capabilities: request.consumer_capabilities as string[] | undefined,
     };
 
-    const decision = await this.opts.onBind?.(bindRequest);
+    let decision: BindDecision | undefined;
+    try {
+      decision = await this.opts.onBind?.(bindRequest);
+    } catch (error) {
+      try {
+        await this.sendError(
+          frame,
+          "route_rejected",
+          error instanceof Error ? error.message : String(error),
+          controlFlags(),
+          sock,
+          generation,
+        );
+      } finally {
+        await this.opts.onRouteGone?.(tentative);
+      }
+      return;
+    }
     const rejection = bindRejection(decision);
     if (rejection) {
-      await this.sendError(frame, rejection.code, rejection.message, controlFlags(), sock, generation);
+      try {
+        await this.sendError(frame, rejection.code, rejection.message, controlFlags(), sock, generation);
+      } finally {
+        await this.opts.onRouteGone?.(tentative);
+      }
       return;
     }
 
-    await this.sendOn(
-      sock,
-      generation,
-      buildFrameWithVersion(
-        frame.header.ver,
-        FrameType.Response,
-        controlFlags(),
-        0,
-        frame.header.corr,
-        encodeJson({ op: "route.bind" }),
-      ),
-    );
+    try {
+      await this.sendOn(
+        sock,
+        generation,
+        buildFrameWithVersion(
+          frame.header.ver,
+          FrameType.Response,
+          controlFlags(),
+          0,
+          0,
+          frame.header.corr,
+          encodeJson({ op: "route.bind" }),
+        ),
+      );
+    } catch (error) {
+      await this.opts.onRouteGone?.(tentative);
+      throw error;
+    }
+
+    if (this.sock !== sock || this.generation !== generation || this.closeStarted || this.closedErr) {
+      await this.opts.onRouteGone?.(tentative);
+      return;
+    }
+    this.liveRoutes.set(tentative.channel, tentative);
+    await this.opts.onBound?.(tentative);
   }
 
-  private async handleDataRequest(frame: Frame, sock: SubcSocket, generation: number): Promise<void> {
-    const { channel, corr, ver } = frame.header;
-    const key = routeKey(generation, channel, corr);
+  private async handleDataRequest(
+    frame: Frame,
+    handle: RouteHandle,
+    sock: SubcSocket,
+    generation: number,
+  ): Promise<void> {
+    const { corr, ver } = frame.header;
+    const key = routeKey(handle, corr);
     const controller = new AbortController();
     this.inflight.set(key, controller);
-    const dataFlags = buildFlags(false, Priority.Interactive, false);
-    const ctx: ProviderRequestContext = {
+    const context: ProviderRequestContext = {
+      handle,
       signal: controller.signal,
       currentEpoch: () => this.connectionEpoch,
-      emit: async (eventBody) => {
-        // Once aborted (cancel / route-gone / socket drop), drop further events silently.
+      emit: async (eventBody, options = {}) => {
+        this.assertLiveHandle(handle);
         if (controller.signal.aborted) return;
         await this.sendOn(
           sock,
           generation,
-          buildFrameWithVersion(ver, FrameType.StreamData, dataFlags, channel, corr, eventBody),
+          buildFrameWithVersion(
+            ver,
+            FrameType.StreamData,
+            buildFlags(
+              false,
+              options.priority ?? Priority.Interactive,
+              false,
+              options.admissionClass ?? AdmissionClass.Normal,
+            ),
+            handle.channel,
+            handle.epoch,
+            corr,
+            eventBody,
+          ),
         );
       },
     };
     const releasePermit = await (this.requestGate ?? new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY)).acquire();
+    const dataFlags = buildFlags(false, Priority.Interactive, false);
     try {
-      const body = await this.opts.handler(channel, frame.body, ctx);
+      const body = await this.opts.handler(handle, frame.body, context);
+      if (controller.signal.aborted) return;
+      this.assertLiveHandle(handle);
       if (body === undefined) {
-        // A streaming handler that ended: close the held-open request with a
-        // StreamEnd terminal (the consumer's subscription resolves).
         await this.sendOn(
           sock,
           generation,
-          buildFrameWithVersion(ver, FrameType.StreamEnd, dataFlags, channel, corr, new Uint8Array(0)),
+          buildFrameWithVersion(
+            ver,
+            FrameType.StreamEnd,
+            dataFlags,
+            handle.channel,
+            handle.epoch,
+            corr,
+            new Uint8Array(0),
+          ),
         );
       } else if (body instanceof Uint8Array) {
         await this.sendOn(
           sock,
           generation,
-          buildFrameWithVersion(ver, FrameType.Response, dataFlags, channel, corr, body),
+          buildFrameWithVersion(
+            ver,
+            FrameType.Response,
+            dataFlags,
+            handle.channel,
+            handle.epoch,
+            corr,
+            body,
+          ),
         );
       } else {
-        throw new SubcProviderError(
-          "provider handler must return a Uint8Array or void",
-          "invalid_handler_response",
-        );
+        throw new SubcProviderError("provider handler must return a Uint8Array or void", "invalid_handler_response");
       }
-    } catch (err) {
+    } catch (error) {
+      if (error instanceof StaleRouteHandleError || controller.signal.aborted) return;
       await this.sendError(
         frame,
-        err instanceof SubcProviderError && err.code ? err.code : "handler_error",
-        err instanceof Error ? err.message : String(err),
+        error instanceof SubcProviderError && error.code ? error.code : "handler_error",
+        error instanceof Error ? error.message : String(error),
         dataFlags,
         sock,
         generation,
@@ -685,8 +907,8 @@ export class SubcProvider {
   }
 
   private async handleHealthRequest(frame: Frame, sock: SubcSocket, generation: number): Promise<void> {
-    const { channel, corr, ver } = frame.header;
-    const key = routeKey(generation, channel, corr);
+    const { corr, ver } = frame.header;
+    const key = `control:${generation}:${corr}`;
     const controller = new AbortController();
     this.inflight.set(key, controller);
     const releasePermit = await (this.requestGate ?? new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY)).acquire();
@@ -700,7 +922,8 @@ export class SubcProvider {
           ver,
           FrameType.Response,
           controlFlags(),
-          channel,
+          0,
+          0,
           corr,
           encodeJson({
             op: HEALTH_CHECK_OP,
@@ -710,11 +933,11 @@ export class SubcProvider {
           }),
         ),
       );
-    } catch (err) {
+    } catch (error) {
       await this.sendError(
         frame,
-        err instanceof SubcProviderError && err.code ? err.code : "health_error",
-        err instanceof Error ? err.message : String(err),
+        error instanceof SubcProviderError && error.code ? error.code : "health_error",
+        error instanceof Error ? error.message : String(error),
         controlFlags(),
         sock,
         generation,
@@ -741,6 +964,7 @@ export class SubcProvider {
         FrameType.Error,
         flags,
         frame.header.channel,
+        frame.header.epoch,
         frame.header.corr,
         encodeJson({ code, message }),
       ),
@@ -802,13 +1026,16 @@ export class SubcProvider {
     }
   }
 
-  private replaceConnection(opened: OpenedProviderConnection): void {
+    private replaceConnection(opened: OpenedProviderConnection): void {
     this.sock.close();
     this.sock = opened.sock;
     this.currentConn = opened.conn;
     this.storage = opened.ack.storage;
     this.closedErr = null;
     this.connectionEpoch += 1;
+    this.connectionToken = newConnectionToken();
+    this.liveRoutes.clear();
+    this.nextCorr = 1n;
     const generation = this.generation;
     void this.readLoop(opened.sock, generation);
     this.scheduleRestored(generation, this.connectionEpoch);
@@ -872,6 +1099,26 @@ export class SubcProvider {
     }
   }
 
+  private isLiveHandle(handle: RouteHandle): boolean {
+    return belongsToConnection(handle, this.connectionToken) && this.liveRoutes.get(handle.channel) === handle;
+  }
+
+  private assertLiveHandle(handle: RouteHandle): void {
+    if (!this.isLiveHandle(handle)) throw new StaleRouteHandleError(handle);
+  }
+
+  private allocateCorr(): bigint {
+    const maximum = 0xffff_ffff_ffff_ffffn;
+    if (this.nextCorr > maximum) {
+      const error = new SubcProviderError("channel-0 correlation id allocator exhausted", "corr_exhausted");
+      this.handleUnexpectedDrop(this.sock, this.generation, error);
+      throw error;
+    }
+    const corr = this.nextCorr;
+    this.nextCorr += 1n;
+    return corr;
+  }
+
   private failFatal(err: Error): void {
     if (!this.closedErr) this.closedErr = err;
     this.closeStarted = true;
@@ -886,8 +1133,17 @@ export class SubcProvider {
   }
 }
 
-function routeKey(generation: number, channel: number, corr: bigint): string {
-  return `${generation}:${channel}:${corr}`;
+function routeKey(handle: RouteHandle, corr: bigint): string {
+  return `${handle.channel}:${handle.epoch}:${corr}`;
+}
+
+function providerErrorFromFrame(frame: Frame): SubcProviderError {
+  try {
+    const body = parseJson(frame.body) as { code?: string; message?: string };
+    return new SubcProviderError(body.message ?? "subc error", body.code);
+  } catch {
+    return new SubcProviderError(Buffer.from(frame.body).toString("utf8") || "subc error");
+  }
 }
 
 function launchNonce(opts: SubcProviderConnectOptions): string | undefined {
@@ -906,6 +1162,7 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
     handshakeTimeoutMs: opts.handshakeTimeoutMs,
     controlOps: opts.controlOps,
     onBind: opts.onBind,
+    onBound: opts.onBound,
     onRouteGone: opts.onRouteGone,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
@@ -927,6 +1184,7 @@ function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
   return buildFrame(
     FrameType.Hello,
     controlFlags(),
+    0,
     0,
     HELLO_CORR,
     encodeJson({
@@ -980,14 +1238,20 @@ async function sendFrame(sock: SubcSocket, frame: Frame): Promise<void> {
 }
 
 async function expectHelloAck(sock: SubcSocket, deadline: number): Promise<ModuleHelloAckBody> {
-  const header = decodeHeader(await sock.readExact(HEADER_LEN, deadline));
-  const body = header.len === 0 ? new Uint8Array(0) : await sock.readExact(header.len, deadline);
-  const frame = { header, body };
-  switch (header.ty) {
-    case FrameType.HelloAck:
-      return parseJson(body) as ModuleHelloAckBody;
+  const frame = await sock.readFrame(deadline, deadline);
+  switch (frame.header.ty) {
+    case FrameType.HelloAck: {
+      const ack = parseJson(frame.body) as ModuleHelloAckBody;
+      if (ack.negotiated_ver !== PROTOCOL_VERSION) {
+        throw new SubcProviderError(
+          `subc negotiated protocol ${ack.negotiated_ver}; expected exactly ${PROTOCOL_VERSION}`,
+          "unsupported_version",
+        );
+      }
+      return ack;
+    }
     case FrameType.Error: {
-      const error = parseJson(body) as { code?: string; message?: string };
+      const error = parseJson(frame.body) as { code?: string; message?: string };
       throw new SubcProviderError(
         `subc rejected HELLO: ${error.code ?? "unknown"} — ${error.message ?? "subc error"}`,
         error.code,

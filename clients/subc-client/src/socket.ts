@@ -6,6 +6,16 @@
 
 import net from "node:net";
 
+import {
+  decodeHeader,
+  DecodeError,
+  FROZEN_PREFIX_LEN,
+  HEADER_LEN,
+  MAX_FRAME_BODY_LEN,
+  PROTOCOL_VERSION,
+  type Frame,
+} from "./envelope.js";
+
 export class SocketClosedError extends Error {}
 export class SocketTimeoutError extends Error {}
 
@@ -97,6 +107,33 @@ export class SubcSocket {
         reject(err);
       });
     });
+  }
+
+  /**
+   * Read one envelope frame. The frozen five-byte prefix is validated before
+   * waiting for the rest of the header, so a stale 17-byte v1 sender fails
+   * promptly instead of leaving this reader blocked for four bytes.
+   */
+  async readFrame(
+    headerDeadlineMs: number,
+    bodyDeadlineMs: number,
+    onHeader?: () => void,
+  ): Promise<Frame> {
+    const prefix = await this.readExact(FROZEN_PREFIX_LEN, headerDeadlineMs);
+    const version = prefix[4]!;
+    if (version !== PROTOCOL_VERSION) throw new DecodeError(`unsupported envelope version ${version}`, "unsupported_version");
+
+    const remainder = await this.readExact(HEADER_LEN - FROZEN_PREFIX_LEN, headerDeadlineMs);
+    const headerBytes = new Uint8Array(HEADER_LEN);
+    headerBytes.set(prefix);
+    headerBytes.set(remainder, FROZEN_PREFIX_LEN);
+    const header = decodeHeader(headerBytes);
+    if (header.len > MAX_FRAME_BODY_LEN) {
+      throw new DecodeError(`frame body ${header.len} exceeds max ${MAX_FRAME_BODY_LEN}`, "frame_body_too_large");
+    }
+    onHeader?.();
+    const body = header.len === 0 ? new Uint8Array(0) : await this.readExact(header.len, bodyDeadlineMs);
+    return { header, body };
   }
 
   /** Read exactly `n` bytes, rejecting if `deadlineMs` (epoch ms) passes first. */

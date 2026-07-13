@@ -62,7 +62,9 @@ impl Deref for TestServer {
 #[derive(Debug, Clone, Copy)]
 struct RoutePair {
     client_channel: u16,
+    client_epoch: u32,
     module_channel: u16,
+    module_epoch: u32,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -91,6 +93,7 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
         .send(&data_frame(
             FrameType::Request,
             route.client_channel,
+            route.client_epoch,
             401,
             in_flight_body,
         ))
@@ -138,6 +141,7 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
         .send(&data_frame(
             FrameType::Response,
             route.module_channel,
+            route.module_epoch,
             401,
             in_flight_response,
         ))
@@ -286,7 +290,12 @@ async fn open_route(
         })
         .await;
     let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
-    let ModuleControlRequest::RouteBind { route_channel, .. } = bind else {
+    let ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch: module_epoch,
+        ..
+    } = bind
+    else {
         panic!("unexpected module control request: {bind:?}");
     };
     module.send(&route_bind_ack(&bind_frame)).await;
@@ -302,11 +311,12 @@ async fn open_route(
     match serde_json::from_slice(&ack_frame.body).unwrap() {
         ClientControlResponse::RouteOpen {
             route_channel: client_channel,
-            // WIRE-WAVE2: retain this epoch in the route test handle.
-            route_epoch: _route_epoch,
+            route_epoch: client_epoch,
         } => RoutePair {
             client_channel,
+            client_epoch,
             module_channel: route_channel,
+            module_epoch,
         },
         other => panic!("unexpected route.open response: {other:?}"),
     }
@@ -343,29 +353,13 @@ fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
         launch_nonce: None,
     })
     .unwrap();
-    Frame::build(
-        FrameType::Hello,
-        control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
-        0,
-        corr,
-        body,
-    )
-    .unwrap()
+    Frame::build(FrameType::Hello, control_flags(), 0, 0, corr, body).unwrap()
 }
 
 fn catalog_update_frame(corr: u64, provides: Vec<ProviderRole>) -> Frame {
     let body =
         serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate { provides }).unwrap();
-    Frame::build(
-        FrameType::Request,
-        control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
-        0,
-        corr,
-        body,
-    )
-    .unwrap()
+    Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
 }
 
 fn route_bind_ack(request: &Frame) -> Frame {
@@ -374,7 +368,7 @@ fn route_bind_ack(request: &Frame) -> Frame {
         request.header.ver,
         FrameType::Response,
         control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         request.header.corr,
         body,
@@ -384,23 +378,15 @@ fn route_bind_ack(request: &Frame) -> Frame {
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     let body = serde_json::to_vec(&request).unwrap();
-    Frame::build(
-        FrameType::Request,
-        control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
-        0,
-        corr,
-        body,
-    )
-    .unwrap()
+    Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
 }
 
-fn data_frame(ty: FrameType, channel: u16, corr: u64, body: &[u8]) -> Frame {
+fn data_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         ty,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body.to_vec(),
     )

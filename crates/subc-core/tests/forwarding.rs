@@ -484,9 +484,12 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
         .unwrap());
 
     let payload = br#"{"jsonrpc":"2.0","id":7,"method":"read","params":{"path":"Cargo.toml"}}"#;
-    write_frame(&mut client, &data_request(ack.route_channel, 202, payload))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, 202, payload),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let response = read_frame_timeout(&mut client).await;
@@ -822,9 +825,12 @@ async fn non_tool_provider_hello_registers_without_hijacking_active_forwarding_m
     );
 
     let payload = br#"{"jsonrpc":"2.0","id":"role-aware"}"#;
-    write_frame(&mut client, &data_request(ack.route_channel, 304, payload))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, 304, payload),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
     let response = read_frame_timeout(&mut client).await;
     assert_response(&response, ack.route_channel, 304, payload);
@@ -899,7 +905,7 @@ async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
     let module_ping = Frame::build(
         FrameType::Ping,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         503,
         Vec::new(),
@@ -917,7 +923,7 @@ async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
     let client_push = Frame::build(
         FrameType::Push,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         504,
         b"client ch0 push".to_vec(),
@@ -934,7 +940,7 @@ async fn role_aware_channel_zero_misuse_is_rejected_over_real_connections() {
     let client_ping = Frame::build(
         FrameType::Ping,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         505,
         Vec::new(),
@@ -1081,7 +1087,7 @@ async fn status_and_liveness_polls_are_fast_while_serial_module_is_busy() {
     let data_sent = Instant::now();
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, data_corr, payload),
+        &data_request(ack.route_channel, ack.route_epoch, data_corr, payload),
     )
     .await
     .unwrap();
@@ -1254,9 +1260,12 @@ async fn single_client_receives_unsolicited_push_and_response_on_bound_route() {
     assert!(ack.route_channel > 0);
 
     let payload = br#"{"jsonrpc":"2.0","id":"push-single","method":"read"}"#;
-    write_frame(&mut client, &data_request(ack.route_channel, 152, payload))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, 152, payload),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let (push, _response) =
@@ -1438,7 +1447,7 @@ async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
     let slow_payload = br#"{"delay_ms":50,"jsonrpc":"2.0","id":"reload-happy"}"#;
     write_frame(
         &mut route_client,
-        &data_request(ack.route_channel, slow_corr, slow_payload),
+        &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
     )
     .await
     .unwrap();
@@ -1485,7 +1494,12 @@ async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
     let fresh_payload = br#"{"jsonrpc":"2.0","id":"after-reload"}"#;
     write_frame(
         &mut fresh_client,
-        &data_request(fresh_ack.route_channel, 405, fresh_payload),
+        &data_request(
+            fresh_ack.route_channel,
+            fresh_ack.route_epoch,
+            405,
+            fresh_payload,
+        ),
     )
     .await
     .unwrap();
@@ -1531,7 +1545,7 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     let slow_payload = br#"{"delay_ms":150,"jsonrpc":"2.0","id":"reload-rejects"}"#;
     write_frame(
         &mut route_client,
-        &data_request(ack.route_channel, slow_corr, slow_payload),
+        &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
     )
     .await
     .unwrap();
@@ -1578,7 +1592,12 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     let rejected_payload = br#"{"jsonrpc":"2.0","id":"should-reject"}"#;
     write_frame(
         &mut route_client,
-        &data_request(ack.route_channel, rejected_corr, rejected_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            rejected_corr,
+            rejected_payload,
+        ),
     )
     .await
     .unwrap();
@@ -1663,7 +1682,7 @@ async fn concurrent_supervisor_ops_remain_coherent() {
     let slow_payload = br#"{"delay_ms":100,"jsonrpc":"2.0","id":"supervisor-concurrent"}"#;
     write_frame(
         &mut route_client,
-        &data_request(ack.route_channel, slow_corr, slow_payload),
+        &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
     )
     .await
     .unwrap();
@@ -1856,7 +1875,7 @@ async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
         br#"{"delay_ms":500,"uncancellable":true,"jsonrpc":"2.0","id":"reload-timeout"}"#;
     write_frame(
         &mut route_client,
-        &data_request(ack.route_channel, held_corr, held_payload),
+        &data_request(ack.route_channel, ack.route_epoch, held_corr, held_payload),
     )
     .await
     .unwrap();
@@ -2164,9 +2183,12 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
     let second_ack = attach_on_stream(&mut client, &project, 602, "ses-route-b", module_id).await;
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 2);
 
-    write_frame(&mut client, &goodbye_frame(first_ack.route_channel, 603))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &goodbye_frame(first_ack.route_channel, first_ack.route_epoch, 603),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
@@ -2191,7 +2213,12 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
     let stale_payload = br#"{"jsonrpc":"2.0","id":"route-a-after-goodbye"}"#;
     write_frame(
         &mut client,
-        &data_request(first_ack.route_channel, 604, stale_payload),
+        &data_request(
+            first_ack.route_channel,
+            first_ack.route_epoch,
+            604,
+            stale_payload,
+        ),
     )
     .await
     .unwrap();
@@ -2208,7 +2235,12 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
     let live_payload = br#"{"jsonrpc":"2.0","id":"route-b-live"}"#;
     write_frame(
         &mut client,
-        &data_request(second_ack.route_channel, 605, live_payload),
+        &data_request(
+            second_ack.route_channel,
+            second_ack.route_epoch,
+            605,
+            live_payload,
+        ),
     )
     .await
     .unwrap();
@@ -2221,7 +2253,7 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
     {
         unknown_channel -= 1;
     }
-    write_frame(&mut client, &goodbye_frame(unknown_channel, 606))
+    write_frame(&mut client, &goodbye_frame(unknown_channel, 1, 606))
         .await
         .unwrap();
     client.flush().await.unwrap();
@@ -2230,7 +2262,12 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
     let after_unknown_payload = br#"{"jsonrpc":"2.0","id":"route-b-after-unknown"}"#;
     write_frame(
         &mut client,
-        &data_request(second_ack.route_channel, 607, after_unknown_payload),
+        &data_request(
+            second_ack.route_channel,
+            second_ack.route_epoch,
+            607,
+            after_unknown_payload,
+        ),
     )
     .await
     .unwrap();
@@ -2286,7 +2323,7 @@ async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
     let payload = br#"{"jsonrpc":"2.0","id":8,"method":"read"}"#;
     write_frame(
         &mut next_client,
-        &data_request(next_ack.route_channel, 303, payload),
+        &data_request(next_ack.route_channel, next_ack.route_epoch, 303, payload),
     )
     .await
     .unwrap();
@@ -2380,7 +2417,7 @@ async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_bind
     let payload = br#"{"jsonrpc":"2.0","id":9,"method":"read"}"#;
     write_frame(
         &mut accepted_client,
-        &data_request(ack.route_channel, 403, payload),
+        &data_request(ack.route_channel, ack.route_epoch, 403, payload),
     )
     .await
     .unwrap();
@@ -2687,7 +2724,12 @@ async fn module_delivery_failure_closes_dead_client_without_erroring_module_or_c
         for offset in 0..256_u64 {
             if write_frame(
                 &mut first,
-                &data_request(first_ack.route_channel, 473 + offset, &dead_payload),
+                &data_request(
+                    first_ack.route_channel,
+                    first_ack.route_epoch,
+                    473 + offset,
+                    &dead_payload,
+                ),
             )
             .await
             .is_err()
@@ -2706,7 +2748,12 @@ async fn module_delivery_failure_closes_dead_client_without_erroring_module_or_c
     let payload = br#"{"jsonrpc":"2.0","id":"cotenant"}"#;
     write_frame(
         &mut second,
-        &data_request(second_ack.route_channel, 490, payload),
+        &data_request(
+            second_ack.route_channel,
+            second_ack.route_epoch,
+            490,
+            payload,
+        ),
     )
     .await
     .unwrap();
@@ -2749,7 +2796,12 @@ async fn backpressured_client_does_not_hol_block_cotenant_and_is_cleaned_up() {
         for offset in 0..256_u64 {
             if write_frame(
                 &mut clogged,
-                &data_request(clogged_ack.route_channel, 20_000 + offset, &flood_payload),
+                &data_request(
+                    clogged_ack.route_channel,
+                    clogged_ack.route_epoch,
+                    20_000 + offset,
+                    &flood_payload,
+                ),
             )
             .await
             .is_err()
@@ -2769,6 +2821,7 @@ async fn backpressured_client_does_not_hol_block_cotenant_and_is_cleaned_up() {
             &mut cotenant,
             &data_request(
                 cotenant_ack.route_channel,
+                cotenant_ack.route_epoch,
                 21_000 + offset,
                 cotenant_payload,
             ),
@@ -2791,7 +2844,12 @@ async fn backpressured_client_does_not_hol_block_cotenant_and_is_cleaned_up() {
     let payload = br#"{"jsonrpc":"2.0","id":"survives"}"#;
     write_frame(
         &mut cotenant,
-        &data_request(cotenant_ack.route_channel, 21_100, payload),
+        &data_request(
+            cotenant_ack.route_channel,
+            cotenant_ack.route_epoch,
+            21_100,
+            payload,
+        ),
     )
     .await
     .unwrap();
@@ -2818,13 +2876,23 @@ async fn two_clients_attach_same_module_and_round_trip_independently() {
     let second_payload = br#"{"jsonrpc":"2.0","id":"second"}"#;
     write_frame(
         &mut first,
-        &data_request(first_ack.route_channel, 503, first_payload),
+        &data_request(
+            first_ack.route_channel,
+            first_ack.route_epoch,
+            503,
+            first_payload,
+        ),
     )
     .await
     .unwrap();
     write_frame(
         &mut second,
-        &data_request(second_ack.route_channel, 504, second_payload),
+        &data_request(
+            second_ack.route_channel,
+            second_ack.route_epoch,
+            504,
+            second_payload,
+        ),
     )
     .await
     .unwrap();
@@ -2865,7 +2933,12 @@ async fn cross_session_slow_call_does_not_block_fast_call() {
     let fast_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"fast"}"#;
     write_frame(
         &mut slow_client,
-        &data_request(slow_ack.route_channel, 527, slow_payload),
+        &data_request(
+            slow_ack.route_channel,
+            slow_ack.route_epoch,
+            527,
+            slow_payload,
+        ),
     )
     .await
     .unwrap();
@@ -2874,7 +2947,12 @@ async fn cross_session_slow_call_does_not_block_fast_call() {
 
     write_frame(
         &mut fast_client,
-        &data_request(fast_ack.route_channel, 528, fast_payload),
+        &data_request(
+            fast_ack.route_channel,
+            fast_ack.route_epoch,
+            528,
+            fast_payload,
+        ),
     )
     .await
     .unwrap();
@@ -2943,12 +3021,18 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
     let payload_a = br#"{"delay_ms":300,"jsonrpc":"2.0","id":"req-a"}"#;
     let payload_b = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"req-b"}"#;
 
-    write_frame(&mut client, &data_request(ack.route_channel, CA, payload_a))
-        .await
-        .unwrap();
-    write_frame(&mut client, &data_request(ack.route_channel, CB, payload_b))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, CA, payload_a),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, CB, payload_b),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
     let sent = Instant::now();
 
@@ -3015,15 +3099,21 @@ async fn cancel_before_response_for_cancellable_request_returns_cancelled_error(
     let (mut client, ack) = attach_client(&server, &project, 801, "ses-cancel-before").await;
     let corr = 802;
     let payload = br#"{"delay_ms":500,"jsonrpc":"2.0","id":"cancel-before"}"#;
-    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, corr, payload),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let cancel_sent = Instant::now();
-    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &cancel_frame(ack.route_channel, ack.route_epoch, corr),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let terminal = read_frame_timeout(&mut client).await;
@@ -3075,16 +3165,22 @@ async fn cancel_after_response_is_idempotent_noop() {
     let (mut client, ack) = attach_client(&server, &project, 811, "ses-cancel-after").await;
     let corr = 812;
     let payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"cancel-after"}"#;
-    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, corr, payload),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
     let response = read_frame_timeout(&mut client).await;
     assert_response(&response, ack.route_channel, corr, payload);
 
-    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &cancel_frame(ack.route_channel, ack.route_epoch, corr),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
     let cancel_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
         event["kind"] == "cancel"
@@ -3099,7 +3195,12 @@ async fn cancel_after_response_is_idempotent_noop() {
     let followup_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"cancel-after-followup"}"#;
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, corr + 1, followup_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            corr + 1,
+            followup_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3128,16 +3229,25 @@ async fn double_cancel_emits_exactly_one_cancelled_error() {
     let (mut client, ack) = attach_client(&server, &project, 821, "ses-double-cancel").await;
     let corr = 822;
     let payload = br#"{"delay_ms":500,"jsonrpc":"2.0","id":"double-cancel"}"#;
-    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, corr, payload),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
-    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
-        .await
-        .unwrap();
-    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &cancel_frame(ack.route_channel, ack.route_epoch, corr),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &cancel_frame(ack.route_channel, ack.route_epoch, corr),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let terminal = read_frame_timeout(&mut client).await;
@@ -3179,15 +3289,21 @@ async fn cancel_for_uncancellable_delayed_request_allows_normal_response() {
     let (mut client, ack) = attach_client(&server, &project, 831, "ses-uncancellable").await;
     let corr = 832;
     let payload = br#"{"delay_ms":200,"uncancellable":true,"jsonrpc":"2.0","id":"uncancellable"}"#;
-    write_frame(&mut client, &data_request(ack.route_channel, corr, payload))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, corr, payload),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let cancel_sent = Instant::now();
-    write_frame(&mut client, &cancel_frame(ack.route_channel, corr))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &cancel_frame(ack.route_channel, ack.route_epoch, corr),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
     let cancel_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
         event["kind"] == "cancel"
@@ -3217,7 +3333,7 @@ async fn cancel_for_uncancellable_delayed_request_allows_normal_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_channel_cancel_returns_unknown_channel_error_and_survives() {
+async fn unknown_channel_cancel_drops_silently_and_connection_survives() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-unknown-cancel";
@@ -3233,23 +3349,21 @@ async fn unknown_channel_cancel_returns_unknown_channel_error_and_survives() {
     assert_ne!(unknown_channel, ack.route_channel);
 
     let unknown_corr = 842;
-    write_frame(&mut client, &cancel_frame(unknown_channel, unknown_corr))
+    write_frame(&mut client, &cancel_frame(unknown_channel, 1, unknown_corr))
         .await
         .unwrap();
     client.flush().await.unwrap();
-    let error_frame = read_frame_timeout(&mut client).await;
-    let body = assert_error(
-        &error_frame,
-        unknown_channel,
-        unknown_corr,
-        "unknown_channel",
-    );
-    assert!(body.message.contains("unknown channel"));
+    assert_no_frame_within(&mut client, Duration::from_millis(100)).await;
 
     let payload = br#"{"jsonrpc":"2.0","id":"after-unknown-cancel"}"#;
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, unknown_corr + 1, payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            unknown_corr + 1,
+            payload,
+        ),
     )
     .await
     .unwrap();
@@ -3281,7 +3395,12 @@ async fn multi_client_fanout_pushes_route_to_each_bound_client() {
     let first_payload = br#"{"jsonrpc":"2.0","id":"fanout-trigger"}"#;
     write_frame(
         &mut first,
-        &data_request(first_ack.route_channel, 553, first_payload),
+        &data_request(
+            first_ack.route_channel,
+            first_ack.route_epoch,
+            553,
+            first_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3310,7 +3429,7 @@ async fn single_client_pipelined_requests_preserve_corr_fifo_order() {
         let body = format!(r#"{{"jsonrpc":"2.0","id":{corr}}}"#);
         write_frame(
             &mut client,
-            &data_request(ack.route_channel, corr, body.as_bytes()),
+            &data_request(ack.route_channel, ack.route_epoch, corr, body.as_bytes()),
         )
         .await
         .unwrap();
@@ -3359,13 +3478,23 @@ async fn serial_flow_control_window_holds_second_request_until_terminal() {
 
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, first_corr, first_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            first_corr,
+            first_payload,
+        ),
     )
     .await
     .unwrap();
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, second_corr, second_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            second_corr,
+            second_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3447,7 +3576,12 @@ async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal()
 
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, cancelled_corr, cancellable_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            cancelled_corr,
+            cancellable_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3460,13 +3594,18 @@ async fn cancel_bypasses_full_flow_control_window_and_credit_frees_on_terminal()
 
     write_frame(
         &mut client,
-        &cancel_frame(ack.route_channel, cancelled_corr),
+        &cancel_frame(ack.route_channel, ack.route_epoch, cancelled_corr),
     )
     .await
     .unwrap();
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, followup_corr, followup_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            followup_corr,
+            followup_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3534,7 +3673,12 @@ async fn flow_control_over_release_guard_does_not_grow_serial_window() {
     let warmup_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"warmup"}"#;
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, warmup_corr, warmup_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            warmup_corr,
+            warmup_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3560,13 +3704,13 @@ async fn flow_control_over_release_guard_does_not_grow_serial_window() {
     let fast_payload = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"over-release-fast"}"#;
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, slow_corr, slow_payload),
+        &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
     )
     .await
     .unwrap();
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, fast_corr, fast_payload),
+        &data_request(ack.route_channel, ack.route_epoch, fast_corr, fast_payload),
     )
     .await
     .unwrap();
@@ -3630,7 +3774,12 @@ async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
 
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, inflight_corr, inflight_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            inflight_corr,
+            inflight_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3642,7 +3791,12 @@ async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
 
     write_frame(
         &mut client,
-        &data_request(ack.route_channel, blocked_corr, blocked_payload),
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch,
+            blocked_corr,
+            blocked_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3693,6 +3847,7 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
 
     let stale_request = data_request(
         old_ack.route_channel,
+        old_ack.route_epoch,
         702,
         br#"{"jsonrpc":"2.0","id":"old"}"#,
     );
@@ -3715,7 +3870,7 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
     let payload = br#"{"jsonrpc":"2.0","id":"new"}"#;
     write_frame(
         &mut client,
-        &data_request(fresh_ack.route_channel, 704, payload),
+        &data_request(fresh_ack.route_channel, fresh_ack.route_epoch, 704, payload),
     )
     .await
     .unwrap();
@@ -3762,13 +3917,13 @@ async fn multi_provider_one_client_two_providers_rewrites_independent_channel_sp
     let payload_b = br#"{"jsonrpc":"2.0","id":"provider-b"}"#;
     write_frame(
         &mut client,
-        &data_request(ack_a.route_channel, 1003, payload_a),
+        &data_request(ack_a.route_channel, ack_a.route_epoch, 1003, payload_a),
     )
     .await
     .unwrap();
     write_frame(
         &mut client,
-        &data_request(ack_b.route_channel, 1004, payload_b),
+        &data_request(ack_b.route_channel, ack_b.route_epoch, 1004, payload_b),
     )
     .await
     .unwrap();
@@ -3818,13 +3973,23 @@ async fn multi_provider_two_clients_one_provider_get_distinct_module_channels() 
     let second_payload = br#"{"jsonrpc":"2.0","id":"second-client"}"#;
     write_frame(
         &mut first,
-        &data_request(first_ack.route_channel, 1013, first_payload),
+        &data_request(
+            first_ack.route_channel,
+            first_ack.route_epoch,
+            1013,
+            first_payload,
+        ),
     )
     .await
     .unwrap();
     write_frame(
         &mut second,
-        &data_request(second_ack.route_channel, 1014, second_payload),
+        &data_request(
+            second_ack.route_channel,
+            second_ack.route_epoch,
+            1014,
+            second_payload,
+        ),
     )
     .await
     .unwrap();
@@ -3920,7 +4085,12 @@ async fn multi_provider_cancel_rewrites_divergent_client_and_module_channels() {
     let payload = br#"{"delay_ms":500,"jsonrpc":"2.0","id":"cancel-divergent"}"#;
     write_frame(
         &mut second,
-        &data_request(second_ack.route_channel, corr, payload),
+        &data_request(
+            second_ack.route_channel,
+            second_ack.route_epoch,
+            corr,
+            payload,
+        ),
     )
     .await
     .unwrap();
@@ -3929,9 +4099,12 @@ async fn multi_provider_cancel_rewrites_divergent_client_and_module_channels() {
         event_is_request_received(event, module_channel, corr)
     })
     .await;
-    write_frame(&mut second, &cancel_frame(second_ack.route_channel, corr))
-        .await
-        .unwrap();
+    write_frame(
+        &mut second,
+        &cancel_frame(second_ack.route_channel, second_ack.route_epoch, corr),
+    )
+    .await
+    .unwrap();
     second.flush().await.unwrap();
     assert_error(
         &read_frame_timeout(&mut second).await,
@@ -3983,7 +4156,7 @@ async fn multi_provider_generation_invalidation_goodbyes_restarted_provider_only
     let payload_a = br#"{"jsonrpc":"2.0","id":"a-still-live"}"#;
     write_frame(
         &mut client,
-        &data_request(ack_a.route_channel, 1043, payload_a),
+        &data_request(ack_a.route_channel, ack_a.route_epoch, 1043, payload_a),
     )
     .await
     .unwrap();
@@ -4086,6 +4259,7 @@ async fn multi_provider_route_open_error_mapping_unknown_unavailable_and_verbati
 #[derive(Debug, Clone, Copy)]
 struct RouteOpenAck {
     route_channel: u16,
+    route_epoch: u32,
 }
 
 async fn attach_client(
@@ -4127,9 +4301,11 @@ where
     match serde_json::from_slice(&ack_frame.body).unwrap() {
         ClientControlResponse::RouteOpen {
             route_channel,
-            // WIRE-WAVE2: retain this epoch in the route test handle.
-            route_epoch: _route_epoch,
-        } => RouteOpenAck { route_channel },
+            route_epoch,
+        } => RouteOpenAck {
+            route_channel,
+            route_epoch,
+        },
         other => panic!("unexpected route.open response: {other:?}"),
     }
 }
@@ -4257,7 +4433,7 @@ fn hello_frame_with_protocol(manifest: ModuleManifest, protocol_ver: u8, corr: u
     Frame::build(
         FrameType::Hello,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -4314,7 +4490,7 @@ fn attach_frame(corr: u64, attach: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -4322,24 +4498,24 @@ fn attach_frame(corr: u64, attach: ClientControlRequest) -> Frame {
     .unwrap()
 }
 
-fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
+fn data_request(channel: u16, epoch: u32, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body.to_vec(),
     )
     .unwrap()
 }
 
-fn goodbye_frame(channel: u16, corr: u64) -> Frame {
+fn goodbye_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
     let frame = Frame::build(
         FrameType::Goodbye,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         Vec::new(),
     )
@@ -4349,12 +4525,12 @@ fn goodbye_frame(channel: u16, corr: u64) -> Frame {
     frame
 }
 
-fn cancel_frame(channel: u16, corr: u64) -> Frame {
+fn cancel_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
     let frame = Frame::build(
         FrameType::Cancel,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         Vec::new(),
     )
@@ -4369,7 +4545,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -4466,15 +4642,14 @@ fn assert_supervisor_ack(frame: &Frame, corr: u64, module_id: &str) -> bool {
 fn route_poll_frame(corr: u64, kind: PollKind, route_channel: u16) -> Frame {
     let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
         route_channel,
-        // WIRE-WAVE2: pass the route test handle epoch.
-        route_epoch: 0,
+        route_epoch: 1,
         kind,
     })
     .unwrap();
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -4587,7 +4762,6 @@ async fn wait_for_cached_status<S>(
         assert_eq!(frame.header.corr, poll_corr);
         match serde_json::from_slice(&frame.body).unwrap() {
             ClientControlResponse::RoutePoll {
-                // WIRE-WAVE2: assert the echoed route test handle.
                 route_channel: _route_channel,
                 route_epoch: _route_epoch,
                 status: Some(status),
@@ -4597,7 +4771,6 @@ async fn wait_for_cached_status<S>(
                 return;
             }
             ClientControlResponse::RoutePoll {
-                // WIRE-WAVE2: assert the echoed route test handle.
                 route_channel: _route_channel,
                 route_epoch: _route_epoch,
                 status: None,
@@ -4621,7 +4794,6 @@ fn assert_status_reply(frame: &Frame, corr: u64, expected_status: &str) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
-            // WIRE-WAVE2: assert the echoed route test handle.
             route_channel: _route_channel,
             route_epoch: _route_epoch,
             status: Some(status),
@@ -4637,7 +4809,6 @@ fn assert_status_none_reply(frame: &Frame, corr: u64) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
-            // WIRE-WAVE2: assert the echoed route test handle.
             route_channel: _route_channel,
             route_epoch: _route_epoch,
             status: None,
@@ -4653,7 +4824,6 @@ fn assert_liveness_reply(frame: &Frame, corr: u64, expected_live: bool) {
     assert_eq!(frame.header.corr, corr);
     match serde_json::from_slice(&frame.body).unwrap() {
         ClientControlResponse::RoutePoll {
-            // WIRE-WAVE2: assert the echoed route test handle.
             route_channel: _route_channel,
             route_epoch: _route_epoch,
             status: None,
@@ -5133,7 +5303,7 @@ async fn run_e2e_bench_cell(
             let mut corr = client_index as u64 * 1_000_000;
             for _ in 0..warmup {
                 let ch = channels[corr as usize % routes];
-                write_frame(&mut stream, &data_request(ch, corr, &payload))
+                write_frame(&mut stream, &data_request(ch, 1, corr, &payload))
                     .await
                     .unwrap();
                 stream.flush().await.unwrap();
@@ -5143,7 +5313,7 @@ async fn run_e2e_bench_cell(
             for _ in 0..measure {
                 let ch = channels[corr as usize % routes];
                 let t0 = Instant::now();
-                write_frame(&mut stream, &data_request(ch, corr, &payload))
+                write_frame(&mut stream, &data_request(ch, 1, corr, &payload))
                     .await
                     .unwrap();
                 stream.flush().await.unwrap();

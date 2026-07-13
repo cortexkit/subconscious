@@ -316,7 +316,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         serde_json::to_vec(&request).unwrap(),

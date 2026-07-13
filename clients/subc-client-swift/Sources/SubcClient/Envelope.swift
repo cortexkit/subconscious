@@ -1,18 +1,16 @@
 import Foundation
 
-// Byte-for-byte port of subc-protocol's 17-byte envelope header.
-// Source of truth: crates/subc-protocol/src/lib.rs (and the TS mirror in
-// clients/subc-client/src/envelope.ts). Field offsets, the little-endian
-// encoding, and the frame-type/flag numbering must stay in lock-step with the
-// Rust; a one-byte drift desynchronizes every frame on the wire.
+// Byte-for-byte mirror of subc-protocol's frozen v2 envelope. The first five
+// bytes stay stable so a reader can reject an unsupported version before it
+// waits for that version's full header.
 
-public let PROTOCOL_VERSION: UInt8 = 1
-public let HEADER_LEN = 17
+public let PROTOCOL_VERSION: UInt8 = 2
+public let HEADER_LEN = 21
 public let FROZEN_PREFIX_LEN = 5
 public let MAX_FRAME_BODY_LEN = 64 * 1024 * 1024
 
 /// `type` byte at offset 5.
-public enum FrameType: UInt8 {
+public enum FrameType: UInt8, Equatable, Sendable {
     case request = 0
     case response = 1
     case push = 2
@@ -25,44 +23,78 @@ public enum FrameType: UInt8 {
     case hello = 9
     case helloAck = 10
     case goodbye = 11
+
+    public var isPureHeader: Bool {
+        switch self {
+        case .cancel, .ping, .pong, .goodbye: true
+        default: false
+        }
+    }
 }
 
 /// Scheduling priority carried in flags bits 1-2.
-public enum Priority: UInt8 {
+public enum Priority: UInt8, Equatable, Sendable {
     case passive = 0
     case interactive = 1
     case background = 2
 }
 
-/// Build the flags byte from typed components (mirrors Flags::new).
-/// bit0 = binary, bits1-2 = priority, bit3 = last.
-public func buildFlags(binary: Bool, priority: Priority, last: Bool) -> UInt8 {
-    var b: UInt8 = 0
-    if binary { b |= 0b0000_0001 }
-    b |= priority.rawValue << 1
-    if last { b |= 0b0000_1000 }
-    return b
+/// Admission behavior carried in flags bits 4-5.
+public enum AdmissionClass: UInt8, Equatable, Sendable {
+    case normal = 0
+    case expedite = 1
+    case sheddable = 2
 }
 
-public struct EnvelopeHeader {
+/// Build the flags byte from typed components.
+public func buildFlags(
+    binary: Bool,
+    priority: Priority,
+    last: Bool,
+    admissionClass: AdmissionClass = .normal
+) -> UInt8 {
+    var bits: UInt8 = 0
+    if binary { bits |= 0b0000_0001 }
+    bits |= priority.rawValue << 1
+    if last { bits |= 0b0000_1000 }
+    bits |= admissionClass.rawValue << 4
+    return bits
+}
+
+public struct EnvelopeHeader: Equatable, Sendable {
     public var len: UInt32
     public var ver: UInt8
     public var ty: FrameType
     public var flags: UInt8
     public var channel: UInt16
+    public var epoch: UInt32
     public var corr: UInt64
 
-    public init(len: UInt32, ver: UInt8, ty: FrameType, flags: UInt8, channel: UInt16, corr: UInt64) {
+    /// Typed view of flags bits 4-5. Invalid raw headers return nil until decode rejects them.
+    public var admissionClass: AdmissionClass? {
+        AdmissionClass(rawValue: (flags >> 4) & 0b11)
+    }
+
+    public init(
+        len: UInt32,
+        ver: UInt8,
+        ty: FrameType,
+        flags: UInt8,
+        channel: UInt16,
+        epoch: UInt32,
+        corr: UInt64
+    ) {
         self.len = len
         self.ver = ver
         self.ty = ty
         self.flags = flags
         self.channel = channel
+        self.epoch = epoch
         self.corr = corr
     }
 }
 
-public struct Frame {
+public struct Frame: Equatable, Sendable {
     public var header: EnvelopeHeader
     public var body: Data
 
@@ -72,39 +104,151 @@ public struct Frame {
     }
 }
 
-public struct DecodeError: Error { public let message: String }
+public enum DecodeError: Error, Equatable, CustomStringConvertible {
+    case tooShortForPrefix(have: Int)
+    case unsupportedVersion(ver: UInt8)
+    case tooShortForHeader(have: Int, need: Int)
+    case unknownFrameType(byte: UInt8)
+    case reservedFlagBits(flags: UInt8)
+    case reservedPriorityBits(flags: UInt8)
+    case reservedAdmissionClass(flags: UInt8)
+    case sheddableIllegalFrameType(ty: FrameType, flags: UInt8)
+    case nonzeroEpochOnControlChannel(epoch: UInt32)
+    case pureHeaderFrameWithBody(ty: FrameType, len: UInt32)
 
-/// Serialize a header to its fixed 17-byte little-endian form.
-public func encodeHeader(_ h: EnvelopeHeader) -> Data {
-    var d = Data()
-    withUnsafeBytes(of: h.len.littleEndian) { d.append(contentsOf: $0) }
-    d.append(h.ver)
-    d.append(h.ty.rawValue)
-    d.append(h.flags)
-    withUnsafeBytes(of: h.channel.littleEndian) { d.append(contentsOf: $0) }
-    withUnsafeBytes(of: h.corr.littleEndian) { d.append(contentsOf: $0) }
-    return d
+    public var description: String {
+        switch self {
+        case let .tooShortForPrefix(have):
+            "too short for frozen prefix: have \(have), need \(FROZEN_PREFIX_LEN)"
+        case let .unsupportedVersion(ver):
+            "unsupported envelope version \(ver)"
+        case let .tooShortForHeader(have, need):
+            "too short for header: have \(have), need \(need)"
+        case let .unknownFrameType(byte):
+            "unknown frame type byte \(byte)"
+        case let .reservedFlagBits(flags):
+            "reserved flag bits set in \(flags)"
+        case let .reservedPriorityBits(flags):
+            "reserved priority bits set in \(flags)"
+        case let .reservedAdmissionClass(flags):
+            "reserved admission class in \(flags)"
+        case let .sheddableIllegalFrameType(ty, flags):
+            "sheddable admission class is illegal for frame type \(ty) in \(flags)"
+        case let .nonzeroEpochOnControlChannel(epoch):
+            "control channel carried nonzero epoch \(epoch)"
+        case let .pureHeaderFrameWithBody(ty, len):
+            "pure-header frame \(ty) declared \(len) body bytes"
+        }
+    }
 }
 
-/// Decode a header from a 17-byte buffer. Minimal validation for the spike
-/// (version + frame-type recognized); the full reserved-bit / pure-header
-/// validation lands with the golden-vector test suite.
+/// Decode and validate the frozen prefix without requiring the rest of a frame.
+/// The body length is returned only after the exact supported version is known.
+func decodeFrozenPrefix(_ bytes: Data) throws -> UInt32 {
+    let raw = [UInt8](bytes)
+    guard raw.count >= FROZEN_PREFIX_LEN else {
+        throw DecodeError.tooShortForPrefix(have: raw.count)
+    }
+    guard raw[4] == PROTOCOL_VERSION else {
+        throw DecodeError.unsupportedVersion(ver: raw[4])
+    }
+    return UInt32(raw[0])
+        | (UInt32(raw[1]) << 8)
+        | (UInt32(raw[2]) << 16)
+        | (UInt32(raw[3]) << 24)
+}
+
+/// Serialize a header to its fixed 21-byte little-endian form.
+public func encodeHeader(_ header: EnvelopeHeader) -> Data {
+    var data = Data()
+    withUnsafeBytes(of: header.len.littleEndian) { data.append(contentsOf: $0) }
+    data.append(header.ver)
+    data.append(header.ty.rawValue)
+    data.append(header.flags)
+    withUnsafeBytes(of: header.channel.littleEndian) { data.append(contentsOf: $0) }
+    withUnsafeBytes(of: header.epoch.littleEndian) { data.append(contentsOf: $0) }
+    withUnsafeBytes(of: header.corr.littleEndian) { data.append(contentsOf: $0) }
+    return data
+}
+
+/// Decode a v2 header and apply the same validation ordering and taxonomy as
+/// subc-protocol. Version validation needs only the frozen five-byte prefix.
 public func decodeHeader(_ bytes: Data) throws -> EnvelopeHeader {
-    let b = [UInt8](bytes)
-    guard b.count >= HEADER_LEN else { throw DecodeError(message: "header too short: \(b.count) bytes") }
-    guard b[4] == PROTOCOL_VERSION else { throw DecodeError(message: "unsupported envelope version \(b[4])") }
-    let len = UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24)
-    guard let ty = FrameType(rawValue: b[5]) else { throw DecodeError(message: "unknown frame type byte \(b[5])") }
-    let channel = UInt16(b[7]) | (UInt16(b[8]) << 8)
+    let raw = [UInt8](bytes)
+    _ = try decodeFrozenPrefix(bytes)
+    guard raw.count >= HEADER_LEN else {
+        throw DecodeError.tooShortForHeader(have: raw.count, need: HEADER_LEN)
+    }
+
+    let len = UInt32(raw[0])
+        | (UInt32(raw[1]) << 8)
+        | (UInt32(raw[2]) << 16)
+        | (UInt32(raw[3]) << 24)
+    guard let ty = FrameType(rawValue: raw[5]) else {
+        throw DecodeError.unknownFrameType(byte: raw[5])
+    }
+    let flags = raw[6]
+    guard flags & 0b1100_0000 == 0 else {
+        throw DecodeError.reservedFlagBits(flags: flags)
+    }
+    guard (flags >> 1) & 0b11 != 0b11 else {
+        throw DecodeError.reservedPriorityBits(flags: flags)
+    }
+    let admissionBits = (flags >> 4) & 0b11
+    guard admissionBits != 0b11 else {
+        throw DecodeError.reservedAdmissionClass(flags: flags)
+    }
+    if admissionBits == AdmissionClass.sheddable.rawValue,
+       ty != .push, ty != .streamData
+    {
+        throw DecodeError.sheddableIllegalFrameType(ty: ty, flags: flags)
+    }
+    if ty.isPureHeader, len != 0 {
+        throw DecodeError.pureHeaderFrameWithBody(ty: ty, len: len)
+    }
+
+    let channel = UInt16(raw[7]) | (UInt16(raw[8]) << 8)
+    let epoch = UInt32(raw[9])
+        | (UInt32(raw[10]) << 8)
+        | (UInt32(raw[11]) << 16)
+        | (UInt32(raw[12]) << 24)
+    guard channel != 0 || epoch == 0 else {
+        throw DecodeError.nonzeroEpochOnControlChannel(epoch: epoch)
+    }
     var corr: UInt64 = 0
-    for i in 0..<8 { corr |= UInt64(b[9 + i]) << (8 * UInt64(i)) }
-    return EnvelopeHeader(len: len, ver: b[4], ty: ty, flags: b[6], channel: channel, corr: corr)
+    for index in 0..<8 {
+        corr |= UInt64(raw[13 + index]) << (8 * UInt64(index))
+    }
+    return EnvelopeHeader(
+        len: len,
+        ver: raw[4],
+        ty: ty,
+        flags: flags,
+        channel: channel,
+        epoch: epoch,
+        corr: corr
+    )
 }
 
-/// Encode a frame to wire bytes: 17-byte header followed by `len` body bytes.
-public func encodeFrame(ty: FrameType, flags: UInt8, channel: UInt16, corr: UInt64, body: Data) -> Data {
-    let header = EnvelopeHeader(len: UInt32(body.count), ver: PROTOCOL_VERSION, ty: ty, flags: flags, channel: channel, corr: corr)
-    var out = encodeHeader(header)
-    out.append(body)
-    return out
+/// Encode a frame to wire bytes: 21-byte header followed by `len` body bytes.
+public func encodeFrame(
+    ty: FrameType,
+    flags: UInt8,
+    channel: UInt16,
+    epoch: UInt32,
+    corr: UInt64,
+    body: Data
+) -> Data {
+    let header = EnvelopeHeader(
+        len: UInt32(body.count),
+        ver: PROTOCOL_VERSION,
+        ty: ty,
+        flags: flags,
+        channel: channel,
+        epoch: epoch,
+        corr: corr
+    )
+    var output = encodeHeader(header)
+    output.append(body)
+    return output
 }

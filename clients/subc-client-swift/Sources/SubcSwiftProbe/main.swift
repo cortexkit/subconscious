@@ -164,9 +164,9 @@ do {
             print("[turn \(i + 1)] DONE finalLen=\(finalLen) cursor=\(cursor.map { "\($0.walSeq):\($0.subIndex)" } ?? "nil")")
         }
     } else if catalog.contains(where: { $0.moduleId == "ai-provider-quota" }) {
-        let ch = try client.routeOpenManagementSurface(
+        let route = try client.routeOpenManagementSurface(
             moduleId: "ai-provider-quota", projectRoot: projectRoot, harness: "swift-probe", session: "p1")
-        let result = try client.callManagement(routeChannel: ch, method: "usage.get")
+        let result = try client.callManagement(route: route, method: "usage.get")
         let providers = result["result"] as? [[String: Any]] ?? []
         print("[swift-probe] usage.get -> \(providers.count) provider entries")
     }

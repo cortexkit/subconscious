@@ -25,40 +25,55 @@
       "ty": 0,
       "flags": 2,
       "channel": 0,
+      "epoch": 0,
       "corr": 1,
       "body_hex": "7b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a2270696e67227d",
-      "expected_header_hex": "2800000001000200000100000000000000",
-      "expected_frame_hex": "28000000010002000001000000000000007b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a2270696e67227d"
+      "expected_header_hex": "280000000200020000000000000100000000000000",
+      "expected_frame_hex": "2800000002000200000000000001000000000000007b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a2270696e67227d"
     },
     {
       "name": "goodbye_pure_header",
       "ty": 11,
       "flags": 0,
       "channel": 0,
+      "epoch": 0,
       "corr": 7,
       "body_hex": "",
-      "expected_header_hex": "00000000010b0000000700000000000000",
-      "expected_frame_hex": "00000000010b0000000700000000000000"
+      "expected_header_hex": "00000000020b000000000000000700000000000000",
+      "expected_frame_hex": "00000000020b000000000000000700000000000000"
     },
     {
-      "name": "stream_data_binary_large_corr",
+      "name": "stream_data_expedite_epoch_one",
       "ty": 3,
-      "flags": 13,
+      "flags": 29,
       "channel": 513,
+      "epoch": 1,
       "corr": 320255973501901,
       "body_hex": "000102037f80feff",
-      "expected_header_hex": "0800000001030d0102cdab896745230100",
-      "expected_frame_hex": "0800000001030d0102cdab896745230100000102037f80feff"
+      "expected_header_hex": "0800000002031d010201000000cdab896745230100",
+      "expected_frame_hex": "0800000002031d010201000000cdab896745230100000102037f80feff"
     },
     {
-      "name": "error_json_max_channel",
+      "name": "error_json_max_epoch",
       "ty": 5,
       "flags": 4,
       "channel": 65535,
+      "epoch": 4294967295,
       "corr": 99,
       "body_hex": "7b22636f6465223a226261645f72657175657374222c226d657373616765223a226f6f7073227d",
-      "expected_header_hex": "27000000010504ffff6300000000000000",
-      "expected_frame_hex": "27000000010504ffff63000000000000007b22636f6465223a226261645f72657175657374222c226d657373616765223a226f6f7073227d"
+      "expected_header_hex": "27000000020504ffffffffffff6300000000000000",
+      "expected_frame_hex": "27000000020504ffffffffffff63000000000000007b22636f6465223a226261645f72657175657374222c226d657373616765223a226f6f7073227d"
+    },
+    {
+      "name": "push_sheddable_max_epoch",
+      "ty": 2,
+      "flags": 32,
+      "channel": 42,
+      "epoch": 4294967295,
+      "corr": 0,
+      "body_hex": "010203",
+      "expected_header_hex": "030000000202202a00ffffffff0000000000000000",
+      "expected_frame_hex": "030000000202202a00ffffffff0000000000000000010203"
     }
   ]
 }

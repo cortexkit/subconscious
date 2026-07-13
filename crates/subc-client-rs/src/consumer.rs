@@ -14,11 +14,13 @@ use std::{
     time::Duration,
 };
 
-use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
+use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind};
 use subc_protocol::{
-    BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget,
-    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    AdmissionClass, BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority,
+    RouteTarget, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
+
+use crate::RouteHandle;
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
     FrameIoError,
@@ -28,7 +30,7 @@ use tokio::{
     net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpStream},
     sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
-    time::{sleep, Instant},
+    time::{sleep, timeout_at, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -129,6 +131,8 @@ pub struct CallOptions {
     /// Deadline for the whole managed call, including route-open retry and the response wait.
     pub timeout: Duration,
     pub priority: Priority,
+    /// Admission behavior stamped into the request frame. Defaults to NORMAL.
+    pub admission_class: AdmissionClass,
     pub route_retry: RetryBackoff,
     /// Maximum real-time limit for retrying route.open attempts when the target is temporarily absent.
     pub route_retry_deadline: Duration,
@@ -146,6 +150,7 @@ impl Default for CallOptions {
         Self {
             timeout: DEFAULT_CALL_TIMEOUT,
             priority: Priority::Interactive,
+            admission_class: AdmissionClass::Normal,
             route_retry: RetryBackoff::default(),
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
             consumer_identity: None,
@@ -158,6 +163,8 @@ impl Default for CallOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeOptions {
     pub priority: Priority,
+    /// Admission behavior stamped into the subscription request. Defaults to NORMAL.
+    pub admission_class: AdmissionClass,
     /// Maximum number of events buffered for the caller before the subscription is dropped.
     /// The reader task never awaits a slow event consumer; if this bounded channel fills,
     /// `closed()` resolves with [`CallError::SubscriptionBackpressure`].
@@ -181,6 +188,7 @@ impl Default for SubscribeOptions {
     fn default() -> Self {
         Self {
             priority: Priority::Interactive,
+            admission_class: AdmissionClass::Normal,
             event_buffer: DEFAULT_SUBSCRIPTION_EVENT_BUFFER,
             route_retry: RetryBackoff::default(),
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
@@ -197,6 +205,14 @@ impl Default for SubscribeOptions {
 pub enum ConnectionState {
     Dropped,
     Restored { epoch: u64 },
+}
+
+/// Result of a route-scoped status or liveness poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutePollResult {
+    pub handle: RouteHandle,
+    pub status: Option<String>,
+    pub live: Option<bool>,
 }
 
 /// Managed Rust consumer for subc route calls.
@@ -239,14 +255,14 @@ impl Subscription {
     /// `(channel, corr)` and settles [`Subscription::closed`] promptly with `Ok(())`.
     /// The provider may still send a terminal frame later; it is ignored because the
     /// local subscription is already closed.
-    pub fn unsubscribe(&self) {
-        self.cancel.unsubscribe();
+    pub fn unsubscribe(&self) -> Result<(), CallError> {
+        self.cancel.unsubscribe()
     }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.cancel.unsubscribe();
+        let _ = self.cancel.unsubscribe();
     }
 }
 
@@ -289,12 +305,14 @@ impl SubscriptionCancel {
         }
     }
 
-    fn unsubscribe(&self) {
+    fn unsubscribe(&self) -> Result<(), CallError> {
+        let handle = RouteHandle::new(self.key.channel, self.key.epoch, self.key.generation);
+        self.shared.validate_current_handle(handle)?;
         if self.cancelled.swap(true, Ordering::AcqRel) {
-            return;
+            return Ok(());
         }
         self.shared
-            .unsubscribe_subscription(self.key, self.priority);
+            .unsubscribe_subscription(self.key, self.priority)
     }
 }
 
@@ -308,6 +326,166 @@ impl SubcConsumer {
         let shared = Arc::new(Shared::new(connection_file.to_path_buf(), opts));
         shared.install_initial(opened)?;
         Ok(Self { shared })
+    }
+
+    /// Open or reuse a managed route and return its connection-fenced handle.
+    pub async fn open_route(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        opts: CallOptions,
+    ) -> Result<RouteHandle, CallError> {
+        let deadline = Instant::now() + opts.timeout;
+        let consumer_identity = route_open_consumer_identity(&opts);
+        let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let key = RouteKey::new(
+            &target,
+            &identity,
+            consumer_identity.as_ref(),
+            consumer_capabilities.as_deref(),
+        );
+        let params = RouteOpenParams {
+            target: &target,
+            identity: &identity,
+            consumer_identity: &consumer_identity,
+            consumer_capabilities: &consumer_capabilities,
+        };
+        self.shared
+            .ensure_route(&key, &params, &opts, deadline)
+            .await
+            .map(|route| route.handle)
+    }
+
+    /// Send one request using an already-opened route handle.
+    pub async fn request(
+        &self,
+        handle: &RouteHandle,
+        body: Vec<u8>,
+        opts: CallOptions,
+    ) -> Result<Vec<u8>, CallError> {
+        let deadline = Instant::now() + opts.timeout;
+        let route = self.shared.route_state(*handle)?;
+        let permit = match timeout_at(deadline, Arc::clone(&route.sem).acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(CallError::StaleRouteHandle(*handle)),
+            Err(_) => {
+                return Err(CallError::not_sent(
+                    "call deadline elapsed waiting for route flow-control",
+                ))
+            }
+        };
+        let result = self
+            .shared
+            .send_request(RequestSend {
+                expected_handle: Some(*handle),
+                channel: handle.channel,
+                epoch: handle.epoch,
+                body,
+                priority: opts.priority,
+                admission_class: opts.admission_class,
+                timeout: remaining_duration(deadline)?,
+                retain_late_route_open: false,
+            })
+            .await;
+        drop(permit);
+        match result? {
+            TerminalFrame::Response { body, .. } => Ok(body),
+            TerminalFrame::StreamEnd => Ok(Vec::new()),
+            TerminalFrame::Error { body } => Err(CallError::Module(body)),
+        }
+    }
+
+    /// Start a held-open request using an already-opened route handle.
+    pub async fn subscribe_route(
+        &self,
+        handle: &RouteHandle,
+        body: Vec<u8>,
+        opts: SubscribeOptions,
+    ) -> Result<Subscription, CallError> {
+        let deadline = Instant::now() + opts.route_open_timeout;
+        let route = self.shared.route_state(*handle)?;
+        let permit = match timeout_at(deadline, Arc::clone(&route.sem).acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(CallError::StaleRouteHandle(*handle)),
+            Err(_) => {
+                return Err(CallError::not_sent(
+                    "subscription deadline elapsed waiting for route flow-control",
+                ))
+            }
+        };
+        self.shared
+            .send_subscription(SubscriptionSend {
+                expected_handle: Some(*handle),
+                channel: handle.channel,
+                epoch: handle.epoch,
+                body,
+                priority: opts.priority,
+                admission_class: opts.admission_class,
+                event_buffer: opts.event_buffer,
+                permit,
+            })
+            .await
+    }
+
+    /// Poll status or liveness for exactly this route handle.
+    pub async fn poll_route(
+        &self,
+        handle: &RouteHandle,
+        kind: PollKind,
+        timeout: Duration,
+    ) -> Result<RoutePollResult, CallError> {
+        let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
+            route_channel: handle.channel,
+            route_epoch: handle.epoch,
+            kind,
+        })
+        .map_err(|err| CallError::not_sent(format!("failed to encode route.poll: {err}")))?;
+        let terminal = self
+            .shared
+            .send_request(RequestSend {
+                expected_handle: Some(*handle),
+                channel: 0,
+                epoch: 0,
+                body,
+                priority: Priority::Interactive,
+                admission_class: AdmissionClass::Normal,
+                timeout,
+                retain_late_route_open: false,
+            })
+            .await?;
+        let TerminalFrame::Response { body, .. } = terminal else {
+            return Err(CallError::not_sent(
+                "route.poll returned a non-response frame",
+            ));
+        };
+        let ClientControlResponse::RoutePoll {
+            route_channel,
+            route_epoch,
+            status,
+            live,
+        } = serde_json::from_slice(&body)
+            .map_err(|err| CallError::not_sent(format!("failed to decode route.poll: {err}")))?
+        else {
+            return Err(CallError::not_sent(
+                "route.poll returned an unexpected control response",
+            ));
+        };
+        if route_channel != handle.channel || route_epoch != handle.epoch {
+            return Err(CallError::not_sent(
+                "route.poll response echoed a different route handle",
+            ));
+        }
+        self.shared.validate_current_handle(*handle)?;
+        Ok(RoutePollResult {
+            handle: *handle,
+            status,
+            live,
+        })
+    }
+
+    /// Locally observed count of unknown or stale route frames dropped by layer-2 validation.
+    pub fn dropped_route_frames(&self) -> u64 {
+        self.shared.lock_inner().dropped_route_frames
     }
 
     /// Managed unary call. Route-open failures happen before the body is sent and are
@@ -342,12 +520,18 @@ impl SubcConsumer {
                 .shared
                 .ensure_route(&route_key, &route_open, &opts, call_deadline)
                 .await?;
-            let permit = match Arc::clone(&route.sem).acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return Err(CallError::not_sent("route flow-control semaphore closed"));
-                }
-            };
+            let permit =
+                match timeout_at(call_deadline, Arc::clone(&route.sem).acquire_owned()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return Err(CallError::not_sent("route flow-control semaphore closed"));
+                    }
+                    Err(_) => {
+                        return Err(CallError::not_sent(
+                            "call deadline elapsed waiting for route flow-control",
+                        ));
+                    }
+                };
 
             if !self.shared.route_is_current(&route_key, &route) {
                 drop(permit);
@@ -360,13 +544,16 @@ impl SubcConsumer {
             let remaining = remaining_duration(call_deadline)?;
             let response = self
                 .shared
-                .send_request(
-                    Some(route.generation),
-                    route.channel,
-                    body.clone(),
-                    opts.priority,
-                    remaining,
-                )
+                .send_request(RequestSend {
+                    expected_handle: Some(route.handle),
+                    channel: route.handle.channel,
+                    epoch: route.handle.epoch,
+                    body: body.clone(),
+                    priority: opts.priority,
+                    admission_class: opts.admission_class,
+                    timeout: remaining,
+                    retain_late_route_open: false,
+                })
                 .await;
             drop(permit);
 
@@ -385,14 +572,12 @@ impl SubcConsumer {
                         && Instant::now() < call_deadline =>
                 {
                     retried_unknown_channel = true;
-                    self.shared
-                        .invalidate_route(&route_key, Some(route.generation));
+                    self.shared.invalidate_route(&route_key, Some(route.handle));
                     continue;
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Err(err) if err.is_not_sent() && Instant::now() < call_deadline => {
-                    self.shared
-                        .invalidate_route(&route_key, Some(route.generation));
+                    self.shared.invalidate_route(&route_key, Some(route.handle));
                     self.shared.ensure_connected_for_call().await?;
                     continue;
                 }
@@ -422,6 +607,7 @@ impl SubcConsumer {
         let route_opts = CallOptions {
             timeout: opts.route_open_timeout,
             priority: opts.priority,
+            admission_class: opts.admission_class,
             route_retry: opts.route_retry,
             route_retry_deadline: opts.route_retry_deadline,
             consumer_identity: opts.consumer_identity.clone(),
@@ -448,12 +634,18 @@ impl SubcConsumer {
                 .shared
                 .ensure_route(&route_key, &route_open, &route_opts, open_deadline)
                 .await?;
-            let permit = match Arc::clone(&route.sem).acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return Err(CallError::not_sent("route flow-control semaphore closed"));
-                }
-            };
+            let permit =
+                match timeout_at(open_deadline, Arc::clone(&route.sem).acquire_owned()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return Err(CallError::not_sent("route flow-control semaphore closed"));
+                    }
+                    Err(_) => {
+                        return Err(CallError::not_sent(
+                            "subscription open deadline elapsed waiting for route flow-control",
+                        ));
+                    }
+                };
 
             if !self.shared.route_is_current(&route_key, &route) {
                 drop(permit);
@@ -465,20 +657,21 @@ impl SubcConsumer {
 
             match self
                 .shared
-                .send_subscription(
-                    Some(route.generation),
-                    route.channel,
-                    body.clone(),
-                    opts.priority,
-                    opts.event_buffer,
+                .send_subscription(SubscriptionSend {
+                    expected_handle: Some(route.handle),
+                    channel: route.handle.channel,
+                    epoch: route.handle.epoch,
+                    body: body.clone(),
+                    priority: opts.priority,
+                    admission_class: opts.admission_class,
+                    event_buffer: opts.event_buffer,
                     permit,
-                )
+                })
                 .await
             {
                 Ok(subscription) => return Ok(subscription),
                 Err(err) if err.is_not_sent() && Instant::now() < open_deadline => {
-                    self.shared
-                        .invalidate_route(&route_key, Some(route.generation));
+                    self.shared.invalidate_route(&route_key, Some(route.handle));
                     self.shared.ensure_connected_for_call().await?;
                     continue;
                 }
@@ -513,6 +706,15 @@ impl SubcConsumer {
             consumer_capabilities.as_deref(),
         );
         self.shared.close_route(&key, &opts).await;
+    }
+
+    /// Close exactly this route handle. A stale connection token fails locally and emits no frame.
+    pub async fn close_handle(
+        &self,
+        handle: &RouteHandle,
+        opts: CloseRouteOptions,
+    ) -> Result<(), CallError> {
+        self.shared.close_handle(*handle, &opts).await
     }
 
     /// Current transport epoch: 1 on initial connect, then +1 per successful reconnect.
@@ -628,6 +830,8 @@ pub enum CallError {
     /// The reader task must never await a slow consumer while it is dispatching frames
     /// for the whole connection, so a full event channel terminates only that subscription.
     SubscriptionBackpressure(Box<dyn Error + Send + Sync>),
+    /// The handle belongs to an earlier connection and no frame was emitted.
+    StaleRouteHandle(RouteHandle),
 }
 
 impl CallError {
@@ -657,6 +861,7 @@ impl fmt::Display for CallError {
             Self::SubscriptionBackpressure(err) => {
                 write!(f, "subscription event channel backpressure: {err}")
             }
+            Self::StaleRouteHandle(handle) => write!(f, "stale route handle: {handle:?}"),
         }
     }
 }
@@ -667,7 +872,7 @@ impl Error for CallError {
             Self::NotSent(err)
             | Self::OutcomeUnknown(err)
             | Self::SubscriptionBackpressure(err) => Some(err.as_ref()),
-            Self::Module(_) => None,
+            Self::Module(_) | Self::StaleRouteHandle(_) => None,
         }
     }
 }
@@ -708,10 +913,12 @@ struct Shared {
 struct Inner {
     generation: u64,
     epoch: u64,
-    next_corr: u64,
+    next_corr: Option<u64>,
     writer: Option<mpsc::Sender<WriteCommand>>,
     pending: HashMap<PendingKey, PendingEntry>,
     routes: HashMap<RouteKey, RouteState>,
+    route_epochs: HashMap<u16, RouteHandle>,
+    dropped_route_frames: u64,
     openings: HashMap<RouteKey, Opening>,
     callbacks: Vec<Callback>,
     closed: bool,
@@ -730,10 +937,12 @@ impl Shared {
             inner: Mutex::new(Inner {
                 generation: 1,
                 epoch: 1,
-                next_corr: 1,
+                next_corr: Some(1),
                 writer: None,
                 pending: HashMap::new(),
                 routes: HashMap::new(),
+                route_epochs: HashMap::new(),
+                dropped_route_frames: 0,
                 openings: HashMap::new(),
                 callbacks: Vec::new(),
                 closed: false,
@@ -787,12 +996,17 @@ impl Shared {
             let (generation, epoch) = match kind {
                 InstallKind::Initial => (inner.generation, inner.epoch),
                 InstallKind::Reconnect => {
-                    inner.generation = inner.generation.saturating_add(1);
-                    inner.epoch = inner.epoch.saturating_add(1);
+                    inner.generation = inner
+                        .generation
+                        .checked_add(1)
+                        .ok_or(ConsumerError::Closed)?;
+                    inner.epoch = inner.epoch.checked_add(1).ok_or(ConsumerError::Closed)?;
                     (inner.generation, inner.epoch)
                 }
             };
             close_routes(&mut inner.routes);
+            inner.route_epochs.clear();
+            inner.next_corr = Some(1);
             inner.writer = Some(tx);
             (
                 generation,
@@ -973,7 +1187,8 @@ impl Shared {
                     return Err(CallError::not_sent("consumer closed"));
                 }
                 if let Some(route) = inner.routes.get(key) {
-                    if route.generation == inner.generation && inner.writer.is_some() {
+                    if route.handle.connection_token() == inner.generation && inner.writer.is_some()
+                    {
                         return Ok(route.clone());
                     }
                 }
@@ -1033,7 +1248,16 @@ impl Shared {
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
             let remaining = remaining_duration(route_deadline)?;
             match self
-                .send_request(None, 0, body, Priority::Interactive, remaining)
+                .send_request(RequestSend {
+                    expected_handle: None,
+                    channel: 0,
+                    epoch: 0,
+                    body,
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    timeout: remaining,
+                    retain_late_route_open: true,
+                })
                 .await
             {
                 Ok(TerminalFrame::Response {
@@ -1047,8 +1271,7 @@ impl Shared {
                         })?;
                     let ClientControlResponse::RouteOpen {
                         route_channel,
-                        // WIRE-WAVE2: retain this epoch in the consumer route handle.
-                        route_epoch: _route_epoch,
+                        route_epoch,
                     } = response
                     else {
                         return Err(CallError::not_sent(
@@ -1056,8 +1279,7 @@ impl Shared {
                         ));
                     };
                     let route = RouteState {
-                        channel: route_channel,
-                        generation,
+                        handle: RouteHandle::new(route_channel, route_epoch, generation),
                         sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
                     };
                     let install = {
@@ -1078,13 +1300,15 @@ impl Shared {
                                 closed: closed_during_open,
                             }
                         } else {
-                            RouteInstall::Cached(
-                                inner
-                                    .routes
-                                    .entry(key.clone())
-                                    .or_insert_with(|| route.clone())
-                                    .clone(),
-                            )
+                            let cached = inner
+                                .routes
+                                .entry(key.clone())
+                                .or_insert_with(|| route.clone())
+                                .clone();
+                            inner
+                                .route_epochs
+                                .insert(cached.handle.channel, cached.handle);
+                            RouteInstall::Cached(cached)
                         }
                     };
                     match install {
@@ -1093,7 +1317,8 @@ impl Shared {
                             if closed {
                                 // GOODBYE the channel we opened so the daemon/module don't
                                 // leak it, then report the close as a NotSent failure.
-                                self.send_route_goodbye(generation, route.channel);
+                                self.send_route_goodbye(route.handle, true);
+                                self.uninstall_route_handle(route.handle);
                                 return Err(CallError::not_sent(
                                     "route was closed before route.open completed",
                                 ));
@@ -1155,34 +1380,56 @@ impl Shared {
 
     async fn send_request(
         self: &Arc<Self>,
-        expected_generation: Option<u64>,
-        channel: u16,
-        body: Vec<u8>,
-        priority: Priority,
-        timeout: Duration,
+        request: RequestSend,
     ) -> Result<TerminalFrame, CallError> {
+        let RequestSend {
+            expected_handle,
+            channel,
+            epoch,
+            body,
+            priority,
+            admission_class,
+            timeout,
+            retain_late_route_open,
+        } = request;
         let (generation, corr, writer) = {
             let mut inner = self.lock_inner();
             if inner.closed {
                 return Err(CallError::not_sent("consumer closed"));
             }
             let generation = inner.generation;
-            if expected_generation.is_some_and(|expected| expected != generation) {
-                return Err(CallError::not_sent("route generation is stale before send"));
+            if let Some(expected) = expected_handle {
+                let route_pair_matches =
+                    channel == 0 || (expected.channel == channel && expected.epoch == epoch);
+                if expected.connection_token() != generation
+                    || !route_pair_matches
+                    || inner.route_epochs.get(&expected.channel) != Some(&expected)
+                {
+                    return Err(CallError::StaleRouteHandle(expected));
+                }
             }
             let Some(writer) = inner.writer.clone() else {
                 return Err(CallError::not_sent("subc connection is down before send"));
             };
-            let corr = inner.next_corr;
-            inner.next_corr = inner.next_corr.saturating_add(1).max(1);
+            let Some(corr) = inner.next_corr else {
+                drop(inner);
+                self.handle_generation_drop(
+                    generation,
+                    "channel-0 correlation allocator exhausted".to_string(),
+                );
+                return Err(CallError::not_sent(
+                    "correlation allocator exhausted; connection closed",
+                ));
+            };
+            inner.next_corr = corr.checked_add(1);
             (generation, corr, writer)
         };
 
         let frame = Frame::build(
             FrameType::Request,
-            Flags::new(false, priority, false),
-            channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            Flags::new(false, priority, false).with_admission_class(admission_class),
+            channel,
+            epoch,
             corr,
             body,
         )
@@ -1190,6 +1437,7 @@ impl Shared {
         let key = PendingKey {
             generation,
             channel,
+            epoch,
             corr,
         };
         let (tx, rx) = oneshot::channel();
@@ -1200,9 +1448,21 @@ impl Shared {
                     "connection changed before request registration",
                 ));
             }
-            inner.pending.insert(key, PendingEntry::unary(tx));
+            if let Some(expected) = expected_handle {
+                if inner.route_epochs.get(&expected.channel) != Some(&expected) {
+                    return Err(CallError::StaleRouteHandle(expected));
+                }
+            }
+            let expected_control_handle = (channel == 0 && !retain_late_route_open)
+                .then_some(expected_handle)
+                .flatten();
+            inner.pending.insert(
+                key,
+                PendingEntry::unary(tx, retain_late_route_open, expected_control_handle),
+            );
         }
-        let mut registration = PendingRegistration::new(Arc::clone(self), key);
+        let mut registration =
+            PendingRegistration::new(Arc::clone(self), key, retain_late_route_open);
 
         if writer
             .send(WriteCommand {
@@ -1228,7 +1488,12 @@ impl Shared {
                 }
             }
             () = sleep(timeout) => {
-                let accepted = registration.remove_pending().unwrap_or(false);
+                let accepted = if retain_late_route_open {
+                    registration.disarm();
+                    self.pending_accepted(key).unwrap_or(false)
+                } else {
+                    registration.remove_pending().unwrap_or(false)
+                };
                 Err(classify_failure(accepted, format!("request on channel {channel} timed out after {timeout:?}")))
             }
             () = self.close_token.cancelled() => {
@@ -1240,35 +1505,55 @@ impl Shared {
 
     async fn send_subscription(
         self: &Arc<Self>,
-        expected_generation: Option<u64>,
-        channel: u16,
-        body: Vec<u8>,
-        priority: Priority,
-        event_buffer: usize,
-        permit: OwnedSemaphorePermit,
+        subscription: SubscriptionSend,
     ) -> Result<Subscription, CallError> {
+        let SubscriptionSend {
+            expected_handle,
+            channel,
+            epoch,
+            body,
+            priority,
+            admission_class,
+            event_buffer,
+            permit,
+        } = subscription;
         let (generation, corr, writer) = {
             let mut inner = self.lock_inner();
             if inner.closed {
                 return Err(CallError::not_sent("consumer closed"));
             }
             let generation = inner.generation;
-            if expected_generation.is_some_and(|expected| expected != generation) {
-                return Err(CallError::not_sent("route generation is stale before send"));
+            if let Some(expected) = expected_handle {
+                if expected.connection_token() != generation
+                    || expected.channel != channel
+                    || expected.epoch != epoch
+                    || inner.route_epochs.get(&channel) != Some(&expected)
+                {
+                    return Err(CallError::StaleRouteHandle(expected));
+                }
             }
             let Some(writer) = inner.writer.clone() else {
                 return Err(CallError::not_sent("subc connection is down before send"));
             };
-            let corr = inner.next_corr;
-            inner.next_corr = inner.next_corr.saturating_add(1).max(1);
+            let Some(corr) = inner.next_corr else {
+                drop(inner);
+                self.handle_generation_drop(
+                    generation,
+                    "correlation allocator exhausted".to_string(),
+                );
+                return Err(CallError::not_sent(
+                    "correlation allocator exhausted; connection closed",
+                ));
+            };
+            inner.next_corr = corr.checked_add(1);
             (generation, corr, writer)
         };
 
         let frame = Frame::build(
             FrameType::Request,
-            Flags::new(false, priority, false),
-            channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            Flags::new(false, priority, false).with_admission_class(admission_class),
+            channel,
+            epoch,
             corr,
             body,
         )
@@ -1276,6 +1561,7 @@ impl Shared {
         let key = PendingKey {
             generation,
             channel,
+            epoch,
             corr,
         };
         let (events_tx, events_rx) = mpsc::channel(event_buffer.max(1));
@@ -1287,12 +1573,17 @@ impl Shared {
                     "connection changed before subscription registration",
                 ));
             }
+            if let Some(expected) = expected_handle {
+                if inner.route_epochs.get(&expected.channel) != Some(&expected) {
+                    return Err(CallError::StaleRouteHandle(expected));
+                }
+            }
             inner.pending.insert(
                 key,
                 PendingEntry::subscription(events_tx, closed_tx, permit, priority),
             );
         }
-        let mut registration = PendingRegistration::new(Arc::clone(self), key);
+        let mut registration = PendingRegistration::new(Arc::clone(self), key, false);
 
         if writer
             .send(WriteCommand {
@@ -1317,12 +1608,19 @@ impl Shared {
         })
     }
 
-    fn unsubscribe_subscription(&self, key: PendingKey, priority: Priority) {
+    fn unsubscribe_subscription(
+        &self,
+        key: PendingKey,
+        priority: Priority,
+    ) -> Result<(), CallError> {
+        let handle = RouteHandle::new(key.channel, key.epoch, key.generation);
+        self.validate_current_handle(handle)?;
         let entry = self.lock_inner().pending.remove(&key);
         if let Some(entry) = entry {
             entry.settle_subscription_result(Ok(()));
-            self.send_cancel(key.generation, key.channel, key.corr, priority);
+            self.send_cancel(handle, key.corr, priority);
         }
+        Ok(())
     }
 
     fn route_stream_data(&self, key: PendingKey, body: Vec<u8>) {
@@ -1364,14 +1662,21 @@ impl Shared {
 
         if let Some((entry, priority, reason)) = overflow {
             entry.settle_call_error(CallError::subscription_backpressure(reason));
-            self.send_cancel(key.generation, key.channel, key.corr, priority);
+            self.send_cancel(
+                RouteHandle::new(key.channel, key.epoch, key.generation),
+                key.corr,
+                priority,
+            );
         }
     }
 
-    fn send_cancel(&self, generation: u64, channel: u16, corr: u64, priority: Priority) {
+    fn send_cancel(&self, handle: RouteHandle, corr: u64, priority: Priority) {
         let writer = {
             let inner = self.lock_inner();
-            if inner.closed || inner.generation != generation {
+            if inner.closed
+                || inner.generation != handle.connection_token()
+                || inner.route_epochs.get(&handle.channel) != Some(&handle)
+            {
                 return;
             }
             inner.writer.clone()
@@ -1382,8 +1687,8 @@ impl Shared {
         let Ok(frame) = Frame::build(
             FrameType::Cancel,
             Flags::new(false, priority, false),
-            channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            handle.channel,
+            handle.epoch,
             corr,
             Vec::new(),
         ) else {
@@ -1407,11 +1712,33 @@ impl Shared {
         true
     }
 
-    fn settle_pending(&self, key: PendingKey, terminal: PendingTerminal) {
+    fn settle_pending(self: &Arc<Self>, key: PendingKey, terminal: PendingTerminal) {
         let entry = self.lock_inner().pending.remove(&key);
-        if let Some(entry) = entry {
-            entry.settle_terminal(terminal);
+        let Some(entry) = entry else {
+            return;
+        };
+        if entry.retain_late_route_open && entry.completion_is_closed() {
+            if let PendingTerminal::Response { generation, body } = &terminal {
+                if let Ok(ClientControlResponse::RouteOpen {
+                    route_channel,
+                    route_epoch,
+                }) = serde_json::from_slice::<ClientControlResponse>(body)
+                {
+                    let handle = RouteHandle::new(route_channel, route_epoch, *generation);
+                    self.send_route_goodbye(handle, true);
+                    self.uninstall_route_handle(handle);
+                }
+            }
+            return;
         }
+        entry.settle_terminal(terminal);
+    }
+
+    fn pending_accepted(&self, key: PendingKey) -> Option<bool> {
+        self.lock_inner()
+            .pending
+            .get(&key)
+            .map(|entry| entry.accepted)
     }
 
     fn handle_generation_drop(self: &Arc<Self>, generation: u64, reason: String) {
@@ -1423,6 +1750,7 @@ impl Shared {
             inner.writer = None;
             inner.restored_token = inner.restored_token.saturating_add(1);
             close_routes(&mut inner.routes);
+            inner.route_epochs.clear();
             let pending = drain_pending_generation(&mut inner.pending, generation);
             let openings = drain_openings(&mut inner.openings);
             let callbacks = inner.callbacks.clone();
@@ -1446,6 +1774,7 @@ impl Shared {
             }
             inner.closed = true;
             inner.writer = None;
+            inner.route_epochs.clear();
             self.close_token.cancel();
             (
                 inner
@@ -1485,24 +1814,54 @@ impl Shared {
         self.notify.notify_waiters();
     }
 
+    fn validate_current_handle(&self, handle: RouteHandle) -> Result<(), CallError> {
+        let inner = self.lock_inner();
+        if inner.closed
+            || inner.generation != handle.connection_token()
+            || inner.writer.is_none()
+            || inner.route_epochs.get(&handle.channel) != Some(&handle)
+        {
+            Err(CallError::StaleRouteHandle(handle))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn route_state(&self, handle: RouteHandle) -> Result<RouteState, CallError> {
+        self.validate_current_handle(handle)?;
+        self.lock_inner()
+            .routes
+            .values()
+            .find(|route| route.handle == handle)
+            .cloned()
+            .ok_or(CallError::StaleRouteHandle(handle))
+    }
+
     fn route_is_current(&self, key: &RouteKey, route: &RouteState) -> bool {
         let inner = self.lock_inner();
-        if inner.closed || inner.generation != route.generation || inner.writer.is_none() {
+        if inner.closed
+            || inner.generation != route.handle.connection_token()
+            || inner.writer.is_none()
+        {
             return false;
         }
         inner.routes.get(key).is_some_and(|cached| {
-            cached.generation == route.generation
-                && cached.channel == route.channel
-                && Arc::ptr_eq(&cached.sem, &route.sem)
+            cached.handle == route.handle && Arc::ptr_eq(&cached.sem, &route.sem)
         })
     }
 
-    fn invalidate_route(&self, key: &RouteKey, generation: Option<u64>) {
+    fn invalidate_route(&self, key: &RouteKey, expected_handle: Option<RouteHandle>) {
         let removed = {
             let mut inner = self.lock_inner();
             match inner.routes.get(key) {
-                Some(route) if generation.is_none_or(|expected| expected == route.generation) => {
-                    inner.routes.remove(key)
+                Some(route) if expected_handle.is_none_or(|expected| expected == route.handle) => {
+                    let removed = inner.routes.remove(key);
+                    if let Some(route) = &removed {
+                        if inner.route_epochs.get(&route.handle.channel) == Some(&route.handle) {
+                            inner.route_epochs.remove(&route.handle.channel);
+                        }
+                    }
+                    removed
                 }
                 _ => None,
             }
@@ -1517,6 +1876,35 @@ impl Shared {
         for waiter in opening.map(|o| o.waiters).unwrap_or_default() {
             let _ = waiter.send(result.clone());
         }
+    }
+
+    async fn close_handle(
+        self: &Arc<Self>,
+        handle: RouteHandle,
+        opts: &CloseRouteOptions,
+    ) -> Result<(), CallError> {
+        self.validate_current_handle(handle)?;
+        let routes = {
+            let mut inner = self.lock_inner();
+            let keys = inner
+                .routes
+                .iter()
+                .filter_map(|(key, route)| (route.handle == handle).then_some(key.clone()))
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| inner.routes.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        if opts.drain {
+            self.drain_channel(handle, opts.drain_timeout).await;
+        }
+        for route in routes {
+            route.sem.close();
+        }
+        self.fail_channel_pending(handle, "route closed by close_handle");
+        self.send_route_goodbye(handle, false);
+        self.uninstall_route_handle(handle);
+        Ok(())
     }
 
     /// Tear down one route by key. See [`SubcConsumer::close_route`].
@@ -1541,32 +1929,35 @@ impl Shared {
         if opts.drain {
             // Wait for in-flight UNARY requests on this channel to settle naturally,
             // bounded by drain_timeout, before tearing the route down.
-            self.drain_channel(route.generation, route.channel, opts.drain_timeout)
-                .await;
+            self.drain_channel(route.handle, opts.drain_timeout).await;
         }
 
         // Closing the semaphore makes any not-yet-sent acquire() return Err -> the
         // caller classifies it NotSent. Already-sent pending requests are settled
         // at-most-once (OutcomeUnknown if the writer accepted their bytes).
         route.sem.close();
-        self.fail_channel_pending(
-            route.generation,
-            route.channel,
-            "route closed by close_route",
-        );
+        self.fail_channel_pending(route.handle, "route closed by close_route");
 
         // Best-effort route GOODBYE: the daemon releases the route + relays the module
         // route-gone GOODBYE the module's reaper consumes. One-way, no ack.
-        self.send_route_goodbye(route.generation, route.channel);
+        self.send_route_goodbye(route.handle, false);
+        self.uninstall_route_handle(route.handle);
+    }
+
+    fn uninstall_route_handle(&self, handle: RouteHandle) {
+        let mut inner = self.lock_inner();
+        if inner.route_epochs.get(&handle.channel) == Some(&handle) {
+            inner.route_epochs.remove(&handle.channel);
+        }
     }
 
     /// Settle every in-flight pending request on `channel` (this generation) as an
     /// at-most-once failure: OutcomeUnknown if the writer already accepted its bytes,
     /// NotSent otherwise. Mirrors the connection-drop path, scoped to one channel.
-    fn fail_channel_pending(&self, generation: u64, channel: u16, reason: &str) {
+    fn fail_channel_pending(&self, handle: RouteHandle, reason: &str) {
         let entries = {
             let mut inner = self.lock_inner();
-            drain_pending_channel(&mut inner.pending, generation, channel, true)
+            drain_pending_handle(&mut inner.pending, handle, true)
         };
         settle_pending_entries(entries, reason.to_string());
     }
@@ -1574,14 +1965,15 @@ impl Shared {
     /// Resolve once every in-flight unary pending on `channel` has settled, or the
     /// timeout elapses. Polls the pending map (entries are removed on settle); the
     /// volume here is tiny (a route window is small) so a short poll is adequate.
-    async fn drain_channel(&self, generation: u64, channel: u16, timeout: Duration) {
+    async fn drain_channel(&self, handle: RouteHandle, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
             let has_inflight = {
                 let inner = self.lock_inner();
                 inner.pending.iter().any(|(key, entry)| {
-                    key.generation == generation
-                        && key.channel == channel
+                    key.generation == handle.connection_token()
+                        && key.channel == handle.channel
+                        && key.epoch == handle.epoch
                         && !entry.is_subscription()
                 })
             };
@@ -1592,36 +1984,49 @@ impl Shared {
         }
     }
 
-    /// Send a best-effort header-only route GOODBYE for `channel` (this generation).
-    /// One-way: the daemon releases the route and relays a route-gone GOODBYE to the
-    /// module. Dropped silently if the connection is gone (the route died with it).
-    fn send_route_goodbye(&self, generation: u64, channel: u16) {
+    /// Queue a header-only route GOODBYE if `handle` is still live on this connection.
+    /// Late successful route.open cleanup sets `close_on_failure`: orphan prevention then
+    /// requires closing the connection when the GOODBYE cannot enter the writer queue.
+    fn send_route_goodbye(self: &Arc<Self>, handle: RouteHandle, close_on_failure: bool) -> bool {
         let writer = {
             let inner = self.lock_inner();
-            if inner.closed || inner.generation != generation {
-                return;
+            if inner.closed
+                || inner.generation != handle.connection_token()
+                || inner.route_epochs.get(&handle.channel) != Some(&handle)
+            {
+                return false;
             }
             inner.writer.clone()
         };
         let Some(writer) = writer else {
-            return;
+            return false;
         };
         let Ok(frame) = Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Interactive, false),
-            channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            handle.channel,
+            handle.epoch,
             0,
             Vec::new(),
         ) else {
-            return;
+            return false;
         };
-        // try_send: best-effort, never block the caller; a full egress means the
-        // connection is saturated and the route is being torn down regardless.
-        let _ = writer.try_send(WriteCommand {
-            frame,
-            pending: None,
-        });
+        if writer
+            .try_send(WriteCommand {
+                frame,
+                pending: None,
+            })
+            .is_ok()
+        {
+            return true;
+        }
+        if close_on_failure {
+            self.handle_generation_drop(
+                handle.connection_token(),
+                "failed to queue late route.open cleanup GOODBYE".to_string(),
+            );
+        }
+        false
     }
 
     fn emit_connection_state(&self, state: ConnectionState) {
@@ -1663,6 +2068,28 @@ struct RouteOpenParams<'a> {
     consumer_capabilities: &'a Option<Vec<String>>,
 }
 
+struct RequestSend {
+    expected_handle: Option<RouteHandle>,
+    channel: u16,
+    epoch: u32,
+    body: Vec<u8>,
+    priority: Priority,
+    admission_class: AdmissionClass,
+    timeout: Duration,
+    retain_late_route_open: bool,
+}
+
+struct SubscriptionSend {
+    expected_handle: Option<RouteHandle>,
+    channel: u16,
+    epoch: u32,
+    body: Vec<u8>,
+    priority: Priority,
+    admission_class: AdmissionClass,
+    event_buffer: usize,
+    permit: OwnedSemaphorePermit,
+}
+
 struct OpeningGuard {
     shared: Arc<Shared>,
     key: RouteKey,
@@ -1699,8 +2126,7 @@ impl Drop for OpeningGuard {
 
 #[derive(Clone)]
 struct RouteState {
-    channel: u16,
-    generation: u64,
+    handle: RouteHandle,
     sem: Arc<Semaphore>,
 }
 
@@ -1852,6 +2278,10 @@ impl From<CallError> for SharedCallFailure {
                 kind: FailureKind::OutcomeUnknown,
                 message: err.to_string(),
             },
+            CallError::StaleRouteHandle(handle) => Self {
+                kind: FailureKind::NotSent,
+                message: format!("stale route handle: {handle:?}"),
+            },
         }
     }
 }
@@ -1866,11 +2296,14 @@ enum FailureKind {
 struct PendingKey {
     generation: u64,
     channel: u16,
+    epoch: u32,
     corr: u64,
 }
 
 struct PendingEntry {
     accepted: bool,
+    retain_late_route_open: bool,
+    expected_control_handle: Option<RouteHandle>,
     completion: PendingCompletion,
 }
 
@@ -1891,9 +2324,15 @@ enum StreamDataDelivery {
 }
 
 impl PendingEntry {
-    fn unary(tx: oneshot::Sender<PendingResult>) -> Self {
+    fn unary(
+        tx: oneshot::Sender<PendingResult>,
+        retain_late_route_open: bool,
+        expected_control_handle: Option<RouteHandle>,
+    ) -> Self {
         Self {
             accepted: false,
+            retain_late_route_open,
+            expected_control_handle,
             completion: PendingCompletion::Unary(tx),
         }
     }
@@ -1906,12 +2345,21 @@ impl PendingEntry {
     ) -> Self {
         Self {
             accepted: false,
+            retain_late_route_open: false,
+            expected_control_handle: None,
             completion: PendingCompletion::Subscription {
                 events,
                 closed,
                 _permit: permit,
                 priority,
             },
+        }
+    }
+
+    fn completion_is_closed(&self) -> bool {
+        match &self.completion {
+            PendingCompletion::Unary(tx) => tx.is_closed(),
+            PendingCompletion::Subscription { closed, .. } => closed.is_closed(),
         }
     }
 
@@ -1989,14 +2437,16 @@ struct PendingRegistration {
     shared: Arc<Shared>,
     key: PendingKey,
     active: bool,
+    retain_on_drop: bool,
 }
 
 impl PendingRegistration {
-    fn new(shared: Arc<Shared>, key: PendingKey) -> Self {
+    fn new(shared: Arc<Shared>, key: PendingKey, retain_on_drop: bool) -> Self {
         Self {
             shared,
             key,
             active: true,
+            retain_on_drop,
         }
     }
 
@@ -2019,7 +2469,11 @@ impl PendingRegistration {
 
 impl Drop for PendingRegistration {
     fn drop(&mut self) {
-        let _ = self.remove_pending();
+        if self.retain_on_drop {
+            self.disarm();
+        } else {
+            let _ = self.remove_pending();
+        }
     }
 }
 
@@ -2053,6 +2507,7 @@ impl PendingTerminal {
     }
 }
 
+#[derive(Debug)]
 enum TerminalFrame {
     Response { generation: u64, body: Vec<u8> },
     Error { body: ErrorBody },
@@ -2124,11 +2579,51 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
     if !shared.generation_is_current(generation) {
         return false;
     }
+    if frame.header.channel != 0
+        && !shared.validate_ingress_handle(generation, frame.header.channel, frame.header.epoch)
+    {
+        return true;
+    }
+
     let key = PendingKey {
         generation,
         channel: frame.header.channel,
+        epoch: frame.header.epoch,
         corr: frame.header.corr,
     };
+
+    if frame.header.channel == 0 && frame.header.ty == FrameType::Response {
+        if let Some(expected) = shared.pending_expected_control_handle(key) {
+            let echoes_expected = matches!(
+                serde_json::from_slice::<ClientControlResponse>(&frame.body),
+                Ok(ClientControlResponse::RoutePoll {
+                    route_channel,
+                    route_epoch,
+                    ..
+                }) if route_channel == expected.channel && route_epoch == expected.epoch
+            );
+            if !echoes_expected {
+                shared.count_dropped_route_frame();
+                return true;
+            }
+        }
+    }
+
+    // A route.open handle is published before its waiter is resolved. The socket reader
+    // cannot consume a following same-route frame until this synchronous install finishes.
+    if frame.header.channel == 0
+        && frame.header.ty == FrameType::Response
+        && shared.pending_expects_route_open(key)
+    {
+        if let Ok(ClientControlResponse::RouteOpen {
+            route_channel,
+            route_epoch,
+        }) = serde_json::from_slice::<ClientControlResponse>(&frame.body)
+        {
+            shared.install_ingress_handle(RouteHandle::new(route_channel, route_epoch, generation));
+        }
+    }
+
     match frame.header.ty {
         FrameType::Response => shared.settle_pending(
             key,
@@ -2153,10 +2648,11 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
             return false;
         }
         FrameType::Goodbye => {
-            shared.invalidate_routes_for_channel(generation, frame.header.channel);
+            let handle = RouteHandle::new(frame.header.channel, frame.header.epoch, generation);
+            shared.invalidate_routes_for_handle(handle);
             let pending = {
                 let mut inner = shared.lock_inner();
-                drain_pending_channel(&mut inner.pending, generation, frame.header.channel, true)
+                drain_pending_handle(&mut inner.pending, handle, true)
             };
             settle_pending_entries(pending, "route closed by subc".to_string());
         }
@@ -2165,7 +2661,7 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
                 frame.header.ver,
                 FrameType::Pong,
                 frame.header.flags,
-                0, // WIRE-WAVE2: thread the binding epoch.
+                0,
                 0,
                 frame.header.corr,
                 Vec::new(),
@@ -2192,16 +2688,55 @@ impl Shared {
         !inner.closed && inner.generation == generation && inner.writer.is_some()
     }
 
-    fn invalidate_routes_for_channel(&self, generation: u64, channel: u16) {
+    fn pending_expected_control_handle(&self, key: PendingKey) -> Option<RouteHandle> {
+        self.lock_inner()
+            .pending
+            .get(&key)
+            .and_then(|entry| entry.expected_control_handle)
+    }
+
+    fn count_dropped_route_frame(&self) {
+        let mut inner = self.lock_inner();
+        inner.dropped_route_frames = inner.dropped_route_frames.saturating_add(1);
+    }
+
+    fn pending_expects_route_open(&self, key: PendingKey) -> bool {
+        self.lock_inner()
+            .pending
+            .get(&key)
+            .is_some_and(|entry| entry.retain_late_route_open)
+    }
+
+    fn validate_ingress_handle(&self, generation: u64, channel: u16, epoch: u32) -> bool {
+        let mut inner = self.lock_inner();
+        let expected = RouteHandle::new(channel, epoch, generation);
+        if inner.route_epochs.get(&channel) == Some(&expected) {
+            true
+        } else {
+            inner.dropped_route_frames = inner.dropped_route_frames.saturating_add(1);
+            false
+        }
+    }
+
+    fn install_ingress_handle(&self, handle: RouteHandle) {
+        let mut inner = self.lock_inner();
+        if !inner.closed && inner.generation == handle.connection_token() && inner.writer.is_some()
+        {
+            inner.route_epochs.insert(handle.channel, handle);
+        }
+    }
+
+    fn invalidate_routes_for_handle(&self, handle: RouteHandle) {
         let removed = {
             let mut inner = self.lock_inner();
+            if inner.route_epochs.get(&handle.channel) != Some(&handle) {
+                return;
+            }
+            inner.route_epochs.remove(&handle.channel);
             let keys = inner
                 .routes
                 .iter()
-                .filter_map(|(key, route)| {
-                    (route.generation == generation && route.channel == channel)
-                        .then_some(key.clone())
-                })
+                .filter_map(|(key, route)| (route.handle == handle).then_some(key.clone()))
                 .collect::<Vec<_>>();
             keys.into_iter()
                 .filter_map(|key| inner.routes.remove(&key))
@@ -2313,17 +2848,17 @@ fn drain_pending_generation(
         .collect()
 }
 
-fn drain_pending_channel(
+fn drain_pending_handle(
     pending: &mut HashMap<PendingKey, PendingEntry>,
-    generation: u64,
-    channel: u16,
+    handle: RouteHandle,
     include_subscriptions: bool,
 ) -> Vec<PendingEntry> {
     let keys = pending
         .iter()
         .filter_map(|(key, entry)| {
-            (key.generation == generation
-                && key.channel == channel
+            (key.generation == handle.connection_token()
+                && key.channel == handle.channel
+                && key.epoch == handle.epoch
                 && (include_subscriptions || !entry.is_subscription()))
             .then_some(*key)
         })
@@ -2572,18 +3107,21 @@ mod tests {
         let mut pending = HashMap::new();
         let generation = 7;
         let channel = 11;
+        let handle = RouteHandle::new(channel, 3, generation);
         let unary_key = PendingKey {
             generation,
             channel,
+            epoch: handle.epoch,
             corr: 1,
         };
         let subscription_key = PendingKey {
             generation,
             channel,
+            epoch: handle.epoch,
             corr: 2,
         };
         let (unary_tx, _unary_rx) = oneshot::channel();
-        pending.insert(unary_key, PendingEntry::unary(unary_tx));
+        pending.insert(unary_key, PendingEntry::unary(unary_tx, false, None));
 
         let (events_tx, _events_rx) = mpsc::channel(1);
         let (closed_tx, _closed_rx) = oneshot::channel();
@@ -2595,12 +3133,348 @@ mod tests {
             PendingEntry::subscription(events_tx, closed_tx, permit, Priority::Interactive),
         );
 
-        let drained = drain_pending_channel(&mut pending, generation, channel, false);
+        let drained = drain_pending_handle(&mut pending, handle, false);
         assert_eq!(drained.len(), 1);
         assert!(pending.contains_key(&subscription_key));
 
-        let drained = drain_pending_channel(&mut pending, generation, channel, true);
+        let drained = drain_pending_handle(&mut pending, handle, true);
         assert_eq!(drained.len(), 1);
         assert!(pending.is_empty());
+    }
+
+    fn response_frame(channel: u16, epoch: u32, corr: u64, body: Vec<u8>) -> Frame {
+        Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            body,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_epoch_ingress_drops_without_settling_matching_corr() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, _rx) = mpsc::channel(4);
+        let current = RouteHandle::new(9, 2, 1);
+        let stale_key = PendingKey {
+            generation: 1,
+            channel: 9,
+            epoch: 1,
+            corr: 77,
+        };
+        let key = PendingKey {
+            generation: 1,
+            channel: 9,
+            epoch: 2,
+            corr: 77,
+        };
+        let (stale_tx, mut stale_response) = oneshot::channel();
+        let (tx, mut response) = oneshot::channel();
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(9, current);
+            inner
+                .pending
+                .insert(stale_key, PendingEntry::unary(stale_tx, false, None));
+            inner
+                .pending
+                .insert(key, PendingEntry::unary(tx, false, None));
+        }
+
+        assert!(dispatch_frame(&shared, 1, response_frame(9, 1, 77, b"stale".to_vec())).await);
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            stale_response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(shared.lock_inner().pending.contains_key(&stale_key));
+        assert!(shared.lock_inner().pending.contains_key(&key));
+        assert_eq!(shared.lock_inner().dropped_route_frames, 1);
+
+        assert!(dispatch_frame(&shared, 1, response_frame(9, 2, 77, b"current".to_vec())).await);
+        let PendingResult::Terminal(PendingTerminal::Response { body, .. }) =
+            response.await.unwrap()
+        else {
+            panic!("current epoch must settle its own pending request");
+        };
+        assert_eq!(body, b"current");
+        assert!(shared.lock_inner().pending.contains_key(&stale_key));
+    }
+
+    #[tokio::test]
+    async fn route_poll_response_must_echo_expected_handle_before_settling() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, _rx) = mpsc::channel(4);
+        let handle = RouteHandle::new(3, 9, 1);
+        let key = PendingKey {
+            generation: 1,
+            channel: 0,
+            epoch: 0,
+            corr: 88,
+        };
+        let (tx, mut response) = oneshot::channel();
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(handle.channel, handle);
+            inner
+                .pending
+                .insert(key, PendingEntry::unary(tx, false, Some(handle)));
+        }
+        let wrong = serde_json::to_vec(&ClientControlResponse::RoutePoll {
+            route_channel: handle.channel,
+            route_epoch: handle.epoch + 1,
+            status: Some("wrong".to_string()),
+            live: Some(true),
+        })
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, response_frame(0, 0, key.corr, wrong)).await);
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(shared.lock_inner().pending.contains_key(&key));
+
+        let correct = serde_json::to_vec(&ClientControlResponse::RoutePoll {
+            route_channel: handle.channel,
+            route_epoch: handle.epoch,
+            status: Some("ready".to_string()),
+            live: Some(true),
+        })
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, response_frame(0, 0, key.corr, correct)).await);
+        assert!(matches!(
+            response.await.unwrap(),
+            PendingResult::Terminal(PendingTerminal::Response { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_connection_handle_emits_no_request_cancel_or_goodbye() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(4);
+        let stale = RouteHandle::new(4, 1, 1);
+        let current = RouteHandle::new(4, 1, 2);
+        {
+            let mut inner = shared.lock_inner();
+            inner.generation = 2;
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(4, current);
+        }
+
+        let err = shared
+            .send_request(RequestSend {
+                expected_handle: Some(stale),
+                channel: stale.channel,
+                epoch: stale.epoch,
+                body: b"request".to_vec(),
+                priority: Priority::Interactive,
+                admission_class: AdmissionClass::Normal,
+                timeout: Duration::from_millis(10),
+                retain_late_route_open: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CallError::StaleRouteHandle(handle) if handle == stale));
+        shared.send_cancel(stale, 8, Priority::Interactive);
+        assert!(!shared.send_route_goodbye(stale, false));
+        assert!(
+            rx.try_recv().is_err(),
+            "stale operations must not queue frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_route_open_queues_goodbye_and_full_queue_closes_connection() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(2);
+        let key = PendingKey {
+            generation: 1,
+            channel: 0,
+            epoch: 0,
+            corr: 41,
+        };
+        let (tx, response) = oneshot::channel();
+        drop(response);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner
+                .pending
+                .insert(key, PendingEntry::unary(tx, true, None));
+        }
+        let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            route_channel: 12,
+            route_epoch: 7,
+        })
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, response_frame(0, 0, 41, body)).await);
+        let cleanup = rx.recv().await.unwrap().frame;
+        assert_eq!(cleanup.header.ty, FrameType::Goodbye);
+        assert_eq!((cleanup.header.channel, cleanup.header.epoch), (12, 7));
+
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions {
+                reconnect_backoff: RetryBackoff {
+                    max_attempts: 1,
+                    ..RetryBackoff::default()
+                },
+                ..ConsumerOptions::default()
+            },
+        ));
+        let (writer, _rx) = mpsc::channel(1);
+        let filler = response_frame(0, 0, 1, Vec::new());
+        writer
+            .try_send(WriteCommand {
+                frame: filler,
+                pending: None,
+            })
+            .unwrap();
+        let key = PendingKey {
+            generation: 1,
+            channel: 0,
+            epoch: 0,
+            corr: 42,
+        };
+        let (tx, response) = oneshot::channel();
+        drop(response);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner
+                .pending
+                .insert(key, PendingEntry::unary(tx, true, None));
+        }
+        let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            route_channel: 13,
+            route_epoch: 8,
+        })
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, response_frame(0, 0, 42, body)).await);
+        assert!(shared.lock_inner().writer.is_none());
+    }
+
+    #[tokio::test]
+    async fn correlation_allocator_emits_max_once_then_closes_without_reuse() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions {
+                reconnect_backoff: RetryBackoff {
+                    max_attempts: 1,
+                    ..RetryBackoff::default()
+                },
+                ..ConsumerOptions::default()
+            },
+        ));
+        let (writer, mut rx) = mpsc::channel(4);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.next_corr = Some(u64::MAX);
+        }
+        let request_shared = Arc::clone(&shared);
+        let request = tokio::spawn(async move {
+            request_shared
+                .send_request(RequestSend {
+                    expected_handle: None,
+                    channel: 0,
+                    epoch: 0,
+                    body: Vec::new(),
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    timeout: Duration::from_secs(1),
+                    retain_late_route_open: false,
+                })
+                .await
+        });
+        let command = rx.recv().await.unwrap();
+        assert_eq!(command.frame.header.corr, u64::MAX);
+        assert!(dispatch_frame(&shared, 1, response_frame(0, 0, u64::MAX, Vec::new()),).await);
+        assert!(request.await.unwrap().is_ok());
+
+        let exhausted = shared
+            .send_request(RequestSend {
+                expected_handle: None,
+                channel: 0,
+                epoch: 0,
+                body: Vec::new(),
+                priority: Priority::Interactive,
+                admission_class: AdmissionClass::Normal,
+                timeout: Duration::from_millis(10),
+                retain_late_route_open: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(exhausted, CallError::NotSent(_)));
+        assert!(rx.try_recv().is_err());
+        assert!(shared.lock_inner().writer.is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_call_deadline_bounds_flow_control_wait() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(4);
+        let target = RouteTarget::ToolProvider {
+            module_id: "flow-controlled".to_string(),
+        };
+        let identity = BindIdentity {
+            project_root: PathBuf::from("/tmp/project"),
+            harness: "test".to_string(),
+            session: "deadline".to_string(),
+        };
+        let opts = CallOptions {
+            timeout: Duration::from_millis(25),
+            consumer_identity: Some(ConsumerIdentity {
+                module_id: "caller".to_string(),
+                launch_nonce: "nonce".to_string(),
+            }),
+            ..CallOptions::default()
+        };
+        let key = RouteKey::new(&target, &identity, opts.consumer_identity.as_ref(), None);
+        let handle = RouteHandle::new(5, 3, 1);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(handle.channel, handle);
+            inner.routes.insert(
+                key,
+                RouteState {
+                    handle,
+                    sem: Arc::new(Semaphore::new(0)),
+                },
+            );
+        }
+        let consumer = SubcConsumer { shared };
+        let started = Instant::now();
+        let result = consumer
+            .call(target, identity, Vec::new(), opts)
+            .await
+            .unwrap_err();
+        assert!(matches!(result, CallError::NotSent(_)));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(rx.try_recv().is_err());
     }
 }

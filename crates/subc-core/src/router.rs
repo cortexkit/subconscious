@@ -10,13 +10,13 @@ use std::{
 
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     control::ControlHandler,
     forwarding::{
-        CloseReason, ConnectionCloseReceiver, DataRoute, ForwardingError, ForwardingTable,
-        RouteBinding,
+        CloseReason, ConnectionCloseReceiver, DataRoute, DataRouteState, ForwardingError,
+        ForwardingTable, RouteBinding, RouteRelease,
     },
     registry::ConnectionId,
     Frame, FrameBuildError,
@@ -39,19 +39,41 @@ impl FrameSink {
 
     pub async fn send(&self, frame: Frame) -> Result<(), RouterError> {
         let channel = frame.header.channel;
+        let epoch = frame.header.epoch;
         let corr = frame.header.corr;
+        self.tx.send(frame).await.map_err(|_| {
+            RouterError::backend_with_epoch(channel, epoch, corr, "connection writer closed")
+        })
+    }
+
+    pub(crate) async fn reserve_owned(&self) -> Result<mpsc::OwnedPermit<Frame>, RouterError> {
         self.tx
-            .send(frame)
+            .clone()
+            .reserve_owned()
             .await
-            .map_err(|_| RouterError::backend(channel, corr, "connection writer closed"))
+            .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve_owned(&self) -> Result<mpsc::OwnedPermit<Frame>, RouterError> {
+        self.tx
+            .clone()
+            .try_reserve_owned()
+            .map_err(|err| RouterError::backend(0, 0, err.to_string()))
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 
     pub(crate) fn try_send(&self, frame: Frame) -> Result<(), RouterError> {
         let channel = frame.header.channel;
+        let epoch = frame.header.epoch;
         let corr = frame.header.corr;
         self.tx.try_send(frame).map_err(|err| {
-            RouterError::backend(
+            RouterError::backend_with_epoch(
                 channel,
+                epoch,
                 corr,
                 format!("connection writer unavailable: {err}"),
             )
@@ -171,16 +193,13 @@ impl Router {
         }
     }
 
-    /// Route a frame associated with one socket connection.
-    ///
-    /// Dispatch remains serial at the caller: this async function is awaited for
-    /// each inbound frame before the connection reads the next one.
     pub async fn route_for_connection(
         &self,
         ctx: &RouteCtx,
         frame: Frame,
     ) -> Result<(), RouterError> {
         let channel = frame.header.channel;
+        let epoch = frame.header.epoch;
         let corr = frame.header.corr;
         if channel == 0 {
             debug!(
@@ -198,93 +217,69 @@ impl Router {
 
         let data_route = self
             .forwarding
-            .lookup_data_route(ctx.connection_id, channel)
+            .lookup_data_route(ctx.connection_id, channel, epoch)
             .map_err(RouterError::Forwarding)?;
 
         match data_route {
-            DataRoute::Module(route) => {
+            DataRoute::Module(DataRouteState::EpochMismatch | DataRouteState::Reserved) => {
+                debug!(
+                    connection_id = ctx.connection_id.get(),
+                    channel,
+                    epoch,
+                    corr,
+                    "dropping module frame for stale or reserved route handle"
+                );
+                return Ok(());
+            }
+            DataRoute::Module(DataRouteState::Absent) => {
+                debug!(
+                    connection_id = ctx.connection_id.get(),
+                    channel, epoch, corr, "dropping module frame for absent route handle"
+                );
+                return Ok(());
+            }
+            DataRoute::Module(DataRouteState::Bound(route)) => {
                 if frame.header.ty == FrameType::Goodbye {
-                    if let Some(target) = self
+                    if let RouteRelease::Removed(target) = self
                         .forwarding
-                        .release_module_route(ctx.connection_id, channel)
+                        .release_module_route(ctx.connection_id, channel, epoch)
                         .map_err(RouterError::Forwarding)?
                     {
-                        debug!(
-                            connection_id = ctx.connection_id.get(),
-                            module_channel = channel,
-                            client_channel = target.channel,
-                            corr,
-                            "forwarding module route GOODBYE to client"
-                        );
                         let mut goodbye = frame;
                         goodbye.header.channel = target.channel;
+                        goodbye.header.epoch = target.epoch;
                         if let Err(err) = target.sink.try_send(goodbye) {
                             if target.close_on_delivery_failure() {
-                                warn!(
-                                    connection_id = ctx.connection_id.get(),
-                                    target_connection_id = target.connection_id.get(),
-                                    module_channel = channel,
-                                    client_channel = target.channel,
-                                    corr,
-                                    error = %err,
-                                    "route GOODBYE delivery failed; closing target client connection"
-                                );
-                                self.forwarding.request_connection_close(
-                                    target.connection_id,
-                                    CloseReason::new(
-                                        "route_goodbye_delivery_failed",
-                                        format!(
-                                            "failed to enqueue route GOODBYE for client channel {}: {err}",
-                                            target.channel
+                                self.forwarding
+                                    .escalate_client_delivery_failure(
+                                        target.connection_id,
+                                        target.channel,
+                                        target.epoch,
+                                        CloseReason::new(
+                                            "route_goodbye_delivery_failed",
+                                            format!(
+                                                "failed to enqueue route GOODBYE for client channel {}: {err}",
+                                                target.channel
+                                            ),
                                         ),
-                                    ),
-                                );
-                            } else {
-                                warn!(
-                                    connection_id = ctx.connection_id.get(),
-                                    target_connection_id = target.connection_id.get(),
-                                    module_channel = channel,
-                                    client_channel = target.channel,
-                                    corr,
-                                    error = %err,
-                                    "route GOODBYE to module dropped under backpressure; not closing shared module connection"
-                                );
+                                    )
+                                    .map_err(RouterError::Forwarding)?;
                             }
                         }
-                        return Ok(());
                     }
-
-                    warn!(
-                        connection_id = ctx.connection_id.get(),
-                        channel, corr, "dropping module GOODBYE for released route channel"
-                    );
                     return Ok(());
                 }
 
-                if let Some(route) = route {
-                    debug!(
-                        connection_id = ctx.connection_id.get(),
-                        module_channel = channel,
-                        client_channel = route.client_channel,
-                        corr,
-                        frame_type = ?frame.header.ty,
-                        "forwarding module data-plane frame to client"
-                    );
-                    let releases_credit = is_terminal_frame(frame.header.ty);
-                    let mut frame = frame;
-                    frame.header.channel = route.client_channel;
-                    if let Err(err) = route.client_sink.try_send(frame) {
-                        debug!(
-                            connection_id = ctx.connection_id.get(),
-                            target_connection_id = route.client_connection_id.get(),
-                            module_channel = channel,
-                            client_channel = route.client_channel,
-                            corr,
-                            error = %err,
-                            "module-to-client delivery failed; closing target client connection"
-                        );
-                        self.forwarding.request_connection_close(
+                let releases_credit = is_terminal_frame(frame.header.ty);
+                let mut frame = frame;
+                frame.header.channel = route.client_channel;
+                frame.header.epoch = route.client_epoch;
+                if let Err(err) = route.client_sink.try_send(frame) {
+                    self.forwarding
+                        .escalate_client_delivery_failure(
                             route.client_connection_id,
+                            route.client_channel,
+                            route.client_epoch,
                             CloseReason::new(
                                 "module_to_client_delivery_failed",
                                 format!(
@@ -292,79 +287,61 @@ impl Router {
                                     route.client_channel
                                 ),
                             ),
-                        );
-                        return Ok(());
-                    }
-                    if releases_credit {
-                        // Release only after the terminal is enqueued to the client sink so
-                        // reload quiescence cannot let a route GOODBYE overtake it. If enqueue
-                        // failed, the forced client cleanup closes the flow instead.
-                        route.flow.release();
-                    }
+                        )
+                        .map_err(RouterError::Forwarding)?;
                     return Ok(());
                 }
-
-                // A module frame landing on an already-released route channel is an
-                // expected, by-design teardown race: the consumer closed/GOODBYE'd the
-                // route while a response or push was already in flight. subc deliberately
-                // drops the straggler (no NACK); re-sending after the module re-attaches is
-                // the module's responsibility, not the router's. This is normal during route
-                // churn, so it is logged at debug rather than warn to avoid steady-state
-                // noise from consumers that open and close routes routinely.
+                if releases_credit {
+                    route.flow.release();
+                }
+                return Ok(());
+            }
+            DataRoute::Client(DataRouteState::EpochMismatch) => {
                 debug!(
                     connection_id = ctx.connection_id.get(),
-                    channel,
-                    corr,
-                    frame_type = ?frame.header.ty,
-                    "dropping module data-plane frame for released route channel"
+                    channel, epoch, corr, "dropping client frame for stale route epoch"
                 );
                 return Ok(());
             }
-            DataRoute::Client(route) => {
+            DataRoute::Client(DataRouteState::Reserved) => {
+                if frame.header.ty == FrameType::Request {
+                    let err = RouterError::UnknownChannel {
+                        channel,
+                        epoch,
+                        corr,
+                    };
+                    if let Some(error_frame) = err.to_error_frame() {
+                        ctx.egress.send(error_frame).await?;
+                    }
+                }
+                return Ok(());
+            }
+            DataRoute::Client(DataRouteState::Bound(route)) => {
                 if frame.header.ty == FrameType::Goodbye {
                     let _ = self
                         .control
-                        .handle_route_goodbye(ctx.connection_id, channel)?;
+                        .handle_route_goodbye(ctx.connection_id, channel, epoch)?;
                     return Ok(());
                 }
-
-                if let Some(route) = route {
-                    debug!(
-                        connection_id = ctx.connection_id.get(),
-                        channel,
-                        corr,
-                        frame_type = ?frame.header.ty,
-                        "forwarding client data-plane frame to module"
-                    );
-                    return self.forward_backend.handle_bound(frame, route).await;
-                }
+                return self.forward_backend.handle_bound(frame, route).await;
             }
+            DataRoute::Client(DataRouteState::Absent) => {}
         }
 
-        let Some(backend) = self.backends.get(&channel) else {
-            let err = RouterError::UnknownChannel { channel, corr };
+        if let Some(backend) = self.backends.get(&channel) {
+            return backend.handle(ctx.clone(), frame).await;
+        }
+        if frame.header.ty == FrameType::Request {
+            let err = RouterError::UnknownChannel {
+                channel,
+                epoch,
+                corr,
+            };
             if let Some(error_frame) = err.to_error_frame() {
-                warn!(
-                    connection_id = ctx.connection_id.get(),
-                    channel,
-                    corr,
-                    error = %err,
-                    "unknown channel; emitted ERROR frame"
-                );
                 ctx.egress.send(error_frame).await?;
-                return Ok(());
             }
-            return Err(err);
-        };
-
-        debug!(
-            connection_id = ctx.connection_id.get(),
-            channel,
-            corr,
-            frame_type = ?frame.header.ty,
-            "routing data-plane frame"
-        );
-        backend.handle(ctx.clone(), frame).await
+        }
+        Ok(())
     }
 }
 
@@ -415,8 +392,8 @@ impl EchoBackend {
             frame.header.ver,
             FrameType::Response,
             frame.header.flags,
-            frame.header.channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            frame.header.channel,
+            frame.header.epoch,
             frame.header.corr,
             frame.body,
         )
@@ -441,12 +418,16 @@ impl ForwardBackend {
         let corr = frame.header.corr;
         let route = match self
             .forwarding
-            .lookup_data_route(ctx.connection_id, channel)
+            .lookup_data_route(ctx.connection_id, channel, frame.header.epoch)
             .map_err(RouterError::Forwarding)?
         {
-            DataRoute::Client(Some(route)) => route,
-            DataRoute::Client(None) | DataRoute::Module(_) => {
-                return Err(RouterError::UnknownChannel { channel, corr });
+            DataRoute::Client(DataRouteState::Bound(route)) => route,
+            DataRoute::Client(_) | DataRoute::Module(_) => {
+                return Err(RouterError::UnknownChannel {
+                    channel,
+                    epoch: frame.header.epoch,
+                    corr,
+                });
             }
         };
         self.handle_bound(frame, route).await
@@ -471,15 +452,17 @@ impl ForwardBackend {
                     .endpoint_is_draining(route.module_endpoint)
                     .map_err(RouterError::Forwarding)?
                 {
-                    return Err(RouterError::route_error(
+                    return Err(RouterError::route_error_with_epoch(
                         channel,
+                        frame.header.epoch,
                         corr,
                         "module_reloading",
                         format!("module endpoint for route channel {channel} is reloading"),
                     ));
                 }
-                return Err(RouterError::backend(
+                return Err(RouterError::backend_with_epoch(
                     channel,
+                    frame.header.epoch,
                     corr,
                     format!("{err} for route channel {channel}"),
                 ));
@@ -488,11 +471,10 @@ impl ForwardBackend {
 
         let mut frame = frame;
         frame.header.channel = route.module_channel;
-        let result = route
-            .module_sink
-            .send(frame)
-            .await
-            .map_err(|err| RouterError::backend(channel, corr, err.to_string()));
+        frame.header.epoch = route.module_epoch;
+        let result = route.module_sink.send(frame).await.map_err(|err| {
+            RouterError::backend_with_epoch(channel, route.client_epoch, corr, err.to_string())
+        });
         if acquired_credit && result.is_err() {
             route.flow.release();
         }
@@ -517,15 +499,18 @@ pub enum RouterError {
     },
     UnknownChannel {
         channel: u16,
+        epoch: u32,
         corr: u64,
     },
     Backend {
         channel: u16,
+        epoch: u32,
         corr: u64,
         message: String,
     },
     RouteError {
         channel: u16,
+        epoch: u32,
         corr: u64,
         code: String,
         message: String,
@@ -536,8 +521,18 @@ pub enum RouterError {
 
 impl RouterError {
     pub fn backend(channel: u16, corr: u64, message: impl Into<String>) -> Self {
+        Self::backend_with_epoch(channel, 0, corr, message)
+    }
+
+    pub fn backend_with_epoch(
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Backend {
             channel,
+            epoch,
             corr,
             message: message.into(),
         }
@@ -549,8 +544,19 @@ impl RouterError {
         code: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
+        Self::route_error_with_epoch(channel, 0, corr, code, message)
+    }
+
+    pub fn route_error_with_epoch(
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::RouteError {
             channel,
+            epoch,
             corr,
             code: code.into(),
             message: message.into(),
@@ -560,23 +566,30 @@ impl RouterError {
     /// Translate route failures that belong on the wire into an `ERROR` frame.
     pub fn to_error_frame(&self) -> Option<Frame> {
         match self {
-            Self::UnknownChannel { channel, corr } => error_frame(
+            Self::UnknownChannel {
+                channel,
+                epoch,
+                corr,
+            } => error_frame(
                 *channel,
+                *epoch,
                 *corr,
                 "unknown_channel",
                 format!("unknown channel {channel}"),
             ),
             Self::Backend {
                 channel,
+                epoch,
                 corr,
                 message,
-            } => error_frame(*channel, *corr, "backend_error", message.clone()),
+            } => error_frame(*channel, *epoch, *corr, "backend_error", message.clone()),
             Self::RouteError {
                 channel,
+                epoch,
                 corr,
                 code,
                 message,
-            } => error_frame(*channel, *corr, code, message.clone()),
+            } => error_frame(*channel, *epoch, *corr, code, message.clone()),
             Self::ReservedChannelZero
             | Self::DuplicateChannel { .. }
             | Self::FrameBuild(_)
@@ -585,7 +598,7 @@ impl RouterError {
     }
 }
 
-fn error_frame(channel: u16, corr: u64, code: &str, message: String) -> Option<Frame> {
+fn error_frame(channel: u16, epoch: u32, corr: u64, code: &str, message: String) -> Option<Frame> {
     let body = serde_json::to_vec(&ErrorBody {
         code: code.to_string(),
         message,
@@ -595,8 +608,8 @@ fn error_frame(channel: u16, corr: u64, code: &str, message: String) -> Option<F
     Frame::build(
         FrameType::Error,
         Flags::new(false, Priority::Passive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        channel,
+        epoch,
         corr,
         body,
     )
@@ -610,13 +623,14 @@ impl fmt::Display for RouterError {
             Self::DuplicateChannel { channel } => {
                 write!(f, "backend already registered for channel {channel}")
             }
-            Self::UnknownChannel { channel, corr } => {
+            Self::UnknownChannel { channel, corr, .. } => {
                 write!(f, "unknown channel {channel} for corr {corr}")
             }
             Self::Backend {
                 channel,
                 corr,
                 message,
+                ..
             } => write!(
                 f,
                 "backend error on channel {channel} corr {corr}: {message}"
@@ -626,6 +640,7 @@ impl fmt::Display for RouterError {
                 corr,
                 code,
                 message,
+                ..
             } => write!(
                 f,
                 "route error {code} on channel {channel} corr {corr}: {message}"
@@ -653,6 +668,7 @@ impl Error for RouterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarding::RouteBindRelayOutcome;
     use std::{sync::Arc, time::Duration};
     use subc_protocol::{manifest::Concurrency, ErrorBody, Flags, FrameType, Priority};
     use tokio::sync::mpsc;
@@ -661,7 +677,7 @@ mod tests {
         Frame::build(
             FrameType::Request,
             Flags::new(true, Priority::Interactive, false),
-            channel, // WIRE-WAVE2: thread the binding epoch.
+            channel,
             0,
             corr,
             body.to_vec(),
@@ -673,7 +689,7 @@ mod tests {
         Frame::build(
             FrameType::Ping,
             Flags::new(false, Priority::Passive, false),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             corr,
             Vec::new(),
@@ -767,19 +783,20 @@ mod tests {
                 FrameSink::new(module_tx),
             )
             .unwrap();
-        let pending = forwarding
-            .begin_route_bind_relay_for(client_connection, "full-sink-provider")
-            .unwrap();
         let (client_tx, mut client_rx) = mpsc::channel(1);
-        client_tx.try_send(ping(700)).unwrap();
-        forwarding
-            .commit_route(
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
                 client_connection,
                 FrameSink::new(client_tx),
-                1,
-                pending.endpoint,
-                pending.client_channel,
-                pending.module_channel,
+                700,
+                "full-sink-provider",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
             )
             .unwrap();
 
@@ -791,8 +808,8 @@ mod tests {
         let terminal = Frame::build(
             FrameType::Response,
             Flags::new(false, Priority::Interactive, true),
-            pending.module_channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            pending.module_channel,
+            pending.module_epoch,
             701,
             b"terminal".to_vec(),
         )
@@ -837,19 +854,20 @@ mod tests {
                 FrameSink::new(module_tx),
             )
             .unwrap();
-        let pending = forwarding
-            .begin_route_bind_relay_for(client_connection, "goodbye-full-provider")
-            .unwrap();
         let (client_tx, mut client_rx) = mpsc::channel(1);
-        client_tx.try_send(ping(800)).unwrap();
-        forwarding
-            .commit_route(
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
                 client_connection,
                 FrameSink::new(client_tx),
-                1,
-                pending.endpoint,
-                pending.client_channel,
-                pending.module_channel,
+                800,
+                "goodbye-full-provider",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
             )
             .unwrap();
 
@@ -861,8 +879,8 @@ mod tests {
         let goodbye = Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Passive, true),
-            pending.module_channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            pending.module_channel,
+            pending.module_epoch,
             801,
             Vec::new(),
         )
@@ -882,6 +900,246 @@ mod tests {
         );
         assert_eq!(client_rx.try_recv().unwrap().header.corr, 800);
         assert!(client_rx.try_recv().is_err());
+    }
+
+    fn route_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> Frame {
+        Frame::build(
+            ty,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            if ty == FrameType::Request || ty == FrameType::Response {
+                b"route-body".to_vec()
+            } else {
+                Vec::new()
+            },
+        )
+        .unwrap()
+    }
+
+    fn dynamic_route_fixture(
+        commit: bool,
+    ) -> (
+        Router,
+        Arc<ForwardingTable>,
+        RouteCtx,
+        mpsc::Receiver<Frame>,
+        RouteCtx,
+        mpsc::Receiver<Frame>,
+        crate::forwarding::PendingRouteBindRelay,
+    ) {
+        let forwarding = Arc::new(ForwardingTable::default());
+        let control = Arc::new(crate::ControlHandler::with_forwarding(
+            Arc::new(crate::Registry::default()),
+            Arc::clone(&forwarding),
+        ));
+        let router = Router::with_control_handler(control);
+        let module_connection = ConnectionId::new(500);
+        let client_connection = ConnectionId::new(501);
+        let (module_tx, module_rx) = mpsc::channel(8);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                "epoch-router".into(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let (client_tx, client_rx) = mpsc::channel(8);
+        let client_sink = FrameSink::new(client_tx);
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
+                client_connection,
+                client_sink.clone(),
+                700,
+                "epoch-router",
+            )
+            .unwrap();
+        if commit {
+            forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    pending.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap();
+        }
+        (
+            router,
+            forwarding,
+            RouteCtx {
+                connection_id: client_connection,
+                egress: client_sink,
+            },
+            client_rx,
+            RouteCtx {
+                connection_id: module_connection,
+                egress: FrameSink::new(mpsc::channel(1).0),
+            },
+            module_rx,
+            pending,
+        )
+    }
+
+    #[tokio::test]
+    async fn route_epochs_validate_both_directions_and_rewrite_to_peer_handle() {
+        let (router, forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
+            dynamic_route_fixture(true);
+        let route_open = client_rx.recv().await.unwrap();
+        assert_eq!(route_open.header.corr, 700);
+
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    701,
+                ),
+            )
+            .await
+            .unwrap();
+        let forwarded = module_rx.recv().await.unwrap();
+        assert_eq!(forwarded.header.channel, pending.module_channel);
+        assert_eq!(forwarded.header.epoch, pending.module_epoch);
+
+        router
+            .route_for_connection(
+                &module_ctx,
+                route_frame(
+                    FrameType::Response,
+                    pending.module_channel,
+                    pending.module_epoch,
+                    701,
+                ),
+            )
+            .await
+            .unwrap();
+        let delivered = client_rx.recv().await.unwrap();
+        assert_eq!(delivered.header.channel, pending.client_channel);
+        assert_eq!(delivered.header.epoch, pending.client_epoch);
+
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch + 1,
+                    702,
+                ),
+            )
+            .await
+            .unwrap();
+        router
+            .route_for_connection(
+                &module_ctx,
+                route_frame(
+                    FrameType::Response,
+                    pending.module_channel,
+                    pending.module_epoch + 1,
+                    703,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(module_rx.try_recv().is_err());
+        assert!(client_rx.try_recv().is_err());
+        assert_eq!(forwarding.stale_epoch_drop_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn accepted_route_publishes_route_open_before_immediate_reverse_request() {
+        let (router, _, _client_ctx, mut client_rx, module_ctx, _module_rx, pending) =
+            dynamic_route_fixture(true);
+        router
+            .route_for_connection(
+                &module_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.module_channel,
+                    pending.module_epoch,
+                    800,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let first = client_rx.recv().await.unwrap();
+        let second = client_rx.recv().await.unwrap();
+        assert_eq!(first.header.channel, 0);
+        assert_eq!(first.header.corr, 700);
+        assert_eq!(second.header.channel, pending.client_channel);
+        assert_eq!(second.header.epoch, pending.client_epoch);
+        assert_eq!(second.header.corr, 800);
+    }
+
+    #[tokio::test]
+    async fn reserved_slot_ingress_errors_only_matching_client_requests() {
+        let (router, forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
+            dynamic_route_fixture(false);
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    900,
+                ),
+            )
+            .await
+            .unwrap();
+        let error = client_rx.recv().await.unwrap();
+        assert_eq!(error.header.ty, FrameType::Error);
+        assert_eq!(error.header.channel, pending.client_channel);
+        assert_eq!(error.header.epoch, pending.client_epoch);
+        assert_eq!(error.header.corr, 900);
+
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Response,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    901,
+                ),
+            )
+            .await
+            .unwrap();
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch + 1,
+                    902,
+                ),
+            )
+            .await
+            .unwrap();
+        router
+            .route_for_connection(
+                &module_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.module_channel,
+                    pending.module_epoch,
+                    903,
+                ),
+            )
+            .await
+            .unwrap();
+        if let Ok(frame) = client_rx.try_recv() {
+            panic!("reserved non-request unexpectedly produced {frame:?}");
+        }
+        assert!(module_rx.try_recv().is_err());
+        assert_eq!(forwarding.stale_epoch_drop_count(), 1);
     }
 
     #[test]

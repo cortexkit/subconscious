@@ -218,6 +218,12 @@ struct ResolvedConnection {
     info: ConnectionInfo,
 }
 
+#[derive(Clone, Copy)]
+struct RouteHandle {
+    channel: u16,
+    epoch: u32,
+}
+
 struct CkClient {
     path: PathBuf,
     info: ConnectionInfo,
@@ -288,7 +294,7 @@ impl CkClient {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             corr,
             body,
@@ -336,7 +342,7 @@ impl CkClient {
         &mut self,
         module_id: &str,
         project_root: PathBuf,
-    ) -> Result<u16, CkError> {
+    ) -> Result<RouteHandle, CkError> {
         let request = ClientControlRequest::RouteOpen {
             target: RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
@@ -353,9 +359,11 @@ impl CkClient {
         match serde_json::from_value::<ClientControlResponse>(value)? {
             ClientControlResponse::RouteOpen {
                 route_channel,
-                // WIRE-WAVE2: retain this epoch in the CLI route handle.
-                route_epoch: _route_epoch,
-            } => Ok(route_channel),
+                route_epoch,
+            } => Ok(RouteHandle {
+                channel: route_channel,
+                epoch: route_epoch,
+            }),
             other => Err(CkError::Message(format!(
                 "unexpected route.open response: {other:?}"
             ))),
@@ -364,7 +372,7 @@ impl CkClient {
 
     async fn route_request_value(
         &mut self,
-        route_channel: u16,
+        route: RouteHandle,
         body: Value,
     ) -> Result<Value, CkError> {
         let corr = self.next_corr;
@@ -373,8 +381,8 @@ impl CkClient {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
-            route_channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            route.channel,
+            route.epoch,
             corr,
             body,
         )
@@ -385,7 +393,10 @@ impl CkClient {
 
         loop {
             let reply = self.next_frame().await?;
-            if reply.header.channel != route_channel || reply.header.corr != corr {
+            if reply.header.channel != route.channel
+                || reply.header.epoch != route.epoch
+                || reply.header.corr != corr
+            {
                 continue;
             }
             return match reply.header.ty {
@@ -398,12 +409,12 @@ impl CkClient {
         }
     }
 
-    async fn route_goodbye(&mut self, route_channel: u16) {
+    async fn route_goodbye(&mut self, route: RouteHandle) {
         let frame = match Frame::build(
             FrameType::Goodbye,
             Flags::new(false, Priority::Passive, false),
-            route_channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            route.channel,
+            route.epoch,
             0,
             Vec::new(),
         ) {
@@ -589,16 +600,13 @@ async fn quota(
     ensure_quota_module_registered(client).await?;
     let project_root = env::current_dir()
         .map_err(|source| CkError::Message(format!("current directory: {source}")))?;
-    let route_channel = client
+    let route = client
         .route_open_management(QUOTA_MODULE_ID, project_root)
         .await?;
     let body = client
-        .route_request_value(
-            route_channel,
-            json!({ "method": "usage.get", "params": {} }),
-        )
+        .route_request_value(route, json!({ "method": "usage.get", "params": {} }))
         .await?;
-    client.route_goodbye(route_channel).await;
+    client.route_goodbye(route).await;
 
     let providers = usage_providers_from_body(&body)?;
     if let Some(filter) = provider_filter {

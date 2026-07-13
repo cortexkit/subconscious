@@ -21,14 +21,14 @@ use subc_protocol::{
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
 };
-use tokio::time::timeout;
 use tokio::time::{timeout_at, Instant};
 use tracing::{debug, info, warn};
 
 use crate::{
     forwarding::{
         CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
-        ModuleEndpointId, PendingModuleControlRpc, RouteBindRelayOutcome,
+        ModuleEndpointId, PendingModuleControlRpc, RouteBindRelayOutcome, RoutePollSnapshot,
+        RouteRelease,
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
@@ -38,10 +38,10 @@ use crate::{
 
 /// Lowest envelope version this subc build will negotiate.
 ///
-/// The v1 hardening floor is intentionally equal to the current locked envelope
-/// version. A HELLO below this floor receives a typed `version_unsupported`
-/// ERROR and is not registered.
-pub const MIN_SUPPORTED_VERSION: u8 = 1;
+/// Module HELLO negotiation is exact: peers must use the daemon's locked
+/// protocol version. Older and newer peers receive `version_unsupported` and
+/// are not registered.
+pub const MIN_SUPPORTED_VERSION: u8 = PROTOCOL_VERSION;
 
 const CAP_MANIFEST_REGISTRATION: &str = "manifest_registration_v1";
 const CAP_CHANNEL_LIFECYCLE: &str = "channel_lifecycle_v1";
@@ -116,9 +116,6 @@ impl fmt::Debug for ControlHandler {
 struct RouteBindReservationGuard {
     forwarding: Arc<ForwardingTable>,
     endpoint: ModuleEndpointId,
-    client_connection_id: ConnectionId,
-    client_channel: u16,
-    module_channel: u16,
     relay_corr: u64,
     armed: bool,
 }
@@ -156,20 +153,10 @@ impl Drop for ModuleControlRpcGuard {
 }
 
 impl RouteBindReservationGuard {
-    fn new(
-        forwarding: Arc<ForwardingTable>,
-        endpoint: ModuleEndpointId,
-        client_connection_id: ConnectionId,
-        client_channel: u16,
-        module_channel: u16,
-        relay_corr: u64,
-    ) -> Self {
+    fn new(forwarding: Arc<ForwardingTable>, endpoint: ModuleEndpointId, relay_corr: u64) -> Self {
         Self {
             forwarding,
             endpoint,
-            client_connection_id,
-            client_channel,
-            module_channel,
             relay_corr,
             armed: true,
         }
@@ -179,15 +166,13 @@ impl RouteBindReservationGuard {
         if !self.armed {
             return;
         }
-        let _ = self
-            .forwarding
-            .cancel_pending_relay(self.endpoint, self.relay_corr);
-        let _ = self.forwarding.release_reserved_route(
-            self.client_connection_id,
-            self.client_channel,
+        if let Ok(Some(target)) = self.forwarding.abort_pending_relay(
             self.endpoint,
-            self.module_channel,
-        );
+            self.relay_corr,
+            RouteBindRelayOutcome::ModuleGone("route.open handler canceled".to_string()),
+        ) {
+            send_goodbye_target_best_effort(&target, "canceled route.bind");
+        }
         self.armed = false;
     }
 
@@ -448,14 +433,15 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
         route_channel: u16,
+        route_epoch: u32,
     ) -> Result<bool, RouterError> {
         debug!(
             connection_id = connection_id.get(),
-            route_channel, "handling route GOODBYE"
+            route_channel, route_epoch, "handling route GOODBYE"
         );
-        let Some(released_route) = self
+        let RouteRelease::Removed(released_route) = self
             .forwarding
-            .release_client_route(connection_id, route_channel)
+            .release_client_route(connection_id, route_channel, route_epoch)
             .map_err(RouterError::Forwarding)?
         else {
             return Ok(false);
@@ -470,8 +456,8 @@ impl ControlHandler {
                 released.negotiated_ver,
                 FrameType::Goodbye,
                 control_flags(),
-                released.channel, // WIRE-WAVE2: thread the binding epoch.
-                0,
+                released.channel,
+                released.epoch,
                 0,
                 Vec::new(),
             ) {
@@ -493,8 +479,10 @@ impl ControlHandler {
                         error = %err,
                         "route GOODBYE was not delivered to client; closing target connection"
                     );
-                    self.forwarding.request_connection_close(
+                    let _ = self.forwarding.escalate_client_delivery_failure(
                         released.connection_id,
+                        released.channel,
+                        released.epoch,
                         CloseReason::new(
                             "route_goodbye_delivery_failed",
                             format!(
@@ -531,13 +519,14 @@ impl ControlHandler {
         module_sink: &crate::FrameSink,
         negotiated_ver: u8,
         module_channel: u16,
+        module_epoch: u32,
     ) {
         let frame = match Frame::build_with_version(
             negotiated_ver,
             FrameType::Goodbye,
             control_flags(),
-            module_channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            module_channel,
+            module_epoch,
             0,
             Vec::new(),
         ) {
@@ -743,7 +732,6 @@ impl ControlHandler {
             FrameType::HelloAck,
             control_flags(),
             0,
-            // WIRE-WAVE2: channel-0 frames always use epoch 0.
             0,
             frame.header.corr,
             body,
@@ -1058,9 +1046,18 @@ impl ControlHandler {
         };
         identity.project_root = project_root.as_path().to_path_buf();
 
+        let relay_deadline = Instant::now() + self.route_bind_relay_timeout;
         let pending = match self
             .forwarding
-            .begin_route_bind_relay_for(ctx.connection_id, &target_module_id)
+            .begin_route_bind_relay_for(
+                ctx.connection_id,
+                ctx.egress.clone(),
+                response_version(&frame),
+                frame.header.corr,
+                &target_module_id,
+                relay_deadline,
+            )
+            .await
         {
             Ok(pending) => pending,
             Err(err) => {
@@ -1075,25 +1072,27 @@ impl ControlHandler {
             endpoint,
             module_sink,
             negotiated_ver,
-            client_connection_id,
             client_channel,
+            client_epoch,
             module_channel,
+            module_epoch,
             corr: relay_corr,
             receiver,
         } = pending;
-        let mut reservation = RouteBindReservationGuard::new(
-            Arc::clone(&self.forwarding),
-            endpoint,
-            client_connection_id,
-            client_channel,
-            module_channel,
-            relay_corr,
-        );
+        let mut reservation =
+            RouteBindReservationGuard::new(Arc::clone(&self.forwarding), endpoint, relay_corr);
 
+        debug!(
+            connection_id = ctx.connection_id.get(),
+            client_channel,
+            client_epoch,
+            module_channel,
+            module_epoch,
+            "reserved route handle pair"
+        );
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
-            // WIRE-WAVE2: replace with the module-slot reservation epoch.
-            epoch: 0,
+            epoch: module_epoch,
             target,
             identity,
             principal: Some(principal),
@@ -1110,7 +1109,7 @@ impl ControlHandler {
             negotiated_ver,
             FrameType::Request,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             relay_corr,
             relay_body,
@@ -1126,41 +1125,23 @@ impl ControlHandler {
             )?]);
         }
 
-        match timeout(self.route_bind_relay_timeout, receiver).await {
+        if !self
+            .forwarding
+            .mark_route_bind_relay_enqueued(endpoint, relay_corr)
+            .map_err(RouterError::Forwarding)?
+        {
+            self.send_abandoned_route_bind_goodbye(
+                &module_sink,
+                negotiated_ver,
+                module_channel,
+                module_epoch,
+            );
+        }
+
+        match timeout_at(relay_deadline, receiver).await {
             Ok(Ok(RouteBindRelayOutcome::Accepted)) => {
-                if let Err(err) = self.forwarding.commit_route(
-                    ctx.connection_id,
-                    ctx.egress.clone(),
-                    response_version(&frame),
-                    endpoint,
-                    client_channel,
-                    module_channel,
-                ) {
-                    // The module already accepted (it holds a binding), but subc
-                    // could not commit locally. Tell the module to drop it.
-                    self.send_abandoned_route_bind_goodbye(
-                        &module_sink,
-                        negotiated_ver,
-                        module_channel,
-                    );
-                    reservation.release_and_disarm();
-                    return Ok(vec![control_error_frame(
-                        &frame,
-                        forwarding_error_code(&err),
-                        err.to_string(),
-                    )?]);
-                }
                 reservation.disarm();
-                let response = ClientControlResponse::RouteOpen {
-                    route_channel: client_channel,
-                    // WIRE-WAVE2: replace with the client-slot reservation epoch.
-                    route_epoch: 0,
-                };
-                Ok(vec![control_response_body_frame(
-                    &frame,
-                    &response,
-                    "ClientControlResponse::RouteOpen",
-                )?])
+                Ok(Vec::new())
             }
             Ok(Ok(RouteBindRelayOutcome::Rejected(body))) => {
                 reservation.release_and_disarm();
@@ -1175,14 +1156,6 @@ impl ControlHandler {
                 )?])
             }
             Ok(Err(_)) => {
-                // The relay was enqueued but its waiter was cancelled before the
-                // module answered; the module may still accept late, so tell it to
-                // drop any binding for this channel.
-                self.send_abandoned_route_bind_goodbye(
-                    &module_sink,
-                    negotiated_ver,
-                    module_channel,
-                );
                 reservation.release_and_disarm();
                 Ok(vec![control_error_frame(
                     &frame,
@@ -1191,13 +1164,6 @@ impl ControlHandler {
                 )?])
             }
             Err(_) => {
-                // Relay was enqueued but the module did not answer in time; it may
-                // still accept late, so tell it to drop any binding for this channel.
-                self.send_abandoned_route_bind_goodbye(
-                    &module_sink,
-                    negotiated_ver,
-                    module_channel,
-                );
                 reservation.release_and_disarm();
                 Ok(vec![control_error_frame(
                     &frame,
@@ -1657,7 +1623,7 @@ impl ControlHandler {
             negotiated_ver,
             FrameType::Request,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             probe_corr,
             probe_body,
@@ -1725,6 +1691,17 @@ impl ControlHandler {
                     &frame,
                     "invalid_control_body",
                     format!("expected module-control op '{expected}', got '{actual}'"),
+                )?])
+            }
+            Ok(Ok(ModuleControlRpcOutcome::DeadlineElapsed)) => {
+                guard.disarm();
+                Ok(vec![control_error_frame(
+                    &frame,
+                    "module_timeout",
+                    format!(
+                        "module_id '{module_id}' answered health.check after {:?}",
+                        self.health_probe_timeout
+                    ),
                 )?])
             }
             Ok(Err(_)) => Ok(vec![control_error_frame(
@@ -1818,12 +1795,11 @@ impl ControlHandler {
         match update {
             ModuleControlPush::RouteStatus {
                 route_channel,
-                // WIRE-WAVE2: validate the pushed epoch against the route binding.
-                route_epoch: _route_epoch,
+                route_epoch,
                 status,
             } => {
                 self.forwarding
-                    .cache_status(endpoint, route_channel, status)
+                    .cache_status(endpoint, route_channel, route_epoch, status)
                     .map_err(RouterError::Forwarding)?;
             }
         }
@@ -1838,43 +1814,44 @@ impl ControlHandler {
         route_epoch: u32,
         kind: PollKind,
     ) -> Result<Vec<Frame>, RouterError> {
-        let response = match kind {
-            PollKind::Liveness => {
-                let route_bound_to_live_module = self
-                    .forwarding
-                    .client_route_is_bound_to_live_module(ctx.connection_id, route_channel)
-                    .map_err(RouterError::Forwarding)?;
-                let process_running = if route_bound_to_live_module {
-                    self.process_running_for_route(ctx.connection_id, route_channel)
-                        .map_err(|message| {
-                            RouterError::backend(frame.header.channel, frame.header.corr, message)
-                        })?
-                } else {
-                    false
-                };
-                let live = route_bound_to_live_module && process_running;
+        let snapshot = self
+            .forwarding
+            .route_poll_snapshot(ctx.connection_id, route_channel, route_epoch)
+            .map_err(RouterError::Forwarding)?;
+        let response = match (kind, snapshot) {
+            (PollKind::Status, RoutePollSnapshot::Bound { status, .. }) => {
                 ClientControlResponse::RoutePoll {
                     route_channel,
-                    // WIRE-WAVE2: validate this requested epoch in the locked route snapshot.
-                    route_epoch,
-                    status: None,
-                    live: Some(live),
-                }
-            }
-            PollKind::Status => {
-                let status = self
-                    .forwarding
-                    .get_status(ctx.connection_id, route_channel)
-                    .map_err(RouterError::Forwarding)?;
-
-                ClientControlResponse::RoutePoll {
-                    route_channel,
-                    // WIRE-WAVE2: validate this requested epoch in the locked route snapshot.
                     route_epoch,
                     status,
                     live: None,
                 }
             }
+            (PollKind::Status, RoutePollSnapshot::Absent) => ClientControlResponse::RoutePoll {
+                route_channel,
+                route_epoch,
+                status: None,
+                live: None,
+            },
+            (PollKind::Liveness, RoutePollSnapshot::Bound { module_id, .. }) => {
+                let live = self
+                    .process_liveness
+                    .as_ref()
+                    .and_then(|source| source.process_live(&module_id))
+                    .unwrap_or(true);
+                ClientControlResponse::RoutePoll {
+                    route_channel,
+                    route_epoch,
+                    status: None,
+                    live: Some(live),
+                }
+            }
+            (PollKind::Liveness, RoutePollSnapshot::Absent) => ClientControlResponse::RoutePoll {
+                route_channel,
+                route_epoch,
+                status: None,
+                live: Some(false),
+            },
         };
 
         Ok(vec![control_response_body_frame(
@@ -1882,34 +1859,6 @@ impl ControlHandler {
             &response,
             "ClientControlResponse::RoutePoll",
         )?])
-    }
-
-    fn process_running_for_route(
-        &self,
-        connection_id: ConnectionId,
-        route_channel: u16,
-    ) -> Result<bool, String> {
-        let Some(process_liveness) = &self.process_liveness else {
-            return Ok(true);
-        };
-        let Some(module_id) = self.module_id_for_route(connection_id, route_channel)? else {
-            return Ok(true);
-        };
-        Ok(process_liveness.process_live(&module_id).unwrap_or(true))
-    }
-
-    fn module_id_for_route(
-        &self,
-        connection_id: ConnectionId,
-        route_channel: u16,
-    ) -> Result<Option<String>, String> {
-        self.forwarding
-            .client_route_module_id(connection_id, route_channel)
-            .map_err(|err| {
-                format!(
-                    "forwarding error resolving module for route channel {route_channel}: {err}"
-                )
-            })
     }
 
     fn handle_module_relay_response(
@@ -2062,11 +2011,14 @@ impl ControlHandler {
             }
         };
 
-        let settled = self
+        let completion = self
             .forwarding
             .complete_pending_relay(connection_id, frame.header.corr, outcome)
             .map_err(RouterError::Forwarding)?;
-        if !settled {
+        if let Some(target) = completion.abandoned.as_ref() {
+            send_goodbye_target_best_effort(target, "late accepted route.bind");
+        }
+        if !completion.settled {
             debug!(
                 connection_id = connection_id.get(),
                 corr = frame.header.corr,
@@ -2318,12 +2270,12 @@ fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {
 }
 
 fn negotiate_version(peer_version: u8) -> Result<u8, String> {
-    if peer_version < MIN_SUPPORTED_VERSION {
+    if peer_version != PROTOCOL_VERSION {
         return Err(format!(
-            "protocol_ver {peer_version} is below minimum supported version {MIN_SUPPORTED_VERSION}"
+            "protocol_ver {peer_version} is unsupported; this daemon requires exactly {PROTOCOL_VERSION}"
         ));
     }
-    Ok(peer_version.min(PROTOCOL_VERSION))
+    Ok(PROTOCOL_VERSION)
 }
 
 fn pong(frame: &Frame) -> Result<Frame, RouterError> {
@@ -2331,7 +2283,7 @@ fn pong(frame: &Frame) -> Result<Frame, RouterError> {
         response_version(frame),
         FrameType::Pong,
         frame.header.flags,
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         frame.header.corr,
         Vec::new(),
@@ -2366,7 +2318,7 @@ fn control_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, Ro
         response_version(frame),
         FrameType::Error,
         control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         frame.header.corr,
         body,
@@ -2391,7 +2343,7 @@ fn control_response_body_frame<T: Serialize>(
         response_version(frame),
         FrameType::Response,
         control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         frame.header.corr,
         body,
@@ -2405,12 +2357,13 @@ fn forwarding_error_code(err: &ForwardingError) -> &'static str {
         ForwardingError::ModuleReloading { .. } => "module_reloading",
         ForwardingError::ClientRouteChannelExhausted { .. }
         | ForwardingError::ModuleRouteChannelExhausted { .. } => "route_limit",
-        ForwardingError::StaleModuleEndpoint | ForwardingError::UnknownReservation { .. } => {
-            "target_unavailable"
-        }
-        ForwardingError::RelayCorrelationExhausted | ForwardingError::Poisoned => {
-            "forwarding_error"
-        }
+        ForwardingError::StaleModuleEndpoint
+        | ForwardingError::UnknownReservation { .. }
+        | ForwardingError::ConnectionClosing { .. }
+        | ForwardingError::ClientEgressClosed { .. } => "target_unavailable",
+        ForwardingError::RelayCorrelationExhausted
+        | ForwardingError::RouteOpenBuild(_)
+        | ForwardingError::Poisoned => "forwarding_error",
     }
 }
 
@@ -2424,6 +2377,29 @@ fn response_version(frame: &Frame) -> u8 {
 
 fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
+}
+
+fn send_goodbye_target_best_effort(target: &GoodbyeTarget, context: &str) {
+    let Ok(frame) = Frame::build_with_version(
+        target.negotiated_ver,
+        FrameType::Goodbye,
+        control_flags(),
+        target.channel,
+        target.epoch,
+        0,
+        Vec::new(),
+    ) else {
+        return;
+    };
+    if let Err(err) = target.sink.try_send(frame) {
+        warn!(
+            route_channel = target.channel,
+            route_epoch = target.epoch,
+            error = %err,
+            %context,
+            "route GOODBYE dropped under backpressure"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2539,15 +2515,7 @@ mod tests {
             launch_nonce,
         })
         .unwrap();
-        Frame::build(
-            FrameType::Hello,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            corr,
-            body,
-        )
-        .unwrap()
+        Frame::build(FrameType::Hello, control_flags(), 0, 0, corr, body).unwrap()
     }
 
     fn non_routable_hello_frame_with_control_ops(
@@ -2564,22 +2532,14 @@ mod tests {
             launch_nonce: None,
         })
         .unwrap();
-        Frame::build(
-            FrameType::Hello,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            corr,
-            body,
-        )
-        .unwrap()
+        Frame::build(FrameType::Hello, control_flags(), 0, 0, corr, body).unwrap()
     }
 
     fn channel_request(channel: u16, corr: u64) -> Frame {
         Frame::build(
             FrameType::Request,
             Flags::new(true, Priority::Interactive, false),
-            channel, // WIRE-WAVE2: thread the binding epoch.
+            channel,
             0,
             corr,
             b"opaque".to_vec(),
@@ -2613,20 +2573,11 @@ mod tests {
     fn route_poll_frame(corr: u64, kind: PollKind, route_channel: u16) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
             route_channel,
-            // WIRE-WAVE2: tests use the placeholder epoch until bindings carry epochs.
             route_epoch: 0,
             kind,
         })
         .unwrap();
-        Frame::build(
-            FrameType::Request,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            corr,
-            body,
-        )
-        .unwrap()
+        Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
     }
 
     fn supervisor_health_probe_frame(corr: u64, module_id: &str) -> Frame {
@@ -2634,15 +2585,7 @@ mod tests {
             module_id: module_id.to_string(),
         })
         .unwrap();
-        Frame::build(
-            FrameType::Request,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            corr,
-            body,
-        )
-        .unwrap()
+        Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
     }
 
     fn route_open_frame(corr: u64, module_id: &str, project_root: std::path::PathBuf) -> Frame {
@@ -2668,15 +2611,7 @@ mod tests {
             consumer_capabilities,
         })
         .unwrap();
-        Frame::build(
-            FrameType::Request,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            corr,
-            body,
-        )
-        .unwrap()
+        Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
     }
 
     fn health_response(corr: u64, status: HealthStatus) -> Frame {
@@ -2686,28 +2621,12 @@ mod tests {
             metrics: Some(json!({"queue_depth": 3})),
         })
         .unwrap();
-        Frame::build(
-            FrameType::Response,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            corr,
-            body,
-        )
-        .unwrap()
+        Frame::build(FrameType::Response, control_flags(), 0, 0, corr, body).unwrap()
     }
 
     fn route_bind_ack(corr: u64) -> Frame {
         let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap();
-        Frame::build(
-            FrameType::Response,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            corr,
-            body,
-        )
-        .unwrap()
+        Frame::build(FrameType::Response, control_flags(), 0, 0, corr, body).unwrap()
     }
 
     fn unique_project_root(label: &str) -> std::path::PathBuf {
@@ -2728,7 +2647,6 @@ mod tests {
             ClientControlResponse::RoutePoll {
                 status: None,
                 live: Some(live),
-                // WIRE-WAVE2: assert the echoed handle once test bindings carry epochs.
                 ..
             } => assert_eq!(live, expected_live),
             other => panic!("unexpected route.poll response: {other:?}"),
@@ -2739,7 +2657,7 @@ mod tests {
         registry: &Registry,
         forwarding: &ForwardingTable,
         module_id: &str,
-    ) -> (RouteCtx, u16) {
+    ) -> (RouteCtx, u16, u32) {
         let module_connection = ConnectionId::new(101);
         let client_connection = ConnectionId::new(202);
         let registration = registry
@@ -2760,10 +2678,18 @@ mod tests {
                 FrameSink::new(module_tx),
             )
             .unwrap();
+        let (client_ctx, _client_rx) = route_ctx(client_connection);
         let pending = forwarding
-            .begin_route_bind_relay_for(client_connection, module_id)
+            .begin_route_bind_relay_for_test(
+                client_connection,
+                client_ctx.egress.clone(),
+                1,
+                module_id,
+            )
             .unwrap();
         assert_eq!(pending.endpoint, endpoint);
+        let route_channel = pending.client_channel;
+        let route_epoch = pending.client_epoch;
         forwarding
             .complete_pending_relay(
                 module_connection,
@@ -2771,18 +2697,7 @@ mod tests {
                 RouteBindRelayOutcome::Accepted,
             )
             .unwrap();
-        let (client_ctx, _client_rx) = route_ctx(client_connection);
-        forwarding
-            .commit_route(
-                client_connection,
-                client_ctx.egress.clone(),
-                PROTOCOL_VERSION,
-                endpoint,
-                pending.client_channel,
-                pending.module_channel,
-            )
-            .unwrap();
-        (client_ctx, pending.client_channel)
+        (client_ctx, route_channel, route_epoch)
     }
 
     struct FakeProcessLiveness {
@@ -2892,15 +2807,8 @@ mod tests {
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.control_ops, module_baseline_control_ops());
 
-        let frame = Frame::build(
-            FrameType::Request,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            77,
-            Vec::new(),
-        )
-        .unwrap();
+        let frame =
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 77, Vec::new()).unwrap();
         assert!(handler
             .guard_module_control_op(&frame, "aft", "route.bind")
             .unwrap()
@@ -2940,15 +2848,8 @@ mod tests {
                 "future.synthetic".to_string(),
             ]
         );
-        let frame = Frame::build(
-            FrameType::Request,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            78,
-            Vec::new(),
-        )
-        .unwrap();
+        let frame =
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 78, Vec::new()).unwrap();
         assert!(handler
             .guard_module_control_op(&frame, "aft", "future.synthetic")
             .unwrap()
@@ -3003,7 +2904,7 @@ mod tests {
             .unwrap();
 
         let project_root = unique_project_root("demux");
-        let (route_client_ctx, _route_client_rx) = route_ctx(ConnectionId::new(31));
+        let (route_client_ctx, mut route_client_rx) = route_ctx(ConnectionId::new(31));
         let route_handler = handler.clone();
         let route_task = tokio::spawn(async move {
             route_handler
@@ -3072,9 +2973,10 @@ mod tests {
             .await
             .unwrap();
         let route_response = route_task.await.unwrap();
-        assert_eq!(route_response.len(), 1);
+        assert!(route_response.is_empty());
+        let published = route_client_rx.recv().await.unwrap();
         assert!(matches!(
-            serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
+            serde_json::from_slice::<ClientControlResponse>(&published.body).unwrap(),
             ClientControlResponse::RouteOpen { .. }
         ));
     }
@@ -3094,7 +2996,7 @@ mod tests {
         let expected = vec!["elicitation".to_string(), "roots".to_string()];
         let expected_for_request = expected.clone();
         let project_root = unique_project_root("consumer-capabilities-present");
-        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(38));
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(38));
         let route_handler = handler.clone();
         let route_task = tokio::spawn(async move {
             route_handler
@@ -3129,8 +3031,10 @@ mod tests {
             .await
             .unwrap();
         let route_response = route_task.await.unwrap();
+        assert!(route_response.is_empty());
+        let published = client_rx.recv().await.unwrap();
         assert!(matches!(
-            serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
+            serde_json::from_slice::<ClientControlResponse>(&published.body).unwrap(),
             ClientControlResponse::RouteOpen { .. }
         ));
     }
@@ -3148,7 +3052,7 @@ mod tests {
             .unwrap();
 
         let project_root = unique_project_root("consumer-capabilities-absent");
-        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(40));
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(40));
         let route_handler = handler.clone();
         let route_task = tokio::spawn(async move {
             route_handler
@@ -3175,8 +3079,10 @@ mod tests {
             .await
             .unwrap();
         let route_response = route_task.await.unwrap();
+        assert!(route_response.is_empty());
+        let published = client_rx.recv().await.unwrap();
         assert!(matches!(
-            serde_json::from_slice::<ClientControlResponse>(&route_response[0].body).unwrap(),
+            serde_json::from_slice::<ClientControlResponse>(&published.body).unwrap(),
             ClientControlResponse::RouteOpen { .. }
         ));
     }
@@ -3350,20 +3256,24 @@ mod tests {
     }
 
     #[test]
-    fn hello_below_version_floor_returns_error_without_registration() {
-        let registry = Arc::new(Registry::default());
-        let handler = ControlHandler::new(Arc::clone(&registry));
+    fn hello_requires_exact_protocol_version() {
+        for (connection, offered) in [(1, PROTOCOL_VERSION - 1), (2, PROTOCOL_VERSION + 1)] {
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(Arc::clone(&registry));
+            let responses = handler
+                .handle_control(
+                    ConnectionId::new(connection),
+                    hello_frame("aft", offered, 9),
+                )
+                .unwrap();
 
-        let responses = handler
-            .handle_control(ConnectionId::new(1), hello_frame("aft", 0, 9))
-            .unwrap();
-
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0].header.ty, FrameType::Error);
-        let error = parse_error(&responses[0]);
-        assert_eq!(error["code"], "version_unsupported");
-        assert!(registry.get_module("aft").unwrap().is_none());
-        assert_eq!(registry.active_registration_count().unwrap(), 0);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].header.ty, FrameType::Error);
+            let error = parse_error(&responses[0]);
+            assert_eq!(error["code"], "version_unsupported");
+            assert!(registry.get_module("aft").unwrap().is_none());
+            assert_eq!(registry.active_registration_count().unwrap(), 0);
+        }
     }
 
     #[test]
@@ -3396,7 +3306,7 @@ mod tests {
         let unknown = Frame::build(
             FrameType::Push,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             5,
             serde_json::to_vec(&json!({"op": "route.future.v2", "extra": 1})).unwrap(),
@@ -3412,7 +3322,7 @@ mod tests {
         let malformed = Frame::build(
             FrameType::Push,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             6,
             serde_json::to_vec(&json!({"op": "route.status"})).unwrap(),
@@ -3598,7 +3508,7 @@ mod tests {
         let malformed = Frame::build(
             FrameType::Hello,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             3,
             b"{not json".to_vec(),
@@ -3609,15 +3519,7 @@ mod tests {
         assert_eq!(error[0].header.ty, FrameType::Error);
         assert_eq!(parse_error(&error[0])["code"], "invalid_hello");
 
-        let ping = Frame::build(
-            FrameType::Ping,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            4,
-            Vec::new(),
-        )
-        .unwrap();
+        let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 4, Vec::new()).unwrap();
         let pong = handler.handle_control(conn, ping).unwrap();
         assert_eq!(pong[0].header.ty, FrameType::Pong);
         assert_eq!(pong[0].header.corr, 4);
@@ -3655,14 +3557,14 @@ mod tests {
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_process_liveness(process_liveness);
-        let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-dead");
+        let (ctx, route_channel, route_epoch) =
+            bind_liveness_route(&registry, &forwarding, "aft-dead");
         let responses = handler
             .handle_route_poll(
                 &ctx,
                 route_poll_frame(41, PollKind::Liveness, route_channel),
                 route_channel,
-                // WIRE-WAVE2: pass the route test handle epoch.
-                0,
+                route_epoch,
                 PollKind::Liveness,
             )
             .unwrap();
@@ -3678,14 +3580,14 @@ mod tests {
         let forwarding = Arc::new(ForwardingTable::default());
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
-        let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-bound-only");
+        let (ctx, route_channel, route_epoch) =
+            bind_liveness_route(&registry, &forwarding, "aft-bound-only");
         let responses = handler
             .handle_route_poll(
                 &ctx,
                 route_poll_frame(42, PollKind::Liveness, route_channel),
                 route_channel,
-                // WIRE-WAVE2: pass the route test handle epoch.
-                0,
+                route_epoch,
                 PollKind::Liveness,
             )
             .unwrap();
@@ -3701,14 +3603,14 @@ mod tests {
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_process_liveness(process_liveness);
-        let (ctx, route_channel) = bind_liveness_route(&registry, &forwarding, "aft-untracked");
+        let (ctx, route_channel, route_epoch) =
+            bind_liveness_route(&registry, &forwarding, "aft-untracked");
         let responses = handler
             .handle_route_poll(
                 &ctx,
                 route_poll_frame(43, PollKind::Liveness, route_channel),
                 route_channel,
-                // WIRE-WAVE2: pass the route test handle epoch.
-                0,
+                route_epoch,
                 PollKind::Liveness,
             )
             .unwrap();
@@ -3723,7 +3625,7 @@ mod tests {
         let request = Frame::build(
             FrameType::Request,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             55,
             br#"{"op":"route.nope","route_channel":1}"#.to_vec(),
@@ -3754,7 +3656,7 @@ mod tests {
             let request = Frame::build(
                 FrameType::Request,
                 control_flags(),
-                0, // WIRE-WAVE2: thread the binding epoch.
+                0,
                 0,
                 corr,
                 body.to_vec(),
@@ -3786,15 +3688,8 @@ mod tests {
         assert_eq!(ack.negotiated_ver, PROTOCOL_VERSION);
         let channel = 1;
 
-        let goodbye = Frame::build(
-            FrameType::Goodbye,
-            control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
-            0,
-            12,
-            Vec::new(),
-        )
-        .unwrap();
+        let goodbye =
+            Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 12, Vec::new()).unwrap();
         router.route_for_connection(&ctx, goodbye).await.unwrap();
         assert!(rx.try_recv().is_err());
         assert!(registry.get_module("aft").unwrap().is_none());
@@ -3837,7 +3732,7 @@ mod tests {
         let request = Frame::build(
             FrameType::Request,
             control_flags(),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             21,
             b"opaque".to_vec(),

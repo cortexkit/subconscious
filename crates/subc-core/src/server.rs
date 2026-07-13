@@ -502,7 +502,7 @@ mod tests {
         Frame::build(
             FrameType::Request,
             Flags::new(true, Priority::Interactive, false),
-            channel, // WIRE-WAVE2: thread the binding epoch.
+            channel,
             0,
             corr,
             body.to_vec(),
@@ -597,7 +597,7 @@ mod tests {
         let ping = Frame::build(
             FrameType::Ping,
             Flags::new(false, Priority::Passive, false),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             55,
             Vec::new(),
@@ -628,7 +628,7 @@ mod tests {
         let ping = Frame::build(
             FrameType::Ping,
             Flags::new(false, Priority::Passive, false),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             66,
             Vec::new(),
@@ -703,7 +703,7 @@ mod tests {
         let ping = Frame::build(
             FrameType::Ping,
             Flags::new(false, Priority::Passive, false),
-            0, // WIRE-WAVE2: thread the binding epoch.
+            0,
             0,
             77,
             Vec::new(),

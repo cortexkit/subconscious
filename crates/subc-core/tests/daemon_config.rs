@@ -109,7 +109,7 @@ async fn config_spawns_supervises_registers_and_routes_stub_module() {
 
     let response = read_frame_timeout(&mut client).await;
     assert_eq!(response.header.ty, FrameType::Response);
-    assert_eq!(response.header.channel, route_channel);
+    assert_eq!(response.header.channel, route_channel.channel);
     assert_eq!(response.header.corr, 101);
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     let text = body["content"][0]["text"].as_str().unwrap();
@@ -203,7 +203,7 @@ async fn failed_spawn_is_visible_and_good_modules_still_start() {
     client.flush().await.unwrap();
     let response = read_frame_timeout(&mut client).await;
     assert_eq!(response.header.ty, FrameType::Response);
-    assert_eq!(response.header.channel, route_channel);
+    assert_eq!(response.header.channel, route_channel.channel);
     assert_eq!(response.header.corr, 21);
     assert_eq!(response.body, b"ping");
 }
@@ -247,7 +247,7 @@ async fn rescan_adds_reserved_module_and_attests_its_launch_nonce() {
     )
     .await
     .expect("launch nonce from rescan-added module should attest its consumer identity");
-    assert!(attested_route > 0);
+    assert!(attested_route.channel > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -278,7 +278,7 @@ async fn rescan_removes_module_and_leaves_other_open_route_undisturbed() {
 
     let goodbye = read_frame_timeout(&mut removed_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
-    assert_eq!(goodbye.header.channel, removed_route);
+    assert_eq!(goodbye.header.channel, removed_route.channel);
 
     write_frame(
         &mut kept_client,
@@ -392,7 +392,7 @@ async fn rescan_add_does_not_interrupt_existing_in_flight_request() {
 
     let response = read_frame_timeout(&mut existing_client).await;
     assert_eq!(response.header.ty, FrameType::Response);
-    assert_eq!(response.header.channel, existing_route);
+    assert_eq!(response.header.channel, existing_route.channel);
     assert_eq!(response.header.corr, 601);
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert!(body["content"][0]["text"]
@@ -783,7 +783,13 @@ async fn wait_for_catalog_absent(path: &Path, module_id: &str, wait: Duration) {
     }
 }
 
-async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> u16
+#[derive(Debug, Clone, Copy)]
+struct RouteHandle {
+    channel: u16,
+    epoch: u32,
+}
+
+async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> RouteHandle
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -797,7 +803,7 @@ async fn open_route_with_consumer_identity<S>(
     module_id: &str,
     corr: u64,
     consumer_identity: ConsumerIdentity,
-) -> Result<u16, ErrorBody>
+) -> Result<RouteHandle, ErrorBody>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -809,7 +815,7 @@ async fn open_route_with_identity<S>(
     module_id: &str,
     corr: u64,
     consumer_identity: Option<ConsumerIdentity>,
-) -> Result<u16, ErrorBody>
+) -> Result<RouteHandle, ErrorBody>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -835,25 +841,27 @@ where
     {
         ClientControlResponse::RouteOpen {
             route_channel,
-            // WIRE-WAVE2: retain this epoch in the route test handle.
-            route_epoch: _route_epoch,
-        } => Ok(route_channel),
+            route_epoch,
+        } => Ok(RouteHandle {
+            channel: route_channel,
+            epoch: route_epoch,
+        }),
         other => panic!("unexpected route.open response: {other:?}"),
     }
 }
 
-async fn call_tool<S>(stream: &mut S, route_channel: u16, corr: u64, name: &str) -> String
+async fn call_tool<S>(stream: &mut S, route: RouteHandle, corr: u64, name: &str) -> String
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let body = serde_json::to_vec(&json!({ "name": name, "arguments": {} })).unwrap();
-    write_frame(stream, &data_request(route_channel, corr, &body))
+    write_frame(stream, &data_request(route, corr, &body))
         .await
         .unwrap();
     stream.flush().await.unwrap();
     let response = read_frame_timeout(stream).await;
     assert_eq!(response.header.ty, FrameType::Response);
-    assert_eq!(response.header.channel, route_channel);
+    assert_eq!(response.header.channel, route.channel);
     assert_eq!(response.header.corr, corr);
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     body["content"][0]["text"]
@@ -902,7 +910,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -910,12 +918,12 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
     .unwrap()
 }
 
-fn data_request(channel: u16, corr: u64, body: &[u8]) -> Frame {
+fn data_request(route: RouteHandle, corr: u64, body: &[u8]) -> Frame {
     Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        channel, // WIRE-WAVE2: thread the binding epoch.
-        0,
+        route.channel,
+        route.epoch,
         corr,
         body.to_vec(),
     )

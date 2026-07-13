@@ -1380,7 +1380,7 @@ async fn probe_module_health(
         negotiated_ver,
         FrameType::Request,
         control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         corr,
         body,
@@ -1427,6 +1427,9 @@ async fn probe_module_health(
                 "expected module-control op '{expected}', got '{actual}'"
             )))
         }
+        Ok(Ok(ModuleControlRpcOutcome::DeadlineElapsed)) => Err(HealthProbeError::new(
+            "module answered health.check after its daemon deadline",
+        )),
         Ok(Err(_)) => Err(HealthProbeError::new(
             "health.check waiter was canceled before the module responded",
         )),
@@ -2402,8 +2405,8 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
             released.negotiated_ver,
             FrameType::Goodbye,
             control_flags(),
-            released.channel, // WIRE-WAVE2: thread the binding epoch.
-            0,
+            released.channel,
+            released.epoch,
             0,
             Vec::new(),
         ) {
@@ -2425,8 +2428,10 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
                     error = %err,
                     "supervisor drain route GOODBYE was not delivered to client; closing target connection"
                 );
-                forwarding.request_connection_close(
+                let _ = forwarding.escalate_client_delivery_failure(
                     released.connection_id,
+                    released.channel,
+                    released.epoch,
                     CloseReason::new(
                         "route_goodbye_delivery_failed",
                         format!(
@@ -2452,7 +2457,7 @@ fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &M
         target.negotiated_ver,
         FrameType::Goodbye,
         control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         0,
         Vec::new(),
@@ -2536,6 +2541,7 @@ async fn begin_forwarding_drain_with(
     })?;
 
     if let Some(target) = drain_target.as_ref() {
+        send_route_goodbyes(forwarding, target.abandoned_bindings.clone());
         if !wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
             .await?
         {

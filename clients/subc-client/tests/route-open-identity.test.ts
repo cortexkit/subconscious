@@ -7,7 +7,7 @@ import {
   type BindIdentity,
   type RouteTarget,
 } from "../src/index.js";
-
+import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
 const TARGET: RouteTarget = { kind: "tool_provider", module_id: "aft" };
 const IDENTITY: BindIdentity = { project_root: "/tmp/subc-ts-test", harness: "bun", session: "s1" };
 
@@ -69,15 +69,21 @@ function routeOpenHarness(): { client: SubcClient; captured: () => unknown } {
   // to `never` under tsc, so reach them via a separate structural view instead.
   const internals = client as unknown as {
     encode(value: unknown): Uint8Array;
-    controlRpc(body: Uint8Array): Promise<unknown>;
+    controlRpc(body: Uint8Array, accept?: (frame: unknown) => boolean): Promise<unknown>;
     parseJson(frame: unknown): unknown;
+    installRoute(channel: number, epoch: number): RouteHandle;
   };
   internals.encode = (value: unknown): Uint8Array => {
     captured = value;
     return new Uint8Array([1]);
   };
-  internals.controlRpc = async () => ({ ok: true });
-  internals.parseJson = () => ({ op: "route.open", route_channel: 7 });
+  const handle = createRouteHandle(7, 1, newConnectionToken());
+  internals.controlRpc = async (_body, accept) => {
+    accept?.({ header: { ty: 1 } });
+    return { ok: true };
+  };
+  internals.parseJson = () => ({ op: "route.open", route_channel: 7, route_epoch: 1 });
+  internals.installRoute = () => handle;
   return { client, captured: () => captured };
 }
 

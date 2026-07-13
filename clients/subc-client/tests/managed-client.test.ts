@@ -606,7 +606,7 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
         } else if (options.routeOpenError) {
           await writeFrame(socket, errorFrame(frame, options.routeOpenError), deadline);
         } else {
-          await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: routeChannel++ }), deadline);
+          await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: routeChannel++, route_epoch: 1 }), deadline);
         }
       }
       continue;
@@ -656,23 +656,11 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
 }
 
 function responseFrame(request: Frame, body: unknown): Frame {
-  return buildFrame(
-    FrameType.Response,
-    buildFlags(false, Priority.Interactive, false),
-    request.header.channel,
-    request.header.corr,
-    encodeJson(body),
-  );
+  return buildFrame(FrameType.Response, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
 }
 
 function errorFrame(request: Frame, body: { code: string; message: string }): Frame {
-  return buildFrame(
-    FrameType.Error,
-    buildFlags(false, Priority.Interactive, false),
-    request.header.channel,
-    request.header.corr,
-    encodeJson(body),
-  );
+  return buildFrame(FrameType.Error, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
 }
 
 async function authenticateFakeServer(

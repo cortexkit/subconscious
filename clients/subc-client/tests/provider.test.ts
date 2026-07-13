@@ -26,6 +26,7 @@ import {
   type ManifestInput,
   type ProviderConnectionState,
 } from "../src/index.js";
+import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0x4b));
 const DAEMON_ID = Uint8Array.from(Array(16).fill(0x6d));
@@ -134,7 +135,7 @@ describe("SubcProvider serve loop", () => {
     };
 
     await provider.handleControlRequest(
-      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, CONTROL_FLAGS, 0, 88n, encodeJson({ op: "health.check" })),
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, CONTROL_FLAGS, 0, 0, 88n, encodeJson({ op: "health.check" })),
       sock,
       1,
     );
@@ -162,7 +163,7 @@ describe("SubcProvider serve loop", () => {
       inflight: Map<string, AbortController>;
       requestGate: { acquire(): Promise<() => void> };
       opts: { handler: () => Promise<Uint8Array>; health: () => { status: "ok" } };
-      handleDataRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+      handleDataRequest(frame: Frame, handle: RouteHandle, sock: unknown, generation: number): Promise<void>;
       handleControlRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
     };
     provider.sock = sock;
@@ -180,20 +181,23 @@ describe("SubcProvider serve loop", () => {
       health: () => ({ status: "ok" }),
     };
 
+    const handle = createRouteHandle(7, 1, newConnectionToken());
     void provider.handleDataRequest(
-      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1n, encodeJson({ n: 1 })),
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 1n, encodeJson({ n: 1 })),
+      handle,
       sock,
       1,
     );
     void provider.handleDataRequest(
-      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 2n, encodeJson({ n: 2 })),
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 2n, encodeJson({ n: 2 })),
+      handle,
       sock,
       1,
     );
     await waitForCondition(() => entered === 2, "saturated handler gate");
 
     await provider.handleControlRequest(
-      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, CONTROL_FLAGS, 0, 89n, encodeJson({ op: "health.check" })),
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, CONTROL_FLAGS, 0, 0, 89n, encodeJson({ op: "health.check" })),
       sock,
       1,
     );
@@ -219,7 +223,7 @@ describe("SubcProvider managed reconnect", () => {
       closedErr: Error | null;
       inflight: Map<string, AbortController>;
       opts: { handler: (routeChannel: number, body: Uint8Array) => Promise<Uint8Array> };
-      handleDataRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+      handleDataRequest(frame: Frame, handle: RouteHandle, sock: unknown, generation: number): Promise<void>;
     };
     provider.sock = oldSock;
     provider.generation = 1;
@@ -233,15 +237,9 @@ describe("SubcProvider managed reconnect", () => {
         }),
     };
 
-    const request = buildFrameWithVersion(
-      PROTOCOL_VERSION,
-      FrameType.Request,
-      buildFlags(false, Priority.Interactive, false),
-      7,
-      99n,
-      encodeJson({ method: "slow" }),
-    );
-    const handling = provider.handleDataRequest(request, oldSock, 1);
+    const request = buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 99n, encodeJson({ method: "slow" }));
+    const handle = createRouteHandle(7, 1, newConnectionToken());
+    const handling = provider.handleDataRequest(request, handle, oldSock, 1);
     await waitForCondition(() => releaseHandler !== undefined, "handler entered");
 
     provider.sock = newSock;
@@ -414,24 +412,17 @@ async function runPingPeer(socket: Socket, manifest: ManifestInput, sawPong: () 
 
   await writeFrame(
     socket,
-    buildFrameWithVersion(
-      PROTOCOL_VERSION,
-      FrameType.HelloAck,
-      CONTROL_FLAGS,
-      0,
-      hello.header.corr,
-      encodeJson({
-        negotiated_ver: PROTOCOL_VERSION,
-        subc_ops: ["server.describe", "catalog.list", "route.open", "route.poll"],
-        subc_capabilities: ["manifest_registration_v1"],
-      }),
-    ),
+    buildFrameWithVersion(PROTOCOL_VERSION, FrameType.HelloAck, CONTROL_FLAGS, 0, 0, hello.header.corr, encodeJson({
+      negotiated_ver: PROTOCOL_VERSION,
+      subc_ops: ["server.describe", "catalog.list", "route.open", "route.poll"],
+      subc_capabilities: ["manifest_registration_v1"],
+    })),
     deadline,
   );
 
   await writeFrame(
     socket,
-    buildFrame(FrameType.Ping, buildFlags(false, Priority.Interactive, false), 0, 77n, new Uint8Array(0)),
+    buildFrame(FrameType.Ping, buildFlags(false, Priority.Interactive, false), 0, 0, 77n, new Uint8Array(0)),
     deadline,
   );
   const pong = await readFrame(reader, deadline);
@@ -678,18 +669,11 @@ class ScriptedProviderDaemon {
     if (result === "ack") {
       await writeFrame(
         socket,
-        buildFrameWithVersion(
-          PROTOCOL_VERSION,
-          FrameType.HelloAck,
-          CONTROL_FLAGS,
-          0,
-          hello.header.corr,
-          encodeJson({
-            negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: ["server.describe", "catalog.list", "route.open", "route.poll"],
-            subc_capabilities: ["manifest_registration_v1"],
-          }),
-        ),
+        buildFrameWithVersion(PROTOCOL_VERSION, FrameType.HelloAck, CONTROL_FLAGS, 0, 0, hello.header.corr, encodeJson({
+          negotiated_ver: PROTOCOL_VERSION,
+          subc_ops: ["server.describe", "catalog.list", "route.open", "route.poll"],
+          subc_capabilities: ["manifest_registration_v1"],
+        })),
         deadline,
       );
       this.recordHello();
@@ -699,14 +683,7 @@ class ScriptedProviderDaemon {
 
     await writeFrame(
       socket,
-      buildFrameWithVersion(
-        PROTOCOL_VERSION,
-        FrameType.Error,
-        CONTROL_FLAGS,
-        0,
-        hello.header.corr,
-        encodeJson(result),
-      ),
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Error, CONTROL_FLAGS, 0, 0, hello.header.corr, encodeJson(result)),
       deadline,
     );
     this.recordHello();

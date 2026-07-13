@@ -77,16 +77,25 @@ const TOOLS_SEARCH_NAME: &str = "tools_search";
 const TOOLS_INVOKE_NAME: &str = "tools_invoke";
 const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 
+static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [--harness <name>]\n  subc-mcp module --subc <subc-connection-file> [--connection-file <path>]";
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, BoxError>;
-type PendingKey = (u16, u64);
+type PendingKey = (u16, u32, u64);
 type PendingTx = mpsc::Sender<SubcFrame>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RouteHandle {
+    channel: u16,
+    epoch: u32,
+    connection_token: u64,
+}
 
 #[derive(Debug, Clone)]
 enum SubcEvent {
-    RouteGoodbye { route_channel: u16 },
+    RouteGoodbye { handle: RouteHandle },
     CatalogChanged { generation: u64 },
 }
 
@@ -262,6 +271,12 @@ impl RelayCancelHandle {
     }
 }
 
+#[derive(Clone)]
+struct PendingRequest {
+    reply: PendingTx,
+    route_session: Option<Arc<RelaySession>>,
+}
+
 struct PendingRelayEntry {
     session_id: String,
     created_at: time::Instant,
@@ -283,20 +298,34 @@ impl PendingRelayEntry {
 #[derive(Clone)]
 struct ReverseRelay {
     tx: mpsc::Sender<SubcFrame>,
-    routes: Arc<Mutex<HashMap<u16, Arc<RelaySession>>>>,
+    connection_token: u64,
+    routes: Arc<Mutex<HashMap<RouteHandle, Arc<RelaySession>>>>,
+    live_epochs: Arc<Mutex<HashMap<u16, u32>>>,
     pending: Arc<Mutex<HashMap<PendingKey, PendingRelayEntry>>>,
+    stale_epoch_drops: Arc<AtomicU64>,
     ttl: Duration,
     max_pending_per_session: usize,
 }
 
 impl ReverseRelay {
-    fn new(tx: mpsc::Sender<SubcFrame>) -> Self {
+    fn new(tx: mpsc::Sender<SubcFrame>, connection_token: u64) -> Self {
         Self {
             tx,
+            connection_token,
             routes: Arc::new(Mutex::new(HashMap::new())),
+            live_epochs: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            stale_epoch_drops: Arc::new(AtomicU64::new(0)),
             ttl: reverse_relay_ttl_from_env(),
             max_pending_per_session: REVERSE_RELAY_PENDING_PER_SESSION,
+        }
+    }
+
+    fn route_handle(&self, channel: u16, epoch: u32) -> RouteHandle {
+        RouteHandle {
+            channel,
+            epoch,
+            connection_token: self.connection_token,
         }
     }
 
@@ -306,28 +335,70 @@ impl ReverseRelay {
         serde_json::json!({
             "active_relay_routes": active_relay_routes,
             "pending_reverse_requests": pending_reverse_requests,
+            "stale_epoch_drops": self.stale_epoch_drops.load(Ordering::Relaxed),
         })
     }
 
-    async fn register_route(&self, route_channel: u16, session: Arc<RelaySession>) {
-        self.routes.lock().await.insert(route_channel, session);
+    async fn install_route(&self, handle: RouteHandle, session: Arc<RelaySession>) -> Result<()> {
+        if handle.connection_token != self.connection_token {
+            return Err(other_error(
+                "route handle belongs to a different subc connection",
+            ));
+        }
+        if handle.channel == 0 || handle.epoch == 0 {
+            return Err(other_error(format!(
+                "route handle must have nonzero channel and epoch, got ({}, {})",
+                handle.channel, handle.epoch
+            )));
+        }
+        self.live_epochs
+            .lock()
+            .await
+            .insert(handle.channel, handle.epoch);
+        let mut routes = self.routes.lock().await;
+        routes.retain(|existing, _| existing.channel != handle.channel);
+        routes.insert(handle, session);
+        Ok(())
     }
 
     async fn unregister_session_routes(&self, session: &RelaySession) {
-        self.routes
-            .lock()
-            .await
-            .retain(|_, route_session| route_session.id() != session.id());
+        let removed = {
+            let mut routes = self.routes.lock().await;
+            let removed = routes
+                .iter()
+                .filter_map(|(handle, route_session)| {
+                    (route_session.id() == session.id()).then_some(*handle)
+                })
+                .collect::<Vec<_>>();
+            for handle in &removed {
+                routes.remove(handle);
+            }
+            removed
+        };
+        let mut live_epochs = self.live_epochs.lock().await;
+        for handle in removed {
+            if live_epochs.get(&handle.channel) == Some(&handle.epoch) {
+                live_epochs.remove(&handle.channel);
+            }
+        }
     }
 
-    async fn route_session(&self, route_channel: u16) -> Option<Arc<RelaySession>> {
-        self.routes.lock().await.get(&route_channel).cloned()
+    async fn route_session(&self, handle: RouteHandle) -> Option<Arc<RelaySession>> {
+        self.routes.lock().await.get(&handle).cloned()
+    }
+
+    async fn validate_ingress(&self, channel: u16, epoch: u32) -> bool {
+        let valid = self.live_epochs.lock().await.get(&channel) == Some(&epoch);
+        if !valid {
+            self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
+        }
+        valid
     }
 
     async fn handle_reverse_request(&self, frame: SubcFrame) {
-        let route_channel = frame.header.channel;
+        let route_handle = self.route_handle(frame.header.channel, frame.header.epoch);
         let reverse_corr = frame.header.corr;
-        let key = (route_channel, reverse_corr);
+        let key = (route_handle.channel, route_handle.epoch, reverse_corr);
 
         if self.pending.lock().await.contains_key(&key) {
             return;
@@ -337,7 +408,7 @@ impl ReverseRelay {
             Ok(request) => request,
             Err(error) => {
                 self.send_reverse_error(
-                    route_channel,
+                    route_handle,
                     reverse_corr,
                     ErrorData::invalid_params(
                         format!("malformed reverse MCP request body: {error}"),
@@ -351,7 +422,7 @@ impl ReverseRelay {
 
         let Some(capability) = ReverseCapability::for_method(&request.method) else {
             self.send_reverse_error(
-                route_channel,
+                route_handle,
                 reverse_corr,
                 ErrorData::new(
                     ErrorCode::METHOD_NOT_FOUND,
@@ -363,12 +434,15 @@ impl ReverseRelay {
             return;
         };
 
-        let Some(session) = self.route_session(route_channel).await else {
+        let Some(session) = self.route_session(route_handle).await else {
             self.send_reverse_error(
-                route_channel,
+                route_handle,
                 reverse_corr,
                 ErrorData::internal_error(
-                    format!("no MCP session owns route channel {route_channel}"),
+                    format!(
+                        "no MCP session owns route handle ({}, {})",
+                        route_handle.channel, route_handle.epoch
+                    ),
                     None,
                 ),
             )
@@ -379,7 +453,7 @@ impl ReverseRelay {
         let peer = match session.peer_for_capability(&request.method, capability) {
             Ok(peer) => peer,
             Err(error) => {
-                self.send_reverse_error(route_channel, reverse_corr, error)
+                self.send_reverse_error(route_handle, reverse_corr, error)
                     .await;
                 return;
             }
@@ -397,7 +471,7 @@ impl ReverseRelay {
             if session_pending >= self.max_pending_per_session {
                 drop(pending);
                 self.send_reverse_error(
-                    route_channel,
+                    route_handle,
                     reverse_corr,
                     ErrorData::internal_error(
                         "too many pending reverse MCP requests for this MCP session",
@@ -415,7 +489,7 @@ impl ReverseRelay {
 
         let host_request =
             ServerRequest::CustomRequest(CustomRequest::new(request.method, request.params));
-        let handle = match peer
+        let host_handle = match peer
             .send_cancellable_request(host_request, PeerRequestOptions::no_options())
             .await
         {
@@ -423,7 +497,7 @@ impl ReverseRelay {
             Err(error) => {
                 if self.remove_pending_for_current_task(key).await.is_some() {
                     self.send_reverse_error(
-                        route_channel,
+                        route_handle,
                         reverse_corr,
                         service_error_to_reverse_error(error),
                     )
@@ -434,14 +508,14 @@ impl ReverseRelay {
         };
 
         let cancel_handle = RelayCancelHandle {
-            peer: handle.peer.clone(),
-            request_id: handle.id.clone(),
+            peer: host_handle.peer.clone(),
+            request_id: host_handle.id.clone(),
         };
         let relay = self.clone();
         let ttl_deadline = created_at + self.ttl;
         let task = tokio::spawn(async move {
             tokio::select! {
-                result = handle.await_response() => {
+                result = host_handle.await_response() => {
                     relay.settle_host_answer(key, result).await;
                 }
                 _ = time::sleep_until(ttl_deadline) => {
@@ -479,10 +553,11 @@ impl ReverseRelay {
         if self.remove_pending_for_current_task(key).await.is_none() {
             return;
         }
+        let handle = self.route_handle(key.0, key.1);
         match result {
-            Ok(result) => self.send_reverse_response(key.0, key.1, result).await,
+            Ok(result) => self.send_reverse_response(handle, key.2, result).await,
             Err(error) => {
-                self.send_reverse_error(key.0, key.1, service_error_to_reverse_error(error))
+                self.send_reverse_error(handle, key.2, service_error_to_reverse_error(error))
                     .await;
             }
         }
@@ -509,18 +584,29 @@ impl ReverseRelay {
                 cancel.cancel(message).await;
             }
             self.send_reverse_error(
-                key.0,
-                key.1,
+                self.route_handle(key.0, key.1),
+                key.2,
                 ErrorData::internal_error(message.to_owned(), None),
             )
             .await;
         }
     }
 
-    async fn drop_route(&self, route_channel: u16) {
-        self.routes.lock().await.remove(&route_channel);
+    async fn drop_route(&self, handle: RouteHandle) {
+        if handle.connection_token != self.connection_token {
+            return;
+        }
+        self.routes.lock().await.remove(&handle);
+        {
+            let mut live_epochs = self.live_epochs.lock().await;
+            if live_epochs.get(&handle.channel) == Some(&handle.epoch) {
+                live_epochs.remove(&handle.channel);
+            }
+        }
         let entries = self
-            .remove_pending_where(|(entry_route, _), _| *entry_route == route_channel)
+            .remove_pending_where(|(channel, epoch, _), _| {
+                *channel == handle.channel && *epoch == handle.epoch
+            })
             .await;
         for (_, mut entry) in entries {
             if let Some(task) = entry.task.take() {
@@ -529,9 +615,14 @@ impl ReverseRelay {
         }
     }
 
-    async fn cancel_route_prompts(&self, route_channel: u16, message: &'static str) {
+    async fn cancel_route_prompts(&self, handle: RouteHandle, message: &'static str) {
+        if handle.connection_token != self.connection_token {
+            return;
+        }
         let entries = self
-            .remove_pending_where(|(entry_route, _), _| *entry_route == route_channel)
+            .remove_pending_where(|(channel, epoch, _), _| {
+                *channel == handle.channel && *epoch == handle.epoch
+            })
             .await;
         for (key, mut entry) in entries {
             if let Some(task) = entry.task.take() {
@@ -541,8 +632,8 @@ impl ReverseRelay {
                 cancel.cancel(message).await;
             }
             self.send_reverse_error(
-                key.0,
-                key.1,
+                self.route_handle(key.0, key.1),
+                key.2,
                 ErrorData::internal_error(message.to_owned(), None),
             )
             .await;
@@ -551,6 +642,7 @@ impl ReverseRelay {
 
     async fn clear_all(&self) {
         self.routes.lock().await.clear();
+        self.live_epochs.lock().await.clear();
         let entries = self.remove_pending_where(|_, _| true).await;
         for (_, mut entry) in entries {
             if let Some(task) = entry.task.take() {
@@ -585,18 +677,18 @@ impl ReverseRelay {
 
     async fn send_reverse_response(
         &self,
-        route_channel: u16,
+        handle: RouteHandle,
         reverse_corr: u64,
         result: ClientResult,
     ) {
         match serde_json::to_vec(&result) {
             Ok(body) => {
-                self.send_reverse_frame(FrameType::Response, route_channel, reverse_corr, body)
+                self.send_reverse_frame(FrameType::Response, handle, reverse_corr, body)
                     .await
             }
             Err(error) => {
                 self.send_reverse_error(
-                    route_channel,
+                    handle,
                     reverse_corr,
                     ErrorData::internal_error(
                         format!("failed to encode reverse MCP response: {error}"),
@@ -608,7 +700,7 @@ impl ReverseRelay {
         }
     }
 
-    async fn send_reverse_error(&self, route_channel: u16, reverse_corr: u64, error: ErrorData) {
+    async fn send_reverse_error(&self, handle: RouteHandle, reverse_corr: u64, error: ErrorData) {
         let body = match serde_json::to_vec(&error) {
             Ok(body) => body,
             Err(error) => {
@@ -616,18 +708,29 @@ impl ReverseRelay {
                 Vec::new()
             }
         };
-        self.send_reverse_frame(FrameType::Error, route_channel, reverse_corr, body)
+        self.send_reverse_frame(FrameType::Error, handle, reverse_corr, body)
             .await;
     }
 
     async fn send_reverse_frame(
         &self,
         ty: FrameType,
-        route_channel: u16,
+        handle: RouteHandle,
         reverse_corr: u64,
         body: Vec<u8>,
     ) {
-        let frame = match build_frame(ty, data_flags(), route_channel, reverse_corr, body) {
+        if handle.connection_token != self.connection_token {
+            eprintln!("subc-mcp module: refusing reverse reply for a stale subc connection");
+            return;
+        }
+        let frame = match build_frame(
+            ty,
+            data_flags(),
+            handle.channel,
+            handle.epoch,
+            reverse_corr,
+            body,
+        ) {
             Ok(frame) => frame,
             Err(error) => {
                 eprintln!("subc-mcp module: failed to build reverse relay frame: {error}");
@@ -869,7 +972,7 @@ struct SessionState {
 struct SessionInner {
     surface_mode: SurfaceMode,
     catalog_generation: u64,
-    routes: HashMap<String, u16>,
+    routes: HashMap<String, RouteHandle>,
     tools: Vec<ExposedTool>,
     bindings: HashMap<String, ToolBinding>,
 }
@@ -877,7 +980,7 @@ struct SessionInner {
 #[derive(Debug, Clone)]
 struct ToolBinding {
     module_id: String,
-    route_channel: u16,
+    route: RouteHandle,
     bare_tool_name: String,
 }
 
@@ -1008,10 +1111,12 @@ enum MaybeSet<T> {
 #[derive(Clone)]
 struct SubcClient {
     tx: mpsc::Sender<SubcFrame>,
-    pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
+    pending: Arc<Mutex<HashMap<PendingKey, PendingRequest>>>,
     events: broadcast::Sender<SubcEvent>,
     relay: Arc<ReverseRelay>,
-    next_corr: Arc<AtomicU64>,
+    connection_token: u64,
+    last_corr: Arc<AtomicU64>,
+    writer_shutdown: watch::Sender<bool>,
     catalog_poller_started: Arc<AtomicBool>,
 }
 
@@ -1021,7 +1126,13 @@ impl SubcClient {
         let (tx, rx) = mpsc::channel(128);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
-        let relay = Arc::new(ReverseRelay::new(tx.clone()));
+        let connection_token = NEXT_CONNECTION_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .expect("subc connection token space exhausted");
+        let relay = Arc::new(ReverseRelay::new(tx.clone(), connection_token));
+        let (writer_shutdown, writer_shutdown_rx) = watch::channel(false);
 
         tokio::spawn(subc_reader_loop(
             read_half,
@@ -1029,20 +1140,67 @@ impl SubcClient {
             events.clone(),
             Arc::clone(&relay),
         ));
-        tokio::spawn(subc_writer_loop(write_half, rx));
+        tokio::spawn(subc_writer_loop(write_half, rx, writer_shutdown_rx));
 
         Self {
             tx,
             pending,
             events,
             relay,
-            next_corr: Arc::new(AtomicU64::new(1)),
+            connection_token,
+            last_corr: Arc::new(AtomicU64::new(0)),
+            writer_shutdown,
             catalog_poller_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn next_corr(&self) -> u64 {
-        self.next_corr.fetch_add(1, Ordering::Relaxed)
+    fn next_corr(&self) -> Result<u64> {
+        match allocate_corr(&self.last_corr) {
+            Some(corr) => Ok(corr),
+            None => {
+                let _ = self.writer_shutdown.send(true);
+                Err(other_error(
+                    "subc correlation space exhausted; connection was closed before reuse",
+                ))
+            }
+        }
+    }
+
+    fn route_handle(&self, channel: u16, epoch: u32) -> RouteHandle {
+        RouteHandle {
+            channel,
+            epoch,
+            connection_token: self.connection_token,
+        }
+    }
+
+    fn validate_handle(&self, handle: RouteHandle) -> Result<()> {
+        if handle.connection_token != self.connection_token {
+            return Err(other_error(
+                "route handle belongs to a stale subc connection",
+            ));
+        }
+        Ok(())
+    }
+
+    fn build_route_frame(
+        &self,
+        ty: FrameType,
+        flags: Flags,
+        handle: RouteHandle,
+        corr: u64,
+        body: Vec<u8>,
+    ) -> Result<SubcFrame> {
+        self.validate_handle(handle)?;
+        build_frame(ty, flags, handle.channel, handle.epoch, corr, body)
+    }
+
+    async fn send_route_frame(&self, handle: RouteHandle, frame: SubcFrame) -> Result<()> {
+        self.validate_handle(handle)?;
+        if frame.header.channel != handle.channel || frame.header.epoch != handle.epoch {
+            return Err(other_error("route frame does not match its route handle"));
+        }
+        self.send(frame).await
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<SubcEvent> {
@@ -1093,14 +1251,26 @@ impl SubcClient {
     }
 
     async fn request_frames(&self, frame: SubcFrame) -> Result<mpsc::Receiver<SubcFrame>> {
-        let key = (frame.header.channel, frame.header.corr);
+        self.request_frames_for_route_open(frame, None).await
+    }
+
+    async fn request_frames_for_route_open(
+        &self,
+        frame: SubcFrame,
+        route_session: Option<Arc<RelaySession>>,
+    ) -> Result<mpsc::Receiver<SubcFrame>> {
+        let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
         let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER);
+        let pending_request = PendingRequest {
+            reply: reply_tx,
+            route_session,
+        };
         {
             let mut pending = self.pending.lock().await;
-            if pending.insert(key, reply_tx).is_some() {
+            if pending.insert(key, pending_request).is_some() {
                 return Err(other_error(format!(
-                    "duplicate pending subc request for channel {} corr {}",
-                    key.0, key.1
+                    "duplicate pending subc request for handle ({}, {}) corr {}",
+                    key.0, key.1, key.2
                 )));
             }
         }
@@ -1113,20 +1283,45 @@ impl SubcClient {
         Ok(reply_rx)
     }
 
-    async fn abandon_request(&self, channel: u16, corr: u64) {
-        self.pending.lock().await.remove(&(channel, corr));
+    async fn abandon_request(&self, handle: RouteHandle, corr: u64) {
+        self.pending
+            .lock()
+            .await
+            .remove(&(handle.channel, handle.epoch, corr));
     }
 
     async fn request(&self, frame: SubcFrame, wait: Duration) -> Result<SubcFrame> {
-        let key = (frame.header.channel, frame.header.corr);
-        let mut reply_rx = self.request_frames(frame).await?;
+        self.request_with_route_session(frame, wait, None).await
+    }
+
+    async fn request_route_open(
+        &self,
+        frame: SubcFrame,
+        wait: Duration,
+        route_session: Arc<RelaySession>,
+    ) -> Result<SubcFrame> {
+        self.request_with_route_session(frame, wait, Some(route_session))
+            .await
+    }
+
+    async fn request_with_route_session(
+        &self,
+        frame: SubcFrame,
+        wait: Duration,
+        route_session: Option<Arc<RelaySession>>,
+    ) -> Result<SubcFrame> {
+        let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
+        let retain_late_route_open = route_session.is_some();
+        let mut reply_rx = self
+            .request_frames_for_route_open(frame, route_session)
+            .await?;
 
         match time::timeout(wait, async {
             loop {
                 let Some(frame) = reply_rx.recv().await else {
                     return Err(other_error(format!(
-                        "subc connection closed before response for channel {} corr {}",
-                        key.0, key.1
+                        "subc connection closed before response for handle ({}, {}) corr {}",
+                        key.0, key.1, key.2
                     )));
                 };
                 if is_terminal_frame_type(frame.header.ty) {
@@ -1138,10 +1333,12 @@ impl SubcClient {
         {
             Ok(result) => result,
             Err(_elapsed) => {
-                self.pending.lock().await.remove(&key);
+                if !retain_late_route_open {
+                    self.pending.lock().await.remove(&key);
+                }
                 Err(other_error(format!(
-                    "timed out waiting {wait:?} for subc response on channel {} corr {}",
-                    key.0, key.1
+                    "timed out waiting {wait:?} for subc response on handle ({}, {}) corr {}",
+                    key.0, key.1, key.2
                 )))
             }
         }
@@ -1363,6 +1560,7 @@ async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Resu
         FrameType::Hello,
         control_flags(),
         0,
+        0,
         SUPERVISION_HELLO_CORR,
         body,
     )
@@ -1538,7 +1736,7 @@ fn supervision_response_frame(request: &SubcFrame, body: Vec<u8>) -> Result<Subc
         request.header.ver,
         FrameType::Response,
         control_flags(),
-        0, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         request.header.corr,
         body,
@@ -1560,7 +1758,7 @@ fn supervision_error_frame(
         request.header.ver,
         FrameType::Error,
         control_flags(),
-        request.header.channel, // WIRE-WAVE2: thread the binding epoch.
+        0,
         0,
         request.header.corr,
         body,
@@ -1693,7 +1891,7 @@ async fn handle_shim_connection(
     subc.relay()
         .unregister_session_routes(&attached.relay_session)
         .await;
-    let goodbye_result = send_route_goodbyes(&subc, attached.state.route_channels()).await;
+    let goodbye_result = send_route_goodbyes(&subc, attached.state.route_handles()).await;
 
     match (serve_result, goodbye_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -1723,14 +1921,12 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
             &provider.module_id,
             &identity,
             relay_session.consumer_capabilities(),
+            Arc::clone(&relay_session),
         )
         .await
         {
-            Ok(route_channel) => {
-                subc.relay()
-                    .register_route(route_channel, Arc::clone(&relay_session))
-                    .await;
-                routes.insert(provider.module_id.clone(), route_channel);
+            Ok(route) => {
+                routes.insert(provider.module_id.clone(), route);
             }
             Err(error) => {
                 subc.relay().unregister_session_routes(&relay_session).await;
@@ -1764,8 +1960,8 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
 async fn catalog_list(subc: &SubcClient) -> Result<CatalogSnapshot> {
     let request = ClientControlRequest::CatalogList { module_id: None };
     let body = serde_json::to_vec(&request)?;
-    let corr = subc.next_corr();
-    let frame = build_frame(FrameType::Request, control_flags(), 0, corr, body)?;
+    let corr = subc.next_corr()?;
+    let frame = build_frame(FrameType::Request, control_flags(), 0, 0, corr, body)?;
     let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
 
     match response.header.ty {
@@ -1797,7 +1993,8 @@ async fn open_provider_route(
     module_id: &str,
     identity: &BindIdentity,
     consumer_capabilities: Option<Vec<String>>,
-) -> Result<u16> {
+    route_session: Arc<RelaySession>,
+) -> Result<RouteHandle> {
     let request = ClientControlRequest::RouteOpen {
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_owned(),
@@ -1807,18 +2004,19 @@ async fn open_provider_route(
         consumer_capabilities,
     };
     let body = serde_json::to_vec(&request)?;
-    let corr = subc.next_corr();
-    let frame = build_frame(FrameType::Request, control_flags(), 0, corr, body)?;
-    let response = subc.request(frame, SUBC_RESPONSE_TIMEOUT).await?;
+    let corr = subc.next_corr()?;
+    let frame = build_frame(FrameType::Request, control_flags(), 0, 0, corr, body)?;
+    let response = subc
+        .request_route_open(frame, SUBC_RESPONSE_TIMEOUT, route_session)
+        .await?;
 
     match response.header.ty {
         FrameType::Response if response.header.channel == 0 => {
             match serde_json::from_slice::<ClientControlResponse>(&response.body)? {
                 ClientControlResponse::RouteOpen {
                     route_channel,
-                    // WIRE-WAVE2: retain this epoch in the MCP route binding.
-                    route_epoch: _route_epoch,
-                } => Ok(route_channel),
+                    route_epoch,
+                } => Ok(subc.route_handle(route_channel, route_epoch)),
                 other => Err(other_error(format!(
                     "unexpected route.open response body: {other:?}"
                 ))),
@@ -1959,14 +2157,14 @@ fn desired_session_from_catalog(
 fn session_inner_from_desired(
     catalog_generation: u64,
     desired: DesiredSession,
-    routes: HashMap<String, u16>,
+    routes: HashMap<String, RouteHandle>,
     surface_mode: SurfaceMode,
 ) -> Result<SessionInner> {
     let mut tools = Vec::new();
     let mut bindings = HashMap::new();
 
     for provider in desired.providers {
-        let route_channel = *routes.get(&provider.module_id).ok_or_else(|| {
+        let route = *routes.get(&provider.module_id).ok_or_else(|| {
             other_error(format!(
                 "missing route channel for enabled provider '{}'",
                 provider.module_id
@@ -1978,7 +2176,7 @@ fn session_inner_from_desired(
                 exposed_name.clone(),
                 ToolBinding {
                     module_id: provider.module_id.clone(),
-                    route_channel,
+                    route,
                     bare_tool_name: desired_tool.bare_tool.name,
                 },
             );
@@ -2083,33 +2281,33 @@ impl SessionState {
         self.read_inner().surface_mode
     }
 
-    fn route_channels(&self) -> Vec<u16> {
-        let mut channels = self
+    fn route_handles(&self) -> Vec<RouteHandle> {
+        let mut handles = self
             .read_inner()
             .routes
             .values()
             .copied()
             .collect::<Vec<_>>();
-        channels.sort_unstable();
-        channels.dedup();
-        channels
+        handles.sort_unstable_by_key(|handle| (handle.channel, handle.epoch));
+        handles.dedup();
+        handles
     }
 
     fn catalog_generation(&self) -> u64 {
         self.read_inner().catalog_generation
     }
 
-    fn route_snapshot(&self) -> HashMap<String, u16> {
+    fn route_snapshot(&self) -> HashMap<String, RouteHandle> {
         self.read_inner().routes.clone()
     }
 
-    fn remove_route(&self, route_channel: u16) -> bool {
+    fn remove_route(&self, handle: RouteHandle) -> bool {
         let mut inner = self.write_inner();
         let old_tools = inner.tools.clone();
         let removed_modules = inner
             .routes
             .iter()
-            .filter(|(_, channel)| **channel == route_channel)
+            .filter(|(_, route)| **route == handle)
             .map(|(module_id, _)| module_id.clone())
             .collect::<HashSet<_>>();
         if removed_modules.is_empty() {
@@ -2722,40 +2920,36 @@ async fn reconcile_session_from_catalog(
         .collect::<HashSet<_>>();
     let removed_routes = existing_routes
         .iter()
-        .filter_map(|(module_id, channel)| {
-            (!desired_modules.contains(module_id)).then_some(*channel)
-        })
+        .filter_map(|(module_id, handle)| (!desired_modules.contains(module_id)).then_some(*handle))
         .collect::<Vec<_>>();
 
     let mut routes = HashMap::new();
     let mut opened_routes = Vec::new();
     for provider in &desired.providers {
-        if let Some(route_channel) = existing_routes.get(&provider.module_id) {
-            routes.insert(provider.module_id.clone(), *route_channel);
+        if let Some(route) = existing_routes.get(&provider.module_id) {
+            routes.insert(provider.module_id.clone(), *route);
             continue;
         }
-        let route_channel = match open_provider_route(
+        let route = match open_provider_route(
             subc,
             &provider.module_id,
             &state.identity,
             relay_session.consumer_capabilities(),
+            Arc::clone(relay_session),
         )
         .await
         {
-            Ok(route_channel) => route_channel,
+            Ok(route) => route,
             Err(error) => {
-                for route_channel in &opened_routes {
-                    subc.relay().drop_route(*route_channel).await;
+                for route in &opened_routes {
+                    subc.relay().drop_route(*route).await;
                 }
                 let _ = send_route_goodbyes(subc, opened_routes).await;
                 return Err(error);
             }
         };
-        subc.relay()
-            .register_route(route_channel, Arc::clone(relay_session))
-            .await;
-        opened_routes.push(route_channel);
-        routes.insert(provider.module_id.clone(), route_channel);
+        opened_routes.push(route);
+        routes.insert(provider.module_id.clone(), route);
     }
 
     let inner = match session_inner_from_desired(
@@ -2775,8 +2969,8 @@ async fn reconcile_session_from_catalog(
     };
     let changed = state.replace_inner(inner);
     if !removed_routes.is_empty() {
-        for route_channel in &removed_routes {
-            subc.relay().drop_route(*route_channel).await;
+        for route in &removed_routes {
+            subc.relay().drop_route(*route).await;
         }
         let _ = send_route_goodbyes(subc, removed_routes).await;
     }
@@ -2801,8 +2995,8 @@ async fn session_lifecycle(
             }
             event = events.recv() => {
                 match event {
-                    Ok(SubcEvent::RouteGoodbye { route_channel }) => {
-                        if state.remove_route(route_channel) && !notify_tool_list_changed(&peer).await {
+                    Ok(SubcEvent::RouteGoodbye { handle }) => {
+                        if state.remove_route(handle) && !notify_tool_list_changed(&peer).await {
                             break;
                         }
                     }
@@ -3162,7 +3356,7 @@ impl SubcMcpServer {
         arguments: JsonObject,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
-        let route_channel = binding.route_channel;
+        let route = binding.route;
         let progress_token = context.meta.get_progress_token();
         let body = RouteToolCallRequest {
             name: binding.bare_tool_name,
@@ -3170,8 +3364,10 @@ impl SubcMcpServer {
             progress_token: progress_token.clone(),
         };
         let body = serde_json::to_vec(&body).map_err(mcp_internal_error)?;
-        let corr = self.subc.next_corr();
-        let frame = build_frame(FrameType::Request, data_flags(), route_channel, corr, body)
+        let corr = self.subc.next_corr().map_err(mcp_internal_error)?;
+        let frame = self
+            .subc
+            .build_route_frame(FrameType::Request, data_flags(), route, corr, body)
             .map_err(mcp_internal_error)?;
         let mut frames = self
             .subc
@@ -3182,8 +3378,8 @@ impl SubcMcpServer {
         loop {
             tokio::select! {
                 _ = context.ct.cancelled() => {
-                    let cancel_result = self.send_route_cancel(route_channel, corr).await;
-                    self.subc.abandon_request(route_channel, corr).await;
+                    let cancel_result = self.send_route_cancel(route, corr).await;
+                    self.subc.abandon_request(route, corr).await;
                     cancel_result.map_err(mcp_internal_error)?;
                     return Err(ErrorData::new(
                         ErrorCode::INTERNAL_ERROR,
@@ -3195,17 +3391,18 @@ impl SubcMcpServer {
                     let Some(frame) = frame else {
                         return Err(ErrorData::internal_error(
                             format!(
-                                "subc route {route_channel} closed before terminal tool response for corr {corr}",
+                                "subc route ({}, {}) closed before terminal tool response for corr {corr}",
+                                route.channel, route.epoch
                             ),
                             None,
                         ));
                     };
 
                     match frame.header.ty {
-                        FrameType::Push if frame.header.channel == route_channel => {
+                        FrameType::Push => {
                             forward_progress(&context, progress_token.clone(), &frame.body).await?;
                         }
-                        FrameType::Response if frame.header.channel == route_channel => {
+                        FrameType::Response => {
                             return serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
                                 ErrorData::internal_error(
                                     format!("provider returned malformed tool result: {source}"),
@@ -3213,14 +3410,14 @@ impl SubcMcpServer {
                                 )
                             });
                         }
-                        FrameType::Error if frame.header.channel == route_channel => {
+                        FrameType::Error => {
                             return Err(subc_error_to_mcp("subc route tool call failed", &frame.body));
                         }
                         ty => {
                             return Err(ErrorData::internal_error(
                                 format!(
-                                    "unexpected route frame {ty:?} on channel {} corr {}",
-                                    frame.header.channel, frame.header.corr
+                                    "unexpected route frame {ty:?} on handle ({}, {}) corr {}",
+                                    frame.header.channel, frame.header.epoch, frame.header.corr
                                 ),
                                 None,
                             ));
@@ -3231,19 +3428,20 @@ impl SubcMcpServer {
         }
     }
 
-    async fn send_route_cancel(&self, route_channel: u16, corr: u64) -> Result<()> {
+    async fn send_route_cancel(&self, route: RouteHandle, corr: u64) -> Result<()> {
+        self.subc.validate_handle(route)?;
         self.subc
             .relay()
-            .cancel_route_prompts(route_channel, "enclosing route request was cancelled")
+            .cancel_route_prompts(route, "enclosing route request was cancelled")
             .await;
-        let frame = build_frame(
+        let frame = self.subc.build_route_frame(
             FrameType::Cancel,
             data_flags(),
-            route_channel,
+            route,
             corr,
             Vec::new(),
         )?;
-        self.subc.send(frame).await
+        self.subc.send_route_frame(route, frame).await
     }
 }
 
@@ -3394,22 +3592,19 @@ fn mcp_internal_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
 }
 
-async fn send_route_goodbye(subc: &SubcClient, route_channel: u16) -> Result<()> {
-    let frame = build_frame(
-        FrameType::Goodbye,
-        data_flags(),
-        route_channel,
-        subc.next_corr(),
-        Vec::new(),
-    )?;
-    subc.send(frame).await
+async fn send_route_goodbye(subc: &SubcClient, route: RouteHandle) -> Result<()> {
+    let frame = subc.build_route_frame(FrameType::Goodbye, data_flags(), route, 0, Vec::new())?;
+    subc.send_route_frame(route, frame).await
 }
 
-async fn send_route_goodbyes(subc: &SubcClient, route_channels: Vec<u16>) -> Result<()> {
+async fn send_route_goodbyes(subc: &SubcClient, routes: Vec<RouteHandle>) -> Result<()> {
     let mut errors = Vec::new();
-    for route_channel in route_channels {
-        if let Err(error) = send_route_goodbye(subc, route_channel).await {
-            errors.push(format!("channel {route_channel}: {error}"));
+    for route in routes {
+        if let Err(error) = send_route_goodbye(subc, route).await {
+            errors.push(format!(
+                "handle ({}, {}): {error}",
+                route.channel, route.epoch
+            ));
         }
     }
     if errors.is_empty() {
@@ -3425,7 +3620,7 @@ async fn send_route_goodbyes(subc: &SubcClient, route_channels: Vec<u16>) -> Res
 
 async fn subc_reader_loop<R>(
     mut read_half: R,
-    pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
+    pending: Arc<Mutex<HashMap<PendingKey, PendingRequest>>>,
     events: broadcast::Sender<SubcEvent>,
     relay: Arc<ReverseRelay>,
 ) where
@@ -3434,6 +3629,14 @@ async fn subc_reader_loop<R>(
     loop {
         match read_frame(&mut read_half).await {
             Ok(Some(frame)) => {
+                if frame.header.channel != 0
+                    && !relay
+                        .validate_ingress(frame.header.channel, frame.header.epoch)
+                        .await
+                {
+                    continue;
+                }
+
                 if frame.header.ty == FrameType::Push && frame.header.channel == 0 {
                     eprintln!(
                         "subc-mcp module: ignoring unrecognized channel-0 Push corr={}",
@@ -3447,30 +3650,25 @@ async fn subc_reader_loop<R>(
                     continue;
                 }
 
+                let route = relay.route_handle(frame.header.channel, frame.header.epoch);
                 if frame.header.ty == FrameType::Goodbye && frame.header.channel != 0 {
-                    relay.drop_route(frame.header.channel).await;
-                    fail_pending_on_route(
-                        &pending,
-                        frame.header.channel,
-                        "subc route closed by provider GOODBYE",
-                    )
-                    .await;
-                    let _ = events.send(SubcEvent::RouteGoodbye {
-                        route_channel: frame.header.channel,
-                    });
+                    relay.drop_route(route).await;
+                    fail_pending_on_route(&pending, route, "subc route closed by provider GOODBYE")
+                        .await;
+                    let _ = events.send(SubcEvent::RouteGoodbye { handle: route });
                     continue;
                 }
 
                 if frame.header.ty == FrameType::Cancel && frame.header.channel != 0 {
                     relay
                         .cancel_route_prompts(
-                            frame.header.channel,
+                            route,
                             "provider cancelled the enclosing route request",
                         )
                         .await;
                 }
 
-                let key = (frame.header.channel, frame.header.corr);
+                let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
                 let terminal = is_terminal_frame_type(frame.header.ty);
                 let reply = if terminal {
                     pending.lock().await.remove(&key)
@@ -3478,13 +3676,49 @@ async fn subc_reader_loop<R>(
                     pending.lock().await.get(&key).cloned()
                 };
                 if let Some(reply) = reply {
-                    if reply.send(frame).await.is_err() && !terminal {
-                        pending.lock().await.remove(&key);
+                    let mut opened = None;
+                    if terminal {
+                        if let Some(route_session) = reply.route_session.as_ref() {
+                            opened = match serde_json::from_slice::<ClientControlResponse>(
+                                &frame.body,
+                            ) {
+                                Ok(ClientControlResponse::RouteOpen {
+                                    route_channel,
+                                    route_epoch,
+                                }) if frame.header.ty == FrameType::Response => {
+                                    Some(relay.route_handle(route_channel, route_epoch))
+                                }
+                                _ => None,
+                            };
+                            if let Some(handle) = opened {
+                                if let Err(error) =
+                                    relay.install_route(handle, Arc::clone(route_session)).await
+                                {
+                                    eprintln!(
+                                        "subc-mcp module: rejected invalid route.open handle: {error}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if reply.reply.send(frame).await.is_err() {
+                        if let Some(handle) = opened {
+                            relay.drop_route(handle).await;
+                            relay
+                                .send_reverse_frame(FrameType::Goodbye, handle, 0, Vec::new())
+                                .await;
+                        } else if !terminal {
+                            pending.lock().await.remove(&key);
+                        }
                     }
                 } else {
                     eprintln!(
-                        "subc-mcp module: dropping unsolicited subc frame type={:?} channel={} corr={}",
-                        frame.header.ty, frame.header.channel, frame.header.corr
+                        "subc-mcp module: dropping unsolicited subc frame type={:?} handle=({}, {}) corr={}",
+                        frame.header.ty,
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr
                     );
                 }
             }
@@ -3504,22 +3738,25 @@ async fn subc_reader_loop<R>(
 }
 
 async fn fail_pending_on_route(
-    pending: &Arc<Mutex<HashMap<PendingKey, PendingTx>>>,
-    route_channel: u16,
+    pending: &Arc<Mutex<HashMap<PendingKey, PendingRequest>>>,
+    route: RouteHandle,
     message: &str,
 ) {
     let replies = {
         let mut pending = pending.lock().await;
         let keys = pending
             .keys()
-            .filter_map(|(channel, corr)| (*channel == route_channel).then_some((*channel, *corr)))
+            .filter_map(|(channel, epoch, corr)| {
+                (*channel == route.channel && *epoch == route.epoch)
+                    .then_some((*channel, *epoch, *corr))
+            })
             .collect::<Vec<_>>();
         keys.into_iter()
             .filter_map(|key| pending.remove(&key).map(|reply| (key, reply)))
             .collect::<Vec<_>>()
     };
 
-    for ((channel, corr), reply) in replies {
+    for ((channel, epoch, corr), reply) in replies {
         let body = match serde_json::to_vec(&ErrorBody {
             code: "target_unavailable".to_owned(),
             message: message.to_owned(),
@@ -3530,14 +3767,14 @@ async fn fail_pending_on_route(
                 Vec::new()
             }
         };
-        let frame = match build_frame(FrameType::Error, data_flags(), channel, corr, body) {
+        let frame = match build_frame(FrameType::Error, data_flags(), channel, epoch, corr, body) {
             Ok(frame) => frame,
             Err(error) => {
                 eprintln!("subc-mcp module: failed to build route GOODBYE error: {error}");
                 continue;
             }
         };
-        let _ = reply.send(frame).await;
+        let _ = reply.reply.send(frame).await;
     }
 }
 
@@ -3548,14 +3785,36 @@ fn is_terminal_frame_type(frame_type: FrameType) -> bool {
     )
 }
 
-async fn subc_writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::Receiver<SubcFrame>) {
+async fn subc_writer_loop(
+    mut write_half: OwnedWriteHalf,
+    mut rx: mpsc::Receiver<SubcFrame>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut writer = BufWriter::new(&mut write_half);
-    while let Some(frame) = rx.recv().await {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+                continue;
+            }
+            frame = rx.recv() => {
+                let Some(frame) = frame else {
+                    return;
+                };
+                frame
+            }
+        };
         if let Err(error) = write_frame(&mut writer, &frame).await {
             eprintln!("subc-mcp module: subc write failed: {error}");
             return;
         }
         while let Ok(frame) = rx.try_recv() {
+            if *shutdown.borrow() {
+                return;
+            }
             if let Err(error) = write_frame(&mut writer, &frame).await {
                 eprintln!("subc-mcp module: subc write failed: {error}");
                 return;
@@ -3810,10 +4069,20 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+fn allocate_corr(last_corr: &AtomicU64) -> Option<u64> {
+    last_corr
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            last.checked_add(1)
+        })
+        .ok()
+        .map(|last| last + 1)
+}
+
 fn build_frame(
     ty: FrameType,
     flags: Flags,
     channel: u16,
+    epoch: u32,
     corr: u64,
     body: Vec<u8>,
 ) -> Result<SubcFrame> {
@@ -3829,11 +4098,8 @@ fn build_frame(
             body.len()
         )));
     }
-    SubcFrame::build(
-        ty, flags, channel, // WIRE-WAVE2: thread the binding epoch.
-        0, corr, body,
-    )
-    .map_err(|source| other_error(format!("failed to build frame: {source}")))
+    SubcFrame::build(ty, flags, channel, epoch, corr, body)
+        .map_err(|source| other_error(format!("failed to build frame: {source}")))
 }
 
 fn control_flags() -> Flags {
@@ -4023,6 +4289,7 @@ mod tests {
             session: "shim-session".to_string(),
         };
         let expected_for_server = expected.clone();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let frame = read_frame(&mut server_stream).await.unwrap().unwrap();
             let request: ClientControlRequest = serde_json::from_slice(&frame.body).unwrap();
@@ -4044,13 +4311,13 @@ mod tests {
 
             let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
                 route_channel: 7,
-                // WIRE-WAVE2: return the MCP test route handle epoch.
-                route_epoch: 0,
+                route_epoch: 11,
             })
             .unwrap();
             let response = build_frame(
                 FrameType::Response,
                 control_flags(),
+                0,
                 0,
                 frame.header.corr,
                 body,
@@ -4058,12 +4325,19 @@ mod tests {
             .unwrap();
             write_frame(&mut server_stream, &response).await.unwrap();
             server_stream.flush().await.unwrap();
+            let _ = close_rx.await;
         });
 
-        let route_channel = open_provider_route(&subc, "aft", &identity, declared)
+        let route_session = Arc::new(RelaySession::new("shim-session".to_owned()));
+        let route = open_provider_route(&subc, "aft", &identity, declared, route_session)
             .await
             .unwrap();
-        assert_eq!(route_channel, 7);
+        assert_eq!((route.channel, route.epoch), (7, 11));
+        assert!(
+            subc.relay().route_session(route).await.is_some(),
+            "route.open must install the handle before resolving the caller"
+        );
+        let _ = close_tx.send(());
         server.await.unwrap();
     }
 
@@ -4344,25 +4618,161 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn correlation_allocator_is_monotonic_and_never_reuses_after_exhaustion() {
+        let corr = AtomicU64::new(0);
+        assert_eq!(allocate_corr(&corr), Some(1));
+        assert_eq!(allocate_corr(&corr), Some(2));
+
+        corr.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(allocate_corr(&corr), Some(u64::MAX));
+        assert_eq!(allocate_corr(&corr), None);
+        assert_eq!(allocate_corr(&corr), None);
+        assert_eq!(corr.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn reader_drops_stale_epoch_before_dispatch_or_lifecycle_callbacks() {
+        let (mut server, client) = tokio::io::duplex(4096);
+        let pending: Arc<Mutex<HashMap<PendingKey, PendingRequest>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (reply_tx, mut reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER);
+        pending.lock().await.insert(
+            (7, 2, 44),
+            PendingRequest {
+                reply: reply_tx,
+                route_session: None,
+            },
+        );
+        let (outbound_tx, _outbound_rx) = mpsc::channel(4);
+        let relay = Arc::new(ReverseRelay::new(outbound_tx, 91));
+        let current = relay.route_handle(7, 2);
+        relay
+            .install_route(current, Arc::new(RelaySession::new("e2".to_owned())))
+            .await
+            .unwrap();
+        let (events, mut events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
+        let reader = tokio::spawn(subc_reader_loop(
+            client,
+            Arc::clone(&pending),
+            events,
+            Arc::clone(&relay),
+        ));
+
+        let stale_response = build_frame(
+            FrameType::Response,
+            data_flags(),
+            7,
+            1,
+            44,
+            br#"{"stale":true}"#.to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut server, &stale_response).await.unwrap();
+        let stale_goodbye =
+            build_frame(FrameType::Goodbye, data_flags(), 7, 1, 0, Vec::new()).unwrap();
+        write_frame(&mut server, &stale_goodbye).await.unwrap();
+        server.flush().await.unwrap();
+        time::sleep(Duration::from_millis(25)).await;
+
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(pending.lock().await.contains_key(&(7, 2, 44)));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(relay.route_session(current).await.is_some());
+        assert_eq!(relay.stale_epoch_drops.load(Ordering::Relaxed), 2);
+
+        reader.abort();
+        let _ = reader.await;
+    }
+
+    #[tokio::test]
+    async fn delayed_reverse_reply_retains_its_ingress_epoch_after_slot_reuse() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let relay = ReverseRelay::new(tx, 27);
+        let e1 = relay.route_handle(9, 1);
+        let e2 = relay.route_handle(9, 2);
+        relay
+            .install_route(e1, Arc::new(RelaySession::new("e1-session".to_owned())))
+            .await
+            .unwrap();
+        relay.pending.lock().await.insert(
+            (e1.channel, e1.epoch, 77),
+            PendingRelayEntry::new("e1-session".to_owned()),
+        );
+        relay
+            .install_route(e2, Arc::new(RelaySession::new("e2-session".to_owned())))
+            .await
+            .unwrap();
+
+        relay
+            .settle_host_answer(
+                (e1.channel, e1.epoch, 77),
+                Err(ServiceError::TransportClosed),
+            )
+            .await;
+
+        let reply = rx.recv().await.unwrap();
+        assert_eq!(
+            (reply.header.channel, reply.header.epoch, reply.header.corr),
+            (e1.channel, e1.epoch, 77),
+            "a delayed E1 host answer must never be stamped as the live E2 route"
+        );
+        assert_eq!(relay.route_session(e2).await.unwrap().id(), "e2-session");
+    }
+
+    #[tokio::test]
+    async fn reverse_reply_from_another_connection_token_emits_no_frame() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let relay = ReverseRelay::new(tx, 2);
+        relay
+            .send_reverse_error(
+                RouteHandle {
+                    channel: 4,
+                    epoch: 1,
+                    connection_token: 1,
+                },
+                8,
+                ErrorData::internal_error("stale", None),
+            )
+            .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn client_ignores_unknown_channel_zero_push() {
         let (mut server, client) = tokio::io::duplex(4096);
-        let pending: Arc<Mutex<HashMap<PendingKey, PendingTx>>> =
+        let pending: Arc<Mutex<HashMap<PendingKey, PendingRequest>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (reply_tx, mut reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER);
-        pending.lock().await.insert((0, 42), reply_tx);
+        pending.lock().await.insert(
+            (0, 0, 42),
+            PendingRequest {
+                reply: reply_tx,
+                route_session: None,
+            },
+        );
 
         let reader_pending = Arc::clone(&pending);
         let reader = tokio::spawn(async move {
             let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
             let (tx, _rx) = mpsc::channel(1);
-            let relay = Arc::new(ReverseRelay::new(tx));
+            let relay = Arc::new(ReverseRelay::new(tx, 1));
             subc_reader_loop(client, reader_pending, events, relay).await;
         });
 
         let push = build_frame(
             FrameType::Push,
             control_flags(),
+            0,
             0,
             42,
             br#"{"op":"catalog.changed","generation":2}"#.to_vec(),
@@ -4373,7 +4783,7 @@ mod tests {
 
         time::sleep(Duration::from_millis(25)).await;
         assert!(
-            pending.lock().await.contains_key(&(0, 42)),
+            pending.lock().await.contains_key(&(0, 0, 42)),
             "unknown channel-0 Push must not satisfy a pending request"
         );
 
@@ -4381,8 +4791,9 @@ mod tests {
             FrameType::Response,
             control_flags(),
             0,
+            0,
             42,
-            br#"{"op":"route.open","route_channel":7}"#.to_vec(),
+            br#"{"op":"route.open","route_channel":7,"route_epoch":1}"#.to_vec(),
         )
         .unwrap();
         write_frame(&mut server, &response).await.unwrap();

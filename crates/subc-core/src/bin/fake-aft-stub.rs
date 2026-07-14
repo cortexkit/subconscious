@@ -109,7 +109,7 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
 async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, StubError> {
     // Any future reconnect loop must call this helper for every reconnect, so key
     // rotation is observed by re-reading the connection file each time.
-    let conn = connection_file::read(connection_file_path).map_err(|source| {
+    let conn = connection_file::read_for_client(connection_file_path).map_err(|source| {
         StubError::ConnectionFile {
             path: connection_file_path.to_path_buf(),
             source,

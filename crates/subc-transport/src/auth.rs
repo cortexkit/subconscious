@@ -669,6 +669,7 @@ mod tests {
         let deadline = Duration::from_millis(100);
         let conn = ConnectionInfo {
             schema: 1,
+            wire_version: None,
             endpoints: vec![Endpoint {
                 host: "127.0.0.1".to_owned(),
                 port: 1,

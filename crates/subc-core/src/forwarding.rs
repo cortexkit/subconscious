@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use crate::{registry::ConnectionId, router::FrameSink, Frame};
+use crate::{observability::DaemonCounters, registry::ConnectionId, router::FrameSink, Frame};
 
 /// Default per-channel request-credit window for modules that schedule internally.
 const DEFAULT_MODULE_MANAGED_WINDOW: usize = 32;
@@ -283,10 +283,14 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 pub struct ForwardingTable {
     inner: RwLock<ForwardingInner>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
-    stale_epoch_drops: AtomicUsize,
+    counters: DaemonCounters,
 }
 
 impl ForwardingTable {
+    pub(crate) fn counters(&self) -> DaemonCounters {
+        self.counters.clone()
+    }
+
     pub(crate) fn register_connection_close(
         &self,
         connection_id: ConnectionId,
@@ -614,14 +618,16 @@ impl ForwardingTable {
         expected_epoch: u32,
     ) -> Result<RouteRelease, ForwardingError> {
         let mut inner = self.write_inner()?;
-        Ok(release_client_route_locked(
+        let release = release_client_route_locked(
             &mut inner,
             ClientRouteKey {
                 connection_id: client_connection_id,
                 channel: client_channel,
             },
             expected_epoch,
-        ))
+        );
+        self.record_route_release(&release);
+        Ok(release)
     }
 
     pub(crate) fn release_module_route(
@@ -638,14 +644,16 @@ impl ForwardingTable {
         else {
             return Ok(RouteRelease::Absent);
         };
-        Ok(release_module_route_locked(
+        let release = release_module_route_locked(
             &mut inner,
             ModuleRouteKey {
                 endpoint,
                 channel: module_channel,
             },
             expected_epoch,
-        ))
+        );
+        self.record_route_release(&release);
+        Ok(release)
     }
 
     pub(crate) fn abort_pending_relay(
@@ -836,53 +844,42 @@ impl ForwardingTable {
         epoch: u32,
     ) -> Result<DataRoute, ForwardingError> {
         let inner = self.read_inner()?;
-        let state =
-            if let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() {
-                let key = ModuleRouteKey { endpoint, channel };
-                match inner.module_to_client.get(&key) {
-                    Some(route) if route.module_epoch == epoch => {
-                        DataRouteState::Bound(Arc::clone(route))
-                    }
-                    Some(_) => {
-                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
-                        DataRouteState::EpochMismatch
-                    }
-                    None if inner.reserved_module.contains_key(&key)
-                        && inner.module_slot_epochs.get(&key).copied() == Some(epoch) =>
-                    {
-                        DataRouteState::Reserved
-                    }
-                    None if inner.reserved_module.contains_key(&key) => {
-                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
-                        DataRouteState::EpochMismatch
-                    }
-                    None => DataRouteState::Absent,
+        let state = if let Some(endpoint) =
+            inner.endpoint_by_connection.get(&connection_id).copied()
+        {
+            let key = ModuleRouteKey { endpoint, channel };
+            match inner.module_to_client.get(&key) {
+                Some(route) if route.module_epoch == epoch => {
+                    DataRouteState::Bound(Arc::clone(route))
                 }
-            } else {
-                let key = ClientRouteKey {
-                    connection_id,
-                    channel,
-                };
-                match inner.client_to_module.get(&key) {
-                    Some(route) if route.client_epoch == epoch => {
-                        DataRouteState::Bound(Arc::clone(route))
-                    }
-                    Some(_) => {
-                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
-                        DataRouteState::EpochMismatch
-                    }
-                    None if inner.reserved_client.contains_key(&key)
-                        && inner.client_slot_epochs.get(&key).copied() == Some(epoch) =>
-                    {
-                        DataRouteState::Reserved
-                    }
-                    None if inner.reserved_client.contains_key(&key) => {
-                        self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
-                        DataRouteState::EpochMismatch
-                    }
-                    None => DataRouteState::Absent,
+                Some(_) => DataRouteState::EpochMismatch,
+                None if inner.reserved_module.contains_key(&key)
+                    && inner.module_slot_epochs.get(&key).copied() == Some(epoch) =>
+                {
+                    DataRouteState::Reserved
                 }
+                None if inner.reserved_module.contains_key(&key) => DataRouteState::EpochMismatch,
+                None => DataRouteState::Absent,
+            }
+        } else {
+            let key = ClientRouteKey {
+                connection_id,
+                channel,
             };
+            match inner.client_to_module.get(&key) {
+                Some(route) if route.client_epoch == epoch => {
+                    DataRouteState::Bound(Arc::clone(route))
+                }
+                Some(_) => DataRouteState::EpochMismatch,
+                None if inner.reserved_client.contains_key(&key)
+                    && inner.client_slot_epochs.get(&key).copied() == Some(epoch) =>
+                {
+                    DataRouteState::Reserved
+                }
+                None if inner.reserved_client.contains_key(&key) => DataRouteState::EpochMismatch,
+                None => DataRouteState::Absent,
+            }
+        };
         Ok(
             if inner.endpoint_by_connection.contains_key(&connection_id) {
                 DataRoute::Module(state)
@@ -890,11 +887,6 @@ impl ForwardingTable {
                 DataRoute::Client(state)
             },
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stale_epoch_drop_count(&self) -> usize {
-        self.stale_epoch_drops.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1270,6 +1262,14 @@ impl ForwardingTable {
             self.request_connection_close(connection_id, reason);
         }
         Ok(should_close)
+    }
+
+    fn record_route_release(&self, release: &RouteRelease) {
+        match release {
+            RouteRelease::Removed(_) => self.counters.increment_route_released_epoch_fenced(),
+            RouteRelease::Stale => self.counters.increment_route_release_stale_skipped(),
+            RouteRelease::Absent => {}
+        }
     }
 
     fn read_inner(&self) -> Result<RwLockReadGuard<'_, ForwardingInner>, ForwardingError> {
@@ -2102,6 +2102,9 @@ mod tests {
             }
             RoutePollSnapshot::Absent => panic!("successor binding was removed"),
         }
+        let counters = forwarding.counters().snapshot();
+        assert_eq!(counters["route_released_epoch_fenced"], 1);
+        assert_eq!(counters["route_release_stale_skipped"], 1);
     }
 
     #[test]

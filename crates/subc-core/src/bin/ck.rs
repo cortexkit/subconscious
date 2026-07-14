@@ -576,6 +576,14 @@ async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError>
                 uptime,
             ]],
         );
+        if let Some(counters) = connected_clients.get("counters").and_then(Value::as_object) {
+            let mut rows = counters
+                .iter()
+                .map(|(name, value)| vec![name.clone(), display_json_value(value)])
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| left[0].cmp(&right[0]));
+            print_table(&["counter", "value"], rows);
+        }
     }
     Ok(())
 }
@@ -1406,7 +1414,7 @@ fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConn
     let mut tried = Vec::new();
 
     for path in candidates {
-        match connection_file::read(&path) {
+        match connection_file::read_for_client(&path) {
             Ok(info) => return Ok(ResolvedConnection { path, info }),
             Err(source) => tried.push(TriedConnectionFile {
                 path,

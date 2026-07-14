@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use subc_protocol::PROTOCOL_VERSION;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MIN_KEY_LEN: usize = 32;
@@ -23,6 +24,8 @@ pub struct Endpoint {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub schema: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_version: Option<u8>,
     pub endpoints: Vec<Endpoint>,
     pub key: Vec<u8>,
     pub daemon_id: [u8; DAEMON_ID_LEN],
@@ -36,6 +39,7 @@ impl fmt::Debug for ConnectionInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionInfo")
             .field("schema", &self.schema)
+            .field("wire_version", &self.wire_version)
             .field("endpoints", &self.endpoints)
             .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
             .field("daemon_id", &self.daemon_id)
@@ -66,6 +70,17 @@ impl ConnectionInfo {
         }
         Ok(())
     }
+
+    /// Validates a declared envelope version without rejecting older files that
+    /// omit the additive field.
+    pub fn validate_wire_version(&self, supported: u8) -> Result<(), ConnectionFileError> {
+        if let Some(file) = self.wire_version {
+            if file != supported {
+                return Err(ConnectionFileError::WireVersionMismatch { file, supported });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -93,6 +108,10 @@ pub enum ConnectionFileError {
     UnsupportedSchema {
         schema: u32,
         supported: u32,
+    },
+    WireVersionMismatch {
+        file: u8,
+        supported: u8,
     },
     Invalid {
         reason: String,
@@ -150,6 +169,14 @@ pub fn read(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileErro
             source,
         })?;
     info.validate()?;
+    Ok(info)
+}
+
+/// Reads connection information for a client and rejects a declared envelope
+/// version this binary cannot decode before a TCP connection is attempted.
+pub fn read_for_client(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
+    let info = read(path)?;
+    info.validate_wire_version(PROTOCOL_VERSION)?;
     Ok(info)
 }
 
@@ -307,6 +334,10 @@ impl fmt::Display for ConnectionFileError {
                 f,
                 "unsupported connection file schema {schema}; expected {supported}"
             ),
+            Self::WireVersionMismatch { file, supported } => write!(
+                f,
+                "connection file wire version {file} does not match supported wire version {supported}; the binary must be upgraded"
+            ),
             Self::Invalid { reason } => write!(f, "invalid connection file: {reason}"),
             Self::KeyTooShort { len, min } => write!(
                 f,
@@ -330,6 +361,7 @@ impl Error for ConnectionFileError {
             Self::MissingParent { .. }
             | Self::MissingFileName { .. }
             | Self::UnsupportedSchema { .. }
+            | Self::WireVersionMismatch { .. }
             | Self::Invalid { .. }
             | Self::KeyTooShort { .. }
             | Self::InsecurePermissions { .. } => None,
@@ -344,6 +376,7 @@ mod tests {
     fn sample_info() -> ConnectionInfo {
         ConnectionInfo {
             schema: SCHEMA_VERSION,
+            wire_version: None,
             endpoints: vec![Endpoint {
                 host: "127.0.0.1".to_owned(),
                 port: 8799,
@@ -428,11 +461,52 @@ mod tests {
     }
 
     #[test]
-    fn read_accepts_owner_only_file() {
+    fn optional_wire_version_round_trips() {
         let path = unique_temp_path();
-        write_atomic(&path, &sample_info()).expect("write owner-only file");
-        let read_back = read(&path).expect("owner-only file is readable");
-        assert_eq!(read_back, sample_info());
+        let legacy = sample_info();
+        write_atomic(&path, &legacy).expect("write legacy connection file");
+        let legacy_json = fs::read_to_string(&path).expect("read legacy connection file");
+        assert!(!legacy_json.contains("wire_version"));
+        assert_eq!(
+            read_for_client(&path).expect("legacy file remains readable"),
+            legacy
+        );
+
+        let mut current = sample_info();
+        current.wire_version = Some(PROTOCOL_VERSION);
+        write_atomic(&path, &current).expect("write current connection file");
+        let current_json = fs::read_to_string(&path).expect("read current connection file");
+        let current_json: serde_json::Value =
+            serde_json::from_str(&current_json).expect("parse current connection file");
+        assert_eq!(
+            current_json["wire_version"].as_u64(),
+            Some(u64::from(PROTOCOL_VERSION))
+        );
+        assert_eq!(
+            read_for_client(&path).expect("current file is readable"),
+            current
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_for_client_rejects_mismatched_wire_version() {
+        let path = unique_temp_path();
+        let mut info = sample_info();
+        let file_version = PROTOCOL_VERSION + 1;
+        info.wire_version = Some(file_version);
+        write_atomic(&path, &info).expect("write mismatched connection file");
+
+        let err = read_for_client(&path).expect_err("mismatched wire version must fail discovery");
+        assert!(matches!(
+            err,
+            ConnectionFileError::WireVersionMismatch { file, supported }
+                if file == file_version && supported == PROTOCOL_VERSION
+        ));
+        let rendered = err.to_string();
+        assert!(rendered.contains(&file_version.to_string()));
+        assert!(rendered.contains(&PROTOCOL_VERSION.to_string()));
+        assert!(rendered.contains("binary must be upgraded"));
         let _ = fs::remove_file(&path);
     }
 

@@ -2527,10 +2527,11 @@ async fn open_connection(
     path: &Path,
     deadline: Duration,
 ) -> Result<OpenedConnection, ConsumerError> {
-    let conn = connection_file::read(path).map_err(|source| ConsumerError::ConnectionFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let conn =
+        connection_file::read_for_client(path).map_err(|source| ConsumerError::ConnectionFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let endpoint = conn
         .endpoints
         .first()

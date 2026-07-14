@@ -2,7 +2,7 @@ use std::{error::Error, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use subc_transport::{authenticate_server, AuthError, DAEMON_ID_LEN, WATCHDOG_CLIENT_ROLE};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::TcpListener,
     sync::{mpsc, Semaphore},
     task::JoinHandle,
@@ -224,7 +224,11 @@ where
         "subc authenticated connection opened"
     );
 
-    let (mut read_half, write_half) = tokio::io::split(stream);
+    let (read_half, write_half) = tokio::io::split(stream);
+    // Authentication is complete before this buffer can read ahead. The only cancellation
+    // of an in-progress frame read terminates the connection, so buffered bytes are never
+    // stranded before a later read.
+    let mut read_half = BufReader::new(read_half);
     let (tx, rx) = mpsc::channel::<crate::Frame>(CONNECTION_EGRESS_BUFFER);
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
 
@@ -500,11 +504,17 @@ impl Error for ConnectionError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
     use super::*;
     use subc_protocol::{
         DecodeError, ErrorBody, Flags, FrameType, Priority, HEADER_LEN, PROTOCOL_VERSION,
     };
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     use subc_transport::{authenticate_client, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 
@@ -512,6 +522,68 @@ mod tests {
 
     const TEST_DEADLINE: Duration = Duration::from_secs(2);
     const TEST_DAEMON_VER: &str = "test-subc-server";
+
+    struct CountingReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        first_read_end: Option<usize>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl CountingReader {
+        fn new(bytes: Vec<u8>, first_read_end: Option<usize>) -> (Self, Arc<AtomicUsize>) {
+            let reads = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    bytes,
+                    offset: 0,
+                    first_read_end,
+                    reads: Arc::clone(&reads),
+                },
+                reads,
+            )
+        }
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let available = self.bytes.len().saturating_sub(self.offset);
+            let first_read_remaining = self
+                .first_read_end
+                .filter(|end| self.offset < *end)
+                .map_or(available, |end| end - self.offset);
+            let count = available.min(first_read_remaining).min(buf.remaining());
+            let end = self.offset + count;
+            buf.put_slice(&self.bytes[self.offset..end]);
+            self.offset = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn encode_frames(frames: &[Frame]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend_from_slice(&frame.header.encode());
+            bytes.extend_from_slice(&frame.body);
+        }
+        bytes
+    }
+
+    async fn read_frames<R>(reader: &mut R, count: usize) -> Vec<Frame>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut frames = Vec::with_capacity(count);
+        for _ in 0..count {
+            frames.push(read_frame(reader).await.unwrap().unwrap());
+        }
+        frames
+    }
 
     fn request(channel: u16, corr: u64, body: &[u8]) -> Frame {
         Frame::build(
@@ -570,6 +642,36 @@ mod tests {
         authenticate_client(stream, conn, TEST_DEADLINE)
             .await
             .expect("test client should authenticate")
+    }
+
+    #[tokio::test]
+    async fn buffered_frame_reader_coalesces_reads_and_preserves_short_reads() {
+        let frames = vec![
+            request(7, 1, b"first"),
+            request(9, 2, b"second"),
+            request(7, 3, b"third"),
+            request(9, 4, b"fourth"),
+        ];
+        let bytes = encode_frames(&frames);
+
+        let (mut direct, direct_reads) = CountingReader::new(bytes.clone(), None);
+        assert_eq!(read_frames(&mut direct, frames.len()).await, frames);
+        assert_eq!(direct_reads.load(Ordering::Relaxed), frames.len() * 3);
+
+        let (buffered_source, buffered_reads) = CountingReader::new(bytes, None);
+        let mut buffered = BufReader::new(buffered_source);
+        assert_eq!(read_frames(&mut buffered, frames.len()).await, frames);
+        assert_eq!(buffered_reads.load(Ordering::Relaxed), 1);
+
+        let split_frame = request(7, 5, b"split-body");
+        let split_bytes = encode_frames(std::slice::from_ref(&split_frame));
+        let (split_source, split_reads) = CountingReader::new(split_bytes, Some(10));
+        let mut split_reader = BufReader::new(split_source);
+        assert_eq!(
+            read_frame(&mut split_reader).await.unwrap(),
+            Some(split_frame)
+        );
+        assert_eq!(split_reads.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

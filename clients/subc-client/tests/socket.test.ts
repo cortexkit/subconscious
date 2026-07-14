@@ -2,7 +2,17 @@ import { expect, test } from "bun:test";
 import { createServer, type AddressInfo } from "node:net";
 
 import { buildFrame, encodeFrame, FrameType, Priority, buildFlags, DecodeError } from "../src/envelope.js";
-import { SocketTimeoutError, SubcSocket } from "../src/socket.js";
+import { SocketTimeoutError, SubcSocket, toWriteBuffer } from "../src/socket.js";
+
+test("outbound write buffer preserves the exact slice without copying", () => {
+  const storage = new Uint8Array([99, 1, 2, 3, 88]);
+  const bytes = storage.subarray(1, 4);
+
+  const writeBuffer = toWriteBuffer(bytes);
+
+  expect([...writeBuffer]).toEqual([1, 2, 3]);
+  expect(writeBuffer.buffer).toBe(bytes.buffer);
+});
 
 test("prefix-first reader rejects a stale 17-byte v1 header without waiting for byte 18", async () => {
   const server = createServer((socket) => {

@@ -34,6 +34,7 @@ interface FakeStats {
   routeOpens: number;
   dataRequests: number;
   dataBodies: unknown[];
+  requestFrames: { channel: number; controlOp?: string }[];
   // The consumer_identity sent on each route.open, in order (undefined when absent),
   // so a test can assert the principal survives a reconnect reopen.
   routeOpenConsumerIdentities: (unknown | undefined)[];
@@ -70,7 +71,14 @@ interface FakeDaemon {
 }
 
 function newStats(): FakeStats {
-  return { routeOpens: 0, dataRequests: 0, dataBodies: [], routeOpenConsumerIdentities: [], connections: 0 };
+  return {
+    routeOpens: 0,
+    dataRequests: 0,
+    dataBodies: [],
+    requestFrames: [],
+    routeOpenConsumerIdentities: [],
+    connections: 0,
+  };
 }
 
 afterEach(async () => {
@@ -327,7 +335,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("a second unknown_channel on the same call surfaces terminal instead of looping", async () => {
+  test("evicts the retry route when a second unknown_channel surfaces terminal", async () => {
     const { connFile } = tempConnectionFile();
     const stats = newStats();
     // EVERY data request rejects with unknown_channel: the retry-once budget must
@@ -345,6 +353,14 @@ describe("SubcClient managed call", () => {
       // Exactly two attempts: original + the single in-place retry.
       expect(stats.dataRequests).toBe(2);
       expect(stats.routeOpens).toBe(2);
+
+      await expect(client.call("managed-provider", "echo", { n: 2 })).rejects.toMatchObject({
+        kind: "terminal",
+        code: "unknown_channel",
+      });
+      // The third data attempt begins a new managed call. It must open a route
+      // before sending data, rather than reuse the retry's dead channel.
+      expect(stats.requestFrames[4]).toEqual({ channel: 0, controlOp: "route.open" });
     } finally {
       client.close();
     }
@@ -587,8 +603,11 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
     const frame = await readFrame(reader, deadline);
     if (frame.header.ty !== FrameType.Request) continue;
 
+    const requestFrame: { channel: number; controlOp?: string } = { channel: frame.header.channel };
+    options.stats.requestFrames.push(requestFrame);
     if (frame.header.channel === 0) {
       const request = parseJson(frame.body) as { op?: string };
+      requestFrame.controlOp = request.op;
       if (request.op === "catalog.list") {
         await writeFrame(socket, responseFrame(frame, { op: "catalog.list", modules: [] }), deadline);
       } else if (request.op === "route.open") {

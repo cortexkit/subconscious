@@ -41,6 +41,15 @@ public func readConnectionFile(_ path: String) throws -> ConnectionInfo {
         throw ConnectionFileError(message: "unsupported connection file schema \(schema); expected \(SCHEMA_VERSION)")
     }
 
+    if let wireVersion = obj["wire_version"] {
+        let version = wireVersion as? Int
+        guard version == Int(PROTOCOL_VERSION) else {
+            throw ConnectionFileError(
+                message: "connection file wire_version \(version.map(String.init) ?? String(describing: wireVersion)) but this client speaks \(PROTOCOL_VERSION); the client library must be upgraded"
+            )
+        }
+    }
+
     guard let endpointsRaw = obj["endpoints"] as? [[String: Any]] else {
         throw ConnectionFileError(message: "connection file 'endpoints' must be an array")
     }

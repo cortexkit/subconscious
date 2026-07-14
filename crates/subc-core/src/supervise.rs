@@ -2192,13 +2192,11 @@ async fn set_child_enabled(
         let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
             Ok(next_child) => next_child,
             Err(err) => {
-                if let Err(state_err) =
-                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                        state.state = ModuleState::Failed;
-                        state.process_alive = false;
-                        state.pid = None;
-                    })
-                {
+                if let Err(state_err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.state = ModuleState::Failed;
+                    state.process_alive = false;
+                    state.pid = None;
+                }) {
                     error!(module_id = %spec.module_id, error = %state_err, "failed to record enable spawn failure");
                 }
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);

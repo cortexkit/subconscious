@@ -428,6 +428,9 @@ export class SubcClient {
           this.evictRouteHandle(routeHandle);
           continue;
         }
+        if (err.code === "unknown_channel" && retriedUnknownChannel) {
+          this.evictRouteHandle(routeHandle);
+        }
         if (err.kind === "not_sent") {
           try {
             await this.reconnectAfterDrop(err);

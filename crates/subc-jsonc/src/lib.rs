@@ -21,6 +21,8 @@ pub fn jsonc_to_json(doc: &str) -> Result<String, String> {
             continue;
         }
 
+        // A removed comment is lexical whitespace; emit a space so adjacent
+        // tokens cannot merge. Newlines are preserved for error-line fidelity.
         match ch {
             '"' => {
                 in_string = true;
@@ -28,6 +30,7 @@ pub fn jsonc_to_json(doc: &str) -> Result<String, String> {
             }
             '/' if chars.peek() == Some(&'/') => {
                 let _ = chars.next();
+                out.push(' ');
                 for next in chars.by_ref() {
                     if next == '\n' {
                         out.push('\n');
@@ -37,6 +40,7 @@ pub fn jsonc_to_json(doc: &str) -> Result<String, String> {
             }
             '/' if chars.peek() == Some(&'*') => {
                 let _ = chars.next();
+                out.push(' ');
                 let mut closed = false;
                 let mut prev = '\0';
                 for next in chars.by_ref() {
@@ -183,6 +187,24 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name}: invalid json output: {err}"));
             assert_eq!(actual, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn well_formed_block_comment_preserves_newlines_and_value() {
+        let doc = "{\"a\":1,/* first\nsecond */\"b\":2,}";
+        let normalized = jsonc_to_json(doc).unwrap();
+        let actual: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(normalized.matches('\n').count(), doc.matches('\n').count());
+        assert_eq!(actual, json!({ "a": 1, "b": 2 }));
+    }
+
+    #[test]
+    fn block_comment_cannot_merge_adjacent_tokens() {
+        let normalized = jsonc_to_json(r#"{"version":1,"port":8/* digits */123}"#).unwrap();
+
+        assert_eq!(normalized, r#"{"version":1,"port":8 123}"#);
+        assert!(serde_json::from_str::<Value>(&normalized).is_err());
     }
 
     #[test]

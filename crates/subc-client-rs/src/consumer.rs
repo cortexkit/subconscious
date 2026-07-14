@@ -26,8 +26,8 @@ use subc_transport::{
     FrameIoError,
 };
 use tokio::{
-    io::{AsyncWriteExt, BufWriter},
-    net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpStream},
+    io::{AsyncWrite, AsyncWriteExt, BufWriter},
+    net::{tcp::OwnedReadHalf, TcpStream},
     sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{sleep, timeout_at, Instant},
@@ -2951,12 +2951,14 @@ impl Shared {
     }
 }
 
-async fn writer_loop(
+async fn writer_loop<W>(
     shared: Arc<Shared>,
-    writer: OwnedWriteHalf,
+    writer: W,
     mut rx: mpsc::Receiver<WriteCommand>,
     generation: u64,
-) {
+) where
+    W: AsyncWrite + Unpin,
+{
     let mut writer = BufWriter::new(writer);
     while let Some(command) = rx.recv().await {
         if let Some(key) = command.pending {
@@ -2964,7 +2966,7 @@ async fn writer_loop(
                 continue;
             }
         }
-        if let Err(err) = write_one_and_flush(&mut writer, &command.frame).await {
+        if let Err(err) = write_frame(&mut writer, &command.frame).await {
             shared.handle_generation_drop(generation, err.to_string());
             return;
         }
@@ -2974,20 +2976,16 @@ async fn writer_loop(
                     continue;
                 }
             }
-            if let Err(err) = write_one_and_flush(&mut writer, &command.frame).await {
+            if let Err(err) = write_frame(&mut writer, &command.frame).await {
                 shared.handle_generation_drop(generation, err.to_string());
                 return;
             }
         }
+        if let Err(err) = writer.flush().await.map_err(FrameIoError::Io) {
+            shared.handle_generation_drop(generation, err.to_string());
+            return;
+        }
     }
-}
-
-async fn write_one_and_flush(
-    writer: &mut BufWriter<OwnedWriteHalf>,
-    frame: &Frame,
-) -> Result<(), FrameIoError> {
-    write_frame(writer, frame).await?;
-    writer.flush().await.map_err(FrameIoError::Io)
 }
 
 fn route_open_consumer_identity(opts: &CallOptions) -> Option<ConsumerIdentity> {
@@ -3144,6 +3142,227 @@ impl From<FrameBuildError> for CallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct InstrumentedWriter {
+        state: Arc<InstrumentedWriterState>,
+        fail_flush: bool,
+    }
+
+    #[derive(Default)]
+    struct InstrumentedWriterState {
+        bytes: Mutex<Vec<u8>>,
+        flushes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl InstrumentedWriter {
+        fn new(fail_flush: bool) -> Self {
+            Self {
+                state: Arc::new(InstrumentedWriterState::default()),
+                fail_flush,
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.state
+                .bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn flush_count(&self) -> usize {
+            self.state.flushes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AsyncWrite for InstrumentedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.state
+                .bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.state.flushes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_flush {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "instrumented flush failure",
+                )))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn writer_test_shared() -> Arc<Shared> {
+        Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions {
+                reconnect_backoff: RetryBackoff {
+                    max_attempts: 1,
+                    ..RetryBackoff::default()
+                },
+                ..ConsumerOptions::default()
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn writer_batches_ready_frames_into_one_flush() {
+        const FRAME_COUNT: usize = 8;
+
+        let shared = writer_test_shared();
+        let (live_writer, _live_rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(FRAME_COUNT + 1);
+        let instrumented = InstrumentedWriter::new(false);
+        let observer = instrumented.clone();
+        let mut expected = Vec::with_capacity(FRAME_COUNT);
+        let mut keys = Vec::with_capacity(FRAME_COUNT);
+
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(live_writer);
+            for index in 0..FRAME_COUNT {
+                let corr = index as u64 + 1;
+                let frame = response_frame(7, 1, corr, vec![index as u8; index + 1]);
+                let key = PendingKey {
+                    generation: 1,
+                    channel: 7,
+                    epoch: 1,
+                    corr,
+                };
+                let (pending_tx, _pending_rx) = oneshot::channel();
+                inner
+                    .pending
+                    .insert(key, PendingEntry::unary(pending_tx, false, None));
+                expected.push(frame.clone());
+                keys.push(key);
+                tx.try_send(WriteCommand {
+                    frame,
+                    pending: Some(key),
+                })
+                .expect("the burst should fit in the writer queue");
+                if index == 0 {
+                    tx.try_send(WriteCommand {
+                        frame: response_frame(7, 1, 999, b"skip".to_vec()),
+                        pending: Some(PendingKey {
+                            generation: 1,
+                            channel: 7,
+                            epoch: 1,
+                            corr: 999,
+                        }),
+                    })
+                    .expect("the skipped command should fit in the writer queue");
+                }
+            }
+        }
+        drop(tx);
+
+        writer_loop(Arc::clone(&shared), instrumented, rx, 1).await;
+
+        {
+            let inner = shared.lock_inner();
+            for key in keys {
+                assert!(
+                    inner.pending.get(&key).is_some_and(|entry| entry.accepted),
+                    "every written command must be marked accepted"
+                );
+            }
+        }
+
+        let mut wire = std::io::Cursor::new(observer.bytes());
+        for expected_frame in expected {
+            let actual = read_frame(&mut wire)
+                .await
+                .expect("the emitted frame should decode")
+                .expect("the emitted frame should be present");
+            assert_eq!(actual, expected_frame);
+        }
+        assert!(
+            read_frame(&mut wire)
+                .await
+                .expect("the end of the emitted burst should be clean")
+                .is_none(),
+            "the writer must not emit extra frames"
+        );
+
+        let flush_count = observer.flush_count();
+        assert_eq!(
+            flush_count, 1,
+            "a ready burst must be coalesced into one flush"
+        );
+        shared.close_sync("test complete");
+    }
+
+    #[tokio::test]
+    async fn writer_flush_failure_drops_generation_and_preserves_acceptance_classification() {
+        let shared = writer_test_shared();
+        let (live_writer, _live_rx) = mpsc::channel(1);
+        let accepted_key = PendingKey {
+            generation: 1,
+            channel: 3,
+            epoch: 1,
+            corr: 1,
+        };
+        let not_sent_key = PendingKey {
+            corr: 2,
+            ..accepted_key
+        };
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (not_sent_tx, not_sent_rx) = oneshot::channel();
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(live_writer);
+            inner
+                .pending
+                .insert(accepted_key, PendingEntry::unary(accepted_tx, false, None));
+            inner
+                .pending
+                .insert(not_sent_key, PendingEntry::unary(not_sent_tx, false, None));
+        }
+
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(WriteCommand {
+            frame: response_frame(3, 1, accepted_key.corr, b"accepted".to_vec()),
+            pending: Some(accepted_key),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        writer_loop(Arc::clone(&shared), InstrumentedWriter::new(true), rx, 1).await;
+
+        assert!(
+            shared.lock_inner().writer.is_none(),
+            "a flush failure must drop the active generation"
+        );
+        let accepted_error = accepted_rx
+            .await
+            .expect("the accepted request should be settled")
+            .into_call_result()
+            .unwrap_err();
+        assert!(matches!(accepted_error, CallError::OutcomeUnknown(_)));
+        let not_sent_error = not_sent_rx
+            .await
+            .expect("the unwritten request should be settled")
+            .into_call_result()
+            .unwrap_err();
+        assert!(matches!(not_sent_error, CallError::NotSent(_)));
+        shared.close_sync("test complete");
+    }
 
     #[test]
     fn reconnect_classifier_treats_auth_failure_as_transient() {

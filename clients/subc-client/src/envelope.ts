@@ -122,6 +122,59 @@ export class DecodeError extends Error {
   }
 }
 
+function validateHeaderFields(header: EnvelopeHeader): void {
+  // Apply wire-width coercions in serialization order before semantic validation.
+  // This preserves encodeHeader's modulo behavior and its early conversion errors.
+  const len = header.len >>> 0;
+  const ver = (header.ver >>> 0) & 0xff;
+  const typeByte = (header.ty >>> 0) & 0xff;
+  const flags = (header.flags >>> 0) & 0xff;
+  const channel = (header.channel >>> 0) & 0xffff;
+  const epoch = header.epoch >>> 0;
+  void BigInt.asUintN(64, header.corr);
+
+  if (ver !== PROTOCOL_VERSION) throw new DecodeError(`unsupported envelope version ${ver}`, "unsupported_version");
+  if (typeByte > FRAME_TYPE_MAX) throw new DecodeError(`unknown frame type byte ${typeByte}`, "unknown_frame_type");
+  const ty = typeByte as FrameType;
+  if ((flags & FLAG_RESERVED_MASK) !== 0) {
+    throw new DecodeError(
+      `reserved flag bits set in flags 0b${flags.toString(2).padStart(8, "0")}`,
+      "reserved_flag_bits",
+    );
+  }
+  if (((flags & FLAG_PRIORITY_MASK) >> FLAG_PRIORITY_SHIFT) === 0b11) {
+    throw new DecodeError(
+      `reserved priority bits set in flags 0b${flags.toString(2).padStart(8, "0")}`,
+      "reserved_priority_bits",
+    );
+  }
+  const admission = (flags & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT;
+  if (admission === 0b11) {
+    throw new DecodeError(
+      `reserved admission class set in flags 0b${flags.toString(2).padStart(8, "0")}`,
+      "reserved_admission_class",
+    );
+  }
+  if (admission === AdmissionClass.Sheddable && ty !== FrameType.Push && ty !== FrameType.StreamData) {
+    throw new DecodeError(
+      `SHEDDABLE admission class is illegal on ${FrameType[ty]} in flags 0b${flags.toString(2).padStart(8, "0")}`,
+      "sheddable_illegal_frame_type",
+    );
+  }
+  if (channel === 0 && epoch !== 0) {
+    throw new DecodeError(
+      `control channel carried nonzero epoch ${epoch}`,
+      "nonzero_epoch_on_control_channel",
+    );
+  }
+  if (isPureHeader(ty) && len !== 0) {
+    throw new DecodeError(
+      `pure-header frame ${FrameType[ty]} declared non-zero body length ${len}`,
+      "pure_header_frame_with_body",
+    );
+  }
+}
+
 /** Decode and validate a header from the front of `bytes`. */
 export function decodeHeader(bytes: Uint8Array): EnvelopeHeader {
   if (bytes.length < FROZEN_PREFIX_LEN) {
@@ -210,7 +263,7 @@ export function buildFrameWithVersion(
     throw new DecodeError(`frame body ${body.length} exceeds max ${MAX_FRAME_BODY_LEN}`, "frame_body_too_large");
   }
   const header = { len: body.length, ver, ty, flags, channel, epoch, corr };
-  decodeHeader(encodeHeader(header));
+  validateHeaderFields(header);
   return { header, body };
 }
 

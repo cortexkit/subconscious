@@ -22,6 +22,19 @@ public final class POSIXTransport: Transport {
         fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw TransportError(message: "socket() failed errno \(errno)") }
 
+        var noSigPipe: Int32 = 1
+        let noSigPipeResult = setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+        guard noSigPipeResult == 0 else {
+            Darwin.close(fd)
+            throw TransportError(message: "setsockopt(SO_NOSIGPIPE) failed errno \(errno)")
+        }
+
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian

@@ -68,17 +68,17 @@ public final class POSIXTransport: Transport {
 
     public func readExact(_ n: Int) throws -> Data {
         guard n > 0 else { return Data() }
-        var buf = [UInt8](repeating: 0, count: n)
+        var data = Data(count: n)
         var got = 0
         while got < n {
-            let r = buf.withUnsafeMutableBytes { ptr -> Int in
+            let r = data.withUnsafeMutableBytes { (ptr: UnsafeMutableRawBufferPointer) -> Int in
                 Darwin.recv(fd, ptr.baseAddress!.advanced(by: got), n - got, 0)
             }
             if r == 0 { throw TransportError(message: "peer closed (EOF) after \(got)/\(n) bytes") }
             if r < 0 { throw TransportError(message: "recv() failed errno \(errno)") }
             got += r
         }
-        return Data(buf)
+        return data
     }
 
     public func close() {

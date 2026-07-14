@@ -919,6 +919,7 @@ struct Inner {
     writer: Option<mpsc::Sender<WriteCommand>>,
     pending: HashMap<PendingKey, PendingEntry>,
     routes: HashMap<RouteKey, RouteState>,
+    route_by_channel: HashMap<u16, RouteKey>,
     route_epochs: HashMap<u16, RouteHandle>,
     dropped_route_frames: u64,
     openings: HashMap<RouteKey, Opening>,
@@ -928,6 +929,47 @@ struct Inner {
     restored_token: u64,
     reader_task: Option<JoinHandle<()>>,
     writer_task: Option<JoinHandle<()>>,
+}
+
+impl Inner {
+    fn cache_route(&mut self, key: RouteKey, route: RouteState) -> RouteState {
+        let cached = self.routes.entry(key.clone()).or_insert(route).clone();
+        let previous = self
+            .route_by_channel
+            .insert(cached.handle.channel, key.clone());
+        debug_assert!(previous.as_ref().is_none_or(|previous| previous == &key));
+        self.route_epochs
+            .insert(cached.handle.channel, cached.handle);
+        cached
+    }
+
+    fn remove_route(&mut self, key: &RouteKey) -> Option<RouteState> {
+        let route = self.routes.remove(key)?;
+        let indexed = self.route_by_channel.remove(&route.handle.channel);
+        debug_assert_eq!(indexed.as_ref(), Some(key));
+        Some(route)
+    }
+
+    fn remove_route_by_handle(&mut self, handle: RouteHandle) -> Option<RouteState> {
+        let key = self.route_by_channel.get(&handle.channel)?.clone();
+        let matches = self
+            .routes
+            .get(&key)
+            .is_some_and(|route| route.handle == handle);
+        debug_assert!(matches);
+        matches.then(|| self.remove_route(&key)).flatten()
+    }
+
+    fn drain_routes(&mut self) -> Vec<RouteState> {
+        self.route_by_channel.clear();
+        self.routes.drain().map(|(_, route)| route).collect()
+    }
+
+    fn close_routes(&mut self) {
+        for route in self.drain_routes() {
+            route.sem.close();
+        }
+    }
 }
 
 impl Shared {
@@ -942,6 +984,7 @@ impl Shared {
                 writer: None,
                 pending: HashMap::new(),
                 routes: HashMap::new(),
+                route_by_channel: HashMap::new(),
                 route_epochs: HashMap::new(),
                 dropped_route_frames: 0,
                 openings: HashMap::new(),
@@ -1004,7 +1047,7 @@ impl Shared {
                     (inner.generation, inner.epoch)
                 }
             };
-            close_routes(&mut inner.routes);
+            inner.close_routes();
             inner.route_epochs.clear();
             inner.next_corr = Some(1);
             inner.writer = Some(tx);
@@ -1414,14 +1457,7 @@ impl Shared {
                                 closed: closed_during_open,
                             }
                         } else {
-                            let cached = inner
-                                .routes
-                                .entry(key.clone())
-                                .or_insert_with(|| route.clone())
-                                .clone();
-                            inner
-                                .route_epochs
-                                .insert(cached.handle.channel, cached.handle);
+                            let cached = inner.cache_route(key.clone(), route.clone());
                             RouteInstall::Cached(cached)
                         }
                     };
@@ -1900,7 +1936,7 @@ impl Shared {
             }
             inner.writer = None;
             inner.restored_token = inner.restored_token.saturating_add(1);
-            close_routes(&mut inner.routes);
+            inner.close_routes();
             inner.route_epochs.clear();
             let pending = drain_pending_generation(&mut inner.pending, generation);
             let openings = drain_openings(&mut inner.openings);
@@ -1942,11 +1978,7 @@ impl Shared {
                     .drain()
                     .map(|(_, opening)| opening.waiters)
                     .collect::<Vec<_>>(),
-                inner
-                    .routes
-                    .drain()
-                    .map(|(_, route)| route)
-                    .collect::<Vec<_>>(),
+                inner.drain_routes(),
                 inner.reader_task.take(),
                 inner.writer_task.take(),
                 reconnect,
@@ -1983,11 +2015,22 @@ impl Shared {
     }
 
     fn route_state(&self, handle: RouteHandle) -> Result<RouteState, CallError> {
-        self.validate_current_handle(handle)?;
-        self.lock_inner()
-            .routes
-            .values()
-            .find(|route| route.handle == handle)
+        let inner = self.lock_inner();
+        if inner.closed
+            || inner.generation != handle.connection_token()
+            || inner.writer.is_none()
+            || inner.route_epochs.get(&handle.channel) != Some(&handle)
+        {
+            return Err(CallError::StaleRouteHandle(handle));
+        }
+
+        let route = inner
+            .route_by_channel
+            .get(&handle.channel)
+            .and_then(|key| inner.routes.get(key));
+        debug_assert!(route.is_none_or(|route| route.handle == handle));
+        route
+            .filter(|route| route.handle == handle)
             .cloned()
             .ok_or(CallError::StaleRouteHandle(handle))
     }
@@ -2010,7 +2053,7 @@ impl Shared {
             let mut inner = self.lock_inner();
             match inner.routes.get(key) {
                 Some(route) if expected_handle.is_none_or(|expected| expected == route.handle) => {
-                    let removed = inner.routes.remove(key);
+                    let removed = inner.remove_route(key);
                     if let Some(route) = &removed {
                         if inner.route_epochs.get(&route.handle.channel) == Some(&route.handle) {
                             inner.route_epochs.remove(&route.handle.channel);
@@ -2041,13 +2084,9 @@ impl Shared {
         self.validate_current_handle(handle)?;
         let routes = {
             let mut inner = self.lock_inner();
-            let keys = inner
-                .routes
-                .iter()
-                .filter_map(|(key, route)| (route.handle == handle).then_some(key.clone()))
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| inner.routes.remove(&key))
+            inner
+                .remove_route_by_handle(handle)
+                .into_iter()
                 .collect::<Vec<_>>()
         };
         if opts.drain {
@@ -2072,7 +2111,7 @@ impl Shared {
             if let Some(opening) = inner.openings.get_mut(key) {
                 opening.closed = true;
             }
-            inner.routes.remove(key)
+            inner.remove_route(key)
         };
 
         // Nothing cached: either never opened (idempotent no-op) or still opening (the
@@ -2936,13 +2975,9 @@ impl Shared {
                 return;
             }
             inner.route_epochs.remove(&handle.channel);
-            let keys = inner
-                .routes
-                .iter()
-                .filter_map(|(key, route)| (route.handle == handle).then_some(key.clone()))
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| inner.routes.remove(&key))
+            inner
+                .remove_route_by_handle(handle)
+                .into_iter()
                 .collect::<Vec<_>>()
         };
         for route in removed {
@@ -3081,12 +3116,6 @@ fn fail_openings(openings: Vec<Vec<OpeningWaiter>>, failure: SharedCallFailure) 
         for waiter in waiters {
             let _ = waiter.send(Err(failure.clone()));
         }
-    }
-}
-
-fn close_routes(routes: &mut HashMap<RouteKey, RouteState>) {
-    for route in routes.drain().map(|(_, route)| route) {
-        route.sem.close();
     }
 }
 
@@ -3514,6 +3543,87 @@ mod tests {
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
     }
 
+    #[tokio::test]
+    async fn route_channel_index_tracks_lookup_close_and_generation_drop() {
+        let shared = writer_test_shared();
+        let (writer, _rx) = mpsc::channel(32);
+        let mut expected = Vec::new();
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            for channel in 1..=8 {
+                let key = RouteKey::new(
+                    &RouteTarget::ToolProvider {
+                        module_id: format!("module-{channel}"),
+                    },
+                    &BindIdentity {
+                        project_root: PathBuf::from("/tmp/project"),
+                        harness: "test".into(),
+                        session: format!("session-{channel}"),
+                    },
+                    None,
+                    None,
+                );
+                let route = RouteState {
+                    handle: RouteHandle::new(channel, channel.into(), 1),
+                    sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
+                };
+                inner.cache_route(key.clone(), route.clone());
+                expected.push((key, route));
+            }
+        }
+
+        for (key, expected_route) in &expected {
+            let resolved = shared
+                .route_state(expected_route.handle)
+                .expect("an indexed route handle should resolve");
+            assert_eq!(resolved.handle, expected_route.handle);
+            assert!(Arc::ptr_eq(&resolved.sem, &expected_route.sem));
+
+            let inner = shared.lock_inner();
+            assert_eq!(
+                inner.route_by_channel.get(&expected_route.handle.channel),
+                Some(key)
+            );
+            assert_eq!(
+                inner.route_epochs.get(&expected_route.handle.channel),
+                Some(&expected_route.handle)
+            );
+            assert!(inner
+                .routes
+                .get(key)
+                .is_some_and(|route| route.handle == expected_route.handle));
+        }
+
+        let (closed_key, closed_route) = &expected[3];
+        shared
+            .close_route(closed_key, &CloseRouteOptions::default())
+            .await;
+        {
+            let inner = shared.lock_inner();
+            assert!(!inner.routes.contains_key(closed_key));
+            assert!(!inner
+                .route_by_channel
+                .contains_key(&closed_route.handle.channel));
+            assert!(!inner
+                .route_epochs
+                .contains_key(&closed_route.handle.channel));
+        }
+        assert!(matches!(
+            shared.route_state(closed_route.handle),
+            Err(CallError::StaleRouteHandle(handle)) if handle == closed_route.handle
+        ));
+
+        shared.handle_generation_drop(1, "test generation dropped".into());
+        {
+            let inner = shared.lock_inner();
+            assert!(inner.routes.is_empty());
+            assert!(inner.route_by_channel.is_empty());
+            assert!(inner.route_epochs.is_empty());
+        }
+        shared.close_sync("test complete");
+    }
+
     #[test]
     fn route_key_canonicalizes_consumer_capabilities() {
         let target = RouteTarget::ToolProvider {
@@ -3910,8 +4020,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
-            inner.route_epochs.insert(handle.channel, handle);
-            inner.routes.insert(
+            inner.cache_route(
                 key,
                 RouteState {
                     handle,
@@ -4077,8 +4186,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
-            inner.route_epochs.insert(handle.channel, handle);
-            inner.routes.insert(
+            inner.cache_route(
                 RouteKey::new(
                     &RouteTarget::ToolProvider {
                         module_id: "subscriptions".to_string(),

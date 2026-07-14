@@ -383,7 +383,7 @@ impl SubcConsumer {
                 body,
                 priority: opts.priority,
                 admission_class: opts.admission_class,
-                timeout: remaining_duration(deadline)?,
+                deadline,
                 retain_late_route_open: false,
             })
             .await;
@@ -422,6 +422,7 @@ impl SubcConsumer {
                 priority: opts.priority,
                 admission_class: opts.admission_class,
                 event_buffer: opts.event_buffer,
+                deadline,
                 permit,
             })
             .await
@@ -434,6 +435,7 @@ impl SubcConsumer {
         kind: PollKind,
         timeout: Duration,
     ) -> Result<RoutePollResult, CallError> {
+        let deadline = Instant::now() + timeout;
         let body = serde_json::to_vec(&ClientControlRequest::RoutePoll {
             route_channel: handle.channel,
             route_epoch: handle.epoch,
@@ -449,7 +451,7 @@ impl SubcConsumer {
                 body,
                 priority: Priority::Interactive,
                 admission_class: AdmissionClass::Normal,
-                timeout,
+                deadline,
                 retain_late_route_open: false,
             })
             .await?;
@@ -541,7 +543,6 @@ impl SubcConsumer {
                 continue;
             }
 
-            let remaining = remaining_duration(call_deadline)?;
             let response = self
                 .shared
                 .send_request(RequestSend {
@@ -551,7 +552,7 @@ impl SubcConsumer {
                     body: body.clone(),
                     priority: opts.priority,
                     admission_class: opts.admission_class,
-                    timeout: remaining,
+                    deadline: call_deadline,
                     retain_late_route_open: false,
                 })
                 .await;
@@ -578,7 +579,7 @@ impl SubcConsumer {
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Err(err) if err.is_not_sent() && Instant::now() < call_deadline => {
                     self.shared.invalidate_route(&route_key, Some(route.handle));
-                    self.shared.ensure_connected_for_call().await?;
+                    self.shared.ensure_connected_for_call(call_deadline).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -665,6 +666,7 @@ impl SubcConsumer {
                     priority: opts.priority,
                     admission_class: opts.admission_class,
                     event_buffer: opts.event_buffer,
+                    deadline: open_deadline,
                     permit,
                 })
                 .await
@@ -672,7 +674,7 @@ impl SubcConsumer {
                 Ok(subscription) => return Ok(subscription),
                 Err(err) if err.is_not_sent() && Instant::now() < open_deadline => {
                     self.shared.invalidate_route(&route_key, Some(route.handle));
-                    self.shared.ensure_connected_for_call().await?;
+                    self.shared.ensure_connected_for_call(open_deadline).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -1046,8 +1048,16 @@ impl Shared {
         Ok((generation, epoch))
     }
 
-    async fn ensure_connected_for_call(self: &Arc<Self>) -> Result<(), CallError> {
+    async fn ensure_connected_for_call(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<(), CallError> {
         loop {
+            if Instant::now() >= deadline {
+                return Err(CallError::not_sent(
+                    "call deadline elapsed waiting for reconnection",
+                ));
+            }
             let action = {
                 let mut inner = self.lock_inner();
                 if inner.closed {
@@ -1065,15 +1075,27 @@ impl Shared {
             };
 
             match action {
-                EnsureAction::Wait => self.notify.notified().await,
+                EnsureAction::Wait => {
+                    timeout_at(deadline, self.notify.notified())
+                        .await
+                        .map_err(|_| {
+                            CallError::not_sent("call deadline elapsed waiting for reconnection")
+                        })?;
+                }
                 EnsureAction::Lead => {
-                    let result = self.reconnect_with_retry().await;
+                    let result = timeout_at(deadline, self.reconnect_with_retry()).await;
                     {
                         let mut inner = self.lock_inner();
                         inner.reconnecting = false;
                     }
                     self.notify.notify_waiters();
-                    return result.map_err(|err| CallError::not_sent(err.to_string()));
+                    return match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(err)) => Err(CallError::not_sent(err.to_string())),
+                        Err(_) => Err(CallError::not_sent(
+                            "call deadline elapsed waiting for reconnection",
+                        )),
+                    };
                 }
             }
         }
@@ -1209,10 +1231,15 @@ impl Shared {
             };
 
             match action {
-                RouteOpenAction::Wait(rx) => match rx.await {
-                    Ok(Ok(route)) => return Ok(route),
-                    Ok(Err(err)) => return Err(err.into_call_error()),
-                    Err(_) => continue,
+                RouteOpenAction::Wait(rx) => match timeout_at(call_deadline, rx).await {
+                    Ok(Ok(Ok(route))) => return Ok(route),
+                    Ok(Ok(Err(err))) => return Err(err.into_call_error()),
+                    Ok(Err(_)) => continue,
+                    Err(_) => {
+                        return Err(CallError::not_sent(
+                            "call deadline elapsed waiting for route.open",
+                        ));
+                    }
                 },
                 RouteOpenAction::Lead => {
                     let mut guard = OpeningGuard::new(Arc::clone(self), key.clone());
@@ -1238,7 +1265,7 @@ impl Shared {
         let mut attempt = 0usize;
         loop {
             attempt = attempt.saturating_add(1);
-            self.ensure_connected_for_call().await?;
+            self.ensure_connected_for_call(route_deadline).await?;
             let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
                 target: route_open.target.clone(),
                 identity: route_open.identity.clone(),
@@ -1246,7 +1273,6 @@ impl Shared {
                 consumer_capabilities: route_open.consumer_capabilities.clone(),
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
-            let remaining = remaining_duration(route_deadline)?;
             match self
                 .send_request(RequestSend {
                     expected_handle: None,
@@ -1255,7 +1281,7 @@ impl Shared {
                     body,
                     priority: Priority::Interactive,
                     admission_class: AdmissionClass::Normal,
-                    timeout: remaining,
+                    deadline: route_deadline,
                     retain_late_route_open: true,
                 })
                 .await
@@ -1389,9 +1415,14 @@ impl Shared {
             body,
             priority,
             admission_class,
-            timeout,
+            deadline,
             retain_late_route_open,
         } = request;
+        if Instant::now() >= deadline {
+            return Err(CallError::not_sent(
+                "call deadline elapsed before request was sent",
+            ));
+        }
         let (generation, corr, writer) = {
             let mut inner = self.lock_inner();
             if inner.closed {
@@ -1464,38 +1495,54 @@ impl Shared {
         let mut registration =
             PendingRegistration::new(Arc::clone(self), key, retain_late_route_open);
 
-        if writer
-            .send(WriteCommand {
+        match timeout_at(
+            deadline,
+            writer.send(WriteCommand {
                 frame,
                 pending: Some(key),
-            })
-            .await
-            .is_err()
+            }),
+        )
+        .await
         {
-            let accepted = registration.remove_pending().unwrap_or(false);
-            return Err(classify_failure(
-                accepted,
-                "writer task closed before accepting request",
-            ));
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                let accepted = registration.remove_pending().unwrap_or(false);
+                return Err(classify_failure(
+                    accepted,
+                    "writer task closed before accepting request",
+                ));
+            }
+            Err(_) => {
+                let _ = registration.remove_pending();
+                return Err(CallError::not_sent(
+                    "call deadline elapsed waiting for writer capacity",
+                ));
+            }
         }
 
         tokio::select! {
-            result = rx => {
-                registration.disarm();
-                match result {
-                    Ok(result) => result.into_call_result(),
-                    Err(_) => Err(CallError::not_sent("pending response channel closed")),
-                }
-            }
-            () = sleep(timeout) => {
-                let accepted = if retain_late_route_open {
+            result = timeout_at(deadline, rx) => match result {
+                Ok(Ok(result)) => {
                     registration.disarm();
-                    self.pending_accepted(key).unwrap_or(false)
-                } else {
-                    registration.remove_pending().unwrap_or(false)
-                };
-                Err(classify_failure(accepted, format!("request on channel {channel} timed out after {timeout:?}")))
-            }
+                    result.into_call_result()
+                }
+                Ok(Err(_)) => {
+                    registration.disarm();
+                    Err(CallError::not_sent("pending response channel closed"))
+                }
+                Err(_) => {
+                    let accepted = if retain_late_route_open {
+                        registration.disarm();
+                        self.pending_accepted(key).unwrap_or(false)
+                    } else {
+                        registration.remove_pending().unwrap_or(false)
+                    };
+                    Err(classify_failure(
+                        accepted,
+                        format!("request on channel {channel} timed out at its deadline"),
+                    ))
+                }
+            },
             () = self.close_token.cancelled() => {
                 let accepted = registration.remove_pending().unwrap_or(false);
                 Err(classify_failure(accepted, "consumer closed while request was pending"))
@@ -1515,8 +1562,14 @@ impl Shared {
             priority,
             admission_class,
             event_buffer,
+            deadline,
             permit,
         } = subscription;
+        if Instant::now() >= deadline {
+            return Err(CallError::not_sent(
+                "subscription deadline elapsed before request was sent",
+            ));
+        }
         let (generation, corr, writer) = {
             let mut inner = self.lock_inner();
             if inner.closed {
@@ -1585,19 +1638,29 @@ impl Shared {
         }
         let mut registration = PendingRegistration::new(Arc::clone(self), key, false);
 
-        if writer
-            .send(WriteCommand {
+        match timeout_at(
+            deadline,
+            writer.send(WriteCommand {
                 frame,
                 pending: Some(key),
-            })
-            .await
-            .is_err()
+            }),
+        )
+        .await
         {
-            let accepted = registration.remove_pending().unwrap_or(false);
-            return Err(classify_failure(
-                accepted,
-                "writer task closed before accepting subscription request",
-            ));
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                let accepted = registration.remove_pending().unwrap_or(false);
+                return Err(classify_failure(
+                    accepted,
+                    "writer task closed before accepting subscription request",
+                ));
+            }
+            Err(_) => {
+                let _ = registration.remove_pending();
+                return Err(CallError::not_sent(
+                    "subscription deadline elapsed waiting for writer capacity",
+                ));
+            }
         }
 
         registration.disarm();
@@ -2075,7 +2138,7 @@ struct RequestSend {
     body: Vec<u8>,
     priority: Priority,
     admission_class: AdmissionClass,
-    timeout: Duration,
+    deadline: Instant,
     retain_late_route_open: bool,
 }
 
@@ -2087,6 +2150,7 @@ struct SubscriptionSend {
     priority: Priority,
     admission_class: AdmissionClass,
     event_buffer: usize,
+    deadline: Instant,
     permit: OwnedSemaphorePermit,
 }
 
@@ -2898,17 +2962,6 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
     }
 }
 
-fn remaining_duration(deadline: Instant) -> Result<Duration, CallError> {
-    let now = Instant::now();
-    if now >= deadline {
-        Err(CallError::not_sent(
-            "call deadline elapsed before request was sent",
-        ))
-    } else {
-        Ok(deadline - now)
-    }
-}
-
 fn is_retryable_route_open_code(code: &str) -> bool {
     matches!(
         code,
@@ -3287,7 +3340,7 @@ mod tests {
                 body: b"request".to_vec(),
                 priority: Priority::Interactive,
                 admission_class: AdmissionClass::Normal,
-                timeout: Duration::from_millis(10),
+                deadline: Instant::now() + Duration::from_millis(10),
                 retain_late_route_open: false,
             })
             .await
@@ -3403,7 +3456,7 @@ mod tests {
                     body: Vec::new(),
                     priority: Priority::Interactive,
                     admission_class: AdmissionClass::Normal,
-                    timeout: Duration::from_secs(1),
+                    deadline: Instant::now() + Duration::from_secs(1),
                     retain_late_route_open: false,
                 })
                 .await
@@ -3421,7 +3474,7 @@ mod tests {
                 body: Vec::new(),
                 priority: Priority::Interactive,
                 admission_class: AdmissionClass::Normal,
-                timeout: Duration::from_millis(10),
+                deadline: Instant::now() + Duration::from_millis(10),
                 retain_late_route_open: false,
             })
             .await
@@ -3446,15 +3499,26 @@ mod tests {
             harness: "test".to_string(),
             session: "deadline".to_string(),
         };
-        let opts = CallOptions {
-            timeout: Duration::from_millis(25),
-            consumer_identity: Some(ConsumerIdentity {
-                module_id: "caller".to_string(),
-                launch_nonce: "nonce".to_string(),
-            }),
+        let consumer_identity = Some(ConsumerIdentity {
+            module_id: "caller".to_string(),
+            launch_nonce: "nonce".to_string(),
+        });
+        let first_opts = CallOptions {
+            timeout: Duration::from_secs(1),
+            consumer_identity: consumer_identity.clone(),
             ..CallOptions::default()
         };
-        let key = RouteKey::new(&target, &identity, opts.consumer_identity.as_ref(), None);
+        let second_opts = CallOptions {
+            timeout: Duration::from_millis(25),
+            consumer_identity,
+            ..CallOptions::default()
+        };
+        let key = RouteKey::new(
+            &target,
+            &identity,
+            first_opts.consumer_identity.as_ref(),
+            None,
+        );
         let handle = RouteHandle::new(5, 3, 1);
         {
             let mut inner = shared.lock_inner();
@@ -3464,18 +3528,224 @@ mod tests {
                 key,
                 RouteState {
                     handle,
-                    sem: Arc::new(Semaphore::new(0)),
+                    sem: Arc::new(Semaphore::new(1)),
                 },
             );
         }
-        let consumer = SubcConsumer { shared };
-        let started = Instant::now();
-        let result = consumer
-            .call(target, identity, Vec::new(), opts)
+
+        let first = tokio::spawn({
+            let consumer = SubcConsumer {
+                shared: Arc::clone(&shared),
+            };
+            let target = target.clone();
+            let identity = identity.clone();
+            async move {
+                consumer
+                    .call(target, identity, b"first".to_vec(), first_opts)
+                    .await
+            }
+        });
+        let first_frame = rx
+            .recv()
             .await
-            .unwrap_err();
+            .expect("the first request should enter the fake daemon queue");
+        assert_eq!(first_frame.frame.header.ty, FrameType::Request);
+        assert_eq!(first_frame.frame.body, b"first");
+        assert!(shared.mark_pending_accepted(
+            first_frame
+                .pending
+                .expect("request commands retain their pending key"),
+        ));
+
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            consumer.call(target, identity, b"second".to_vec(), second_opts),
+        )
+        .await
+        .expect("a flow-controlled call must finish at its own deadline")
+        .unwrap_err();
         assert!(matches!(result, CallError::NotSent(_)));
-        assert!(started.elapsed() < Duration::from_millis(250));
-        assert!(rx.try_recv().is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "the timed-out second request must not reach the fake daemon"
+        );
+
+        first.abort();
+        let _ = first.await;
+    }
+
+    #[tokio::test]
+    async fn route_open_waiter_deadline_is_not_sent_without_writing() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(4);
+        let target = RouteTarget::ToolProvider {
+            module_id: "single-flight".to_string(),
+        };
+        let identity = BindIdentity {
+            project_root: PathBuf::from("/tmp/project"),
+            harness: "test".to_string(),
+            session: "route-open".to_string(),
+        };
+        let opts = CallOptions {
+            timeout: Duration::from_millis(25),
+            consumer_identity: Some(ConsumerIdentity {
+                module_id: "caller".to_string(),
+                launch_nonce: "nonce".to_string(),
+            }),
+            ..CallOptions::default()
+        };
+        let key = RouteKey::new(&target, &identity, opts.consumer_identity.as_ref(), None);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.openings.insert(
+                key,
+                Opening {
+                    waiters: Vec::new(),
+                    closed: false,
+                },
+            );
+        }
+
+        let consumer = SubcConsumer { shared };
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            consumer.open_route(target, identity, opts),
+        )
+        .await
+        .expect("a route.open waiter must finish at its own deadline")
+        .unwrap_err();
+        assert!(matches!(result, CallError::NotSent(_)));
+        assert!(
+            rx.try_recv().is_err(),
+            "a timed-out route.open waiter must not write a control frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_poll_deadline_bounds_writer_capacity() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(1);
+        let handle = RouteHandle::new(8, 4, 1);
+        writer
+            .try_send(WriteCommand {
+                frame: response_frame(0, 0, 99, Vec::new()),
+                pending: None,
+            })
+            .expect("the fake daemon queue should accept its filler frame");
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(handle.channel, handle);
+        }
+
+        let consumer = SubcConsumer { shared };
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            consumer.poll_route(&handle, PollKind::Liveness, Duration::from_millis(25)),
+        )
+        .await
+        .expect("a control request must finish at its own deadline")
+        .unwrap_err();
+        assert!(matches!(result, CallError::NotSent(_)));
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("the filler must still be the only queued frame")
+                .frame
+                .header
+                .corr,
+            99
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the timed-out control request must not reach the fake daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_deadline_bounds_writer_capacity() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(1);
+        let handle = RouteHandle::new(9, 2, 1);
+        let route_sem = Arc::new(Semaphore::new(1));
+        writer
+            .try_send(WriteCommand {
+                frame: response_frame(0, 0, 100, Vec::new()),
+                pending: None,
+            })
+            .expect("the fake daemon queue should accept its filler frame");
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(handle.channel, handle);
+            inner.routes.insert(
+                RouteKey::new(
+                    &RouteTarget::ToolProvider {
+                        module_id: "subscriptions".to_string(),
+                    },
+                    &BindIdentity {
+                        project_root: PathBuf::from("/tmp/project"),
+                        harness: "test".to_string(),
+                        session: "subscription".to_string(),
+                    },
+                    None,
+                    None,
+                ),
+                RouteState {
+                    handle,
+                    sem: Arc::clone(&route_sem),
+                },
+            );
+        }
+
+        let consumer = SubcConsumer { shared };
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            consumer.subscribe_route(
+                &handle,
+                b"subscribe".to_vec(),
+                SubscribeOptions {
+                    route_open_timeout: Duration::from_millis(25),
+                    ..SubscribeOptions::default()
+                },
+            ),
+        )
+        .await
+        .expect("a subscription must finish at its route-open deadline");
+        let result = match result {
+            Ok(_) => panic!("a subscription blocked before writing must time out"),
+            Err(err) => err,
+        };
+        assert!(matches!(result, CallError::NotSent(_)));
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("the filler must still be the only queued frame")
+                .frame
+                .header
+                .corr,
+            100
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the timed-out subscription must not reach the fake daemon"
+        );
+        assert!(
+            route_sem.try_acquire().is_ok(),
+            "a pre-write subscription timeout must release its route credit"
+        );
     }
 }

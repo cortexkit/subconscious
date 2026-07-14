@@ -16,7 +16,7 @@ pub use auth::{
     WATCHDOG_CLIENT_ROLE,
 };
 pub use connection_file::{
-    generate_daemon_id, generate_key, read, write_atomic, ConnectionFileError, ConnectionInfo,
-    Endpoint, DAEMON_ID_LEN, KEY_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
+    generate_daemon_id, generate_key, read, read_for_client, write_atomic, ConnectionFileError,
+    ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
 };
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};

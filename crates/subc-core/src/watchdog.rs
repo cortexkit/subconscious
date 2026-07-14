@@ -302,7 +302,7 @@ impl DaemonSelfWatchdog {
     }
 
     fn verify_connection_file(&self) -> Result<(), WatchdogTickError> {
-        let file_info = connection_file::read(&self.connection_file_path)
+        let file_info = connection_file::read_for_client(&self.connection_file_path)
             .map_err(|err| map_connection_file_error(&self.connection_file_path, err))?;
 
         let live_port = self
@@ -331,6 +331,12 @@ impl DaemonSelfWatchdog {
         }
         if file_info.key != self.live_connection_info.key {
             divergences.push("key".to_owned());
+        }
+        if file_info.wire_version != self.live_connection_info.wire_version {
+            divergences.push(format!(
+                "wire_version (live={:?}, file={:?})",
+                self.live_connection_info.wire_version, file_info.wire_version
+            ));
         }
 
         if divergences.is_empty() {
@@ -390,6 +396,12 @@ fn map_connection_file_error(path: &Path, err: ConnectionFileError) -> WatchdogT
             "connection file {} schema mismatch: file={}, supported={}",
             path.display(),
             schema,
+            supported
+        ),
+        ConnectionFileError::WireVersionMismatch { file, supported } => format!(
+            "connection file {} wire version mismatch: file={}, supported={}; the binary must be upgraded",
+            path.display(),
+            file,
             supported
         ),
         ConnectionFileError::Invalid { reason } => {

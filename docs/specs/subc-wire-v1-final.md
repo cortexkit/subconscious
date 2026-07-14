@@ -326,6 +326,34 @@ reservation's) epoch — the carrying types (`GoodbyeTarget`, `RouterError`
 paths, `PendingRouteBindRelay`) gain epoch fields so no synthesized frame
 ever goes out unstamped.
 
+### 3.3.0 RouteBind on an installed channel: implicit-replace on higher epoch
+
+The daemon never re-issues `RouteBind` on a LIVE channel — the allocator
+skips channels present in the live map or the pending-reservation map, so a
+slot is reallocated only after its binding is released. But a provider
+endpoint can still legitimately receive a `RouteBind` for a channel it
+believes installed, because the daemon→module route-gone GOODBYE is
+best-effort (dropped on module egress backpressure by the co-tenant
+protection policy): the client releases the route, the daemon frees the
+slot without the module learning, and a later `route.open` reuses the
+channel with a freshly minted epoch. Per-slot epochs are persistent and
+strictly monotonic (allocation mints `last_slot_epoch + 1`; a slot at
+`u32::MAX` is retired, never reused), so the daemon never repeats or lowers
+an epoch for one `(endpoint, channel)`.
+
+Normative endpoint rule (all provider/serve loops, SDK-carried and
+hand-rolled alike): a `RouteBind` whose channel is currently installed is
+handled by epoch comparison —
+
+- **strictly higher epoch → implicit replace**: the stale install is
+  unreachable by construction (the daemon freed that binding); tear it down
+  locally (no GOODBYE emission for it) and process the bind normally.
+- **equal or lower epoch → reject** the bind (protocol violation; the
+  daemon never does this).
+
+Rejecting all binds on installed channels is a defect: one dropped
+route-gone GOODBYE would wedge the slot forever on that endpoint.
+
 ### 3.3.1 Route-referencing channel-0 operations (gate finding 3)
 
 Any channel-0 payload that references a route by channel number must carry

@@ -1591,7 +1591,13 @@ fn remove_module_connection_locked(
     inner.draining_endpoints.remove(&endpoint);
     let module_id = inner.module_id_by_endpoint.remove(&endpoint);
     if let Some(module_id) = module_id.as_ref() {
-        inner.modules_by_id.remove(module_id);
+        if inner
+            .modules_by_id
+            .get(module_id)
+            .is_some_and(|module| module.endpoint == endpoint)
+        {
+            inner.modules_by_id.remove(module_id);
+        }
     }
     inner.endpoint_by_connection.remove(&endpoint.connection_id);
     inner.next_module_channel.remove(&endpoint);
@@ -1959,6 +1965,58 @@ mod tests {
             .unwrap()
             .next_client_channel
             .contains_key(&client));
+    }
+
+    #[test]
+    fn stale_module_cleanup_preserves_fast_reconnect_successor() {
+        let forwarding = ForwardingTable::default();
+        let module_id = "fast-reconnect-provider";
+        let first_connection = ConnectionId::new(70);
+        let second_connection = ConnectionId::new(80);
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let first_endpoint = forwarding
+            .register_module_connection(
+                first_connection,
+                module_id.to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(first_tx),
+            )
+            .unwrap();
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let second_endpoint = forwarding
+            .register_module_connection(
+                second_connection,
+                module_id.to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(second_tx),
+            )
+            .unwrap();
+        assert_ne!(first_endpoint, second_endpoint);
+
+        let released = forwarding.cleanup_connection(first_connection).unwrap();
+
+        assert!(released.is_empty());
+        assert_eq!(
+            forwarding
+                .inner
+                .read()
+                .unwrap()
+                .modules_by_id
+                .get(module_id)
+                .map(|module| module.endpoint),
+            Some(second_endpoint)
+        );
+        assert!(forwarding.has_live_module_connection(module_id).unwrap());
+        let control_rpc = forwarding
+            .begin_module_control_rpc_for(
+                module_id,
+                "health.check",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(control_rpc.endpoint, second_endpoint);
     }
 
     fn route_fixture(

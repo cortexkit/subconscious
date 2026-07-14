@@ -34,6 +34,16 @@ const SERVER_NONCE = Uint8Array.from(Array.from({ length: 32 }, (_, i) => i + 1)
 const CONTROL_FLAGS = buildFlags(false, Priority.Passive, false);
 const RECONNECT_BACKOFF = { baseMs: 5, capMs: 5, maxAttempts: 1 };
 
+type ProviderReconnectInternals = {
+  sock: unknown;
+  generation: number;
+  handleUnexpectedDrop(sock: unknown, generation: number, cause: Error): void;
+};
+
+function reconnectInternals(provider: SubcProvider): ProviderReconnectInternals {
+  return provider as unknown as ProviderReconnectInternals;
+}
+
 const tempDirs: string[] = [];
 const scriptedDaemons: ScriptedProviderDaemon[] = [];
 
@@ -330,6 +340,133 @@ describe("SubcProvider managed reconnect", () => {
 
     expect(oldWrites).toEqual([]);
     expect(newWrites).toEqual([]);
+  });
+
+  test("supersedes a stalled reconnect after a later drop and re-registers", async () => {
+    const daemon = await ScriptedProviderDaemon.start(["ack", "drop", "ack"]);
+    const dir = trackedTempDir("subc-provider-stalled-reconnect-");
+    const connFile = writeConnectionFile(dir, daemon.port);
+    const sleep = createManualSleep();
+    const provider = await SubcProvider.connect({
+      connectionFile: connFile,
+      manifest: managementSurfaceManifest({ moduleId: "stalled-reconnect-provider", operations: ["echo"] }),
+      handler: async (_routeChannel, body) => body,
+      reconnectBackoff: RECONNECT_BACKOFF,
+      sleep: sleep.sleep,
+    });
+
+    try {
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(2);
+      await waitForCondition(
+        () => sleep.calls.includes(RECONNECT_BACKOFF.baseMs),
+        "stalled reconnect backoff",
+      );
+
+      const internals = reconnectInternals(provider);
+      internals.handleUnexpectedDrop(
+        internals.sock,
+        internals.generation,
+        new Error("second daemon restart"),
+      );
+
+      await daemon.waitForHelloCount(3);
+      await waitForCondition(() => provider.currentEpoch() === 2, "provider epoch after superseding reconnect");
+      expect(daemon.helloCount).toBe(3);
+    } finally {
+      sleep.resolveAll();
+      await provider.close();
+    }
+  });
+
+  test("single-flights duplicate drops for the same generation", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const dir = trackedTempDir("subc-provider-single-flight-");
+    const connFile = writeConnectionFile(dir, daemon.port);
+    const provider = await SubcProvider.connect({
+      connectionFile: connFile,
+      manifest: managementSurfaceManifest({ moduleId: "single-flight-provider", operations: ["echo"] }),
+      handler: async (_routeChannel, body) => body,
+      reconnectBackoff: RECONNECT_BACKOFF,
+    });
+
+    try {
+      const internals = reconnectInternals(provider);
+      const { sock, generation } = internals;
+      internals.handleUnexpectedDrop(sock, generation, new Error("first drop"));
+      internals.handleUnexpectedDrop(sock, generation, new Error("duplicate drop"));
+
+      await daemon.waitForHelloCount(2);
+      await waitForCondition(() => provider.currentEpoch() === 2, "provider epoch after one re-registration");
+      expect(daemon.helloCount).toBe(2);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("orders a superseding reconnect after down and ignores stale reconnect events", async () => {
+    const daemon = await ScriptedProviderDaemon.start(["ack", "drop", "ack"]);
+    const dir = trackedTempDir("subc-provider-reconnect-events-");
+    const connFile = writeConnectionFile(dir, daemon.port);
+    const sleep = createManualSleep();
+    const events: ProviderConnectionState[] = [];
+    const provider = await SubcProvider.connect({
+      connectionFile: connFile,
+      manifest: managementSurfaceManifest({ moduleId: "reconnect-events-provider", operations: ["echo"] }),
+      handler: async (_routeChannel, body) => body,
+      reconnectBackoff: RECONNECT_BACKOFF,
+      sleep: sleep.sleep,
+      onConnectionState: (event) => {
+        events.push(event);
+      },
+    });
+
+    try {
+      await waitForCondition(() => events.some((event) => event.state === "connected"), "connected event");
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(2);
+      await waitForCondition(
+        () => sleep.calls.includes(RECONNECT_BACKOFF.baseMs),
+        "stalled reconnect backoff",
+      );
+
+      const internals = reconnectInternals(provider);
+      internals.handleUnexpectedDrop(
+        internals.sock,
+        internals.generation,
+        new Error("second daemon restart"),
+      );
+
+      await daemon.waitForHelloCount(3);
+      await waitForCondition(() => provider.currentEpoch() === 2, "provider epoch after superseding reconnect");
+      await waitForCondition(
+        () => events.filter((event) => event.state === "reconnecting").length === 2,
+        "reconnecting events",
+      );
+      expect(events.map((event) => event.state)).toEqual([
+        "connected",
+        "down",
+        "reconnecting",
+        "down",
+        "reconnecting",
+      ]);
+
+      const down = events.filter(
+        (event): event is Extract<ProviderConnectionState, { state: "down" }> => event.state === "down",
+      );
+      expect(down[1]?.cause.message).toBe("second daemon restart");
+
+      sleep.resolveAll();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(events.filter((event) => event.state === "reconnecting")).toEqual([
+        { state: "reconnecting", attempt: 1 },
+        { state: "reconnecting", attempt: 1 },
+      ]);
+      expect(daemon.helloCount).toBe(3);
+    } finally {
+      sleep.resolveAll();
+      await provider.close();
+    }
   });
 
   test("coalesces restored events while currentEpoch advances for each completed re-registration", async () => {
@@ -688,7 +825,7 @@ class SocketReader {
 }
 
 
-type HelloResult = "ack" | { code: string; message: string };
+type HelloResult = "ack" | "drop" | { code: string; message: string };
 
 class ScriptedProviderDaemon {
   readonly sockets = new Set<Socket>();
@@ -759,6 +896,12 @@ class ScriptedProviderDaemon {
       );
       this.recordHello();
       await this.drainUntilClose(reader);
+      return;
+    }
+
+    if (result === "drop") {
+      this.recordHello();
+      socket.destroy();
       return;
     }
 

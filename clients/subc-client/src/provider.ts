@@ -312,6 +312,13 @@ interface OpenedProviderConnection {
   ack: ModuleHelloAckBody;
 }
 
+interface ReconnectCycle {
+  readonly generation: number;
+  socket: SubcSocket | null;
+  socketDied: boolean;
+  superseded: boolean;
+}
+
 export interface ModuleHelloAckBody {
   negotiated_ver: number;
   subc_ops: string[];
@@ -435,10 +442,10 @@ export class SubcProvider {
   private nextCorr = 1n;
   private ingressEpochDropCount = 0;
   private readonly requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
-  private reconnecting: Promise<void> | null = null;
+  private reconnecting: ReconnectCycle | null = null;
   private generation = 1;
   private connectionEpoch = 1;
-  private stateQueue: ProviderConnectionState[] = [];
+  private stateQueue: Array<{ event: ProviderConnectionState; generation?: number; reconnect?: ReconnectCycle }> = [];
   private drainingStateQueue = false;
   private restoredDebounceToken = 0;
 
@@ -587,12 +594,16 @@ export class SubcProvider {
     await this.closed;
   }
 
-  private static async openConnection(opts: NormalizedSubcProviderConnectOptions): Promise<OpenedProviderConnection> {
+  private static async openConnection(
+    opts: NormalizedSubcProviderConnectOptions,
+    onSocket?: (sock: SubcSocket) => void,
+  ): Promise<OpenedProviderConnection> {
     const conn = await readConnectionFile(opts.connectionFile);
     const deadline = Date.now() + (opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     const endpoint = conn.endpoints[0]!;
     const sock = await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
     try {
+      onSocket?.(sock);
       await authenticateClient(sock, conn, deadline);
       await sendFrame(sock, buildHelloFrame(opts));
       const ack = await expectHelloAck(sock, deadline);
@@ -998,43 +1009,79 @@ export class SubcProvider {
   }
 
   private handleUnexpectedDrop(sock: SubcSocket, generation: number, cause: Error): void {
+    if (this.closeStarted || this.sock !== sock || this.generation !== generation) return;
     this.cancelRestoredDebounce();
     this.abortGeneration(generation);
     this.generation += 1;
     sock.close();
-    this.enqueueConnectionState({ state: "down", cause });
-    this.scheduleReconnectAfterDrop(cause);
+    this.scheduleReconnectAfterDrop(cause, this.generation, sock);
   }
 
-  private scheduleReconnectAfterDrop(trigger: unknown): void {
-    if (this.closeStarted || this.reconnecting) return;
-    const promise = this.reconnectWithRetry(trigger)
+  private scheduleReconnectAfterDrop(cause: Error, generation: number, droppedSocket: SubcSocket): void {
+    if (this.closeStarted) return;
+
+    const previous = this.reconnecting;
+    if (previous) {
+      if (!this.shouldSupersedeReconnect(previous, generation, droppedSocket)) return;
+      previous.superseded = true;
+      previous.socket?.close();
+    }
+
+    const cycle: ReconnectCycle = {
+      generation,
+      socket: null,
+      socketDied: false,
+      superseded: false,
+    };
+    this.reconnecting = cycle;
+    this.enqueueConnectionState({ state: "down", cause });
+    void this.reconnectWithRetry(cycle)
       .catch((err) => {
-        if (!this.closeStarted) this.failFatal(err instanceof Error ? err : new SubcProviderError(String(err)));
+        if (this.isCurrentReconnect(cycle) && !this.closeStarted) {
+          this.failFatal(err instanceof Error ? err : new SubcProviderError(String(err)));
+        }
       })
       .finally(() => {
-        if (this.reconnecting === promise) this.reconnecting = null;
+        if (this.isCurrentReconnect(cycle)) this.reconnecting = null;
       });
-    this.reconnecting = promise;
   }
 
-  private async reconnectWithRetry(_trigger: unknown): Promise<void> {
+  private async reconnectWithRetry(cycle: ReconnectCycle): Promise<void> {
     let attempt = 0;
     let delay = this.opts.reconnectBackoff.baseMs;
 
     for (;;) {
+      if (!this.isCurrentReconnect(cycle)) return;
       if (this.closeStarted) throw new SubcProviderError("provider closed");
+
+      cycle.socket = null;
+      cycle.socketDied = false;
       attempt += 1;
-      this.enqueueConnectionState({ state: "reconnecting", attempt });
+      this.enqueueReconnectState(cycle, attempt);
       try {
-        const opened = await SubcProvider.openConnection(this.opts);
-        if (this.closeStarted) {
+        const opened = await SubcProvider.openConnection(this.opts, (sock) => {
+          if (!this.isCurrentReconnect(cycle)) {
+            sock.close();
+            return;
+          }
+          cycle.socket = sock;
+        });
+        if (!this.isCurrentReconnect(cycle) || this.closeStarted) {
           opened.sock.close();
-          throw new SubcProviderError("provider closed");
+          if (this.closeStarted) throw new SubcProviderError("provider closed");
+          return;
         }
-        this.replaceConnection(opened);
+
+        const epoch = this.replaceConnection(opened, cycle.generation);
+        this.reconnecting = null;
+        if (this.reconnecting !== null) {
+          throw new SubcProviderError("reconnect state must clear before restored", "reconnect_state");
+        }
+        this.scheduleRestored(cycle.generation, epoch);
         return;
       } catch (err) {
+        if (!this.isCurrentReconnect(cycle)) return;
+        if (cycle.socket) cycle.socketDied = true;
         if (this.closeStarted) throw err;
         if (!isProviderReconnectTransient(err)) throw err;
         // Providers retry transient failures indefinitely by design (a module
@@ -1047,7 +1094,20 @@ export class SubcProvider {
     }
   }
 
-    private replaceConnection(opened: OpenedProviderConnection): void {
+  private isCurrentReconnect(cycle: ReconnectCycle): boolean {
+    return !cycle.superseded && this.reconnecting === cycle && this.generation === cycle.generation;
+  }
+
+  private shouldSupersedeReconnect(cycle: ReconnectCycle, generation: number, droppedSocket: SubcSocket): boolean {
+    return cycle.generation < generation || cycle.socketDied || cycle.socket === droppedSocket;
+  }
+
+  private enqueueReconnectState(cycle: ReconnectCycle, attempt: number): void {
+    if (!this.isCurrentReconnect(cycle)) return;
+    this.enqueueConnectionState({ state: "reconnecting", attempt }, cycle.generation, cycle);
+  }
+
+  private replaceConnection(opened: OpenedProviderConnection, generation: number): number {
     this.sock.close();
     this.sock = opened.sock;
     this.currentConn = opened.conn;
@@ -1057,9 +1117,8 @@ export class SubcProvider {
     this.connectionToken = newConnectionToken();
     this.liveRoutes.clear();
     this.nextCorr = 1n;
-    const generation = this.generation;
     void this.readLoop(opened.sock, generation);
-    this.scheduleRestored(generation, this.connectionEpoch);
+    return this.connectionEpoch;
   }
 
   private scheduleRestored(generation: number, epoch: number): void {
@@ -1075,7 +1134,7 @@ export class SubcProvider {
           this.generation === generation &&
           this.connectionEpoch === epoch
         ) {
-          this.enqueueConnectionState({ state: "restored", epoch });
+          this.enqueueConnectionState({ state: "restored", epoch }, generation);
         }
       })
       .catch((err) => {
@@ -1089,9 +1148,9 @@ export class SubcProvider {
     this.restoredDebounceToken += 1;
   }
 
-  private enqueueConnectionState(event: ProviderConnectionState): void {
+  private enqueueConnectionState(event: ProviderConnectionState, generation?: number, reconnect?: ReconnectCycle): void {
     if (!this.opts.onConnectionState) return;
-    this.stateQueue.push(event);
+    this.stateQueue.push({ event, generation, reconnect });
     if (!this.drainingStateQueue) void this.drainConnectionStateQueue();
   }
 
@@ -1100,7 +1159,17 @@ export class SubcProvider {
     this.drainingStateQueue = true;
     try {
       while (this.stateQueue.length > 0) {
-        const event = this.stateQueue[0]!;
+        const queued = this.stateQueue[0]!;
+        if (
+          this.closeStarted ||
+          (queued.generation !== undefined && queued.generation !== this.generation) ||
+          queued.reconnect?.superseded
+        ) {
+          this.stateQueue.shift();
+          continue;
+        }
+
+        const { event } = queued;
         try {
           await this.opts.onConnectionState?.(event);
           this.stateQueue.shift();

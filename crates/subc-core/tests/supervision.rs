@@ -249,6 +249,53 @@ async fn restart_cap_marks_module_failed_without_infinite_loop() {
     assert!(!status.live);
 }
 
+/// `start` (enable on an already-enabled module) must heal a Failed module: the
+/// budget is exhausted, no in-band retry remains, and the operator's start IS the
+/// recovery act. Regression for the 2026-07-14 aft outage, where set_enabled(true)
+/// returned applied=false on the failed module and the only revival was
+/// subc-probe --supervisor-restart from a human terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_enabled_true_revives_a_failed_module_and_resets_budget() {
+    let server = TestServer::start().await;
+    let max_restarts = 2;
+    let supervisor = supervisor(&server, max_restarts, Duration::from_millis(10));
+    let module_id = "fake-aft-failed-revive";
+    let module = supervisor
+        .spawn(stub_spec(
+            &server,
+            module_id,
+            [("FAKE_AFT_CRASH_AFTER_MS", "0")],
+        ))
+        .unwrap();
+
+    let failed = wait_for_status(&module, Duration::from_secs(2), |status| {
+        status.state == ModuleState::Failed
+    })
+    .await;
+    assert_eq!(failed.restart_count, max_restarts);
+
+    // The instant-crash env is still in the spec, so the revived child will crash
+    // again — but the revival itself must be applied (not the old no-op) and must
+    // have reset the budget, observable as the state leaving Failed and the
+    // restart counter dropping below the exhausted value.
+    let applied = module
+        .set_enabled(true)
+        .await
+        .expect("set_enabled must reach the supervision task");
+    assert!(
+        applied,
+        "start on a failed module must apply the revival, not no-op"
+    );
+    let revived = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state != ModuleState::Failed || status.restart_count < max_restarts
+    })
+    .await;
+    assert!(
+        revived.state != ModuleState::Failed || revived.restart_count < max_restarts,
+        "revival must reset the exhausted budget"
+    );
+}
+
 /// A clean child exit of an ENABLED module must not kill the supervision task:
 /// the command channel has to stay open so a later operator restart can revive
 /// the module. Regression for a production wedge where a module that exited 0

@@ -2160,8 +2160,22 @@ async fn set_child_enabled(
     child: &mut Option<Child>,
     enabled: bool,
 ) -> Result<bool, SuperviseError> {
-    let current_enabled = lock_snapshot(snapshot)?.enabled;
-    if current_enabled == enabled {
+    let (current_enabled, current_state) = {
+        let state = lock_snapshot(snapshot)?;
+        (state.enabled, state.state)
+    };
+    // `start` (enable on an already-enabled module) heals TERMINAL states instead
+    // of no-op'ing: a module whose restart budget exhausted (Failed) or that exited
+    // clean (Stopped) has no live process and no other in-band recovery — the
+    // operator's start is the explicit recovery act and resets the budget. Without
+    // this arm the only revival was subc-probe --supervisor-restart in a terminal,
+    // which the 2026-07-14 aft outage proved is a trap when the failed module is
+    // the one providing every agent's shell.
+    let revive_terminal = enabled
+        && current_enabled
+        && child.is_none()
+        && matches!(current_state, ModuleState::Failed | ModuleState::Stopped);
+    if current_enabled == enabled && !revive_terminal {
         return Ok(false);
     }
 

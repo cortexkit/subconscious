@@ -1,6 +1,6 @@
 [package]
 name = "subc-transport"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 publish = true
 description = "subc loopback-TCP + key transport: pre-envelope auth handshake, connection-file discovery, and async envelope frame I/O."

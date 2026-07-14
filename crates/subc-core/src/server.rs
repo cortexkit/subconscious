@@ -20,7 +20,11 @@ use crate::{
 
 pub const CONNECTION_EGRESS_BUFFER: usize = 64;
 pub const DEFAULT_AUTH_DEADLINE: Duration = Duration::from_secs(2);
-pub const DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS: usize = 32;
+// Sized for the restart-herd shape: after a daemon bounce, every live client
+// connection plus all supervised children re-dial within the same second
+// (~120+ observed on the 2026-07-14 fleet). Handshakes are cheap loopback
+// HMAC exchanges; the deadline, not the permit count, is the DoS bound.
+pub const DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS: usize = 256;
 const CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Authentication material and DoS bounds applied before a TCP connection may
@@ -180,13 +184,24 @@ pub async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let permit = match auth.unauthenticated.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let _ = stream.shutdown().await;
-            return Err(ConnectionError::UnauthenticatedCapacity);
-        }
-    };
+    // Over-cap connections WAIT for a handshake slot (bounded by the auth deadline)
+    // instead of being reset. A restart herd — every client and supervised child
+    // re-dialing the fresh daemon at once — otherwise loses supervised modules to
+    // the permit lottery: each reset burns a module restart-budget slot, and a
+    // module that treats auth failure as fatal can exhaust its budget into
+    // state=failed within the boot window (2026-07-14 aft outage). On loopback
+    // with the pre-auth HMAC deadline, a bounded queue is strictly safer than a
+    // reset; the deadline still bounds total pre-auth occupancy per connection.
+    let permit =
+        match tokio::time::timeout(auth.deadline, auth.unauthenticated.clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                let _ = stream.shutdown().await;
+                return Err(ConnectionError::UnauthenticatedCapacity);
+            }
+        };
 
     let authenticated = authenticate_server(
         &mut stream,
@@ -649,9 +664,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_capacity_rejects_second_idle_peer() {
-        let (first_client, first_server_stream) = duplex(512);
-        let (mut second_client, second_server_stream) = duplex(512);
+    async fn over_cap_peer_queues_for_a_slot_and_authenticates_when_one_frees() {
+        // Restart-herd contract: an over-cap pre-auth connection WAITS (bounded by
+        // the auth deadline) instead of being reset. When the slot-holder finishes,
+        // the queued peer must complete a normal handshake — the 2026-07-14 aft
+        // outage was exactly a supervised child being reset out of this lottery.
+        let (mut first_client, first_server_stream) = duplex(2048);
+        let (mut second_client, second_server_stream) = duplex(2048);
         let (auth, conn) = test_auth_with_limit(1);
         let registry = Arc::new(Registry::default());
         let router = Arc::new(Router::with_control_handler(Arc::new(ControlHandler::new(
@@ -669,11 +688,57 @@ mod tests {
             Arc::clone(&router),
             auth.clone(),
         ));
-        let second_err = tokio::time::timeout(Duration::from_secs(1), second_server)
+
+        // The second peer must still be pending (not reset) while the slot is held.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_server.is_finished(),
+            "queued peer must not be reset"
+        );
+
+        // First peer completes its handshake, freeing the slot; the queued second
+        // peer then authenticates normally.
+        authenticate(&mut first_client, &conn).await;
+        authenticate(&mut second_client, &conn).await;
+
+        drop(first_client);
+        drop(second_client);
+        let _ = first_server.await;
+        let _ = second_server.await;
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn over_cap_peer_is_rejected_when_no_slot_frees_within_deadline() {
+        // The deadline stays the DoS bound: if no slot frees, the queued peer is
+        // rejected at the deadline with a closed stream. The slot is held DIRECTLY
+        // (not by another connection) so nothing can free it mid-test — a squatting
+        // connection's own auth deadline would release the slot at exactly the
+        // waiter's timeout, making the outcome racy.
+        let (mut second_client, second_server_stream) = duplex(512);
+        let (auth, conn) = test_auth_with_limit(1);
+        let registry = Arc::new(Registry::default());
+        let router = Arc::new(Router::with_control_handler(Arc::new(ControlHandler::new(
+            Arc::clone(&registry),
+        ))));
+
+        let held_slot = auth
+            .unauthenticated
+            .clone()
+            .try_acquire_owned()
+            .expect("sole pre-auth slot");
+
+        let second_server = tokio::spawn(handle_connection(
+            second_server_stream,
+            Arc::clone(&router),
+            auth.clone(),
+        ));
+        let second_err = tokio::time::timeout(TEST_DEADLINE * 2, second_server)
             .await
-            .expect("capacity reject should settle promptly")
+            .expect("capacity reject should settle at the deadline")
             .expect("second connection task should not panic")
-            .expect_err("second unauthenticated connection must be rejected");
+            .expect_err("queued peer must be rejected when no slot frees");
+        drop(held_slot);
         assert!(matches!(
             second_err,
             ConnectionError::UnauthenticatedCapacity
@@ -684,14 +749,6 @@ mod tests {
             0,
             "capacity-rejected peer should observe a closed stream"
         );
-        assert_eq!(registry.active_registration_count().unwrap(), 0);
-
-        drop(first_client);
-        let first_err = first_server
-            .await
-            .expect("first connection task should not panic")
-            .expect_err("idle pre-auth peer should fail auth when closed");
-        assert!(matches!(first_err, ConnectionError::Auth(_)));
         assert_eq!(registry.active_registration_count().unwrap(), 0);
 
         let (mut authed_client, authed_server_stream) = duplex(2048);

@@ -628,7 +628,7 @@ public final class SubcClient {
 // Decode a subscribe StreamData body into a renderable SessionEvent. Two shapes:
 //   control: { kind:"control", cursor:{wal_seq, sub_index}, unit:{type,...} }  (durable)
 //   display: { kind:"display", event:{type:"text_delta", delta, ...} }         (live, lossy)
-private func decodeStreamEvent(_ body: Data) throws -> SessionEvent? {
+func decodeStreamEvent(_ body: Data) throws -> SessionEvent? {
     guard let v = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
         throw SubcError(message: "subscribe event not a JSON object")
     }
@@ -637,8 +637,24 @@ private func decodeStreamEvent(_ body: Data) throws -> SessionEvent? {
     }
     guard (v["kind"] as? String) == "control" else { return nil }
     let cursor = v["cursor"] as? [String: Any]
-    let walSeq = (cursor?["wal_seq"] as? Int).map { UInt64($0) } ?? 0
-    let subIndex = (cursor?["sub_index"] as? Int).map { UInt32($0) } ?? 0
+    let walSeq: UInt64
+    if let rawWalSeq = cursor?["wal_seq"] {
+        guard let value = rawWalSeq as? Int, let decoded = UInt64(exactly: value) else {
+            throw SubcError(message: "control event cursor.wal_seq must be a nonnegative UInt64")
+        }
+        walSeq = decoded
+    } else {
+        walSeq = 0
+    }
+    let subIndex: UInt32
+    if let rawSubIndex = cursor?["sub_index"] {
+        guard let value = rawSubIndex as? Int, let decoded = UInt32(exactly: value) else {
+            throw SubcError(message: "control event cursor.sub_index must be a nonnegative UInt32")
+        }
+        subIndex = decoded
+    } else {
+        subIndex = 0
+    }
     guard let unit = v["unit"] as? [String: Any], let type = unit["type"] as? String else {
         throw SubcError(message: "control event missing unit.type")
     }

@@ -106,6 +106,48 @@ async fn set_enabled_current_value_returns_false_without_state_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_spawn_during_enable_allows_a_later_retry() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let missing_program = std::env::temp_dir().join(format!(
+        "subc-missing-enable-program-{}",
+        std::process::id()
+    ));
+    assert!(!missing_program.exists());
+    let module = supervisor
+        .supervise_configured(
+            ModuleSpec {
+                module_id: "missing-enable-program".to_string(),
+                program: missing_program,
+                args: Vec::new(),
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            },
+            false,
+        )
+        .unwrap();
+
+    let first = module.set_enabled(true).await;
+    let failed = module.status().unwrap();
+    let second = module.set_enabled(true).await;
+
+    assert!(matches!(first, Err(SuperviseError::Spawn { .. })));
+    assert_eq!(
+        failed.state,
+        ModuleState::Failed,
+        "failed enable must leave a retryable state; second enable returned {second:?}"
+    );
+    assert!(failed.enabled);
+    assert!(!failed.process_alive);
+    assert_eq!(failed.pid, None);
+    assert!(
+        matches!(second, Err(SuperviseError::Spawn { .. })),
+        "second enable must retry spawning instead of returning {second:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reload_without_forwarding_table_returns_reload_unavailable_without_state_mutation() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));

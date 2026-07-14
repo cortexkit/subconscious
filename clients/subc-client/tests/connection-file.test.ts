@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ConnectionFileError, readConnectionFile } from "../src/connection-file.js";
+import { PROTOCOL_VERSION } from "../src/envelope.js";
 
 const dirs: string[] = [];
 
@@ -33,13 +34,28 @@ afterEach(() => {
 });
 
 describe("connection file reader", () => {
-  test("reads and validates an owner-only file", async () => {
+  test("accepts a file without wire_version", async () => {
     const info = await readConnectionFile(tempFile(validInfo()));
     expect(info.schema).toBe(1);
     expect(info.endpoints[0]).toEqual({ host: "127.0.0.1", port: 8799 });
     expect(info.key.length).toBe(32);
     expect(info.daemonId.length).toBe(16);
     expect(info.daemonVer).toBe("subc-test");
+  });
+
+  test("accepts a matching wire_version", async () => {
+    await expect(readConnectionFile(tempFile(validInfo({ wire_version: PROTOCOL_VERSION })))).resolves.toMatchObject({
+      schema: 1,
+    });
+  });
+
+  test("rejects a mismatched wire_version with upgrade guidance", async () => {
+    const wireVersion = PROTOCOL_VERSION + 1;
+    await expect(readConnectionFile(tempFile(validInfo({ wire_version: wireVersion })))).rejects.toThrow(
+      new RegExp(
+        `connection file wire_version ${wireVersion} but this client speaks ${PROTOCOL_VERSION}; the client library must be upgraded`,
+      ),
+    );
   });
 
   test.if(process.platform !== "win32")("rejects a group/world-readable file", async () => {

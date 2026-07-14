@@ -6,6 +6,8 @@
 
 import { promises as fs } from "node:fs";
 
+import { PROTOCOL_VERSION } from "./envelope.js";
+
 export const SCHEMA_VERSION = 1;
 export const MIN_KEY_LEN = 32;
 export const DAEMON_ID_LEN = 16;
@@ -82,6 +84,13 @@ export async function readConnectionFile(path: string): Promise<ConnectionInfo> 
     parsed = JSON.parse(raw) as Record<string, unknown>;
   } catch (err) {
     throw new ConnectionFileError(`connection file JSON read failed for ${path}: ${String(err)}`);
+  }
+
+  const wireVersion = parsed.wire_version;
+  if (wireVersion !== undefined && wireVersion !== PROTOCOL_VERSION) {
+    throw new ConnectionFileError(
+      `connection file wire_version ${String(wireVersion)} but this client speaks ${PROTOCOL_VERSION}; the client library must be upgraded`,
+    );
   }
 
   const endpointsRaw = parsed.endpoints;

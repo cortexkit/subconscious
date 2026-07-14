@@ -338,6 +338,9 @@ impl DaemonSelfWatchdog {
                 self.live_connection_info.wire_version, file_info.wire_version
             ));
         }
+        if file_info.daemon_id != self.live_connection_info.daemon_id {
+            divergences.push("daemon_id".to_owned());
+        }
 
         if divergences.is_empty() {
             Ok(())

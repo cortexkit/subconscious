@@ -99,6 +99,8 @@ pub enum ClientControlResponse {
         subc_ops: Vec<String>,
         capabilities: Vec<String>,
         connected_clients: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        counters: Option<serde_json::Value>,
     },
     #[serde(rename = "catalog.list")]
     CatalogList {

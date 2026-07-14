@@ -16,10 +16,10 @@ use subc_core::{
     read_frame, serve_listener, write_frame, ControlHandler, DaemonSelfWatchdog,
     DaemonSelfWatchdogConfig, Frame, Registry, Router, ServerAuth,
 };
-use subc_protocol::{Flags, FrameType, Priority};
+use subc_protocol::{Flags, FrameType, Priority, PROTOCOL_VERSION};
 use subc_transport::{
-    generate_daemon_id, generate_key, read as read_connection_file, write_atomic, ConnectionInfo,
-    Endpoint, SCHEMA_VERSION,
+    generate_daemon_id, generate_key, read_for_client as read_connection_file, write_atomic,
+    ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -62,6 +62,41 @@ async fn watchdog_tick_against_live_daemon_succeeds_silently() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn watchdog_detects_wire_version_divergence() {
+    let temp_dir = unique_temp_dir("watchdog-wire-version");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let connection_file_path = temp_dir.join("subc-conn.json");
+    let port = reserve_free_port().await;
+    let live_info = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
+        endpoints: vec![Endpoint {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port,
+        }],
+        key: generate_key().unwrap(),
+        daemon_id: generate_daemon_id().unwrap(),
+        pid: process::id(),
+        daemon_ver: "test-subc".to_owned(),
+    };
+    let mut file_info = live_info.clone();
+    file_info.wire_version = None;
+    write_atomic(&connection_file_path, &file_info).unwrap();
+    let server_task = start_fixed_port_server(port, &live_info).await;
+    let watchdog = DaemonSelfWatchdog::new(live_info, &connection_file_path);
+
+    let err = watchdog
+        .run_once()
+        .await
+        .expect_err("missing wire_version must diverge from a daemon-published file");
+    assert_eq!(err.stage(), subc_core::WatchdogStage::ConnectionFile);
+    assert!(err.to_string().contains("wire_version"), "error: {err}");
+
+    server_task.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn bootstrap_watchdog_logs_connection_file_divergence() {
     let capture = LogCapture::default();
     let _guard = tracing::subscriber::set_default(capture.subscriber());
@@ -101,6 +136,7 @@ async fn watchdog_failed_tick_logs_stage_and_recovery_streak() {
     let port = reserve_free_port().await;
     let live_info = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: None,
         endpoints: vec![Endpoint {
             host: Ipv4Addr::LOCALHOST.to_string(),
             port,

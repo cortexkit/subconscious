@@ -9,9 +9,9 @@ use std::{
 use serde::{de::DeserializeOwned, Serialize};
 use subc_transport::{
     authenticate_client, authenticate_server, compute_proof, generate_daemon_id, generate_key,
-    read as read_connection_file, write_atomic, AuthError, AuthStage, ClientAuth, ClientHello,
-    ConnectionInfo, Endpoint, ServerProof, CLIENT_AUTH_DOMAIN, MAX_AUTH_MESSAGE_LEN, NONCE_LEN,
-    SCHEMA_VERSION, SERVER_PROOF_DOMAIN,
+    read_for_client as read_connection_file, write_atomic, AuthError, AuthStage, ClientAuth,
+    ClientHello, ConnectionInfo, Endpoint, ServerProof, CLIENT_AUTH_DOMAIN, MAX_AUTH_MESSAGE_LEN,
+    NONCE_LEN, SCHEMA_VERSION, SERVER_PROOF_DOMAIN,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -416,6 +416,7 @@ async fn listener_with_connection_file(
 fn make_connection_info(port: u16, key: Vec<u8>, daemon_id: [u8; 16]) -> ConnectionInfo {
     ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: None,
         endpoints: vec![Endpoint {
             host: "127.0.0.1".to_owned(),
             port,

@@ -526,6 +526,7 @@ mod tests {
         let daemon_id = [0x24; 16];
         let conn = ConnectionInfo {
             schema: SCHEMA_VERSION,
+            wire_version: None,
             endpoints: vec![Endpoint {
                 host: "127.0.0.1".to_owned(),
                 port: 1,

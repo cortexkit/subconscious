@@ -36,4 +36,4 @@ subc-protocol = { path = "../subc-protocol" }
 subc-transport = { path = "../subc-transport" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

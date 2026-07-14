@@ -73,7 +73,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
     let args = parse_args(argv)?;
 
     // 1. Discover + authenticate (client half of the HMAC handshake).
-    let conn = connection_file::read(&args.connection_file).map_err(|source| {
+    let conn = connection_file::read_for_client(&args.connection_file).map_err(|source| {
         ProbeError::ConnectionFile {
             path: args.connection_file.clone(),
             source: source.to_string(),

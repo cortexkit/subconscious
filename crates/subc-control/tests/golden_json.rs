@@ -164,6 +164,25 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 subc_ops: thin_core_ops(),
                 capabilities: vec!["manifest_registration_v1".to_string()],
                 connected_clients: 2,
+                counters: None,
+            },
+        ),
+        (
+            "client_control_response_server_describe_with_counters",
+            ClientControlResponse::ServerDescribe {
+                protocol_ver: PROTOCOL_VERSION,
+                subc_ops: thin_core_ops(),
+                capabilities: vec!["manifest_registration_v1".to_string()],
+                connected_clients: 2,
+                counters: Some(serde_json::json!({
+                    "module_frames_dropped_no_route": 3,
+                    "client_frames_dropped_stale_route": 2,
+                    "client_egress_close_delivery_failed": 1,
+                    "goodbye_relay_client_failed": 4,
+                    "goodbye_relay_module_dropped": 5,
+                    "route_released_epoch_fenced": 6,
+                    "route_release_stale_skipped": 7,
+                })),
             },
         ),
         (

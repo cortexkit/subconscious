@@ -30,7 +30,13 @@ public func readConnectionFile(_ path: String) throws -> ConnectionInfo {
     try verifyOwnerOnly(path)
 
     let raw = try Data(contentsOf: URL(fileURLWithPath: path))
-    guard let obj = try JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+    let decoded: Any
+    do {
+        decoded = try JSONSerialization.jsonObject(with: raw)
+    } catch {
+        throw ConnectionFileError(message: "connection file JSON decode failed for \(path): \(error)")
+    }
+    guard let obj = decoded as? [String: Any] else {
         throw ConnectionFileError(message: "connection file is not a JSON object: \(path)")
     }
 
@@ -57,7 +63,10 @@ public func readConnectionFile(_ path: String) throws -> ConnectionInfo {
         guard let host = e["host"] as? String, let port = e["port"] as? Int else {
             throw ConnectionFileError(message: "endpoint must be { host: string, port: number }")
         }
-        return Endpoint(host: host, port: UInt16(port))
+        guard let port16 = UInt16(exactly: port) else {
+            throw ConnectionFileError(message: "endpoint port \(port) out of range 0...65535")
+        }
+        return Endpoint(host: host, port: port16)
     }
     guard !endpoints.isEmpty else {
         throw ConnectionFileError(message: "connection file must include at least one endpoint")
@@ -86,7 +95,12 @@ private func bytes(_ value: Any?, _ field: String) throws -> Data {
     guard let arr = value as? [Int] else {
         throw ConnectionFileError(message: "connection file field '\(field)' must be a JSON array of bytes")
     }
-    return Data(arr.map { UInt8(truncatingIfNeeded: $0) })
+    return Data(try arr.map { value in
+        guard let byte = UInt8(exactly: value) else {
+            throw ConnectionFileError(message: "connection file field '\(field)' contains out-of-range byte \(value)")
+        }
+        return byte
+    })
 }
 
 /// On unix, reject any group/other permission bit: the key is published

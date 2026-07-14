@@ -2189,7 +2189,22 @@ async fn set_child_enabled(
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
         reset_restart_count(snapshot, &spec.module_id)?;
         process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-        let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
+        let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
+            Ok(next_child) => next_child,
+            Err(err) => {
+                if let Err(state_err) =
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = ModuleState::Failed;
+                        state.process_alive = false;
+                        state.pid = None;
+                    })
+                {
+                    error!(module_id = %spec.module_id, error = %state_err, "failed to record enable spawn failure");
+                }
+                process_liveness.untrack_if_current(&spec.module_id, snapshot);
+                return Err(err);
+            }
+        };
         *child = Some(next_child);
         debug!(module_id = %spec.module_id, "supervised module enabled");
         Ok(true)

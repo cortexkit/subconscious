@@ -44,6 +44,13 @@ export interface SocketWriteResult {
   completed: Promise<void>;
 }
 
+export function toWriteBuffer(bytes: Uint8Array): Buffer {
+  // Frame writes pass encodeFrame's fresh, single-use Uint8Array. Authentication
+  // writes likewise use fresh prefix/JSON storage and await each write without
+  // retaining or mutating it, so this view remains stable while Node drains it.
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
 interface Waiter {
   need: number;
   resolve: (bytes: Uint8Array) => void;
@@ -230,7 +237,7 @@ export class SubcSocket {
       }, remaining);
 
       try {
-        this.sock.write(Buffer.from(bytes), (err) => {
+        this.sock.write(toWriteBuffer(bytes), (err) => {
           settle(() => {
             if (err) {
               reject(

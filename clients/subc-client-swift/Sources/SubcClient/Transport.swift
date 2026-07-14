@@ -16,7 +16,7 @@ public protocol Transport {
 public struct TransportError: Error { public let message: String }
 
 public final class POSIXTransport: Transport {
-    private let fd: Int32
+    private var fd: Int32
 
     public init(host: String, port: UInt16) throws {
         fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -81,7 +81,15 @@ public final class POSIXTransport: Transport {
         return Data(buf)
     }
 
-    public func close() { Darwin.close(fd) }
+    public func close() {
+        guard fd >= 0 else { return }
+        Darwin.close(fd)
+        fd = -1
+    }
+
+    deinit {
+        close()
+    }
 }
 
 public enum FrameReadError: Error, Equatable {

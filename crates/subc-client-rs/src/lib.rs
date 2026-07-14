@@ -275,6 +275,16 @@ impl ModuleHandle {
         Ok(())
     }
 
+    fn installed_route(&self, channel: u16) -> Result<Option<RouteHandle>, SubcModuleError> {
+        Ok(self
+            .shared
+            .live_routes
+            .lock()
+            .map_err(|_| SubcModuleError::InFlightPoisoned)?
+            .get(&channel)
+            .copied())
+    }
+
     fn remove_route(&self, handle: RouteHandle) -> Result<bool, SubcModuleError> {
         let mut routes = self
             .shared
@@ -1009,6 +1019,40 @@ where
             principal,
             consumer_capabilities,
         } => {
+            // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
+            // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
+            // can arrive for a channel this endpoint still believes installed. A
+            // strictly higher epoch proves the daemon freed the old binding: tear the
+            // stale install down locally and proceed. Equal or lower epoch is a
+            // protocol violation the daemon cannot produce: reject the bind.
+            if let Some(stale) = module_handle.installed_route(route_channel)? {
+                if epoch <= stale.epoch {
+                    let body = serde_json::to_vec(&ErrorBody {
+                        code: "route_rejected".to_string(),
+                        message: format!(
+                            "route.bind epoch {epoch} does not supersede installed epoch {} on channel {route_channel}",
+                            stale.epoch
+                        ),
+                    })
+                    .map_err(SubcModuleError::Json)?;
+                    let reject = Frame::build_with_version(
+                        frame.header.ver,
+                        FrameType::Error,
+                        control_flags(),
+                        0,
+                        0,
+                        frame.header.corr,
+                        body,
+                    )
+                    .map_err(SubcModuleError::FrameBuild)?;
+                    send_outbound(egress, reject).await?;
+                    return Ok(());
+                }
+                if module_handle.remove_route(stale)? {
+                    cancel_handle(&dispatcher.in_flight, stale)?;
+                    handler.on_route_gone(&stale).await;
+                }
+            }
             let handle = module_handle.route_handle(route_channel, epoch);
             let req = RouteBindRequest {
                 handle,
@@ -1757,6 +1801,119 @@ mod tests {
             module_handle.validate_route(RouteHandle::new(6, 3, 1)),
             Err(SubcModuleError::StaleRouteHandle(_))
         ));
+    }
+
+    struct RebindCountingHandler {
+        bound: Arc<AtomicUsize>,
+        cleanup: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for RebindCountingHandler {
+        async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(Vec::new())
+        }
+
+        async fn on_bound(&self, _handle: &RouteHandle) {
+            self.bound.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn on_route_gone(&self, _handle: &RouteHandle) {
+            self.cleanup.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Wire spec 3.3.0: a bind on an installed channel with a strictly higher epoch
+    // replaces the stale install (the daemon freed that binding; its route-gone
+    // GOODBYE is best-effort and can be dropped), firing the replaced install's
+    // route-gone teardown. Equal-or-lower epoch is a protocol violation: rejected,
+    // installed route untouched.
+    #[tokio::test]
+    async fn rebind_on_installed_channel_replaces_on_higher_epoch_only() {
+        let (module_handle, mut rx) = test_module_handle(&[]);
+        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        let bound = Arc::new(AtomicUsize::new(0));
+        let cleanup = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(RebindCountingHandler {
+            bound: Arc::clone(&bound),
+            cleanup: Arc::clone(&cleanup),
+        });
+
+        // Install epoch 4 on channel 8.
+        handle_frame(
+            route_bind_frame(8, 4, 90),
+            &tx,
+            Arc::clone(&handler),
+            RequestDispatcher::new(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+        assert_eq!(
+            (bound.load(Ordering::SeqCst), cleanup.load(Ordering::SeqCst)),
+            (1, 0)
+        );
+
+        // Same epoch: rejected, install untouched, no teardown fired.
+        handle_frame(
+            route_bind_frame(8, 4, 91),
+            &tx,
+            Arc::clone(&handler),
+            RequestDispatcher::new(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let reject = rx.recv().await.unwrap();
+        assert_eq!(reject.header.ty, FrameType::Error);
+        assert_eq!(
+            (bound.load(Ordering::SeqCst), cleanup.load(Ordering::SeqCst)),
+            (1, 0)
+        );
+        module_handle
+            .validate_route(RouteHandle::new(8, 4, 1))
+            .expect("epoch-4 install must survive the rejected rebind");
+
+        // Lower epoch: same rejection shape.
+        handle_frame(
+            route_bind_frame(8, 3, 92),
+            &tx,
+            Arc::clone(&handler),
+            RequestDispatcher::new(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Error);
+        assert_eq!(
+            (bound.load(Ordering::SeqCst), cleanup.load(Ordering::SeqCst)),
+            (1, 0)
+        );
+
+        // Strictly higher epoch: implicit replace — stale install torn down
+        // (route-gone fired exactly once), new epoch installed and bound.
+        handle_frame(
+            route_bind_frame(8, 5, 93),
+            &tx,
+            Arc::clone(&handler),
+            RequestDispatcher::new(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+        assert_eq!(
+            (bound.load(Ordering::SeqCst), cleanup.load(Ordering::SeqCst)),
+            (2, 1)
+        );
+        assert!(matches!(
+            module_handle.validate_route(RouteHandle::new(8, 4, 1)),
+            Err(SubcModuleError::StaleRouteHandle(_))
+        ));
+        module_handle
+            .validate_route(RouteHandle::new(8, 5, 1))
+            .expect("epoch-5 install must be live after implicit replace");
     }
 
     #[test]

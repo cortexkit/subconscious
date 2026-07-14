@@ -748,11 +748,32 @@ export class SubcProvider {
       throw new SubcProviderError(`unsupported module control request ${request.op ?? "<missing op>"}`);
     }
 
-    const tentative = createRouteHandle(
-      numberField(request.route_channel, "route_channel"),
-      numberField(request.epoch, "epoch"),
-      this.connectionToken,
-    );
+    const boundChannel = numberField(request.route_channel, "route_channel");
+    const boundEpoch = numberField(request.epoch, "epoch");
+    // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
+    // channel, but its route-gone GOODBYE to modules is best-effort, so a bind can
+    // arrive for a channel this endpoint still believes installed. A strictly
+    // higher epoch proves the daemon freed the old binding: tear the stale install
+    // down locally and proceed. Equal or lower epoch is a protocol violation the
+    // daemon cannot produce: reject the bind.
+    const stale = this.liveRoutes.get(boundChannel);
+    if (stale) {
+      if (boundEpoch <= stale.epoch) {
+        await this.sendError(
+          frame,
+          "route_rejected",
+          `route.bind epoch ${boundEpoch} does not supersede installed epoch ${stale.epoch} on channel ${boundChannel}`,
+          controlFlags(),
+          sock,
+          generation,
+        );
+        return;
+      }
+      this.liveRoutes.delete(stale.channel);
+      this.abortHandle(stale);
+      await this.opts.onRouteGone?.(stale);
+    }
+    const tentative = createRouteHandle(boundChannel, boundEpoch, this.connectionToken);
     const bindRequest: RouteBindRequest = {
       handle: tentative,
       target: request.target as RouteTarget,

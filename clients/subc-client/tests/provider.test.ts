@@ -206,6 +206,87 @@ describe("SubcProvider serve loop", () => {
     releaseHandler();
   });
 
+  // Wire spec 3.3.0: a route.bind on an installed channel with a strictly higher
+  // epoch replaces the stale install (the daemon freed that binding; its route-gone
+  // GOODBYE is best-effort and can be dropped), firing the replaced install's
+  // onRouteGone. Equal-or-lower epoch is a protocol violation: rejected loud, the
+  // installed route untouched.
+  test("route.bind on an installed channel replaces on higher epoch only", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const gone: { channel: number; epoch: number }[] = [];
+    const bound: { channel: number; epoch: number }[] = [];
+    const token = newConnectionToken();
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      pending: Map<string, unknown>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      opts: {
+        handler: () => Uint8Array;
+        onBound: (handle: RouteHandle) => void;
+        onRouteGone: (handle: RouteHandle) => void;
+      };
+      handleControlRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.pending = new Map();
+    provider.liveRoutes = new Map();
+    provider.connectionToken = token;
+    provider.opts = {
+      handler: () => new Uint8Array(0),
+      onBound: (handle) => bound.push({ channel: handle.channel, epoch: handle.epoch }),
+      onRouteGone: (handle) => gone.push({ channel: handle.channel, epoch: handle.epoch }),
+    };
+
+    const bindFrame = (epoch: number, corr: bigint) =>
+      buildFrameWithVersion(
+        PROTOCOL_VERSION,
+        FrameType.Request,
+        CONTROL_FLAGS,
+        0,
+        0,
+        corr,
+        encodeJson({ op: "route.bind", route_channel: 8, epoch, target: { kind: "tool_provider", module_id: "m" }, identity: { project_root: "/tmp/p", harness: "test", session: "s" } }),
+      );
+
+    // Install epoch 4.
+    await provider.handleControlRequest(bindFrame(4, 90n), sock, 1);
+    expect(writes.at(-1)?.header.ty).toBe(FrameType.Response);
+    expect(bound).toEqual([{ channel: 8, epoch: 4 }]);
+    expect(gone).toEqual([]);
+
+    // Same epoch: rejected, install untouched.
+    await provider.handleControlRequest(bindFrame(4, 91n), sock, 1);
+    expect(writes.at(-1)?.header.ty).toBe(FrameType.Error);
+    expect(parseJson(writes.at(-1)!.body)).toMatchObject({ code: "route_rejected" });
+    expect(provider.liveRoutes.get(8)?.epoch).toBe(4);
+    expect(gone).toEqual([]);
+
+    // Lower epoch: same rejection.
+    await provider.handleControlRequest(bindFrame(3, 92n), sock, 1);
+    expect(writes.at(-1)?.header.ty).toBe(FrameType.Error);
+    expect(provider.liveRoutes.get(8)?.epoch).toBe(4);
+    expect(gone).toEqual([]);
+
+    // Strictly higher epoch: implicit replace — stale install torn down, new bound.
+    await provider.handleControlRequest(bindFrame(5, 93n), sock, 1);
+    expect(writes.at(-1)?.header.ty).toBe(FrameType.Response);
+    expect(gone).toEqual([{ channel: 8, epoch: 4 }]);
+    expect(bound).toEqual([
+      { channel: 8, epoch: 4 },
+      { channel: 8, epoch: 5 },
+    ]);
+    expect(provider.liveRoutes.get(8)?.epoch).toBe(5);
+  });
 });
 
 describe("SubcProvider managed reconnect", () => {

@@ -1202,7 +1202,7 @@ export class SubcClient {
   }
 
   private encode(value: unknown): Uint8Array {
-    return new Uint8Array(Buffer.from(JSON.stringify(value), "utf8"));
+    return Buffer.from(JSON.stringify(value), "utf8");
   }
 
   private parseJson(frame: Frame): unknown {

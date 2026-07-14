@@ -134,7 +134,7 @@ final class ParityTests: XCTestCase {
                 "Rust header mismatch for vector \(vector.name)"
             )
             XCTAssertEqual(
-                encodeFrame(
+                try encodeFrame(
                     ty: ty,
                     flags: vector.flags,
                     channel: vector.channel,

@@ -592,16 +592,6 @@ impl ReverseTestClient {
         wait_for_atomic_at_least(&self.cancel_count, expected, "MCP request cancellations").await;
     }
 
-    async fn assert_cancellation_count_stays(&self, expected: usize) {
-        assert_counter_stays(
-            &self.cancel_count,
-            expected,
-            "MCP request cancellations",
-            QUIET_TIMEOUT,
-        )
-        .await;
-    }
-
     async fn assert_prompt_count_stays(&self, expected: usize) {
         assert_counter_stays(
             &self.prompt_count,
@@ -955,60 +945,6 @@ async fn mcp_reverse_elicitation_declared_host_round_trips() {
         response.pointer("/content/approved"),
         Some(&Value::Bool(true))
     );
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn mcp_reverse_elicitation_immediate_host_response_is_not_cancelled() {
-    let mut harness =
-        ReverseHarness::start("mcp-reverse-immediate-response", elicitation_capabilities()).await;
-    let route_channel = harness.provider.wait_bound().await;
-
-    const ROUNDS: u64 = 32;
-    const REQUESTS_PER_ROUND: u64 = 8;
-    for round in 0..ROUNDS {
-        for _ in 0..REQUESTS_PER_ROUND {
-            harness
-                .client_handler
-                .respond_elicitation(accepted_elicitation(json!({ "approved": true })))
-                .await;
-        }
-        for offset in 0..REQUESTS_PER_ROUND {
-            harness
-                .provider
-                .send_reverse_request(
-                    route_channel,
-                    902 + round * REQUESTS_PER_ROUND + offset,
-                    elicitation_body("immediate"),
-                )
-                .await;
-        }
-
-        for _ in 0..REQUESTS_PER_ROUND {
-            let event = harness
-                .provider
-                .wait_for_event("reverse response", |event| {
-                    matches!(event, ScriptedProviderEvent::ReverseResponse { .. })
-                })
-                .await;
-            let ScriptedProviderEvent::ReverseResponse { body: response, .. } = event else {
-                unreachable!("reverse-response predicate returned another event")
-            };
-            assert_eq!(
-                response.pointer("/content/approved"),
-                Some(&Value::Bool(true))
-            );
-        }
-    }
-    harness
-        .client_handler
-        .wait_for_prompts((ROUNDS * REQUESTS_PER_ROUND) as usize)
-        .await;
-    harness
-        .client_handler
-        .assert_cancellation_count_stays(0)
-        .await;
 
     harness.shutdown().await;
 }

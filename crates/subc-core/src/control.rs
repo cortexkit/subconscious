@@ -33,7 +33,7 @@ use crate::{
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
     supervise::{validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SupervisorHandle},
-    ConnectedClients, Frame, ProjectRootId, Supervisor,
+    ConnectedClients, DaemonCounters, Frame, ProjectRootId, Supervisor,
 };
 
 /// Lowest envelope version this subc build will negotiate.
@@ -99,6 +99,7 @@ pub struct ControlHandler {
     storage_config: Option<crate::daemon_config::StorageConfig>,
     rescan: Option<SupervisorRescanContext>,
     connected_clients: ConnectedClients,
+    counters: DaemonCounters,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -193,6 +194,7 @@ impl ControlHandler {
     }
 
     pub fn with_forwarding(registry: Arc<Registry>, forwarding: Arc<ForwardingTable>) -> Self {
+        let counters = forwarding.counters();
         Self {
             registry,
             forwarding,
@@ -209,6 +211,7 @@ impl ControlHandler {
             storage_config: None,
             rescan: None,
             connected_clients: ConnectedClients::new(),
+            counters,
         }
     }
 
@@ -270,6 +273,10 @@ impl ControlHandler {
 
     pub fn forwarding(&self) -> Arc<ForwardingTable> {
         Arc::clone(&self.forwarding)
+    }
+
+    pub(crate) fn counters(&self) -> DaemonCounters {
+        self.counters.clone()
     }
 
     /// Remove a connection's registry entries WITHOUT signalling the supervisor's
@@ -479,19 +486,26 @@ impl ControlHandler {
                         error = %err,
                         "route GOODBYE was not delivered to client; closing target connection"
                     );
-                    let _ = self.forwarding.escalate_client_delivery_failure(
-                        released.connection_id,
-                        released.channel,
-                        released.epoch,
-                        CloseReason::new(
-                            "route_goodbye_delivery_failed",
-                            format!(
-                                "failed to enqueue route GOODBYE for channel {}: {err}",
-                                released.channel
+                    if self
+                        .forwarding
+                        .escalate_client_delivery_failure(
+                            released.connection_id,
+                            released.channel,
+                            released.epoch,
+                            CloseReason::new(
+                                "route_goodbye_delivery_failed",
+                                format!(
+                                    "failed to enqueue route GOODBYE for channel {}: {err}",
+                                    released.channel
+                                ),
                             ),
-                        ),
-                    );
+                        )
+                        .unwrap_or(false)
+                    {
+                        self.counters.increment_goodbye_relay_client_failed();
+                    }
                 } else {
+                    self.counters.increment_goodbye_relay_module_dropped();
                     warn!(
                         target_connection_id = released.connection_id.get(),
                         route_channel = released.channel,
@@ -858,6 +872,7 @@ impl ControlHandler {
             subc_ops: subc_ops(),
             capabilities: self.subc_capabilities.as_ref().to_vec(),
             connected_clients: self.connected_clients.count(),
+            counters: Some(self.counters.snapshot()),
         };
         Ok(vec![control_response_body_frame(
             &frame,

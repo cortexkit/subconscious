@@ -86,6 +86,27 @@ impl Drop for TempDir {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_reports_and_renders_route_counters() {
+    let server = TestServer::start().await;
+
+    let response = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["daemon", "--json"],
+    ));
+    assert_eq!(response["counters"]["module_frames_dropped_no_route"], 0);
+    assert_eq!(response["counters"]["route_release_stale_skipped"], 0);
+
+    let output = ck_with_subc(&server.connection_file_path, ["daemon"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("counter"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("module_frames_dropped_no_route"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_list_json_uses_subc_override_and_shows_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);

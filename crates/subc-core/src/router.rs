@@ -19,7 +19,7 @@ use crate::{
         ForwardingTable, RouteBinding, RouteRelease,
     },
     registry::ConnectionId,
-    Frame, FrameBuildError,
+    DaemonCounters, Frame, FrameBuildError,
 };
 
 /// Cheaply cloneable handle to one connection's bounded outbound frame queue.
@@ -132,17 +132,20 @@ pub struct Router {
     control: Arc<ControlHandler>,
     forwarding: Arc<ForwardingTable>,
     forward_backend: ForwardBackend,
+    counters: DaemonCounters,
     next_connection_id: AtomicU64,
 }
 
 impl Router {
     pub fn with_control_handler(control: Arc<ControlHandler>) -> Self {
         let forwarding = control.forwarding();
+        let counters = control.counters();
         Self {
             backends: HashMap::new(),
             control,
             forwarding: Arc::clone(&forwarding),
             forward_backend: ForwardBackend::new(forwarding),
+            counters,
             // ConnectionId::LOCAL is 0; real socket ids start at 1 and never collide.
             next_connection_id: AtomicU64::new(1),
         }
@@ -222,6 +225,7 @@ impl Router {
 
         match data_route {
             DataRoute::Module(DataRouteState::EpochMismatch | DataRouteState::Reserved) => {
+                self.counters.increment_module_frames_dropped_no_route();
                 debug!(
                     connection_id = ctx.connection_id.get(),
                     channel,
@@ -232,6 +236,7 @@ impl Router {
                 return Ok(());
             }
             DataRoute::Module(DataRouteState::Absent) => {
+                self.counters.increment_module_frames_dropped_no_route();
                 debug!(
                     connection_id = ctx.connection_id.get(),
                     channel, epoch, corr, "dropping module frame for absent route handle"
@@ -249,8 +254,9 @@ impl Router {
                         goodbye.header.channel = target.channel;
                         goodbye.header.epoch = target.epoch;
                         if let Err(err) = target.sink.try_send(goodbye) {
-                            if target.close_on_delivery_failure() {
-                                self.forwarding
+                            if target.close_on_delivery_failure()
+                                && self
+                                    .forwarding
                                     .escalate_client_delivery_failure(
                                         target.connection_id,
                                         target.channel,
@@ -263,7 +269,9 @@ impl Router {
                                             ),
                                         ),
                                     )
-                                    .map_err(RouterError::Forwarding)?;
+                                    .map_err(RouterError::Forwarding)?
+                            {
+                                self.counters.increment_goodbye_relay_client_failed();
                             }
                         }
                     }
@@ -275,7 +283,8 @@ impl Router {
                 frame.header.channel = route.client_channel;
                 frame.header.epoch = route.client_epoch;
                 if let Err(err) = route.client_sink.try_send(frame) {
-                    self.forwarding
+                    if self
+                        .forwarding
                         .escalate_client_delivery_failure(
                             route.client_connection_id,
                             route.client_channel,
@@ -288,7 +297,11 @@ impl Router {
                                 ),
                             ),
                         )
-                        .map_err(RouterError::Forwarding)?;
+                        .map_err(RouterError::Forwarding)?
+                    {
+                        self.counters
+                            .increment_client_egress_close_delivery_failed();
+                    }
                     return Ok(());
                 }
                 if releases_credit {
@@ -297,6 +310,9 @@ impl Router {
                 return Ok(());
             }
             DataRoute::Client(DataRouteState::EpochMismatch) => {
+                if frame.header.ty == FrameType::Request {
+                    self.counters.increment_client_frames_dropped_stale_route();
+                }
                 debug!(
                     connection_id = ctx.connection_id.get(),
                     channel, epoch, corr, "dropping client frame for stale route epoch"
@@ -831,6 +847,10 @@ mod tests {
         );
         assert_eq!(client_rx.try_recv().unwrap().header.corr, 700);
         assert!(client_rx.try_recv().is_err());
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            1
+        );
     }
 
     #[tokio::test]
@@ -900,6 +920,8 @@ mod tests {
         );
         assert_eq!(client_rx.try_recv().unwrap().header.corr, 800);
         assert!(client_rx.try_recv().is_err());
+        assert_eq!(router.counters.snapshot()["goodbye_relay_client_failed"], 1);
+        assert_eq!(router.counters.snapshot()["route_released_epoch_fenced"], 1);
     }
 
     fn route_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> Frame {
@@ -985,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_epochs_validate_both_directions_and_rewrite_to_peer_handle() {
-        let (router, forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
+        let (router, _forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
             dynamic_route_fixture(true);
         let route_open = client_rx.recv().await.unwrap();
         assert_eq!(route_open.header.corr, 700);
@@ -1048,7 +1070,9 @@ mod tests {
             .unwrap();
         assert!(module_rx.try_recv().is_err());
         assert!(client_rx.try_recv().is_err());
-        assert_eq!(forwarding.stale_epoch_drop_count(), 2);
+        let counters = router.counters.snapshot();
+        assert_eq!(counters["client_frames_dropped_stale_route"], 1);
+        assert_eq!(counters["module_frames_dropped_no_route"], 1);
     }
 
     #[tokio::test]
@@ -1079,7 +1103,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserved_slot_ingress_errors_only_matching_client_requests() {
-        let (router, forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
+        let (router, _forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
             dynamic_route_fixture(false);
         router
             .route_for_connection(
@@ -1139,7 +1163,34 @@ mod tests {
             panic!("reserved non-request unexpectedly produced {frame:?}");
         }
         assert!(module_rx.try_recv().is_err());
-        assert_eq!(forwarding.stale_epoch_drop_count(), 1);
+        let counters = router.counters.snapshot();
+        assert_eq!(counters["client_frames_dropped_stale_route"], 1);
+        assert_eq!(counters["module_frames_dropped_no_route"], 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_module_route_goodbye_increments_counter() {
+        let (router, _forwarding, client_ctx, mut client_rx, _module_ctx, mut module_rx, pending) =
+            dynamic_route_fixture(true);
+        let _ = client_rx.recv().await;
+        module_rx.close();
+
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Goodbye,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    999,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let counters = router.counters.snapshot();
+        assert_eq!(counters["goodbye_relay_module_dropped"], 1);
+        assert_eq!(counters["route_released_epoch_fenced"], 1);
     }
 
     #[test]

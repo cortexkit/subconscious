@@ -1,0 +1,30 @@
+{
+  "capabilities": [
+    "manifest_registration_v1"
+  ],
+  "connected_clients": 2,
+  "counters": {
+    "client_egress_close_delivery_failed": 1,
+    "client_frames_dropped_stale_route": 2,
+    "goodbye_relay_client_failed": 4,
+    "goodbye_relay_module_dropped": 5,
+    "module_frames_dropped_no_route": 3,
+    "route_release_stale_skipped": 7,
+    "route_released_epoch_fenced": 6
+  },
+  "op": "server.describe",
+  "protocol_ver": 2,
+  "subc_ops": [
+    "server.describe",
+    "catalog.list",
+    "route.open",
+    "route.poll",
+    "supervisor.list",
+    "supervisor.restart",
+    "supervisor.reload",
+    "supervisor.rescan",
+    "supervisor.set_enabled",
+    "supervisor.health_probe",
+    "supervisor.health"
+  ]
+}

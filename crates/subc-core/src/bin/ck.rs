@@ -576,6 +576,14 @@ async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError>
                 uptime,
             ]],
         );
+        if let Some(counters) = connected_clients.get("counters").and_then(Value::as_object) {
+            let mut rows = counters
+                .iter()
+                .map(|(name, value)| vec![name.clone(), display_json_value(value)])
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| left[0].cmp(&right[0]));
+            print_table(&["counter", "value"], rows);
+        }
     }
     Ok(())
 }

@@ -2,6 +2,8 @@
 
 use std::process;
 
+use tracing_subscriber::EnvFilter;
+
 #[tokio::main]
 async fn main() {
     // Side-effect-free provenance probe: must be evaluated before tracing,
@@ -26,6 +28,8 @@ async fn main() {
 
 fn init_tracing() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 }

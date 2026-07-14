@@ -16,6 +16,7 @@ use subc_core::{
     serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
     Registry, Router, ServerAuth, SupervisorHandle,
 };
+use subc_protocol::PROTOCOL_VERSION;
 use subc_transport::{
     authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
     SCHEMA_VERSION,
@@ -99,6 +100,7 @@ async fn start_test_daemon_inner(
     let connection_file_path = temp_dir.join("subc-conn.json");
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
         endpoints: vec![Endpoint {
             host: Ipv4Addr::LOCALHOST.to_string(),
             port,
@@ -140,7 +142,7 @@ async fn start_test_daemon_inner(
 }
 
 pub async fn connect_authed_client(path: impl AsRef<Path>) -> io::Result<TcpStream> {
-    let conn = subc_transport::read(path.as_ref()).map_err(io::Error::other)?;
+    let conn = subc_transport::read_for_client(path.as_ref()).map_err(io::Error::other)?;
     let endpoint = conn.endpoints.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

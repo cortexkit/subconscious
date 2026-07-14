@@ -2794,6 +2794,7 @@ async fn mcp_shim_rejects_unsupported_hello_ack_schema() {
         &connection_file_path,
         &ConnectionInfo {
             schema: SCHEMA_VERSION,
+            wire_version: None,
             endpoints: vec![Endpoint {
                 host: Ipv4Addr::LOCALHOST.to_string(),
                 port,
@@ -3098,6 +3099,7 @@ async fn start_test_daemon_with_process_liveness_and_supervisor(
     let connection_file_path = temp_dir.join("subc-conn.json");
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: None,
         endpoints: vec![Endpoint {
             host: Ipv4Addr::LOCALHOST.to_string(),
             port,
@@ -3304,7 +3306,7 @@ fn module_command(
 async fn wait_for_module_connection_file(child: &mut Child, path: &Path, wait: Duration) {
     let deadline = Instant::now() + wait;
     loop {
-        if subc_transport::read(path).is_ok() {
+        if subc_transport::read_for_client(path).is_ok() {
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -3442,7 +3444,7 @@ async fn wait_for_control_client(path: &Path, wait: Duration) -> TcpStream {
 }
 
 async fn connect_control_client(path: &Path) -> Result<TcpStream, String> {
-    let conn = subc_transport::read(path).map_err(|source| source.to_string())?;
+    let conn = subc_transport::read_for_client(path).map_err(|source| source.to_string())?;
     let endpoint = conn
         .endpoints
         .first()

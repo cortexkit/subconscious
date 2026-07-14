@@ -10,6 +10,7 @@ use std::{
 };
 
 use fs4::{FileExt, TryLockError};
+use subc_protocol::PROTOCOL_VERSION;
 use subc_transport::{
     authenticate_client, connection_file, generate_daemon_id, generate_key, write_atomic,
     AuthError, ConnectionFileError, ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -423,6 +424,7 @@ pub async fn ensure_singleton_with_config(
     let (listeners, endpoints) = bind_loopback(config.port).await?;
     let connection_info = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
         endpoints,
         key: generate_key().map_err(BootstrapError::GenerateConnectionFile)?,
         daemon_id: generate_daemon_id().map_err(BootstrapError::GenerateConnectionFile)?,
@@ -516,7 +518,10 @@ fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
         | ConnectionFileError::MissingFileName { .. }
         | ConnectionFileError::Io { .. }
         | ConnectionFileError::JsonWrite { .. }
-        | ConnectionFileError::Random(_) => false,
+        | ConnectionFileError::Random(_)
+        // A wire mismatch may identify a newer live daemon, so never reclaim its
+        // connection file merely because this binary cannot speak its envelope.
+        | ConnectionFileError::WireVersionMismatch { .. } => false,
     }
 }
 
@@ -949,6 +954,7 @@ mod tests {
     fn make_connection_info(port: u16) -> ConnectionInfo {
         ConnectionInfo {
             schema: SCHEMA_VERSION,
+            wire_version: Some(PROTOCOL_VERSION),
             endpoints: vec![Endpoint {
                 host: "127.0.0.1".to_owned(),
                 port,
@@ -1049,6 +1055,20 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+        cleanup_connection_file_path(&path);
+    }
+
+    #[tokio::test]
+    async fn daemon_connection_file_publishes_protocol_wire_version() {
+        let path = temp_connection_file_path("wire-version");
+        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        assert_eq!(bound.connection_info.wire_version, Some(PROTOCOL_VERSION));
+        assert_eq!(
+            connection_file::read(&path).unwrap().wire_version,
+            Some(PROTOCOL_VERSION)
+        );
+
+        drop(bound.listeners);
         cleanup_connection_file_path(&path);
     }
 

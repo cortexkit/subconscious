@@ -1299,7 +1299,7 @@ where
 }
 
 async fn connect_authed_client(path: &Path) -> io::Result<TcpStream> {
-    let conn = subc_transport::read(path).map_err(io::Error::other)?;
+    let conn = subc_transport::read_for_client(path).map_err(io::Error::other)?;
     let endpoint = conn.endpoints.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

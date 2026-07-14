@@ -10,7 +10,8 @@ use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{Flags, FrameType, Priority};
 use subc_transport::{
     authenticate_client, authenticate_server, generate_daemon_id, generate_key,
-    read as read_connection_file, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    read_for_client as read_connection_file, write_atomic, ConnectionInfo, Endpoint,
+    SCHEMA_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -78,6 +79,7 @@ async fn listener_with_connection_file(
 fn make_connection_info(port: u16, key: Vec<u8>, daemon_id: [u8; 16]) -> ConnectionInfo {
     ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: None,
         endpoints: vec![Endpoint {
             host: "127.0.0.1".to_owned(),
             port,

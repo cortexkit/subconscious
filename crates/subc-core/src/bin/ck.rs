@@ -1414,7 +1414,7 @@ fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConn
     let mut tried = Vec::new();
 
     for path in candidates {
-        match connection_file::read(&path) {
+        match connection_file::read_for_client(&path) {
             Ok(info) => return Ok(ResolvedConnection { path, info }),
             Err(source) => tried.push(TriedConnectionFile {
                 path,

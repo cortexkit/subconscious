@@ -1819,6 +1819,7 @@ fn publish_module_connection_file(
 
     let info = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        wire_version: None,
         endpoints: vec![Endpoint {
             host: Ipv4Addr::LOCALHOST.to_string(),
             port,
@@ -3859,7 +3860,7 @@ async fn pipe_stdio(stream: TcpStream) -> Result<()> {
 }
 
 async fn connect_authenticated(connection_file_path: &Path) -> Result<TcpStream> {
-    let conn = connection_file::read(connection_file_path).map_err(|source| {
+    let conn = connection_file::read_for_client(connection_file_path).map_err(|source| {
         other_error(format!(
             "failed to read connection file {}: {source}",
             connection_file_path.display()
@@ -4817,6 +4818,7 @@ mod tests {
         let path = env::temp_dir().join(format!("subc-mcp-non-loopback-{}.json", hex(&daemon_id)));
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
+            wire_version: None,
             endpoints: vec![Endpoint {
                 host: "0.0.0.0".to_owned(),
                 port: 0,

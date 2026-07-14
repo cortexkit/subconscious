@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     error::Error,
     ffi::{OsStr, OsString},
@@ -75,6 +75,7 @@ const DEFAULT_REVERSE_RELAY_TTL: Duration = Duration::from_secs(10 * 60);
 const REVERSE_RELAY_TTL_MS_ENV: &str = "SUBC_MCP_REVERSE_RELAY_TTL_MS";
 const TOOLS_SEARCH_NAME: &str = "tools_search";
 const TOOLS_INVOKE_NAME: &str = "tools_invoke";
+const ACK_ONLY_TOOL_RESPONSE_TEXT: &str = "Queued for context compaction.";
 const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -295,6 +296,42 @@ impl PendingRelayEntry {
     }
 }
 
+/// Counters are allocated with the session policy so an acknowledgment takes
+/// only a relaxed atomic increment.
+#[derive(Debug, Default)]
+struct AckOnlyAckMetrics {
+    counters: RwLock<HashMap<String, Arc<AtomicU64>>>,
+}
+
+impl AckOnlyAckMetrics {
+    fn counter_for(&self, tool_name: &str) -> Arc<AtomicU64> {
+        let mut counters = self.counters.write().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "subc-mcp module: warning: recovering from poisoned ack-only metrics write lock"
+            );
+            poisoned.into_inner()
+        });
+        Arc::clone(
+            counters
+                .entry(tool_name.to_owned())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        )
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, u64> {
+        let counters = self.counters.read().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "subc-mcp module: warning: recovering from poisoned ack-only metrics read lock"
+            );
+            poisoned.into_inner()
+        });
+        counters
+            .iter()
+            .map(|(tool_name, count)| (tool_name.clone(), count.load(Ordering::Relaxed)))
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 struct ReverseRelay {
     tx: mpsc::Sender<SubcFrame>,
@@ -303,6 +340,7 @@ struct ReverseRelay {
     live_epochs: Arc<Mutex<HashMap<u16, u32>>>,
     pending: Arc<Mutex<HashMap<PendingKey, PendingRelayEntry>>>,
     stale_epoch_drops: Arc<AtomicU64>,
+    ack_only_acks: Arc<AckOnlyAckMetrics>,
     ttl: Duration,
     max_pending_per_session: usize,
 }
@@ -316,6 +354,7 @@ impl ReverseRelay {
             live_epochs: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             stale_epoch_drops: Arc::new(AtomicU64::new(0)),
+            ack_only_acks: Arc::new(AckOnlyAckMetrics::default()),
             ttl: reverse_relay_ttl_from_env(),
             max_pending_per_session: REVERSE_RELAY_PENDING_PER_SESSION,
         }
@@ -329,6 +368,10 @@ impl ReverseRelay {
         }
     }
 
+    fn ack_only_counter(&self, tool_name: &str) -> Arc<AtomicU64> {
+        self.ack_only_acks.counter_for(tool_name)
+    }
+
     async fn health_metrics(&self) -> serde_json::Value {
         let active_relay_routes = self.routes.lock().await.len();
         let pending_reverse_requests = self.pending.lock().await.len();
@@ -336,6 +379,7 @@ impl ReverseRelay {
             "active_relay_routes": active_relay_routes,
             "pending_reverse_requests": pending_reverse_requests,
             "stale_epoch_drops": self.stale_epoch_drops.load(Ordering::Relaxed),
+            "ack_only_acks": self.ack_only_acks.snapshot(),
         })
     }
 
@@ -884,6 +928,14 @@ enum SurfaceMode {
     Search,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolMode {
+    #[default]
+    Forward,
+    AckOnly,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum RefreshMode {
     #[default]
@@ -940,6 +992,7 @@ struct ToolConfig {
 struct ToolOverride {
     enabled: Option<bool>,
     description: Option<String>,
+    mode: Option<ToolMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,6 +1035,15 @@ struct ToolBinding {
     module_id: String,
     route: RouteHandle,
     bare_tool_name: String,
+    dispatch: ToolDispatch,
+}
+
+/// Ack-only calls must not write to the provider route because their effect is
+/// applied on a separate transport path.
+#[derive(Debug, Clone)]
+enum ToolDispatch {
+    Forward,
+    AckOnly { acks: Arc<AtomicU64> },
 }
 
 #[derive(Debug, Clone)]
@@ -999,6 +1061,7 @@ struct DesiredProvider {
 struct DesiredTool {
     bare_tool: ManifestTool,
     exposed_tool: ExposedTool,
+    mode: ToolMode,
 }
 
 #[derive(Debug, Default)]
@@ -1098,6 +1161,8 @@ struct RawToolOverrideObject {
     enabled: MaybeSet<bool>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     description: MaybeSet<String>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    mode: MaybeSet<ToolMode>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1940,6 +2005,7 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
 
     let opened_routes = routes.values().copied().collect::<Vec<_>>();
     let inner = match session_inner_from_desired(
+        subc,
         catalog.generation,
         desired,
         routes,
@@ -2134,6 +2200,7 @@ fn desired_session_from_catalog(
             let mut exposed_manifest = tool.clone();
             exposed_manifest.name = exposed_name;
             tools.push(DesiredTool {
+                mode: config.tool_mode(&entry.module_id, &tool.name),
                 bare_tool: tool,
                 exposed_tool: ExposedTool {
                     manifest: exposed_manifest,
@@ -2156,6 +2223,7 @@ fn desired_session_from_catalog(
 }
 
 fn session_inner_from_desired(
+    subc: &SubcClient,
     catalog_generation: u64,
     desired: DesiredSession,
     routes: HashMap<String, RouteHandle>,
@@ -2173,12 +2241,19 @@ fn session_inner_from_desired(
         })?;
         for desired_tool in provider.tools {
             let exposed_name = desired_tool.exposed_tool.manifest.name.clone();
+            let dispatch = match desired_tool.mode {
+                ToolMode::Forward => ToolDispatch::Forward,
+                ToolMode::AckOnly => ToolDispatch::AckOnly {
+                    acks: subc.relay().ack_only_counter(&exposed_name),
+                },
+            };
             bindings.insert(
                 exposed_name.clone(),
                 ToolBinding {
                     module_id: provider.module_id.clone(),
                     route,
                     bare_tool_name: desired_tool.bare_tool.name,
+                    dispatch,
                 },
             );
             tools.push(desired_tool.exposed_tool);
@@ -2383,6 +2458,14 @@ impl GatewayConfig {
             .get(tool_name)?
             .description
             .clone()
+    }
+
+    fn tool_mode(&self, module_id: &str, tool_name: &str) -> ToolMode {
+        self.providers
+            .get(module_id)
+            .and_then(|provider| provider.tools.overrides.get(tool_name))
+            .and_then(|override_config| override_config.mode)
+            .unwrap_or_default()
     }
 }
 
@@ -2605,6 +2688,12 @@ fn validate_raw_tool_config(tools: &RawToolConfig, path: &Path, prefix: &str) ->
                     path.display()
                 )));
             }
+            if matches!(object.mode, MaybeSet::Null) {
+                return Err(other_error(format!(
+                    "invalid MCP config {}: {prefix}.overrides.{tool_name}.mode must be omitted instead of null",
+                    path.display()
+                )));
+            }
         }
     }
     Ok(())
@@ -2776,6 +2865,11 @@ fn merge_tool_config(effective: &mut ToolConfig, raw: RawToolConfig) {
                     MaybeSet::Null => unreachable!("validated object override description null"),
                     MaybeSet::Value(description) => override_config.description = Some(description),
                 }
+                match object.mode {
+                    MaybeSet::Missing => {}
+                    MaybeSet::Null => unreachable!("validated object override mode null"),
+                    MaybeSet::Value(mode) => override_config.mode = Some(mode),
+                }
             }
         }
     }
@@ -2822,6 +2916,7 @@ fn merge_project_tool_config(
         let field = format!("providers.{module_id}.tools.overrides.{tool_name}");
         let baseline_callable =
             baseline.provider_enabled(module_id) && baseline.tool_enabled(module_id, &tool_name);
+        let baseline_mode = baseline.tool_mode(module_id, &tool_name);
         match override_value {
             RawToolOverrideValue::Null(()) => {
                 let has_description = provider
@@ -2830,12 +2925,12 @@ fn merge_project_tool_config(
                     .get(&tool_name)
                     .and_then(|override_config| override_config.description.as_ref())
                     .is_some();
-                if baseline_callable && !has_description {
+                if baseline_callable && !has_description && baseline_mode == ToolMode::Forward {
                     provider.tools.overrides.remove(&tool_name);
                 } else {
                     warn_project_drop(
                         &field,
-                        "project MCP config cannot delete a deny or inherited tool description",
+                        "project MCP config cannot delete a deny, ack-only mode, or inherited tool description",
                     );
                 }
             }
@@ -2864,6 +2959,17 @@ fn merge_project_tool_config(
                         baseline_callable,
                     ),
                 }
+                match object.mode {
+                    MaybeSet::Missing => {}
+                    MaybeSet::Null => unreachable!("validated object override mode null"),
+                    MaybeSet::Value(mode) => merge_project_override_mode(
+                        &mut provider.tools,
+                        &format!("{field}.mode"),
+                        &tool_name,
+                        mode,
+                        baseline_mode,
+                    ),
+                }
             }
         }
     }
@@ -2886,6 +2992,27 @@ fn merge_project_override_enabled(
         warn_project_drop(
             field,
             "project MCP config cannot enable a tool disabled by the user baseline",
+        );
+    }
+}
+
+fn merge_project_override_mode(
+    effective: &mut ToolConfig,
+    field: &str,
+    tool_name: &str,
+    mode: ToolMode,
+    baseline_mode: ToolMode,
+) {
+    if mode == ToolMode::AckOnly || baseline_mode == ToolMode::Forward {
+        effective
+            .overrides
+            .entry(tool_name.to_owned())
+            .or_default()
+            .mode = Some(mode);
+    } else {
+        warn_project_drop(
+            field,
+            "project MCP config cannot forward a tool acknowledged by the user baseline",
         );
     }
 }
@@ -2954,6 +3081,7 @@ async fn reconcile_session_from_catalog(
     }
 
     let inner = match session_inner_from_desired(
+        subc,
         catalog.generation,
         desired,
         routes,
@@ -3336,7 +3464,8 @@ impl SubcMcpServer {
         let Some(binding) = self.state.private_binding(&args.name) else {
             return Err(unknown_tool_error(&args.name));
         };
-        self.call_bound_tool(binding, args.arguments, context).await
+        self.dispatch_bound_tool(binding, args.arguments, context)
+            .await
     }
 
     async fn call_tool_over_route(
@@ -3347,8 +3476,21 @@ impl SubcMcpServer {
         let Some(binding) = self.state.direct_binding(&request.name) else {
             return Err(unknown_tool_error(&request.name));
         };
-        self.call_bound_tool(binding, request.arguments.unwrap_or_default(), context)
+        self.dispatch_bound_tool(binding, request.arguments.unwrap_or_default(), context)
             .await
+    }
+
+    async fn dispatch_bound_tool(
+        &self,
+        binding: ToolBinding,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        if let ToolDispatch::AckOnly { acks } = &binding.dispatch {
+            acks.fetch_add(1, Ordering::Relaxed);
+            return ack_only_tool_result();
+        }
+        self.call_bound_tool(binding, arguments, context).await
     }
 
     async fn call_bound_tool(
@@ -3489,6 +3631,14 @@ fn lexical_search_rank(tool: &ExposedTool, query: &str) -> Option<usize> {
                 .all(|token| name.contains(token) || description.contains(token)))
         .then_some(3)
     }
+}
+
+fn ack_only_tool_result() -> std::result::Result<CallToolResult, ErrorData> {
+    serde_json::from_value(serde_json::json!({
+        "content": [{ "type": "text", "text": ACK_ONLY_TOOL_RESPONSE_TEXT }],
+        "isError": false,
+    }))
+    .map_err(mcp_internal_error)
 }
 
 fn json_tool_result(value: serde_json::Value) -> std::result::Result<CallToolResult, ErrorData> {
@@ -4374,7 +4524,7 @@ mod tests {
                         "defaultEnabled": false,
                         "overrides": {
                           "read": true,
-                          "write": { "enabled": false, "description": "curated write" },
+                          "write": { "enabled": false, "description": "curated write", "mode": "ack_only" },
                           "drop_me": null
                         }
                       }
@@ -4391,6 +4541,7 @@ mod tests {
         assert_eq!(tools.default_enabled, Some(false));
         assert_eq!(tools.overrides["read"].enabled, Some(true));
         assert_eq!(tools.overrides["write"].enabled, Some(false));
+        assert_eq!(tools.overrides["write"].mode, Some(ToolMode::AckOnly));
         assert_eq!(
             tools.overrides["write"].description.as_deref(),
             Some("curated write")
@@ -4445,6 +4596,28 @@ mod tests {
         assert!(
             null_inside_object.contains("enabled must be omitted instead of null"),
             "unexpected object-null error: {null_inside_object}"
+        );
+
+        let mode_null = parse_gateway_config_doc(
+            r#"
+            {
+              "version": 1,
+              "providers": {
+                "aft": {
+                  "tools": {
+                    "overrides": { "read": { "mode": null } }
+                  }
+                }
+              }
+            }
+            "#,
+            Path::new("mode-null-object.jsonc"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            mode_null.contains("mode must be omitted instead of null"),
+            "unexpected mode-null error: {mode_null}"
         );
     }
 
@@ -4577,6 +4750,67 @@ mod tests {
     }
 
     #[test]
+    fn project_tier_can_narrow_tool_mode_but_cannot_widen_ack_only() {
+        let project_narrowed = compose_test_config(
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "providers": {
+                    "aft": {
+                      "tools": { "overrides": { "read": { "mode": "forward" } } }
+                    }
+                  }
+                }
+                "#,
+            ),
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "providers": {
+                    "aft": {
+                      "tools": { "overrides": { "read": { "mode": "ack_only" } } }
+                    }
+                  }
+                }
+                "#,
+            ),
+            DEFAULT_HARNESS,
+        );
+        assert_eq!(project_narrowed.tool_mode("aft", "read"), ToolMode::AckOnly);
+
+        let attempted_widen = compose_test_config(
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "providers": {
+                    "aft": {
+                      "tools": { "overrides": { "read": { "mode": "ack_only" } } }
+                    }
+                  }
+                }
+                "#,
+            ),
+            Some(
+                r#"
+                {
+                  "version": 1,
+                  "providers": {
+                    "aft": {
+                      "tools": { "overrides": { "read": { "mode": "forward" } } }
+                    }
+                  }
+                }
+                "#,
+            ),
+            DEFAULT_HARNESS,
+        );
+        assert_eq!(attempted_widen.tool_mode("aft", "read"), ToolMode::AckOnly);
+    }
+
+    #[test]
     fn facade_default_disabled_modules_require_global_enable() {
         let baseline = GatewayConfig::facade_default();
         assert!(!baseline.provider_enabled("magic-context"));
@@ -4617,6 +4851,21 @@ mod tests {
             None,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn health_metrics_report_ack_only_acks_by_tool() {
+        let (tx, _rx) = mpsc::channel(1);
+        let relay = ReverseRelay::new(tx, 91);
+        relay
+            .ack_only_counter("fake-aft_fake_read")
+            .fetch_add(2, Ordering::Relaxed);
+
+        let metrics = relay.health_metrics().await;
+        assert_eq!(
+            metrics["ack_only_acks"],
+            serde_json::json!({ "fake-aft_fake_read": 2 })
+        );
     }
 
     #[test]

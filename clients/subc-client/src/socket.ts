@@ -113,10 +113,19 @@ export class SubcSocket {
    * Read one envelope frame. The frozen five-byte prefix is validated before
    * waiting for the rest of the header, so a stale 17-byte v1 sender fails
    * promptly instead of leaving this reader blocked for four bytes.
+   *
+   * `bodyDeadline` is either an absolute epoch-ms deadline (a single total
+   * budget shared with the header read — the bounded handshake read) or
+   * `{ afterHeaderMs }` to start the body budget from header arrival. A
+   * background frame loop waits for the header with an infinite deadline, so it
+   * MUST use `afterHeaderMs`: anchoring the body budget before that idle wait
+   * makes a frame arriving after a quiet stretch longer than the body timeout
+   * instant-reject ("timed out waiting for N bytes") even though its body is
+   * arriving normally.
    */
   async readFrame(
     headerDeadlineMs: number,
-    bodyDeadlineMs: number,
+    bodyDeadline: number | { afterHeaderMs: number },
     onHeader?: () => void,
   ): Promise<Frame> {
     const prefix = await this.readExact(FROZEN_PREFIX_LEN, headerDeadlineMs);
@@ -132,6 +141,8 @@ export class SubcSocket {
       throw new DecodeError(`frame body ${header.len} exceeds max ${MAX_FRAME_BODY_LEN}`, "frame_body_too_large");
     }
     onHeader?.();
+    const bodyDeadlineMs =
+      typeof bodyDeadline === "number" ? bodyDeadline : Date.now() + bodyDeadline.afterHeaderMs;
     const body = header.len === 0 ? new Uint8Array(0) : await this.readExact(header.len, bodyDeadlineMs);
     return { header, body };
   }

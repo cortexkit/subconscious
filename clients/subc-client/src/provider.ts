@@ -606,7 +606,7 @@ export class SubcProvider {
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
     try {
       for (;;) {
-        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, Date.now() + BODY_READ_TIMEOUT_MS);
+        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: BODY_READ_TIMEOUT_MS });
         const keepGoing = await this.dispatch(frame, sock, generation);
         if (!keepGoing) {
           if (this.sock === sock && this.generation === generation) this.closeStarted = true;

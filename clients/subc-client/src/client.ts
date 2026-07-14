@@ -1004,7 +1004,7 @@ export class SubcClient {
         this.readerActive = false;
         const frame = await sock.readFrame(
           Number.POSITIVE_INFINITY,
-          Date.now() + BODY_READ_TIMEOUT_MS,
+          { afterHeaderMs: BODY_READ_TIMEOUT_MS },
           () => {
             this.readerActive = true;
           },

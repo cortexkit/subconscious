@@ -1373,9 +1373,10 @@ async fn mcp_tools_call_returns_result_and_stub_receives_route_body() {
         .await
         .unwrap();
     assert_eq!(result.is_error, Some(false));
-    assert!(
-        result_text(&result).contains("fake-aft tool fake_read called with"),
-        "unexpected tool result: {result:?}"
+    assert_eq!(result.content.len(), 1);
+    assert_eq!(
+        result_text(&result),
+        "fake-aft tool fake_read called with {\"value\":\"hello\"}"
     );
 
     let event = wait_for_stub_event(&harness.events_path, READ_TIMEOUT, |event| {
@@ -1393,6 +1394,108 @@ async fn mcp_tools_call_returns_result_and_stub_receives_route_body() {
             .is_some_and(|token| !token.is_null()),
         "rmcp should supply a progress token and subc-mcp should forward it in the v1 route contract"
     );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_project_ack_only_tool_stays_visible_and_skips_provider_frames() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "fake-aft": {
+          "tools": { "overrides": { "fake_read": { "mode": "forward" } } }
+        }
+      }
+    }
+    "#;
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "fake-aft": {
+          "tools": { "overrides": { "fake_read": { "mode": "ack_only" } } }
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-ack-only",
+        vec![StubProvider::new("fake-aft", &[])],
+        Some(user_config),
+        Some(project_config),
+    )
+    .await;
+
+    let tools = harness.client.peer().list_tools(None).await.unwrap();
+    assert_eq!(tools.tools.len(), 1);
+    assert_eq!(tools.tools[0].name, "fake-aft_fake_read");
+    assert_eq!(
+        tools.tools[0].input_schema.get("type"),
+        Some(&Value::String("object".to_owned()))
+    );
+
+    let provider_events_before = stub_events(&harness.events_path).unwrap();
+    let mut args = JsonObject::new();
+    args.insert("value".to_owned(), json!("ack-only"));
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("fake-aft_fake_read").with_arguments(args))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(result.content.len(), 1);
+    assert_eq!(result_text(&result), "Queued for context compaction.");
+    assert_no_new_stub_events_within(&harness.events_path, &provider_events_before, QUIET_TIMEOUT)
+        .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_project_mode_cannot_widen_user_ack_only() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "fake-aft": {
+          "tools": { "overrides": { "fake_read": { "mode": "ack_only" } } }
+        }
+      }
+    }
+    "#;
+    let project_config = r#"
+    {
+      "version": 1,
+      "providers": {
+        "fake-aft": {
+          "tools": { "overrides": { "fake_read": { "mode": "forward" } } }
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-ack-only-widen",
+        vec![StubProvider::new("fake-aft", &[])],
+        Some(user_config),
+        Some(project_config),
+    )
+    .await;
+
+    let provider_events_before = stub_events(&harness.events_path).unwrap();
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("fake-aft_fake_read"))
+        .await
+        .unwrap();
+
+    assert_eq!(result_text(&result), "Queued for context compaction.");
+    assert_no_new_stub_events_within(&harness.events_path, &provider_events_before, QUIET_TIMEOUT)
+        .await;
 
     harness.shutdown().await;
 }
@@ -2528,6 +2631,59 @@ async fn mcp_search_mode_exposes_meta_surface_and_private_invocation() {
 }
 
 #[tokio::test]
+async fn mcp_search_mode_invoke_honors_ack_only_policy() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "surfaceMode": "search",
+      "providers": {
+        "fake-aft": {
+          "tools": { "overrides": { "fake_read": { "mode": "ack_only" } } }
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-search-ack-only",
+        vec![StubProvider::new("fake-aft", &[])],
+        Some(user_config),
+        None,
+    )
+    .await;
+
+    let mut search_args = JsonObject::new();
+    search_args.insert("query".to_owned(), json!("fake_read"));
+    let search_result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("tools_search").with_arguments(search_args))
+        .await
+        .unwrap();
+    let search_json = result_json(&search_result);
+    assert_eq!(search_json[0]["name"], json!("fake-aft_fake_read"));
+    assert_eq!(search_json[0]["input_schema"]["type"], json!("object"));
+
+    let provider_events_before = stub_events(&harness.events_path).unwrap();
+    let mut invoke_args = JsonObject::new();
+    invoke_args.insert("name".to_owned(), json!("fake-aft_fake_read"));
+    invoke_args.insert("arguments".to_owned(), json!({ "value": "search ack" }));
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("tools_invoke").with_arguments(invoke_args))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(result.content.len(), 1);
+    assert_eq!(result_text(&result), "Queued for context compaction.");
+    assert_no_new_stub_events_within(&harness.events_path, &provider_events_before, QUIET_TIMEOUT)
+        .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_cleans_opened_routes() {
     let label = "mcp-catalog-failure";
     let server = TestServer::start().await;
@@ -3655,6 +3811,21 @@ where
         if let Some(event) = events.iter().find(|event| matches(event)) {
             panic!("unexpected stub event within {wait:?}: {event:?}; events: {events:?}");
         }
+        if Instant::now() >= deadline {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn assert_no_new_stub_events_within(path: &Path, baseline: &[Value], wait: Duration) {
+    let deadline = Instant::now() + wait;
+    loop {
+        let events = stub_events(path).unwrap();
+        assert_eq!(
+            events, baseline,
+            "provider received a frame during an ack-only invocation"
+        );
         if Instant::now() >= deadline {
             return;
         }

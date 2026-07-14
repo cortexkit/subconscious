@@ -5,7 +5,9 @@ use std::{
     env,
     error::Error,
     ffi::{OsStr, OsString},
-    fs, io as stdio,
+    fs,
+    future::Future,
+    io as stdio,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
@@ -296,6 +298,35 @@ impl PendingRelayEntry {
     }
 }
 
+/// Install tracking state only while the pending request still exists. When
+/// teardown wins the race, run cleanup after releasing the pending-map lock.
+async fn install_pending_value_or_cleanup<T, CleanupFuture>(
+    pending: &Mutex<HashMap<PendingKey, PendingRelayEntry>>,
+    key: PendingKey,
+    value: T,
+    install: impl FnOnce(&mut PendingRelayEntry, T),
+    cleanup: impl FnOnce(T) -> CleanupFuture,
+) -> bool
+where
+    CleanupFuture: Future<Output = ()>,
+{
+    let cleanup_value = {
+        let mut pending = pending.lock().await;
+        if let Some(entry) = pending.get_mut(&key) {
+            install(entry, value);
+            None
+        } else {
+            Some(value)
+        }
+    };
+    if let Some(value) = cleanup_value {
+        cleanup(value).await;
+        false
+    } else {
+        true
+    }
+}
+
 /// Counters are allocated with the session policy so an acknowledgment takes
 /// only a relaxed atomic increment.
 #[derive(Debug, Default)]
@@ -555,6 +586,22 @@ impl ReverseRelay {
             peer: host_handle.peer.clone(),
             request_id: host_handle.id.clone(),
         };
+        let cancel_tracked = install_pending_value_or_cleanup(
+            &self.pending,
+            key,
+            cancel_handle.clone(),
+            |entry, cancel| entry.cancel = Some(cancel),
+            |cancel| async move {
+                cancel
+                    .cancel("reverse MCP request torn down before the host request was tracked")
+                    .await;
+            },
+        )
+        .await;
+        if !cancel_tracked {
+            return;
+        }
+
         let relay = self.clone();
         let ttl_deadline = created_at + self.ttl;
         let task = tokio::spawn(async move {
@@ -569,23 +616,14 @@ impl ReverseRelay {
         });
 
         let mut task = Some(task);
-        let mut cancel_if_gone = None;
         {
             let mut pending = self.pending.lock().await;
             if let Some(entry) = pending.get_mut(&key) {
-                entry.cancel = Some(cancel_handle.clone());
                 entry.task = task.take();
-            } else {
-                cancel_if_gone = Some(cancel_handle);
             }
         }
         if let Some(task) = task {
             task.abort();
-        }
-        if let Some(cancel) = cancel_if_gone {
-            cancel
-                .cancel("reverse MCP request was settled before the host request started")
-                .await;
         }
     }
 
@@ -4388,6 +4426,25 @@ fn other_error(message: impl Into<String>) -> BoxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pre_spawn_teardown_runs_untracked_request_cleanup_once() {
+        let pending = Mutex::new(HashMap::new());
+        let cleanup_count = Arc::new(AtomicU64::new(0));
+        let tracked = install_pending_value_or_cleanup(
+            &pending,
+            (7, 3, 11),
+            Arc::clone(&cleanup_count),
+            |_entry, _cleanup_count| unreachable!("missing entry must not install tracking"),
+            |cleanup_count| async move {
+                cleanup_count.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(!tracked);
+        assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+    }
 
     fn parse_test_config(doc: &str) -> RawGatewayConfig {
         parse_gateway_config_doc(doc, Path::new("test-mcp.jsonc")).unwrap()

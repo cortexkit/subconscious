@@ -28,7 +28,7 @@ pub use forwarding::{ForwardingError, ForwardingTable, ModuleEndpointId};
 // in subc-transport (with the authenticated stream). Re-exported here so the
 // `subc_core::{Frame, read_frame, write_frame, ...}` surface stays stable.
 pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
-pub use observability::ConnectedClients;
+pub use observability::{ConnectedClients, DaemonCounters};
 pub use registry::{ChannelState, ConnectionId, ModuleRegistration, Registry, RegistryError};
 pub use router::{
     Backend, EchoBackend, ForwardBackend, FrameSink, RouteCtx, Router, RouterConnection,

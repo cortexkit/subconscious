@@ -67,18 +67,7 @@ async fn watchdog_detects_wire_version_divergence() {
     fs::create_dir_all(&temp_dir).unwrap();
     let connection_file_path = temp_dir.join("subc-conn.json");
     let port = reserve_free_port().await;
-    let live_info = ConnectionInfo {
-        schema: SCHEMA_VERSION,
-        wire_version: Some(PROTOCOL_VERSION),
-        endpoints: vec![Endpoint {
-            host: Ipv4Addr::LOCALHOST.to_string(),
-            port,
-        }],
-        key: generate_key().unwrap(),
-        daemon_id: generate_daemon_id().unwrap(),
-        pid: process::id(),
-        daemon_ver: "test-subc".to_owned(),
-    };
+    let live_info = test_connection_info(port);
     let mut file_info = live_info.clone();
     file_info.wire_version = None;
     write_atomic(&connection_file_path, &file_info).unwrap();
@@ -91,6 +80,31 @@ async fn watchdog_detects_wire_version_divergence() {
         .expect_err("missing wire_version must diverge from a daemon-published file");
     assert_eq!(err.stage(), subc_core::WatchdogStage::ConnectionFile);
     assert!(err.to_string().contains("wire_version"), "error: {err}");
+
+    server_task.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn watchdog_detects_daemon_id_divergence() {
+    let temp_dir = unique_temp_dir("watchdog-daemon-id");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let connection_file_path = temp_dir.join("subc-conn.json");
+    let port = reserve_free_port().await;
+    let live_info = test_connection_info(port);
+    let mut file_info = live_info.clone();
+    file_info.daemon_id = generate_daemon_id().unwrap();
+    assert_ne!(file_info.daemon_id, live_info.daemon_id);
+    write_atomic(&connection_file_path, &file_info).unwrap();
+    let server_task = start_fixed_port_server(port, &live_info).await;
+    let watchdog = DaemonSelfWatchdog::new(live_info, &connection_file_path);
+
+    let err = watchdog
+        .run_once()
+        .await
+        .expect_err("daemon_id must match the live daemon identity");
+    assert_eq!(err.stage(), subc_core::WatchdogStage::ConnectionFile);
+    assert!(err.to_string().contains("daemon_id"), "error: {err}");
 
     server_task.abort();
     let _ = fs::remove_dir_all(&temp_dir);
@@ -341,6 +355,21 @@ async fn reserve_free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn test_connection_info(port: u16) -> ConnectionInfo {
+    ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
+        endpoints: vec![Endpoint {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port,
+        }],
+        key: generate_key().unwrap(),
+        daemon_id: generate_daemon_id().unwrap(),
+        pid: process::id(),
+        daemon_ver: "test-subc".to_owned(),
+    }
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {

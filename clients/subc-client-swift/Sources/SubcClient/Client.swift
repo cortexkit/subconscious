@@ -240,7 +240,7 @@ public final class SubcClient {
             last: false,
             admissionClass: admissionClass
         )
-        try transport.writeAll(encodeFrame(
+        try transport.writeAll(try encodeFrame(
             ty: .cancel,
             flags: flags,
             channel: route.channel,
@@ -474,7 +474,7 @@ public final class SubcClient {
             last: false,
             admissionClass: admissionClass
         )
-        try transport.writeAll(encodeFrame(
+        try transport.writeAll(try encodeFrame(
             ty: .request,
             flags: flags,
             channel: route.channel,
@@ -495,7 +495,7 @@ public final class SubcClient {
             last: false,
             admissionClass: admissionClass
         )
-        try transport.writeAll(encodeFrame(
+        try transport.writeAll(try encodeFrame(
             ty: .request,
             flags: flags,
             channel: 0,
@@ -595,7 +595,7 @@ public final class SubcClient {
             last: false,
             admissionClass: admissionClass
         )
-        try transport.writeAll(encodeFrame(
+        try transport.writeAll(try encodeFrame(
             ty: .goodbye,
             flags: flags,
             channel: route.channel,

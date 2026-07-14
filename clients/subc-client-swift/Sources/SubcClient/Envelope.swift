@@ -104,6 +104,10 @@ public struct Frame: Equatable, Sendable {
     }
 }
 
+public enum FrameEncodeError: Error, Equatable {
+    case bodyTooLarge(len: Int, max: Int)
+}
+
 public enum DecodeError: Error, Equatable, CustomStringConvertible {
     case tooShortForPrefix(have: Int)
     case unsupportedVersion(ver: UInt8)
@@ -238,9 +242,15 @@ public func encodeFrame(
     epoch: UInt32,
     corr: UInt64,
     body: Data
-) -> Data {
+) throws -> Data {
+    guard body.count <= MAX_FRAME_BODY_LEN,
+          let bodyLength = UInt32(exactly: body.count)
+    else {
+        throw FrameEncodeError.bodyTooLarge(len: body.count, max: MAX_FRAME_BODY_LEN)
+    }
+
     let header = EnvelopeHeader(
-        len: UInt32(body.count),
+        len: bodyLength,
         ver: PROTOCOL_VERSION,
         ty: ty,
         flags: flags,

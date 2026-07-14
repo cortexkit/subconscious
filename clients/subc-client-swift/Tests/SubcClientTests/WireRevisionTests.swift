@@ -51,7 +51,7 @@ private func makeFrame(
     json: Any? = nil
 ) throws -> Data {
     let body = try json.map { try JSONSerialization.data(withJSONObject: $0) } ?? Data()
-    return encodeFrame(
+    return try encodeFrame(
         ty: ty,
         flags: flags,
         channel: channel,
@@ -194,6 +194,41 @@ final class EnvelopeRevisionTests: XCTestCase {
             )
         }
         XCTAssertEqual(transport.readSizes, [FROZEN_PREFIX_LEN])
+    }
+
+    func testEncodeRejectsBodyAboveProtocolCap() {
+        let bodyLength = MAX_FRAME_BODY_LEN + 1
+        let body = Data(count: bodyLength)
+
+        XCTAssertThrowsError(try encodeFrame(
+            ty: .request,
+            flags: 0,
+            channel: 1,
+            epoch: 1,
+            corr: 1,
+            body: body
+        )) { error in
+            XCTAssertEqual(
+                error as? FrameEncodeError,
+                .bodyTooLarge(len: bodyLength, max: MAX_FRAME_BODY_LEN)
+            )
+        }
+    }
+
+    func testEncodeAcceptsBodyAtProtocolCap() throws {
+        let body = Data(count: MAX_FRAME_BODY_LEN)
+        let encoded = try encodeFrame(
+            ty: .request,
+            flags: 0,
+            channel: 1,
+            epoch: 1,
+            corr: 1,
+            body: body
+        )
+
+        XCTAssertEqual(encoded.count, HEADER_LEN + MAX_FRAME_BODY_LEN)
+        let header = try decodeHeader(Data(encoded.prefix(HEADER_LEN)))
+        XCTAssertEqual(header.len, UInt32(MAX_FRAME_BODY_LEN))
     }
 }
 

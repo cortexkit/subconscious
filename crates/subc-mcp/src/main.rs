@@ -1030,20 +1030,20 @@ struct SessionInner {
     bindings: HashMap<String, ToolBinding>,
 }
 
+/// Ack-only calls must not write to the provider route because their effect is
+/// applied on a separate transport path. The binding is a sum type so an
+/// ack-only tool carries no route at all: only the forward payload can
+/// type-check into the route writer.
 #[derive(Debug, Clone)]
-struct ToolBinding {
-    module_id: String,
-    route: RouteHandle,
-    bare_tool_name: String,
-    dispatch: ToolDispatch,
+enum ToolBinding {
+    Forward(ForwardBinding),
+    AckOnly { acks: Arc<AtomicU64> },
 }
 
-/// Ack-only calls must not write to the provider route because their effect is
-/// applied on a separate transport path.
 #[derive(Debug, Clone)]
-enum ToolDispatch {
-    Forward,
-    AckOnly { acks: Arc<AtomicU64> },
+struct ForwardBinding {
+    route: RouteHandle,
+    bare_tool_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2241,21 +2241,16 @@ fn session_inner_from_desired(
         })?;
         for desired_tool in provider.tools {
             let exposed_name = desired_tool.exposed_tool.manifest.name.clone();
-            let dispatch = match desired_tool.mode {
-                ToolMode::Forward => ToolDispatch::Forward,
-                ToolMode::AckOnly => ToolDispatch::AckOnly {
+            let binding = match desired_tool.mode {
+                ToolMode::Forward => ToolBinding::Forward(ForwardBinding {
+                    route,
+                    bare_tool_name: desired_tool.bare_tool.name,
+                }),
+                ToolMode::AckOnly => ToolBinding::AckOnly {
                     acks: subc.relay().ack_only_counter(&exposed_name),
                 },
             };
-            bindings.insert(
-                exposed_name.clone(),
-                ToolBinding {
-                    module_id: provider.module_id.clone(),
-                    route,
-                    bare_tool_name: desired_tool.bare_tool.name,
-                    dispatch,
-                },
-            );
+            bindings.insert(exposed_name.clone(), binding);
             tools.push(desired_tool.exposed_tool);
         }
     }
@@ -2393,9 +2388,12 @@ impl SessionState {
         inner
             .routes
             .retain(|module_id, _| !removed_modules.contains(module_id));
-        inner
-            .bindings
-            .retain(|_, binding| !removed_modules.contains(&binding.module_id));
+        // Ack-only bindings survive route death: they never touch the route, so
+        // the tool stays serviceable while the provider reconnects.
+        inner.bindings.retain(|_, binding| match binding {
+            ToolBinding::Forward(forward) => forward.route != handle,
+            ToolBinding::AckOnly { .. } => true,
+        });
         let live_names = inner.bindings.keys().cloned().collect::<HashSet<_>>();
         inner
             .tools
@@ -3486,16 +3484,20 @@ impl SubcMcpServer {
         arguments: JsonObject,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
-        if let ToolDispatch::AckOnly { acks } = &binding.dispatch {
-            acks.fetch_add(1, Ordering::Relaxed);
-            return ack_only_tool_result();
+        match binding {
+            ToolBinding::AckOnly { acks } => {
+                acks.fetch_add(1, Ordering::Relaxed);
+                ack_only_tool_result()
+            }
+            ToolBinding::Forward(forward) => {
+                self.call_bound_tool(forward, arguments, context).await
+            }
         }
-        self.call_bound_tool(binding, arguments, context).await
     }
 
     async fn call_bound_tool(
         &self,
-        binding: ToolBinding,
+        binding: ForwardBinding,
         arguments: JsonObject,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {

@@ -924,11 +924,10 @@ struct Inner {
     openings: HashMap<RouteKey, Opening>,
     callbacks: Vec<Callback>,
     closed: bool,
-    reconnecting: bool,
+    reconnect: ReconnectState,
     restored_token: u64,
     reader_task: Option<JoinHandle<()>>,
     writer_task: Option<JoinHandle<()>>,
-    reconnect_task: Option<JoinHandle<()>>,
 }
 
 impl Shared {
@@ -948,11 +947,10 @@ impl Shared {
                 openings: HashMap::new(),
                 callbacks: Vec::new(),
                 closed: false,
-                reconnecting: false,
+                reconnect: ReconnectState::Idle,
                 restored_token: 0,
                 reader_task: None,
                 writer_task: None,
-                reconnect_task: None,
             }),
             notify: Notify::new(),
             close_token: CancellationToken::new(),
@@ -1066,11 +1064,28 @@ impl Shared {
                 if inner.writer.is_some() {
                     return Ok(());
                 }
-                if inner.reconnecting {
+                let generation = inner.generation;
+                let reconnect_is_live = match &inner.reconnect {
+                    ReconnectState::Idle => false,
+                    ReconnectState::Inline { generation: active } => *active == generation,
+                    ReconnectState::Background {
+                        generation: active,
+                        task,
+                    } => *active == generation && !task.is_finished(),
+                };
+                if reconnect_is_live {
                     EnsureAction::Wait
                 } else {
-                    inner.reconnecting = true;
-                    EnsureAction::Lead
+                    let stale_task =
+                        match std::mem::replace(&mut inner.reconnect, ReconnectState::Idle) {
+                            ReconnectState::Background { task, .. } => Some(task),
+                            ReconnectState::Idle | ReconnectState::Inline { .. } => None,
+                        };
+                    inner.reconnect = ReconnectState::Inline { generation };
+                    EnsureAction::Lead {
+                        generation,
+                        stale_task,
+                    }
                 }
             };
 
@@ -1082,13 +1097,16 @@ impl Shared {
                             CallError::not_sent("call deadline elapsed waiting for reconnection")
                         })?;
                 }
-                EnsureAction::Lead => {
-                    let result = timeout_at(deadline, self.reconnect_with_retry()).await;
-                    {
-                        let mut inner = self.lock_inner();
-                        inner.reconnecting = false;
+                EnsureAction::Lead {
+                    generation,
+                    stale_task,
+                } => {
+                    if let Some(handle) = stale_task {
+                        handle.abort();
                     }
-                    self.notify.notify_waiters();
+                    let mut guard = InlineReconnectGuard::new(Arc::clone(self), generation);
+                    let result = timeout_at(deadline, self.reconnect_with_retry(generation)).await;
+                    guard.finish();
                     return match result {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(err)) => Err(CallError::not_sent(err.to_string())),
@@ -1101,52 +1119,68 @@ impl Shared {
         }
     }
 
-    fn spawn_reconnect(self: &Arc<Self>) {
-        let should_spawn = {
+    fn spawn_reconnect(self: &Arc<Self>, generation: u64) -> bool {
+        // Reconnect ownership is fenced by the dropped transport generation. A
+        // newer drop replaces an older attempt instead of letting that attempt
+        // block recovery for the newer transport.
+        let stale_task = {
             let mut inner = self.lock_inner();
-            if inner.closed || inner.writer.is_some() || inner.reconnecting {
-                false
-            } else {
-                inner.reconnecting = true;
-                true
+            if inner.closed || inner.writer.is_some() || inner.generation != generation {
+                return false;
             }
+            let should_spawn = match &inner.reconnect {
+                ReconnectState::Idle => true,
+                ReconnectState::Inline { generation: active } => *active < generation,
+                ReconnectState::Background {
+                    generation: active,
+                    task,
+                } => *active < generation || (*active == generation && task.is_finished()),
+            };
+            if !should_spawn {
+                return false;
+            }
+
+            let stale_task = match std::mem::replace(&mut inner.reconnect, ReconnectState::Idle) {
+                ReconnectState::Background { task, .. } => Some(task),
+                ReconnectState::Idle | ReconnectState::Inline { .. } => None,
+            };
+            let shared = Arc::clone(self);
+            let handle = tokio::spawn(async move {
+                let _result = shared.reconnect_with_retry(generation).await;
+                shared.finish_background_reconnect(generation);
+            });
+            inner.reconnect = ReconnectState::Background {
+                generation,
+                task: handle,
+            };
+            stale_task
         };
-        if !should_spawn {
-            return;
-        }
-
-        let shared = Arc::clone(self);
-        let handle = tokio::spawn(async move {
-            let result = shared.reconnect_with_retry().await;
-            {
-                let mut inner = shared.lock_inner();
-                inner.reconnecting = false;
-            }
-            shared.notify.notify_waiters();
-            if let Err(err) = result {
-                if !shared.close_token.is_cancelled() {
-                    let _ = err;
-                }
-            }
-        });
-
-        let mut inner = self.lock_inner();
-        if inner.closed || inner.writer.is_some() {
+        if let Some(handle) = stale_task {
             handle.abort();
-        } else {
-            inner.reconnect_task = Some(handle);
         }
+        true
     }
 
-    async fn reconnect_with_retry(self: &Arc<Self>) -> Result<(), ConsumerError> {
+    async fn reconnect_with_retry(
+        self: &Arc<Self>,
+        reconnect_generation: u64,
+    ) -> Result<(), ConsumerError> {
         let mut last_error: Option<ConsumerError> = None;
         for attempt in 1..=self.opts.reconnect_backoff.max_attempts {
             if self.close_token.is_cancelled() {
                 return Err(ConsumerError::Closed);
             }
+            if !self.reconnect_attempt_is_current(reconnect_generation) {
+                return Ok(());
+            }
 
             match open_connection(&self.connection_file, self.opts.handshake_timeout).await {
                 Ok(opened) => {
+                    // A newer drop may have installed its own attempt while this
+                    // connection was opening. Do not let the stale attempt replace it.
+                    if !self.reconnect_attempt_is_current(reconnect_generation) {
+                        return Ok(());
+                    }
                     let (generation, epoch) = self.install_reconnected(opened)?;
                     self.schedule_restored(generation, epoch);
                     return Ok(());
@@ -1166,6 +1200,60 @@ impl Shared {
             }
         }
         Err(last_error.unwrap_or(ConsumerError::Closed))
+    }
+
+    fn reconnect_attempt_is_current(&self, generation: u64) -> bool {
+        let inner = self.lock_inner();
+        !inner.closed
+            && inner.writer.is_none()
+            && inner.generation == generation
+            && matches!(
+                &inner.reconnect,
+                ReconnectState::Inline { generation: active }
+                    | ReconnectState::Background {
+                        generation: active,
+                        ..
+                    } if *active == generation
+            )
+    }
+
+    fn finish_inline_reconnect(&self, generation: u64) {
+        let finished = {
+            let mut inner = self.lock_inner();
+            if matches!(
+                &inner.reconnect,
+                ReconnectState::Inline { generation: active } if *active == generation
+            ) {
+                inner.reconnect = ReconnectState::Idle;
+                true
+            } else {
+                false
+            }
+        };
+        if finished {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn finish_background_reconnect(&self, generation: u64) {
+        let completed_task = {
+            let mut inner = self.lock_inner();
+            if !matches!(
+                &inner.reconnect,
+                ReconnectState::Background { generation: active, .. } if *active == generation
+            ) {
+                None
+            } else {
+                match std::mem::replace(&mut inner.reconnect, ReconnectState::Idle) {
+                    ReconnectState::Background { task, .. } => Some(task),
+                    ReconnectState::Idle | ReconnectState::Inline { .. } => unreachable!(),
+                }
+            }
+        };
+        if completed_task.is_some() {
+            drop(completed_task);
+            self.notify.notify_waiters();
+        }
     }
 
     fn schedule_restored(self: &Arc<Self>, generation: u64, epoch: u64) {
@@ -1825,7 +1913,7 @@ impl Shared {
             fail_openings(openings, SharedCallFailure::not_sent(reason.clone()));
             emit_callbacks(callbacks, ConnectionState::Dropped);
             self.notify.notify_waiters();
-            self.spawn_reconnect();
+            let _ = self.spawn_reconnect(generation);
         }
     }
 
@@ -1839,6 +1927,10 @@ impl Shared {
             inner.writer = None;
             inner.route_epochs.clear();
             self.close_token.cancel();
+            let reconnect = match std::mem::replace(&mut inner.reconnect, ReconnectState::Idle) {
+                ReconnectState::Background { task, .. } => Some(task),
+                ReconnectState::Idle | ReconnectState::Inline { .. } => None,
+            };
             (
                 inner
                     .pending
@@ -1857,7 +1949,7 @@ impl Shared {
                     .collect::<Vec<_>>(),
                 inner.reader_task.take(),
                 inner.writer_task.take(),
-                inner.reconnect_task.take(),
+                reconnect,
             )
         };
         for route in routes {
@@ -2106,7 +2198,24 @@ enum InstallKind {
 
 enum EnsureAction {
     Wait,
-    Lead,
+    Lead {
+        generation: u64,
+        stale_task: Option<JoinHandle<()>>,
+    },
+}
+
+/// The reconnect state is fenced by the generation whose transport failed. A
+/// newer generation can replace an older attempt, and completion only changes
+/// the state when its generation still owns the slot.
+enum ReconnectState {
+    Idle,
+    Inline {
+        generation: u64,
+    },
+    Background {
+        generation: u64,
+        task: JoinHandle<()>,
+    },
 }
 
 /// Outcome of the install decision after a route.open response arrives, taken under
@@ -2184,6 +2293,35 @@ impl Drop for OpeningGuard {
                     "route.open future was cancelled",
                 )),
             );
+        }
+    }
+}
+
+struct InlineReconnectGuard {
+    shared: Arc<Shared>,
+    generation: u64,
+    finished: bool,
+}
+
+impl InlineReconnectGuard {
+    fn new(shared: Arc<Shared>, generation: u64) -> Self {
+        Self {
+            shared,
+            generation,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.shared.finish_inline_reconnect(self.generation);
+        self.finished = true;
+    }
+}
+
+impl Drop for InlineReconnectGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.shared.finish_inline_reconnect(self.generation);
         }
     }
 }
@@ -3031,6 +3169,36 @@ mod tests {
             },
         };
         assert!(is_reconnect_transient(&absent));
+    }
+
+    #[tokio::test]
+    async fn newer_drop_supersedes_reconnect_and_ignores_stale_completion() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let stale_task = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut inner = shared.lock_inner();
+            inner.generation = 2;
+            inner.reconnect = ReconnectState::Background {
+                generation: 1,
+                task: stale_task,
+            };
+        }
+
+        assert!(shared.spawn_reconnect(2));
+        assert!(matches!(
+            &shared.lock_inner().reconnect,
+            ReconnectState::Background { generation, .. } if *generation == 2
+        ));
+
+        shared.finish_background_reconnect(1);
+        assert!(matches!(
+            &shared.lock_inner().reconnect,
+            ReconnectState::Background { generation, .. } if *generation == 2
+        ));
+        shared.close_sync("test complete");
     }
 
     #[test]

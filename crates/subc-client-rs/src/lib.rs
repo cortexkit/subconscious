@@ -706,6 +706,9 @@ where
     let handle = ModuleHandle::new(&ack, tx.clone(), connection_token, close_token);
     let serve_handle = handle.clone();
     let serve_future = Box::pin(async move {
+        // Connection loss ends this serve future. Module serving retains no
+        // reconnect task or in-flight reconnect gate; a supervisor that needs
+        // recovery starts a fresh serve_with_handle invocation.
         let loop_result =
             module_loop(read_half, tx, Arc::clone(&handler), serve_handle.clone()).await;
         serve_handle.close_connection();

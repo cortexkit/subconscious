@@ -1206,7 +1206,8 @@ export class SubcClient {
   }
 
   private parseJson(frame: Frame): unknown {
-    return JSON.parse(Buffer.from(frame.body).toString("utf8"));
+    const b = frame.body;
+    return JSON.parse(Buffer.from(b.buffer, b.byteOffset, b.byteLength).toString("utf8"));
   }
 }
 

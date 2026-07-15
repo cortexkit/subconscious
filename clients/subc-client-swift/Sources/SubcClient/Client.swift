@@ -284,6 +284,30 @@ public final class SubcClient {
             session: session,
             admissionClass: admissionClass
         )
+        var subscribeRouteForCleanup: RouteHandle?
+        var subscribeCorrForCleanup: UInt64?
+        var subscribeKeyForCleanup: InFlightKey?
+        var sendKeyForCleanup: InFlightKey?
+        var subscriptionEnded = false
+        defer {
+            if let subscribeKeyForCleanup { inFlight.remove(subscribeKeyForCleanup) }
+            if let sendKeyForCleanup { inFlight.remove(sendKeyForCleanup) }
+            if !subscriptionEnded,
+               let subscribeRouteForCleanup,
+               let subscribeCorrForCleanup
+            {
+                try? cancel(
+                    route: subscribeRouteForCleanup,
+                    corr: subscribeCorrForCleanup,
+                    admissionClass: admissionClass
+                )
+            }
+            try? closeRoute(commandRoute, admissionClass: admissionClass)
+            if let subscribeRouteForCleanup {
+                try? closeRoute(subscribeRouteForCleanup, admissionClass: admissionClass)
+            }
+        }
+
         let subscribeRoute = try routeOpenManagementSurface(
             moduleId: moduleId,
             projectRoot: projectRoot,
@@ -291,8 +315,10 @@ public final class SubcClient {
             session: session,
             admissionClass: admissionClass
         )
+        subscribeRouteForCleanup = subscribeRoute
 
         let subscribeCorr = try allocateCorr()
+        subscribeCorrForCleanup = subscribeCorr
         let fromValue: Any
         if let cursor = fromCursor {
             fromValue = ["wal_seq": cursor.walSeq, "sub_index": cursor.subIndex]
@@ -338,10 +364,8 @@ public final class SubcClient {
             corr: sendCorr
         )
         inFlight.formUnion([subscribeKey, sendKey])
-        defer {
-            inFlight.remove(subscribeKey)
-            inFlight.remove(sendKey)
-        }
+        subscribeKeyForCleanup = subscribeKey
+        sendKeyForCleanup = sendKey
 
         var lastCursor: SubscribeCursor? = fromCursor
         while true {
@@ -377,6 +401,7 @@ public final class SubcClient {
                     if event.type == "run_finished" { return lastCursor }
                 }
             case .streamEnd:
+                subscriptionEnded = true
                 return lastCursor
             case .error:
                 throw remoteError(prefix: "subscribe stream error", body: frame.body)

@@ -1030,6 +1030,12 @@ struct ConfigSnapshot {
     files: ConfigFileSnapshot,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PolicyRefreshChanges {
+    tools_changed: bool,
+    prompts_changed: bool,
+}
+
 #[derive(Debug)]
 struct SessionState {
     config: RwLock<ConfigSnapshot>,
@@ -2774,7 +2780,14 @@ fn validate_raw_prompts(
     let MaybeSet::Value(prompts) = prompts else {
         return Ok(());
     };
+    let known_prompts = prompts::prompt_names();
     for (prompt_name, override_value) in &prompts.overrides {
+        if !known_prompts.contains(&prompt_name.as_str()) {
+            return Err(other_error(format!(
+                "invalid MCP config {}: {prefix}.overrides.{prompt_name} names an unknown prompt",
+                path.display()
+            )));
+        }
         if let RawPromptOverrideValue::Object(object) = override_value {
             if matches!(object.enabled, MaybeSet::Null) {
                 return Err(other_error(format!(
@@ -3352,6 +3365,48 @@ async fn reconcile_session_from_catalog(
     Ok(changed)
 }
 
+async fn refresh_policy_if_changed(
+    subc: &SubcClient,
+    state: &SessionState,
+    relay_session: &Arc<RelaySession>,
+    reconcile_gate: &Arc<Mutex<()>>,
+) -> Result<Option<PolicyRefreshChanges>> {
+    let snapshot = state.config_snapshot();
+    if snapshot.effective.refresh != RefreshMode::Immediate {
+        return Ok(None);
+    }
+
+    let _reconcile_guard = reconcile_gate.lock().await;
+    let snapshot = state.config_snapshot();
+    if snapshot.effective.refresh != RefreshMode::Immediate || !config_files_changed(&snapshot)? {
+        return Ok(None);
+    }
+
+    let next_config = read_gateway_config(&state.identity.project_root, &state.identity.harness)?;
+    let prompts_changed =
+        snapshot.effective.visible_prompt_names() != next_config.effective.visible_prompt_names();
+    let catalog = catalog_list(subc).await?;
+    let tools_changed =
+        reconcile_session_from_catalog(subc, state, relay_session, catalog, &next_config.effective)
+            .await?;
+    state.replace_config(next_config);
+
+    Ok(Some(PolicyRefreshChanges {
+        tools_changed,
+        prompts_changed,
+    }))
+}
+
+async fn notify_policy_refresh(peer: &Peer<RoleServer>, changes: PolicyRefreshChanges) -> bool {
+    if changes.tools_changed && !notify_tool_list_changed(peer).await {
+        return false;
+    }
+    if changes.prompts_changed && !notify_prompt_list_changed(peer).await {
+        return false;
+    }
+    true
+}
+
 async fn session_lifecycle(
     subc: SubcClient,
     state: Arc<SessionState>,
@@ -3361,11 +3416,31 @@ async fn session_lifecycle(
     mut shutdown: watch::Receiver<bool>,
     reconcile_gate: Arc<Mutex<()>>,
 ) {
+    let mut config_poll = time::interval(CATALOG_POLL_INTERVAL);
+    config_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
+                }
+            }
+            _ = config_poll.tick() => {
+                match refresh_policy_if_changed(
+                    &subc,
+                    &state,
+                    &relay_session,
+                    &reconcile_gate,
+                ).await {
+                    Ok(Some(changes)) => {
+                        if !notify_policy_refresh(&peer, changes).await {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("subc-mcp module: keeping previous MCP policy after proactive config refresh failed: {error}");
+                    }
                 }
             }
             event = events.recv() => {
@@ -3677,47 +3752,21 @@ impl SubcMcpServer {
         &self,
         peer: &Peer<RoleServer>,
     ) -> std::result::Result<(), ErrorData> {
-        let snapshot = self.state.config_snapshot();
-        if snapshot.effective.refresh != RefreshMode::Immediate {
-            return Ok(());
-        }
-
-        let _reconcile_guard = self.reconcile_gate.lock().await;
-        let snapshot = self.state.config_snapshot();
-        if snapshot.effective.refresh != RefreshMode::Immediate {
-            return Ok(());
-        }
-        if !config_files_changed(&snapshot).map_err(mcp_internal_error)? {
-            return Ok(());
-        }
-
-        let next_config = read_gateway_config(
-            &self.state.identity.project_root,
-            &self.state.identity.harness,
-        )
-        .map_err(mcp_internal_error)?;
-        let prompts_changed = snapshot.effective.visible_prompt_names()
-            != next_config.effective.visible_prompt_names();
-        let catalog = catalog_list(&self.subc).await.map_err(mcp_internal_error)?;
-        let changed = reconcile_session_from_catalog(
+        let Some(changes) = refresh_policy_if_changed(
             &self.subc,
             &self.state,
             &self.relay_session,
-            catalog,
-            &next_config.effective,
+            &self.reconcile_gate,
         )
         .await
-        .map_err(mcp_internal_error)?;
-        self.state.replace_config(next_config);
-        if changed && !notify_tool_list_changed(peer).await {
+        .map_err(mcp_internal_error)?
+        else {
+            return Ok(());
+        };
+
+        if !notify_policy_refresh(peer, changes).await {
             return Err(ErrorData::internal_error(
-                "failed to notify MCP tools/list_changed after immediate policy refresh",
-                None,
-            ));
-        }
-        if prompts_changed && !notify_prompt_list_changed(peer).await {
-            return Err(ErrorData::internal_error(
-                "failed to notify MCP prompts/list_changed after immediate policy refresh",
+                "failed to notify MCP list change after immediate policy refresh",
                 None,
             ));
         }
@@ -5017,6 +5066,22 @@ mod tests {
             mode_null.contains("mode must be omitted instead of null"),
             "unexpected mode-null error: {mode_null}"
         );
+    }
+
+    #[test]
+    fn prompt_policy_rejects_unknown_override_names() {
+        let error = parse_gateway_config_doc(
+            r#"{
+                "version": 1,
+                "prompts": { "overrides": { "stats": true } }
+            }"#,
+            Path::new("prompt-typo.jsonc"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("prompts.overrides.stats"), "{error}");
+        assert!(error.contains("unknown prompt"), "{error}");
     }
 
     #[test]

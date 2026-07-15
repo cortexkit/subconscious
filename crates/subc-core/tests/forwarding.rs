@@ -294,6 +294,65 @@ async fn health_prober_failing_restart_exhausts_budget_to_disabled() {
     .await;
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_restart_spawn_failure_marks_failed_and_start_recovers() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let server = TestServer::start().await;
+    let supervisor =
+        supervisor(&server, 10, Duration::from_millis(10)).with_health_config(health_config(
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+            1,
+            HealthAction::Report,
+            HealthAction::Restart,
+            false,
+        ));
+    let module_id = "fake-aft-health-respawn-fails";
+    let program = server.temp_dir.join("health-respawn-program");
+    let real_program = Path::new(env!("CARGO_BIN_EXE_fake-aft-stub"));
+    fs::copy(real_program, &program).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut spec = stub_spec_with_env(
+        &server,
+        module_id,
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "failing"),
+        ],
+    );
+    spec.program = program.clone();
+    let module = supervisor.spawn(spec).unwrap();
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+
+    // The running process keeps its executable mapped after unlink on Unix, while
+    // the health-triggered replacement deterministically fails at Command::spawn.
+    fs::remove_file(&program).unwrap();
+    let failed = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Failed && !status.registration_active
+    })
+    .await;
+    assert!(failed.enabled);
+    assert_eq!(failed.pid, None);
+    assert_eq!(
+        subc_core::ModuleProcessLiveness::process_live(server.process_liveness.as_ref(), module_id),
+        None,
+        "failed health respawn must be removed from process-liveness tracking"
+    );
+
+    fs::copy(real_program, &program).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(module.set_enabled(true).await.unwrap());
+    wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+
+    module.stop().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_prober_degraded_report_is_not_restarted_and_is_observable() {
     let server = TestServer::start().await;

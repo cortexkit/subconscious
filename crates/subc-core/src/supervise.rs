@@ -1683,9 +1683,18 @@ async fn health_restart_child(
     .await?;
     sleep(runtime.restart_policy.backoff).await;
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-    let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
-    *child = Some(next_child);
-    Ok(())
+    match spawn_and_mark_running(spec, runtime, snapshot) {
+        Ok(next_child) => {
+            *child = Some(next_child);
+            Ok(())
+        }
+        Err(err) => {
+            fail_snapshot(snapshot, Some(&spec.module_id), None);
+            process_liveness.untrack_if_current(&spec.module_id, snapshot);
+            *child = None;
+            Err(err)
+        }
+    }
 }
 
 fn record_health_action(snapshot: &SharedSnapshot, module_id: &str, action: String, now_ms: u64) {

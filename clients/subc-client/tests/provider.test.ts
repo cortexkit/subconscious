@@ -371,6 +371,48 @@ describe("SubcProvider serve loop", () => {
     ]);
     expect(provider.liveRoutes.get(8)?.epoch).toBe(5);
   });
+
+  test("cancel handles write rejection and still sends on a healthy socket", async () => {
+    const failed = providerControlHarness(rejectingWritableSocket());
+    const unhandled = await recordUnhandledRejections(() => {
+      expect(failed.provider.cancel(failed.handle, 42n)).toBeUndefined();
+    });
+    expect(unhandled).toEqual([]);
+
+    const writes: Frame[] = [];
+    const healthy = providerControlHarness(fakeWritableSocket(writes));
+    expect(healthy.provider.cancel(healthy.handle, 43n)).toBeUndefined();
+    await Promise.resolve();
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.header).toMatchObject({
+      ty: FrameType.Cancel,
+      channel: healthy.handle.channel,
+      epoch: healthy.handle.epoch,
+      corr: 43n,
+    });
+  });
+
+  test("closeRoute handles write rejection and still sends on a healthy socket", async () => {
+    const failed = providerControlHarness(rejectingWritableSocket());
+    const unhandled = await recordUnhandledRejections(() => {
+      expect(failed.provider.closeRoute(failed.handle)).toBeUndefined();
+    });
+    expect(unhandled).toEqual([]);
+
+    const writes: Frame[] = [];
+    const healthy = providerControlHarness(fakeWritableSocket(writes));
+    expect(healthy.provider.closeRoute(healthy.handle)).toBeUndefined();
+    await Promise.resolve();
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.header).toMatchObject({
+      ty: FrameType.Goodbye,
+      channel: healthy.handle.channel,
+      epoch: healthy.handle.epoch,
+      corr: 0n,
+    });
+  });
 });
 
 describe("SubcProvider managed reconnect", () => {
@@ -1022,6 +1064,61 @@ function fakeWritableSocket(writes: Frame[]): unknown {
       // Unit tests use this fake only to observe writes; there is no OS socket to close.
     },
   };
+}
+
+function rejectingWritableSocket(): unknown {
+  return {
+    write(): Promise<void> {
+      return Promise.reject(new Error("write failed"));
+    },
+  };
+}
+
+function providerControlHarness(
+  sock: unknown,
+  channel = 8,
+  epoch = 3,
+): { provider: SubcProvider; handle: RouteHandle } {
+  const provider = Object.create(SubcProvider.prototype) as SubcProvider;
+  const internals = provider as unknown as {
+    sock: unknown;
+    generation: number;
+    connectionToken: object;
+    closeStarted: boolean;
+    closedErr: Error | null;
+    inflight: Map<string, AbortController>;
+    pending: Map<string, unknown>;
+    liveRoutes: Map<number, RouteHandle>;
+  };
+  const token = newConnectionToken();
+  const handle = createRouteHandle(channel, epoch, token);
+  Object.assign(internals, {
+    sock,
+    generation: 1,
+    connectionToken: token,
+    closeStarted: false,
+    closedErr: null,
+    inflight: new Map(),
+    pending: new Map(),
+    liveRoutes: new Map([[channel, handle]]),
+  });
+  return { provider, handle };
+}
+
+async function recordUnhandledRejections(run: () => void): Promise<unknown[]> {
+  const reasons: unknown[] = [];
+  const record = (reason: unknown): void => {
+    reasons.push(reason);
+  };
+  process.on("unhandledRejection", record);
+  try {
+    run();
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return reasons;
+  } finally {
+    process.off("unhandledRejection", record);
+  }
 }
 
 function createManualSleep(): {

@@ -14,6 +14,35 @@ test("outbound write buffer preserves the exact slice without copying", () => {
   expect(writeBuffer.buffer).toBe(bytes.buffer);
 });
 
+test("public write owns queued bytes while the caller reuses its source buffer", async () => {
+  const queued: Buffer[] = [];
+  let completeWrite!: () => void;
+  const socket = Object.create(SubcSocket.prototype) as SubcSocket;
+  const internals = socket as unknown as {
+    sock: {
+      write(bytes: Buffer, callback: (error?: Error | null) => void): boolean;
+    };
+    closedErr: Error | null;
+  };
+  internals.closedErr = null;
+  internals.sock = {
+    write(bytes, callback) {
+      queued.push(bytes);
+      completeWrite = () => callback();
+      return false;
+    },
+  };
+  const source = new Uint8Array([1, 2, 3]);
+
+  const completed = socket.write(source, Date.now() + 1_000);
+  source.fill(9);
+  const observedAfterMutation = [...queued[0]!];
+  completeWrite();
+  await completed;
+
+  expect(observedAfterMutation).toEqual([1, 2, 3]);
+});
+
 test("prefix-first reader rejects a stale 17-byte v1 header without waiting for byte 18", async () => {
   const server = createServer((socket) => {
     const staleHeader = new Uint8Array(17);

@@ -216,6 +216,80 @@ describe("SubcProvider serve loop", () => {
     releaseHandler();
   });
 
+  test("does not invoke a capacity-queued handler after its request is cancelled", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const gate = createPermitGate(1);
+    const token = newConnectionToken();
+    const handle = createRouteHandle(7, 1, token);
+    const handled: number[] = [];
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      pending: Map<string, unknown>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      requestGate: { acquire(): Promise<() => void> };
+      opts: { handler: (_handle: RouteHandle, body: Uint8Array) => Promise<Uint8Array> };
+      handleDataRequest(frame: Frame, handle: RouteHandle, sock: unknown, generation: number): Promise<void>;
+      dispatch(frame: Frame, sock: unknown, generation: number): Promise<boolean>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.pending = new Map();
+    provider.liveRoutes = new Map([[handle.channel, handle]]);
+    provider.connectionToken = token;
+    provider.requestGate = gate;
+    provider.opts = {
+      handler: async (_handle, body) => {
+        const request = parseJson(body) as { n: number };
+        handled.push(request.n);
+        if (request.n === 1) await firstBlocked;
+        return encodeJson({ n: request.n });
+      },
+    };
+
+    const first = provider.handleDataRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 1n, encodeJson({ n: 1 })),
+      handle,
+      sock,
+      1,
+    );
+    await waitForCondition(() => handled.length === 1, "first handler to hold provider capacity");
+
+    const cancelled = provider.handleDataRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 2n, encodeJson({ n: 2 })),
+      handle,
+      sock,
+      1,
+    );
+    await waitForCondition(() => provider.inflight.has("7:1:2"), "queued request registration");
+    await provider.dispatch(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Cancel, buildFlags(false, Priority.Interactive, false), 7, 1, 2n, new Uint8Array(0)),
+      sock,
+      1,
+    );
+
+    releaseFirst();
+    await Promise.all([first, cancelled]);
+
+    expect(handled).toEqual([1]);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.header.corr).toBe(1n);
+    expect(parseJson(writes[0]!.body)).toEqual({ n: 1 });
+    expect(provider.inflight.size).toBe(0);
+  });
+
   // Wire spec 3.3.0: a route.bind on an installed channel with a strictly higher
   // epoch replaces the stale install (the daemon freed that binding; its route-gone
   // GOODBYE is best-effort and can be dropped), firing the replaced install's

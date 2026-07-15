@@ -12,6 +12,7 @@ use std::{
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs,
+    io::{self, IsTerminal},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process,
@@ -105,7 +106,7 @@ fn discover_external_domains() -> Vec<String> {
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set";
 
-const QUOTA_HELP: &str = "ck quota — AI-provider quota and usage windows\n\nusage: ck [--json] quota [<provider-id>]\n\n  ck quota            all tracked providers\n  ck quota claude     one provider's windows in detail";
+const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
 const HEALTH_HELP: &str =
     "ck health — one-line health for every supervised module\n\nusage: ck [--json] health";
@@ -157,9 +158,10 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }
         Command::Health => health(&mut client, args.json).await,
         Command::Daemon => daemon(&mut client, args.json).await,
-        Command::Quota { provider_id } => {
-            quota(&mut client, provider_id.as_deref(), args.json).await
-        }
+        Command::Quota {
+            provider_id,
+            verbose,
+        } => quota(&mut client, provider_id.as_deref(), args.json, verbose).await,
         Command::Help(_) | Command::External { .. } => unreachable!("handled before connect"),
     }
 }
@@ -192,6 +194,7 @@ enum Command {
     Daemon,
     Quota {
         provider_id: Option<String>,
+        verbose: bool,
     },
     /// Explicit help request (bare `ck`, `ck <domain>` with no verb, `ck help …`,
     /// `-h/--help`): prints to stdout and exits 0 without touching the daemon.
@@ -604,6 +607,7 @@ async fn quota(
     client: &mut CkClient,
     provider_filter: Option<&str>,
     json_output: bool,
+    verbose: bool,
 ) -> Result<(), CkError> {
     ensure_quota_module_registered(client).await?;
     let project_root = env::current_dir()
@@ -630,7 +634,7 @@ async fn quota(
     if json_output {
         print_json(&body)?;
     } else {
-        print_quota_table(&providers, provider_filter);
+        print_quota_table(&providers, provider_filter, verbose);
     }
     Ok(())
 }
@@ -672,6 +676,8 @@ fn provider_ids_sorted(providers: &[Value]) -> Vec<String> {
     ids
 }
 
+const QUOTA_PROGRESS_BAR_WIDTH: usize = 16;
+
 fn account_label(entry: &Value) -> String {
     entry
         .get("account")
@@ -679,6 +685,30 @@ fn account_label(entry: &Value) -> String {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_default()
+}
+
+fn table_account_label(entry: &Value) -> String {
+    shorten_uuid_label(&account_label(entry))
+}
+
+fn shorten_uuid_label(label: &str) -> String {
+    if is_uuid_shaped(label) {
+        label[..8].to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+fn is_uuid_shaped(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 fn entry_error_detail(entry: &Value) -> Option<String> {
@@ -689,75 +719,113 @@ fn entry_error_detail(entry: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn print_quota_table(providers: &[Value], filter: Option<&str>) {
-    let mut rows = Vec::new();
-    let mut sorted = providers.to_vec();
-    sorted.sort_by_key(provider_id);
+fn quota_entry_is_connected(entry: &Value) -> bool {
+    // Connected is signalled by the presence of a usage object on the wire; a
+    // disconnected provider carries an error string and no usage object. The
+    // wire carries no explicit "ok" flag, so usage presence is the signal.
+    entry.get("usage").is_some_and(Value::is_object)
+}
 
-    for entry in &sorted {
+fn quota_entries_for_table<'a>(
+    providers: &'a [Value],
+    filter: Option<&str>,
+    verbose: bool,
+) -> Vec<&'a Value> {
+    let mut entries = providers.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| provider_id(entry));
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let matches_filter =
+                filter.is_none() || filter.is_some_and(|wanted| provider_id(entry) == wanted);
+            matches_filter && (filter.is_some() || verbose || quota_entry_is_connected(entry))
+        })
+        .collect()
+}
+
+fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
+    let color_enabled = ansi_color_enabled();
+    let show_status = verbose || filter.is_some();
+    let mut rows = Vec::new();
+
+    for entry in quota_entries_for_table(providers, filter, verbose) {
         let id = provider_id(entry);
-        if filter.is_some_and(|wanted| wanted != id) {
-            continue;
-        }
-        let account = account_label(entry);
+        let account = table_account_label(entry);
         let error_detail = entry_error_detail(entry);
         let window_rows = quota_window_rows_for_entry(entry);
 
         if window_rows.is_empty() {
-            let detail = error_detail
-                .as_deref()
-                .map(truncate_cell)
-                .unwrap_or_else(|| "-".to_string());
-            rows.push(vec![
+            let mut row = vec![
                 id,
                 account,
                 "-".to_string(),
                 "-".to_string(),
                 "-".to_string(),
-                detail,
-            ]);
+            ];
+            if show_status {
+                row.push(
+                    error_detail
+                        .as_deref()
+                        .map(truncate_cell)
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            rows.push(row);
             continue;
         }
 
-        for (idx, (label, window)) in window_rows.iter().enumerate() {
-            let used = format!("{:>6}", format_used_percent_rate_window(window));
-            let resets = format_resets_at_rate_window(window);
-            let status_cell = if idx == 0 {
-                error_detail
-                    .as_deref()
-                    .map(truncate_cell)
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let provider_cell = if idx == 0 { id.clone() } else { String::new() };
-            let account_cell = if idx == 0 {
-                account.clone()
-            } else {
-                String::new()
-            };
-            rows.push(vec![
-                provider_cell,
-                account_cell,
+        for (index, (label, window)) in window_rows.iter().enumerate() {
+            let mut row = vec![
+                if index == 0 {
+                    id.clone()
+                } else {
+                    String::new()
+                },
+                if index == 0 {
+                    account.clone()
+                } else {
+                    String::new()
+                },
                 label.clone(),
-                used,
-                resets,
-                status_cell,
-            ]);
+                format_used_percent_rate_window(window, color_enabled),
+                format_resets_at_rate_window(window),
+            ];
+            if show_status {
+                row.push(if index == 0 {
+                    error_detail
+                        .as_deref()
+                        .map(truncate_cell)
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                });
+            }
+            rows.push(row);
         }
     }
 
-    print_table(
-        &[
+    let headers = if show_status {
+        vec![
             "provider",
             "account",
             "window",
             "used%",
             "resets",
             "status/detail",
-        ],
-        rows,
-    );
+        ]
+    } else {
+        vec!["provider", "account", "window", "used%", "resets"]
+    };
+    print_table(&headers, rows);
+
+    if filter.is_none() && !verbose {
+        let disconnected = providers
+            .iter()
+            .filter(|entry| !quota_entry_is_connected(entry))
+            .count();
+        let summary = format!("{disconnected} providers not connected (--verbose to list)");
+        println!("{}", dim_text(&summary, color_enabled));
+    }
 }
 
 fn quota_window_rows_for_entry(entry: &Value) -> Vec<(String, Value)> {
@@ -829,18 +897,62 @@ fn label_from_window_minutes(minutes: i64) -> String {
     }
 }
 
-fn format_used_percent_rate_window(window: &Value) -> String {
+fn format_used_percent_rate_window(window: &Value, color_enabled: bool) -> String {
     let used = window.get("usedPercent").and_then(Value::as_f64);
     match used {
-        Some(value) => {
-            let rounded = (value * 10.0).round() / 10.0;
-            if (rounded - rounded.round()).abs() < f64::EPSILON {
-                format!("{:.0}", rounded)
-            } else {
-                format!("{rounded:.1}")
-            }
-        }
+        Some(value) => format!(
+            "{} {:>5}%",
+            format_quota_progress_bar(value, color_enabled),
+            format_used_percent(value)
+        ),
         None => "-".to_string(),
+    }
+}
+
+fn format_used_percent(value: f64) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if (rounded - rounded.round()).abs() < f64::EPSILON {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
+fn format_quota_progress_bar(used_percent: f64, color_enabled: bool) -> String {
+    let percent = if used_percent.is_finite() {
+        used_percent.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let filled = ((percent / 100.0) * QUOTA_PROGRESS_BAR_WIDTH as f64).round() as usize;
+    let bar = format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(QUOTA_PROGRESS_BAR_WIDTH - filled)
+    );
+    if !color_enabled {
+        return bar;
+    }
+
+    let color = if percent < 60.0 {
+        32
+    } else if percent <= 85.0 {
+        33
+    } else {
+        31
+    };
+    format!("\x1b[{color}m{bar}\x1b[0m")
+}
+
+fn ansi_color_enabled() -> bool {
+    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+fn dim_text(text: &str, color_enabled: bool) -> String {
+    if color_enabled {
+        format!("\x1b[2m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 
@@ -1158,12 +1270,12 @@ fn truncate_cell(cell: &str) -> String {
 fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
     let mut widths = headers
         .iter()
-        .map(|header| header.len())
+        .map(|header| display_width(header))
         .collect::<Vec<_>>();
     for row in &rows {
         for (idx, cell) in row.iter().enumerate() {
             if let Some(width) = widths.get_mut(idx) {
-                *width = (*width).max(cell.chars().count());
+                *width = (*width).max(display_width(cell));
             }
         }
     }
@@ -1181,14 +1293,38 @@ fn print_row<'a>(cells: impl IntoIterator<Item = &'a str>, widths: &[usize]) {
             print!("  ");
         }
         let width = widths.get(idx).copied().unwrap_or_default();
-        print!("{cell:<width$}");
+        print!(
+            "{cell}{}",
+            " ".repeat(width.saturating_sub(display_width(cell)))
+        );
     }
     println!();
 }
 
+fn display_width(text: &str) -> usize {
+    let mut chars = text.chars();
+    let mut width = 0;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.next() == Some('[') {
+            for sequence_char in chars.by_ref() {
+                if sequence_char.is_ascii() && ('@'..='~').contains(&sequence_char) {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
 fn print_json(value: &Value) -> Result<(), CkError> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    println!("{}", format_json_output(value)?);
     Ok(())
+}
+
+fn format_json_output(value: &Value) -> Result<String, CkError> {
+    Ok(serde_json::to_string_pretty(value)?)
 }
 
 fn modules_array(value: &Value) -> &[Value] {
@@ -1389,11 +1525,21 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             Some(_) => Ok(Command::Help(DAEMON_HELP.into())),
         },
         "quota" => {
-            let provider = tail.first().map(|t| t.to_string_lossy().into_owned());
-            match provider.as_deref() {
+            let mut provider_id = None;
+            let mut verbose = false;
+            for argument in tail {
+                let argument = argument.to_string_lossy();
+                if argument == "--verbose" {
+                    verbose = true;
+                } else if provider_id.is_none() {
+                    provider_id = Some(argument.into_owned());
+                }
+            }
+            match provider_id.as_deref() {
                 Some("-h") | Some("--help") | Some("help") => Ok(Command::Help(QUOTA_HELP.into())),
                 _ => Ok(Command::Quota {
-                    provider_id: provider,
+                    provider_id,
+                    verbose,
                 }),
             }
         }
@@ -1595,5 +1741,108 @@ impl Error for CkError {}
 impl From<serde_json::Error> for CkError {
     fn from(source: serde_json::Error) -> Self {
         Self::Json(source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_progress_bars_have_fixed_width_at_thresholds() {
+        for (percent, filled) in [(0.0, 0), (47.0, 8), (60.0, 10), (85.0, 14), (100.0, 16)] {
+            let expected = format!(
+                "{}{}",
+                "█".repeat(filled),
+                "░".repeat(QUOTA_PROGRESS_BAR_WIDTH - filled)
+            );
+            let actual = format_quota_progress_bar(percent, false);
+            assert_eq!(actual, expected, "unexpected bar for {percent}%");
+            assert_eq!(display_width(&actual), QUOTA_PROGRESS_BAR_WIDTH);
+        }
+    }
+
+    #[test]
+    fn table_account_labels_shorten_only_uuid_shapes() {
+        assert_eq!(
+            shorten_uuid_label("550e8400-e29b-41d4-a716-446655440000"),
+            "550e8400"
+        );
+        assert_eq!(shorten_uuid_label("work"), "work");
+        assert_eq!(
+            shorten_uuid_label("not-a-uuid-e29b-41d4-a716-446655440000"),
+            "not-a-uuid-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn quota_default_filters_to_connected_entries_even_without_windows() {
+        // The wire signals "connected" by the presence of a usage object, never
+        // an explicit ok flag (the real module emits usage OR error, no ok key).
+        let providers = vec![
+            serde_json::json!({
+                "provider": "connected",
+                "usage": { "primary": { "usedPercent": 0.0 } }
+            }),
+            serde_json::json!({
+                "provider": "empty-windows",
+                "usage": {}
+            }),
+            serde_json::json!({
+                "provider": "unavailable",
+                "error": "no session: no API key set"
+            }),
+            serde_json::json!({
+                "provider": "missing-usage"
+            }),
+        ];
+
+        let default_entries = quota_entries_for_table(&providers, None, false);
+        let default_ids = default_entries
+            .iter()
+            .map(|entry| provider_id(entry))
+            .collect::<Vec<_>>();
+        assert_eq!(default_ids, ["connected", "empty-windows"]);
+        let empty_windows = default_entries
+            .iter()
+            .find(|entry| provider_id(entry) == "empty-windows")
+            .expect("connected empty-window entry");
+        assert!(quota_window_rows_for_entry(empty_windows).is_empty());
+
+        assert_eq!(quota_entries_for_table(&providers, None, true).len(), 4);
+        assert_eq!(
+            quota_entries_for_table(&providers, Some("unavailable"), false).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quota_json_output_preserves_the_raw_reply_format() {
+        let reply = serde_json::json!({
+            "result": [{
+                "provider": "codex",
+                "usage": {}
+            }]
+        });
+        let expected =
+            "{\n  \"result\": [\n    {\n      \"provider\": \"codex\",\n      \"usage\": {}\n    }\n  ]\n}";
+        assert_eq!(format_json_output(&reply).unwrap(), expected);
+    }
+
+    #[test]
+    fn quota_verbose_flag_is_parsed_and_documented() {
+        let command = parse_command(
+            "quota",
+            &[OsString::from("anthropic"), OsString::from("--verbose")],
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::Quota {
+                provider_id: Some(provider_id),
+                verbose: true,
+            } if provider_id == "anthropic"
+        ));
+        assert!(QUOTA_HELP.contains("--verbose"));
     }
 }

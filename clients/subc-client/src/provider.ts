@@ -545,22 +545,22 @@ export class SubcProvider {
 
   cancel(handle: RouteHandle, corr: bigint): void {
     this.assertLiveHandle(handle);
-    void this.sendOn(
+    this.sendOn(
       this.sock,
       this.generation,
       buildFrame(FrameType.Cancel, controlFlags(), handle.channel, handle.epoch, corr, new Uint8Array(0)),
-    );
+    ).catch(() => undefined);
   }
 
   closeRoute(handle: RouteHandle): void {
     this.assertLiveHandle(handle);
     this.liveRoutes.delete(handle.channel);
     this.abortHandle(handle);
-    void this.sendOn(
+    this.sendOn(
       this.sock,
       this.generation,
       buildFrame(FrameType.Goodbye, controlFlags(), handle.channel, handle.epoch, 0n, new Uint8Array(0)),
-    );
+    ).catch(() => undefined);
   }
 
   /** Read the connection file, authenticate as a client, register the manifest with HELLO, and serve frames. */

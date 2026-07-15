@@ -888,6 +888,12 @@ where
             }
             return;
         };
+        if ctx.cancelled.is_cancelled() {
+            if let Ok(mut guard) = in_flight.lock() {
+                guard.remove(&(handle.channel, handle.epoch, corr));
+            }
+            return;
+        }
         let outcome = handler.handle(ctx.clone(), body).await;
         let _ = send_handler_outcome(&ctx, outcome).await;
         if let Ok(mut guard) = in_flight.lock() {
@@ -1610,6 +1616,117 @@ mod tests {
         );
 
         release.notify_waiters();
+    }
+
+    struct CorrBlockingHandler {
+        entered: Arc<Mutex<Vec<u64>>>,
+        release_first: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for CorrBlockingHandler {
+        async fn handle(&self, ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            let corr = ctx.corr();
+            self.entered.lock().unwrap().push(corr);
+            if corr == 1 {
+                self.release_first.acquire().await.unwrap().forget();
+            }
+            HandlerOutcome::Response(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_capacity_queued_data_request_skips_handler_and_cleans_up() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let entered = Arc::new(Mutex::new(Vec::new()));
+        let release_first = Arc::new(Semaphore::new(0));
+        let handler = Arc::new(CorrBlockingHandler {
+            entered: Arc::clone(&entered),
+            release_first: Arc::clone(&release_first),
+        });
+        let dispatcher = RequestDispatcher {
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            permits: Arc::new(Semaphore::new(1)),
+        };
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
+        module_handle
+            .install_route(RouteHandle::new(7, 1, 1))
+            .unwrap();
+
+        handle_frame(
+            data_request(7, 1),
+            &tx,
+            Arc::clone(&handler),
+            dispatcher.clone(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while entered.lock().unwrap().as_slice() != [1] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        handle_frame(
+            data_request(7, 2),
+            &tx,
+            Arc::clone(&handler),
+            dispatcher.clone(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !dispatcher
+                .in_flight
+                .lock()
+                .unwrap()
+                .contains_key(&(7, 1, 2))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        handle_frame(
+            Frame::build(FrameType::Cancel, data_flags(), 7, 1, 2, Vec::new()).unwrap(),
+            &tx,
+            Arc::clone(&handler),
+            dispatcher.clone(),
+            module_handle,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dispatcher
+                .in_flight
+                .lock()
+                .unwrap()
+                .get(&(7, 1, 2))
+                .unwrap()
+                .is_cancelled(),
+            "cancel must land while the second request waits for handler capacity"
+        );
+
+        release_first.add_permits(1);
+        timeout(Duration::from_secs(1), async {
+            while !dispatcher.in_flight.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(*entered.lock().unwrap(), vec![1]);
+        let response = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.header.corr, 1);
+        assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
     }
 
     struct CountingHandler {

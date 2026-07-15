@@ -389,6 +389,120 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertEqual(transport.writes.count, 1)
     }
 
+    func testRunSessionTurnCleansRoutesAfterEachCompletedTurn() throws {
+        let transport = ScriptedTransport()
+        let client = SubcClient(transport: transport)
+
+        func appendCompletedTurn(
+            commandChannel: UInt16,
+            subscribeChannel: UInt16,
+            commandOpenCorr: UInt64,
+            subscribeOpenCorr: UInt64,
+            subscribeCorr: UInt64,
+            sendCorr: UInt64,
+            walSeq: Int,
+            streamEnds: Bool = false
+        ) throws {
+            try transport.append(makeFrame(
+                ty: .response,
+                channel: 0,
+                epoch: 0,
+                corr: commandOpenCorr,
+                json: ["route_channel": commandChannel, "route_epoch": 1]
+            ))
+            try transport.append(makeFrame(
+                ty: .response,
+                channel: 0,
+                epoch: 0,
+                corr: subscribeOpenCorr,
+                json: ["route_channel": subscribeChannel, "route_epoch": 1]
+            ))
+            try transport.append(makeFrame(
+                ty: .response,
+                channel: commandChannel,
+                epoch: 1,
+                corr: sendCorr
+            ))
+            if streamEnds {
+                try transport.append(makeFrame(
+                    ty: .streamEnd,
+                    channel: subscribeChannel,
+                    epoch: 1,
+                    corr: subscribeCorr
+                ))
+            } else {
+                try transport.append(makeFrame(
+                    ty: .streamData,
+                    channel: subscribeChannel,
+                    epoch: 1,
+                    corr: subscribeCorr,
+                    json: [
+                        "kind": "control",
+                        "cursor": ["wal_seq": walSeq, "sub_index": 0],
+                        "unit": ["type": "run_finished", "reason": "completed"],
+                    ]
+                ))
+            }
+        }
+
+        try appendCompletedTurn(
+            commandChannel: 10,
+            subscribeChannel: 11,
+            commandOpenCorr: 1,
+            subscribeOpenCorr: 2,
+            subscribeCorr: 3,
+            sendCorr: 4,
+            walSeq: 1
+        )
+        let firstCursor = try client.runSessionTurn(
+            moduleId: "broca",
+            projectRoot: "/tmp",
+            harness: "test",
+            session: "session",
+            prompt: "first",
+            provider: "provider",
+            model: "model"
+        ) { _ in }
+        XCTAssertEqual(firstCursor?.walSeq, 1)
+        guard transport.writes.count == 7 else {
+            XCTFail("completed turn should write four requests followed by CANCEL and two GOODBYEs")
+            return
+        }
+        let firstCleanup = try transport.writes[4...6].map(decodeWrittenFrame)
+        XCTAssertEqual(firstCleanup.map(\.header.ty), [.cancel, .goodbye, .goodbye])
+        XCTAssertEqual(firstCleanup.map(\.header.channel), [11, 10, 11])
+        XCTAssertEqual(firstCleanup.map(\.header.corr), [3, 0, 0])
+
+        try appendCompletedTurn(
+            commandChannel: 12,
+            subscribeChannel: 13,
+            commandOpenCorr: 5,
+            subscribeOpenCorr: 6,
+            subscribeCorr: 7,
+            sendCorr: 8,
+            walSeq: 2,
+            streamEnds: true
+        )
+        let secondCursor = try client.runSessionTurn(
+            moduleId: "broca",
+            projectRoot: "/tmp",
+            harness: "test",
+            session: "session",
+            prompt: "second",
+            provider: "provider",
+            model: "model"
+        ) { _ in }
+        XCTAssertNil(secondCursor)
+        guard transport.writes.count == 13 else {
+            XCTFail("second completed turn should independently release its two new routes")
+            return
+        }
+        let secondCleanup = try transport.writes[11...12].map(decodeWrittenFrame)
+        XCTAssertEqual(secondCleanup.map(\.header.ty), [.goodbye, .goodbye])
+        XCTAssertEqual(secondCleanup.map(\.header.channel), [12, 13])
+        XCTAssertEqual(secondCleanup.map(\.header.corr), [0, 0])
+    }
+
     func testCorrelationMaxEmittedOnceThenConnectionCloses() throws {
         let transport = ScriptedTransport()
         try transport.append(makeFrame(

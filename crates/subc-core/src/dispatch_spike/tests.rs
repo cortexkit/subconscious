@@ -24,6 +24,18 @@ fn request(corr: u64, body: &[u8]) -> Frame {
     .expect("test frame must be valid")
 }
 
+fn cancel(corr: u64) -> Frame {
+    Frame::build(
+        FrameType::Cancel,
+        Flags::new(false, Priority::Interactive, false),
+        7,
+        11,
+        corr,
+        Vec::new(),
+    )
+    .expect("test cancel frame must be valid")
+}
+
 #[derive(Debug)]
 struct CountingFlow {
     cap: usize,
@@ -354,6 +366,7 @@ fn dispatcher_fixture(
     depth: usize,
 ) -> (
     Arc<RouteDispatcher>,
+    RouteDrain,
     Arc<ChannelFlow>,
     mpsc::Receiver<Frame>,
     mpsc::UnboundedReceiver<SyntheticTerminal>,
@@ -361,13 +374,13 @@ fn dispatcher_fixture(
     let flow = Arc::new(ChannelFlow::new(window));
     let (module_tx, module_rx) = mpsc::channel(depth.max(1));
     let (synthetic_tx, synthetic_rx) = mpsc::unbounded_channel();
-    let dispatcher = Arc::new(RouteDispatcher::new(
+    let (dispatcher, drain) = RouteDispatcher::new(
         depth,
         Arc::clone(&flow),
         FrameSink::new(module_tx),
         synthetic_tx,
-    ));
-    (dispatcher, flow, module_rx, synthetic_rx)
+    );
+    (dispatcher, drain, flow, module_rx, synthetic_rx)
 }
 
 async fn prepare_delivered(dispatcher: &RouteDispatcher, flow: &Arc<ChannelFlow>, corr: u64) {
@@ -398,7 +411,7 @@ async fn prepare_delivered(dispatcher: &RouteDispatcher, flow: &Arc<ChannelFlow>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_terminal_with_second_in_flight_cannot_steal_its_credit() {
-    let (dispatcher, flow, _module_rx, _synthetic_rx) = dispatcher_fixture(2, 2);
+    let (dispatcher, _drain, flow, _module_rx, _synthetic_rx) = dispatcher_fixture(2, 2);
     prepare_delivered(&dispatcher, &flow, 1).await;
     prepare_delivered(&dispatcher, &flow, 2).await;
     assert_eq!(flow.in_flight(), 2);
@@ -436,14 +449,14 @@ async fn duplicate_terminal_with_second_in_flight_cannot_steal_its_credit() {
 
 #[tokio::test]
 async fn binding_back_reference_and_registry_make_terminal_and_teardown_reachable() {
-    let (dispatcher, flow, _module_rx, _synthetic_rx) = dispatcher_fixture(1, 2);
+    let (dispatcher, _drain, flow, _module_rx, _synthetic_rx) = dispatcher_fixture(1, 2);
     prepare_delivered(&dispatcher, &flow, 9).await;
     let binding = SpikeRouteBinding::new(&dispatcher);
     assert!(binding.on_terminal(9));
     assert!(!binding.on_terminal(9));
     assert_eq!(flow.in_flight(), 0);
 
-    let (other, _other_flow, _module_rx, _synthetic_rx) = dispatcher_fixture(1, 1);
+    let (other, _other_drain, _other_flow, _module_rx, _synthetic_rx) = dispatcher_fixture(1, 1);
     let registry = SpikeForwardingInner::default();
     registry.insert(
         SpikeRouteKey {
@@ -474,19 +487,204 @@ async fn binding_back_reference_and_registry_make_terminal_and_teardown_reachabl
     );
 }
 
+async fn delivered_cancel_order(use_broken_second_writer: bool) -> Vec<FrameType> {
+    let flow = Arc::new(ChannelFlow::new(1));
+    let (module_tx, mut module_rx) = mpsc::channel(4);
+    let broken_writer = FrameSink::new(module_tx.clone());
+    let (synthetic_tx, _synthetic_rx) = mpsc::unbounded_channel();
+    let (dispatcher, drain) = RouteDispatcher::new(
+        1,
+        Arc::clone(&flow),
+        FrameSink::new(module_tx),
+        synthetic_tx,
+    );
+    let gate = SendGate::new();
+    let drain = tokio::spawn(drain.with_send_gate(Arc::clone(&gate)).run());
+
+    assert_eq!(
+        dispatcher.push_request(21, request(21, b"delayed-send")),
+        PushOutcome::Admitted
+    );
+    timeout(Duration::from_secs(1), gate.wait_until_parked())
+        .await
+        .expect("request send never reached the gate");
+    assert_eq!(
+        dispatcher
+            .inbox
+            .lock()
+            .expect("route inbox mutex poisoned")
+            .state(21),
+        Some(SlotState::Delivered)
+    );
+
+    let mut observed = Vec::new();
+    if use_broken_second_writer {
+        broken_writer
+            .send(cancel(21))
+            .await
+            .expect("broken writer should reach the open sink");
+        observed.push(
+            timeout(Duration::from_secs(1), module_rx.recv())
+                .await
+                .expect("broken cancel timed out")
+                .expect("module sink closed")
+                .header
+                .ty,
+        );
+    } else {
+        assert_eq!(
+            dispatcher.submit_cancel(cancel(21)),
+            CancelDecision::QueuedForDrain
+        );
+        assert!(
+            module_rx.try_recv().is_err(),
+            "the drain must not send CANCEL before its parked Request"
+        );
+    }
+
+    gate.release();
+    while observed.len() < 2 {
+        observed.push(
+            timeout(Duration::from_secs(1), module_rx.recv())
+                .await
+                .expect("ordered module frame timed out")
+                .expect("module sink closed")
+                .header
+                .ty,
+        );
+    }
+
+    assert!(dispatcher.terminal_from_module(21));
+    assert_eq!(flow.in_flight(), 0);
+    dispatcher.begin_closing(TeardownKind::None);
+    timeout(Duration::from_secs(1), drain)
+        .await
+        .expect("drain did not stop")
+        .expect("drain task panicked");
+    observed
+}
+
+#[tokio::test]
+async fn delivered_cancel_is_request_ordered_and_discriminates_a_second_writer() {
+    assert_eq!(
+        delivered_cancel_order(false).await,
+        vec![FrameType::Request, FrameType::Cancel]
+    );
+    assert_eq!(
+        delivered_cancel_order(true).await,
+        vec![FrameType::Cancel, FrameType::Request],
+        "a deliberately broken second writer must reproduce N2"
+    );
+}
+
+#[test]
+fn route_drain_has_the_only_module_sink_send_site() {
+    let source = include_str!("mod.rs");
+    assert_eq!(
+        source.matches("self.module_sink.send(frame).await").count(),
+        1,
+        "module-bound writes must remain centralized in RouteDrain::send_to_module"
+    );
+}
+
+#[tokio::test]
+async fn delivered_cancel_preempts_later_blocked_acquire_and_breaks_r5() {
+    let (dispatcher, drain, flow, mut module_rx, _synthetic_rx) = dispatcher_fixture(1, 2);
+    let drain = tokio::spawn(drain.run());
+
+    assert_eq!(
+        dispatcher.push_request(31, request(31, b"A")),
+        PushOutcome::Admitted
+    );
+    let first = timeout(Duration::from_secs(1), module_rx.recv())
+        .await
+        .expect("request A timed out")
+        .expect("module sink closed");
+    assert_eq!(
+        (first.header.ty, first.header.corr),
+        (FrameType::Request, 31)
+    );
+    assert_eq!(flow.in_flight(), 1);
+
+    assert_eq!(
+        dispatcher.push_request(32, request(32, b"B")),
+        PushOutcome::Admitted
+    );
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if dispatcher
+                .inbox
+                .lock()
+                .expect("route inbox mutex poisoned")
+                .state(32)
+                == Some(SlotState::Sending { cancelled: false })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request B never blocked in Sending");
+
+    assert_eq!(
+        dispatcher.submit_cancel(cancel(31)),
+        CancelDecision::QueuedForDrain
+    );
+    let forwarded_cancel = timeout(Duration::from_secs(1), module_rx.recv())
+        .await
+        .expect("CANCEL(A) was blocked behind B's acquire")
+        .expect("module sink closed");
+    assert_eq!(
+        (forwarded_cancel.header.ty, forwarded_cancel.header.corr),
+        (FrameType::Cancel, 31)
+    );
+    assert_eq!(flow.in_flight(), 1, "B must not acquire A's live credit");
+    assert_eq!(
+        dispatcher
+            .inbox
+            .lock()
+            .expect("route inbox mutex poisoned")
+            .state(32),
+        Some(SlotState::Sending { cancelled: false })
+    );
+    assert!(module_rx.try_recv().is_err(), "B was sent before A settled");
+
+    assert!(dispatcher.terminal_from_module(31));
+    let second = timeout(Duration::from_secs(1), module_rx.recv())
+        .await
+        .expect("request B did not proceed after A settled")
+        .expect("module sink closed");
+    assert_eq!(
+        (second.header.ty, second.header.corr),
+        (FrameType::Request, 32)
+    );
+    assert!(dispatcher.terminal_from_module(32));
+    assert_eq!(flow.in_flight(), 0);
+    assert_eq!(flow.available_permits(), 1);
+
+    dispatcher.begin_closing(TeardownKind::None);
+    timeout(Duration::from_secs(1), drain)
+        .await
+        .expect("drain did not stop")
+        .expect("drain task panicked");
+}
+
 #[tokio::test]
 async fn async_drain_skips_queued_cancel_and_preserves_fifo_credit() {
-    let (dispatcher, flow, mut module_rx, mut synthetic_rx) = dispatcher_fixture(1, 3);
+    let (dispatcher, drain, flow, mut module_rx, mut synthetic_rx) = dispatcher_fixture(1, 3);
     for corr in 1..=3 {
         assert_eq!(
             dispatcher.push_request(corr, request(corr, &[corr as u8])),
             PushOutcome::Admitted
         );
     }
-    assert_eq!(dispatcher.on_cancel(2), CancelDecision::SynthesizeCancelled);
-    dispatcher.synthesize(2, SyntheticKind::Cancelled);
+    assert_eq!(
+        dispatcher.submit_cancel(cancel(2)),
+        CancelDecision::SynthesizeCancelled
+    );
 
-    let drain = tokio::spawn(Arc::clone(&dispatcher).drain());
+    let drain = tokio::spawn(drain.run());
     let first = timeout(Duration::from_secs(1), module_rx.recv())
         .await
         .expect("first dispatch timed out")
@@ -526,13 +724,13 @@ async fn async_drain_skips_queued_cancel_and_preserves_fifo_credit() {
 
 #[tokio::test]
 async fn cancel_during_blocked_acquire_is_rolled_back_before_send() {
-    let (dispatcher, flow, mut module_rx, mut synthetic_rx) = dispatcher_fixture(1, 1);
+    let (dispatcher, drain, flow, mut module_rx, mut synthetic_rx) = dispatcher_fixture(1, 1);
     flow.acquire().await.expect("window is open");
     assert_eq!(
         dispatcher.push_request(4, request(4, b"blocked-acquire")),
         PushOutcome::Admitted
     );
-    let drain = tokio::spawn(Arc::clone(&dispatcher).drain());
+    let drain = tokio::spawn(drain.run());
 
     timeout(Duration::from_secs(1), async {
         loop {
@@ -550,7 +748,10 @@ async fn cancel_during_blocked_acquire_is_rolled_back_before_send() {
     })
     .await
     .expect("drain never entered Sending");
-    assert_eq!(dispatcher.on_cancel(4), CancelDecision::DeferredToDrain);
+    assert_eq!(
+        dispatcher.submit_cancel(cancel(4)),
+        CancelDecision::DeferredToDrain
+    );
 
     flow.release();
     assert_eq!(
@@ -576,13 +777,13 @@ async fn cancel_during_blocked_acquire_is_rolled_back_before_send() {
 
 #[tokio::test]
 async fn async_drain_send_failure_rolls_back_delivered_credit() {
-    let (dispatcher, flow, module_rx, mut synthetic_rx) = dispatcher_fixture(1, 1);
+    let (dispatcher, drain, flow, module_rx, mut synthetic_rx) = dispatcher_fixture(1, 1);
     drop(module_rx);
     assert_eq!(
         dispatcher.push_request(5, request(5, b"send-fails")),
         PushOutcome::Admitted
     );
-    let drain = tokio::spawn(Arc::clone(&dispatcher).drain());
+    let drain = tokio::spawn(drain.run());
     assert_eq!(
         timeout(Duration::from_secs(1), synthetic_rx.recv())
             .await
@@ -603,13 +804,13 @@ async fn async_drain_send_failure_rolls_back_delivered_credit() {
 }
 
 async fn closed_flow_result(kind: TeardownKind) -> Option<SyntheticTerminal> {
-    let (dispatcher, flow, _module_rx, mut synthetic_rx) = dispatcher_fixture(1, 1);
+    let (dispatcher, drain, flow, _module_rx, mut synthetic_rx) = dispatcher_fixture(1, 1);
     assert_eq!(
         dispatcher.push_request(13, request(13, b"blocked")),
         PushOutcome::Admitted
     );
     dispatcher.close_flow(kind);
-    Arc::clone(&dispatcher).drain().await;
+    drain.run().await;
     assert_eq!(flow.in_flight(), 0);
     synthetic_rx.try_recv().ok()
 }

@@ -210,13 +210,14 @@ export class SubcCallError extends Error {
 /**
  * A live subscription to a provider's event stream, riding a single held-open
  * request. `onEvent` fires for each StreamData frame; `closed` resolves when the
- * provider ends the stream (StreamEnd) and rejects on an Error terminal or a route
- * GOODBYE. `unsubscribe` cancels the held-open request so the provider unwinds.
+ * provider ends the stream (StreamEnd) or the consumer unsubscribes, and rejects on
+ * an Error terminal or a route GOODBYE. `unsubscribe` cancels the held-open request
+ * so the provider unwinds.
  */
 export interface Subscription {
   /** Cancel the subscription: sends Cancel on the held-open request; idempotent. */
   unsubscribe(): void;
-  /** Resolves on StreamEnd; rejects on an Error terminal or route close. */
+  /** Resolves on StreamEnd or local unsubscribe; rejects on an Error terminal or route close. */
   readonly closed: Promise<void>;
 }
 
@@ -465,19 +466,23 @@ export class SubcClient {
     const corr = this.allocateCorr();
     const key = pendingKey(handle, corr);
 
+    let subscriptionPending: Pending | null = null;
+    let resolveClosed: (() => void) | null = null;
     const closed = new Promise<void>((resolve, reject) => {
       if (this.closedErr) {
         reject(this.closedErr);
         return;
       }
-      this.pending.set(key, {
+      resolveClosed = resolve;
+      subscriptionPending = {
         handle,
         resolve: () => resolve(),
         reject,
         onProgress: onEvent,
         timer: null,
         subscription: true,
-      });
+      };
+      this.pending.set(key, subscriptionPending);
       const frame = buildFrame(
         FrameType.Request,
         buildFlags(false, priority, false, admission),
@@ -496,7 +501,8 @@ export class SubcClient {
     const unsubscribe = (): void => {
       if (cancelled) return;
       cancelled = true;
-      this.cancel(handle, corr, priority);
+      if (subscriptionPending && resolveClosed) this.settle(key, subscriptionPending, resolveClosed);
+      if (this.isLiveHandle(handle)) this.cancel(handle, corr, priority);
     };
     return { unsubscribe, closed };
   }

@@ -37,6 +37,8 @@ import {
   SocketWriteNotQueuedError,
   SocketWriteQueuedError,
   SubcSocket,
+  writeBorrowed,
+  writeTrackedBorrowed,
 } from "./socket.js";
 
 const debug = debuglog("subc-client");
@@ -491,7 +493,7 @@ export class SubcClient {
         corr,
         bytes,
       );
-      this.sock.write(encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch((err) => {
+      writeBorrowed(this.sock, encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch((err) => {
         const pending = this.pending.get(key);
         if (pending) this.rejectPending(key, pending, err instanceof Error ? err : new SubcError(String(err)));
       });
@@ -518,7 +520,7 @@ export class SubcClient {
       corr,
       EMPTY_BODY,
     );
-    this.sock.write(encodeFrame(cancel), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => undefined);
+    writeBorrowed(this.sock, encodeFrame(cancel), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => undefined);
   }
 
   /** Poll status or liveness for exactly the supplied route generation. */
@@ -613,7 +615,7 @@ export class SubcClient {
       0n,
       EMPTY_BODY,
     );
-    const write = this.sock.writeTracked(encodeFrame(goodbye), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS);
+    const write = writeTrackedBorrowed(this.sock, encodeFrame(goodbye), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS);
     if (!write.queued && closeOnQueueFailure) this.closeConnectionAfterCleanupFailure();
     write.completed.catch(() => {
       if (closeOnQueueFailure && !write.queued) this.closeConnectionAfterCleanupFailure();
@@ -685,7 +687,7 @@ export class SubcClient {
       };
       pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
       this.pending.set(key, pending);
-      this.sock.write(encodeFrame(frame), Date.now() + ms).catch((error) => {
+      writeBorrowed(this.sock, encodeFrame(frame), Date.now() + ms).catch((error) => {
         const current = this.pending.get(key);
         if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
       });
@@ -803,7 +805,7 @@ export class SubcClient {
       };
       pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, handle.channel, corr, ms), ms);
       this.pending.set(key, pending);
-      const write = this.sock.writeTracked(encodeFrame(frame), Date.now() + ms);
+      const write = writeTrackedBorrowed(this.sock, encodeFrame(frame), Date.now() + ms);
       handedToSocket = write.queued;
       write.completed.catch((error) => {
         const current = this.pending.get(key);

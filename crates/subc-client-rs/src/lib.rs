@@ -883,12 +883,21 @@ where
     let permits = Arc::clone(&dispatcher.permits);
     tokio::spawn(async move {
         let Ok(_permit) = permits.acquire_owned().await else {
+            // A closed dispatcher means connection teardown will release every route credit.
             if let Ok(mut guard) = in_flight.lock() {
                 guard.remove(&(handle.channel, handle.epoch, corr));
             }
             return;
         };
         if ctx.cancelled.is_cancelled() {
+            let _ = send_handler_outcome(
+                &ctx,
+                HandlerOutcome::Error {
+                    code: "cancelled".to_string(),
+                    message: "request cancelled".to_string(),
+                },
+            )
+            .await;
             if let Ok(mut guard) = in_flight.lock() {
                 guard.remove(&(handle.channel, handle.epoch, corr));
             }
@@ -1636,7 +1645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_capacity_queued_data_request_skips_handler_and_cleans_up() {
+    async fn cancelled_capacity_queued_data_request_emits_terminal_and_skips_handler() {
         let (tx, mut rx) = mpsc::channel(4);
         let entered = Arc::new(Mutex::new(Vec::new()));
         let release_first = Arc::new(Semaphore::new(0));
@@ -1725,8 +1734,57 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(response.header.ty, FrameType::Response);
         assert_eq!(response.header.corr, 1);
+
+        let cancelled = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.header.ty, FrameType::Error);
+        assert_eq!(cancelled.header.channel, 7);
+        assert_eq!(cancelled.header.epoch, 1);
+        assert_eq!(cancelled.header.corr, 2);
+        assert_eq!(
+            serde_json::from_slice::<ErrorBody>(&cancelled.body).unwrap(),
+            ErrorBody {
+                code: "cancelled".to_string(),
+                message: "request cancelled".to_string(),
+            }
+        );
         assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_terminal_is_not_sent_after_route_teardown() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
+        let handle = RouteHandle::new(7, 1, 1);
+        module_handle.install_route(handle).unwrap();
+        let ctx = RequestCtx {
+            handle,
+            corr: 2,
+            ver: PROTOCOL_VERSION,
+            egress: tx,
+            module_handle: module_handle.clone(),
+            cancelled: CancellationToken::new(),
+        };
+        assert!(module_handle.remove_route(handle).unwrap());
+
+        let result = send_handler_outcome(
+            &ctx,
+            HandlerOutcome::Error {
+                code: "cancelled".to_string(),
+                message: "request cancelled".to_string(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SubcModuleError::StaleRouteHandle(stale)) if stale == handle
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     struct CountingHandler {

@@ -406,8 +406,10 @@ struct AskView: View {
             Text("reversibility \(String(format: "%.1f", value))")
                 .font(.caption)
                 .foregroundColor(.secondary)
+            // Never derive a tint from Color.accentColor: tint is what accentColor
+            // resolves through, so a self-referential tint makes AppKit's color
+            // resolution recurse until stack overflow (crashes at launch).
             ProgressView(value: normalized)
-                .tint(Color.accentColor.opacity(0.65))
         }
     }
 

@@ -9,6 +9,8 @@
 pub mod bootstrap;
 pub mod control;
 pub mod daemon_config;
+#[cfg(test)]
+pub(crate) mod dispatch_spike;
 pub mod forwarding;
 pub mod identity;
 pub mod observability;

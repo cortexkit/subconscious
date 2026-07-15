@@ -14,7 +14,9 @@ use std::{
     time::Duration,
 };
 
-use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind};
+use subc_control::{
+    CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
+};
 use subc_protocol::{
     AdmissionClass, BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority,
     RouteTarget, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
@@ -80,6 +82,8 @@ impl RetryBackoff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerOptions {
     pub handshake_timeout: Duration,
+    /// Deadline for channel-0 calls that do not take per-call options.
+    pub call_timeout: Duration,
     pub reconnect_backoff: RetryBackoff,
     pub restored_debounce: Duration,
 }
@@ -88,6 +92,7 @@ impl Default for ConsumerOptions {
     fn default() -> Self {
         Self {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
             reconnect_backoff: RetryBackoff::default(),
             restored_debounce: DEFAULT_RESTORED_DEBOUNCE,
         }
@@ -213,6 +218,19 @@ pub struct RoutePollResult {
     pub handle: RouteHandle,
     pub status: Option<String>,
     pub live: Option<bool>,
+}
+
+/// Typed response from the daemon's channel-0 `catalog.list` operation.
+///
+/// Each module entry exposes the provider roles and tool definitions advertised by
+/// that module.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct CatalogList {
+    pub generation: u64,
+    #[serde(default)]
+    pub modules: Vec<CatalogEntry>,
+    #[serde(default)]
+    pub subc_ops: Vec<String>,
 }
 
 /// Managed Rust consumer for subc route calls.
@@ -354,6 +372,57 @@ impl SubcConsumer {
             .ensure_route(&key, &params, &opts, deadline)
             .await
             .map(|route| route.handle)
+    }
+
+    /// Fetch the daemon's module catalog over channel 0.
+    pub async fn catalog_list(&self) -> Result<CatalogList, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": subc_control::ops::CATALOG_LIST,
+        }))
+        .map_err(|err| CallError::not_sent(format!("failed to encode catalog.list: {err}")))?;
+
+        loop {
+            match self
+                .shared
+                .control_call(body.clone(), deadline, false)
+                .await
+            {
+                Ok(TerminalFrame::Response { body, .. }) => {
+                    let response =
+                        serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
+                            CallError::not_sent(format!(
+                                "failed to decode catalog.list response: {err}"
+                            ))
+                        })?;
+                    let ClientControlResponse::CatalogList {
+                        generation,
+                        modules,
+                        subc_ops,
+                    } = response
+                    else {
+                        return Err(CallError::not_sent(
+                            "catalog.list returned an unexpected control response",
+                        ));
+                    };
+                    return Ok(CatalogList {
+                        generation,
+                        modules,
+                        subc_ops,
+                    });
+                }
+                Ok(TerminalFrame::Error { body }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::StreamEnd) => {
+                    return Err(CallError::not_sent("catalog.list returned StreamEnd"));
+                }
+                Err(err)
+                    if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Send one request using an already-opened route handle.
@@ -1396,7 +1465,6 @@ impl Shared {
         let mut attempt = 0usize;
         loop {
             attempt = attempt.saturating_add(1);
-            self.ensure_connected_for_call(route_deadline).await?;
             let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
                 target: route_open.target.clone(),
                 identity: route_open.identity.clone(),
@@ -1404,19 +1472,7 @@ impl Shared {
                 consumer_capabilities: route_open.consumer_capabilities.clone(),
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
-            match self
-                .send_request(RequestSend {
-                    expected_handle: None,
-                    channel: 0,
-                    epoch: 0,
-                    body,
-                    priority: Priority::Interactive,
-                    admission_class: AdmissionClass::Normal,
-                    deadline: route_deadline,
-                    retain_late_route_open: true,
-                })
-                .await
-            {
+            match self.control_call(body, route_deadline, true).await {
                 Ok(TerminalFrame::Response {
                     generation, body, ..
                 }) => {
@@ -1526,6 +1582,26 @@ impl Shared {
             () = self.close_token.cancelled() => Err(CallError::not_sent("consumer closed")),
             () = sleep(bounded) => Ok(()),
         }
+    }
+
+    async fn control_call(
+        self: &Arc<Self>,
+        body: Vec<u8>,
+        deadline: Instant,
+        retain_late_route_open: bool,
+    ) -> Result<TerminalFrame, CallError> {
+        self.ensure_connected_for_call(deadline).await?;
+        self.send_request(RequestSend {
+            expected_handle: None,
+            channel: 0,
+            epoch: 0,
+            body,
+            priority: Priority::Interactive,
+            admission_class: AdmissionClass::Normal,
+            deadline,
+            retain_late_route_open,
+        })
+        .await
     }
 
     async fn send_request(
@@ -3134,6 +3210,10 @@ fn is_retryable_route_open_code(code: &str) -> bool {
     )
 }
 
+fn is_retryable_catalog_transport_error(err: &CallError) -> bool {
+    matches!(err, CallError::NotSent(_) | CallError::OutcomeUnknown(_))
+}
+
 fn is_reconnect_transient(err: &ConsumerError) -> bool {
     match err {
         ConsumerError::Connect { source, .. } => matches!(
@@ -4242,5 +4322,108 @@ mod tests {
             route_sem.try_acquire().is_ok(),
             "a pre-write subscription timeout must release its route credit"
         );
+    }
+
+    #[test]
+    fn catalog_list_deserializes_golden_reply_and_ignores_unknown_fields() {
+        let mut reply: serde_json::Value = serde_json::from_str(include_str!(
+            "../../subc-control/tests/golden/client_control_response_catalog_list.json"
+        ))
+        .expect("the catalog.list golden reply must be valid JSON");
+        reply["future_top_level"] = serde_json::json!(true);
+        reply["modules"][0]["future_module_field"] = serde_json::json!("ignored");
+
+        let catalog: CatalogList =
+            serde_json::from_value(reply).expect("catalog.list should tolerate additive fields");
+        assert_eq!(catalog.generation, 7);
+        assert_eq!(catalog.modules.len(), 1);
+        assert!(catalog.subc_ops.iter().any(|op| op == "catalog.list"));
+
+        let tools = catalog.modules[0]
+            .roles
+            .iter()
+            .find_map(|role| match role {
+                subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .expect("the golden module must advertise a tool_provider role");
+        let tool = tools
+            .first()
+            .expect("the golden tool_provider role must advertise a tool");
+        assert!(!tool.name.is_empty());
+        assert_eq!(
+            tool.schema.get("type").and_then(serde_json::Value::as_str),
+            Some("object")
+        );
+        assert!(matches!(
+            tool.execution_mode,
+            subc_protocol::manifest::ExecutionMode::Pure
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_list_sends_an_unfiltered_channel_zero_request() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(1);
+        shared.lock_inner().writer = Some(writer);
+
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let request = tokio::spawn(async move { consumer.catalog_list().await });
+        let command = rx
+            .recv()
+            .await
+            .expect("catalog.list must queue a channel-0 request");
+        assert_eq!(command.frame.header.channel, 0);
+        let body: serde_json::Value = serde_json::from_slice(&command.frame.body).unwrap();
+        assert_eq!(body["op"], "catalog.list");
+        assert!(
+            body.get("module_id").is_none(),
+            "catalog.list must request the complete catalog without a module filter"
+        );
+
+        let response = serde_json::to_vec(&ClientControlResponse::CatalogList {
+            generation: 9,
+            modules: Vec::new(),
+            subc_ops: vec!["catalog.list".to_string()],
+        })
+        .unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                response_frame(0, 0, command.frame.header.corr, response),
+            )
+            .await
+        );
+        let catalog = request.await.unwrap().unwrap();
+        assert_eq!(catalog.generation, 9);
+        assert!(catalog.modules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_list_deadline_is_not_sent_when_reconnection_stays_down() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/subc-client-rs-catalog-list-unavailable"),
+            ConsumerOptions {
+                call_timeout: Duration::from_millis(25),
+                reconnect_backoff: RetryBackoff {
+                    base: Duration::from_millis(1),
+                    cap: Duration::from_millis(1),
+                    max_attempts: 100,
+                },
+                ..ConsumerOptions::default()
+            },
+        ));
+        let consumer = SubcConsumer { shared };
+        let result = tokio::time::timeout(Duration::from_millis(250), consumer.catalog_list())
+            .await
+            .expect("catalog.list must finish at its configured deadline")
+            .unwrap_err();
+        assert!(matches!(result, CallError::NotSent(_)));
     }
 }

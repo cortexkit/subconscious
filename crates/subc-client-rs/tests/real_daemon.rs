@@ -42,6 +42,7 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONSUMER_MODULE_A: &str = "subc-client-rs-consumer-a";
 const CONSUMER_MODULE_B: &str = "subc-client-rs-consumer-b";
+const CATALOG_FAKE_AFT_MODULE_ID: &str = "subc-client-rs-catalog-fake-aft";
 
 struct LiveDaemon {
     child: Child,
@@ -89,6 +90,66 @@ impl ModuleHandler for EchoModuleHandler {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         HandlerOutcome::Response(body)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let fake_aft_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "fake-aft-stub"),
+        &["build", "-p", "subc-core", "--bin", "fake-aft-stub"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-catalog-list");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        fake_aft_stub_config_doc(&fake_aft_bin, CATALOG_FAKE_AFT_MODULE_ID),
+    )
+    .unwrap();
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_catalog_module(
+        &daemon.connection_file,
+        CATALOG_FAKE_AFT_MODULE_ID,
+        START_TIMEOUT,
+    )
+    .await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let catalog = consumer.catalog_list().await.unwrap();
+    let module = catalog
+        .modules
+        .iter()
+        .find(|module| module.module_id == CATALOG_FAKE_AFT_MODULE_ID)
+        .expect("catalog.list must include the fake-aft-stub module");
+    let tools = module
+        .roles
+        .iter()
+        .find_map(|role| match role {
+            ProviderRole::ToolProvider { tools, .. } => Some(tools),
+            _ => None,
+        })
+        .expect("fake-aft-stub must advertise a tool_provider role");
+    let tool = tools
+        .first()
+        .expect("fake-aft-stub must advertise at least one tool");
+    assert!(!tool.name.is_empty());
+    assert!(tool.schema.is_object());
+
+    daemon.kill_and_wait();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1048,6 +1109,8 @@ fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Liv
 
 fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Child {
     Command::new(daemon_bin)
+        .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
+        .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("SUBC_PORT", "0")
@@ -1096,6 +1159,27 @@ fn config_doc(module_bin: &Path, events_path: &Path) -> String {
     .unwrap()
 }
 
+fn fake_aft_stub_config_doc(module_bin: &Path, module_id: &str) -> String {
+    let env = BTreeMap::from([
+        ("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()),
+        ("FAKE_AFT_TOOLS".to_string(), "catalog.inspect".to_string()),
+    ]);
+    let modules = serde_json::Map::from_iter([(
+        module_id.to_string(),
+        json!({
+            "program": module_bin.to_string_lossy(),
+            "args": [],
+            "env": env,
+            "enabled": true,
+        }),
+    )]);
+    serde_json::to_string_pretty(&json!({
+        "version": 1,
+        "modules": modules,
+    }))
+    .unwrap()
+}
+
 fn write_empty_config(config_dir: &Path) {
     fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
     fs::write(
@@ -1108,6 +1192,7 @@ fn write_empty_config(config_dir: &Path) {
 fn fast_consumer_options() -> ConsumerOptions {
     ConsumerOptions {
         handshake_timeout: AUTH_DEADLINE,
+        call_timeout: Duration::from_secs(8),
         reconnect_backoff: RetryBackoff {
             base: Duration::from_millis(50),
             cap: Duration::from_millis(250),

@@ -191,7 +191,18 @@ where
     // module that treats auth failure as fatal can exhaust its budget into
     // state=failed within the boot window (2026-07-14 aft outage). On loopback
     // with the pre-auth HMAC deadline, a bounded queue is strictly safer than a
-    // reset; the deadline still bounds total pre-auth occupancy per connection.
+    // reset.
+    //
+    // Pre-auth time is governed by TWO deliberately separate budgets: the queue
+    // wait below is bounded by `auth.deadline`, and `authenticate_server` then
+    // starts a FRESH `auth.deadline` for the handshake itself. Total pre-auth
+    // occupancy per connection is therefore up to 2x the configured deadline.
+    // This is intentional, not an accounting slip: charging queue time against
+    // the handshake budget would hand a herd-queued supervised module a
+    // near-zero handshake window under CPU saturation, recreating the fatal
+    // auth-failure -> restart-budget-burn path this queue exists to prevent.
+    // On a loopback-only, key-authenticated listener the doubled bound is a
+    // per-connection occupancy cost, not a meaningful DoS surface.
     let permit =
         match tokio::time::timeout(auth.deadline, auth.unauthenticated.clone().acquire_owned())
             .await

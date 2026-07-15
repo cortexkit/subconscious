@@ -284,10 +284,138 @@ describe("SubcProvider serve loop", () => {
     await Promise.all([first, cancelled]);
 
     expect(handled).toEqual([1]);
-    expect(writes).toHaveLength(1);
-    expect(writes[0]?.header.corr).toBe(1n);
+    expect(writes).toHaveLength(2);
+    expect(writes[0]?.header).toMatchObject({ ty: FrameType.Response, channel: 7, epoch: 1, corr: 1n });
     expect(parseJson(writes[0]!.body)).toEqual({ n: 1 });
+    expect(writes[1]?.header).toMatchObject({ ty: FrameType.Error, channel: 7, epoch: 1, corr: 2n });
+    expect(parseJson(writes[1]!.body)).toEqual({ code: "cancelled", message: "request cancelled" });
     expect(provider.inflight.size).toBe(0);
+  });
+
+  test("emits a cancelled terminal when the request is aborted during its handler", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const token = newConnectionToken();
+    const handle = createRouteHandle(7, 1, token);
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      opts: { handler: () => Promise<Uint8Array> };
+      handleDataRequest(frame: Frame, handle: RouteHandle, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.liveRoutes = new Map([[handle.channel, handle]]);
+    provider.connectionToken = token;
+    provider.opts = {
+      handler: async () => {
+        provider.inflight.get("7:1:3")!.abort();
+        return encodeJson({ ignored: true });
+      },
+    };
+
+    await provider.handleDataRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 3n, encodeJson({ n: 3 })),
+      handle,
+      sock,
+      1,
+    );
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.header).toMatchObject({ ty: FrameType.Error, channel: 7, epoch: 1, corr: 3n });
+    expect(parseJson(writes[0]!.body)).toEqual({ code: "cancelled", message: "request cancelled" });
+  });
+
+  test("emits a cancelled terminal when an aborted handler rejects", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const token = newConnectionToken();
+    const handle = createRouteHandle(7, 1, token);
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      opts: { handler: () => Promise<Uint8Array> };
+      handleDataRequest(frame: Frame, handle: RouteHandle, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.liveRoutes = new Map([[handle.channel, handle]]);
+    provider.connectionToken = token;
+    provider.opts = {
+      handler: async () => {
+        provider.inflight.get("7:1:4")!.abort();
+        throw new Error("handler stopped after abort");
+      },
+    };
+
+    await provider.handleDataRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 4n, encodeJson({ n: 4 })),
+      handle,
+      sock,
+      1,
+    );
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.header).toMatchObject({ ty: FrameType.Error, channel: 7, epoch: 1, corr: 4n });
+    expect(parseJson(writes[0]!.body)).toEqual({ code: "cancelled", message: "request cancelled" });
+  });
+
+  test("does not write a cancelled terminal after route teardown bumps the generation", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const token = newConnectionToken();
+    const handle = createRouteHandle(7, 1, token);
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      opts: { handler: () => Promise<Uint8Array> };
+      handleDataRequest(frame: Frame, handle: RouteHandle, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.liveRoutes = new Map([[handle.channel, handle]]);
+    provider.connectionToken = token;
+    provider.opts = {
+      handler: async () => {
+        provider.liveRoutes.delete(handle.channel);
+        provider.generation = 2;
+        provider.inflight.get("7:1:5")!.abort();
+        return encodeJson({ ignored: true });
+      },
+    };
+
+    await provider.handleDataRequest(
+      buildFrameWithVersion(PROTOCOL_VERSION, FrameType.Request, buildFlags(false, Priority.Interactive, false), 7, 1, 5n, encodeJson({ n: 5 })),
+      handle,
+      sock,
+      1,
+    );
+
+    expect(writes).toEqual([]);
   });
 
   // Wire spec 3.3.0: a route.bind on an installed channel with a strictly higher

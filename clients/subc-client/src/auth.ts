@@ -16,7 +16,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type { ConnectionInfo } from "./connection-file.js";
-import { SubcSocket } from "./socket.js";
+import { SubcSocket, writeBorrowed } from "./socket.js";
 
 export const NONCE_LEN = 32;
 export const PROOF_LEN = 32;
@@ -59,8 +59,8 @@ async function writeMessage(
   }
   const lenPrefix = new Uint8Array(4);
   new DataView(lenPrefix.buffer).setUint32(0, json.length, true);
-  await sock.write(lenPrefix, deadlineMs);
-  await sock.write(json, deadlineMs);
+  await writeBorrowed(sock, lenPrefix, deadlineMs);
+  await writeBorrowed(sock, json, deadlineMs);
 }
 
 async function readMessage<T>(sock: SubcSocket, deadlineMs: number): Promise<T> {

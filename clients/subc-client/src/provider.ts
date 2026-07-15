@@ -33,6 +33,7 @@ import {
   SocketWriteNotQueuedError,
   SocketWriteQueuedError,
   SubcSocket,
+  writeBorrowed,
 } from "./socket.js";
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -888,9 +889,15 @@ export class SubcProvider {
     const releasePermit = await (this.requestGate ?? new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY)).acquire();
     const dataFlags = buildFlags(false, Priority.Interactive, false);
     try {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        await this.sendError(frame, "cancelled", "request cancelled", dataFlags, sock, generation);
+        return;
+      }
       const body = await this.opts.handler(handle, frame.body, context);
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        await this.sendError(frame, "cancelled", "request cancelled", dataFlags, sock, generation);
+        return;
+      }
       this.assertLiveHandle(handle);
       if (body === undefined) {
         await this.sendOn(
@@ -924,7 +931,11 @@ export class SubcProvider {
         throw new SubcProviderError("provider handler must return a Uint8Array or void", "invalid_handler_response");
       }
     } catch (error) {
-      if (error instanceof StaleRouteHandleError || controller.signal.aborted) return;
+      if (error instanceof StaleRouteHandleError) return;
+      if (controller.signal.aborted) {
+        await this.sendError(frame, "cancelled", "request cancelled", dataFlags, sock, generation);
+        return;
+      }
       await this.sendError(
         frame,
         error instanceof SubcProviderError && error.code ? error.code : "handler_error",
@@ -989,6 +1000,10 @@ export class SubcProvider {
     sock: SubcSocket,
     generation: number,
   ): Promise<void> {
+    if (frame.header.channel !== 0) {
+      const handle = this.liveRoutes.get(frame.header.channel);
+      if (!handle || handle.epoch !== frame.header.epoch || !this.isLiveHandle(handle)) return;
+    }
     await this.sendOn(
       sock,
       generation,
@@ -1325,7 +1340,7 @@ function controlFlags(): number {
 }
 
 async function sendFrame(sock: SubcSocket, frame: Frame): Promise<void> {
-  await sock.write(encodeFrame(frame), Date.now() + WRITE_TIMEOUT_MS);
+  await writeBorrowed(sock, encodeFrame(frame), Date.now() + WRITE_TIMEOUT_MS);
 }
 
 async function expectHelloAck(sock: SubcSocket, deadline: number): Promise<ModuleHelloAckBody> {

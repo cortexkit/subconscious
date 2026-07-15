@@ -45,10 +45,25 @@ export interface SocketWriteResult {
 }
 
 export function toWriteBuffer(bytes: Uint8Array): Buffer {
-  // Frame writes pass encodeFrame's fresh, single-use Uint8Array. Authentication
-  // writes likewise use fresh prefix/JSON storage and await each write without
-  // retaining or mutating it, so this view remains stable while Node drains it.
+  // Internal frame writes pass encodeFrame's fresh, single-use Uint8Array.
+  // Authentication writes likewise use fresh prefix/JSON storage and await each
+  // write without mutating it, so this view remains stable while Node drains it.
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+const WRITE_BORROWED = Symbol("subc.socket.writeBorrowed");
+const WRITE_TRACKED_BORROWED = Symbol("subc.socket.writeTrackedBorrowed");
+
+/** @internal Write fresh, single-use internal storage without copying it. */
+export function writeBorrowed(socket: SubcSocket, bytes: Uint8Array, deadlineMs: number): Promise<void> {
+  const borrowed = socket[WRITE_BORROWED];
+  return borrowed ? borrowed.call(socket, bytes, deadlineMs) : socket.write(bytes, deadlineMs);
+}
+
+/** @internal Track a write of fresh, single-use internal storage without copying it. */
+export function writeTrackedBorrowed(socket: SubcSocket, bytes: Uint8Array, deadlineMs: number): SocketWriteResult {
+  const borrowed = socket[WRITE_TRACKED_BORROWED];
+  return borrowed ? borrowed.call(socket, bytes, deadlineMs) : socket.writeTracked(bytes, deadlineMs);
 }
 
 interface Waiter {
@@ -181,8 +196,24 @@ export class SubcSocket {
   }
 
   async write(bytes: Uint8Array, deadlineMs: number): Promise<void> {
+    await this.writeBuffer(Buffer.from(bytes), deadlineMs);
+  }
+
+  writeTracked(bytes: Uint8Array, deadlineMs: number): SocketWriteResult {
+    return this.writeTrackedBuffer(Buffer.from(bytes), deadlineMs);
+  }
+
+  async [WRITE_BORROWED](bytes: Uint8Array, deadlineMs: number): Promise<void> {
+    await this.writeBuffer(toWriteBuffer(bytes), deadlineMs);
+  }
+
+  [WRITE_TRACKED_BORROWED](bytes: Uint8Array, deadlineMs: number): SocketWriteResult {
+    return this.writeTrackedBuffer(toWriteBuffer(bytes), deadlineMs);
+  }
+
+  private async writeBuffer(buffer: Buffer, deadlineMs: number): Promise<void> {
     try {
-      await this.writeTracked(bytes, deadlineMs).completed;
+      await this.writeTrackedBuffer(buffer, deadlineMs).completed;
     } catch (err) {
       if (err instanceof SocketWriteNotQueuedError || err instanceof SocketWriteQueuedError) {
         throw err.cause ?? err;
@@ -191,7 +222,7 @@ export class SubcSocket {
     }
   }
 
-  writeTracked(bytes: Uint8Array, deadlineMs: number): SocketWriteResult {
+  private writeTrackedBuffer(buffer: Buffer, deadlineMs: number): SocketWriteResult {
     if (this.closedErr) {
       return {
         queued: false,
@@ -237,7 +268,7 @@ export class SubcSocket {
       }, remaining);
 
       try {
-        this.sock.write(toWriteBuffer(bytes), (err) => {
+        this.sock.write(buffer, (err) => {
           settle(() => {
             if (err) {
               reject(

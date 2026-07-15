@@ -888,6 +888,7 @@ export class SubcProvider {
     const releasePermit = await (this.requestGate ?? new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY)).acquire();
     const dataFlags = buildFlags(false, Priority.Interactive, false);
     try {
+      if (controller.signal.aborted) return;
       const body = await this.opts.handler(handle, frame.body, context);
       if (controller.signal.aborted) return;
       this.assertLiveHandle(handle);

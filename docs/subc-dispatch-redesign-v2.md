@@ -1,6 +1,19 @@
 # subc-core dispatch redesign v2 — mechanism-complete spec
 
-Status: **DESIGN v2 — re-gate pending.** Supersedes the mechanism sections of
+Status: **v2 — RE-GATE NO-GO (6 NO-GO / 2 GO-WITH-CHANGES, 2026-07-15). Trajectory: 5 of 10
+v1 blockers verified CLOSED (B3/B5/B6/B7/B8); B2 NOT-CLOSED (B5↔B2 tension: Delivered-before-
+send opens a CANCEL-overtake window); new mechanism blockers N1 (two-lock pop/claim gap →
+missing-slot panic), N2 (CANCEL forwarded from read loop can overtake the drain's un-issued
+send — must serialize module-bound frames through the drain via Sending sub-state), N3 (RAII
+guard + explicit release double-releases; credit must be ONE consuming token owned by the
+Slot), N4 (corr-uniqueness unenforced → silent slot overwrite leak), N7 (unimplementable
+against shipped types: RouteBinding needs Weak<RouteDispatcher>, ForwardingInner needs a
+dispatchers map), plus majority items N5/N6/N8/N9/N11. Council archive:
+.cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/.
+NEXT (per the engram precedent): v3 = WALKING-SKELETON SPIKE — implement the RouteDispatcher
+core in code with N1-N7 folded (atomic pop+claim, Sending sub-state, consuming credit token,
+corr-uniqueness, dispatcher back-refs), prove with loom/T10-T17-class tests, then gate the
+spike+spec together instead of a third prose round.** Supersedes the mechanism sections of
 `docs/subc-dispatch-redesign.md` (v1, gated NO-GO 8/8). v1's architecture was endorsed; this
 doc specifies the load-bearing concurrency mechanism the gate found missing. No code until v2
 passes re-gate. Verified at source at master `be293a4c`.

@@ -1,7 +1,70 @@
 # subc-core dispatch redesign — non-blocking read loop, per-route dispatch, snapshot-published forwarding
 
-Status: DESIGN — Athena gate pending. No code until the gate passes.
+Status: **v1 DRAFT — GATED NO-GO (unanimous 8/8 council, 2026-07-15). Architecture sound;
+mechanism spec incomplete/wrong. Needs a mechanism-complete v2 + re-gate before any code.**
+Council archive: `.cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/`.
 Motivation: LOOP escalations R1 + R5 (+R11 rider), 2026-07-15. Verified at source at master `9b995560`.
+
+## v2 PUNCH LIST (must all close + re-gate before implementation)
+
+The DEFECT is confirmed real (R5: CANCEL structurally unreadable behind a saturated route).
+The v1 FIX below is architecturally endorsed but fails the gate on load-bearing mechanism
+details. v2 must specify all of these and be re-gated:
+
+- **B1 (prerequisite SDK merge-0):** the "zero SDK changes / route_backpressure = NotSent"
+  claim is FALSE — verified at source: a data-plane `Error{route_backpressure}` classifies as
+  terminal/outcome_unknown in TS (client.ts:781-792,807 → handedToSocket=true → outcome_unknown
+  → RECONNECT) and CallError::Module in Rust (consumer.rs:570-579); the only retryable-code
+  classifier is a closed channel-0 route.open set. Must land a merge-0 adding a data-plane
+  retryable class (route_backpressure/control_backpressure → retry-in-place, NOT reconnect)
+  across TS+Rust+Swift with parity tests, BEFORE the dispatch-queue merge. Correct Goal 5/§5/I8.
+- **B2 (CANCEL vs queued→delivered limbo):** a Request popped by the drain task but awaiting
+  acquire/send is in neither queue nor outstanding-set → CANCEL either loses (forwards to module
+  ahead of the Request → no-op cancel → runs uncancelled = the R5 defect transposed) or
+  double-fires (queue-removal + synthetic cancelled AND module terminal). Replace read-loop
+  queue-inspection with a route-local per-corr state machine (Queued→Claimed→Delivered→
+  Settled/Cancelled), one atomic decision point.
+- **B3 (queue primitive unspecified):** 3.2 `queue.recv()` (mpsc) is incompatible with 3.3's
+  read-loop scan of the same queue (data race). Specify: route-local `VecDeque` behind a mutex
+  + `corr→node` index + `cancelled_corrs` tombstone set; prove the lock hold is bounded + never
+  awaits.
+- **B4 (drain-task error arms unspecified):** the drain pseudocode has NO error arm. Must
+  replicate shipped send-failure release (router.rs:491-496), disambiguate ChannelFlowClosed
+  into reload/GOODBYE/close (test blocked_flow_control_acquire_wakes_when_module_tears_down
+  demands a backend_error terminal), RAII the forget()'d credit, and make the panic guard
+  release exactly-outstanding corrs.
+- **B5 (outstanding insert ordering):** insert corr into outstanding BEFORE module_sink.send
+  (RAII), else a fast module terminal races the insert → permanent credit leak. (Collapses B2's
+  limbo too.)
+- **B6 (O(queue) CANCEL scan = DoS):** ~8.4M comparisons/burst on the read loop reintroduces
+  HOL. Use the corr-index / tombstone set for O(1) CANCEL; never linear-scan on the read loop.
+- **B7 (channel-0 FIFO breaks bind-ACK barrier):** VERIFIED via shipped test
+  accepted_route_publishes_route_open_before_immediate_reverse_request (router.rs:1078-1102):
+  a module's route.bind ACK (route.open response) MUST publish before its immediate reverse
+  request, else the reverse frame drops as Reserved/Absent. Q3 lean (whole channel-0 FIFO) is
+  WRONG — keep route-publication commits inline (or add a per-connection ingress fence). Only
+  offload the genuinely-blocking control ops (route.open's module-ack wait) without reordering
+  the publication barrier.
+- **B8 (false invariants):** I3/I7/I4 are FALSE as written (the 3.7 outstanding-gate changes the
+  release call site; flush-on-GOODBYE changes raw-wire semantics). Reword as intentional deltas;
+  add duplicate/late/unknown-corr terminal tests. NOTE: shipped release() ALREADY has a CAS
+  over-release guard (forwarding.rs:1702-1731) that catches the in_flight==0 case — so R11 is
+  specifically the CONCURRENT-duplicate case (guard only fires at 0); the doc's "trusted not
+  enforced" framing was imprecise and must be corrected.
+- **B9 (GOODBYE flush non-atomic + teardown hang):** flush-then-release doesn't prevent a
+  lock-free snapshot reader from try_push after flush; and a drain task blocked on
+  module_sink.send retains a FrameSink clone that can hang connection-close (server.rs:241-267;
+  JoinHandle drop ≠ abort). Need Open/Closing/Closed admission gate, close-before-flush,
+  cancellation-token close→cancel→bounded-join→abort, and a lock hierarchy.
+- **B10 (merge-1 not standalone-neutral):** ArcSwap load() widens the stale-Bound-after-release
+  window vs RwLock read-after-write → new observable backend_error state. Landable ONLY if the
+  snapshot publishes UNDER the write lock with a per-binding closed/generation guard making
+  stale Bound reads inert, + read-your-writes tests.
+- **VERIFY external consumers** (broca/aft/alfonso-core, not in this checkout) for B1 impact.
+
+---
+### (v1 draft below — retained for the endorsed architecture; mechanism sections superseded by
+### the punch list above)
 
 ## 1. The defect class (verified at source)
 

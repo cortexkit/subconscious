@@ -3545,7 +3545,14 @@ impl SubcMcpServer {
 
                     match frame.header.ty {
                         FrameType::Push => {
-                            forward_progress(&context, progress_token.clone(), &frame.body).await?;
+                            if let Err(err) =
+                                forward_progress(&context, progress_token.clone(), &frame.body).await
+                            {
+                                let cancel_result = self.send_route_cancel(route, corr).await;
+                                self.subc.abandon_request(route, corr).await;
+                                cancel_result.map_err(mcp_internal_error)?;
+                                return Err(err);
+                            }
                         }
                         FrameType::Response => {
                             return serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {

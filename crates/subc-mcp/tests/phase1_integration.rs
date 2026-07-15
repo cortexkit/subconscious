@@ -2444,10 +2444,100 @@ async fn mcp_on_attach_refresh_keeps_mid_session_config_edits_sticky() {
 }
 
 #[tokio::test]
-async fn mcp_immediate_refresh_recomputes_before_triggering_call_and_notifies() {
-    let user_config = r#"{ "version": 1, "refresh": "immediate" }"#;
+async fn mcp_immediate_policy_removal_does_not_retain_forward_binding() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "refresh": "immediate",
+      "providers": {
+        "aft": {
+          "tools": { "overrides": { "read": { "mode": "ack_only" } } }
+        }
+      }
+    }
+    "#;
     let harness = McpHarness::start_configured(
-        "mcp-immediate-refresh",
+        "mcp-forward-removal",
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "read,write,keep")],
+        )],
+        Some(user_config),
+        None,
+    )
+    .await;
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_keep", "aft_read", "aft_write"]
+    );
+
+    let notification_baseline = harness
+        .client_handler
+        .tool_list_changed_count
+        .load(Ordering::SeqCst);
+    let provider_events_before = stub_events(harness.provider_events_path("aft")).unwrap();
+    write_project_mcp_config(
+        &harness._project.path,
+        r#"
+        {
+          "version": 1,
+          "providers": {
+            "aft": {
+              "tools": { "overrides": { "read": false, "write": false } }
+            }
+          }
+        }
+        "#,
+    );
+
+    let ack_result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("aft_read"))
+        .await
+        .unwrap();
+    assert_eq!(ack_result.is_error, Some(false));
+    assert_eq!(result_text(&ack_result), "Queued for context compaction.");
+
+    let err = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("aft_write"))
+        .await
+        .unwrap_err();
+    assert_unknown_tool_error(err, "aft_write");
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        notification_baseline,
+        "tools/list_changed after immediate policy refresh",
+    )
+    .await;
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_keep"]);
+    assert_no_new_stub_events_within(
+        harness.provider_events_path("aft"),
+        &provider_events_before,
+        QUIET_TIMEOUT,
+    )
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_immediate_policy_removal_keeps_ack_only_tombstone_for_stale_call() {
+    let user_config = r#"
+    {
+      "version": 1,
+      "refresh": "immediate",
+      "providers": {
+        "aft": {
+          "tools": { "overrides": { "read": { "mode": "ack_only" } } }
+        }
+      }
+    }
+    "#;
+    let harness = McpHarness::start_configured(
+        "mcp-ack-only-tombstone",
         vec![StubProvider::new(
             "aft",
             &[("FAKE_AFT_TOOLS", "read,write")],
@@ -2461,43 +2551,32 @@ async fn mcp_immediate_refresh_recomputes_before_triggering_call_and_notifies() 
         vec!["aft_read", "aft_write"]
     );
 
-    let baseline = harness
-        .client_handler
-        .tool_list_changed_count
-        .load(Ordering::SeqCst);
+    let provider_events_before = stub_events(harness.provider_events_path("aft")).unwrap();
     write_project_mcp_config(
         &harness._project.path,
         r#"
         {
           "version": 1,
           "providers": {
-            "aft": { "tools": { "overrides": { "write": false } } }
+            "aft": { "tools": { "overrides": { "read": false } } }
           }
         }
         "#,
     );
 
-    let err = harness
+    let result = harness
         .client
         .peer()
-        .call_tool(CallToolRequestParams::new("aft_write"))
+        .call_tool(CallToolRequestParams::new("aft_read"))
         .await
-        .unwrap_err();
-    assert_unknown_tool_error(err, "aft_write");
-    TestMcpClient::wait_for_counter(
-        &harness.client_handler.tool_list_changed_count,
-        baseline,
-        "tools/list_changed after immediate policy refresh",
-    )
-    .await;
-    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
-    assert_no_stub_event_within(
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(result_text(&result), "Queued for context compaction.");
+    assert_eq!(list_tool_names(&harness).await, vec!["aft_write"]);
+    assert_no_new_stub_events_within(
         harness.provider_events_path("aft"),
+        &provider_events_before,
         QUIET_TIMEOUT,
-        |event| {
-            event.get("kind") == Some(&Value::String("tool_call".to_owned()))
-                && event.get("name") == Some(&Value::String("write".to_owned()))
-        },
     )
     .await;
 

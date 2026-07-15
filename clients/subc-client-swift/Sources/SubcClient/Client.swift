@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 // Consumer-side channel-0 control RPC + session data/stream plane over one
@@ -570,23 +571,46 @@ public final class SubcClient {
     }
 
     private func installRouteOpen(_ body: Data) throws -> RouteHandle {
-        guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let channelNumber = object["route_channel"] as? NSNumber,
-              let epochNumber = object["route_epoch"] as? NSNumber,
-              channelNumber.int64Value > 0,
-              channelNumber.uint64Value <= UInt64(UInt16.max),
-              epochNumber.int64Value > 0,
-              epochNumber.uint64Value <= UInt64(UInt32.max)
-        else {
+        guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             throw SubcError(message: "route.open returned no valid route_channel/route_epoch")
         }
+        let channel = try exactWireUInt(
+            object["route_channel"],
+            field: "route_channel",
+            max: UInt64(UInt16.max)
+        )
+        let epoch = try exactWireUInt(
+            object["route_epoch"],
+            field: "route_epoch",
+            max: UInt64(UInt32.max)
+        )
         let route = RouteHandle(
-            channel: UInt16(channelNumber.uint64Value),
-            epoch: UInt32(epochNumber.uint64Value),
+            channel: UInt16(channel),
+            epoch: UInt32(epoch),
             connectionToken: connectionToken
         )
         liveEpochs[route.channel] = route.epoch
         return route
+    }
+
+    private func exactWireUInt(_ value: Any?, field: String, max: UInt64) throws -> UInt64 {
+        guard let number = value as? NSNumber else {
+            throw SubcError(message: "route.open field '\(field)' is missing or not a number")
+        }
+        // JSONSerialization represents booleans as CFBoolean-backed NSNumbers, so reject
+        // them before integer conversion can silently turn true and false into 1 and 0.
+        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            throw SubcError(message: "route.open field '\(field)' must be an integer, not a boolean")
+        }
+        let double = number.doubleValue
+        guard double.isFinite, double == double.rounded(.towardZero) else {
+            throw SubcError(message: "route.open field '\(field)' must be an integer")
+        }
+        let integer = number.uint64Value
+        guard double >= 1, integer >= 1, integer <= max else {
+            throw SubcError(message: "route.open field '\(field)' out of range")
+        }
+        return integer
     }
 
     private func ensureCurrent(_ route: RouteHandle) throws {

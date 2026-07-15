@@ -277,6 +277,58 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertEqual(client.droppedIngressFrames, 2)
     }
 
+    func testRouteOpenRejectsNonIntegralBooleanAndOutOfRangeHandles() throws {
+        let invalidBodies: [[String: Any]] = [
+            ["route_channel": 1.5, "route_epoch": 3],
+            ["route_channel": true, "route_epoch": 3],
+            ["route_channel": 7, "route_epoch": 2.9],
+            ["route_channel": Int(UInt16.max) + 1, "route_epoch": 3],
+        ]
+
+        for body in invalidBodies {
+            let transport = ScriptedTransport()
+            try transport.append(makeFrame(
+                ty: .response,
+                channel: 0,
+                epoch: 0,
+                corr: 1,
+                json: body
+            ))
+            let client = SubcClient(transport: transport)
+
+            XCTAssertThrowsError(try client.routeOpenManagementSurface(
+                moduleId: "module",
+                projectRoot: "/tmp",
+                harness: "test",
+                session: "session"
+            ), "accepted invalid route.open body: \(body)")
+        }
+
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response,
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+            json: ["route_channel": 7, "route_epoch": 3]
+        ))
+        let client = SubcClient(transport: transport)
+        let route = try client.routeOpenManagementSurface(
+            moduleId: "module",
+            projectRoot: "/tmp",
+            harness: "test",
+            session: "session"
+        )
+
+        XCTAssertEqual(route.channel, 7)
+        XCTAssertEqual(route.epoch, 3)
+        try client.cancel(route: route, corr: 99)
+        let cancel = try decodeWrittenFrame(transport.writes[1])
+        XCTAssertEqual(cancel.header.ty, .cancel)
+        XCTAssertEqual(cancel.header.channel, 7)
+        XCTAssertEqual(cancel.header.epoch, 3)
+    }
+
     func testStaleHandleFromAnotherConnectionEmitsNoFrame() throws {
         let firstTransport = ScriptedTransport()
         try firstTransport.append(makeFrame(

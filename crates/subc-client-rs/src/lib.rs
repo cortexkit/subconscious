@@ -2,8 +2,8 @@
 
 pub mod consumer;
 pub use consumer::{
-    CallError, CallOptions, CloseRouteOptions, ConnectionState, ConsumerError, ConsumerOptions,
-    RetryBackoff, RoutePollResult, SubcConsumer, SubscribeOptions, Subscription,
+    CallError, CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerError,
+    ConsumerOptions, RetryBackoff, RoutePollResult, SubcConsumer, SubscribeOptions, Subscription,
     SubscriptionClosed,
 };
 
@@ -25,11 +25,9 @@ use std::{
 };
 
 pub use async_trait::async_trait;
-pub use subc_control::ConsumerIdentity;
-pub use subc_protocol::session::{HealthReport, HealthStatus};
-pub use subc_protocol::AdmissionClass;
+pub use subc_control::{CatalogEntry, ConsumerIdentity};
 use subc_protocol::{
-    manifest::{ModuleManifest, ProviderRole},
+    manifest::ModuleManifest,
     session::{
         ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
         ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -38,6 +36,11 @@ use subc_protocol::{
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV,
     SUBC_MODULE_ID_ENV,
+};
+pub use subc_protocol::{
+    manifest::{ExecutionMode, ProviderRole, Tool},
+    session::{HealthReport, HealthStatus},
+    AdmissionClass,
 };
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,

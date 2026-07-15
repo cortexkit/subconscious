@@ -5,14 +5,24 @@
 //! Run the model-checked test with
 //! `cargo test -p subc-core dispatch_spike --features loom`; the package build script scopes
 //! `cfg(loom)` to this crate because a workspace-wide setting disables Tokio networking.
+//!
+//! # Single-writer invariant
+//!
+//! [`RouteDrain`] owns the only `FrameSink` for a route and is consumed by one drain task.
+//! Read-loop actors can only enqueue cancellation intent through [`RouteDispatcher`]; they can
+//! never write module-bound frames directly. Therefore the drain's Request send completes before
+//! it dequeues and sends a CANCEL for that Delivered correlation.
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
 };
 
-use subc_protocol::Frame;
-use tokio::sync::{mpsc, Notify};
+use subc_protocol::{Frame, FrameType};
+use tokio::sync::{mpsc, Notify, Semaphore};
 
 use crate::{forwarding::ChannelFlow, router::FrameSink};
 
@@ -49,6 +59,8 @@ pub(crate) enum CancelDecision {
     SynthesizeCancelled,
     DeferredToDrain,
     ForwardToModule,
+    QueuedForDrain,
+    DrainStopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,14 +298,61 @@ impl<F: CreditRelease> Drop for CreditToken<F> {
     }
 }
 
-/// Thin async wrapper around [`RouteInbox`]. It is not wired into the daemon.
+/// Thin synchronized wrapper around [`RouteInbox`]. It is not wired into the daemon.
 #[derive(Debug)]
 pub(crate) struct RouteDispatcher {
     inbox: Mutex<RouteInbox>,
     notify: Notify,
     flow: Arc<ChannelFlow>,
-    module_sink: FrameSink,
+    cancel_tx: mpsc::UnboundedSender<Frame>,
     synthetic_sink: mpsc::UnboundedSender<SyntheticTerminal>,
+}
+
+/// Consumed by one task, making that task the route's only module-sink writer.
+#[derive(Debug)]
+pub(crate) struct RouteDrain {
+    dispatcher: Arc<RouteDispatcher>,
+    module_sink: FrameSink,
+    cancel_rx: mpsc::UnboundedReceiver<Frame>,
+    send_gate: Option<Arc<SendGate>>,
+}
+
+/// Test synchronization hook that parks the first Request before it reaches the real sink.
+#[derive(Debug)]
+pub(crate) struct SendGate {
+    armed: AtomicBool,
+    entered: Notify,
+    release: Semaphore,
+}
+
+impl SendGate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Semaphore::new(0),
+        })
+    }
+
+    pub(crate) async fn wait_until_parked(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    async fn park_if_first_request(&self, frame_type: FrameType) {
+        if frame_type == FrameType::Request && self.armed.swap(false, Ordering::AcqRel) {
+            self.entered.notify_one();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("test send gate must remain open");
+            permit.forget();
+        }
+    }
 }
 
 impl RouteDispatcher {
@@ -302,14 +361,22 @@ impl RouteDispatcher {
         flow: Arc<ChannelFlow>,
         module_sink: FrameSink,
         synthetic_sink: mpsc::UnboundedSender<SyntheticTerminal>,
-    ) -> Self {
-        Self {
+    ) -> (Arc<Self>, RouteDrain) {
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let dispatcher = Arc::new(Self {
             inbox: Mutex::new(RouteInbox::new(depth_cap)),
             notify: Notify::new(),
             flow,
-            module_sink,
+            cancel_tx,
             synthetic_sink,
-        }
+        });
+        let drain = RouteDrain {
+            dispatcher: Arc::clone(&dispatcher),
+            module_sink,
+            cancel_rx,
+            send_gate: None,
+        };
+        (dispatcher, drain)
     }
 
     pub(crate) fn push_request(&self, corr: u64, frame: Frame) -> PushOutcome {
@@ -324,11 +391,30 @@ impl RouteDispatcher {
         outcome
     }
 
-    pub(crate) fn on_cancel(&self, corr: u64) -> CancelDecision {
-        self.inbox
+    /// Records cancellation synchronously; module forwarding is always delegated to the drain.
+    pub(crate) fn submit_cancel(&self, frame: Frame) -> CancelDecision {
+        debug_assert_eq!(frame.header.ty, FrameType::Cancel);
+        let corr = frame.header.corr;
+        let decision = self
+            .inbox
             .lock()
             .expect("route inbox mutex poisoned")
-            .on_cancel(corr)
+            .on_cancel(corr);
+        match decision {
+            CancelDecision::SynthesizeCancelled => {
+                self.synthesize(corr, SyntheticKind::Cancelled);
+                CancelDecision::SynthesizeCancelled
+            }
+            CancelDecision::DeferredToDrain => CancelDecision::DeferredToDrain,
+            CancelDecision::ForwardToModule => {
+                if self.cancel_tx.send(frame).is_ok() {
+                    CancelDecision::QueuedForDrain
+                } else {
+                    CancelDecision::DrainStopped
+                }
+            }
+            CancelDecision::QueuedForDrain | CancelDecision::DrainStopped => decision,
+        }
     }
 
     pub(crate) fn begin_closing(&self, kind: TeardownKind) {
@@ -366,12 +452,38 @@ impl RouteDispatcher {
     fn synthesize(&self, corr: u64, kind: SyntheticKind) {
         let _ = self.synthetic_sink.send(SyntheticTerminal { corr, kind });
     }
+}
 
-    pub(crate) async fn drain(self: Arc<Self>) {
+impl RouteDrain {
+    pub(crate) fn with_send_gate(mut self, gate: Arc<SendGate>) -> Self {
+        self.send_gate = Some(gate);
+        self
+    }
+
+    /// The sole call site that writes a route frame to the module sink.
+    async fn send_to_module(&self, frame: Frame) -> bool {
+        if let Some(gate) = &self.send_gate {
+            gate.park_if_first_request(frame.header.ty).await;
+        }
+        self.module_sink.send(frame).await.is_ok()
+    }
+
+    pub(crate) async fn run(mut self) {
         loop {
-            let notified = self.notify.notified();
+            // A cancel queued while the preceding Request send was blocked must be emitted
+            // before the drain starts another request-credit acquisition.
+            if let Ok(cancel) = self.cancel_rx.try_recv() {
+                let _ = self.send_to_module(cancel).await;
+                continue;
+            }
+
+            let notified = self.dispatcher.notify.notified();
             let next = {
-                let mut inbox = self.inbox.lock().expect("route inbox mutex poisoned");
+                let mut inbox = self
+                    .dispatcher
+                    .inbox
+                    .lock()
+                    .expect("route inbox mutex poisoned");
                 let corr = inbox.pop_for_dispatch();
                 let has_more_queue_entries = !inbox.queue_is_empty();
                 let should_exit = inbox.admission() != Admission::Open
@@ -387,31 +499,56 @@ impl RouteDispatcher {
                 if next.1 {
                     continue;
                 }
-                notified.await;
+                tokio::select! {
+                    cancel = self.cancel_rx.recv() => {
+                        if let Some(cancel) = cancel {
+                            let _ = self.send_to_module(cancel).await;
+                        }
+                    }
+                    () = notified => {}
+                }
                 continue;
             };
 
-            if self.flow.acquire().await.is_err() {
+            // A later Request may be waiting for credit held by the cancel target. Keep
+            // forwarding cancels while acquire is blocked so the target can settle and return
+            // the credit that lets the later Request proceed.
+            let acquired = loop {
+                tokio::select! {
+                    cancel = self.cancel_rx.recv() => {
+                        if let Some(cancel) = cancel {
+                            let _ = self.send_to_module(cancel).await;
+                        }
+                    }
+                    acquired = self.dispatcher.flow.acquire() => break acquired,
+                }
+            };
+
+            if acquired.is_err() {
                 let kind = self
+                    .dispatcher
                     .inbox
                     .lock()
                     .expect("route inbox mutex poisoned")
                     .on_acquire_closed(corr);
                 match kind {
                     Some(TeardownKind::Reloading) => {
-                        self.synthesize(corr, SyntheticKind::ModuleReloading);
+                        self.dispatcher
+                            .synthesize(corr, SyntheticKind::ModuleReloading);
                     }
                     Some(TeardownKind::Goodbye | TeardownKind::ConnectionClose) => {}
                     Some(TeardownKind::None) => {
-                        self.synthesize(corr, SyntheticKind::BackendError);
+                        self.dispatcher
+                            .synthesize(corr, SyntheticKind::BackendError);
                     }
                     None => {}
                 }
                 continue;
             }
 
-            let token = CreditToken::new(Arc::clone(&self.flow));
+            let token = CreditToken::new(Arc::clone(&self.dispatcher.flow));
             let decision = self
+                .dispatcher
                 .inbox
                 .lock()
                 .expect("route inbox mutex poisoned")
@@ -419,19 +556,21 @@ impl RouteDispatcher {
             match decision {
                 CommitDecision::Proceed(frame) => {
                     token.commit();
-                    if self.module_sink.send(frame).await.is_err()
-                        && self.terminal_from_module(corr)
+                    if !self.send_to_module(frame).await
+                        && self.dispatcher.terminal_from_module(corr)
                     {
-                        self.synthesize(corr, SyntheticKind::BackendError);
+                        self.dispatcher
+                            .synthesize(corr, SyntheticKind::BackendError);
                     }
                 }
                 CommitDecision::RollbackCancelled => {
                     drop(token);
-                    self.synthesize(corr, SyntheticKind::Cancelled);
+                    self.dispatcher.synthesize(corr, SyntheticKind::Cancelled);
                 }
                 CommitDecision::Missing => {
                     drop(token);
-                    self.synthesize(corr, SyntheticKind::BackendError);
+                    self.dispatcher
+                        .synthesize(corr, SyntheticKind::BackendError);
                 }
             }
         }

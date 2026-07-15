@@ -162,6 +162,57 @@ describe("RouteHandle fencing and endpoint validation", () => {
     expect(socket.writes).toEqual([]);
   });
 
+  test("unsubscribe settles locally, removes its waiter, and ignores late stream data", async () => {
+    const { client, internals, socket, handle } = clientHarness(9, 3);
+    const events: Uint8Array[] = [];
+    const subscription = client.subscribe(handle, { method: "stream" }, (event) => events.push(event));
+    const request = socket.writes[0]!;
+
+    expect(internals.pending.size).toBe(1);
+    subscription.unsubscribe();
+
+    const outcome = await Promise.race([
+      subscription.closed.then(() => "resolved" as const),
+      new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 25)),
+    ]);
+    expect(outcome).toBe("resolved");
+    expect(internals.pending.size).toBe(0);
+    expect(socket.writes).toHaveLength(2);
+    expect(socket.writes[1]!.header).toMatchObject({
+      ty: FrameType.Cancel,
+      channel: handle.channel,
+      epoch: handle.epoch,
+      corr: request.header.corr,
+    });
+
+    internals.dispatch(
+      buildFrame(
+        FrameType.StreamData,
+        buildFlags(false, Priority.Interactive, false),
+        handle.channel,
+        handle.epoch,
+        request.header.corr,
+        json({ late: true }),
+      ),
+    );
+    expect(events).toEqual([]);
+  });
+
+  test("unsubscribe settles locally without throwing after its handle becomes stale", async () => {
+    const { client, internals, socket, handle } = clientHarness(9, 3);
+    const subscription = client.subscribe(handle, { method: "stream" }, () => undefined);
+    const nextToken = newConnectionToken();
+    const replacement = createRouteHandle(handle.channel, handle.epoch, nextToken);
+    internals.connectionToken = nextToken;
+    internals.liveRoutes = new Map([[replacement.channel, replacement]]);
+
+    expect(() => subscription.unsubscribe()).not.toThrow();
+    await expect(subscription.closed).resolves.toBeUndefined();
+    expect(internals.pending.size).toBe(0);
+    expect(socket.writes).toHaveLength(1);
+    expect(socket.writes[0]!.header.ty).toBe(FrameType.Request);
+  });
+
   test("a stale epoch carrying the current corr cannot settle the current request", async () => {
     const { client, internals, socket, handle } = clientHarness(7, 2);
     let settled = false;

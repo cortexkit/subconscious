@@ -238,9 +238,12 @@ fn parse_wrapup_keep_pairs<'a>(
 }
 
 fn validate_status_summary(summary: &str) -> Result<(), ErrorData> {
-    if summary.chars().count() > MAX_STATUS_SUMMARY_CHARS
-        || summary.contains('\n')
-        || summary.contains('\r')
+    let has_control = summary
+        .chars()
+        .any(|character| matches!(character, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}'));
+    if summary.trim().is_empty()
+        || summary.chars().count() > MAX_STATUS_SUMMARY_CHARS
+        || has_control
     {
         return Err(ErrorData::internal_error(
             "prompt backend returned an invalid status summary",
@@ -628,8 +631,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_summary_rejects_oversize_and_multiline_backend_text() {
-        for summary in ["x".repeat(501), "first line\nsecond line".to_owned()] {
+    async fn status_summary_rejects_empty_control_multiline_and_oversize_backend_text() {
+        for summary in [
+            String::new(),
+            " \u{2003} ".to_owned(),
+            "contains\ta tab".to_owned(),
+            "contains\0a nul".to_owned(),
+            "contains\u{0085}a C1 control".to_owned(),
+            "first line\nsecond line".to_owned(),
+            "x".repeat(501),
+        ] {
             let backend = Arc::new(MockBackend::success(&summary));
             let error = service(backend)
                 .get_prompt(GetPromptRequestParams::new(STATUS_NAME))

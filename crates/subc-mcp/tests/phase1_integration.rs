@@ -1384,7 +1384,7 @@ async fn mcp_prompts_are_hidden_by_default() {
 }
 
 #[tokio::test]
-async fn mcp_prompt_policy_refresh_is_drift_guarded_inert_and_tool_neutral() {
+async fn mcp_prompt_policy_refresh_is_proactive_inert_and_tool_neutral() {
     let user_config = r#"{
         "version": 1,
         "refresh": "immediate",
@@ -1418,13 +1418,13 @@ async fn mcp_prompt_policy_refresh_is_drift_guarded_inert_and_tool_neutral() {
 
     assert!(peer.list_prompts(None).await.unwrap().prompts.is_empty());
     write_project_mcp_config(&harness._project.path, enabled_project_config);
-    let activated = peer.list_prompts(None).await.unwrap();
     TestMcpClient::wait_for_counter(
         &harness.client_handler.prompt_list_changed_count,
         prompt_notification_baseline,
-        "prompt list activation notification",
+        "proactive prompt list activation notification without an MCP request",
     )
     .await;
+    let activated = peer.list_prompts(None).await.unwrap();
     assert_eq!(
         serde_json::to_value(activated).unwrap(),
         json!({
@@ -1458,6 +1458,12 @@ async fn mcp_prompt_policy_refresh_is_drift_guarded_inert_and_tool_neutral() {
         .load(Ordering::SeqCst);
     assert_eq!(after_activation, prompt_notification_baseline + 1);
     write_project_mcp_config(&harness._project.path, hidden_project_config);
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.prompt_list_changed_count,
+        after_activation,
+        "proactive prompt list re-hide notification without an MCP request",
+    )
+    .await;
     assert_mcp_error(
         peer.get_prompt(GetPromptRequestParams::new("status"))
             .await
@@ -1465,12 +1471,6 @@ async fn mcp_prompt_policy_refresh_is_drift_guarded_inert_and_tool_neutral() {
         ErrorCode::INVALID_PARAMS,
         "unknown prompt 'status'",
     );
-    TestMcpClient::wait_for_counter(
-        &harness.client_handler.prompt_list_changed_count,
-        after_activation,
-        "prompt list re-hide notification",
-    )
-    .await;
     assert_eq!(
         harness
             .client_handler

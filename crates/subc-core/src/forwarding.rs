@@ -1680,7 +1680,7 @@ pub(crate) struct ChannelFlow {
 }
 
 impl ChannelFlow {
-    fn new(window: usize) -> Self {
+    pub(crate) fn new(window: usize) -> Self {
         debug_assert!(window > 0, "flow-control window must be non-zero");
         Self {
             sem: Semaphore::new(window),
@@ -1732,6 +1732,11 @@ impl ChannelFlow {
 
     pub(crate) fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self) -> usize {
+        self.sem.available_permits()
     }
 
     pub(crate) fn close(&self) {

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod prompts;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
@@ -16,12 +18,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use prompts::{PendingBackend, PromptBackend, PromptService};
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
-        ClientResult, CustomRequest, ErrorCode, ErrorData, Implementation, JsonObject,
-        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
-        RequestId, ServerCapabilities, ServerInfo, ServerRequest, Tool as McpTool, ToolAnnotations,
+        ClientResult, CustomRequest, ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult,
+        Implementation, JsonObject, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, RequestId, ServerCapabilities, ServerInfo,
+        ServerRequest, Tool as McpTool, ToolAnnotations,
     },
     service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError},
     transport::async_rw::AsyncRwTransport,
@@ -1454,7 +1458,7 @@ fn parse_shim_args(args: impl IntoIterator<Item = OsString>) -> Result<ShimArgs>
             // The shim IS the MCP facade, so every bind it produces is an
             // mcp-class identity. Providers validate harness against
             // opencode|pi|runner|mcp:<client> and reject bare tokens with an
-            // opaque config_divergence — auto-prefix so `--harness claude-code`
+            // opaque config_divergence; auto-prefix so `--harness claude-code`
             // means what the operator obviously intended. Explicit prefixed
             // values (and the reserved non-mcp identities) pass through.
             if !harness.contains(':') && !matches!(harness.as_str(), "opencode" | "pi" | "runner") {
@@ -1938,14 +1942,16 @@ async fn handle_shim_connection(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let reconcile_gate = Arc::new(Mutex::new(()));
 
-    let handler = SubcMcpServer {
-        subc: subc.clone(),
-        state: Arc::clone(&attached.state),
-        relay_session: Arc::clone(&attached.relay_session),
-        lifecycle_started: Arc::new(AtomicBool::new(false)),
-        shutdown: shutdown_rx,
-        reconcile_gate: Arc::clone(&reconcile_gate),
-    };
+    let handler = SubcMcpServer::new(
+        subc.clone(),
+        Arc::clone(&attached.state),
+        Arc::clone(&attached.relay_session),
+        Arc::new(AtomicBool::new(false)),
+        shutdown_rx,
+        Arc::clone(&reconcile_gate),
+        hello.instance_token.clone(),
+        Arc::new(PendingBackend),
+    );
     let (read_half, write_half) = stream.into_split();
     let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
     let serve_result = serve_mcp_server(handler, transport).await;
@@ -2106,7 +2112,7 @@ async fn open_provider_route(
 /// never as `direct` (which it trusts). Both env vars are injected by the
 /// daemon on spawn; a facade started any other way (manual launch, a supervisor
 /// that stopped injecting the nonce, an SDK regression dropping the attach)
-/// would silently bind as a trusted first-party — the exact downgrade this
+/// would silently bind as a trusted first-party, which is the exact downgrade this
 /// guard turns into a loud startup failure.
 fn require_spawn_attestation() -> Result<()> {
     let module_id_present = env::var(SUBC_MODULE_ID_ENV)
@@ -3248,6 +3254,7 @@ struct SubcMcpServer {
     lifecycle_started: Arc<AtomicBool>,
     shutdown: watch::Receiver<bool>,
     reconcile_gate: Arc<Mutex<()>>,
+    prompts: PromptService,
 }
 
 /// v1 subc-mcp ↔ provider tool-call request contract carried as an opaque
@@ -3303,9 +3310,26 @@ impl ServerHandler for SubcMcpServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_prompts()
                 .build(),
         )
         .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListPromptsResult, ErrorData> {
+        Ok(self.prompts.list_prompts())
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<GetPromptResult, ErrorData> {
+        self.prompts.get_prompt(request).await
     }
 
     async fn list_tools(
@@ -3375,6 +3399,28 @@ impl ServerHandler for SubcMcpServer {
 }
 
 impl SubcMcpServer {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        subc: SubcClient,
+        state: Arc<SessionState>,
+        relay_session: Arc<RelaySession>,
+        lifecycle_started: Arc<AtomicBool>,
+        shutdown: watch::Receiver<bool>,
+        reconcile_gate: Arc<Mutex<()>>,
+        instance_token: Option<String>,
+        prompt_backend: Arc<dyn PromptBackend>,
+    ) -> Self {
+        Self {
+            subc,
+            state,
+            relay_session,
+            lifecycle_started,
+            shutdown,
+            reconcile_gate,
+            prompts: PromptService::new(instance_token, prompt_backend),
+        }
+    }
+
     async fn refresh_policy_if_needed(
         &self,
         peer: &Peer<RoleServer>,
@@ -4204,7 +4250,7 @@ fn bind_session_from_hello(hello: &ShimHello) -> Result<String> {
 /// Shared validity rule for instance tokens, matching ai-proxy's validation of
 /// the x-ck-instance header form so both consumers accept the same tokens:
 /// non-empty, at most [`MAX_INSTANCE_TOKEN_LEN`] bytes, charset [A-Za-z0-9._-].
-/// The token is otherwise OPAQUE — never parsed for shape.
+/// The token is otherwise OPAQUE and is never parsed for shape.
 fn valid_instance_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= MAX_INSTANCE_TOKEN_LEN

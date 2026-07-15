@@ -78,10 +78,22 @@ async function readMessage<T>(sock: SubcSocket, deadlineMs: number): Promise<T> 
 }
 
 interface ServerProofMessage {
-  daemon_id: number[];
-  server_nonce: number[];
+  daemon_id: unknown;
+  server_nonce: unknown;
   daemon_ver: string;
-  server_proof: number[];
+  server_proof: unknown;
+}
+
+function authBytes(value: unknown, field: string): Uint8Array {
+  if (!Array.isArray(value)) {
+    throw new AuthError(`auth field '${field}' must be a byte array`);
+  }
+  for (const byte of value) {
+    if (typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255) {
+      throw new AuthError(`auth field '${field}' has invalid byte ${String(byte)}`);
+    }
+  }
+  return Uint8Array.from(value as number[]);
 }
 
 /**
@@ -103,9 +115,9 @@ export async function authenticateClient(
   );
 
   const proof = await readMessage<ServerProofMessage>(sock, deadlineMs);
-  const serverNonce = Uint8Array.from(proof.server_nonce);
-  const daemonId = Uint8Array.from(proof.daemon_id);
-  const serverProof = Uint8Array.from(proof.server_proof);
+  const serverNonce = authBytes(proof.server_nonce, "server_nonce");
+  const daemonId = authBytes(proof.daemon_id, "daemon_id");
+  const serverProof = authBytes(proof.server_proof, "server_proof");
 
   const expected = computeProof(conn.key, SERVER_PROOF_DOMAIN, clientNonce, serverNonce, daemonId);
   if (!constantTimeEq(expected, serverProof)) {

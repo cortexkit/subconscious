@@ -43,9 +43,12 @@ private func constantTimeEq(_ a: Data, _ b: Data) -> Bool {
     return diff == 0
 }
 
-private func randomNonce(_ n: Int) -> Data {
+func randomNonce(_ n: Int) throws -> Data {
     var bytes = [UInt8](repeating: 0, count: n)
-    _ = SecRandomCopyBytes(kSecRandomDefault, n, &bytes)
+    let status = SecRandomCopyBytes(kSecRandomDefault, n, &bytes)
+    guard status == errSecSuccess else {
+        throw AuthError(message: "failed to generate secure random nonce: SecRandomCopyBytes status \(status)")
+    }
     return Data(bytes)
 }
 
@@ -82,7 +85,7 @@ private func jsonBytes(_ value: Any?, _ field: String) throws -> Data {
 /// Run the client handshake over a connected transport. Returns on success;
 /// throws AuthError on any proof/identity mismatch or framing fault.
 public func authenticateClient(_ t: Transport, _ conn: ConnectionInfo) throws {
-    let clientNonce = randomNonce(NONCE_LEN)
+    let clientNonce = try randomNonce(NONCE_LEN)
 
     try writeMessage(t, ["client_nonce": [UInt8](clientNonce).map { Int($0) }, "role": DEFAULT_CLIENT_ROLE])
 

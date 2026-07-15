@@ -81,6 +81,22 @@ describe("connection file reader", () => {
     ).rejects.toThrow(/key is too short/);
   });
 
+  test("rejects an out-of-range key byte", async () => {
+    const key = Array(32).fill(1);
+    key[0] = 427;
+    await expect(readConnectionFile(tempFile(validInfo({ key })))).rejects.toThrow(
+      "connection file field 'key' has invalid byte 427",
+    );
+  });
+
+  test("rejects an out-of-range daemon_id byte", async () => {
+    const daemonId = Array(16).fill(1);
+    daemonId[0] = -1;
+    await expect(readConnectionFile(tempFile(validInfo({ daemon_id: daemonId })))).rejects.toThrow(
+      "connection file field 'daemon_id' has invalid byte -1",
+    );
+  });
+
   test("rejects a wrong-length daemon_id", async () => {
     await expect(
       readConnectionFile(tempFile(validInfo({ daemon_id: Array(8).fill(1) }))),

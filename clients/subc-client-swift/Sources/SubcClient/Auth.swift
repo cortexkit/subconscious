@@ -79,7 +79,12 @@ private func readMessage(_ t: Transport) throws -> [String: Any] {
 
 private func jsonBytes(_ value: Any?, _ field: String) throws -> Data {
     guard let arr = value as? [Int] else { throw AuthError(message: "auth field '\(field)' must be a byte array") }
-    return Data(arr.map { UInt8(truncatingIfNeeded: $0) })
+    return try Data(arr.map { value -> UInt8 in
+        guard let byte = UInt8(exactly: value) else {
+            throw AuthError(message: "auth field '\(field)' has invalid byte \(value)")
+        }
+        return byte
+    })
 }
 
 /// Run the client handshake over a connected transport. Returns on success;

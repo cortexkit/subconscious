@@ -2401,9 +2401,22 @@ impl SessionState {
         old_tools != inner.tools
     }
 
-    fn replace_inner(&self, next: SessionInner) -> bool {
+    fn replace_inner(&self, mut next: SessionInner) -> bool {
         let mut inner = self.write_inner();
         let changed = inner.surface_mode != next.surface_mode || inner.tools != next.tools;
+
+        // Clients can call an item from a stale advertised tools/list before they
+        // process tools/list_changed. Keep removed AckOnly bindings as hidden
+        // tombstones only in `bindings`, never `tools`, so that window gets the
+        // inert acknowledgment without retaining a provider route. Forward bindings
+        // are never retained because they own provider route state that must disappear
+        // with the policy.
+        for (name, binding) in &inner.bindings {
+            if matches!(binding, ToolBinding::AckOnly { .. }) && !next.bindings.contains_key(name) {
+                next.bindings.insert(name.clone(), binding.clone());
+            }
+        }
+
         *inner = next;
         changed
     }
@@ -4427,6 +4440,76 @@ mod tests {
         parse_shim_args(vec![OsString::from("--harness"), OsString::from(harness)]).unwrap()
     }
 
+    fn test_session_state(inner: SessionInner) -> SessionState {
+        SessionState::new(
+            ConfigSnapshot {
+                effective: GatewayConfig::default(),
+                files: ConfigFileSnapshot {
+                    user: ConfigFileState {
+                        path: PathBuf::from("user-mcp.jsonc"),
+                        modified: None,
+                        len: None,
+                    },
+                    project: ConfigFileState {
+                        path: PathBuf::from("project-mcp.jsonc"),
+                        modified: None,
+                        len: None,
+                    },
+                },
+            },
+            BindIdentity {
+                project_root: PathBuf::from("/tmp/subc-mcp-tombstone-test"),
+                harness: DEFAULT_HARNESS.to_owned(),
+                session: "tombstone-test-session".to_owned(),
+            },
+            inner,
+        )
+    }
+
+    fn test_session_inner(
+        tool_names: &[&str],
+        bindings: HashMap<String, ToolBinding>,
+    ) -> SessionInner {
+        SessionInner {
+            surface_mode: SurfaceMode::Full,
+            catalog_generation: 0,
+            routes: HashMap::new(),
+            tools: tool_names
+                .iter()
+                .map(|name| ExposedTool {
+                    manifest: ManifestTool {
+                        name: (*name).to_owned(),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: serde_json::json!({ "type": "object" }),
+                    },
+                    description: format!("test tool {name}"),
+                })
+                .collect(),
+            bindings,
+        }
+    }
+
+    fn ack_counter(state: &SessionState, tool_name: &str) -> Arc<AtomicU64> {
+        match state.direct_binding(tool_name) {
+            Some(ToolBinding::AckOnly { acks }) => acks,
+            Some(ToolBinding::Forward(_)) => {
+                panic!("{tool_name} should have an ack-only binding")
+            }
+            None => panic!("{tool_name} should have an ack-only binding"),
+        }
+    }
+
+    fn call_ack_only_binding(binding: ToolBinding) -> CallToolResult {
+        match binding {
+            ToolBinding::AckOnly { acks } => {
+                acks.fetch_add(1, Ordering::Relaxed);
+                ack_only_tool_result().expect("ack-only tool result should be valid")
+            }
+            ToolBinding::Forward(_) => panic!("test call expected an ack-only binding"),
+        }
+    }
+
     async fn connected_tcp_stream_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4875,6 +4958,123 @@ mod tests {
             metrics["ack_only_acks"],
             serde_json::json!({ "fake-aft_fake_read": 2 })
         );
+    }
+
+    #[test]
+    fn policy_refresh_readding_tool_replaces_ack_only_tombstone() {
+        const TOOL_NAME: &str = "aft_read";
+        let removed_counter = Arc::new(AtomicU64::new(0));
+        let state = test_session_state(test_session_inner(
+            &[TOOL_NAME],
+            HashMap::from([(
+                TOOL_NAME.to_owned(),
+                ToolBinding::AckOnly {
+                    acks: Arc::clone(&removed_counter),
+                },
+            )]),
+        ));
+
+        assert!(state.replace_inner(test_session_inner(&[], HashMap::new())));
+        assert!(state.exposed_tools().is_empty());
+        assert!(Arc::ptr_eq(
+            &ack_counter(&state, TOOL_NAME),
+            &removed_counter
+        ));
+
+        let readded_ack_counter = Arc::new(AtomicU64::new(0));
+        assert!(state.replace_inner(test_session_inner(
+            &[TOOL_NAME],
+            HashMap::from([(
+                TOOL_NAME.to_owned(),
+                ToolBinding::AckOnly {
+                    acks: Arc::clone(&readded_ack_counter),
+                },
+            )]),
+        )));
+        assert_eq!(
+            state
+                .exposed_tools()
+                .iter()
+                .map(|tool| tool.manifest.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![TOOL_NAME]
+        );
+        let readded_ack = ack_counter(&state, TOOL_NAME);
+        assert!(Arc::ptr_eq(&readded_ack, &readded_ack_counter));
+        assert!(!Arc::ptr_eq(&readded_ack, &removed_counter));
+        readded_ack.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(readded_ack_counter.load(Ordering::Relaxed), 1);
+
+        assert!(state.replace_inner(test_session_inner(&[], HashMap::new())));
+        let forward_route = RouteHandle {
+            channel: 7,
+            epoch: 3,
+            connection_token: 11,
+        };
+        assert!(state.replace_inner(test_session_inner(
+            &[TOOL_NAME],
+            HashMap::from([(
+                TOOL_NAME.to_owned(),
+                ToolBinding::Forward(ForwardBinding {
+                    route: forward_route,
+                    bare_tool_name: "read".to_owned(),
+                }),
+            )]),
+        )));
+        match state.direct_binding(TOOL_NAME) {
+            Some(ToolBinding::Forward(forward)) => {
+                assert_eq!(forward.route, forward_route);
+                assert_eq!(forward.bare_tool_name, "read");
+            }
+            Some(ToolBinding::AckOnly { .. }) => {
+                panic!("a re-added forward tool must not retain its ack-only tombstone")
+            }
+            None => panic!("re-added forward tool should have a binding"),
+        }
+    }
+
+    #[test]
+    fn policy_refresh_keeps_ack_only_tombstone_counter_stable() {
+        const TOOL_NAME: &str = "aft_read";
+        let counter = Arc::new(AtomicU64::new(0));
+        let state = test_session_state(test_session_inner(
+            &[TOOL_NAME],
+            HashMap::from([(
+                TOOL_NAME.to_owned(),
+                ToolBinding::AckOnly {
+                    acks: Arc::clone(&counter),
+                },
+            )]),
+        ));
+
+        assert!(state.replace_inner(test_session_inner(&[], HashMap::new())));
+        let tombstone_counter = ack_counter(&state, TOOL_NAME);
+        assert!(Arc::ptr_eq(&tombstone_counter, &counter));
+        let stale_result = call_ack_only_binding(
+            state
+                .direct_binding(TOOL_NAME)
+                .expect("tombstone should resolve the stale tool call"),
+        );
+        assert_eq!(stale_result.is_error, Some(false));
+
+        assert!(!state.replace_inner(test_session_inner(&[], HashMap::new())));
+        let repeated_tombstone_counter = ack_counter(&state, TOOL_NAME);
+        assert!(Arc::ptr_eq(&repeated_tombstone_counter, &counter));
+        assert_eq!(repeated_tombstone_counter.load(Ordering::Relaxed), 1);
+        assert_eq!(state.read_inner().bindings.len(), 1);
+
+        assert!(state.replace_inner(test_session_inner(
+            &[TOOL_NAME],
+            HashMap::from([(
+                TOOL_NAME.to_owned(),
+                ToolBinding::AckOnly {
+                    acks: Arc::clone(&counter),
+                },
+            )]),
+        )));
+        let readded_counter = ack_counter(&state, TOOL_NAME);
+        assert!(Arc::ptr_eq(&readded_counter, &counter));
+        assert_eq!(readded_counter.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -2,16 +2,61 @@ import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
 import {
+  AuthError,
+  authenticateClient,
   CLIENT_AUTH_DOMAIN,
   computeProof,
   PROOF_LEN,
   SERVER_PROOF_DOMAIN,
 } from "../src/auth.js";
+import type { ConnectionInfo } from "../src/connection-file.js";
+import type { SubcSocket } from "../src/socket.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0xab));
 const CN = Uint8Array.from(Array(32).fill(0x01));
 const SN = Uint8Array.from(Array(32).fill(0x02));
 const DID = Uint8Array.from(Array(16).fill(0x03));
+const CONNECTION: ConnectionInfo = {
+  schema: 1,
+  endpoints: [{ host: "127.0.0.1", port: 8799 }],
+  key: KEY,
+  daemonId: DID,
+  pid: 1,
+  daemonVer: "test",
+};
+
+class ScriptedAuthSocket {
+  private readonly inbound: Uint8Array;
+  private offset = 0;
+
+  constructor(message: unknown) {
+    const body = Buffer.from(JSON.stringify(message), "utf8");
+    const prefix = Buffer.alloc(4);
+    prefix.writeUInt32LE(body.length);
+    this.inbound = Buffer.concat([prefix, body]);
+  }
+
+  async readExact(n: number): Promise<Uint8Array> {
+    const end = this.offset + n;
+    if (end > this.inbound.length) throw new Error("scripted auth input exhausted");
+    const bytes = this.inbound.slice(this.offset, end);
+    this.offset = end;
+    return bytes;
+  }
+
+  async write(_bytes: Uint8Array): Promise<void> {}
+}
+
+async function expectAuthByteError(message: unknown, expected: string): Promise<void> {
+  const socket = new ScriptedAuthSocket(message) as unknown as SubcSocket;
+  try {
+    await authenticateClient(socket, CONNECTION, Date.now() + 1_000);
+    throw new Error("authentication unexpectedly succeeded");
+  } catch (error) {
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as Error).message).toContain(expected);
+  }
+}
 
 describe("auth crypto", () => {
   // Pins the exact primitive computeProof relies on (node's HMAC-SHA256) against
@@ -54,5 +99,33 @@ describe("auth crypto", () => {
     const a = computeProof(KEY, SERVER_PROOF_DOMAIN, CN, SN, DID);
     const b = computeProof(k2, SERVER_PROOF_DOMAIN, CN, SN, DID);
     expect(Buffer.from(a).equals(Buffer.from(b))).toBe(false);
+  });
+});
+
+describe("auth message validation", () => {
+  test("rejects an out-of-range proof byte before HMAC verification", async () => {
+    const serverProof = Array(PROOF_LEN).fill(0);
+    serverProof[0] = 427;
+    await expectAuthByteError(
+      {
+        daemon_id: Array.from(DID),
+        server_nonce: Array.from(SN),
+        daemon_ver: "test",
+        server_proof: serverProof,
+      },
+      "auth field 'server_proof' has invalid byte 427",
+    );
+  });
+
+  test("rejects a non-array auth byte field as AuthError", async () => {
+    await expectAuthByteError(
+      {
+        daemon_id: Array.from(DID),
+        server_nonce: "not-an-array",
+        daemon_ver: "test",
+        server_proof: Array(PROOF_LEN).fill(0),
+      },
+      "auth field 'server_nonce' must be a byte array",
+    );
   });
 });

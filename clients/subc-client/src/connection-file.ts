@@ -31,8 +31,13 @@ export interface ConnectionInfo {
 export class ConnectionFileError extends Error {}
 
 function toBytes(value: unknown, field: string): Uint8Array {
-  if (!Array.isArray(value) || value.some((n) => typeof n !== "number")) {
+  if (!Array.isArray(value)) {
     throw new ConnectionFileError(`connection file field '${field}' must be a JSON array of bytes`);
+  }
+  for (const byte of value) {
+    if (typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255) {
+      throw new ConnectionFileError(`connection file field '${field}' has invalid byte ${String(byte)}`);
+    }
   }
   return Uint8Array.from(value as number[]);
 }

@@ -19,8 +19,8 @@ use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities,
         ClientInfo, ClientRequest, CreateElicitationRequestParams, CreateElicitationResult,
-        ElicitationAction, ErrorData as McpErrorData, Implementation, JsonObject,
-        ProgressNotificationParam,
+        ElicitationAction, ErrorCode, ErrorData as McpErrorData, GetPromptRequestParams,
+        Implementation, JsonObject, ProgressNotificationParam,
     },
     service::{
         MaybeSendFuture, NotificationContext, PeerRequestOptions, RunningService, ServiceError,
@@ -185,7 +185,7 @@ impl TestMcpClient {
     /// Wait until `counter` advances past `baseline`, bounded by READ_TIMEOUT.
     ///
     /// Notifications are level-triggered counters (not edge-triggered `Notify`)
-    /// so a notification delivered before this poll begins is never lost — the
+    /// so a notification delivered before this poll begins is never lost; the
     /// race that made the edge-triggered waits flake on Windows under load.
     async fn wait_for_counter(counter: &AtomicUsize, baseline: usize, label: &str) {
         let deadline = Instant::now() + READ_TIMEOUT;
@@ -1334,7 +1334,7 @@ impl McpHarness {
 }
 
 #[tokio::test]
-async fn mcp_initialize_advertises_tools_capability() {
+async fn mcp_initialize_advertises_tools_and_prompts_capabilities() {
     let harness = McpHarness::start("mcp-init", &[]).await;
 
     let server_info = harness
@@ -1348,7 +1348,102 @@ async fn mcp_initialize_advertises_tools_capability() {
         .as_ref()
         .expect("subc-mcp should advertise the MCP tools capability");
     assert_eq!(tools_capability.list_changed, Some(true));
+    assert!(
+        server_info.capabilities.prompts.is_some(),
+        "subc-mcp should advertise the MCP prompts capability"
+    );
     assert_eq!(server_info.server_info.name, "subc-mcp");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_prompts_list_serialized_descriptors_are_drift_guarded() {
+    let harness = McpHarness::start("mcp-prompts-list", &[]).await;
+
+    let result = harness.client.peer().list_prompts(None).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        json!({
+            "prompts": [
+                {
+                    "name": "status",
+                    "description": "Summarize the current conversation state from Magic Context."
+                },
+                {
+                    "name": "wrapup",
+                    "description": "Wrap up this conversation: fold history and keep only the most recent messages.",
+                    "arguments": [
+                        {
+                            "name": "keep",
+                            "description": "number of recent messages to keep (5-100, default 20)",
+                            "required": false
+                        }
+                    ]
+                }
+            ]
+        })
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_prompts_get_validation_and_pending_backend_errors_are_clean() {
+    let harness = McpHarness::start("mcp-prompts-get", &[]).await;
+    let peer = harness.client.peer();
+
+    assert_mcp_error(
+        peer.get_prompt(GetPromptRequestParams::new("missing"))
+            .await
+            .unwrap_err(),
+        ErrorCode::INVALID_PARAMS,
+        "unknown prompt 'missing'",
+    );
+
+    assert_mcp_error(
+        peer.get_prompt(GetPromptRequestParams::new("status"))
+            .await
+            .unwrap_err(),
+        ErrorCode(-32000),
+        "status backend not wired yet",
+    );
+
+    for keep in [None, Some("-2"), Some("4"), Some("500")] {
+        let mut request = GetPromptRequestParams::new("wrapup");
+        if let Some(keep) = keep {
+            let mut arguments = JsonObject::new();
+            arguments.insert("keep".to_owned(), json!(keep));
+            request = request.with_arguments(arguments);
+        }
+        assert_mcp_error(
+            peer.get_prompt(request).await.unwrap_err(),
+            ErrorCode(-32000),
+            "wrapup backend not wired yet",
+        );
+    }
+
+    for keep in ["abc", "9223372036854775808"] {
+        let mut arguments = JsonObject::new();
+        arguments.insert("keep".to_owned(), json!(keep));
+        assert_mcp_error(
+            peer.get_prompt(GetPromptRequestParams::new("wrapup").with_arguments(arguments))
+                .await
+                .unwrap_err(),
+            ErrorCode::INVALID_PARAMS,
+            "keep must be an integer",
+        );
+    }
+
+    let mut arguments = JsonObject::new();
+    arguments.insert("recent".to_owned(), json!("20"));
+    assert_mcp_error(
+        peer.get_prompt(GetPromptRequestParams::new("wrapup").with_arguments(arguments))
+            .await
+            .unwrap_err(),
+        ErrorCode::INVALID_PARAMS,
+        "unknown argument 'recent' for prompt 'wrapup'",
+    );
 
     harness.shutdown().await;
 }
@@ -3117,7 +3212,7 @@ async fn mcp_shim_rejects_unsupported_hello_ack_schema() {
 async fn mcp_module_without_spawn_attestation_exits_loud_before_serving() {
     // The facade fronts remote-model callers; its binds must carry the attested
     // reserved principal. Started WITHOUT the daemon-injected env (a manual
-    // launch or an injection regression), it must refuse to serve — the
+    // launch or an injection regression), it must refuse to serve; the
     // alternative is silently binding as the trusted `direct` principal.
     let server = TestServer::start().await;
     let module_connection_file = server.daemon.temp_dir.join("mcp-unattested-module.json");
@@ -4235,6 +4330,16 @@ fn result_json(result: &rmcp::model::CallToolResult) -> Value {
             result_text(result)
         )
     })
+}
+
+fn assert_mcp_error(error: ServiceError, code: ErrorCode, message: &str) {
+    match error {
+        ServiceError::McpError(error) => {
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+        other => panic!("expected MCP error {code:?} with message {message:?}, got {other:?}"),
+    }
 }
 
 fn assert_unknown_tool_error(error: ServiceError, name: &str) {

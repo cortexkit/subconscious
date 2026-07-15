@@ -14,6 +14,7 @@ const WRAPUP_DESCRIPTION: &str =
 const KEEP_ARGUMENT: &str = "keep";
 const KEEP_DESCRIPTION: &str = "number of recent messages to keep (5-100, default 20)";
 const BACKEND_UNAVAILABLE: ErrorCode = ErrorCode(-32000);
+const MAX_STATUS_SUMMARY_CHARS: usize = 500;
 
 type StatusBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, PromptBackendError>> + Send + 'a>>;
@@ -99,6 +100,10 @@ pub(crate) struct PromptService {
     backend: Arc<dyn PromptBackend>,
 }
 
+pub(crate) fn prompt_names() -> [&'static str; 2] {
+    [STATUS_NAME, WRAPUP_NAME]
+}
+
 impl PromptService {
     pub(crate) fn new(instance_token: Option<String>, backend: Arc<dyn PromptBackend>) -> Self {
         Self {
@@ -107,14 +112,31 @@ impl PromptService {
         }
     }
 
-    pub(crate) fn list_prompts(&self) -> ListPromptsResult {
+    pub(crate) fn list_prompts(
+        &self,
+        mut is_visible: impl FnMut(&str) -> bool,
+    ) -> ListPromptsResult {
         ListPromptsResult {
-            prompts: prompt_descriptors(),
+            prompts: prompt_descriptors()
+                .into_iter()
+                .filter(|prompt| is_visible(&prompt.name))
+                .collect(),
             ..Default::default()
         }
     }
 
-    pub(crate) async fn get_prompt(
+    pub(crate) async fn get_prompt_if_visible(
+        &self,
+        request: GetPromptRequestParams,
+        is_visible: bool,
+    ) -> Result<GetPromptResult, ErrorData> {
+        if !is_visible {
+            return Err(unknown_prompt(&request.name));
+        }
+        self.get_prompt(request).await
+    }
+
+    async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
     ) -> Result<GetPromptResult, ErrorData> {
@@ -122,7 +144,13 @@ impl PromptService {
         let text = match request.name.as_str() {
             STATUS_NAME => {
                 reject_arguments(STATUS_NAME, arguments)?;
-                self.backend.status(self.instance_token.as_deref()).await
+                let summary = self
+                    .backend
+                    .status(self.instance_token.as_deref())
+                    .await
+                    .map_err(backend_error_to_mcp)?;
+                validate_status_summary(&summary)?;
+                summary
             }
             WRAPUP_NAME => {
                 let keep = parse_wrapup_keep(arguments)?;
@@ -131,11 +159,11 @@ impl PromptService {
                     .enqueue_wrapup(self.instance_token.as_deref(), keep)
                     .await
                     .map_err(backend_error_to_mcp)?;
-                Ok(render_wrapup(enqueued))
+                log_wrapup(&enqueued);
+                render_wrapup(enqueued)
             }
-            name => return Err(invalid_params(format!("unknown prompt '{name}'"))),
-        }
-        .map_err(backend_error_to_mcp)?;
+            name => return Err(unknown_prompt(name)),
+        };
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             PromptMessageRole::User,
@@ -178,6 +206,9 @@ fn parse_wrapup_keep(arguments: Option<&JsonObject>) -> Result<Option<i64>, Erro
     )
 }
 
+// MCP arguments are decoded into JsonObject before this handler runs, so duplicate
+// wire keys have already collapsed. The pair check remains defensive for callers
+// that preserve duplicates, while unknown decoded arguments still fail closed.
 fn parse_wrapup_keep_pairs<'a>(
     arguments: impl IntoIterator<Item = (&'a str, &'a Value)>,
 ) -> Result<Option<i64>, ErrorData> {
@@ -206,6 +237,30 @@ fn parse_wrapup_keep_pairs<'a>(
     Ok(keep)
 }
 
+fn validate_status_summary(summary: &str) -> Result<(), ErrorData> {
+    if summary.chars().count() > MAX_STATUS_SUMMARY_CHARS
+        || summary.contains('\n')
+        || summary.contains('\r')
+    {
+        return Err(ErrorData::internal_error(
+            "prompt backend returned an invalid status summary",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn log_wrapup(enqueued: &WrapupEnqueued) {
+    eprintln!(
+        "subc-mcp prompt wrapup: status={:?} command_id={} effective_keep={} clamped={} expires_at_ms={}",
+        enqueued.status,
+        enqueued.command_id,
+        enqueued.keep,
+        enqueued.clamped,
+        enqueued.expires_at_ms
+    );
+}
+
 fn render_wrapup(enqueued: WrapupEnqueued) -> String {
     let status = match enqueued.status {
         WrapupEnqueueStatus::Queued => "Wrapup queued",
@@ -217,19 +272,25 @@ fn render_wrapup(enqueued: WrapupEnqueued) -> String {
         ""
     };
     format!(
-        "{status} as command {}. Effective keep: {}{clamped}. It applies to your next message and has a 15-minute expiry at {} ms since the Unix epoch.",
-        enqueued.command_id, enqueued.keep, enqueued.expires_at_ms
+        "{status} with an effective keep of {} messages{clamped}. It starts on the next eligible parent message, the fold takes effect on a later pass, and an abandoned command expires after its 15-minute deadline.",
+        enqueued.keep
     )
 }
 
 fn backend_error_to_mcp(error: PromptBackendError) -> ErrorData {
     match error {
-        PromptBackendError::Unavailable(message) => {
-            ErrorData::new(BACKEND_UNAVAILABLE, message, None)
+        PromptBackendError::Unavailable(_) => {
+            ErrorData::new(BACKEND_UNAVAILABLE, "prompt backend is unavailable", None)
         }
-        PromptBackendError::InvalidParams(message) => ErrorData::invalid_params(message, None),
-        PromptBackendError::Internal(message) => ErrorData::internal_error(message, None),
+        PromptBackendError::InvalidParams(_) => {
+            ErrorData::invalid_params("prompt backend rejected the request", None)
+        }
+        PromptBackendError::Internal(_) => ErrorData::internal_error("prompt backend failed", None),
     }
+}
+
+fn unknown_prompt(name: &str) -> ErrorData {
+    invalid_params(format!("unknown prompt '{name}'"))
 }
 
 fn invalid_params(message: impl Into<std::borrow::Cow<'static, str>>) -> ErrorData {
@@ -351,7 +412,7 @@ mod tests {
     #[test]
     fn prompt_descriptors_serialization_is_exact() {
         let backend = Arc::new(MockBackend::success("unused"));
-        let serialized = serde_json::to_value(service(backend).list_prompts()).unwrap();
+        let serialized = serde_json::to_value(service(backend).list_prompts(|_| true)).unwrap();
         assert_eq!(
             serialized,
             json!({
@@ -374,6 +435,26 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn prompt_list_filter_can_hide_every_descriptor() {
+        let backend = Arc::new(MockBackend::success("unused"));
+        let result = service(backend).list_prompts(|_| false);
+        assert!(result.prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hidden_prompt_get_is_inert() {
+        let backend = Arc::new(MockBackend::success("must not be returned"));
+        let error = service(Arc::clone(&backend))
+            .get_prompt_if_visible(GetPromptRequestParams::new(STATUS_NAME), false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(error.message, "unknown prompt 'status'");
+        assert!(backend.calls().is_empty());
     }
 
     #[tokio::test]
@@ -476,7 +557,7 @@ mod tests {
                 .pointer("/messages/0/content/text")
                 .and_then(Value::as_str),
             Some(
-                "Wrapup queued as command command-clamped. Effective keep: 5 (clamped from your requested value). It applies to your next message and has a 15-minute expiry at 123456 ms since the Unix epoch."
+                "Wrapup queued with an effective keep of 5 messages (clamped from your requested value). It starts on the next eligible parent message, the fold takes effect on a later pass, and an abandoned command expires after its 15-minute deadline."
             )
         );
 
@@ -497,13 +578,13 @@ mod tests {
                 .pointer("/messages/0/content/text")
                 .and_then(Value::as_str),
             Some(
-                "Wrapup already queued as command command-existing. Effective keep: 20. It applies to your next message and has a 15-minute expiry at 654321 ms since the Unix epoch."
+                "Wrapup already queued with an effective keep of 20 messages. It starts on the next eligible parent message, the fold takes effect on a later pass, and an abandoned command expires after its 15-minute deadline."
             )
         );
     }
 
     #[test]
-    fn wrapup_keep_rejects_duplicate_and_unknown_argument_names() {
+    fn defensive_pair_parser_rejects_duplicate_and_unknown_argument_names() {
         let first = json!("20");
         let second = json!("30");
         let duplicate =
@@ -547,6 +628,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_summary_rejects_oversize_and_multiline_backend_text() {
+        for summary in ["x".repeat(501), "first line\nsecond line".to_owned()] {
+            let backend = Arc::new(MockBackend::success(&summary));
+            let error = service(backend)
+                .get_prompt(GetPromptRequestParams::new(STATUS_NAME))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                error.message,
+                "prompt backend returned an invalid status summary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_summary_accepts_exactly_five_hundred_characters() {
+        let summary = "x".repeat(MAX_STATUS_SUMMARY_CHARS);
+        let backend = Arc::new(MockBackend::success(&summary));
+        let result = service(backend)
+            .get_prompt(GetPromptRequestParams::new(STATUS_NAME))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result)
+                .unwrap()
+                .pointer("/messages/0/content/text")
+                .and_then(Value::as_str),
+            Some(summary.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn backend_failure_returns_clean_mcp_error() {
         let backend = Arc::new(MockBackend::failure(PromptBackendError::Unavailable(
             "temporarily offline".to_owned(),
@@ -557,7 +671,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, BACKEND_UNAVAILABLE);
-        assert_eq!(error.message, "temporarily offline");
+        assert_eq!(error.message, "prompt backend is unavailable");
     }
 
     #[test]
@@ -566,11 +680,13 @@ mod tests {
             "backend rejected parameters".to_owned(),
         ));
         assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(invalid.message, "prompt backend rejected the request");
 
         let internal = backend_error_to_mcp(PromptBackendError::Internal(
             "backend response failed".to_owned(),
         ));
         assert_eq!(internal.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(internal.message, "prompt backend failed");
     }
 
     #[tokio::test]

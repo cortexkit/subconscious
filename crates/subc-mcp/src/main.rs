@@ -976,6 +976,7 @@ struct ExposedTool {
 struct GatewayConfig {
     surface_mode: SurfaceMode,
     refresh: RefreshMode,
+    prompts: PromptConfig,
     providers: HashMap<String, ProviderConfig>,
 }
 
@@ -997,6 +998,17 @@ struct ToolOverride {
     enabled: Option<bool>,
     description: Option<String>,
     mode: Option<ToolMode>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PromptConfig {
+    default_enabled: Option<bool>,
+    overrides: HashMap<String, PromptOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PromptOverride {
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1072,6 +1084,7 @@ struct DesiredTool {
 struct RawGatewayLayer {
     surface_mode: MaybeSet<SurfaceMode>,
     refresh: MaybeSet<RefreshMode>,
+    prompts: MaybeSet<RawPromptConfig>,
     providers: HashMap<String, RawProviderConfig>,
 }
 
@@ -1087,6 +1100,8 @@ struct RawGatewayConfig {
     surface_mode: MaybeSet<SurfaceMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     refresh: MaybeSet<RefreshMode>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    prompts: MaybeSet<RawPromptConfig>,
     #[serde(default)]
     providers: HashMap<String, RawProviderConfig>,
     #[serde(default)]
@@ -1104,6 +1119,8 @@ struct RawGatewayOverlayConfig {
     surface_mode: MaybeSet<SurfaceMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     refresh: MaybeSet<RefreshMode>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    prompts: MaybeSet<RawPromptConfig>,
     #[serde(default)]
     providers: HashMap<String, RawProviderConfig>,
 }
@@ -1130,6 +1147,52 @@ struct RawToolConfig {
     default_enabled: MaybeSet<bool>,
     #[serde(default)]
     overrides: HashMap<String, RawToolOverrideValue>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPromptConfig {
+    #[serde(
+        default,
+        rename = "defaultEnabled",
+        deserialize_with = "deserialize_maybe_set"
+    )]
+    default_enabled: MaybeSet<bool>,
+    #[serde(default)]
+    overrides: HashMap<String, RawPromptOverrideValue>,
+}
+
+#[derive(Debug)]
+enum RawPromptOverrideValue {
+    Object(RawPromptOverrideObject),
+    Bool(bool),
+    Null(()),
+}
+
+impl<'de> Deserialize<'de> for RawPromptOverrideValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Null(())),
+            serde_json::Value::Bool(enabled) => Ok(Self::Bool(enabled)),
+            serde_json::Value::Object(_) => serde_json::from_value(value)
+                .map(Self::Object)
+                .map_err(de::Error::custom),
+            other => Err(de::Error::custom(format!(
+                "prompt override must be bool, null, or object, got {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPromptOverrideObject {
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    enabled: MaybeSet<bool>,
 }
 
 #[derive(Debug)]
@@ -1458,7 +1521,7 @@ fn parse_shim_args(args: impl IntoIterator<Item = OsString>) -> Result<ShimArgs>
             // The shim IS the MCP facade, so every bind it produces is an
             // mcp-class identity. Providers validate harness against
             // opencode|pi|runner|mcp:<client> and reject bare tokens with an
-            // opaque config_divergence; auto-prefix so `--harness claude-code`
+            // opaque config_divergence — auto-prefix so `--harness claude-code`
             // means what the operator obviously intended. Explicit prefixed
             // values (and the reserved non-mcp identities) pass through.
             if !harness.contains(':') && !matches!(harness.as_str(), "opencode" | "pi" | "runner") {
@@ -2112,7 +2175,7 @@ async fn open_provider_route(
 /// never as `direct` (which it trusts). Both env vars are injected by the
 /// daemon on spawn; a facade started any other way (manual launch, a supervisor
 /// that stopped injecting the nonce, an SDK regression dropping the attach)
-/// would silently bind as a trusted first-party, which is the exact downgrade this
+/// would silently bind as a trusted first-party — the exact downgrade this
 /// guard turns into a loud startup failure.
 fn require_spawn_attestation() -> Result<()> {
     let module_id_present = env::var(SUBC_MODULE_ID_ENV)
@@ -2428,6 +2491,15 @@ impl SessionState {
     }
 }
 
+impl PromptConfig {
+    fn enabled(&self, prompt_name: &str) -> bool {
+        self.overrides
+            .get(prompt_name)
+            .and_then(|override_config| override_config.enabled)
+            .unwrap_or_else(|| self.default_enabled.unwrap_or(false))
+    }
+}
+
 impl GatewayConfig {
     fn facade_default() -> Self {
         let mut config = Self::default();
@@ -2439,6 +2511,17 @@ impl GatewayConfig {
                 .enabled = Some(false);
         }
         config
+    }
+
+    fn prompt_enabled(&self, prompt_name: &str) -> bool {
+        self.prompts.enabled(prompt_name)
+    }
+
+    fn visible_prompt_names(&self) -> Vec<&'static str> {
+        prompts::prompt_names()
+            .into_iter()
+            .filter(|prompt_name| self.prompt_enabled(prompt_name))
+            .collect()
     }
 
     fn provider_enabled(&self, module_id: &str) -> bool {
@@ -2666,13 +2749,40 @@ fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> 
 }
 
 fn validate_raw_gateway_config(raw: &RawGatewayConfig, path: &Path) -> Result<()> {
+    validate_raw_prompts(&raw.prompts, path, "prompts")?;
     validate_raw_providers(&raw.providers, path, "providers")?;
     for (harness_name, harness) in &raw.harness {
+        validate_raw_prompts(
+            &harness.prompts,
+            path,
+            &format!("harness.{harness_name}.prompts"),
+        )?;
         validate_raw_providers(
             &harness.providers,
             path,
             &format!("harness.{harness_name}.providers"),
         )?;
+    }
+    Ok(())
+}
+
+fn validate_raw_prompts(
+    prompts: &MaybeSet<RawPromptConfig>,
+    path: &Path,
+    prefix: &str,
+) -> Result<()> {
+    let MaybeSet::Value(prompts) = prompts else {
+        return Ok(());
+    };
+    for (prompt_name, override_value) in &prompts.overrides {
+        if let RawPromptOverrideValue::Object(object) = override_value {
+            if matches!(object.enabled, MaybeSet::Null) {
+                return Err(other_error(format!(
+                    "invalid MCP config {}: {prefix}.overrides.{prompt_name}.enabled must be omitted instead of null; use null for the whole override entry to delete it",
+                    path.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2722,6 +2832,7 @@ impl RawGatewayConfig {
             RawGatewayLayer {
                 surface_mode: self.surface_mode,
                 refresh: self.refresh,
+                prompts: self.prompts,
                 providers: self.providers,
             },
             self.harness,
@@ -2734,6 +2845,7 @@ impl From<RawGatewayOverlayConfig> for RawGatewayLayer {
         Self {
             surface_mode: raw.surface_mode,
             refresh: raw.refresh,
+            prompts: raw.prompts,
             providers: raw.providers,
         }
     }
@@ -2765,6 +2877,11 @@ fn merge_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLayer) {
         MaybeSet::Missing => {}
         MaybeSet::Null => effective.refresh = RefreshMode::OnAttach,
         MaybeSet::Value(refresh) => effective.refresh = refresh,
+    }
+    match raw.prompts {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.prompts = PromptConfig::default(),
+        MaybeSet::Value(prompts) => merge_prompt_config(&mut effective.prompts, prompts),
     }
 
     for (module_id, raw_provider) in raw.providers {
@@ -2805,6 +2922,14 @@ fn merge_project_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLa
             "refresh",
             "project MCP config cannot weaken user-chosen refresh latency",
         );
+    }
+    match raw.prompts {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.prompts = PromptConfig::default(),
+        MaybeSet::Value(prompts) => {
+            let baseline = effective.prompts.clone();
+            merge_project_prompt_config(&mut effective.prompts, &baseline, prompts);
+        }
     }
 
     for (module_id, raw_provider) in raw.providers {
@@ -2853,6 +2978,110 @@ fn merge_project_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLa
                 merge_project_tool_config(effective, &baseline, &module_id, tools);
             }
         }
+    }
+}
+
+fn merge_prompt_config(effective: &mut PromptConfig, raw: RawPromptConfig) {
+    match raw.default_enabled {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.default_enabled = None,
+        MaybeSet::Value(default_enabled) => effective.default_enabled = Some(default_enabled),
+    }
+    for (prompt_name, override_value) in raw.overrides {
+        match override_value {
+            RawPromptOverrideValue::Null(()) => {
+                effective.overrides.remove(&prompt_name);
+            }
+            RawPromptOverrideValue::Bool(enabled) => {
+                effective.overrides.entry(prompt_name).or_default().enabled = Some(enabled);
+            }
+            RawPromptOverrideValue::Object(object) => match object.enabled {
+                MaybeSet::Missing => {}
+                MaybeSet::Null => unreachable!("validated prompt override enabled null"),
+                MaybeSet::Value(enabled) => {
+                    effective.overrides.entry(prompt_name).or_default().enabled = Some(enabled);
+                }
+            },
+        }
+    }
+}
+
+fn merge_project_prompt_config(
+    effective: &mut PromptConfig,
+    baseline: &PromptConfig,
+    raw: RawPromptConfig,
+) {
+    let baseline_default_enabled = baseline.default_enabled.unwrap_or(false);
+    match raw.default_enabled {
+        MaybeSet::Missing => {}
+        MaybeSet::Value(false) | MaybeSet::Null => effective.default_enabled = Some(false),
+        MaybeSet::Value(true) => {
+            if baseline_default_enabled {
+                effective.default_enabled = Some(true);
+            } else {
+                warn_project_drop(
+                    "prompts.defaultEnabled",
+                    "project MCP config cannot enable prompts disabled by the user baseline",
+                );
+            }
+        }
+    }
+
+    for (prompt_name, override_value) in raw.overrides {
+        let field = format!("prompts.overrides.{prompt_name}");
+        let baseline_enabled = baseline.enabled(&prompt_name);
+        match override_value {
+            RawPromptOverrideValue::Null(()) => {
+                let enabled_without_override = effective.default_enabled.unwrap_or(false);
+                if baseline_enabled || !enabled_without_override {
+                    effective.overrides.remove(&prompt_name);
+                } else {
+                    warn_project_drop(
+                        &field,
+                        "project MCP config cannot delete a prompt deny from the user baseline",
+                    );
+                }
+            }
+            RawPromptOverrideValue::Bool(enabled) => merge_project_prompt_override_enabled(
+                effective,
+                &field,
+                &prompt_name,
+                enabled,
+                baseline_enabled,
+            ),
+            RawPromptOverrideValue::Object(object) => match object.enabled {
+                MaybeSet::Missing => {}
+                MaybeSet::Null => unreachable!("validated prompt override enabled null"),
+                MaybeSet::Value(enabled) => merge_project_prompt_override_enabled(
+                    effective,
+                    &format!("{field}.enabled"),
+                    &prompt_name,
+                    enabled,
+                    baseline_enabled,
+                ),
+            },
+        }
+    }
+}
+
+fn merge_project_prompt_override_enabled(
+    effective: &mut PromptConfig,
+    field: &str,
+    prompt_name: &str,
+    enabled: bool,
+    baseline_enabled: bool,
+) {
+    if !enabled || baseline_enabled {
+        effective
+            .overrides
+            .entry(prompt_name.to_owned())
+            .or_default()
+            .enabled = Some(enabled);
+    } else {
+        warn_project_drop(
+            field,
+            "project MCP config cannot enable a prompt disabled by the user baseline",
+        );
     }
 }
 
@@ -3246,6 +3475,16 @@ async fn notify_tool_list_changed(peer: &Peer<RoleServer>) -> bool {
     }
 }
 
+async fn notify_prompt_list_changed(peer: &Peer<RoleServer>) -> bool {
+    match peer.notify_prompt_list_changed().await {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("subc-mcp module: failed to notify MCP prompts/list_changed: {error}");
+            false
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SubcMcpServer {
     subc: SubcClient,
@@ -3311,6 +3550,7 @@ impl ServerHandler for SubcMcpServer {
                 .enable_tools()
                 .enable_tool_list_changed()
                 .enable_prompts()
+                .enable_prompts_list_changed()
                 .build(),
         )
         .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
@@ -3319,17 +3559,29 @@ impl ServerHandler for SubcMcpServer {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListPromptsResult, ErrorData> {
-        Ok(self.prompts.list_prompts())
+        self.refresh_policy_if_needed(&context.peer).await?;
+        let config = self.state.config_snapshot();
+        Ok(self
+            .prompts
+            .list_prompts(|prompt_name| config.effective.prompt_enabled(prompt_name)))
     }
 
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<GetPromptResult, ErrorData> {
-        self.prompts.get_prompt(request).await
+        self.refresh_policy_if_needed(&context.peer).await?;
+        let is_visible = self
+            .state
+            .config_snapshot()
+            .effective
+            .prompt_enabled(&request.name);
+        self.prompts
+            .get_prompt_if_visible(request, is_visible)
+            .await
     }
 
     async fn list_tools(
@@ -3444,6 +3696,8 @@ impl SubcMcpServer {
             &self.state.identity.harness,
         )
         .map_err(mcp_internal_error)?;
+        let prompts_changed = snapshot.effective.visible_prompt_names()
+            != next_config.effective.visible_prompt_names();
         let catalog = catalog_list(&self.subc).await.map_err(mcp_internal_error)?;
         let changed = reconcile_session_from_catalog(
             &self.subc,
@@ -3458,6 +3712,12 @@ impl SubcMcpServer {
         if changed && !notify_tool_list_changed(peer).await {
             return Err(ErrorData::internal_error(
                 "failed to notify MCP tools/list_changed after immediate policy refresh",
+                None,
+            ));
+        }
+        if prompts_changed && !notify_prompt_list_changed(peer).await {
+            return Err(ErrorData::internal_error(
+                "failed to notify MCP prompts/list_changed after immediate policy refresh",
                 None,
             ));
         }
@@ -4250,7 +4510,7 @@ fn bind_session_from_hello(hello: &ShimHello) -> Result<String> {
 /// Shared validity rule for instance tokens, matching ai-proxy's validation of
 /// the x-ck-instance header form so both consumers accept the same tokens:
 /// non-empty, at most [`MAX_INSTANCE_TOKEN_LEN`] bytes, charset [A-Za-z0-9._-].
-/// The token is otherwise OPAQUE and is never parsed for shape.
+/// The token is otherwise OPAQUE — never parsed for shape.
 fn valid_instance_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= MAX_INSTANCE_TOKEN_LEN
@@ -4757,6 +5017,60 @@ mod tests {
             mode_null.contains("mode must be omitted instead of null"),
             "unexpected mode-null error: {mode_null}"
         );
+    }
+
+    #[test]
+    fn prompt_policy_is_default_hidden_and_project_cannot_widen_user_denies() {
+        let default = GatewayConfig::facade_default();
+        assert!(default.visible_prompt_names().is_empty());
+
+        let effective = compose_test_config(
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": {
+                        "defaultEnabled": false,
+                        "overrides": { "status": false, "wrapup": false }
+                    }
+                }"#,
+            ),
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": {
+                        "defaultEnabled": true,
+                        "overrides": { "status": true, "wrapup": { "enabled": true } }
+                    }
+                }"#,
+            ),
+            DEFAULT_HARNESS,
+        );
+
+        assert!(!effective.prompt_enabled("status"));
+        assert!(!effective.prompt_enabled("wrapup"));
+        assert!(effective.visible_prompt_names().is_empty());
+    }
+
+    #[test]
+    fn project_prompt_policy_can_narrow_user_enabled_prompts() {
+        let effective = compose_test_config(
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": { "defaultEnabled": true }
+                }"#,
+            ),
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": { "overrides": { "status": false } }
+                }"#,
+            ),
+            DEFAULT_HARNESS,
+        );
+
+        assert!(!effective.prompt_enabled("status"));
+        assert!(effective.prompt_enabled("wrapup"));
     }
 
     #[test]

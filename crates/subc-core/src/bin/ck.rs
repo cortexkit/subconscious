@@ -720,8 +720,10 @@ fn entry_error_detail(entry: &Value) -> Option<String> {
 }
 
 fn quota_entry_is_connected(entry: &Value) -> bool {
-    entry.get("ok").and_then(Value::as_bool) == Some(true)
-        && entry.get("usage").is_some_and(Value::is_object)
+    // Connected is signalled by the presence of a usage object on the wire; a
+    // disconnected provider carries an error string and no usage object. The
+    // wire carries no explicit "ok" flag, so usage presence is the signal.
+    entry.get("usage").is_some_and(Value::is_object)
 }
 
 fn quota_entries_for_table<'a>(
@@ -1775,25 +1777,23 @@ mod tests {
 
     #[test]
     fn quota_default_filters_to_connected_entries_even_without_windows() {
+        // The wire signals "connected" by the presence of a usage object, never
+        // an explicit ok flag (the real module emits usage OR error, no ok key).
         let providers = vec![
             serde_json::json!({
                 "provider": "connected",
-                "ok": true,
                 "usage": { "primary": { "usedPercent": 0.0 } }
             }),
             serde_json::json!({
                 "provider": "empty-windows",
-                "ok": true,
                 "usage": {}
             }),
             serde_json::json!({
                 "provider": "unavailable",
-                "ok": false,
-                "usage": {}
+                "error": "no session: no API key set"
             }),
             serde_json::json!({
-                "provider": "missing-usage",
-                "ok": true
+                "provider": "missing-usage"
             }),
         ];
 
@@ -1820,12 +1820,12 @@ mod tests {
     fn quota_json_output_preserves_the_raw_reply_format() {
         let reply = serde_json::json!({
             "result": [{
-                "ok": true,
+                "provider": "codex",
                 "usage": {}
             }]
         });
         let expected =
-            "{\n  \"result\": [\n    {\n      \"ok\": true,\n      \"usage\": {}\n    }\n  ]\n}";
+            "{\n  \"result\": [\n    {\n      \"provider\": \"codex\",\n      \"usage\": {}\n    }\n  ]\n}";
         assert_eq!(format_json_output(&reply).unwrap(), expected);
     }
 

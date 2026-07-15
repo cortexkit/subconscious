@@ -1,0 +1,62 @@
+archive_name: council-subc-dispatch-redesign-e26112ccb9170497
+created_at: 2026-07-15T07:43:54Z
+question: |
+  Adversarial multi-model design review (council) of docs/subc-dispatch-redesign.md against the shipped subc-core daemon source. Concurrency-critical redesign of the daemon's per-connection dispatch path; must be gated before implementation.
+prompt_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-prompt.md
+members:
+  - task_id: bg_d7a707f4
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_d7a707f4.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-d7a707f4.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_21e4f4a2
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_21e4f4a2.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-21e4f4a2.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_bd01aa80
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_bd01aa80.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-bd01aa80.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_cbc7c6e8
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_cbc7c6e8.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-cbc7c6e8.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_874eee0d
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_874eee0d.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-874eee0d.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_e5aba7b6
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_e5aba7b6.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-e5aba7b6.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_ddf133ed
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_ddf133ed.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-ddf133ed.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_904cb9dd
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_904cb9dd.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-e26112ccb9170497/council-member-bg-904cb9dd.md
+    has_response: true
+    response_complete: true

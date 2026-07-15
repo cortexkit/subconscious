@@ -1,0 +1,62 @@
+archive_name: council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2
+created_at: 2026-07-15T08:59:54Z
+question: |
+  Adversarial re-gate of docs/subc-dispatch-redesign-v2.md: verify each v1 blocker B1-B10 is actually closed by the v2 mechanism, and hunt for new defects the v2 mechanisms introduce. Output per-blocker CLOSED/NOT-CLOSED/NEWLY-BROKEN and a GO/GO-WITH-CHANGES/NO-GO verdict.
+prompt_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-prompt.md
+members:
+  - task_id: bg_cafecc2f
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_cafecc2f.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-cafecc2f.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_332df7e2
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_332df7e2.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-332df7e2.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_b807063c
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_b807063c.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-b807063c.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_283e71b4
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_283e71b4.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-283e71b4.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_2c3f3554
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_2c3f3554.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-2c3f3554.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_40ece100
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_40ece100.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-40ece100.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_d6f7350a
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_d6f7350a.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-d6f7350a.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_c5ca2826
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_c5ca2826.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/council-member-bg-c5ca2826.md
+    has_response: true
+    response_complete: true

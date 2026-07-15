@@ -1,0 +1,41 @@
+archive_name: council-subc-federation-v3-regate-c3b60de6c18a21df
+created_at: 2026-07-05T10:24:31Z
+question: |
+  Adversarial re-gate of the subc federation design v3: verify v3 deltas (P1 catalog.update, P2 prefix reservation, §6.1 at-most-once mechanics, §5.4 identity split, §5.3 TOFU) close the v2 re-gate findings and hunt new gaps. Per-finding BLOCKER/SHOULD-FIX/NOTE verdicts, end with GO/GO-WITH-CHANGES/NO-GO for phase 0.
+prompt_file: .cortexkit/alfonso/athena/council-subc-federation-v3-regate-c3b60de6c18a21df/council-prompt.md
+members:
+  - task_id: bg_d6ab1591
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_d6ab1591.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v3-regate-c3b60de6c18a21df/council-member-bg-d6ab1591.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_51873127
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_51873127.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v3-regate-c3b60de6c18a21df/council-member-bg-51873127.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_2fa3e54b
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_2fa3e54b.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v3-regate-c3b60de6c18a21df/council-member-bg-2fa3e54b.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_d483d626
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_d483d626.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v3-regate-c3b60de6c18a21df/council-member-bg-d483d626.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_7858316b
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_7858316b.md
+    archive_file: 
+    has_response: false
+    response_complete: false

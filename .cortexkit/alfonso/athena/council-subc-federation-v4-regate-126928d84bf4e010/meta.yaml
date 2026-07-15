@@ -1,0 +1,48 @@
+archive_name: council-subc-federation-v4-regate-126928d84bf4e010
+created_at: 2026-07-05T10:41:00Z
+question: |
+  CONFIRMATION re-gate of subc federation design v4: verify v4's fold of the 13 v3 re-gate findings actually closes each, flag incomplete folds / new cross-section contradictions / weakened locked decisions, per-finding CLOSED/PARTIAL/NOT-CLOSED verdict, end GO/NO-GO for phase 0 (P1 catalog.update + P2 prefix reservation).
+prompt_file: .cortexkit/alfonso/athena/council-subc-federation-v4-regate-126928d84bf4e010/council-prompt.md
+members:
+  - task_id: bg_b83ccb3f
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_b83ccb3f.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v4-regate-126928d84bf4e010/council-member-bg-b83ccb3f.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_6863cb06
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_6863cb06.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v4-regate-126928d84bf4e010/council-member-bg-6863cb06.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_faba0f01
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_faba0f01.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v4-regate-126928d84bf4e010/council-member-bg-faba0f01.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_ea7a2ec0
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_ea7a2ec0.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v4-regate-126928d84bf4e010/council-member-bg-ea7a2ec0.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_895a6a43
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_895a6a43.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v4-regate-126928d84bf4e010/council-member-bg-895a6a43.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_628635b1
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_628635b1.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-v4-regate-126928d84bf4e010/council-member-bg-628635b1.md
+    has_response: true
+    response_complete: true

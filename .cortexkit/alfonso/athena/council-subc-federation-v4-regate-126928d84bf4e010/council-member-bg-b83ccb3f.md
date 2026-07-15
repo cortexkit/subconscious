@@ -1,0 +1,50 @@
+# subc Federation Design v4 — CONFIRMATION RE-GATE
+
+Scope: confirm each of the 13 v3 findings is actually closed by v4's fold; verify source-grounded folds against real code (which I read: registry.rs, forwarding.rs, control.rs, supervise.rs, subc-protocol/manifest.rs). Locked skeleton not re-litigated.
+
+## Per-finding verdicts
+
+**#1: PARTIAL** — 2.6:85 ("No tool-granular GOODBYE… a call to a since-removed tool therefore reaches the module and gets a module-side typed error… P1 promises catalog VISIBILITY freshness, not route teardown") + changelog:9 correctly retract the impossible promise, and this matches source: `RouteBinding`/`ModuleRouteKey` carry only `module_id` + `channel`, no tool identity (forwarding.rs:43-60, confirmed). **BUT 4.1:130 still reads "removed tools get route-GOODBYE"** — the exact impossible promise finding #1 killed, re-asserted verbatim in the data-flow narrative. The authoritative spec closes it; a stale contradictory sentence survives → PARTIAL, not CLOSED. (See NEW-CONTRADICTIONS.)
+
+**#2: CLOSED** — 2.6:86 freezes `module_id, role kind, concurrency, control_ops` as HELLO-time and rejects any P1 payload changing them (`catalog_update_frozen_field`). Source-verified as load-bearing: concurrency sizes the credit window (forwarding.rs:19/22 `DEFAULT_MODULE_MANAGED_WINDOW=32` vs `STATELESS_PARALLEL_WINDOW=1024`), read via `manifest_concurrency` at register (control.rs:619) and stored on `ModuleConnection` (forwarding.rs:304); `control_ops` via `effective_module_control_ops` (control.rs:584), stored registry.rs:83, read by the health prober (control.rs:1260). Freeze-and-reject is exactly the converged fix; no contradicting statement elsewhere.
+
+**#3: CLOSED** — 2.6:89-91: prefix MUST end with `:`, `id.starts_with(prefix)` (so `fed:`≠`fedx:tool`), exact-id precedence, overlap rejected at config load, boundary matrix (89); prefix→owner supervised module_id verified against the OWNER's current spawn nonce (90); honest threat statement "P2 is NOT a same-user barrier" (91). Source-verified: `reserved_hello_authorized` is an exact-id lookup returning `true` on miss (supervise.rs:389-390 `None => true`), and the nonce ships via `SUBC_LAUNCH_NONCE_ENV` (supervise.rs:2033) — same-user readable. v4 takes the synthesis's explicitly-sanctioned "document P2 is not a same-user barrier" branch, so honest, not weakened.
+
+**#4: CLOSED (minor caveat)** — 6.1:200-206 fed-state→CallError table + recovery reconciliation closes the pre-intent-crash hole: "before intent fsync → recovery finds NO intent row → effect provably never left → durable `not_sent` tombstone" (203); "intent durable, send unconfirmed → queries SERVING ledger" (204); test vectors required per row, crash-cut style (206). This is the mechanism (not just prose) the synthesis asked for. Caveat: the parenthetical "the caller simply re-invokes" (203) slightly overstates — the consumer sees `OutcomeUnknown` in both the before-intent and intent-durable windows and must consult the tombstone/reconciliation to distinguish them; the query mechanism is specified, so the hole is closed, but "simply re-invokes" is imprecise.
+
+**#5: CLOSED** — 6.1:197 `effect_id = (origin_device_pubkey, incarnation_uuid, seq)`, incarnation minted on db create/loss/restore and stored IN that db; serving side keeps per-(pubkey,incarnation) high-water mark and refuses seq regression with a typed fence (never replay). Directly implements the converged fix (incarnation epoch + serving-side fence). New mechanism, no in-repo source to contradict.
+
+**#6: CLOSED (grace number still open)** — 6.1:199 co-defines retention to the origin's confirmed-watermark (piggybacked ack) + bounded grace; post-expiry = typed `effect_outcome_expired` refusal, never re-dispatch; residual documented. Circularity resolved. Caveat: synthesis asked for "a concrete number"; v4 says "bounded grace" without one — a tuning param left open like the Fork Cat staleness number, acceptable but note it.
+
+**#6a: PARTIAL** — 6.1:196 + changelog:11 drop the appeal ("standard WAL discipline… stand on their own"). **BUT line 23 (v2→v3 changelog) still reads "borrowing llm-runner's proven intent-log discipline"** — the exact "proven"/external appeal #6a wanted removed survives in a historical section. Low severity, but the flagged phrase persists → PARTIAL.
+
+**#7: CLOSED (deferred as designed)** — 5.4:180 first-class `fed:<peer-fingerprint>` harness class; acknowledges AFT allowlist `{opencode,pi,runner,mcp:*}` would reject/unscope `fed:*`; defines config posture (fed-class = untrusted/project-tier like `mcp:*`); "Verify against real AFT before phase 2." Matches the converged fix and its own phase-2 gate; AFT is external so residual-unverified is expected and disclosed.
+
+**#8: CLOSED** — 5.3:170-174: first contact non-routable until OOB code compared (172); rotation must be old-key-signed tombstone chain or verified-device/manual re-pair, else presents as first contact (173); code binds BOTH endpoints' long-term device static keys, never session/ephemeral (172); residual documented (174). All four converged sub-fixes present.
+
+**#9: CLOSED** — 6.2:213 makes the fed-module keepalive reaper the AUTHORITATIVE classifier that closes the per-peer loopback connection (→ connection-granular cleanup → deterministic client-direction GOODBYEs), and demotes module-direction GOODBYE to best-effort. Source-verified: `GoodbyeTargetKind::Module` = "best-effort DROP, never close" (forwarding.rs:68-93), while client-target GOODBYE escalates to close (`close_on_delivery_failure`, forwarding.rs:112-113). Mechanism is sound. (Shorthand "GOODBYE-on-partition" at :253/:268 is a label, not a contradiction.)
+
+**#10: CLOSED** — 6.5:223 exchanges raw capability docs and filters/translates to the negotiated version BEFORE typed decode/P1. Source-verified: `ProviderRole` is a closed `#[serde(tag="role")]` enum, "unknown role tags fail serde decode" (manifest.rs:36-39). Raw-layer filtering is the correct and only viable fix.
+
+**#11: CLOSED** — 2.5:79 decides "one loopback connection per (peer, remote module)… exactly one HELLO," and phase-1:251 mandates the N-connections-one-process confirming test. Source-verified: `register_module_connection` evicts the prior endpoint for the same connection_id (forwarding.rs:280-282), so multi-HELLO-per-connection was never viable — v4's topology matches the eviction semantics.
+
+**#12: CLOSED (deferred)** — 6.4:220 + changelog:17 confirm ClientHello device-identity is a v2 transport addition, phase-4+. The field-vs-message residue is unresolved but the finding is a NOTE explicitly not gating phase-0; deferral is appropriate.
+
+**#13: CLOSED** —  Fork Cat:243 now reads "RESOLVED mechanism: P1 catalog.update per (peer, module) connection (2.6). Open: only the acceptable staleness-window number." The old "coarse re-HELLO" text is gone; grep confirms "coarse re-HELLO" survives only at line 21 (v2→v3 changelog) where it is correctly stated as withdrawn/not-viable.
+
+## NEW-CONTRADICTIONS (b-class)
+
+1. **[HIGH] 4.1:130 vs 2.6:85 + changelog:9 — GOODBYE for removed tools.** 4.1:130: "removed tools get route-GOODBYE." 2.6:85: "No tool-granular GOODBYE… a call to a since-removed tool… gets a module-side typed error." changelog:9: "never a GOODBYE." This is the flagship #1 blocker re-surfacing verbatim in the data-flow section. The authoritative primitive spec (2.6) is correct and source-consistent, but 4.1:130 would mislead a phase-1 implementer into re-attempting the architecturally-impossible tool-granular GOODBYE. **Must-fix: delete/replace the "removed tools get route-GOODBYE" clause at 4.1:130.**
+
+2. **[LOW] line 23 vs changelog:11 / 6.1:196 — "proven" llm-runner appeal.** changelog:11 and 6.1:196 drop the external "proven" appeal; line 23 (historical changelog) still says "borrowing llm-runner's proven intent-log discipline." Residual, historical-section only; harmless but the exact flagged phrase persists.
+
+## WEAKENED-DECISIONS (c-class)
+
+None material. Two items examined and cleared:
+- **P2 "not a same-user barrier" (2.6:91)** is not a quiet regression — the v3 synthesis (#3 fix direction) explicitly sanctioned documenting P2 as a different-user/accidental-collision barrier under the accepted same-host floor. This is honest scoping, not a weakening of the locked exact-id-reservation guarantee.
+- **P1 "provides-list-only" (2.6:84-86)** narrows 2.6's "non-disruptive catalog update" but is the sanctioned resolution of #1/#2, not a regression of a locked decision.
+- Minor: 6.1:199 "bounded grace" and Fork Cat staleness number remain un-numbered — open tuning params, consistent with the doc's stated open items, not weakened decisions.
+
+## PHASE-0 VERDICT: GO (conditional on one trivial doc fix)
+
+Justification: Phase 0 builds the P1 `catalog.update` and P2 prefix-reservation primitives, whose authoritative specs live in 2.6. Both are correct, implementable, and source-verified: #2 (frozen fields — concurrency/control_ops confirmed load-bearing in forwarding.rs/control.rs/registry.rs) and #3 (delimiter semantics + owner-module nonce mapping + honest same-user threat model — confirmed against `reserved_hello_authorized`'s true-on-miss exact lookup and the env-borne launch nonce) are fully CLOSED and would not bake incorrect registry/forwarding invariants. #1's actual primitive design (provides-list-only, no tool-granular GOODBYE, module-side typed error) is also CLOSED in 2.6 and consistent with the tool-less `RouteBinding`. The one blocker to full confidence is **not a design flaw in the artifact phase 0 builds** but a stale contradictory sentence at 4.1:130 that re-asserts the impossible tool-granular GOODBYE promise — a one-clause documentation defect in a phase-1 narrative, not in the 2.6 primitive spec. I am NOT softening this: 4.1:130 must be corrected (and ideally line 23's "proven" residue scrubbed) because leaving the flagship blocker's exact wording live in the doc risks a phase-1 implementer reviving it. GO for writing P1+P2 code now, hard-conditioned on fixing 4.1:130 so the doc no longer contradicts its own locked P1 semantics.

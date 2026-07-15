@@ -1,0 +1,19 @@
+You are a bug-hunting mason on THE LOOP (round 20, BUG LANE ONLY — perf lane terminated) in the CortexKit `subconscious` repo (subc daemon + wire clients: subc-core, subc-protocol, subc-transport, subc-control, subc-mcp, subc-jsonc, clients/subc-client [TS], crates/subc-client-rs [Rust], clients/subc-client-swift).
+
+TASK: Find exactly ONE — the single highest-confidence — CORRECTNESS BUG that is LOCALIZED and auto-fixable (behavior-preserving, no wire-contract/API/semantics decision). REPORT ONLY. No code changes; worktree stays clean.
+Do NOT spawn or use any subagents — do all investigation yourself with direct tools.
+
+We are 19 rounds deep; 22 bugs fixed. A truthful "no localized auto-fixable bug found this round" is a PERFECTLY GOOD, expected outcome — report it plainly rather than stretching or surfacing another design/contract fork (we have 8 escalations already). Only a LOCALIZED behavior-preserving defect with a clear correct fix, OR the honest none.
+
+HIGHEST-YIELD PATTERN — SIBLING-PATH GAPS (5 fixes this session traced to it): a guard/cleanup/check present in one code path but MISSING in a parallel path. Keep hunting these. Fixed already: data-vs-health post-acquire cancel check (TS provider r17 AND Rust client r19 — that cross-client pair is CLOSED); crash-restart vs set_child_enabled vs health_restart spawn-failure state rollback (CLOSED); TS-vs-Rust unsubscribe local-settle (r18, CLOSED). FIND A NEW sibling pair: two parallel handlers/paths/frame-types/clients where one has a safety guard (abort/bounds/cleanup/rollback/epoch check/error handling/timeout) and the other is missing it.
+
+What counts (localized + auto-fixable): trap/overflow/off-by-one/bounds reachable from real input with an obvious guard; a resource/task leak with a clear best-effort cleanup; an error path that drops/duplicates fixable in place; a missing guard a sibling path already demonstrates. NOT counted: fixes requiring a choice between competing valid behaviors (escalation — note in one line, don't develop).
+
+ANTI-REPEAT / OFF-LIMITS (do NOT re-surface):
+- FIXED (Swift, CONSUMER-ONLY client — no provider/serve role, so no provider-handler gaps exist there): SIGPIPE; cursor-int trap; fd-leak/idempotent-close; ConnectionFile port/byte traps + JSON-decode wrap; readExact; encodeFrame 64MiB cap; runSessionTurn route leak.
+- FIXED (Rust): forwarding.rs successor-erasure; supervise.rs Starting-strand + Restarting-strand; subc-jsonc comment token-merge; watchdog daemon_id; spawn_data_request cancel-while-queued.
+- FIXED (TS): all client body-copies; envelope validate-by-round-trip; provider handleDataRequest cancel-while-queued; Subscription.unsubscribe local-settle.
+- OFF-LIMITS (REDESIGN): subc-mcp ReverseRelay settlement lane.
+- OFF-LIMITS (ESCALATED, do NOT re-pitch): forwarding.rs:846 route-lock; connection_loop HOL-blocking/route-credit; auth queue-wait deadline; flow-control credit double-release; TS managed consumer_capabilities parity; Rust consumer close-under-backpressure GOODBYE leak.
+
+Prioritize NEW sibling pairs across: daemon control-op handlers (route.open vs route.poll vs supervisor.* — one validates/bounds what a sibling doesn't); subc-mcp forward-request vs reverse-request non-settlement paths; TS-vs-Rust consumer reconnect/route-eviction (one handles an edge the other misses); frame-type dispatch arms in the router or clients (one type-arm guards what another doesn't); subc-transport auth message parsing (one length-prefix bounded, a sibling not). Report ONE localized auto-fixable proven bug, OR the honest "none found" naming surfaces checked.

@@ -1,0 +1,55 @@
+archive_name: council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25
+created_at: 2026-07-07T12:14:57Z
+question: |
+  Adversarial design review of the subc federation PHASE 3 design (docs/subc-federation-phase3-design.md), verifying inheritance claims against phase-2 (docs/subc-federation-design.md). Find gaps and blockers across SECURITY, CORRECTNESS, OPERATIONAL axes; answer the 5 open questions; output structured findings + GO/GO-WITH-CHANGES/NO-GO verdict.
+prompt_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-prompt.md
+members:
+  - task_id: bg_1fb231ba
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_1fb231ba.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-member-bg-1fb231ba.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_a645cf20
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_a645cf20.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-member-bg-a645cf20.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_57e10e78
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_57e10e78.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-member-bg-57e10e78.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_14a8061a
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_14a8061a.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-member-bg-14a8061a.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_53104f31
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_53104f31.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-member-bg-53104f31.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_d31510f8
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_d31510f8.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-member-bg-d31510f8.md
+    has_response: true
+    response_complete: true
+  - task_id: bg_496ef21e
+    member: "council-member"
+    member_slug: council-member
+    task_output_path: .cortexkit/alfonso/task-outputs/bg_496ef21e.md
+    archive_file: .cortexkit/alfonso/athena/council-subc-federation-phase3-adversarial-review-3e2c32f78c760d25/council-member-bg-496ef21e.md
+    has_response: true
+    response_complete: true

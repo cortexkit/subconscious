@@ -250,6 +250,7 @@ enum RawProviderBehavior {
 struct RawProvider {
     module_id: String,
     tool_name: String,
+    route_cancel_count: Arc<AtomicUsize>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -267,12 +268,15 @@ impl RawProvider {
         let tool_name_owned = tool_name.to_owned();
         let task_module_id = module_id_owned.clone();
         let task_tool_name = tool_name_owned.clone();
+        let route_cancel_count = Arc::new(AtomicUsize::new(0));
+        let task_route_cancel_count = Arc::clone(&route_cancel_count);
         let task = tokio::spawn(async move {
             run_raw_provider(
                 &connection_file_path,
                 &task_module_id,
                 &task_tool_name,
                 behavior,
+                task_route_cancel_count,
                 shutdown_rx,
             )
             .await;
@@ -280,6 +284,7 @@ impl RawProvider {
         Self {
             module_id: module_id_owned,
             tool_name: tool_name_owned,
+            route_cancel_count,
             shutdown_tx: Some(shutdown_tx),
             task,
         }
@@ -287,6 +292,10 @@ impl RawProvider {
 
     fn exposed_tool_name(&self) -> String {
         format!("{}_{}", self.module_id, self.tool_name)
+    }
+
+    fn route_cancel_count(&self) -> &AtomicUsize {
+        self.route_cancel_count.as_ref()
     }
 
     async fn shutdown(mut self) {
@@ -1683,6 +1692,12 @@ async fn mcp_malformed_progress_frame_resolves_request_to_error_without_hang() {
         }
         other => panic!("expected MCP internal error for malformed progress, got {other:?}"),
     }
+    wait_for_atomic_at_least(
+        harness.raw_provider.route_cancel_count(),
+        1,
+        "malformed-progress route cancellation",
+    )
+    .await;
 
     harness.shutdown().await;
 }
@@ -3867,6 +3882,7 @@ async fn run_raw_provider(
     module_id: &str,
     tool_name: &str,
     behavior: RawProviderBehavior,
+    route_cancel_count: Arc<AtomicUsize>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let mut stream = connect_control_client(connection_file_path)
@@ -3973,6 +3989,9 @@ async fn run_raw_provider(
                                 stream.flush().await.unwrap();
                             }
                         }
+                    }
+                    FrameType::Cancel if route == Some(WireRoute::from_frame(&frame)) => {
+                        route_cancel_count.fetch_add(1, Ordering::SeqCst);
                     }
                     FrameType::Goodbye if frame.header.channel == 0 => return,
                     _ => {}

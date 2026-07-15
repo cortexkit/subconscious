@@ -10,10 +10,21 @@ Slot), N4 (corr-uniqueness unenforced → silent slot overwrite leak), N7 (unimp
 against shipped types: RouteBinding needs Weak<RouteDispatcher>, ForwardingInner needs a
 dispatchers map), plus majority items N5/N6/N8/N9/N11. Council archive:
 .cortexkit/alfonso/athena/council-subc-dispatch-redesign-v2-regate-b000c2137b81bba2/.
-NEXT (per the engram precedent): v3 = WALKING-SKELETON SPIKE — implement the RouteDispatcher
-core in code with N1-N7 folded (atomic pop+claim, Sending sub-state, consuming credit token,
-corr-uniqueness, dispatcher back-refs), prove with loom/T10-T17-class tests, then gate the
-spike+spec together instead of a third prose round.** Supersedes the mechanism sections of
+SPIKE LANDED (b235f5be, crates/subc-core/src/dispatch_spike, test-gated, not wired into live
+routing): N1/N2/N3/N4/N7 are now closed IN CODE with fail-first-discriminating tests — atomic
+pop+claim (one lock), single-writer RouteDrain owning the route's only FrameSink with
+cancel-forwards routed through the drain and a select! keeping them credit-free under a
+saturated window (the R5-liveness test proves CANCEL(A) reaches the module while B is still
+un-acquired), single consuming CreditToken (loom-modeled), corr-uniqueness enforcement, and
+concrete Weak<RouteDispatcher>/registry wiring. 720-ordering exhaustive sync-interleaving
+harness asserts exactly-one-terminal + credit conservation. RESIDUAL for the production build
+(not spike scope): N5 (synthetic-egress full), N6 (async teardown vs shipped sync Drop +
+reload quiescence), N8 (merge-1 closed-recheck on both Bound branches), N9 (route_closing SDK
+code), N11 (byte-based memory budgets), merge-0 SDK class + fleet verify, live integration.
+NEXT: fold the spike's PROVEN shapes back into this spec as normative text, then re-gate
+spec+spike together; the production build decomposes as merge-0 (SDKs) → merge-1 (snapshot)
+→ merge-2 (dispatch, replacing the spike's registry with real RouteBinding/ForwardingInner
+wiring per N7's mapping comments).** Supersedes the mechanism sections of
 `docs/subc-dispatch-redesign.md` (v1, gated NO-GO 8/8). v1's architecture was endorsed; this
 doc specifies the load-bearing concurrency mechanism the gate found missing. No code until v2
 passes re-gate. Verified at source at master `be293a4c`.

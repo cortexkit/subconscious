@@ -3611,9 +3611,11 @@ type PromptRouteFuture<'a> = Pin<
 
 trait PromptRouteClient: Send + Sync {
     /// `bind_session` overrides the route's bind session for this call.
-    /// Magic-context validates a request's session_id against the channel's
-    /// bound session (channel-keyed consistency), so status queries must bind
-    /// the resolved composite key rather than the shim's instance token.
+    /// The shim's routes normally bind the per-launch instance token, but
+    /// magic-context keys its sessions by the conversation key that thalamus
+    /// mints from provider traffic and validates a request's session_id
+    /// against the channel's bound session. A status query therefore has to
+    /// bind the conversation key it is asking about, not the instance token.
     fn call<'a>(
         &'a self,
         target: PromptRouteTarget,
@@ -3814,10 +3816,10 @@ impl PromptBackend for RouteBackend {
             let Some(instance_token) = instance_token else {
                 return self.pending.status(None).await;
             };
-            // Two-hop by contract: instance tokens are thalamus's identity
-            // namespace, so the token is first resolved to the composite
-            // conversation key there, and magic-context's session.status is
-            // then called with that key as session_id.
+            // Two-hop resolution: instance tokens are thalamus's identity
+            // namespace, so the token is first resolved to the conversation
+            // key there, and magic-context's session.status is then called
+            // with that key as session_id.
             let resolved = self
                 .routes
                 .call(
@@ -3846,9 +3848,10 @@ impl PromptBackend for RouteBackend {
                     PromptBackendUnavailable::RetrySoon,
                 ));
             };
-            // The MC route binds the resolved composite: magic-context checks
-            // session_id against the channel's bound session, and the shim's
-            // default routes bind the raw instance token.
+            // The MC route binds the session_id returned from resolution:
+            // magic-context checks session_id against the channel's bound
+            // session, and the shim's default routes bind the raw instance
+            // token instead.
             let response = self
                 .routes
                 .call(

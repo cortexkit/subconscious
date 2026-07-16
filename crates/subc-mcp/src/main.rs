@@ -3751,6 +3751,15 @@ struct StatusRouteResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResolveRouteResponse {
+    /// Full composite conversation key minted by thalamus. Passed to
+    /// magic-context verbatim: the composite encoding (including any
+    /// separator characters) is thalamus's identity namespace, never
+    /// parsed here. Null means the instance token is unknown or expired.
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WrapupRouteStatus {
     Queued,
@@ -3773,6 +3782,31 @@ impl PromptBackend for RouteBackend {
             let Some(instance_token) = instance_token else {
                 return self.pending.status(None).await;
             };
+            // Two-hop by contract: instance tokens are thalamus's identity
+            // namespace, so the token is first resolved to the composite
+            // conversation key there, and magic-context's session.status is
+            // then called with that key as session_id.
+            let resolved = self
+                .routes
+                .call(
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "method": "session.resolve",
+                        "params": { "instance_token": instance_token },
+                    }),
+                )
+                .await
+                .map_err(map_prompt_route_failure)?;
+            let resolved = serde_json::from_value::<ResolveRouteResponse>(resolved)
+                .map_err(|_| PromptBackendError::Internal)?;
+            let Some(session_id) = resolved.session_id else {
+                // Unknown or expired token: the conversation has not produced
+                // provider traffic yet (fresh launch) or the mapping aged out.
+                // A user-facing retry message, never an internal error.
+                return Err(PromptBackendError::Unavailable(
+                    PromptBackendUnavailable::RetrySoon,
+                ));
+            };
             let response = self
                 .routes
                 .call(
@@ -3780,7 +3814,7 @@ impl PromptBackend for RouteBackend {
                     serde_json::json!({
                         "method": "session.status",
                         "v": 1,
-                        "instance_token": instance_token,
+                        "session_id": session_id,
                     }),
                 )
                 .await
@@ -5183,10 +5217,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_backend_status_uses_magic_context_contract() {
-        let routes = Arc::new(MockPromptRouteClient::new([Ok(serde_json::json!({
-            "summary": "Conversation status is stable."
-        }))]));
+    async fn route_backend_status_resolves_token_then_queries_magic_context() {
+        // Composite key with the thalamus separator: passed verbatim, never parsed.
+        let composite = "80bbd4e4-c5d5\u{241f}agent-7\u{241f}3";
+        let routes = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({
+                "session_id": composite,
+                "last_traffic_ms": 4200,
+            })),
+            Ok(serde_json::json!({
+                "summary": "Conversation status is stable."
+            })),
+        ]));
         let backend = RouteBackend::new(routes.clone());
 
         assert_eq!(
@@ -5195,15 +5237,43 @@ mod tests {
         );
         assert_eq!(
             routes.calls(),
-            vec![(
-                PromptRouteTarget::MagicContext,
-                serde_json::json!({
-                    "method": "session.status",
-                    "v": 1,
-                    "instance_token": "instance-token-123",
-                }),
-            )]
+            vec![
+                (
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "method": "session.resolve",
+                        "params": { "instance_token": "instance-token-123" },
+                    }),
+                ),
+                (
+                    PromptRouteTarget::MagicContext,
+                    serde_json::json!({
+                        "method": "session.status",
+                        "v": 1,
+                        "session_id": composite,
+                    }),
+                ),
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn route_backend_status_null_resolve_is_unavailable_not_internal() {
+        let routes = Arc::new(MockPromptRouteClient::new([Ok(serde_json::json!({
+            "session_id": null,
+            "last_traffic_ms": null,
+        }))]));
+        let backend = RouteBackend::new(routes.clone());
+
+        assert_eq!(
+            backend
+                .status(Some("instance-token-123"))
+                .await
+                .unwrap_err(),
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        );
+        // Resolution failed before magic-context was ever contacted.
+        assert_eq!(routes.calls().len(), 1);
     }
 
     #[tokio::test]

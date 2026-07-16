@@ -3610,11 +3610,34 @@ type PromptRouteFuture<'a> = Pin<
 >;
 
 trait PromptRouteClient: Send + Sync {
+    /// `bind_session` overrides the route's bind session for this call.
+    /// Magic-context validates a request's session_id against the channel's
+    /// bound session (channel-keyed consistency), so status queries must bind
+    /// the resolved composite key rather than the shim's instance token.
     fn call<'a>(
         &'a self,
         target: PromptRouteTarget,
+        bind_session: Option<String>,
         body: serde_json::Value,
     ) -> PromptRouteFuture<'a>;
+}
+
+/// Thalamus's management surface wraps every successful payload as
+/// {"result": ...} (uniform across proxy.status, session.resolve, and
+/// session.command.enqueue); magic-context's tool provider responds flat.
+/// Backends strip the envelope before decoding thalamus payload shapes, so
+/// fixtures exercise the real wire body.
+fn unwrap_result_envelope(
+    value: serde_json::Value,
+) -> std::result::Result<serde_json::Value, PromptBackendError> {
+    let missing = || {
+        eprintln!("subc-mcp prompt backend: thalamus response is missing the result envelope");
+        PromptBackendError::Internal
+    };
+    match value {
+        serde_json::Value::Object(mut map) => map.remove("result").ok_or_else(missing),
+        _ => Err(missing()),
+    }
 }
 
 struct SubcPromptRouteClient {
@@ -3635,6 +3658,7 @@ impl SubcPromptRouteClient {
     async fn call_route(
         &self,
         target: PromptRouteTarget,
+        bind_session: Option<String>,
         body: serde_json::Value,
     ) -> std::result::Result<serde_json::Value, PromptRouteFailure> {
         let (target, target_label) = match target {
@@ -3651,11 +3675,18 @@ impl SubcPromptRouteClient {
                 "thalamus management surface",
             ),
         };
+        let identity = match bind_session {
+            Some(session) => BindIdentity {
+                session,
+                ..self.identity.clone()
+            },
+            None => self.identity.clone(),
+        };
         let route = open_route(
             &self.subc,
             target,
             target_label,
-            &self.identity,
+            &identity,
             None,
             Arc::clone(&self.relay_session),
         )
@@ -3725,9 +3756,10 @@ impl PromptRouteClient for SubcPromptRouteClient {
     fn call<'a>(
         &'a self,
         target: PromptRouteTarget,
+        bind_session: Option<String>,
         body: serde_json::Value,
     ) -> PromptRouteFuture<'a> {
-        Box::pin(async move { self.call_route(target, body).await })
+        Box::pin(async move { self.call_route(target, bind_session, body).await })
     }
 }
 
@@ -3790,6 +3822,7 @@ impl PromptBackend for RouteBackend {
                 .routes
                 .call(
                     PromptRouteTarget::Thalamus,
+                    None,
                     serde_json::json!({
                         "method": "session.resolve",
                         "params": { "instance_token": instance_token },
@@ -3797,20 +3830,30 @@ impl PromptBackend for RouteBackend {
                 )
                 .await
                 .map_err(map_prompt_route_failure)?;
-            let resolved = serde_json::from_value::<ResolveRouteResponse>(resolved)
-                .map_err(|_| PromptBackendError::Internal)?;
+            let resolved =
+                serde_json::from_value::<ResolveRouteResponse>(unwrap_result_envelope(resolved)?)
+                    .map_err(|_| PromptBackendError::Internal)?;
             let Some(session_id) = resolved.session_id else {
                 // Unknown or expired token: the conversation has not produced
                 // provider traffic yet (fresh launch) or the mapping aged out.
                 // A user-facing retry message, never an internal error.
+                eprintln!(
+                    "subc-mcp prompt backend: session.resolve returned no session for the \
+                     instance token; conversation has no provider traffic yet or the mapping \
+                     expired"
+                );
                 return Err(PromptBackendError::Unavailable(
                     PromptBackendUnavailable::RetrySoon,
                 ));
             };
+            // The MC route binds the resolved composite: magic-context checks
+            // session_id against the channel's bound session, and the shim's
+            // default routes bind the raw instance token.
             let response = self
                 .routes
                 .call(
                     PromptRouteTarget::MagicContext,
+                    Some(session_id.clone()),
                     serde_json::json!({
                         "method": "session.status",
                         "v": 1,
@@ -3851,6 +3894,7 @@ impl PromptBackend for RouteBackend {
                 .routes
                 .call(
                     PromptRouteTarget::Thalamus,
+                    None,
                     // Thalamus's management surface dispatches on "method" (the same
                     // envelope as proxy.status / session.resolve); a body without it
                     // decodes as invalid_request.
@@ -3861,8 +3905,9 @@ impl PromptBackend for RouteBackend {
                 )
                 .await
                 .map_err(map_prompt_route_failure)?;
-            let response = serde_json::from_value::<WrapupRouteResponse>(response)
-                .map_err(|_| PromptBackendError::Internal)?;
+            let response =
+                serde_json::from_value::<WrapupRouteResponse>(unwrap_result_envelope(response)?)
+                    .map_err(|_| PromptBackendError::Internal)?;
             if response.command != "wrapup" || response.command_id.trim().is_empty() {
                 return Err(PromptBackendError::Internal);
             }
@@ -5108,7 +5153,7 @@ mod tests {
 
     struct MockPromptRouteClient {
         responses: StdMutex<VecDeque<std::result::Result<serde_json::Value, PromptRouteFailure>>>,
-        calls: StdMutex<Vec<(PromptRouteTarget, serde_json::Value)>>,
+        calls: StdMutex<Vec<(PromptRouteTarget, Option<String>, serde_json::Value)>>,
     }
 
     impl MockPromptRouteClient {
@@ -5123,7 +5168,7 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<(PromptRouteTarget, serde_json::Value)> {
+        fn calls(&self) -> Vec<(PromptRouteTarget, Option<String>, serde_json::Value)> {
             self.calls.lock().expect("prompt route calls lock").clone()
         }
     }
@@ -5132,13 +5177,15 @@ mod tests {
         fn call<'a>(
             &'a self,
             target: PromptRouteTarget,
+            bind_session: Option<String>,
             body: serde_json::Value,
         ) -> PromptRouteFuture<'a> {
             Box::pin(async move {
-                self.calls
-                    .lock()
-                    .expect("prompt route calls lock")
-                    .push((target, body));
+                self.calls.lock().expect("prompt route calls lock").push((
+                    target,
+                    bind_session,
+                    body,
+                ));
                 self.responses
                     .lock()
                     .expect("prompt route responses lock")
@@ -5150,23 +5197,24 @@ mod tests {
 
     #[tokio::test]
     async fn route_backend_wrapup_uses_frozen_contract_and_decodes_both_statuses() {
+        // Thalamus responses ride the wire wrapped as {"result": ...}.
         let routes = Arc::new(MockPromptRouteClient::new([
-            Ok(serde_json::json!({
+            Ok(serde_json::json!({"result": {
                 "status": "queued",
                 "command_id": "command-negative",
                 "command": "wrapup",
                 "keep": 5,
                 "clamped": true,
                 "expires_at_ms": 123_456,
-            })),
-            Ok(serde_json::json!({
+            }})),
+            Ok(serde_json::json!({"result": {
                 "status": "already_queued",
                 "command_id": "command-existing",
                 "command": "wrapup",
                 "keep": 20,
                 "clamped": false,
                 "expires_at_ms": 654_321,
-            })),
+            }})),
         ]));
         let backend = RouteBackend::new(routes.clone());
 
@@ -5193,6 +5241,7 @@ mod tests {
             vec![
                 (
                     PromptRouteTarget::Thalamus,
+                    None,
                     serde_json::json!({
                         "method": "session.command.enqueue",
                         "params": {
@@ -5204,6 +5253,7 @@ mod tests {
                 ),
                 (
                     PromptRouteTarget::Thalamus,
+                    None,
                     serde_json::json!({
                         "method": "session.command.enqueue",
                         "params": {
@@ -5221,10 +5271,11 @@ mod tests {
         // Composite key with the thalamus separator: passed verbatim, never parsed.
         let composite = "80bbd4e4-c5d5\u{241f}agent-7\u{241f}3";
         let routes = Arc::new(MockPromptRouteClient::new([
-            Ok(serde_json::json!({
+            // Hop 1 (thalamus): wrapped envelope. Hop 2 (magic-context): flat.
+            Ok(serde_json::json!({"result": {
                 "session_id": composite,
                 "last_traffic_ms": 4200,
-            })),
+            }})),
             Ok(serde_json::json!({
                 "summary": "Conversation status is stable."
             })),
@@ -5240,13 +5291,17 @@ mod tests {
             vec![
                 (
                     PromptRouteTarget::Thalamus,
+                    None,
                     serde_json::json!({
                         "method": "session.resolve",
                         "params": { "instance_token": "instance-token-123" },
                     }),
                 ),
                 (
+                    // The MC route binds the resolved composite so the
+                    // channel-keyed session check passes.
                     PromptRouteTarget::MagicContext,
+                    Some(composite.to_owned()),
                     serde_json::json!({
                         "method": "session.status",
                         "v": 1,
@@ -5259,10 +5314,12 @@ mod tests {
 
     #[tokio::test]
     async fn route_backend_status_null_resolve_is_unavailable_not_internal() {
-        let routes = Arc::new(MockPromptRouteClient::new([Ok(serde_json::json!({
-            "session_id": null,
-            "last_traffic_ms": null,
-        }))]));
+        let routes = Arc::new(MockPromptRouteClient::new([Ok(
+            serde_json::json!({"result": {
+                "session_id": null,
+                "last_traffic_ms": null,
+            }}),
+        )]));
         let backend = RouteBackend::new(routes.clone());
 
         assert_eq!(
@@ -5273,6 +5330,26 @@ mod tests {
             PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
         );
         // Resolution failed before magic-context was ever contacted.
+        assert_eq!(routes.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_backend_rejects_flat_thalamus_response_missing_envelope() {
+        // A thalamus reply without the {"result": ...} wrapper is a contract
+        // violation and must fail loud, not decode as absent fields.
+        let routes = Arc::new(MockPromptRouteClient::new([Ok(serde_json::json!({
+            "session_id": "38b797f0",
+            "last_traffic_ms": 4200,
+        }))]));
+        let backend = RouteBackend::new(routes.clone());
+
+        assert_eq!(
+            backend
+                .status(Some("instance-token-123"))
+                .await
+                .unwrap_err(),
+            PromptBackendError::Internal
+        );
         assert_eq!(routes.calls().len(), 1);
     }
 

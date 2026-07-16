@@ -8,7 +8,11 @@ import SubcChatAskSupport
 /// server remains the source of truth for answers, cancellations, and deadlines.
 @MainActor
 final class AskViewModel: ObservableObject {
-    @Published var asks: [AskRequest] = []
+    // The badge lives in didSet so answering or dismissing an ask (which edits
+    // the array directly) clears it immediately rather than on the next poll.
+    @Published var asks: [AskRequest] = [] {
+        didSet { AskNotifier.updateBadge(count: asks.count) }
+    }
     @Published var askDetail: AskRequest?
     @Published var selectedAskId: String?
     @Published var status: String = "idle"
@@ -19,6 +23,9 @@ final class AskViewModel: ObservableObject {
     private let work = DispatchQueue(label: "subc-asks.client", qos: .userInitiated)
     private let worker: AskManagementWorker
     private var completedRequestIDs = Set<String>()
+    /// Ask IDs seen by a completed poll. `nil` until the first successful poll so
+    /// a backlog present at launch badges quietly instead of firing banners.
+    private var knownAskIDs: Set<String>? = nil
 
     init() {
         // Reuse the rooms identity so every app management tab is one ck-app caller.
@@ -41,6 +48,9 @@ final class AskViewModel: ObservableObject {
             harness: "ck-app",
             sessionId: sessionId,
             callerDirectory: dir.path)
+        // Poll for the app's whole lifetime, not just while the Asks tab is
+        // visible: new-ask notifications must fire from any tab.
+        startPolling()
     }
 
     var tabTitle: String {
@@ -59,15 +69,19 @@ final class AskViewModel: ObservableObject {
     // MARK: Lifecycle
 
     func appear() {
+        // The lifetime timer is already running; entering the tab just refreshes
+        // immediately so the list is current.
         pollPending()
+    }
+
+    func disappear() {}
+
+    private func startPolling() {
         timer?.invalidate()
+        pollPending()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pollPending() }
         }
-    }
-
-    func disappear() {
-        timer?.invalidate(); timer = nil
     }
 
     private var timer: Timer?
@@ -82,9 +96,11 @@ final class AskViewModel: ObservableObject {
                 // than sorting client-side so ties retain the server's order too.
                 let asks = try worker.pendingAsksBlocking()
                 DispatchQueue.main.async {
-                    self?.asks = asks
-                    self?.opsAvailable = true
-                    self?.status = "live"
+                    guard let self else { return }
+                    self.asks = asks
+                    self.opsAvailable = true
+                    self.status = "live"
+                    self.announceArrivals(asks)
                 }
             } catch {
                 let message = shortError(error)
@@ -104,6 +120,32 @@ final class AskViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Raises a banner/bounce/sound for asks that arrived after the previous
+    /// poll. The launch backlog stays quiet (badge only, via the asks didSet):
+    /// those asks may be hours old, and a banner storm on every app start would
+    /// teach the user to ignore real arrivals.
+    private func announceArrivals(_ asks: [AskRequest]) {
+        defer { knownAskIDs = Set(asks.map(\.requestID)) }
+        guard let known = knownAskIDs else { return }
+        let fresh = asks.filter { !known.contains($0.requestID) }
+        guard !fresh.isEmpty else { return }
+
+        // One urgent ask makes the whole announcement urgent (persistent bounce).
+        let critical = fresh.contains {
+            $0.urgency?.lowercased() == "high" || $0.blocking == true || $0.materialDamage == true
+        }
+        let title: String
+        if fresh.count == 1 {
+            title = critical ? "Urgent ask from an agent" : "New ask from an agent"
+        } else {
+            title = critical ? "\(fresh.count) new asks (urgent)" : "\(fresh.count) new asks"
+        }
+        let body = fresh.first.map { ask in
+            ask.question.count > 140 ? String(ask.question.prefix(140)) + "\u{2026}" : ask.question
+        } ?? ""
+        AskNotifier.notify(title: title, body: body, critical: critical)
     }
 
     func selectAsk(_ id: String) {

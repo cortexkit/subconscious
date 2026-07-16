@@ -29,14 +29,14 @@ final class ObserveViewModel: ObservableObject {
     @Published var transcriptStatus: String = ""
 
     private let work = DispatchQueue(label: "subc-observe.client", qos: .userInitiated)
-    private var client: SubcClient?
-    private var alfonsoRoute: RouteHandle?
+    // The blocking client lives in a nonisolated worker (same split as
+    // AskManagementWorker): these calls run on the work queue, so they must not
+    // be main-actor isolated.
+    private let worker: ObserveWorker
     private var timer: Timer?
 
     let connectionFile =
         NSString(string: "~/.local/share/cortexkit/run/subc-connection.json").expandingTildeInPath
-    private let harness = "ck-app"
-    private let sessionId: String
     private let callerDirectory: String
 
     init() {
@@ -48,6 +48,7 @@ final class ObserveViewModel: ObservableObject {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         callerDirectory = dir.path
         let idFile = dir.appendingPathComponent("rooms-identity.txt")
+        let sessionId: String
         if let existing = try? String(contentsOf: idFile, encoding: .utf8),
            !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             sessionId = existing.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -56,6 +57,11 @@ final class ObserveViewModel: ObservableObject {
             try? minted.write(to: idFile, atomically: true, encoding: .utf8)
             sessionId = minted
         }
+        worker = ObserveWorker(
+            connectionFile: connectionFile,
+            harness: "ck-app",
+            sessionId: sessionId,
+            callerDirectory: dir.path)
     }
 
     // MARK: Lifecycle
@@ -72,52 +78,20 @@ final class ObserveViewModel: ObservableObject {
         timer?.invalidate(); timer = nil
     }
 
-    // MARK: Wire plumbing (alfonso-core route, mirrors RoomsViewModel)
-
-    private func ensureAlfonsoBlocking() throws -> (SubcClient, RouteHandle) {
-        if let client, let alfonsoRoute { return (client, alfonsoRoute) }
-        let c = try SubcClient.connect(connectionFilePath: connectionFile)
-        let route = try c.routeOpenManagementSurface(
-            moduleId: "alfonso-core",
-            projectRoot: callerDirectory,
-            harness: harness,
-            session: sessionId)
-        client = c
-        alfonsoRoute = route
-        return (c, route)
-    }
-
-    private func alfonsoCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
-        var merged = params
-        merged["harness"] = harness
-        merged["sessionId"] = sessionId
-        merged["callerDirectory"] = callerDirectory
-        let (client, route) = try ensureAlfonsoBlocking()
-        let reply = try client.callManagement(route: route, method: method, params: merged)
-        guard let result = reply["result"] else {
-            throw SubcError(message: "\(method): reply had no result field")
-        }
-        return JSONKeyNormalizer.camelize(result)
-    }
-
-    private func decode<T: Decodable>(_ type: T.Type, from any: Any) throws -> T {
-        let data = try JSONSerialization.data(withJSONObject: any)
-        return try JSONDecoder().decode(T.self, from: data)
-    }
-
     // MARK: Polling
 
     private func pollAll() {
-        work.async { [weak self] in
-            guard let self else { return }
+        let worker = worker
+        work.async { [weak self, worker] in
             do {
-                let consultsRaw = try self.alfonsoCallBlocking("athena.list_consults", ["limit": 50])
-                let consults = try self.decode([ConsultRow].self, from: self.rowsArray(consultsRaw, key: "consults"))
-                let gathersRaw = try self.alfonsoCallBlocking("observe.recent_runs", ["kind": "gather", "limit": 50])
-                let gathers = try self.decode([ObservedRun].self, from: self.rowsArray(gathersRaw, key: "runs"))
-                let checksRaw = try self.alfonsoCallBlocking("observe.recent_runs", ["kind": "oneshot", "limit": 50])
-                let checks = try self.decode([ObservedRun].self, from: self.rowsArray(checksRaw, key: "runs"))
+                let consultsRaw = try worker.alfonsoCallBlocking("athena.list_consults", ["limit": 50])
+                let consults = try worker.decode([ConsultRow].self, from: worker.rowsArray(consultsRaw, key: "consults"))
+                let gathersRaw = try worker.alfonsoCallBlocking("observe.recent_runs", ["kind": "gather", "limit": 50])
+                let gathers = try worker.decode([ObservedRun].self, from: worker.rowsArray(gathersRaw, key: "runs"))
+                let checksRaw = try worker.alfonsoCallBlocking("observe.recent_runs", ["kind": "oneshot", "limit": 50])
+                let checks = try worker.decode([ObservedRun].self, from: worker.rowsArray(checksRaw, key: "runs"))
                 DispatchQueue.main.async {
+                    guard let self else { return }
                     self.consults = consults
                     self.gathers = gathers
                     self.checks = checks
@@ -125,18 +99,19 @@ final class ObserveViewModel: ObservableObject {
                     self.status = "live"
                 }
             } catch {
+                // An unknown-op class error means ALF's ops haven't deployed yet:
+                // show the banner and keep polling; anything else drops the cached
+                // client (on the work queue, where the worker lives) so the next
+                // tick reconnects.
+                let msg = shortError(error)
+                let opsUnavailable = msg.contains("unknown") || msg.contains("unsupported") || msg.contains("no such")
+                if !opsUnavailable { worker.resetConnection() }
                 DispatchQueue.main.async {
-                    // An unknown-op class error means ALF's ops haven't deployed yet:
-                    // show the banner and keep polling; anything else drops the cached
-                    // client so the next tick reconnects.
-                    let msg = shortError(error)
-                    if msg.contains("unknown") || msg.contains("unsupported") || msg.contains("no such") {
+                    guard let self else { return }
+                    if opsUnavailable {
                         self.opsAvailable = false
                         self.status = "waiting for alfonso-core ops"
                     } else {
-                        self.client?.close()
-                        self.client = nil
-                        self.alfonsoRoute = nil
                         self.status = "poll failed: \(msg)"
                     }
                 }
@@ -144,23 +119,17 @@ final class ObserveViewModel: ObservableObject {
         }
     }
 
-    /// List results may arrive as a bare array or wrapped ({consults: [...]}/{runs: [...]}).
-    private func rowsArray(_ any: Any, key: String) -> Any {
-        if let dict = any as? [String: Any], let inner = dict[key] { return inner }
-        return any
-    }
-
     func selectConsult(_ id: String) {
         selectedConsultId = id
         consultDetail = nil
-        work.async { [weak self] in
-            guard let self else { return }
+        let worker = worker
+        work.async { [weak self, worker] in
             do {
-                let raw = try self.alfonsoCallBlocking("athena.get_consult", ["consultId": id])
-                let detail = try self.decode(ConsultDetail.self, from: raw)
-                DispatchQueue.main.async { self.consultDetail = detail }
+                let raw = try worker.alfonsoCallBlocking("athena.get_consult", ["consultId": id])
+                let detail = try worker.decode(ConsultDetail.self, from: raw)
+                DispatchQueue.main.async { self?.consultDetail = detail }
             } catch {
-                DispatchQueue.main.async { self.status = "detail failed: \(shortError(error))" }
+                DispatchQueue.main.async { self?.status = "detail failed: \(shortError(error))" }
             }
         }
     }
@@ -230,5 +199,69 @@ final class ObserveViewModel: ObservableObject {
                 }
             }
         }
+    }
+}
+
+/// Owns the blocking alfonso-core client for the observe tabs. Lives off the main
+/// actor (same split as AskManagementWorker): every call here runs on the view
+/// model's private work queue, which also serializes access to the mutable
+/// client/route state.
+private final class ObserveWorker: @unchecked Sendable {
+    private let connectionFile: String
+    private let harness: String
+    private let sessionId: String
+    private let callerDirectory: String
+    private var client: SubcClient?
+    private var alfonsoRoute: RouteHandle?
+
+    init(connectionFile: String, harness: String, sessionId: String, callerDirectory: String) {
+        self.connectionFile = connectionFile
+        self.harness = harness
+        self.sessionId = sessionId
+        self.callerDirectory = callerDirectory
+    }
+
+    /// Drops the cached connection so the next call reconnects.
+    func resetConnection() {
+        client?.close()
+        client = nil
+        alfonsoRoute = nil
+    }
+
+    func alfonsoCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
+        var merged = params
+        merged["harness"] = harness
+        merged["sessionId"] = sessionId
+        merged["callerDirectory"] = callerDirectory
+        let (client, route) = try ensureAlfonsoBlocking()
+        let reply = try client.callManagement(route: route, method: method, params: merged)
+        guard let result = reply["result"] else {
+            throw SubcError(message: "\(method): reply had no result field")
+        }
+        return JSONKeyNormalizer.camelize(result)
+    }
+
+    func decode<T: Decodable>(_ type: T.Type, from any: Any) throws -> T {
+        let data = try JSONSerialization.data(withJSONObject: any)
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    /// List results may arrive as a bare array or wrapped ({consults: [...]}/{runs: [...]}).
+    func rowsArray(_ any: Any, key: String) -> Any {
+        if let dict = any as? [String: Any], let inner = dict[key] { return inner }
+        return any
+    }
+
+    private func ensureAlfonsoBlocking() throws -> (SubcClient, RouteHandle) {
+        if let client, let alfonsoRoute { return (client, alfonsoRoute) }
+        let c = try SubcClient.connect(connectionFilePath: connectionFile)
+        let route = try c.routeOpenManagementSurface(
+            moduleId: "alfonso-core",
+            projectRoot: callerDirectory,
+            harness: harness,
+            session: sessionId)
+        client = c
+        alfonsoRoute = route
+        return (c, route)
     }
 }

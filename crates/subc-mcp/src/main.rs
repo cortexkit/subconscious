@@ -1,13 +1,18 @@
 #![forbid(unsafe_code)]
 
+mod prompts;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     error::Error,
     ffi::{OsStr, OsString},
-    fs, io as stdio,
+    fs,
+    future::Future,
+    io as stdio,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    pin::Pin,
     process,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,12 +21,17 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use prompts::{
+    PendingBackend, PromptBackend, PromptBackendError, PromptBackendUnavailable, PromptService,
+    StatusBackendFuture, WrapupBackendFuture, WrapupEnqueueStatus, WrapupEnqueued,
+};
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
-        ClientResult, CustomRequest, ErrorCode, ErrorData, Implementation, JsonObject,
-        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
-        RequestId, ServerCapabilities, ServerInfo, ServerRequest, Tool as McpTool, ToolAnnotations,
+        ClientResult, CustomRequest, ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult,
+        Implementation, JsonObject, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, RequestId, ServerCapabilities, ServerInfo,
+        ServerRequest, Tool as McpTool, ToolAnnotations,
     },
     service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError},
     transport::async_rw::AsyncRwTransport,
@@ -972,6 +982,7 @@ struct ExposedTool {
 struct GatewayConfig {
     surface_mode: SurfaceMode,
     refresh: RefreshMode,
+    prompts: PromptConfig,
     providers: HashMap<String, ProviderConfig>,
 }
 
@@ -995,6 +1006,17 @@ struct ToolOverride {
     mode: Option<ToolMode>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PromptConfig {
+    default_enabled: Option<bool>,
+    overrides: HashMap<String, PromptOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PromptOverride {
+    enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigFileState {
     path: PathBuf,
@@ -1012,6 +1034,12 @@ struct ConfigFileSnapshot {
 struct ConfigSnapshot {
     effective: GatewayConfig,
     files: ConfigFileSnapshot,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PolicyRefreshChanges {
+    tools_changed: bool,
+    prompts_changed: bool,
 }
 
 #[derive(Debug)]
@@ -1068,6 +1096,7 @@ struct DesiredTool {
 struct RawGatewayLayer {
     surface_mode: MaybeSet<SurfaceMode>,
     refresh: MaybeSet<RefreshMode>,
+    prompts: MaybeSet<RawPromptConfig>,
     providers: HashMap<String, RawProviderConfig>,
 }
 
@@ -1083,6 +1112,8 @@ struct RawGatewayConfig {
     surface_mode: MaybeSet<SurfaceMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     refresh: MaybeSet<RefreshMode>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    prompts: MaybeSet<RawPromptConfig>,
     #[serde(default)]
     providers: HashMap<String, RawProviderConfig>,
     #[serde(default)]
@@ -1100,6 +1131,8 @@ struct RawGatewayOverlayConfig {
     surface_mode: MaybeSet<SurfaceMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     refresh: MaybeSet<RefreshMode>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    prompts: MaybeSet<RawPromptConfig>,
     #[serde(default)]
     providers: HashMap<String, RawProviderConfig>,
 }
@@ -1126,6 +1159,52 @@ struct RawToolConfig {
     default_enabled: MaybeSet<bool>,
     #[serde(default)]
     overrides: HashMap<String, RawToolOverrideValue>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPromptConfig {
+    #[serde(
+        default,
+        rename = "defaultEnabled",
+        deserialize_with = "deserialize_maybe_set"
+    )]
+    default_enabled: MaybeSet<bool>,
+    #[serde(default)]
+    overrides: HashMap<String, RawPromptOverrideValue>,
+}
+
+#[derive(Debug)]
+enum RawPromptOverrideValue {
+    Object(RawPromptOverrideObject),
+    Bool(bool),
+    Null(()),
+}
+
+impl<'de> Deserialize<'de> for RawPromptOverrideValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Null(())),
+            serde_json::Value::Bool(enabled) => Ok(Self::Bool(enabled)),
+            serde_json::Value::Object(_) => serde_json::from_value(value)
+                .map(Self::Object)
+                .map_err(de::Error::custom),
+            other => Err(de::Error::custom(format!(
+                "prompt override must be bool, null, or object, got {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPromptOverrideObject {
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    enabled: MaybeSet<bool>,
 }
 
 #[derive(Debug)]
@@ -1937,15 +2016,22 @@ async fn handle_shim_connection(
     let attached = attach_session(&subc, &hello).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let reconcile_gate = Arc::new(Mutex::new(()));
+    let prompt_backend = Arc::new(RouteBackend::new(Arc::new(SubcPromptRouteClient::new(
+        subc.clone(),
+        attached.state.identity.clone(),
+        Arc::clone(&attached.relay_session),
+    ))));
 
-    let handler = SubcMcpServer {
-        subc: subc.clone(),
-        state: Arc::clone(&attached.state),
-        relay_session: Arc::clone(&attached.relay_session),
-        lifecycle_started: Arc::new(AtomicBool::new(false)),
-        shutdown: shutdown_rx,
-        reconcile_gate: Arc::clone(&reconcile_gate),
-    };
+    let handler = SubcMcpServer::new(
+        subc.clone(),
+        Arc::clone(&attached.state),
+        Arc::clone(&attached.relay_session),
+        Arc::new(AtomicBool::new(false)),
+        shutdown_rx,
+        Arc::clone(&reconcile_gate),
+        hello.instance_token.clone(),
+        prompt_backend,
+    );
     let (read_half, write_half) = stream.into_split();
     let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
     let serve_result = serve_mcp_server(handler, transport).await;
@@ -2062,10 +2148,29 @@ async fn open_provider_route(
     consumer_capabilities: Option<Vec<String>>,
     route_session: Arc<RelaySession>,
 ) -> Result<RouteHandle> {
-    let request = ClientControlRequest::RouteOpen {
-        target: RouteTarget::ToolProvider {
+    open_route(
+        subc,
+        RouteTarget::ToolProvider {
             module_id: module_id.to_owned(),
         },
+        module_id,
+        identity,
+        consumer_capabilities,
+        route_session,
+    )
+    .await
+}
+
+async fn open_route(
+    subc: &SubcClient,
+    target: RouteTarget,
+    target_label: &str,
+    identity: &BindIdentity,
+    consumer_capabilities: Option<Vec<String>>,
+    route_session: Arc<RelaySession>,
+) -> Result<RouteHandle> {
+    let request = ClientControlRequest::RouteOpen {
+        target,
         identity: identity.clone(),
         consumer_identity: consumer_identity_from_env(),
         consumer_capabilities,
@@ -2090,7 +2195,7 @@ async fn open_provider_route(
             }
         }
         FrameType::Error => Err(error_response(
-            &format!("subc rejected route.open for provider '{module_id}'"),
+            &format!("subc rejected route.open for target '{target_label}'"),
             &response.body,
         )),
         ty => Err(other_error(format!(
@@ -2422,6 +2527,15 @@ impl SessionState {
     }
 }
 
+impl PromptConfig {
+    fn enabled(&self, prompt_name: &str) -> bool {
+        self.overrides
+            .get(prompt_name)
+            .and_then(|override_config| override_config.enabled)
+            .unwrap_or_else(|| self.default_enabled.unwrap_or(false))
+    }
+}
+
 impl GatewayConfig {
     fn facade_default() -> Self {
         let mut config = Self::default();
@@ -2433,6 +2547,17 @@ impl GatewayConfig {
                 .enabled = Some(false);
         }
         config
+    }
+
+    fn prompt_enabled(&self, prompt_name: &str) -> bool {
+        self.prompts.enabled(prompt_name)
+    }
+
+    fn visible_prompt_names(&self) -> Vec<&'static str> {
+        prompts::prompt_names()
+            .into_iter()
+            .filter(|prompt_name| self.prompt_enabled(prompt_name))
+            .collect()
     }
 
     fn provider_enabled(&self, module_id: &str) -> bool {
@@ -2660,13 +2785,47 @@ fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> 
 }
 
 fn validate_raw_gateway_config(raw: &RawGatewayConfig, path: &Path) -> Result<()> {
+    validate_raw_prompts(&raw.prompts, path, "prompts")?;
     validate_raw_providers(&raw.providers, path, "providers")?;
     for (harness_name, harness) in &raw.harness {
+        validate_raw_prompts(
+            &harness.prompts,
+            path,
+            &format!("harness.{harness_name}.prompts"),
+        )?;
         validate_raw_providers(
             &harness.providers,
             path,
             &format!("harness.{harness_name}.providers"),
         )?;
+    }
+    Ok(())
+}
+
+fn validate_raw_prompts(
+    prompts: &MaybeSet<RawPromptConfig>,
+    path: &Path,
+    prefix: &str,
+) -> Result<()> {
+    let MaybeSet::Value(prompts) = prompts else {
+        return Ok(());
+    };
+    let known_prompts = prompts::prompt_names();
+    for (prompt_name, override_value) in &prompts.overrides {
+        if !known_prompts.contains(&prompt_name.as_str()) {
+            return Err(other_error(format!(
+                "invalid MCP config {}: {prefix}.overrides.{prompt_name} names an unknown prompt",
+                path.display()
+            )));
+        }
+        if let RawPromptOverrideValue::Object(object) = override_value {
+            if matches!(object.enabled, MaybeSet::Null) {
+                return Err(other_error(format!(
+                    "invalid MCP config {}: {prefix}.overrides.{prompt_name}.enabled must be omitted instead of null; use null for the whole override entry to delete it",
+                    path.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2716,6 +2875,7 @@ impl RawGatewayConfig {
             RawGatewayLayer {
                 surface_mode: self.surface_mode,
                 refresh: self.refresh,
+                prompts: self.prompts,
                 providers: self.providers,
             },
             self.harness,
@@ -2728,6 +2888,7 @@ impl From<RawGatewayOverlayConfig> for RawGatewayLayer {
         Self {
             surface_mode: raw.surface_mode,
             refresh: raw.refresh,
+            prompts: raw.prompts,
             providers: raw.providers,
         }
     }
@@ -2759,6 +2920,11 @@ fn merge_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLayer) {
         MaybeSet::Missing => {}
         MaybeSet::Null => effective.refresh = RefreshMode::OnAttach,
         MaybeSet::Value(refresh) => effective.refresh = refresh,
+    }
+    match raw.prompts {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.prompts = PromptConfig::default(),
+        MaybeSet::Value(prompts) => merge_prompt_config(&mut effective.prompts, prompts),
     }
 
     for (module_id, raw_provider) in raw.providers {
@@ -2799,6 +2965,14 @@ fn merge_project_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLa
             "refresh",
             "project MCP config cannot weaken user-chosen refresh latency",
         );
+    }
+    match raw.prompts {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.prompts = PromptConfig::default(),
+        MaybeSet::Value(prompts) => {
+            let baseline = effective.prompts.clone();
+            merge_project_prompt_config(&mut effective.prompts, &baseline, prompts);
+        }
     }
 
     for (module_id, raw_provider) in raw.providers {
@@ -2847,6 +3021,110 @@ fn merge_project_gateway_config(effective: &mut GatewayConfig, raw: RawGatewayLa
                 merge_project_tool_config(effective, &baseline, &module_id, tools);
             }
         }
+    }
+}
+
+fn merge_prompt_config(effective: &mut PromptConfig, raw: RawPromptConfig) {
+    match raw.default_enabled {
+        MaybeSet::Missing => {}
+        MaybeSet::Null => effective.default_enabled = None,
+        MaybeSet::Value(default_enabled) => effective.default_enabled = Some(default_enabled),
+    }
+    for (prompt_name, override_value) in raw.overrides {
+        match override_value {
+            RawPromptOverrideValue::Null(()) => {
+                effective.overrides.remove(&prompt_name);
+            }
+            RawPromptOverrideValue::Bool(enabled) => {
+                effective.overrides.entry(prompt_name).or_default().enabled = Some(enabled);
+            }
+            RawPromptOverrideValue::Object(object) => match object.enabled {
+                MaybeSet::Missing => {}
+                MaybeSet::Null => unreachable!("validated prompt override enabled null"),
+                MaybeSet::Value(enabled) => {
+                    effective.overrides.entry(prompt_name).or_default().enabled = Some(enabled);
+                }
+            },
+        }
+    }
+}
+
+fn merge_project_prompt_config(
+    effective: &mut PromptConfig,
+    baseline: &PromptConfig,
+    raw: RawPromptConfig,
+) {
+    let baseline_default_enabled = baseline.default_enabled.unwrap_or(false);
+    match raw.default_enabled {
+        MaybeSet::Missing => {}
+        MaybeSet::Value(false) | MaybeSet::Null => effective.default_enabled = Some(false),
+        MaybeSet::Value(true) => {
+            if baseline_default_enabled {
+                effective.default_enabled = Some(true);
+            } else {
+                warn_project_drop(
+                    "prompts.defaultEnabled",
+                    "project MCP config cannot enable prompts disabled by the user baseline",
+                );
+            }
+        }
+    }
+
+    for (prompt_name, override_value) in raw.overrides {
+        let field = format!("prompts.overrides.{prompt_name}");
+        let baseline_enabled = baseline.enabled(&prompt_name);
+        match override_value {
+            RawPromptOverrideValue::Null(()) => {
+                let enabled_without_override = effective.default_enabled.unwrap_or(false);
+                if baseline_enabled || !enabled_without_override {
+                    effective.overrides.remove(&prompt_name);
+                } else {
+                    warn_project_drop(
+                        &field,
+                        "project MCP config cannot delete a prompt deny from the user baseline",
+                    );
+                }
+            }
+            RawPromptOverrideValue::Bool(enabled) => merge_project_prompt_override_enabled(
+                effective,
+                &field,
+                &prompt_name,
+                enabled,
+                baseline_enabled,
+            ),
+            RawPromptOverrideValue::Object(object) => match object.enabled {
+                MaybeSet::Missing => {}
+                MaybeSet::Null => unreachable!("validated prompt override enabled null"),
+                MaybeSet::Value(enabled) => merge_project_prompt_override_enabled(
+                    effective,
+                    &format!("{field}.enabled"),
+                    &prompt_name,
+                    enabled,
+                    baseline_enabled,
+                ),
+            },
+        }
+    }
+}
+
+fn merge_project_prompt_override_enabled(
+    effective: &mut PromptConfig,
+    field: &str,
+    prompt_name: &str,
+    enabled: bool,
+    baseline_enabled: bool,
+) {
+    if !enabled || baseline_enabled {
+        effective
+            .overrides
+            .entry(prompt_name.to_owned())
+            .or_default()
+            .enabled = Some(enabled);
+    } else {
+        warn_project_drop(
+            field,
+            "project MCP config cannot enable a prompt disabled by the user baseline",
+        );
     }
 }
 
@@ -3117,6 +3395,48 @@ async fn reconcile_session_from_catalog(
     Ok(changed)
 }
 
+async fn refresh_policy_if_changed(
+    subc: &SubcClient,
+    state: &SessionState,
+    relay_session: &Arc<RelaySession>,
+    reconcile_gate: &Arc<Mutex<()>>,
+) -> Result<Option<PolicyRefreshChanges>> {
+    let snapshot = state.config_snapshot();
+    if snapshot.effective.refresh != RefreshMode::Immediate {
+        return Ok(None);
+    }
+
+    let _reconcile_guard = reconcile_gate.lock().await;
+    let snapshot = state.config_snapshot();
+    if snapshot.effective.refresh != RefreshMode::Immediate || !config_files_changed(&snapshot)? {
+        return Ok(None);
+    }
+
+    let next_config = read_gateway_config(&state.identity.project_root, &state.identity.harness)?;
+    let prompts_changed =
+        snapshot.effective.visible_prompt_names() != next_config.effective.visible_prompt_names();
+    let catalog = catalog_list(subc).await?;
+    let tools_changed =
+        reconcile_session_from_catalog(subc, state, relay_session, catalog, &next_config.effective)
+            .await?;
+    state.replace_config(next_config);
+
+    Ok(Some(PolicyRefreshChanges {
+        tools_changed,
+        prompts_changed,
+    }))
+}
+
+async fn notify_policy_refresh(peer: &Peer<RoleServer>, changes: PolicyRefreshChanges) -> bool {
+    if changes.tools_changed && !notify_tool_list_changed(peer).await {
+        return false;
+    }
+    if changes.prompts_changed && !notify_prompt_list_changed(peer).await {
+        return false;
+    }
+    true
+}
+
 async fn session_lifecycle(
     subc: SubcClient,
     state: Arc<SessionState>,
@@ -3126,11 +3446,31 @@ async fn session_lifecycle(
     mut shutdown: watch::Receiver<bool>,
     reconcile_gate: Arc<Mutex<()>>,
 ) {
+    let mut config_poll = time::interval(CATALOG_POLL_INTERVAL);
+    config_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
+                }
+            }
+            _ = config_poll.tick() => {
+                match refresh_policy_if_changed(
+                    &subc,
+                    &state,
+                    &relay_session,
+                    &reconcile_gate,
+                ).await {
+                    Ok(Some(changes)) => {
+                        if !notify_policy_refresh(&peer, changes).await {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("subc-mcp module: keeping previous MCP policy after proactive config refresh failed: {error}");
+                    }
                 }
             }
             event = events.recv() => {
@@ -3240,6 +3580,289 @@ async fn notify_tool_list_changed(peer: &Peer<RoleServer>) -> bool {
     }
 }
 
+async fn notify_prompt_list_changed(peer: &Peer<RoleServer>) -> bool {
+    match peer.notify_prompt_list_changed().await {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("subc-mcp module: failed to notify MCP prompts/list_changed: {error}");
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptRouteTarget {
+    MagicContext,
+    Thalamus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptRouteFailure {
+    Transport,
+    Remote(String),
+    Malformed,
+}
+
+type PromptRouteFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = std::result::Result<serde_json::Value, PromptRouteFailure>> + Send + 'a,
+    >,
+>;
+
+trait PromptRouteClient: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        target: PromptRouteTarget,
+        body: serde_json::Value,
+    ) -> PromptRouteFuture<'a>;
+}
+
+struct SubcPromptRouteClient {
+    subc: SubcClient,
+    identity: BindIdentity,
+    relay_session: Arc<RelaySession>,
+}
+
+impl SubcPromptRouteClient {
+    fn new(subc: SubcClient, identity: BindIdentity, relay_session: Arc<RelaySession>) -> Self {
+        Self {
+            subc,
+            identity,
+            relay_session,
+        }
+    }
+
+    async fn call_route(
+        &self,
+        target: PromptRouteTarget,
+        body: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, PromptRouteFailure> {
+        let (target, target_label) = match target {
+            PromptRouteTarget::MagicContext => (
+                RouteTarget::ToolProvider {
+                    module_id: "magic-context".to_owned(),
+                },
+                "magic-context tool provider",
+            ),
+            PromptRouteTarget::Thalamus => (
+                RouteTarget::ManagementSurface {
+                    module_id: "thalamus".to_owned(),
+                },
+                "thalamus management surface",
+            ),
+        };
+        let route = open_route(
+            &self.subc,
+            target,
+            target_label,
+            &self.identity,
+            None,
+            Arc::clone(&self.relay_session),
+        )
+        .await
+        .map_err(|error| {
+            eprintln!("subc-mcp prompt backend: failed to open {target_label} route: {error}");
+            PromptRouteFailure::Transport
+        })?;
+
+        let response = async {
+            let body = serde_json::to_vec(&body).map_err(|error| {
+                eprintln!("subc-mcp prompt backend: failed to encode route request: {error}");
+                PromptRouteFailure::Malformed
+            })?;
+            let corr = self.subc.next_corr().map_err(|error| {
+                eprintln!("subc-mcp prompt backend: failed to allocate correlation id: {error}");
+                PromptRouteFailure::Transport
+            })?;
+            let frame = self
+                .subc
+                .build_route_frame(FrameType::Request, data_flags(), route, corr, body)
+                .map_err(|error| {
+                    eprintln!("subc-mcp prompt backend: failed to build route request: {error}");
+                    PromptRouteFailure::Transport
+                })?;
+            let frame = self
+                .subc
+                .request(frame, SUBC_RESPONSE_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    eprintln!("subc-mcp prompt backend: route request failed: {error}");
+                    PromptRouteFailure::Transport
+                })?;
+            match frame.header.ty {
+                FrameType::Response => serde_json::from_slice(&frame.body).map_err(|error| {
+                    eprintln!("subc-mcp prompt backend: malformed route response: {error}");
+                    PromptRouteFailure::Malformed
+                }),
+                FrameType::Error => {
+                    let error =
+                        serde_json::from_slice::<ErrorBody>(&frame.body).map_err(|source| {
+                            eprintln!("subc-mcp prompt backend: malformed route error: {source}");
+                            PromptRouteFailure::Malformed
+                        })?;
+                    eprintln!(
+                        "subc-mcp prompt backend: {target_label} returned error code={}",
+                        error.code
+                    );
+                    Err(PromptRouteFailure::Remote(error.code))
+                }
+                ty => {
+                    eprintln!("subc-mcp prompt backend: unexpected route response frame {ty:?}");
+                    Err(PromptRouteFailure::Malformed)
+                }
+            }
+        }
+        .await;
+
+        if let Err(error) = send_route_goodbye(&self.subc, route).await {
+            eprintln!("subc-mcp prompt backend: failed to close {target_label} route: {error}");
+        }
+        response
+    }
+}
+
+impl PromptRouteClient for SubcPromptRouteClient {
+    fn call<'a>(
+        &'a self,
+        target: PromptRouteTarget,
+        body: serde_json::Value,
+    ) -> PromptRouteFuture<'a> {
+        Box::pin(async move { self.call_route(target, body).await })
+    }
+}
+
+struct RouteBackend {
+    routes: Arc<dyn PromptRouteClient>,
+    pending: PendingBackend,
+}
+
+impl RouteBackend {
+    fn new(routes: Arc<dyn PromptRouteClient>) -> Self {
+        Self {
+            routes,
+            pending: PendingBackend,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusRouteResponse {
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WrapupRouteStatus {
+    Queued,
+    AlreadyQueued,
+}
+
+#[derive(Debug, Deserialize)]
+struct WrapupRouteResponse {
+    status: WrapupRouteStatus,
+    command_id: String,
+    command: String,
+    keep: u32,
+    clamped: bool,
+    expires_at_ms: i64,
+}
+
+impl PromptBackend for RouteBackend {
+    fn status<'a>(&'a self, instance_token: Option<&'a str>) -> StatusBackendFuture<'a> {
+        Box::pin(async move {
+            let Some(instance_token) = instance_token else {
+                return self.pending.status(None).await;
+            };
+            let response = self
+                .routes
+                .call(
+                    PromptRouteTarget::MagicContext,
+                    serde_json::json!({
+                        "method": "session.status",
+                        "v": 1,
+                        "instance_token": instance_token,
+                    }),
+                )
+                .await
+                .map_err(map_prompt_route_failure)?;
+            serde_json::from_value::<StatusRouteResponse>(response)
+                .map(|response| response.summary)
+                .map_err(|_| PromptBackendError::Internal)
+        })
+    }
+
+    fn enqueue_wrapup<'a>(
+        &'a self,
+        instance_token: Option<&'a str>,
+        keep: Option<i64>,
+    ) -> WrapupBackendFuture<'a> {
+        Box::pin(async move {
+            let Some(instance_token) = instance_token else {
+                return self.pending.enqueue_wrapup(None, keep).await;
+            };
+            let mut params = serde_json::Map::from_iter([
+                (
+                    "instance_token".to_owned(),
+                    serde_json::Value::String(instance_token.to_owned()),
+                ),
+                (
+                    "command".to_owned(),
+                    serde_json::Value::String("wrapup".to_owned()),
+                ),
+            ]);
+            if let Some(keep) = keep {
+                params.insert("keep".to_owned(), serde_json::json!(keep));
+            }
+            let response = self
+                .routes
+                .call(
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "op": "session.command.enqueue",
+                        "params": params,
+                    }),
+                )
+                .await
+                .map_err(map_prompt_route_failure)?;
+            let response = serde_json::from_value::<WrapupRouteResponse>(response)
+                .map_err(|_| PromptBackendError::Internal)?;
+            if response.command != "wrapup" || response.command_id.trim().is_empty() {
+                return Err(PromptBackendError::Internal);
+            }
+            Ok(WrapupEnqueued {
+                status: match response.status {
+                    WrapupRouteStatus::Queued => WrapupEnqueueStatus::Queued,
+                    WrapupRouteStatus::AlreadyQueued => WrapupEnqueueStatus::AlreadyQueued,
+                },
+                command_id: response.command_id,
+                keep: response.keep,
+                clamped: response.clamped,
+                expires_at_ms: response.expires_at_ms,
+            })
+        })
+    }
+}
+
+fn map_prompt_route_failure(failure: PromptRouteFailure) -> PromptBackendError {
+    match failure {
+        PromptRouteFailure::Transport => {
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        }
+        PromptRouteFailure::Remote(code) if code == "store_unavailable" => {
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        }
+        PromptRouteFailure::Remote(code) if code == "command_queue_full" => {
+            PromptBackendError::Unavailable(PromptBackendUnavailable::CommandQueueFull)
+        }
+        PromptRouteFailure::Remote(code) if code == "invalid_request" => {
+            PromptBackendError::Internal
+        }
+        PromptRouteFailure::Remote(_) | PromptRouteFailure::Malformed => {
+            PromptBackendError::Internal
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SubcMcpServer {
     subc: SubcClient,
@@ -3248,6 +3871,7 @@ struct SubcMcpServer {
     lifecycle_started: Arc<AtomicBool>,
     shutdown: watch::Receiver<bool>,
     reconcile_gate: Arc<Mutex<()>>,
+    prompts: PromptService,
 }
 
 /// v1 subc-mcp ↔ provider tool-call request contract carried as an opaque
@@ -3303,9 +3927,39 @@ impl ServerHandler for SubcMcpServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_prompts()
+                .enable_prompts_list_changed()
                 .build(),
         )
         .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListPromptsResult, ErrorData> {
+        self.refresh_policy_if_needed(&context.peer).await?;
+        let config = self.state.config_snapshot();
+        Ok(self
+            .prompts
+            .list_prompts(|prompt_name| config.effective.prompt_enabled(prompt_name)))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<GetPromptResult, ErrorData> {
+        self.refresh_policy_if_needed(&context.peer).await?;
+        let is_visible = self
+            .state
+            .config_snapshot()
+            .effective
+            .prompt_enabled(&request.name);
+        self.prompts
+            .get_prompt_if_visible(request, is_visible)
+            .await
     }
 
     async fn list_tools(
@@ -3375,43 +4029,47 @@ impl ServerHandler for SubcMcpServer {
 }
 
 impl SubcMcpServer {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        subc: SubcClient,
+        state: Arc<SessionState>,
+        relay_session: Arc<RelaySession>,
+        lifecycle_started: Arc<AtomicBool>,
+        shutdown: watch::Receiver<bool>,
+        reconcile_gate: Arc<Mutex<()>>,
+        instance_token: Option<String>,
+        prompt_backend: Arc<dyn PromptBackend>,
+    ) -> Self {
+        Self {
+            subc,
+            state,
+            relay_session,
+            lifecycle_started,
+            shutdown,
+            reconcile_gate,
+            prompts: PromptService::new(instance_token, prompt_backend),
+        }
+    }
+
     async fn refresh_policy_if_needed(
         &self,
         peer: &Peer<RoleServer>,
     ) -> std::result::Result<(), ErrorData> {
-        let snapshot = self.state.config_snapshot();
-        if snapshot.effective.refresh != RefreshMode::Immediate {
-            return Ok(());
-        }
-
-        let _reconcile_guard = self.reconcile_gate.lock().await;
-        let snapshot = self.state.config_snapshot();
-        if snapshot.effective.refresh != RefreshMode::Immediate {
-            return Ok(());
-        }
-        if !config_files_changed(&snapshot).map_err(mcp_internal_error)? {
-            return Ok(());
-        }
-
-        let next_config = read_gateway_config(
-            &self.state.identity.project_root,
-            &self.state.identity.harness,
-        )
-        .map_err(mcp_internal_error)?;
-        let catalog = catalog_list(&self.subc).await.map_err(mcp_internal_error)?;
-        let changed = reconcile_session_from_catalog(
+        let Some(changes) = refresh_policy_if_changed(
             &self.subc,
             &self.state,
             &self.relay_session,
-            catalog,
-            &next_config.effective,
+            &self.reconcile_gate,
         )
         .await
-        .map_err(mcp_internal_error)?;
-        self.state.replace_config(next_config);
-        if changed && !notify_tool_list_changed(peer).await {
+        .map_err(mcp_internal_error)?
+        else {
+            return Ok(());
+        };
+
+        if !notify_policy_refresh(peer, changes).await {
             return Err(ErrorData::internal_error(
-                "failed to notify MCP tools/list_changed after immediate policy refresh",
+                "failed to notify MCP list change after immediate policy refresh",
                 None,
             ));
         }
@@ -4407,7 +5065,222 @@ fn other_error(message: impl Into<String>) -> BoxError {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Mutex as StdMutex};
+
     use super::*;
+
+    struct MockPromptRouteClient {
+        responses: StdMutex<VecDeque<std::result::Result<serde_json::Value, PromptRouteFailure>>>,
+        calls: StdMutex<Vec<(PromptRouteTarget, serde_json::Value)>>,
+    }
+
+    impl MockPromptRouteClient {
+        fn new(
+            responses: impl IntoIterator<
+                Item = std::result::Result<serde_json::Value, PromptRouteFailure>,
+            >,
+        ) -> Self {
+            Self {
+                responses: StdMutex::new(responses.into_iter().collect()),
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(PromptRouteTarget, serde_json::Value)> {
+            self.calls.lock().expect("prompt route calls lock").clone()
+        }
+    }
+
+    impl PromptRouteClient for MockPromptRouteClient {
+        fn call<'a>(
+            &'a self,
+            target: PromptRouteTarget,
+            body: serde_json::Value,
+        ) -> PromptRouteFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("prompt route calls lock")
+                    .push((target, body));
+                self.responses
+                    .lock()
+                    .expect("prompt route responses lock")
+                    .pop_front()
+                    .expect("mock prompt route response")
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn route_backend_wrapup_uses_frozen_contract_and_decodes_both_statuses() {
+        let routes = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({
+                "status": "queued",
+                "command_id": "command-negative",
+                "command": "wrapup",
+                "keep": 5,
+                "clamped": true,
+                "expires_at_ms": 123_456,
+            })),
+            Ok(serde_json::json!({
+                "status": "already_queued",
+                "command_id": "command-existing",
+                "command": "wrapup",
+                "keep": 20,
+                "clamped": false,
+                "expires_at_ms": 654_321,
+            })),
+        ]));
+        let backend = RouteBackend::new(routes.clone());
+
+        let queued = backend
+            .enqueue_wrapup(Some("instance-token-123"), Some(-2))
+            .await
+            .unwrap();
+        assert_eq!(queued.status, WrapupEnqueueStatus::Queued);
+        assert_eq!(queued.command_id, "command-negative");
+        assert_eq!(queued.keep, 5);
+        assert!(queued.clamped);
+
+        let already_queued = backend
+            .enqueue_wrapup(Some("instance-token-123"), None)
+            .await
+            .unwrap();
+        assert_eq!(already_queued.status, WrapupEnqueueStatus::AlreadyQueued);
+        assert_eq!(already_queued.command_id, "command-existing");
+        assert_eq!(already_queued.keep, 20);
+        assert!(!already_queued.clamped);
+
+        assert_eq!(
+            routes.calls(),
+            vec![
+                (
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "op": "session.command.enqueue",
+                        "params": {
+                            "instance_token": "instance-token-123",
+                            "command": "wrapup",
+                            "keep": -2,
+                        },
+                    }),
+                ),
+                (
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "op": "session.command.enqueue",
+                        "params": {
+                            "instance_token": "instance-token-123",
+                            "command": "wrapup",
+                        },
+                    }),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_backend_status_uses_magic_context_contract() {
+        let routes = Arc::new(MockPromptRouteClient::new([Ok(serde_json::json!({
+            "summary": "Conversation status is stable."
+        }))]));
+        let backend = RouteBackend::new(routes.clone());
+
+        assert_eq!(
+            backend.status(Some("instance-token-123")).await.unwrap(),
+            "Conversation status is stable."
+        );
+        assert_eq!(
+            routes.calls(),
+            vec![(
+                PromptRouteTarget::MagicContext,
+                serde_json::json!({
+                    "method": "session.status",
+                    "v": 1,
+                    "instance_token": "instance-token-123",
+                }),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_backend_maps_transport_and_frozen_remote_errors() {
+        for (failure, expected) in [
+            (
+                PromptRouteFailure::Transport,
+                PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon),
+            ),
+            (
+                PromptRouteFailure::Remote("store_unavailable".to_owned()),
+                PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon),
+            ),
+            (
+                PromptRouteFailure::Remote("command_queue_full".to_owned()),
+                PromptBackendError::Unavailable(PromptBackendUnavailable::CommandQueueFull),
+            ),
+            (
+                PromptRouteFailure::Remote("invalid_request".to_owned()),
+                PromptBackendError::Internal,
+            ),
+        ] {
+            let routes = Arc::new(MockPromptRouteClient::new([Err(failure)]));
+            let backend = RouteBackend::new(routes);
+            assert_eq!(
+                backend
+                    .enqueue_wrapup(Some("instance-token-123"), Some(20))
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_backend_uses_pending_fallback_without_instance_token() {
+        let routes = Arc::new(MockPromptRouteClient::new([]));
+        let backend = RouteBackend::new(routes.clone());
+
+        assert_eq!(
+            backend.status(None).await.unwrap_err(),
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        );
+        assert_eq!(
+            backend.enqueue_wrapup(None, Some(-2)).await.unwrap_err(),
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        );
+        assert!(routes.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_backend_rejects_malformed_wrapup_responses() {
+        for response in [
+            serde_json::json!({
+                "status": "queued",
+                "command_id": "",
+                "command": "wrapup",
+                "keep": 20,
+                "clamped": false,
+                "expires_at_ms": 123,
+            }),
+            serde_json::json!({
+                "status": "queued",
+                "command_id": "command-id",
+                "command": "other",
+                "keep": 20,
+                "clamped": false,
+                "expires_at_ms": 123,
+            }),
+        ] {
+            let backend = RouteBackend::new(Arc::new(MockPromptRouteClient::new([Ok(response)])));
+            assert_eq!(
+                backend
+                    .enqueue_wrapup(Some("instance-token-123"), None)
+                    .await
+                    .unwrap_err(),
+                PromptBackendError::Internal
+            );
+        }
+    }
 
     fn parse_test_config(doc: &str) -> RawGatewayConfig {
         parse_gateway_config_doc(doc, Path::new("test-mcp.jsonc")).unwrap()
@@ -4711,6 +5584,76 @@ mod tests {
             mode_null.contains("mode must be omitted instead of null"),
             "unexpected mode-null error: {mode_null}"
         );
+    }
+
+    #[test]
+    fn prompt_policy_rejects_unknown_override_names() {
+        let error = parse_gateway_config_doc(
+            r#"{
+                "version": 1,
+                "prompts": { "overrides": { "stats": true } }
+            }"#,
+            Path::new("prompt-typo.jsonc"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("prompts.overrides.stats"), "{error}");
+        assert!(error.contains("unknown prompt"), "{error}");
+    }
+
+    #[test]
+    fn prompt_policy_is_default_hidden_and_project_cannot_widen_user_denies() {
+        let default = GatewayConfig::facade_default();
+        assert!(default.visible_prompt_names().is_empty());
+
+        let effective = compose_test_config(
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": {
+                        "defaultEnabled": false,
+                        "overrides": { "status": false, "wrapup": false }
+                    }
+                }"#,
+            ),
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": {
+                        "defaultEnabled": true,
+                        "overrides": { "status": true, "wrapup": { "enabled": true } }
+                    }
+                }"#,
+            ),
+            DEFAULT_HARNESS,
+        );
+
+        assert!(!effective.prompt_enabled("status"));
+        assert!(!effective.prompt_enabled("wrapup"));
+        assert!(effective.visible_prompt_names().is_empty());
+    }
+
+    #[test]
+    fn project_prompt_policy_can_narrow_user_enabled_prompts() {
+        let effective = compose_test_config(
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": { "defaultEnabled": true }
+                }"#,
+            ),
+            Some(
+                r#"{
+                    "version": 1,
+                    "prompts": { "overrides": { "status": false } }
+                }"#,
+            ),
+            DEFAULT_HARNESS,
+        );
+
+        assert!(!effective.prompt_enabled("status"));
+        assert!(effective.prompt_enabled("wrapup"));
     }
 
     #[test]

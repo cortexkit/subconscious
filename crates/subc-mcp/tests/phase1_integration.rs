@@ -19,8 +19,8 @@ use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities,
         ClientInfo, ClientRequest, CreateElicitationRequestParams, CreateElicitationResult,
-        ElicitationAction, ErrorData as McpErrorData, Implementation, JsonObject,
-        ProgressNotificationParam,
+        ElicitationAction, ErrorCode, ErrorData as McpErrorData, GetPromptRequestParams,
+        Implementation, JsonObject, ProgressNotificationParam,
     },
     service::{
         MaybeSendFuture, NotificationContext, PeerRequestOptions, RunningService, ServiceError,
@@ -171,6 +171,7 @@ struct TestMcpClient {
     progress: Arc<TokioMutex<Vec<ProgressNotificationParam>>>,
     progress_count: Arc<AtomicUsize>,
     tool_list_changed_count: Arc<AtomicUsize>,
+    prompt_list_changed_count: Arc<AtomicUsize>,
 }
 
 impl TestMcpClient {
@@ -179,6 +180,7 @@ impl TestMcpClient {
             progress: Arc::new(TokioMutex::new(Vec::new())),
             progress_count: Arc::new(AtomicUsize::new(0)),
             tool_list_changed_count: Arc::new(AtomicUsize::new(0)),
+            prompt_list_changed_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -223,6 +225,15 @@ impl ClientHandler for TestMcpClient {
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
         self.tool_list_changed_count.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(())
+    }
+
+    fn on_prompt_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        self.prompt_list_changed_count
+            .fetch_add(1, Ordering::SeqCst);
         std::future::ready(())
     }
 }
@@ -1334,7 +1345,7 @@ impl McpHarness {
 }
 
 #[tokio::test]
-async fn mcp_initialize_advertises_tools_capability() {
+async fn mcp_initialize_advertises_tools_and_prompts_capabilities() {
     let harness = McpHarness::start("mcp-init", &[]).await;
 
     let server_info = harness
@@ -1348,7 +1359,203 @@ async fn mcp_initialize_advertises_tools_capability() {
         .as_ref()
         .expect("subc-mcp should advertise the MCP tools capability");
     assert_eq!(tools_capability.list_changed, Some(true));
+    let prompts_capability = server_info
+        .capabilities
+        .prompts
+        .as_ref()
+        .expect("subc-mcp should advertise the MCP prompts capability");
+    assert_eq!(prompts_capability.list_changed, Some(true));
     assert_eq!(server_info.server_info.name, "subc-mcp");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_prompts_are_hidden_by_default() {
+    let harness = McpHarness::start("mcp-prompts-hidden", &[]).await;
+
+    let result = harness.client.peer().list_prompts(None).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        json!({ "prompts": [] })
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_prompt_policy_refresh_is_proactive_inert_and_tool_neutral() {
+    let user_config = r#"{
+        "version": 1,
+        "refresh": "immediate",
+        "prompts": { "defaultEnabled": true }
+    }"#;
+    let hidden_project_config = r#"{
+        "version": 1,
+        "prompts": { "defaultEnabled": false }
+    }"#;
+    let enabled_project_config = r#"{
+        "version": 1,
+        "prompts": { "defaultEnabled": true }
+    }"#;
+    let harness = McpHarness::start_configured(
+        "mcp-prompts-refresh",
+        vec![StubProvider::new("fake-aft", &[])],
+        Some(user_config),
+        Some(hidden_project_config),
+    )
+    .await;
+    let peer = harness.client.peer();
+    let tools_before = serde_json::to_vec(&peer.list_tools(None).await.unwrap()).unwrap();
+    let tool_notification_baseline = harness
+        .client_handler
+        .tool_list_changed_count
+        .load(Ordering::SeqCst);
+    let prompt_notification_baseline = harness
+        .client_handler
+        .prompt_list_changed_count
+        .load(Ordering::SeqCst);
+
+    assert!(peer.list_prompts(None).await.unwrap().prompts.is_empty());
+    write_project_mcp_config(&harness._project.path, enabled_project_config);
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.prompt_list_changed_count,
+        prompt_notification_baseline,
+        "proactive prompt list activation notification without an MCP request",
+    )
+    .await;
+    let activated = peer.list_prompts(None).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(activated).unwrap(),
+        json!({
+            "prompts": [
+                {
+                    "name": "status",
+                    "description": "Summarize the current conversation state from Magic Context."
+                },
+                {
+                    "name": "wrapup",
+                    "description": "Wrap up this conversation: fold history and keep only the most recent messages.",
+                    "arguments": [
+                        {
+                            "name": "keep",
+                            "description": "number of recent messages to keep (5-100, default 20)",
+                            "required": false
+                        }
+                    ]
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        serde_json::to_vec(&peer.list_tools(None).await.unwrap()).unwrap(),
+        tools_before
+    );
+
+    let after_activation = harness
+        .client_handler
+        .prompt_list_changed_count
+        .load(Ordering::SeqCst);
+    assert_eq!(after_activation, prompt_notification_baseline + 1);
+    write_project_mcp_config(&harness._project.path, hidden_project_config);
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.prompt_list_changed_count,
+        after_activation,
+        "proactive prompt list re-hide notification without an MCP request",
+    )
+    .await;
+    assert_mcp_error(
+        peer.get_prompt(GetPromptRequestParams::new("status"))
+            .await
+            .unwrap_err(),
+        ErrorCode::INVALID_PARAMS,
+        "unknown prompt 'status'",
+    );
+    assert_eq!(
+        harness
+            .client_handler
+            .prompt_list_changed_count
+            .load(Ordering::SeqCst),
+        after_activation + 1
+    );
+    assert!(peer.list_prompts(None).await.unwrap().prompts.is_empty());
+    assert_eq!(
+        serde_json::to_vec(&peer.list_tools(None).await.unwrap()).unwrap(),
+        tools_before
+    );
+    assert_counter_stays(
+        &harness.client_handler.tool_list_changed_count,
+        tool_notification_baseline,
+        "tool list notifications during prompt-only policy refresh",
+        QUIET_TIMEOUT,
+    )
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_prompts_get_validation_and_unavailable_backend_errors_are_clean() {
+    let harness = McpHarness::start_configured(
+        "mcp-prompts-get",
+        vec![StubProvider::new("fake-aft", &[])],
+        Some(r#"{ "version": 1, "prompts": { "defaultEnabled": true } }"#),
+        None,
+    )
+    .await;
+    let peer = harness.client.peer();
+
+    assert_mcp_error(
+        peer.get_prompt(GetPromptRequestParams::new("missing"))
+            .await
+            .unwrap_err(),
+        ErrorCode::INVALID_PARAMS,
+        "unknown prompt 'missing'",
+    );
+
+    assert_mcp_error(
+        peer.get_prompt(GetPromptRequestParams::new("status"))
+            .await
+            .unwrap_err(),
+        ErrorCode(-32000),
+        "prompt backend is temporarily unavailable; try again shortly",
+    );
+
+    for keep in [None, Some("-2"), Some("4"), Some("500")] {
+        let mut request = GetPromptRequestParams::new("wrapup");
+        if let Some(keep) = keep {
+            let mut arguments = JsonObject::new();
+            arguments.insert("keep".to_owned(), json!(keep));
+            request = request.with_arguments(arguments);
+        }
+        assert_mcp_error(
+            peer.get_prompt(request).await.unwrap_err(),
+            ErrorCode(-32000),
+            "prompt backend is temporarily unavailable; try again shortly",
+        );
+    }
+
+    for keep in ["abc", "9223372036854775808"] {
+        let mut arguments = JsonObject::new();
+        arguments.insert("keep".to_owned(), json!(keep));
+        assert_mcp_error(
+            peer.get_prompt(GetPromptRequestParams::new("wrapup").with_arguments(arguments))
+                .await
+                .unwrap_err(),
+            ErrorCode::INVALID_PARAMS,
+            "keep must be an integer",
+        );
+    }
+
+    let mut arguments = JsonObject::new();
+    arguments.insert("recent".to_owned(), json!("20"));
+    assert_mcp_error(
+        peer.get_prompt(GetPromptRequestParams::new("wrapup").with_arguments(arguments))
+            .await
+            .unwrap_err(),
+        ErrorCode::INVALID_PARAMS,
+        "unknown argument 'recent' for prompt 'wrapup'",
+    );
 
     harness.shutdown().await;
 }
@@ -4235,6 +4442,16 @@ fn result_json(result: &rmcp::model::CallToolResult) -> Value {
             result_text(result)
         )
     })
+}
+
+fn assert_mcp_error(error: ServiceError, code: ErrorCode, message: &str) {
+    match error {
+        ServiceError::McpError(error) => {
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+        other => panic!("expected MCP error {code:?} with message {message:?}, got {other:?}"),
+    }
 }
 
 fn assert_unknown_tool_error(error: ServiceError, name: &str) {

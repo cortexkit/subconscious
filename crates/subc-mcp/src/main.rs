@@ -7,9 +7,12 @@ use std::{
     env,
     error::Error,
     ffi::{OsStr, OsString},
-    fs, io as stdio,
+    fs,
+    future::Future,
+    io as stdio,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    pin::Pin,
     process,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,7 +21,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use prompts::{PendingBackend, PromptBackend, PromptService};
+use prompts::{
+    PendingBackend, PromptBackend, PromptBackendError, PromptBackendUnavailable, PromptService,
+    StatusBackendFuture, WrapupBackendFuture, WrapupEnqueueStatus, WrapupEnqueued,
+};
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
@@ -2010,6 +2016,11 @@ async fn handle_shim_connection(
     let attached = attach_session(&subc, &hello).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let reconcile_gate = Arc::new(Mutex::new(()));
+    let prompt_backend = Arc::new(RouteBackend::new(Arc::new(SubcPromptRouteClient::new(
+        subc.clone(),
+        attached.state.identity.clone(),
+        Arc::clone(&attached.relay_session),
+    ))));
 
     let handler = SubcMcpServer::new(
         subc.clone(),
@@ -2019,7 +2030,7 @@ async fn handle_shim_connection(
         shutdown_rx,
         Arc::clone(&reconcile_gate),
         hello.instance_token.clone(),
-        Arc::new(PendingBackend),
+        prompt_backend,
     );
     let (read_half, write_half) = stream.into_split();
     let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
@@ -2137,10 +2148,29 @@ async fn open_provider_route(
     consumer_capabilities: Option<Vec<String>>,
     route_session: Arc<RelaySession>,
 ) -> Result<RouteHandle> {
-    let request = ClientControlRequest::RouteOpen {
-        target: RouteTarget::ToolProvider {
+    open_route(
+        subc,
+        RouteTarget::ToolProvider {
             module_id: module_id.to_owned(),
         },
+        module_id,
+        identity,
+        consumer_capabilities,
+        route_session,
+    )
+    .await
+}
+
+async fn open_route(
+    subc: &SubcClient,
+    target: RouteTarget,
+    target_label: &str,
+    identity: &BindIdentity,
+    consumer_capabilities: Option<Vec<String>>,
+    route_session: Arc<RelaySession>,
+) -> Result<RouteHandle> {
+    let request = ClientControlRequest::RouteOpen {
+        target,
         identity: identity.clone(),
         consumer_identity: consumer_identity_from_env(),
         consumer_capabilities,
@@ -2165,7 +2195,7 @@ async fn open_provider_route(
             }
         }
         FrameType::Error => Err(error_response(
-            &format!("subc rejected route.open for provider '{module_id}'"),
+            &format!("subc rejected route.open for target '{target_label}'"),
             &response.body,
         )),
         ty => Err(other_error(format!(
@@ -3560,6 +3590,279 @@ async fn notify_prompt_list_changed(peer: &Peer<RoleServer>) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptRouteTarget {
+    MagicContext,
+    Thalamus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptRouteFailure {
+    Transport,
+    Remote(String),
+    Malformed,
+}
+
+type PromptRouteFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = std::result::Result<serde_json::Value, PromptRouteFailure>> + Send + 'a,
+    >,
+>;
+
+trait PromptRouteClient: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        target: PromptRouteTarget,
+        body: serde_json::Value,
+    ) -> PromptRouteFuture<'a>;
+}
+
+struct SubcPromptRouteClient {
+    subc: SubcClient,
+    identity: BindIdentity,
+    relay_session: Arc<RelaySession>,
+}
+
+impl SubcPromptRouteClient {
+    fn new(subc: SubcClient, identity: BindIdentity, relay_session: Arc<RelaySession>) -> Self {
+        Self {
+            subc,
+            identity,
+            relay_session,
+        }
+    }
+
+    async fn call_route(
+        &self,
+        target: PromptRouteTarget,
+        body: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, PromptRouteFailure> {
+        let (target, target_label) = match target {
+            PromptRouteTarget::MagicContext => (
+                RouteTarget::ToolProvider {
+                    module_id: "magic-context".to_owned(),
+                },
+                "magic-context tool provider",
+            ),
+            PromptRouteTarget::Thalamus => (
+                RouteTarget::ManagementSurface {
+                    module_id: "thalamus".to_owned(),
+                },
+                "thalamus management surface",
+            ),
+        };
+        let route = open_route(
+            &self.subc,
+            target,
+            target_label,
+            &self.identity,
+            None,
+            Arc::clone(&self.relay_session),
+        )
+        .await
+        .map_err(|error| {
+            eprintln!("subc-mcp prompt backend: failed to open {target_label} route: {error}");
+            PromptRouteFailure::Transport
+        })?;
+
+        let response = async {
+            let body = serde_json::to_vec(&body).map_err(|error| {
+                eprintln!("subc-mcp prompt backend: failed to encode route request: {error}");
+                PromptRouteFailure::Malformed
+            })?;
+            let corr = self.subc.next_corr().map_err(|error| {
+                eprintln!("subc-mcp prompt backend: failed to allocate correlation id: {error}");
+                PromptRouteFailure::Transport
+            })?;
+            let frame = self
+                .subc
+                .build_route_frame(FrameType::Request, data_flags(), route, corr, body)
+                .map_err(|error| {
+                    eprintln!("subc-mcp prompt backend: failed to build route request: {error}");
+                    PromptRouteFailure::Transport
+                })?;
+            let frame = self
+                .subc
+                .request(frame, SUBC_RESPONSE_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    eprintln!("subc-mcp prompt backend: route request failed: {error}");
+                    PromptRouteFailure::Transport
+                })?;
+            match frame.header.ty {
+                FrameType::Response => serde_json::from_slice(&frame.body).map_err(|error| {
+                    eprintln!("subc-mcp prompt backend: malformed route response: {error}");
+                    PromptRouteFailure::Malformed
+                }),
+                FrameType::Error => {
+                    let error =
+                        serde_json::from_slice::<ErrorBody>(&frame.body).map_err(|source| {
+                            eprintln!("subc-mcp prompt backend: malformed route error: {source}");
+                            PromptRouteFailure::Malformed
+                        })?;
+                    eprintln!(
+                        "subc-mcp prompt backend: {target_label} returned error code={}",
+                        error.code
+                    );
+                    Err(PromptRouteFailure::Remote(error.code))
+                }
+                ty => {
+                    eprintln!("subc-mcp prompt backend: unexpected route response frame {ty:?}");
+                    Err(PromptRouteFailure::Malformed)
+                }
+            }
+        }
+        .await;
+
+        if let Err(error) = send_route_goodbye(&self.subc, route).await {
+            eprintln!("subc-mcp prompt backend: failed to close {target_label} route: {error}");
+        }
+        response
+    }
+}
+
+impl PromptRouteClient for SubcPromptRouteClient {
+    fn call<'a>(
+        &'a self,
+        target: PromptRouteTarget,
+        body: serde_json::Value,
+    ) -> PromptRouteFuture<'a> {
+        Box::pin(async move { self.call_route(target, body).await })
+    }
+}
+
+struct RouteBackend {
+    routes: Arc<dyn PromptRouteClient>,
+    pending: PendingBackend,
+}
+
+impl RouteBackend {
+    fn new(routes: Arc<dyn PromptRouteClient>) -> Self {
+        Self {
+            routes,
+            pending: PendingBackend,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusRouteResponse {
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WrapupRouteStatus {
+    Queued,
+    AlreadyQueued,
+}
+
+#[derive(Debug, Deserialize)]
+struct WrapupRouteResponse {
+    status: WrapupRouteStatus,
+    command_id: String,
+    command: String,
+    keep: u32,
+    clamped: bool,
+    expires_at_ms: i64,
+}
+
+impl PromptBackend for RouteBackend {
+    fn status<'a>(&'a self, instance_token: Option<&'a str>) -> StatusBackendFuture<'a> {
+        Box::pin(async move {
+            let Some(instance_token) = instance_token else {
+                return self.pending.status(None).await;
+            };
+            let response = self
+                .routes
+                .call(
+                    PromptRouteTarget::MagicContext,
+                    serde_json::json!({
+                        "method": "session.status",
+                        "v": 1,
+                        "instance_token": instance_token,
+                    }),
+                )
+                .await
+                .map_err(map_prompt_route_failure)?;
+            serde_json::from_value::<StatusRouteResponse>(response)
+                .map(|response| response.summary)
+                .map_err(|_| PromptBackendError::Internal)
+        })
+    }
+
+    fn enqueue_wrapup<'a>(
+        &'a self,
+        instance_token: Option<&'a str>,
+        keep: Option<i64>,
+    ) -> WrapupBackendFuture<'a> {
+        Box::pin(async move {
+            let Some(instance_token) = instance_token else {
+                return self.pending.enqueue_wrapup(None, keep).await;
+            };
+            let mut params = serde_json::Map::from_iter([
+                (
+                    "instance_token".to_owned(),
+                    serde_json::Value::String(instance_token.to_owned()),
+                ),
+                (
+                    "command".to_owned(),
+                    serde_json::Value::String("wrapup".to_owned()),
+                ),
+            ]);
+            if let Some(keep) = keep {
+                params.insert("keep".to_owned(), serde_json::json!(keep));
+            }
+            let response = self
+                .routes
+                .call(
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "op": "session.command.enqueue",
+                        "params": params,
+                    }),
+                )
+                .await
+                .map_err(map_prompt_route_failure)?;
+            let response = serde_json::from_value::<WrapupRouteResponse>(response)
+                .map_err(|_| PromptBackendError::Internal)?;
+            if response.command != "wrapup" || response.command_id.trim().is_empty() {
+                return Err(PromptBackendError::Internal);
+            }
+            Ok(WrapupEnqueued {
+                status: match response.status {
+                    WrapupRouteStatus::Queued => WrapupEnqueueStatus::Queued,
+                    WrapupRouteStatus::AlreadyQueued => WrapupEnqueueStatus::AlreadyQueued,
+                },
+                command_id: response.command_id,
+                keep: response.keep,
+                clamped: response.clamped,
+                expires_at_ms: response.expires_at_ms,
+            })
+        })
+    }
+}
+
+fn map_prompt_route_failure(failure: PromptRouteFailure) -> PromptBackendError {
+    match failure {
+        PromptRouteFailure::Transport => {
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        }
+        PromptRouteFailure::Remote(code) if code == "store_unavailable" => {
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        }
+        PromptRouteFailure::Remote(code) if code == "command_queue_full" => {
+            PromptBackendError::Unavailable(PromptBackendUnavailable::CommandQueueFull)
+        }
+        PromptRouteFailure::Remote(code) if code == "invalid_request" => {
+            PromptBackendError::Internal
+        }
+        PromptRouteFailure::Remote(_) | PromptRouteFailure::Malformed => {
+            PromptBackendError::Internal
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SubcMcpServer {
     subc: SubcClient,
@@ -4762,7 +5065,222 @@ fn other_error(message: impl Into<String>) -> BoxError {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Mutex as StdMutex};
+
     use super::*;
+
+    struct MockPromptRouteClient {
+        responses: StdMutex<VecDeque<std::result::Result<serde_json::Value, PromptRouteFailure>>>,
+        calls: StdMutex<Vec<(PromptRouteTarget, serde_json::Value)>>,
+    }
+
+    impl MockPromptRouteClient {
+        fn new(
+            responses: impl IntoIterator<
+                Item = std::result::Result<serde_json::Value, PromptRouteFailure>,
+            >,
+        ) -> Self {
+            Self {
+                responses: StdMutex::new(responses.into_iter().collect()),
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(PromptRouteTarget, serde_json::Value)> {
+            self.calls.lock().expect("prompt route calls lock").clone()
+        }
+    }
+
+    impl PromptRouteClient for MockPromptRouteClient {
+        fn call<'a>(
+            &'a self,
+            target: PromptRouteTarget,
+            body: serde_json::Value,
+        ) -> PromptRouteFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("prompt route calls lock")
+                    .push((target, body));
+                self.responses
+                    .lock()
+                    .expect("prompt route responses lock")
+                    .pop_front()
+                    .expect("mock prompt route response")
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn route_backend_wrapup_uses_frozen_contract_and_decodes_both_statuses() {
+        let routes = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({
+                "status": "queued",
+                "command_id": "command-negative",
+                "command": "wrapup",
+                "keep": 5,
+                "clamped": true,
+                "expires_at_ms": 123_456,
+            })),
+            Ok(serde_json::json!({
+                "status": "already_queued",
+                "command_id": "command-existing",
+                "command": "wrapup",
+                "keep": 20,
+                "clamped": false,
+                "expires_at_ms": 654_321,
+            })),
+        ]));
+        let backend = RouteBackend::new(routes.clone());
+
+        let queued = backend
+            .enqueue_wrapup(Some("instance-token-123"), Some(-2))
+            .await
+            .unwrap();
+        assert_eq!(queued.status, WrapupEnqueueStatus::Queued);
+        assert_eq!(queued.command_id, "command-negative");
+        assert_eq!(queued.keep, 5);
+        assert!(queued.clamped);
+
+        let already_queued = backend
+            .enqueue_wrapup(Some("instance-token-123"), None)
+            .await
+            .unwrap();
+        assert_eq!(already_queued.status, WrapupEnqueueStatus::AlreadyQueued);
+        assert_eq!(already_queued.command_id, "command-existing");
+        assert_eq!(already_queued.keep, 20);
+        assert!(!already_queued.clamped);
+
+        assert_eq!(
+            routes.calls(),
+            vec![
+                (
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "op": "session.command.enqueue",
+                        "params": {
+                            "instance_token": "instance-token-123",
+                            "command": "wrapup",
+                            "keep": -2,
+                        },
+                    }),
+                ),
+                (
+                    PromptRouteTarget::Thalamus,
+                    serde_json::json!({
+                        "op": "session.command.enqueue",
+                        "params": {
+                            "instance_token": "instance-token-123",
+                            "command": "wrapup",
+                        },
+                    }),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_backend_status_uses_magic_context_contract() {
+        let routes = Arc::new(MockPromptRouteClient::new([Ok(serde_json::json!({
+            "summary": "Conversation status is stable."
+        }))]));
+        let backend = RouteBackend::new(routes.clone());
+
+        assert_eq!(
+            backend.status(Some("instance-token-123")).await.unwrap(),
+            "Conversation status is stable."
+        );
+        assert_eq!(
+            routes.calls(),
+            vec![(
+                PromptRouteTarget::MagicContext,
+                serde_json::json!({
+                    "method": "session.status",
+                    "v": 1,
+                    "instance_token": "instance-token-123",
+                }),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_backend_maps_transport_and_frozen_remote_errors() {
+        for (failure, expected) in [
+            (
+                PromptRouteFailure::Transport,
+                PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon),
+            ),
+            (
+                PromptRouteFailure::Remote("store_unavailable".to_owned()),
+                PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon),
+            ),
+            (
+                PromptRouteFailure::Remote("command_queue_full".to_owned()),
+                PromptBackendError::Unavailable(PromptBackendUnavailable::CommandQueueFull),
+            ),
+            (
+                PromptRouteFailure::Remote("invalid_request".to_owned()),
+                PromptBackendError::Internal,
+            ),
+        ] {
+            let routes = Arc::new(MockPromptRouteClient::new([Err(failure)]));
+            let backend = RouteBackend::new(routes);
+            assert_eq!(
+                backend
+                    .enqueue_wrapup(Some("instance-token-123"), Some(20))
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_backend_uses_pending_fallback_without_instance_token() {
+        let routes = Arc::new(MockPromptRouteClient::new([]));
+        let backend = RouteBackend::new(routes.clone());
+
+        assert_eq!(
+            backend.status(None).await.unwrap_err(),
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        );
+        assert_eq!(
+            backend.enqueue_wrapup(None, Some(-2)).await.unwrap_err(),
+            PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon)
+        );
+        assert!(routes.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_backend_rejects_malformed_wrapup_responses() {
+        for response in [
+            serde_json::json!({
+                "status": "queued",
+                "command_id": "",
+                "command": "wrapup",
+                "keep": 20,
+                "clamped": false,
+                "expires_at_ms": 123,
+            }),
+            serde_json::json!({
+                "status": "queued",
+                "command_id": "command-id",
+                "command": "other",
+                "keep": 20,
+                "clamped": false,
+                "expires_at_ms": 123,
+            }),
+        ] {
+            let backend = RouteBackend::new(Arc::new(MockPromptRouteClient::new([Ok(response)])));
+            assert_eq!(
+                backend
+                    .enqueue_wrapup(Some("instance-token-123"), None)
+                    .await
+                    .unwrap_err(),
+                PromptBackendError::Internal
+            );
+        }
+    }
 
     fn parse_test_config(doc: &str) -> RawGatewayConfig {
         parse_gateway_config_doc(doc, Path::new("test-mcp.jsonc")).unwrap()

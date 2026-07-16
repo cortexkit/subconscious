@@ -3817,8 +3817,11 @@ impl PromptBackend for RouteBackend {
                 .routes
                 .call(
                     PromptRouteTarget::Thalamus,
+                    // Thalamus's management surface dispatches on "method" (the same
+                    // envelope as proxy.status / session.resolve); a body without it
+                    // decodes as invalid_request.
                     serde_json::json!({
-                        "op": "session.command.enqueue",
+                        "method": "session.command.enqueue",
                         "params": params,
                     }),
                 )
@@ -5157,7 +5160,7 @@ mod tests {
                 (
                     PromptRouteTarget::Thalamus,
                     serde_json::json!({
-                        "op": "session.command.enqueue",
+                        "method": "session.command.enqueue",
                         "params": {
                             "instance_token": "instance-token-123",
                             "command": "wrapup",
@@ -5168,7 +5171,7 @@ mod tests {
                 (
                     PromptRouteTarget::Thalamus,
                     serde_json::json!({
-                        "op": "session.command.enqueue",
+                        "method": "session.command.enqueue",
                         "params": {
                             "instance_token": "instance-token-123",
                             "command": "wrapup",

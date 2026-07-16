@@ -1495,7 +1495,7 @@ async fn mcp_prompt_policy_refresh_is_proactive_inert_and_tool_neutral() {
 }
 
 #[tokio::test]
-async fn mcp_prompts_get_validation_and_pending_backend_errors_are_clean() {
+async fn mcp_prompts_get_validation_and_unavailable_backend_errors_are_clean() {
     let harness = McpHarness::start_configured(
         "mcp-prompts-get",
         vec![StubProvider::new("fake-aft", &[])],
@@ -1518,7 +1518,7 @@ async fn mcp_prompts_get_validation_and_pending_backend_errors_are_clean() {
             .await
             .unwrap_err(),
         ErrorCode(-32000),
-        "prompt backend is unavailable",
+        "prompt backend is temporarily unavailable; try again shortly",
     );
 
     for keep in [None, Some("-2"), Some("4"), Some("500")] {
@@ -1531,7 +1531,7 @@ async fn mcp_prompts_get_validation_and_pending_backend_errors_are_clean() {
         assert_mcp_error(
             peer.get_prompt(request).await.unwrap_err(),
             ErrorCode(-32000),
-            "prompt backend is unavailable",
+            "prompt backend is temporarily unavailable; try again shortly",
         );
     }
 

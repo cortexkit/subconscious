@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use rmcp::model::{
     ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult, JsonObject, ListPromptsResult,
@@ -16,9 +16,9 @@ const KEEP_DESCRIPTION: &str = "number of recent messages to keep (5-100, defaul
 const BACKEND_UNAVAILABLE: ErrorCode = ErrorCode(-32000);
 const MAX_STATUS_SUMMARY_CHARS: usize = 500;
 
-type StatusBackendFuture<'a> =
+pub(crate) type StatusBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, PromptBackendError>> + Send + 'a>>;
-type WrapupBackendFuture<'a> =
+pub(crate) type WrapupBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<WrapupEnqueued, PromptBackendError>> + Send + 'a>>;
 
 /// Prompt backends receive only launch identity and validated prompt parameters.
@@ -49,25 +49,19 @@ pub(crate) struct WrapupEnqueued {
     pub(crate) expires_at_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "reserved for future backend implementations")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptBackendUnavailable {
+    RetrySoon,
+    CommandQueueFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptBackendError {
-    Unavailable(String),
-    InvalidParams(String),
-    Internal(String),
+    Unavailable(PromptBackendUnavailable),
+    #[allow(dead_code, reason = "reserved for future prompt backends")]
+    InvalidParams,
+    Internal,
 }
-
-impl fmt::Display for PromptBackendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unavailable(message) | Self::InvalidParams(message) | Self::Internal(message) => {
-                formatter.write_str(message)
-            }
-        }
-    }
-}
-
-impl Error for PromptBackendError {}
 
 #[derive(Debug, Default)]
 pub(crate) struct PendingBackend;
@@ -76,7 +70,7 @@ impl PromptBackend for PendingBackend {
     fn status<'a>(&'a self, _instance_token: Option<&'a str>) -> StatusBackendFuture<'a> {
         Box::pin(async {
             Err(PromptBackendError::Unavailable(
-                "status backend not wired yet".to_owned(),
+                PromptBackendUnavailable::RetrySoon,
             ))
         })
     }
@@ -88,7 +82,7 @@ impl PromptBackend for PendingBackend {
     ) -> WrapupBackendFuture<'a> {
         Box::pin(async {
             Err(PromptBackendError::Unavailable(
-                "wrapup backend not wired yet".to_owned(),
+                PromptBackendUnavailable::RetrySoon,
             ))
         })
     }
@@ -275,20 +269,29 @@ fn render_wrapup(enqueued: WrapupEnqueued) -> String {
         ""
     };
     format!(
-        "{status} with an effective keep of {} messages{clamped}. It starts on the next eligible parent message, the fold takes effect on a later pass, and an abandoned command expires after its 15-minute deadline.",
+        "{status} with an effective keep of {} messages{clamped}. It starts on the next eligible parent message; the fold takes effect on a later pass; an unclaimed command expires after its queue deadline.",
         enqueued.keep
     )
 }
 
 fn backend_error_to_mcp(error: PromptBackendError) -> ErrorData {
     match error {
-        PromptBackendError::Unavailable(_) => {
-            ErrorData::new(BACKEND_UNAVAILABLE, "prompt backend is unavailable", None)
+        PromptBackendError::Unavailable(PromptBackendUnavailable::RetrySoon) => ErrorData::new(
+            BACKEND_UNAVAILABLE,
+            "prompt backend is temporarily unavailable; try again shortly",
+            None,
+        ),
+        PromptBackendError::Unavailable(PromptBackendUnavailable::CommandQueueFull) => {
+            ErrorData::new(
+                BACKEND_UNAVAILABLE,
+                "wrapup command queue is full; try again after a queued command expires",
+                None,
+            )
         }
-        PromptBackendError::InvalidParams(_) => {
+        PromptBackendError::InvalidParams => {
             ErrorData::invalid_params("prompt backend rejected the request", None)
         }
-        PromptBackendError::Internal(_) => ErrorData::internal_error("prompt backend failed", None),
+        PromptBackendError::Internal => ErrorData::internal_error("prompt backend failed", None),
     }
 }
 
@@ -344,7 +347,7 @@ mod tests {
 
         fn failure(error: PromptBackendError) -> Self {
             Self {
-                status_response: Err(error.clone()),
+                status_response: Err(error),
                 wrapup_response: Err(error),
                 calls: Mutex::new(Vec::new()),
             }
@@ -560,7 +563,7 @@ mod tests {
                 .pointer("/messages/0/content/text")
                 .and_then(Value::as_str),
             Some(
-                "Wrapup queued with an effective keep of 5 messages (clamped from your requested value). It starts on the next eligible parent message, the fold takes effect on a later pass, and an abandoned command expires after its 15-minute deadline."
+                "Wrapup queued with an effective keep of 5 messages (clamped from your requested value). It starts on the next eligible parent message; the fold takes effect on a later pass; an unclaimed command expires after its queue deadline."
             )
         );
 
@@ -581,7 +584,7 @@ mod tests {
                 .pointer("/messages/0/content/text")
                 .and_then(Value::as_str),
             Some(
-                "Wrapup already queued with an effective keep of 20 messages. It starts on the next eligible parent message, the fold takes effect on a later pass, and an abandoned command expires after its 15-minute deadline."
+                "Wrapup already queued with an effective keep of 20 messages. It starts on the next eligible parent message; the fold takes effect on a later pass; an unclaimed command expires after its queue deadline."
             )
         );
     }
@@ -674,7 +677,7 @@ mod tests {
     #[tokio::test]
     async fn backend_failure_returns_clean_mcp_error() {
         let backend = Arc::new(MockBackend::failure(PromptBackendError::Unavailable(
-            "temporarily offline".to_owned(),
+            PromptBackendUnavailable::RetrySoon,
         )));
         let error = service(backend)
             .get_prompt(GetPromptRequestParams::new(STATUS_NAME))
@@ -682,20 +685,37 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, BACKEND_UNAVAILABLE);
-        assert_eq!(error.message, "prompt backend is unavailable");
+        assert_eq!(
+            error.message,
+            "prompt backend is temporarily unavailable; try again shortly"
+        );
     }
 
     #[test]
     fn backend_error_variants_map_to_distinct_mcp_errors() {
-        let invalid = backend_error_to_mcp(PromptBackendError::InvalidParams(
-            "backend rejected parameters".to_owned(),
+        let retry = backend_error_to_mcp(PromptBackendError::Unavailable(
+            PromptBackendUnavailable::RetrySoon,
         ));
+        assert_eq!(retry.code, BACKEND_UNAVAILABLE);
+        assert_eq!(
+            retry.message,
+            "prompt backend is temporarily unavailable; try again shortly"
+        );
+
+        let queue_full = backend_error_to_mcp(PromptBackendError::Unavailable(
+            PromptBackendUnavailable::CommandQueueFull,
+        ));
+        assert_eq!(queue_full.code, BACKEND_UNAVAILABLE);
+        assert_eq!(
+            queue_full.message,
+            "wrapup command queue is full; try again after a queued command expires"
+        );
+
+        let invalid = backend_error_to_mcp(PromptBackendError::InvalidParams);
         assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
         assert_eq!(invalid.message, "prompt backend rejected the request");
 
-        let internal = backend_error_to_mcp(PromptBackendError::Internal(
-            "backend response failed".to_owned(),
-        ));
+        let internal = backend_error_to_mcp(PromptBackendError::Internal);
         assert_eq!(internal.code, ErrorCode::INTERNAL_ERROR);
         assert_eq!(internal.message, "prompt backend failed");
     }

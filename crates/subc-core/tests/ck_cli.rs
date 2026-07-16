@@ -200,16 +200,30 @@ async fn quota_table_renders_providers_and_used_percent() {
         "expected usedPercent 42.0 in table, stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("rate limit probe failed for secondary account"),
-        "degraded error should appear, stdout:\n{stdout}"
-    );
-    assert!(
         stdout.contains("Bonus credits"),
         "extraRateWindows title should appear, stdout:\n{stdout}"
     );
+    // The default view lists connected providers only; entries without a
+    // usage object collapse into the summary line.
     assert!(
-        stdout.contains("cookie jar unreadable"),
-        "error-only entry should appear, stdout:\n{stdout}"
+        stdout.contains("1 providers not connected (--verbose to list)"),
+        "not-connected summary should appear, stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("cookie jar unreadable"),
+        "error-only entry must stay out of the default view, stdout:\n{stdout}"
+    );
+
+    let verbose = ck_with_subc(&server.connection_file_path, ["quota", "--verbose"]);
+    assert_exit(&verbose, 0);
+    let verbose_stdout = text(&verbose.stdout);
+    assert!(
+        verbose_stdout.contains("rate limit probe failed for secondary account"),
+        "degraded error should appear under --verbose, stdout:\n{verbose_stdout}"
+    );
+    assert!(
+        verbose_stdout.contains("cookie jar unreadable"),
+        "error-only entry should appear under --verbose, stdout:\n{verbose_stdout}"
     );
 
     module.stop().await.unwrap();

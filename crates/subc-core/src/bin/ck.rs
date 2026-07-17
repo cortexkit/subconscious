@@ -899,13 +899,24 @@ fn label_from_window_minutes(minutes: i64) -> String {
 
 fn format_used_percent_rate_window(window: &Value, color_enabled: bool) -> String {
     let used = window.get("usedPercent").and_then(Value::as_f64);
-    match used {
-        Some(value) => format!(
+    // A relaxed window (banked-reset arming in effect) reports the effective
+    // pacing number in usedPercent and the provider's real utilization in
+    // rawUsedPercent. Humans want the real number; render it and note the
+    // effective one so 0% never reads as an idle account.
+    let raw = window.get("rawUsedPercent").and_then(Value::as_f64);
+    match (used, raw) {
+        (Some(effective), Some(raw)) => format!(
+            "{} {:>5}% ({}% eff · resets banked)",
+            format_quota_progress_bar(raw, color_enabled),
+            format_used_percent(raw),
+            format_used_percent(effective)
+        ),
+        (Some(value), None) => format!(
             "{} {:>5}%",
             format_quota_progress_bar(value, color_enabled),
             format_used_percent(value)
         ),
-        None => "-".to_string(),
+        (None, _) => "-".to_string(),
     }
 }
 
@@ -1760,6 +1771,29 @@ mod tests {
             assert_eq!(actual, expected, "unexpected bar for {percent}%");
             assert_eq!(display_width(&actual), QUOTA_PROGRESS_BAR_WIDTH);
         }
+    }
+
+    #[test]
+    fn relaxed_window_renders_raw_percent_with_effective_note() {
+        // A relaxed (banked-reset) window carries provider truth in
+        // rawUsedPercent beside the effective pacing number; the human table
+        // must show the raw value, not the effective zero.
+        let relaxed = serde_json::json!({ "usedPercent": 0.0, "rawUsedPercent": 70.0 });
+        let rendered = format_used_percent_rate_window(&relaxed, false);
+        assert!(rendered.contains("70%"), "raw percent missing: {rendered}");
+        assert!(
+            rendered.contains("(0% eff · resets banked)"),
+            "effective note missing: {rendered}"
+        );
+
+        // Unrelaxed windows omit the field and keep the original rendering.
+        let plain = serde_json::json!({ "usedPercent": 58.0 });
+        let rendered = format_used_percent_rate_window(&plain, false);
+        assert!(
+            rendered.contains("58%"),
+            "plain percent missing: {rendered}"
+        );
+        assert!(!rendered.contains("eff"), "unexpected note: {rendered}");
     }
 
     #[test]

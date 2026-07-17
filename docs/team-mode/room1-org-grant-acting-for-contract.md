@@ -128,10 +128,13 @@ Paths: (a) member-device over fed — subject derivable, stamped from the
 §2 composition, no attestation; (b) gateway — A3 as serve-layer call
 metadata (fed is courier; no principal vocabulary in the fed envelope).
 
-**Path (b) verification order**: signature (account JWKS) · typ ==
-acting_for · aud == own service-principal ULID · presenter identity ==
-A3.gateway · org match · surface match · platform_binding against the
-resolved link · exp · jti consume · intent ledger (below).
+**Path (b) verification**: follows the §7 CANONICAL ORDER (authenticity
+→ identity → replay-mutation last). The identity phase for A3
+additionally checks: aud == own service-principal ULID · presenter
+identity == A3.gateway · org match · surface match · platform_binding
+against the resolved link. Only after every check passes: jti consume,
+then the intent ledger (below). An A3 failing any earlier check burns
+neither jti nor intent state.
 
 **Authority vs effect (named rule): authority gates on jti; effect-dedup
 gates on intent_id.** Two tables, two purposes:

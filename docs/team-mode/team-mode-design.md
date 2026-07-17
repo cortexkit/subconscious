@@ -303,8 +303,11 @@ Pinned properties:
 - Transport reuse: the gateway is a new CLIENT of fed's rendezvous/relay
   infra, not new plumbing.
 
-Naming: open (brain-metaphor candidate: `ck-wernicke`; alternatives
-`ck-relay`, `ck-presence`). Not yet decided.
+Naming: RATIFIED (Ufuk, 2026-07-18) — the gateway module is
+**`ck-wernicke`** (Wernicke's area, language comprehension: the natural
+pair to broca's production). Ratified the same day: fed's binary becomes
+**`ck-callosum`** (corpus callosum, the bridge between hemispheres — the
+bridge between daemons), peer nickname CALLO.
 
 ## 6. Sequencing lean (v1.1, not yet ratified)
 
@@ -393,7 +396,7 @@ mechanics. Partition with JOINT SEAMS:
   admission; exact envelope placement and verification points (Room 1).
 - **OQ-3**: Ceiling clamp mechanics — layered model pinned; the
   action-taxonomy contract and gate placement (Room 2).
-- **OQ-4**: Gateway module name and repo home.
+- **OQ-4**: RESOLVED — `ck-wernicke` (§5). Repo home still open.
 - **OQ-5**: Org daemon ops story (managed cloud offering vs self-hosted;
   likely both, managed first for paid tier). Target N for the org-daemon
   spec rides this.

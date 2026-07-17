@@ -1,10 +1,11 @@
-# Room 1 Output Contract — Org Grant + Acting-For (v5)
+# Room 1 Output Contract — Org Grant + Acting-For (v6)
 
-Status: REVISED FOR ROUND-5 GATE. Round 1: unanimous NO-GO, 9 blockers
+Status: REVISED FOR ROUND-6 GATE. Round 1: unanimous NO-GO, 9 blockers
 (→ v2 @ 91734119). Round 2: NO-GO, B1/B6 RESOLVED (→ v3 @ 05b899e8).
-Round 3: NO-GO, R3/R8 RESOLVED (→ v4 @ f9cf0004). Round 4
-(ct_...35198108d1b8): NO-GO, F2/F3/F4 RESOLVED; residue G1-G6 folded
-here with owner confirms (room [#40]-[#43]).
+Round 3: NO-GO, R3/R8 RESOLVED (→ v4 @ f9cf0004). Round 4: NO-GO,
+F2/F3/F4 RESOLVED (→ v5 @ ac2b4021). Round 5 (single-reviewer verdict;
+G3/G5 cleared): five findings H1-H5 folded here with owner confirms
+(room [#44]-[#46]).
 Date: 2026-07-17
 Parent: team-mode-design.md v1.1 §7-§9 with the §10 R6 supersession.
 Base docs by reference: cortexkit-account/docs/org-grant-design.md @
@@ -159,19 +160,36 @@ gates on intent_id.** Two tables, two purposes:
   inequality; the REMINT HORIZON (§5) guarantees structurally that a
   swept row can never meet a live re-mint.
 - **Effect atomicity model (normative — the outbox protocol)**: the
-  effect ledger is the authority record and the external effect is
-  bracketed by TWO LOCAL TRANSACTIONS, the only authority points:
-  (1) dispatch admission writes ADMITTED + a durable effect-intent
+  effect ledger is the authority record. Ledger row lifecycle:
+  **ADMITTED → SENDING → terminal (RECORDED | ABORTED |
+  outcome_unknown)**, three durable transaction points:
+  (1) dispatch admission writes ADMITTED + the durable effect-intent
   (outbox) row in one local transaction BEFORE any external work;
-  (2) the terminal is RECORDED in the local transaction that consumes
+  (2) the **SENDING mark is committed in its OWN transaction, fully
+  fsynced BEFORE the external call is issued** (fsync-before-effect; a
+  SENDING mark not durable before the call is the same as no mark);
+  (3) the terminal is written in the local transaction that consumes
   the outbox row. No cross-system transaction is assumed to exist.
-- **Reconciliation discipline (normative): RECONCILIATION RE-QUERIES,
-  IT NEVER RE-SENDS.** That sentence is the whole safety property.
-  Provider class is a STATIC capability of the provider binding,
-  declared at bind time — never inferred per-call; ABSENT an explicit
-  declaration a provider is the NEITHER class (the floor is
-  at-most-once; upgrades are opt-in with proof — a capability you
-  cannot prove, you do not have). Three classes, three exact behaviors:
+  **Crash-recovery reads**: row at ADMITTED = never sent — INITIATE may
+  proceed under §3 revalidation; row at SENDING = the send MAY have
+  happened — NEVER re-send outside the idempotency-key class; resolve
+  by re-query (status class) or bounded wait to outcome_unknown
+  (neither class). Rationale, recorded so the asymmetry with fed is
+  understood: fed's ledger deliberately retired its durable pre-send
+  boundary because every fed effect targets a peer running a queryable
+  serving ledger ("did you record this?" is always answerable). The
+  NEITHER and STATUS-QUERY classes lack exactly that downstream
+  authority — the SENDING mark is the LOCAL SUBSTITUTE for the
+  peer-ledger query fed relies on. That is why the mark exists here and
+  not in fed.
+- **Reconciliation discipline (normative): reconciliation NEVER
+  RE-SENDS WITHOUT PROVIDER-SIDE DEDUP — re-send exists ONLY inside the
+  IDEMPOTENCY-KEY class.** Provider class is a STATIC capability of the
+  provider binding, declared at bind time — never inferred per-call;
+  ABSENT an explicit declaration a provider is the NEITHER class (the
+  floor is at-most-once; upgrades are opt-in with proof — a capability
+  you cannot prove, you do not have). Three classes, three exact
+  behaviors:
   · IDEMPOTENCY-KEY provider: the executor passes an intent_id-derived
     key; re-send is safe (the key dedups provider-side); reconciliation
     MAY re-send and re-query; converges to the true terminal.
@@ -249,9 +267,12 @@ org_dissolved as the matrix intends.
   per-subject fact (never a bundle-refresh side effect); only the
   refused subject's entry flips — the rest of the bundle stays in its
   current grace phase. For the refused subject it is
-  epoch-bump-equivalent: established standing drops immediately,
-  pending and held asks die (R2 precedence), in-flight effects hit
-  ABORTED at their next revalidation point.
+  epoch-bump-equivalent: established standing drops immediately;
+  pending and held asks die (R2 precedence); PENDING (not-yet-sent)
+  ledger work hits ABORTED at its INITIATE revalidation; already-SENT
+  effects have no mid-flight revalidation point and run to terminal per
+  §10 window (e) — the ADMITTED-vs-SENDING boundary is exactly this
+  split.
 - **Ask state machine (durable; fsync at each edge; single-winner
   transitions; duplicate answers idempotent on ask id)**:
   `parked → {answered_held | dead}` · `answered_held → {executed |
@@ -307,7 +328,11 @@ org_dissolved as the matrix intends.
   anomaly detection are CKCRED-side controls with fleet-wide effect.
 - **Remint horizon (1 h, enforced at the mint choke point)**: the mint
   records first-seen per (org, intent_id) — including the intent's
-  SUBJECT at first mint — and refuses mints for an intent older than
+  SUBJECT — as an ATOMIC durable insert-if-absent keyed (org,
+  intent_id): under concurrent first mints of one intent_id with
+  different subjects exactly one wins; the loser is refused
+  intent_collision (DB-constraint-is-the-law, same discipline as the
+  serve-side tables). The mint refuses mints for an intent older than
   the horizon (refusal reason `intent_expired`). A remint request for a
   known intent_id with a DIFFERENT subject is refused at the mint as
   `intent_collision` — the choke point catches a buggy or compromised
@@ -328,11 +353,12 @@ org_dissolved as the matrix intends.
 - **Per-subject fairness cap — slot lifecycle (AGE-OUT-ONLY,
   normative)**: the cap is a mint-side BURST RATE-SHAPER of 5 slots per
   subject, a pure function of mint-local facts (first_seen + horizon +
-  TTL) — there is NO learn path and none is needed. A slot is held from
-  first mint and releases at age remint_horizon + A3 TTL; a slot NEVER
-  outlives its intent's remint eligibility (both expire together at
-  horizon + TTL, same clock, same row — no drift between the windows is
-  possible). Accepted consequence, named: a turn still executing past
+  TTL) — there is NO learn path and none is needed. Two instants, one
+  TTL apart, both from the same first_seen clock and row: remint
+  ELIGIBILITY ends at first_seen + horizon (1 h; later mints refuse
+  intent_expired); the SLOT releases at first_seen + horizon + A3 TTL —
+  the expiry of the last A3 that could possibly exist for the intent.
+  No drift between the windows is possible. Accepted consequence, named: a turn still executing past
   ~62 min stops counting against MINT fairness — acceptable because the
   cap bounds mint-side burst concurrency; ACTUAL execution concurrency
   is bounded org-daemon-side (its own admission/execution limits + the

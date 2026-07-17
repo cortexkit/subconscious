@@ -1,6 +1,13 @@
 # SUBC spec — Admission-Facts Relay + Conformance Corpus (Room-1 share)
 
-Status: DRAFT v2 for re-gate. v1's gate (bg_7f71c026) returned NO-GO
+Status: DRAFT v3. The v2 re-gate (bg_7d786e11) verified B2/B3-mechanics/
+B5/rollout-token/validation-split CLOSED and returned four blockers,
+folded here: (B1) the frozen contract itself contains a latent
+stamping-ownership inconsistency — resolution rides Amendment A1 (room
+[#74], v7.3) rather than this spec; (B2→§3.1) normative wire schemas;
+(B3→§3.2) the carrier-identity config authority; (B4→§4) the pinned
+one-shot SDK path. Should-fixes folded: value-relay wording, error
+precedence, mandatory org-profile target allowlist. v1's gate (bg_7f71c026) returned NO-GO
 with 4 blockers + 1 blocker-class underspecification; v2 restructures
 around the central correction: what crosses the wire is NOT the
 admission context (the contract forbids that: §0 "not a wire object")
@@ -55,6 +62,55 @@ ClientControlRequest::RouteOpen {
 }
 ```
 
+### 3.1 Normative fact schemas (wire-exact)
+
+Both packages are JSON OBJECTS; top-level `null` is treated as absent
+(serde Option collapses it — stated so no implementer distinguishes
+explicit null from omission). subc-core never inspects these;
+alfonso-core validates them EXACTLY as follows. Common required
+fields: `schema` (integer, ==1; unknown schema → reject
+`admission_facts_unsupported_schema`), `verified_class` (string:
+"member" | "service"; anything else → reject), `peer_static` (string,
+lowercase hex, exactly 64 chars), `org` (string ULID). Epoch/version
+numerics are JSON integers 0..2^53-1 (reject fractional, negative,
+string-typed). Size limit: the serialized object ≤ 4 KiB, nesting
+depth ≤ 3 (alfonso-side reject). Duplicate keys: last-wins per serde
+default, harmless given exact-field validation.
+
+MEMBER package (verified_class=="member") additionally REQUIRES:
+`account` (ULID), `role` (string), `membership_epoch` (integer),
+`device_epoch` (integer — from the A4 the admission verified),
+`bundle_version` (integer, diagnostic). FORBIDDEN: `grant_id`,
+`grant_ref`, `service_principal_ulid`, `subject` — presence → reject
+`admission_facts_forbidden_field`. (Member-path records need no
+grant_ref per the contract's lifetime rule — member records check
+membership_epoch only; the v2-gate concern that member facts lack
+grant_id is resolved by the contract, not a lookup.)
+
+SERVICE package (verified_class=="service") additionally REQUIRES:
+`service_principal_ulid` (ULID). FORBIDDEN: `account`, `subject`,
+`role`, `membership_epoch`, `grant_id`, `grant_ref` — presence →
+reject `admission_facts_forbidden_field` (the shared-pipe rule:
+per-turn subject identity is A3 call metadata exclusively).
+
+Unknown fields OUTSIDE the forbidden sets: ignored (additive
+evolution). The forbidden sets are part of the schema version: v2's
+"unknown fields ignored" and the forbidden-field rejection compose
+because forbidden fields are KNOWN names with security meaning, not
+unknowns.
+
+### 3.2 Carrier identity: the config authority
+
+New top-level daemon-config field: `admission_facts_carrier_module_id:
+Option<String>`. Validated at config load: when set, it MUST name a
+configured, enabled module with `reserved: true` — violation is a
+config error (fail startup loud). When unset (default; every personal
+daemon), NO carrier exists and any admission_facts-bearing route.open
+is rejected. The carrier gate compares
+Principal::Reserved{module_id} == the configured value by exact string
+equality. Spawn attestation alone is NEVER sufficient. Hard-coding
+any module name in subc-core is prohibited.
+
 Relay gate in subc-core's handle_route_open, positioned AFTER
 route_open_principal validation and BEFORE route reservation/relay:
 - If admission_facts is present and the resolved principal is NOT
@@ -66,11 +122,22 @@ route_open_principal validation and BEFORE route reservation/relay:
   reject the open with `admission_facts_not_permitted` (protocol
   violation class, loud). Reject-not-strip, scoped to that route.open
   only — a rejected open wedges nothing else.
-- If permitted: relay verbatim (content-opaque) into
+- If permitted: relay the SAME JSON VALUE without content inspection
+  or mutation (parse-and-reserialize per the shipped body path; byte
+  identity is NOT promised and nothing may depend on it) into
   `ModuleControlRequest::RouteBind { ..., admission_facts }`.
-- Optional destination constraint (config): `admission_facts_targets:
-  ["alfonso-core"]` — when set, carrying binds may only target listed
-  module ids; others reject. Default unset (org-daemon config sets it).
+- Destination constraint: `admission_facts_targets: ["..."]`,
+  MANDATORY whenever the carrier id is set — config load rejects a
+  carrier without a non-empty target allowlist (fail closed; member
+  identity facts must never be routable to an arbitrary target by a
+  buggy fed). Unset carrier ⇒ the constraint is moot.
+- ERROR PRECEDENCE (pinned, matches the shipped flow): target
+  existence, role, liveness and bind-support checks run BEFORE the
+  principal gate, so an unauthorized facts-bearing open toward a
+  nonexistent target yields `unknown_module`, not
+  `admission_facts_not_permitted`. This is intentional (no
+  information-ordering hazard: both errors are same-trust-surface) and
+  conformance vectors assert the shipped precedence.
 
 subc-core validates carrier permission and NOTHING else. Content
 validation splits three ways (v1 should-fix pinned): serde rejects
@@ -83,11 +150,17 @@ the §2 gateway-facts-with-subject case).
 
 Route epochs fence HANDLES, not freshness. Pinned consequences:
 - Fed MUST NOT use managed cached-route auto-reopen for admitted
-  routes. An admitted route that drops is closed permanently; fed
-  re-runs its §2 admission (fresh A4/A2/bundle reads) and issues a NEW
-  route.open with fresh facts. The SDK requirement is the negative one
-  (exclude these routes from reopen caches); no new SDK callback
-  machinery is required for v1 — fed owns its own reopen loop.
+  routes, and the SDK path is PINNED, not advisory: fed uses
+  subc-client-rs, which gains ONE new one-shot API
+  `open_route_with_admission_facts(target, identity, facts)` —
+  unmanaged (no cache entry, no auto-reopen, no retry-resend of the
+  facts; a transport failure returns the error to fed). The managed
+  APIs (`open_route`, `call`, cached reopen) REJECT non-None facts
+  synchronously (`admission_facts_requires_oneshot`). Tests prove the
+  reconnect and retry paths never re-send a previously admitted
+  package. An admitted route that drops is closed permanently; fed
+  re-runs its §2 admission (fresh A4/A2/bundle reads) and calls the
+  one-shot API again with fresh facts.
 - Facts are immutable per binding (re-admission = new bind). Epoch
   fencing then guarantees a stale binding's facts are unreferencable —
   in its handle-fencing role only, not as a freshness mechanism.

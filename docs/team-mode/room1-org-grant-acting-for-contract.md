@@ -433,8 +433,8 @@ completes after revocation;
 ask-authority horizon;
 (e) an external effect INITIATED before revocation observation runs to
 its terminal — bounded by the effect's own duration plus the §3
-reconciliation protocol (driven re-drives, bounded exhaustion to
-outcome_unknown), never by the revocation itself. Revocation during a
+reconciliation protocol (class-permitted operations only, bounded
+exhaustion to outcome_unknown), never by the revocation itself. Revocation during a
 long-running effect is observed near-immediately (push-healthy), but
 the effect completes per the outbox protocol; that is the honest
 statement.

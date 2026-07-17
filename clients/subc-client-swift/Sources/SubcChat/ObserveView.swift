@@ -1,4 +1,5 @@
 import SwiftUI
+import SubcChatAskSupport
 
 /// The three alfonso observability lanes: Athena consults, gather_context runs,
 /// and comment-check oneshots. One shared view model; the tab picker selects the
@@ -141,6 +142,9 @@ struct ObserveView: View {
                     if let s = d.synthesis, s.present == true, let r = s.resultPreview, !r.isEmpty {
                         section("Synthesis\(s.mechanical == true ? " (mechanical)" : "")", r)
                     }
+                    if let tu = d.tokenUsage {
+                        tokenUsageSection(tu)
+                    }
                 } else if vm.selectedConsultId != nil {
                     ProgressView().padding(30)
                 } else {
@@ -186,19 +190,96 @@ struct ObserveView: View {
     // MARK: Shared bits
 
     private func attemptRow(_ a: ConsultAttempt, showPhase: Bool) -> some View {
-        HStack(spacing: 6) {
-            stateChip(a.state ?? "?")
-            if showPhase, let p = a.phase {
-                Text(p).font(.caption2).foregroundColor(.secondary)
-            }
-            Text(a.model?.label ?? a.subjectKey ?? "member").font(.system(size: 12))
-            Spacer()
-            if let sid = a.sessionId {
-                Button("transcript") {
-                    vm.openTranscript(sessionId: sid, projectRoot: a.projectRoot)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                stateChip(a.state ?? "?")
+                if showPhase, let p = a.phase {
+                    Text(p).font(.caption2).foregroundColor(.secondary)
                 }
-                .font(.caption2)
+                Text(a.model?.label ?? a.subjectKey ?? "member").font(.system(size: 12))
+                Spacer()
+                if let sid = a.sessionId {
+                    Button("transcript") {
+                        vm.openTranscript(sessionId: sid, projectRoot: a.projectRoot)
+                    }
+                    .font(.caption2)
+                }
             }
+            usageLine(a.usage)
+        }
+    }
+
+    // Per-run usage under each attempt row. Providers split prompt tokens
+    // across input/cachedInput/cacheWrite differently (anthropic cache-warmed
+    // sends report input=1 with the rest under cacheWrite; kimi bills the
+    // whole prompt as cachedInput with input=0), so the headline is the SUM
+    // of the three, with the split and output/reasoning shown beside it.
+    @ViewBuilder
+    private func usageLine(_ u: AttemptUsage?) -> some View {
+        if let u = u {
+            let prompt = (u.inputTokens ?? 0) + (u.cachedInputTokens ?? 0) + (u.cacheWriteTokens ?? 0)
+            HStack(spacing: 8) {
+                tokenChip("prompt", prompt)
+                if (u.cachedInputTokens ?? 0) > 0 { tokenChip("cached", u.cachedInputTokens!) }
+                if (u.cacheWriteTokens ?? 0) > 0 { tokenChip("cacheW", u.cacheWriteTokens!) }
+                tokenChip("out", u.outputTokens ?? 0)
+                if (u.reasoningTokens ?? 0) > 0 { tokenChip("reason", u.reasoningTokens!) }
+                if let r = u.retriesUsed, r > 0 {
+                    Text("\(r) retr").font(.system(size: 10)).foregroundColor(.orange)
+                }
+            }
+            .padding(.leading, 46)
+        } else {
+            Text("unmeasured")
+                .font(.system(size: 10)).foregroundColor(.secondary.opacity(0.6))
+                .padding(.leading, 46)
+        }
+    }
+
+    private func tokenChip(_ label: String, _ value: Int64) -> some View {
+        HStack(spacing: 2) {
+            Text(label).foregroundColor(.secondary)
+            Text(TokenFormat.count(value)).monospacedDigit()
+        }
+        .font(.system(size: 10))
+    }
+
+
+
+    // Server-computed rollup: the total row also counts unmeasured attempts,
+    // which a client-side sum over present usage objects would silently miss.
+    @ViewBuilder
+    private func tokenUsageSection(_ tu: TokenUsageRollup) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Token Usage").font(.caption).bold()
+            if let rows = tu.models {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, m in
+                    tokenUsageRow(m, bold: false)
+                }
+            }
+            if let t = tu.total {
+                Divider().padding(.vertical, 1)
+                tokenUsageRow(t, bold: true)
+            }
+        }
+    }
+
+    private func tokenUsageRow(_ m: TokenUsageModelRow, bold: Bool) -> some View {
+        HStack(spacing: 8) {
+            Text(bold ? "total" : (m.model ?? "?"))
+                .font(.system(size: 11, weight: bold ? .semibold : .regular))
+                .frame(minWidth: 150, alignment: .leading)
+            let prompt = (m.input ?? 0) + (m.cachedInput ?? 0) + (m.cacheWrite ?? 0)
+            tokenChip("prompt", prompt)
+            if (m.cachedInput ?? 0) > 0 { tokenChip("cached", m.cachedInput!) }
+            if (m.cacheWrite ?? 0) > 0 { tokenChip("cacheW", m.cacheWrite!) }
+            tokenChip("out", m.output ?? 0)
+            if (m.reasoning ?? 0) > 0 { tokenChip("reason", m.reasoning!) }
+            if let c = m.calls { Text("\(c) call\(c == 1 ? "" : "s")").font(.system(size: 10)).foregroundColor(.secondary) }
+            if let un = m.unmeasured, un > 0 {
+                Text("\(un) unmeasured").font(.system(size: 10)).foregroundColor(.orange)
+            }
+            Spacer()
         }
     }
 

@@ -23,6 +23,10 @@ pub struct DaemonConfig {
     /// Central storage policy: the single backend choice all managed modules use.
     /// `None` when the config has no `storage` section (no managed storage).
     pub storage: Option<StorageConfig>,
+    /// Exact module id whose reserved process may carry admission facts.
+    pub admission_facts_carrier_module_id: Option<String>,
+    /// Exact target module ids that may receive facts from the configured carrier.
+    pub admission_facts_targets: Option<Vec<String>>,
 }
 
 /// Central storage configuration: one backend for every managed module. subc
@@ -133,6 +137,10 @@ struct RawDaemonConfig {
     modules: BTreeMap<String, RawModuleConfig>,
     #[serde(default)]
     storage: Option<RawStorageConfig>,
+    #[serde(default)]
+    admission_facts_carrier_module_id: Option<String>,
+    #[serde(default)]
+    admission_facts_targets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +280,12 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
 
     validate_reserved_prefixes(&modules, path)?;
+    validate_admission_facts_config(
+        &modules,
+        raw.admission_facts_carrier_module_id.as_deref(),
+        raw.admission_facts_targets.as_deref(),
+        path,
+    )?;
 
     let storage = raw.storage.map(|s| match s {
         RawStorageConfig::Sqlite { data_home } => StorageConfig::Sqlite {
@@ -284,7 +298,57 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         port: raw.port,
         modules,
         storage,
+        admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
+        admission_facts_targets: raw.admission_facts_targets,
     })
+}
+
+fn validate_admission_facts_config(
+    modules: &[ConfiguredModule],
+    carrier_module_id: Option<&str>,
+    targets: Option<&[String]>,
+    path: &Path,
+) -> Result<(), DaemonConfigError> {
+    let Some(carrier_module_id) = carrier_module_id else {
+        return Ok(());
+    };
+
+    let Some(carrier) = modules
+        .iter()
+        .find(|module| module.module_id == carrier_module_id)
+    else {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "admission_facts_carrier_module_id '{carrier_module_id}' must name a configured module"
+            ),
+        });
+    };
+    if !carrier.enabled || !carrier.reserved {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "admission_facts_carrier_module_id '{carrier_module_id}' must name an enabled reserved module"
+            ),
+        });
+    }
+
+    let Some(targets) = targets else {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: "admission_facts_targets must be present when an admission facts carrier is configured".to_string(),
+        });
+    };
+    if targets.is_empty() || targets.iter().any(String::is_empty) {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message:
+                "admission_facts_targets must be non-empty and must not contain empty module ids"
+                    .to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn default_enabled() -> bool {
@@ -763,6 +827,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(zero, DaemonConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn admission_facts_carrier_requires_non_empty_targets() {
+        let missing_targets = parse_doc(
+            r#"{
+              "version": 1,
+              "admission_facts_carrier_module_id": "fed",
+              "modules": { "fed": { "program": "fed", "reserved": true } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing_targets,
+            DaemonConfigError::InvalidValue { .. }
+        ));
+
+        let empty_targets = parse_doc(
+            r#"{
+              "version": 1,
+              "admission_facts_carrier_module_id": "fed",
+              "admission_facts_targets": [""],
+              "modules": { "fed": { "program": "fed", "reserved": true } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            empty_targets,
+            DaemonConfigError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn admission_facts_carrier_must_be_enabled_reserved_and_configured() {
+        for module in [
+            r#"{ "program": "fed", "enabled": false, "reserved": true }"#,
+            r#"{ "program": "fed", "enabled": true, "reserved": false }"#,
+        ] {
+            let doc = format!(
+                r#"{{
+                  "version": 1,
+                  "admission_facts_carrier_module_id": "fed",
+                  "admission_facts_targets": ["target"],
+                  "modules": {{ "fed": {module}, "target": {{ "program": "target" }} }}
+                }}"#
+            );
+            let err = parse_doc(&doc, Path::new("subc.jsonc")).unwrap_err();
+            assert!(matches!(err, DaemonConfigError::InvalidValue { .. }));
+        }
+
+        let absent = parse_doc(
+            r#"{
+              "version": 1,
+              "admission_facts_carrier_module_id": "missing",
+              "admission_facts_targets": ["target"],
+              "modules": { "target": { "program": "target" } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .unwrap_err();
+        assert!(matches!(absent, DaemonConfigError::InvalidValue { .. }));
     }
 
     #[test]

@@ -357,6 +357,7 @@ impl CkClient {
             },
             consumer_identity: None,
             consumer_capabilities: None,
+            admission_facts: None,
         };
         let value = self.rpc_value(request).await?;
         match serde_json::from_value::<ClientControlResponse>(value)? {

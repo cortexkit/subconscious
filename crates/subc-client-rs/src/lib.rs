@@ -618,6 +618,8 @@ pub struct RouteBindRequest {
     /// no reverse-request capability. Known MCP method-family values today are
     /// "elicitation", "sampling", and "roots".
     pub consumer_capabilities: Option<Vec<String>>,
+    /// Opaque admission facts relayed by subc from its configured carrier.
+    pub admission_facts: Option<serde_json::Value>,
 }
 
 /// Decision returned by [`ModuleHandler::on_bind`].
@@ -1039,6 +1041,7 @@ where
             identity,
             principal,
             consumer_capabilities,
+            admission_facts,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
             // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
@@ -1081,6 +1084,7 @@ where
                 identity,
                 principal,
                 consumer_capabilities,
+                admission_facts,
             };
             let decision = handler.on_bind(&req).await;
             match decision.kind {
@@ -1879,6 +1883,7 @@ mod tests {
             },
             principal: None,
             consumer_capabilities: None,
+            admission_facts: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()

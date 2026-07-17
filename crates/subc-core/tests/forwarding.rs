@@ -2420,6 +2420,7 @@ async fn route_open_invalid_project_root_returns_error_without_provider_attach()
         },
         consumer_identity: None,
         consumer_capabilities: None,
+        admission_facts: None,
     };
     write_frame(&mut client, &control_request_frame(481, request))
         .await
@@ -4541,6 +4542,7 @@ fn attach_request_with_consumer_identity(
         },
         consumer_identity,
         consumer_capabilities: None,
+        admission_facts: None,
     }
 }
 

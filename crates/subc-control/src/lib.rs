@@ -43,6 +43,9 @@ pub mod ops {
 /// Client-originated channel-0 control RPC body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op")]
+// RouteOpen carries the complete route metadata, while several control operations
+// are markers; retain the direct public wire shape instead of boxing its fields.
+#[allow(clippy::large_enum_variant)]
 pub enum ClientControlRequest {
     #[serde(rename = "server.describe")]
     ServerDescribe {},
@@ -66,6 +69,9 @@ pub enum ClientControlRequest {
         /// "roots".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_capabilities: Option<Vec<String>>,
+        /// Opaque admission facts supplied by the configured carrier module.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admission_facts: Option<serde_json::Value>,
     },
     #[serde(rename = "route.poll")]
     RoutePoll {
@@ -239,6 +245,7 @@ mod tests {
             },
             consumer_identity: None,
             consumer_capabilities: None,
+            admission_facts: None,
         };
 
         let body = serde_json::to_value(request).unwrap();
@@ -264,6 +271,7 @@ mod tests {
         let ClientControlRequest::RouteOpen {
             consumer_identity,
             consumer_capabilities,
+            admission_facts,
             ..
         } = decoded
         else {
@@ -271,5 +279,6 @@ mod tests {
         };
         assert_eq!(consumer_identity, None);
         assert_eq!(consumer_capabilities, None);
+        assert_eq!(admission_facts, None);
     }
 }

@@ -362,11 +362,23 @@ org_dissolved as the matrix intends.
   agent-list change is a GRANT MUTATION → delegation-epoch bump → the
   existing three-factor check refuses stale presentations and kills
   pending/held asks — ACL revocation rides machinery this contract
-  already froze, no new paths. Forward-compatibility: when Room 2's ACL
-  machinery lands, the grant agent-list becomes the per-(gateway,
-  subject) NARROWING of Room 2's org-wide role→agent ACL (same
-  narrowing-only composition as every other tier in this design), not a
-  surface to migrate away.
+  already froze, no new paths. Forward-compatibility, with the
+  composition and revocation bridge PINNED: when Room 2's ACL machinery
+  lands, the effective predicate becomes **target_agent ∈ (grant.agents
+  ∩ room2_allowed(subject, role))** — the grant list is the
+  per-(gateway, subject) NARROWING of Room 2's org-wide role→agent ACL
+  (narrowing-only, like every tier composition in this design), not a
+  surface to migrate away. REVOCATION BRIDGE: the Room-2 ACL is a §8
+  snapshot-store fact — an ACL mutation lands as a snapshot version
+  bump (same ingestion path as epoch pushes: bump BEFORE any subsequent
+  decision consumes it) and is therefore seen by the SAME universal
+  per-effect revalidation and ask-time checks that read the store
+  today; it does NOT bump delegation_epoch (that remains grant-mutation
+  only) and needs no new invalidation path. Until Room 2 lands,
+  room2_allowed is the identity (no additional narrowing). Additionally
+  pinned: a grant whose scope lacks invoke authorizes nothing
+  regardless of its agents list (fail-closed; the list narrows invoke,
+  it never substitutes for it).
 - Lazy per-(gateway, subject) mint on first @mention; auto-grant only
   for zero-ceiling roles (under the interim: no auto-grants); nonzero →
   admin approval; re-evaluated at each mint (no grandfathering).

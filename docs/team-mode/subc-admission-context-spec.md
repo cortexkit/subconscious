@@ -1,143 +1,154 @@
-# SUBC spec — Admission-Context Surface + Conformance Corpus (Room-1 share)
+# SUBC spec — Admission-Facts Relay + Conformance Corpus (Room-1 share)
 
-Status: DRAFT v1 for adversarial gate. Implements the SUBC share of the
-Room-1 partition (room [#69]) against the frozen contract
-(room1-org-grant-acting-for-contract.md v7.2 @ e81fb984). ALF's outbox
-INITIATE read consumes this surface as frozen once this spec passes its
-gate (their declared interface hole; the ordering obligation is ours).
+Status: DRAFT v2 for re-gate. v1's gate (bg_7f71c026) returned NO-GO
+with 4 blockers + 1 blocker-class underspecification; v2 restructures
+around the central correction: what crosses the wire is NOT the
+admission context (the contract forbids that: §0 "not a wire object")
+but fed's ADMISSION FACTS — a new, explicitly-wire object; the
+admission context of the frozen contract is COMPOSED inside
+alfonso-core by serve admission from those facts plus its own §8 store.
+Governing text: room1-org-grant-acting-for-contract.md v7.2 @ e81fb984
+(unamended — v2 no longer needs the amendment v1 would have required).
 Date: 2026-07-18
 
-## 1. Problem shape
+## 1. Corrected model (one paragraph)
 
-The frozen contract §0 defines the admission context as "the
-daemon-internal surface (local API between fed admission and the module
-layer; not a wire object) carrying {peer_static, account, org, role,
-grant_ref, verified_class}, stamped FROM the §8 snapshot store" — plus
-Zone-1 target_agent per v7.2 §3.
+fed (ck-callosum) verifies transport identity per the contract's §2
+member→org algorithm (Noise static, A4 against the fed cloud key, A2
+against the account JWKS from its local bundle). The RESULT of that
+verification — the admission facts — crosses the subc wire to
+alfonso-core as spawn-attested route metadata. Serve admission in
+alfonso-core then composes the CONTRACT's admission context: it takes
+fed's facts as the transport-identity input, reads ITS OWN §8 snapshot
+store for freshness (epochs, grace phase, refusals), and stamps the
+context daemon-internally. The contract's sentence "stamped FROM the §8
+snapshot store" is satisfied at the only place the store lives; fed
+never reads ALF's store (no cross-process read API, no second cache —
+v1's B5 dissolves), and the wire object is honestly named a fact
+package, not the context (v1's B1 dissolves without amending v7.2).
 
-On the org daemon that "daemon-internal" boundary crosses two supervised
-processes: fed (ck-callosum) performs the Noise handshake and artifact
-verification (§2 member→org algorithm), while serve admission and the
-§8 snapshot store live in alfonso-core. The context therefore has to
-cross the subc wire between two modules of one daemon WITHOUT becoming
-a caller-claimable wire object. That is exactly the problem subc's
-principal machinery already solves for spawn attestation: a module's
-claim is validated by the daemon against infrastructure it controls
-(spawn nonces), and the RESULT is stamped by the daemon, never relayed
-from the claimant.
+## 2. Scope split (v1's B2 fix — the load-bearing correction)
 
-## 2. Design
+- MEMBER-SESSION binds (path (a)): admission facts describe the
+  admitted MEMBER-DEVICE session and are per-bind. Fields: peer_static,
+  account, org, role, membership_epoch, bundle_version (the fed-local
+  bundle version the A2 was verified from), verified_class="member".
+- GATEWAY binds (path (b)): admission facts describe only the GATEWAY
+  SERVICE identity: peer_static, org, verified_class="service",
+  service_principal_ulid. NO subject, NO grant_ref, NO account — a
+  gateway bind is a shared pipe serving many subjects, and per-turn
+  subject identity arrives EXCLUSIVELY as A3 serve-layer call metadata
+  on each send, exactly as the frozen contract places it (§3 path (b)).
+  v1's "valid gateway stamp with grant_ref" vector is deleted; its
+  replacement vector asserts the OPPOSITE: a gateway fact package
+  carrying subject/grant fields is REJECTED by alfonso-core as a
+  protocol violation.
 
-### 2.1 Carrier: stamped bind metadata, fed-attested
+## 3. Wire mechanics (v1's B3 fix — the real ingress path)
 
-The admission context rides `route.bind` metadata on the route fed
-opens toward alfonso-core for an admitted member session — the same
-relay position as `Principal` and `consumer_capabilities` today — with
-a new optional field:
+Admission facts enter at `route.open`, the only ingress that exists:
 
 ```
-RouteBind {
-  ...existing fields...,
-  admission_context: Option<AdmissionContext>,   // wire-opaque to subc-core
+ClientControlRequest::RouteOpen {
+  ...existing (target, identity, consumer_identity, consumer_capabilities)...,
+  admission_facts: Option<serde_json::Value>,   // opaque to subc-core
 }
-
-AdmissionContext {
-  schema: u32,                    // 1
-  peer_static: String,            // hex X25519, fed-session identity
-  account: String,                // account_ulid from A4
-  org: String,
-  role: String,                   // identity fact per A2; policy resolves org-side
-  membership_epoch: u64,
-  grant_ref: Option<GrantRef>,    // gateway-path only
-  verified_class: String,         // "member" | "service"
-  snapshot_version: u64,          // §8 store version the stamp was read at
-}
-
-GrantRef { grant_id: String, org: String, account: String, membership_epoch: u64 }
 ```
 
-target_agent is NOT in this struct: per v7.2 §3 it is stamped by serve
-admission (alfonso-core) at turn admission, downstream of this surface.
-This surface delivers who was admitted; serve admission decides what
-they address. Keeping the two stamps at their authorities prevents this
-surface from ever carrying an agent claim fed cannot know.
+Relay gate in subc-core's handle_route_open, positioned AFTER
+route_open_principal validation and BEFORE route reservation/relay:
+- If admission_facts is present and the resolved principal is NOT
+  Principal::Reserved{module_id} where module_id == the daemon-config
+  FED MODULE ID (exact string compare; the fed entry must be
+  reserved:true in subc.jsonc — being merely spawn-attested is NOT
+  sufficient, closing the v1 should-fix: any supervised module gets
+  spawn attestation, only the configured fed module gets this field):
+  reject the open with `admission_facts_not_permitted` (protocol
+  violation class, loud). Reject-not-strip, scoped to that route.open
+  only — a rejected open wedges nothing else.
+- If permitted: relay verbatim (content-opaque) into
+  `ModuleControlRequest::RouteBind { ..., admission_facts }`.
+- Optional destination constraint (config): `admission_facts_targets:
+  ["alfonso-core"]` — when set, carrying binds may only target listed
+  module ids; others reject. Default unset (org-daemon config sets it).
 
-### 2.2 Trust rule (the load-bearing sentence)
+subc-core validates carrier permission and NOTHING else. Content
+validation splits three ways (v1 should-fix pinned): serde rejects
+structurally unparseable outer JSON at the existing parse site;
+subc-core rejects unauthorized carriers; alfonso-core rejects
+unsupported schema / malformed fields / semantic violations (including
+the §2 gateway-facts-with-subject case).
 
-subc-core relays `admission_context` ONLY on binds whose consumer
-connection is the spawn-attested `reserved:<fed-module-id>` principal.
-A bind from any other consumer carrying the field is REJECTED at relay
-(`admission_context_not_permitted`, protocol violation class) — not
-stripped-and-forwarded, rejected loudly: a non-fed module attempting to
-stamp admission is either a bug or an attack, and both must surface.
+## 4. Freshness and reconnect (v1's B4 fix)
 
-This composes three shipped mechanisms and adds no new trust surface:
-spawn attestation authenticates WHICH module speaks; the principal
-stamp survives relay; and body-opacity means subc-core validates only
-the envelope-level permission (who may carry the field), never the
-context's content — fed's verification chain (§2 of the contract) is
-the content authority, exactly as the contract assigns it.
+Route epochs fence HANDLES, not freshness. Pinned consequences:
+- Fed MUST NOT use managed cached-route auto-reopen for admitted
+  routes. An admitted route that drops is closed permanently; fed
+  re-runs its §2 admission (fresh A4/A2/bundle reads) and issues a NEW
+  route.open with fresh facts. The SDK requirement is the negative one
+  (exclude these routes from reopen caches); no new SDK callback
+  machinery is required for v1 — fed owns its own reopen loop.
+- Facts are immutable per binding (re-admission = new bind). Epoch
+  fencing then guarantees a stale binding's facts are unreferencable —
+  in its handle-fencing role only, not as a freshness mechanism.
+- Serve admission composes the context at bind time and re-reads its
+  own CURRENT §8 store at every subsequent decision (the contract's
+  atomic-decision rule). bundle_version in the facts is diagnostic
+  (staleness audit), never a substitute read — same discipline as
+  v1's snapshot_version, now on the honest field.
 
-### 2.3 Consumer contract (ALF's frozen read)
+## 5. Rollout (v1 should-fix: the old-core semantic downgrade)
 
-alfonso-core receives `admission_context` in its `on_bind` metadata.
-Guarantees this spec freezes for that read:
-1. PRESENCE ⇒ the bind traversed a spawn-attested fed module on this
-   daemon. Absence ⇒ not a fed-admitted session (local/direct binds:
-   personal-mode traffic; alfonso-core treats absence per its own
-   policy, fail-closed for org-scoped operations).
-2. IMMUTABLE per binding: re-admission after epoch events is a NEW bind
-   (fed tears down and re-binds; epoch fencing on the route makes stale
-   contexts unreferencable — channel+epoch reuse cannot resurrect one).
-3. snapshot_version is the §8 store version fed READ when composing the
-   stamp. ALF's gate MUST re-read its own current store on every
-   decision (the contract's atomic-decision rule); snapshot_version
-   exists for audit and staleness diagnostics, never as a substitute
-   read.
-4. Unknown extra fields: ignored (schema-additive evolution; schema
-   bump only for incompatible change, amendment-governed).
+An old subc-core would silently ignore-and-strip the unknown
+route.open field (serde default) and admit the route WITHOUT facts —
+a semantic downgrade invisible to the exact-version rule. Fix:
+`server.describe` capability token `admission_facts_relay_v1`. Fed
+REFUSES org-member admission when the daemon lacks the token (fail
+closed; personal-mode traffic unaffected). No protocol version bump:
+the field is decode-additive on every shipped consumer (source-verified
+in the v1 gate: no deny_unknown_fields in session.rs, TS provider
+selects known properties), and the capability token carries the
+semantic guarantee the version number cannot.
 
-### 2.4 What subc-core does NOT do
+## 6. Consumer contract (ALF's frozen read, unchanged in substance)
 
-No content validation, no §8 store, no epoch checking, no ACL — the
-thin-core invariant holds. subc-core's entire contribution is the
-permission gate (2.2) and verbatim relay. The org daemon needs zero
-subc-core state beyond what exists: spawn nonces and principal stamping
-ship today; the change is one optional field + one relay-permission
-check + tests.
+alfonso-core receives admission_facts in on_bind metadata. Frozen
+guarantees: presence ⇒ the carrier was the daemon-configured fed module
+(spawn-attested, exact-id); absence ⇒ not a fed-admitted session (org
+operations fail closed); immutable per binding; unknown extra fields
+ignored (schema-additive; schema field bumps only via amendment).
+Serve admission owns context composition and every freshness read.
 
-## 3. Conformance corpus (second deliverable)
+## 7. Conformance corpus (unchanged home, repaired completeness bar)
 
-Home: `subconscious/docs/team-mode/conformance/` — assembled from the
-two authored sources, vendored by commit hash, refreshed only via the
-amendment mechanism (fixture diff + room notice):
-- CKCRED artifact fixtures (cortexkit-account, stable vector ids).
-- FED A4 vectors (subc-federation, same id scheme; fed key domain).
-- THIS SPEC adds the admission-context vectors: valid member stamp,
-  valid gateway stamp with grant_ref, relay-rejection cases (non-fed
-  carrier, malformed schema), absence semantics, and the immutability
-  case (context change requires re-bind).
+Home `docs/team-mode/conformance/`: CKCRED artifacts + FED A4 vectors +
+subc admission-facts vectors, all stable-id, vendored by commit hash,
+amendment-governed. v1 should-fix folded — coverage is tracked by
+NORMATIVE REQUIREMENT ID, not per-table: the index enumerates each
+normative requirement (tables decompose into security-distinct
+rows/transitions/boundaries; prose rules like canonical verifier order
+and single-freshness-authority get ids too) and maps requirement id →
+vector ids covering it, with the uncovered set listed explicitly. Each
+vector pins {input, expected decision or error, responsible seat,
+path}. Cross-seat runners emit vector id + normalized outcome.
+subc-authored vectors: member facts accepted; gateway facts accepted
+(service-identity-only); gateway facts with subject/grant → rejected by
+alfonso-core; non-fed carrier → admission_facts_not_permitted;
+unparseable body → parse reject; absence semantics; immutability
+(facts change requires re-bind); old-core capability refusal (fed side).
 
-Corpus index: `conformance/index.json` mapping vector id → source repo,
-commit, path, and the contract clause it pins. A seat's conformance run
-cites vector ids in failure output. The corpus is complete for the
-implementation phase when all three sources are pinned and every
-normative table in the frozen contract has ≥1 vector referencing it —
-the index carries a coverage table naming any uncovered clause.
+## 8. Delivery plan
 
-## 4. Delivery plan
+1. Re-gate this v2.
+2. subc-core change: RouteOpen field + carrier gate + optional target
+   constraint + capability token + tests (including the negative:
+   non-fed reserved module carrying facts is rejected).
+3. Corpus scaffolding (index schema + subc vectors); CKCRED/FED pins
+   land as their specs produce them.
+4. Hand ALF §6; their interface hole closes. Fed's spec consumes §3-§5
+   (their roster-authority spine supplies the §2 verification inputs).
 
-1. Gate this spec (adversarial pass).
-2. Wire change in subc-core (field + relay gate + tests) — small,
-   protocol-additive (optional field: no version bump needed under the
-   v2 exact-version rule since body schemas are opaque; the
-   subc-protocol type addition is additive serde).
-3. Corpus scaffolding (index + subc-authored vectors); CKCRED/FED
-   pins land as their spec phases produce them.
-4. Hand ALF the frozen 2.3 read; their interface hole closes.
+## 9. Out of scope
 
-## 5. Out of scope
-
-Wernicke gateway seam (own lane, later); org-daemon deployment
-topology; any Room-2 machinery; fed's roster-authority internals (their
-spec); serve-admission internals (ALF's spec).
+Unchanged from v1: wernicke seam, org-daemon deployment topology,
+Room-2 machinery, fed roster internals, serve-admission internals.

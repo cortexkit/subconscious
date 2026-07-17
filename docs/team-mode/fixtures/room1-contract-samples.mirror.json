@@ -1,0 +1,207 @@
+{
+  "comment": "Room-1 contract v2 fixture set. Throwaway test key (kid test-key-1) — see mint script header. A4 device-record assertions are fed-cloud-key domain and live in fed's fixtures, not here.",
+  "contract": "room1-org-grant-acting-for-contract.md @ 97dc03a8 (v6)",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "kid": "test-key-1",
+        "alg": "EdDSA"
+      }
+    ]
+  },
+  "identities": {
+    "org": "01SAMPLEORG0000000000000000",
+    "alice": "01SAMPLEACCOUNTALICE0000000",
+    "org_daemon_sp": "01SAMPLESVCORGDAEMON0000000",
+    "other_daemon_sp": "01SAMPLESVCOTHERDAEMON00000",
+    "gateway_sp": "01SAMPLESVCGATEWAY000000000",
+    "other_gateway_sp": "01SAMPLESVCOTHERGATEWAY0000",
+    "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+    "membership_epoch": 7,
+    "delegation_epoch": 3,
+    "intent_id": "01SAMPLEINTENTTURN000000000",
+    "bob": "01SAMPLEACCOUNTBOB000000000"
+  },
+  "membership_assertion": {
+    "valid": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjMyNjkxNWUxLTAzODMtNDgzYi1iMWI3LTI3NWMyNjFhNjc5OCJ9.O-7dcOa-JQMUbzn-9bNrzoM8Mogi4ukTl5Nl2ys4SrL3abJqJ_6GN5PPegpXZ0cKMHz7bpJ-p1SLnqB-3uwyAw",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjk0NjY4NDgwMCwianRpIjoiNDE4MzNkOWYtYmRiZC00ODAwLTgzZjMtN2JhM2Y4ZDRiYTRkIn0.89i3bt-0R9ddg3X73TCMckgkeneAyIW7Cpsha8CMOQYkE30WTVl1hOxicSbenNs3jjtcnP7D7t8_PQLVTxFRCw",
+    "wrong_aud": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1mZWQiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMjY0MTIxNTktYmM0OC00NWQ1LTgwZDgtMjkwYzYyMDQ4OTBiIn0.tnHFQbdTM_daf2mReEOXwRixhzAl6DEV89x7jj9Gsvep4zEcfFwjFgxVxtYMLGcJ4npMyjW8v7pYtbvIq21jBw"
+  },
+  "refusal": {
+    "revoked": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInJlYXNvbiI6InJldm9rZWQiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiNmU5N2Y0MjAtNmViMy00NDU0LTgyNTctNzJkMTNmNGRhODgxIn0.4wQsaDxJjxGkgaODDrpRasY-OfeRsyAuvvrayCMrHldh0iC_ZCvxy_ceejMTTzi2dS7-rduFqRLcyV_NarooCw",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInJlYXNvbiI6ImV4cGlyZWQiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiYTA3ZjAxNmMtMDQ3NS00MmJhLTkyNDQtZTk0NWJkYmQyNjMxIn0.reU7XSv_f3XT9PuEx3aMdWta_sJv7LCwPvIWqYXe6yqdRjE4rEfIC1gL1ypJBq0on-6RAdYUP6cqbv43u5YtDQ",
+    "org_gone": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInJlYXNvbiI6Im9yZ19nb25lIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6ImE4NDk5MDkxLTNkOTUtNDdkNC1iZDk1LTkyZGU1NjUzMTdkNCJ9.Szfspwe5pMrN3FDSXAu4nto123-RBV8at05ZFXf0DD4NUMXwjZCTzO-hLxFC8AQBCAj-8QdPsu_5ZPym7rg7Bg"
+  },
+  "acting_for": {
+    "valid": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6Ijk2YWM2YjI1LWEzYTgtNGVmYS1hYmI1LTc3YWQ0OGQ5ZDc3OCJ9.sRRvOZHTj-EimcGOHzuByPUTERSx4s0XtzuzqaL8jq7EujRGg0HEc-CdPsh4A7HFlvFDgg7VwDELQpGaUy1FAw",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjk0NjY4NDgwMCwianRpIjoiN2JiY2VkMTEtYTExYi00NzI0LWE5OWQtMzA1MDgyZmEzMjM2In0.LTcwEpWcM5XIyXCcWaCInUH0IZU7QgFlwgLrLZFFQDbfNl6LSyTx-ZyheLiY-QGRNjZ0x5KfC1CMqR5g6YdNBg",
+    "cross_gateway": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNPVEhFUkdBVEVXQVkwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjFjZmM0MjczLTQ0NDQtNGE5OC1hMTdjLWEzOGJlM2E5YjcwNCJ9.nZlNB4gJAJu4w2mdprJxBZUamDRDYdxFJx3Y96reGLrvumOFEYjIvkEhFxSS-rFEsyvwznoCwOBQNI2vDXbWAQ",
+    "cross_daemon": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPVEhFUkRBRU1PTjAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjIyZDE2MmYzLTllYjMtNDI1Zi1hNWNjLThhMGE5OTk3ZmZlNSJ9.OlsEvC7gzn3OCOw2FM0sR3hxar8U6z_-RrDkB0fCQ7cDFairM7FH0YKVH2ZnuOwHRQyA_vLVTyQY6GI1sMggCA",
+    "replayed_pair": [
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVwbGF5ZWQtanRpLTAwMDEifQ.A0G0w5GP4rFmFpXbey5SE6tYJIIHOfwEk4srmZx381-Zb-PcmWGOnltdJhWa-XBmiV1ezKtmIILuYWU1gcIxDQ",
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjoxLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVwbGF5ZWQtanRpLTAwMDEifQ.MAZDhjJF2zyrQFBAzaTzYDHjSY82J33kw2_sem07xLCNShkPInkLwH6M6jfctXyiG1yP46BM5Yejp54d9f3-Dw"
+    ],
+    "remint_pair": [
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVtaW50LWp0aS1hIn0.hbhaKwPH72MQocRpPXSRzXOWFDbTANGyhpo-6E2a2IhII_u-j9UkR_6FKNnJHhB8VVeNWgIKP4J-Shg5F8RWAQ",
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVtaW50LWp0aS1iIn0.0wFTVn2vE-aaIP4OPcWZcy5klr6dntZzLt7T9p4N1cIUrGc6RBWUCRPDz__3Uz4TFcxml1T1jkcgD_tbgNkhBw"
+    ],
+    "intent_collision": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQk9CMDAwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjI5YmQ5Zjg2LTg0MGMtNGNlMS1iZTk0LTllZjk0M2JhYTY1MyJ9.rBGEMEL-WDr8CFyo4Q0LfEAeVgSe0bFLw1u--vKUrygVmoqRjW5xzv1R6vsjEqEqZ641TLJjvM9hAAhS2okrDQ"
+  },
+  "typ_confusion": {
+    "comment": "Cross-slot presentations: each verifies cryptographically under the shared JWKS; the verifier MUST die on typ (and would also die on aud). Both directions provided.",
+    "a2_presented_as_a3": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6IjAxU0FNUExFU1ZDT1JHREFFTU9OMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiIwNDhlNGY4Ny0zYWM0LTRmOTMtOWQ4NS1iMzc4YjY3Y2NjZmUifQ.Cau3viGhH_6p-cWSLFOKQuRFwda0FAlUjuR0FCvJAagqobbceWDoXdsL3wBThlAeQtOFDbnnfU_YAWBoI687Aw",
+    "a3_presented_as_a2": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiOTYzYThlZjctYTQ5ZC00OTAwLWFmZTEtNTU5NTAzNGY0MTU5In0.z4_7uSy5lnK0hEl1cVc3Y7V5W9rjQ2y1X31auMBwB4C8WqOHe6RCpaQg_mpvtesoV5NZM-Q4-IoCLtOupHWsBQ"
+  },
+  "mint_refusal": {
+    "comment": "Structured mint-refusal reasons (contract §5): the gateway renders honest UX from the reason; the anomaly-detection lane reads the same stream. Signed like any CKCRED artifact.",
+    "rate_limited": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6InJhdGVfbGltaXRlZCIsInJldHJ5X2FmdGVyX3NlY3MiOjEyLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjU2M2M0NTY4LWNlNjItNGUxYi1hMTY3LTI3NGQwYTE0YjZmYiJ9.cG9Ntty4K-RmFPbeUYLZEk6e9hZtfrQx0YXyHcgH8dcgJdLPLoI6ZVcSa8EwhuBepeEsqU2qLkBAbopPx31nAg",
+    "no_delegation": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6Im5vX2RlbGVnYXRpb24iLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6ImM2MmJiZWVlLTQ1N2QtNGY0ZS05Y2U4LWJjOTY1NTcyYjY2YiJ9.bkiBNWWFLrLZQ0TDdbdYwy_slXcuY92rKQKlEYMa1SPDL1408mTZ9r__Lrq3kLLGvtOD2m_9JAHNfpDrNGxjCA",
+    "delegation_revoked": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6ImRlbGVnYXRpb25fcmV2b2tlZCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiIwMVNBTVBMRVNWQ0dBVEVXQVkwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiZmM5ZGY0ZjAtYTFiNi00N2M1LTlmMTktOTQ0NTUzZTVkMzA5In0.ht9cq-g0zh9CMjhm4NEjflQxGL3LvDv4UyStM8mScjMcCWG4RlQ0att6ifMhAG_vwCnU_mdFmoxfoYf_xN4NCg",
+    "unknown_subject": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEJPQjAwMDAwMDAwMCIsInJlYXNvbiI6InVua25vd25fc3ViamVjdCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiIwMVNBTVBMRVNWQ0dBVEVXQVkwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMjU3NWVmOGQtODFkYy00ZDAwLWJlYWMtMmRlODAwM2I4ZTUxIn0.u_V6_XEohlpL95YDcfBOIysWRJS9vcsS1T4EV_Tb9Aflx_ugex6aHJyX7a2IntcsRhb0IfZyYffra6v4WEzoCQ",
+    "org_gone": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6Im9yZ19nb25lIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6IjAxU0FNUExFU1ZDR0FURVdBWTAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJkNWVhNDEyYy0xYTYxLTQ5ODgtOWE4My0wZThhNDUxNmNmNGIifQ.kN05K0UOgL-eizepdhfwYU0kT_VnGZLXcKZauFeicVLE7aqYKvvNOqa8BSw38qLRpFgX5mJTthbNmaUxZEEWAQ",
+    "intent_expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6ImludGVudF9leHBpcmVkIiwiaW50ZW50X2lkIjoiMDFTQU1QTEVJTlRFTlRUVVJOMDAwMDAwMDAwIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6IjAxU0FNUExFU1ZDR0FURVdBWTAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJmMDM1YjJlMS04N2NlLTQ4NmYtODYxMC1lMWI5ODU4OWQ2ZWQifQ.pdwueMgZpCmQ1YqbapVMru7ufLbK7v4-xgGoHOWmQRqXUmz705Xu1bwEGuWeuE-FJ8Y_oZlYWCT4w4Inb6dbCg",
+    "intent_collision": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEJPQjAwMDAwMDAwMCIsInJlYXNvbiI6ImludGVudF9jb2xsaXNpb24iLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6Ijc5M2U2ZjhhLWY1ODMtNDI2MC05NWViLWFkNjdhNDE5ZDFkOCJ9.dRS0FME2CN5oFLUvCSCcxC6g2t_-kr417-iLwIMuTTmDHaA8I11hmuIfR134X_L95kke14JMpepSNXCHO556Cg"
+  },
+  "epoch_push": {
+    "revoked": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJlcG9jaF9wdXNoIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiYWNjb3VudCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm5ld19lcG9jaCI6OCwicmVhc29uIjoicmV2b2tlZCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiJjb3J0ZXhraXQtb3JnOjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJjZWNkNjNiNi1kODI2LTQyNWEtYjIwZS02YjY0NTJmMDU4NjEifQ.C7iLhhqmiu_UXQmVjMAkpz41GydxnfkvJy9vASHLFiB5kIixXEnRf0n8JFj0GnT2pnQDSkHPce_PFDTya4oOCQ",
+    "compromised": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJlcG9jaF9wdXNoIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiYWNjb3VudCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm5ld19lcG9jaCI6OCwicmVhc29uIjoiY29tcHJvbWlzZWQiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiN2U2OWFiZDgtZjVkNy00ZjBlLTk4ZmMtNzBiODBjOWU1YjE2In0.EFLLObc2n8UHPmsj6GqWHTXHG0AQRkPhkeniXMd4wGQgXc7YxAW75cjwvt9BMHs0bcSw6B2wlVofepWwCWK5CQ",
+    "org_dissolved": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJ0eXAiOiJlcG9jaF9wdXNoIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiYWNjb3VudCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm5ld19lcG9jaCI6OCwicmVhc29uIjoib3JnX2Rpc3NvbHZlZCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiJjb3J0ZXhraXQtb3JnOjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJlZGQ1YzNmMy1kMmY3LTQyZjctYjI5Zi0wM2U3ZjEwYzgxOGQifQ.La5Hye9TPaOGXrIZmOa_3YiKY4wlJhZxnJ2hU7S7JVNJ-A8l9PmsW60NQCHDnkaKczrzxvWleuW5DuXIGjE6Dg"
+  },
+  "ledger_lifecycle_vectors": {
+    "comment": "Contract §3 ADMITTED → SENDING → terminal crash-recovery matrix (v6/H2) + slot lifecycle under age-out-only release (G2/H3). SENDING commits durably BEFORE the external call; recovery never re-sends outside the idempotency-key provider class.",
+    "crash_recovery": [
+      {
+        "row_state": "absent",
+        "meaning": "never admitted",
+        "recovery": "fresh dispatch permitted (after §3 revalidation)"
+      },
+      {
+        "row_state": "ADMITTED",
+        "meaning": "admitted, never sent",
+        "recovery": "INITIATE may proceed under revalidation; revocation observed here -> ABORTED"
+      },
+      {
+        "row_state": "SENDING",
+        "provider_class": "idempotency_key",
+        "recovery": "re-send permitted (provider dedups) or re-query; converges to true terminal"
+      },
+      {
+        "row_state": "SENDING",
+        "provider_class": "status_query",
+        "recovery": "re-query ONLY, never re-send; converges when query returns terminal"
+      },
+      {
+        "row_state": "SENDING",
+        "provider_class": "neither",
+        "recovery": "bounded wait -> outcome_unknown; no re-drive exists"
+      },
+      {
+        "row_state": "RECORDED",
+        "meaning": "terminal known",
+        "recovery": "serve recorded outcome to any re-mint presentation"
+      },
+      {
+        "row_state": "ABORTED",
+        "meaning": "admitted, deliberately never sent (revalidation refused)",
+        "recovery": "slot released; fresh turn permitted with new intent_id"
+      }
+    ],
+    "slot_lifecycle": [
+      {
+        "at": "mint (first-seen insert-if-absent wins)",
+        "slot": "HELD",
+        "note": "atomic; concurrent first mints of one intent_id -> one winner, loser refused intent_collision"
+      },
+      {
+        "at": "remint within horizon, same subject",
+        "slot": "HELD (same slot)",
+        "note": "fresh jti, same intent_id"
+      },
+      {
+        "at": "remint past horizon (1h)",
+        "slot": "n/a",
+        "note": "refused intent_expired; no A3 can exist past horizon"
+      },
+      {
+        "at": "horizon + A3 TTL",
+        "slot": "RELEASED (age-out)",
+        "note": "the last possible A3 expired; slot release and remint eligibility differ by exactly one TTL (H3)"
+      }
+    ]
+  },
+  "ask_authority_vectors": {
+    "comment": "Condition tables for the three-factor ask-time check (durable record + membership_epoch + delegation_epoch of the record's frozen grant_id). Not JWTs — the record is a daemon-internal composition; these pin the expected disposition per state.",
+    "cases": [
+      {
+        "name": "all_fresh",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 7,
+          "delegation_epoch": 3,
+          "grant_exists": true
+        },
+        "expect": "authorized"
+      },
+      {
+        "name": "membership_epoch_stale",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 8,
+          "delegation_epoch": 3,
+          "grant_exists": true
+        },
+        "expect": "denied_pending_asks_die"
+      },
+      {
+        "name": "delegation_epoch_stale",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 7,
+          "delegation_epoch": 4,
+          "grant_exists": true
+        },
+        "expect": "denied_pending_asks_die"
+      },
+      {
+        "name": "grant_deleted",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 7,
+          "delegation_epoch": null,
+          "grant_exists": false
+        },
+        "expect": "fail_closed_unknown_grant"
+      },
+      {
+        "name": "member_path_no_grant",
+        "record": {
+          "grant_id": null,
+          "minted_membership_epoch": 7
+        },
+        "current": {
+          "membership_epoch": 7
+        },
+        "expect": "authorized_membership_only"
+      }
+    ]
+  }
+}

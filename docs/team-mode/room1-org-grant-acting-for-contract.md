@@ -1,6 +1,13 @@
-# Room 1 Output Contract — Org Grant + Acting-For (v6)
+# Room 1 Output Contract — Org Grant + Acting-For (v7)
 
-Status: REVISED FOR ROUND-6 GATE. Round 1: unanimous NO-GO, 9 blockers
+Status: REVISED FOR ROUND-7 GATE. Round 6 (ct_...03438e9f10a8, full
+3-seat panel): H1/H3/H4 RESOLVED; NO-GO on (i) the self-edit
+contradiction between the two ledger bullets (fixed here by collapsing
+both into ONE normative state-machine table, transcribed from FED
+[#52]), (ii) the unpinned INITIATE order (pinned in the table), and
+(iii) sol N1: no target-agent binding (resolved via Zone-1
+target_agent + grant agent-list, confirms [#51][#52][#53]).
+Prior: REVISED FOR ROUND-6 GATE. Round 1: unanimous NO-GO, 9 blockers
 (→ v2 @ 91734119). Round 2: NO-GO, B1/B6 RESOLVED (→ v3 @ 05b899e8).
 Round 3: NO-GO, R3/R8 RESOLVED (→ v4 @ f9cf0004). Round 4: NO-GO,
 F2/F3/F4 RESOLVED (→ v5 @ ac2b4021). Round 5 (single-reviewer verdict;
@@ -120,7 +127,15 @@ class:"human" pairing stays distinct; fed enroll pins class:"human".
 
 **Zone 1 — VERIFIED identity facts** (composed at admission from signed
 artifacts; daemon-internal within R1's security domain): {subject, org,
-role, grant_ref | (jti, grant_id, intent_id)}.
+role, **target_agent**, grant_ref | (jti, grant_id, intent_id)}.
+target_agent is SERVE-ADMISSION-DERIVED: the org daemon resolves which
+agent the turn addresses and stamps it — infrastructure-derived, never
+gateway-claimed (same stamping discipline as the acting-for subject);
+A3 and the mint stay agent-agnostic. Gateway-path authorization adds
+one predicate at the same admission read: **target_agent ∈
+grant.agents** (the agent list fetched via the grant_id the A3 already
+carries); refusal is loud and structured like every other admission
+refusal.
 **Zone 2 — admission annotations (advisory)**: {surface, reply_surface}.
 Normative stamping boundary: ONLY serve admission stamps; caller fields
 never merge into Zone 1; full org-daemon compromise is out of scope.
@@ -143,53 +158,85 @@ gates on intent_id.** Two tables, two purposes:
 - **(org, jti)** — artifact replay kill. Durable insert-if-absent,
   committed BEFORE any dispatch effect. Retention exp+skew; sweep
   lazy-on-insert or alarm-driven.
-- **(org, intent_id) — the effect ledger**, two transaction points:
-  written as ADMITTED in the same durable transaction that admits the
-  dispatch (before any effect), converted to its terminal (RECORDED |
-  ABORTED | outcome_unknown) in the transaction that commits it. Every
-  crash lands in a NAMED state: missing row = never admitted (fresh
-  dispatch OK); ADMITTED-unsettled = dispatch may have run — a re-mint
-  presenting this intent_id receives an explicit **outcome_pending**
-  response, NEVER a silent second dispatch; terminal = the recorded
-  outcome is served. **Subject binding**: the row carries {subject,
-  grant_id} from FIRST admission (never from a later presentation); a
-  presentation whose A3 subject or grant differs from the row's is
+- **(org, intent_id) — the effect ledger.** Row identity: {subject,
+  grant_id} bound at FIRST admission (never from a later presentation);
+  a presentation whose A3 subject or grant differs from the row's is
   refused as **intent_collision** — loud, structured, never served.
-  Authority was never crossable (jti + A3 binding); the OUTCOME must
-  not cross either. Retention ≥ 24 h (org-tunable) under the header
+  Authority was never crossable (jti + A3 binding); the OUTCOME must not
+  cross either. Retention ≥ 24 h (org-tunable) under the header
   inequality; the REMINT HORIZON (§5) guarantees structurally that a
   swept row can never meet a live re-mint.
-- **Effect atomicity model (normative — the outbox protocol)**: the
-  effect ledger is the authority record. Ledger row lifecycle:
-  **ADMITTED → SENDING → terminal (RECORDED | ABORTED |
-  outcome_unknown)**, three durable transaction points:
-  (1) dispatch admission writes ADMITTED + the durable effect-intent
-  (outbox) row in one local transaction BEFORE any external work;
-  (2) the **SENDING mark is committed in its OWN transaction, fully
-  fsynced BEFORE the external call is issued** (fsync-before-effect; a
-  SENDING mark not durable before the call is the same as no mark);
-  (3) the terminal is written in the local transaction that consumes
-  the outbox row. No cross-system transaction is assumed to exist.
-  **Crash-recovery reads**: row at ADMITTED = never sent — INITIATE may
-  proceed under §3 revalidation; row at SENDING = the send MAY have
-  happened — NEVER re-send outside the idempotency-key class; resolve
-  by re-query (status class) or bounded wait to outcome_unknown
-  (neither class). Rationale, recorded so the asymmetry with fed is
-  understood: fed's ledger deliberately retired its durable pre-send
-  boundary because every fed effect targets a peer running a queryable
-  serving ledger ("did you record this?" is always answerable). The
-  NEITHER and STATUS-QUERY classes lack exactly that downstream
-  authority — the SENDING mark is the LOCAL SUBSTITUTE for the
-  peer-ledger query fed relies on. That is why the mark exists here and
-  not in fed.
+
+**THE EFFECT-LEDGER STATE MACHINE (single normative source — FED
+transcription, [#52]). Every other sentence about ledger states in this
+document is commentary on THIS table; on any conflict, the table wins.**
+
+States: `ADMITTED → SENDING → terminal{RECORDED | ABORTED |
+OUTCOME_UNKNOWN}`.
+
+Durable transaction points (three, each its own fsync-committed
+transaction):
+
+| point | transition | discipline |
+|---|---|---|
+| T1 admit | (absent) → ADMITTED | written with the durable effect-intent (outbox) row in one local transaction BEFORE any external work |
+| T2 send-intent | ADMITTED → SENDING | own transaction, fsynced BEFORE the external call; a SENDING mark not durable before the call is the same as no mark |
+| T3 settle | SENDING → terminal | written in the local transaction that consumes the outbox row |
+
+Legal transitions (anything else is corruption → fail closed):
+
+| from | to | trigger |
+|---|---|---|
+| ADMITTED | SENDING | INITIATE, gated by §3 revalidation (order below) |
+| ADMITTED | ABORTED | §3 revalidation REFUSES at INITIATE: never sent, clean abort |
+| ADMITTED | ABORTED | reconciliation exhaustion of a never-sent row |
+| SENDING | RECORDED | terminal outcome observed / provider terminal |
+| SENDING | OUTCOME_UNKNOWN | reconciliation exhausted; may-have-sent |
+
+INITIATE ORDER (pinned, the only legal sequence): (1) §3 revalidation →
+(2) T2 SENDING fsync → (3) external call → (4) T3 terminal.
+Revalidation-refusal happens BEFORE T2, so **ABORTED is reachable ONLY
+from ADMITTED** — a refused send never entered SENDING and can never
+resolve to unknown.
+
+Crash-recovery reads (one row per persisted state):
+
+| persisted state | meaning | recovery |
+|---|---|---|
+| no row | never admitted (a refused MINT also creates NOTHING — refusals are mint-surface artifacts, not ledger states) | fresh dispatch OK |
+| ADMITTED | never sent (T2 not durable) | INITIATE may proceed under §3 revalidation, OR exhaust to ABORTED — never to OUTCOME_UNKNOWN (an ADMITTED row cannot have sent) |
+| SENDING | may have sent | NEVER re-send outside the idempotency-key class; re-query (status class) or bounded wait → OUTCOME_UNKNOWN (neither class) |
+| RECORDED / ABORTED / OUTCOME_UNKNOWN | terminal | serve the recorded disposition |
+
+Exhaustion is STATE-SCOPED: ADMITTED exhausts to ABORTED; SENDING
+exhausts to OUTCOME_UNKNOWN; never cross them — that separation is the
+entire point of the SENDING mark.
+
+Re-presentation responses (a re-mint presenting a known intent_id):
+
+| row state | response |
+|---|---|
+| ADMITTED or SENDING | **outcome_pending** — terminal-for-this-turn; gateway renders "still working" and MUST NOT auto-remint |
+| RECORDED | the recorded outcome |
+| ABORTED | aborted (turn consumed; a new turn needs a fresh intent_id) |
+| OUTCOME_UNKNOWN | unknown — rendered honestly, never retried |
+
+Rationale, recorded so the asymmetry with fed is understood: fed's
+ledger deliberately retired its durable pre-send boundary because every
+fed effect targets a peer running a queryable serving ledger ("did you
+record this?" is always answerable). The NEITHER and STATUS-QUERY
+classes lack exactly that downstream authority — the SENDING mark is
+the LOCAL SUBSTITUTE for the peer-ledger query fed relies on.
+
 - **Reconciliation discipline (normative): reconciliation NEVER
   RE-SENDS WITHOUT PROVIDER-SIDE DEDUP — re-send exists ONLY inside the
   IDEMPOTENCY-KEY class.** Provider class is a STATIC capability of the
   provider binding, declared at bind time — never inferred per-call;
   ABSENT an explicit declaration a provider is the NEITHER class (the
   floor is at-most-once; upgrades are opt-in with proof — a capability
-  you cannot prove, you do not have). Three classes, three exact
-  behaviors:
+  you cannot prove, you do not have; the proof bar for declaring the
+  idempotency-key or status-query capability is defined with Room 2's
+  capability vocabulary and consumed here by reference). Three classes:
   · IDEMPOTENCY-KEY provider: the executor passes an intent_id-derived
     key; re-send is safe (the key dedups provider-side); reconciliation
     MAY re-send and re-query; converges to the true terminal.
@@ -198,28 +245,18 @@ gates on intent_id.** Two tables, two purposes:
     double-execute; converges when the query returns terminal.
   · NEITHER: single-dispatch-attempt, full stop. A crash in the send
     window is unrecoverable-by-protocol and resolves via bounded wait
-    to outcome_unknown. No re-drive exists for this class.
-  RECONCILIATION IS DRIVEN, NOT HOPED: the org daemon's serve layer
-  owns admitted-unsettled rows on a schedule and at reconnect
-  boundaries (within each class's permitted operations); exhaustion
-  (bounded attempts within a pinned deadline; floor 15 min,
-  org-tunable) writes a durable, explicit **outcome_unknown** terminal
-  under the same transaction discipline — an unsettled row that nothing
-  sweeps is a liveness bug, not a pending outcome.
-- **outcome_unknown is an OBSERVATION terminal, not the external
+    per the recovery table. No re-drive exists for this class.
+  RECONCILIATION IS DRIVEN, NOT HOPED: the org daemon's serve layer owns
+  non-terminal rows on a schedule and at reconnect boundaries (within
+  each class's permitted operations); exhaustion (bounded attempts
+  within a pinned deadline; floor 15 min, org-tunable) writes the
+  state-scoped terminal from the table above — an unswept non-terminal
+  row is a liveness bug, not a pending outcome.
+- **OUTCOME_UNKNOWN is an OBSERVATION terminal, not the external
   effect's terminal.** A later authoritative provider outcome is
   recorded as a LATE_RECORDED annotation on the unknown terminal
   (audit + delivered on the notification lane); it never transitions
-  the terminal and never re-executes. The gateway renders
-  outcome_unknown honestly and never retries it.
-- **INITIATE is an effect initiation**: the outbox executor's send step
-  (post-ADMITTED, pre-external-send) runs §3 universal revalidation. A
-  revocation observed between admission and send REFUSES the send and
-  records **ABORTED** — a first-class ledger terminal ("admitted,
-  deliberately not sent, will never be sent"); the intent stays
-  consumed; a new turn needs a fresh intent_id.
-- **Gateway obligation**: outcome_pending is terminal-for-this-turn
-  (render "still working"); the gateway MUST NOT auto-remint on it.
+  the terminal and never re-executes.
 - **Deployment invariant**: serve admission on the org daemon runs
   SINGLE-PROCESS (stated invariant, true today); the durable unique-key
   constraints are the correctness authority regardless — the single
@@ -317,8 +354,19 @@ org_dissolved as the matrix intends.
 ## 5. Delegation grants and the mint choke point
 
 - Shape: {grant_id, gateway_principal, subject_account, org, scope:
-  invoke, delegation_epoch}; admin-minted; epoch-revoked. v1 scope:
-  gateway class only; widening is a recorded ruling.
+  **{invoke, agents:[...]}**, delegation_epoch}; admin-minted;
+  epoch-revoked. v1 scope: gateway class only; widening is a recorded
+  ruling. The agent list is the interim carrier of the parent design's
+  per-member invocation ACL: **agents:[] authorizes NOTHING**
+  (fail-closed; UI may warn, the contract never defaults open). An
+  agent-list change is a GRANT MUTATION → delegation-epoch bump → the
+  existing three-factor check refuses stale presentations and kills
+  pending/held asks — ACL revocation rides machinery this contract
+  already froze, no new paths. Forward-compatibility: when Room 2's ACL
+  machinery lands, the grant agent-list becomes the per-(gateway,
+  subject) NARROWING of Room 2's org-wide role→agent ACL (same
+  narrowing-only composition as every other tier in this design), not a
+  surface to migrate away.
 - Lazy per-(gateway, subject) mint on first @mention; auto-grant only
   for zero-ceiling roles (under the interim: no auto-grants); nonzero →
   admin approval; re-evaluated at each mint (no grandfathering).
@@ -332,8 +380,9 @@ org_dissolved as the matrix intends.
   intent_id): under concurrent first mints of one intent_id with
   different subjects exactly one wins; the loser is refused
   intent_collision (DB-constraint-is-the-law, same discipline as the
-  serve-side tables). The mint refuses mints for an intent older than
-  the horizon (refusal reason `intent_expired`). A remint request for a
+  serve-side tables). The mint refuses mints for an intent whose age
+  EXCEEDS the horizon — boundary pinned: refuse when now >= first_seen
+  + horizon (refusal reason `intent_expired`). A remint request for a
   known intent_id with a DIFFERENT subject is refused at the mint as
   `intent_collision` — the choke point catches a buggy or compromised
   gateway one hop before an A3 for the wrong subject can exist

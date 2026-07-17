@@ -62,10 +62,15 @@ lifecycle).
   external effect; anything effect-initiating is EXECUTE, full stop.
 - **hard fence**: immediate termination of session and authority; no
   settlement window.
-- **admission context**: the daemon-internal surface (local API between
-  fed admission and the module layer; not a wire object) carrying
-  {peer_static, account, org, role, grant_ref, verified_class}, stamped
-  FROM the §8 snapshot store.
+- **admission context**: the daemon-internal surface (not a wire
+  object) carrying {peer_static, account, org, role, grant_ref,
+  verified_class}. Fed admission VERIFIES transport identity and
+  SUPPLIES the resulting admission facts to the module layer; SERVE
+  ADMISSION composes and stamps the admission context from those facts
+  plus its own §8 snapshot read — the only store read, at the only
+  store. (Amendment A1, room [#74]-[#78]: the pre-v7.3 wording had fed
+  stamping from a store it does not own, which contradicted §3's
+  only-serve-admission boundary and §8's consumer rule.)
 - **grant_ref**: {grant_id, org, account, membership_epoch}.
 - **zero-ceiling action**: an action whose class in the INFRASTRUCTURE
   ACTION TAXONOMY maps to ceiling zero. NORMATIVE DEPENDENCY: the
@@ -109,9 +114,10 @@ collapsed; §7 typing makes cross-slot confusion structurally detectable.
 **Member → org daemon**: (1) Noise handshake → peer static; (2) A4
 against FED CLOUD KEY → account_ulid, device_epoch fresh; (3) A2 from the
 local bundle against ACCOUNT JWKS → {org, role, membership_epoch fresh};
-(4) compose MEMBER-in-good-standing; stamp admission context from the §8
-snapshot. Per-session; re-stamped on re-admission; re-checked on epoch
-pushes and refresh boundaries.
+(4) compose MEMBER-in-good-standing and supply the verified admission
+facts to the module layer; serve admission stamps the admission context
+from those facts plus its own §8 snapshot read. Per-session; re-stamped
+on re-admission; re-checked on epoch pushes and refresh boundaries.
 
 **Org → member daemon** (ask delivery): (1) Noise handshake → org static;
 (2) 1.3 verification (service JWT class=service, org match, binding
@@ -492,8 +498,10 @@ The org daemon's serve admission OWNS the authoritative versioned
 snapshot store {bundle version, grace phase, epoch set}. ALF's ceiling
 gate reads THAT store (in-process — the gate lives in the org daemon's
 alfonso-core module, same process as serve admission), never an
-independent fetch. Fed admission stamps admission contexts FROM the same
-store; epoch pushes land in the store (version bump) BEFORE any session,
+independent fetch. Fed admission supplies verified admission facts;
+SERVE ADMISSION stamps admission contexts from those facts plus the
+same store (fed never reads the store — one store, one reader path);
+epoch pushes land in the store (version bump) BEFORE any session,
 gate, or ask decision consumes them: push → version bump → every
 subsequent decision reads the bumped version. Ask-time revalidation
 (§3) reads the same store. There is exactly ONE freshness authority in

@@ -48,6 +48,12 @@ const START_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// Runtime bootstrap configuration. Production uses the default fixed port and
 /// optional daemon-config override; tests pass port 0 to let the OS assign a free
 /// loopback port and discover it from the connection file.
+#[derive(Debug, Clone, Default)]
+struct AdmissionFactsConfig {
+    carrier_module_id: Option<String>,
+    targets: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
     pub connection_file_path: PathBuf,
@@ -55,6 +61,7 @@ pub struct BootstrapConfig {
     pub daemon_ver: String,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
+    admission_facts: AdmissionFactsConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     watchdog_config: DaemonSelfWatchdogConfig,
@@ -68,6 +75,7 @@ impl BootstrapConfig {
             daemon_ver: DAEMON_VERSION.to_owned(),
             configured_modules: Vec::new(),
             storage_config: None,
+            admission_facts: AdmissionFactsConfig::default(),
             daemon_config_path: None,
             configured_port: None,
             watchdog_config: DaemonSelfWatchdogConfig::default(),
@@ -88,6 +96,12 @@ impl BootstrapConfig {
         let storage_config = daemon_config
             .as_ref()
             .and_then(|config| config.storage.clone());
+        let admission_facts_carrier_module_id = daemon_config
+            .as_ref()
+            .and_then(|config| config.admission_facts_carrier_module_id.clone());
+        let admission_facts_targets = daemon_config
+            .as_ref()
+            .and_then(|config| config.admission_facts_targets.clone());
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
@@ -113,6 +127,7 @@ impl BootstrapConfig {
         Ok(Self::new(connection_file_path(), port)
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
+            .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_daemon_config_source(daemon_config_path, config_port))
     }
 
@@ -127,12 +142,19 @@ impl BootstrapConfig {
         let storage_config = daemon_config
             .as_ref()
             .and_then(|config| config.storage.clone());
+        let admission_facts_carrier_module_id = daemon_config
+            .as_ref()
+            .and_then(|config| config.admission_facts_carrier_module_id.clone());
+        let admission_facts_targets = daemon_config
+            .as_ref()
+            .and_then(|config| config.admission_facts_targets.clone());
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
         Ok(self
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
+            .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_daemon_config_source(daemon_config_path, configured_port))
     }
 
@@ -151,6 +173,18 @@ impl BootstrapConfig {
         storage_config: Option<daemon_config::StorageConfig>,
     ) -> Self {
         self.storage_config = storage_config;
+        self
+    }
+
+    pub fn with_admission_facts_config(
+        mut self,
+        carrier_module_id: Option<String>,
+        targets: Option<Vec<String>>,
+    ) -> Self {
+        self.admission_facts = AdmissionFactsConfig {
+            carrier_module_id,
+            targets,
+        };
         self
     }
 
@@ -213,6 +247,7 @@ pub async fn run() -> Result<(), BootstrapError> {
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
     let configured_modules = config.configured_modules.clone();
     let storage_config = config.storage_config.clone();
+    let admission_facts = config.admission_facts.clone();
     let daemon_config_path = config.daemon_config_path.clone();
     let configured_port = config.configured_port;
     let watchdog_config = config.watchdog_config.clone();
@@ -226,6 +261,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 bound,
                 configured_modules,
                 storage_config,
+                admission_facts,
                 daemon_config_path,
                 configured_port,
                 watchdog_config,
@@ -314,6 +350,7 @@ async fn serve_bound_daemon(
     bound: BoundDaemon,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
+    admission_facts: AdmissionFactsConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     watchdog_config: DaemonSelfWatchdogConfig,
@@ -341,7 +378,8 @@ async fn serve_bound_daemon(
         .with_process_liveness(process_liveness)
         .with_supervisor(supervisor_handle)
         .with_connected_clients(connected_clients.clone())
-        .with_storage_config(storage_config);
+        .with_storage_config(storage_config)
+        .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets);
     if let Some(config_path) = daemon_config_path {
         control = control.with_supervisor_rescan(supervisor.clone(), config_path, configured_port);
     }

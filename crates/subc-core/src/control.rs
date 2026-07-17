@@ -47,6 +47,7 @@ const CAP_MANIFEST_REGISTRATION: &str = "manifest_registration_v1";
 const CAP_CHANNEL_LIFECYCLE: &str = "channel_lifecycle_v1";
 const CAP_PING_PONG: &str = "ping_pong_v1";
 const CAP_SESSION_ATTACH: &str = "session_attach_v1";
+const CAP_ADMISSION_FACTS_RELAY: &str = "admission_facts_relay_v1";
 
 const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SERVER_DESCRIBE,
@@ -82,6 +83,8 @@ struct SupervisorRescanContext {
     config_path: PathBuf,
     configured_port: Option<u16>,
     storage_config: Option<crate::daemon_config::StorageConfig>,
+    admission_facts_carrier_module_id: Option<String>,
+    admission_facts_targets: Option<Vec<String>>,
 }
 
 /// Real channel-0 control handler for subc itself.
@@ -97,6 +100,8 @@ pub struct ControlHandler {
     /// Central storage policy. When set, each registering module receives its
     /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
     storage_config: Option<crate::daemon_config::StorageConfig>,
+    admission_facts_carrier_module_id: Option<String>,
+    admission_facts_targets: Option<Vec<String>>,
     rescan: Option<SupervisorRescanContext>,
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
@@ -112,6 +117,14 @@ impl fmt::Debug for ControlHandler {
             .field("subc_capabilities", &self.subc_capabilities)
             .finish()
     }
+}
+
+struct RouteOpenRequest {
+    target: RouteTarget,
+    identity: BindIdentity,
+    consumer_identity: Option<ConsumerIdentity>,
+    consumer_capabilities: Option<Vec<String>>,
+    admission_facts: Option<serde_json::Value>,
 }
 
 struct RouteBindReservationGuard {
@@ -205,10 +218,13 @@ impl ControlHandler {
                 CAP_CHANNEL_LIFECYCLE.to_string(),
                 CAP_PING_PONG.to_string(),
                 CAP_SESSION_ATTACH.to_string(),
+                CAP_ADMISSION_FACTS_RELAY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             storage_config: None,
+            admission_facts_carrier_module_id: None,
+            admission_facts_targets: None,
             rescan: None,
             connected_clients: ConnectedClients::new(),
             counters,
@@ -222,6 +238,19 @@ impl ControlHandler {
         storage_config: Option<crate::daemon_config::StorageConfig>,
     ) -> Self {
         self.storage_config = storage_config;
+        self
+    }
+
+    /// Configure the exact reserved module and target ids permitted to relay
+    /// opaque admission facts. Config-file loading validates this authority;
+    /// this builder keeps the same policy available to embedded test daemons.
+    pub fn with_admission_facts_config(
+        mut self,
+        carrier_module_id: Option<String>,
+        targets: Option<Vec<String>>,
+    ) -> Self {
+        self.admission_facts_carrier_module_id = carrier_module_id;
+        self.admission_facts_targets = targets;
         self
     }
 
@@ -262,6 +291,8 @@ impl ControlHandler {
             config_path: config_path.into(),
             configured_port,
             storage_config: self.storage_config.clone(),
+            admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
+            admission_facts_targets: self.admission_facts_targets.clone(),
         });
         self
     }
@@ -769,14 +800,18 @@ impl ControlHandler {
                 identity,
                 consumer_identity,
                 consumer_capabilities,
+                admission_facts,
             } => {
                 self.handle_route_open(
                     ctx,
                     frame,
-                    target,
-                    identity,
-                    consumer_identity,
-                    consumer_capabilities,
+                    RouteOpenRequest {
+                        target,
+                        identity,
+                        consumer_identity,
+                        consumer_capabilities,
+                        admission_facts,
+                    },
                 )
                 .await
             }
@@ -950,11 +985,15 @@ impl ControlHandler {
         &self,
         ctx: &RouteCtx,
         frame: Frame,
-        target: RouteTarget,
-        mut identity: BindIdentity,
-        consumer_identity: Option<ConsumerIdentity>,
-        consumer_capabilities: Option<Vec<String>>,
+        request: RouteOpenRequest,
     ) -> Result<Vec<Frame>, RouterError> {
+        let RouteOpenRequest {
+            target,
+            mut identity,
+            consumer_identity,
+            consumer_capabilities,
+            admission_facts,
+        } = request;
         let target_module_id = target_module_id(&target).to_string();
         debug!(
             connection_id = ctx.connection_id.get(),
@@ -1049,6 +1088,39 @@ impl ControlHandler {
             Err(error) => return Ok(vec![error]),
         };
 
+        if admission_facts.is_some() {
+            let carrier_matches = matches!(
+                &principal,
+                Principal::Reserved { module_id }
+                    if self.admission_facts_carrier_module_id.as_deref() == Some(module_id)
+            );
+            if !carrier_matches {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "admission_facts_not_permitted",
+                    "admission facts may only be carried by the configured reserved module",
+                )?]);
+            }
+
+            let target_allowed = self
+                .admission_facts_targets
+                .as_ref()
+                .is_some_and(|targets| targets.iter().any(|id| id == &target_module_id));
+            if !target_allowed {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "admission_facts_target_not_allowed",
+                    format!(
+                        "admission facts are not permitted for target module_id '{target_module_id}'"
+                    ),
+                )?]);
+            }
+
+            // Keep the value opaque to subc. The downstream admission validator owns
+            // schema and semantic checks; this daemon only enforces carrier authority
+            // and the configured destination allowlist.
+        }
+
         let project_root = match ProjectRootId::from_path(&identity.project_root) {
             Ok(project_root) => project_root,
             Err(err) => {
@@ -1112,6 +1184,7 @@ impl ControlHandler {
             identity,
             principal: Some(principal),
             consumer_capabilities,
+            admission_facts,
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(
@@ -1368,11 +1441,29 @@ impl ControlHandler {
                 )?])
             }
         };
-        let (configured_port, storage_config, modules) = loaded
-            .map(|config| (config.port, config.storage, config.modules))
-            .unwrap_or((None, None, Vec::new()));
+        let (
+            configured_port,
+            storage_config,
+            admission_facts_carrier_module_id,
+            admission_facts_targets,
+            modules,
+        ) = loaded
+            .map(|config| {
+                (
+                    config.port,
+                    config.storage,
+                    config.admission_facts_carrier_module_id,
+                    config.admission_facts_targets,
+                    config.modules,
+                )
+            })
+            .unwrap_or((None, None, None, None, Vec::new()));
 
-        if configured_port != context.configured_port || storage_config != context.storage_config {
+        if configured_port != context.configured_port
+            || storage_config != context.storage_config
+            || admission_facts_carrier_module_id != context.admission_facts_carrier_module_id
+            || admission_facts_targets != context.admission_facts_targets
+        {
             warn!(
                 config_path = %context.config_path.display(),
                 "daemon config changed outside the modules section; restart the daemon to apply those changes"
@@ -2624,6 +2715,30 @@ mod tests {
             },
             consumer_identity: None,
             consumer_capabilities,
+            admission_facts: None,
+        })
+        .unwrap();
+        Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    fn route_open_frame_with_admission_facts(
+        corr: u64,
+        module_id: &str,
+        consumer_identity: Option<subc_control::ConsumerIdentity>,
+        facts: Option<Value>,
+    ) -> Frame {
+        let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            identity: BindIdentity {
+                project_root: unique_project_root("admission-facts"),
+                harness: "unit".to_string(),
+                session: format!("session-{corr}"),
+            },
+            consumer_identity,
+            consumer_capabilities: None,
+            admission_facts: facts,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -2994,6 +3109,183 @@ mod tests {
             serde_json::from_slice::<ClientControlResponse>(&published.body).unwrap(),
             ClientControlResponse::RouteOpen { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn admission_facts_gate_checks_carrier_target_and_precedence() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("fed", "fed-nonce".to_string());
+        supervisor.set_spawn_nonce("other", "other-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor)
+                .with_admission_facts_config(
+                    Some("fed".to_string()),
+                    Some(vec!["target".to_string()]),
+                );
+
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(70));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+        let (other_ctx, _other_rx) = route_ctx(ConnectionId::new(71));
+        handler
+            .handle_control_frame(&other_ctx, hello_frame("other", PROTOCOL_VERSION, 2))
+            .await
+            .unwrap();
+
+        let facts = json!({"schema": 1, "verified_class": "member", "org": "01H"});
+        let expected_facts = facts.clone();
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(72));
+        let route_handler = handler.clone();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(
+                    &client_ctx,
+                    route_open_frame_with_admission_facts(
+                        10,
+                        "target",
+                        Some(subc_control::ConsumerIdentity {
+                            module_id: "fed".to_string(),
+                            launch_nonce: "fed-nonce".to_string(),
+                        }),
+                        Some(facts.clone()),
+                    ),
+                )
+                .await
+                .unwrap()
+        });
+        let bind_frame = target_rx.recv().await.unwrap();
+        let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
+        let ModuleControlRequest::RouteBind {
+            admission_facts, ..
+        } = bind
+        else {
+            panic!("expected route.bind")
+        };
+        assert_eq!(admission_facts, Some(expected_facts));
+        handler
+            .handle_control_frame(&target_ctx, route_bind_ack(bind_frame.header.corr))
+            .await
+            .unwrap();
+        assert!(route_task.await.unwrap().is_empty());
+        assert!(matches!(
+            serde_json::from_slice::<ClientControlResponse>(&client_rx.recv().await.unwrap().body)
+                .unwrap(),
+            ClientControlResponse::RouteOpen { .. }
+        ));
+
+        let direct = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(73)).0,
+                route_open_frame_with_admission_facts(11, "target", None, Some(json!({"x": 1}))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_error(&direct[0])["code"],
+            "admission_facts_not_permitted"
+        );
+
+        let different_reserved = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(77)).0,
+                route_open_frame_with_admission_facts(
+                    15,
+                    "target",
+                    Some(subc_control::ConsumerIdentity {
+                        module_id: "other".to_string(),
+                        launch_nonce: "other-nonce".to_string(),
+                    }),
+                    Some(json!({"x": 1})),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_error(&different_reserved[0])["code"],
+            "admission_facts_not_permitted"
+        );
+
+        let other_target = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(74)).0,
+                route_open_frame_with_admission_facts(
+                    12,
+                    "other",
+                    Some(subc_control::ConsumerIdentity {
+                        module_id: "fed".to_string(),
+                        launch_nonce: "fed-nonce".to_string(),
+                    }),
+                    Some(json!({"x": 1})),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_error(&other_target[0])["code"],
+            "admission_facts_target_not_allowed"
+        );
+
+        let nonexistent = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(75)).0,
+                route_open_frame_with_admission_facts(13, "missing", None, Some(json!({"x": 1}))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&nonexistent[0])["code"], "unknown_module");
+
+        let described = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(76)).0,
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    14,
+                    serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&described[0].body).unwrap()
+        else {
+            panic!("expected server.describe response")
+        };
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap == "admission_facts_relay_v1"));
+    }
+
+    #[tokio::test]
+    async fn admission_facts_without_configured_carrier_are_rejected() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler = ControlHandler::with_forwarding(registry, forwarding);
+        let (target_ctx, _) = route_ctx(ConnectionId::new(78));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+
+        let responses = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(79)).0,
+                route_open_frame_with_admission_facts(16, "target", None, Some(json!({"x": 1}))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_error(&responses[0])["code"],
+            "admission_facts_not_permitted"
+        );
     }
 
     #[tokio::test]

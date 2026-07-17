@@ -90,6 +90,9 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: Some(vec!["elicitation".to_string(), "roots".to_string()]),
+                admission_facts: Some(
+                    serde_json::json!({"schema": 1, "verified_class": "service"}),
+                ),
             },
         ),
         (
@@ -105,6 +108,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: None,
+                admission_facts: None,
             },
         ),
         (

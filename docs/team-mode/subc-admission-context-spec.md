@@ -14,8 +14,8 @@ admission context (the contract forbids that: §0 "not a wire object")
 but fed's ADMISSION FACTS — a new, explicitly-wire object; the
 admission context of the frozen contract is COMPOSED inside
 alfonso-core by serve admission from those facts plus its own §8 store.
-Governing text: room1-org-grant-acting-for-contract.md v7.2 @ e81fb984
-(unamended — v2 no longer needs the amendment v1 would have required).
+Governing text: room1-org-grant-acting-for-contract.md v7.3 @ f02d9b2f
+(Amendment A1, room [#74]-[#79]).
 Date: 2026-07-18
 
 ## 1. Corrected model (one paragraph)
@@ -32,7 +32,8 @@ context daemon-internally. The contract's sentence "stamped FROM the §8
 snapshot store" is satisfied at the only place the store lives; fed
 never reads ALF's store (no cross-process read API, no second cache —
 v1's B5 dissolves), and the wire object is honestly named a fact
-package, not the context (v1's B1 dissolves without amending v7.2).
+package, not the context; the stamping-ownership wording this requires
+is contract text as of Amendment A1 (v7.3).
 
 ## 2. Scope split (v1's B2 fix — the load-bearing correction)
 
@@ -73,8 +74,19 @@ fields: `schema` (integer, ==1; unknown schema → reject
 "member" | "service"; anything else → reject), `peer_static` (string,
 lowercase hex, exactly 64 chars), `org` (string ULID). Epoch/version
 numerics are JSON integers 0..2^53-1 (reject fractional, negative,
-string-typed). Size limit: the serialized object ≤ 4 KiB, nesting
-depth ≤ 3 (alfonso-side reject). Duplicate keys: last-wins per serde
+string-typed). Size limit: the COMPACT UTF-8 SERIALIZATION of the
+post-parse JSON value (no whitespace; the metric every validator can
+compute identically, independent of wire bytes — subc's relay
+parse-reserializes, so wire-byte length is not stable) ≤ 4096 bytes;
+reject at 4097. Depth: the root object is depth 1, every nested
+container (object OR array) increments; maximum 3; reject at 4. Both
+checks run over the COMPLETE post-parse value BEFORE unknown-field
+tolerance applies (an ignored unknown field still counts toward size
+and depth; duplicate-key content discarded by last-wins does NOT — it
+no longer exists in the post-parse value). Boundary vectors: 4096-byte
+accept, 4097-byte reject, depth-3 accept, depth-4 reject, forbidden
+field with null value (still forbidden — presence is by key, value
+irrelevant), duplicate-key last-wins. Duplicate keys: last-wins per serde
 default, harmless given exact-field validation.
 
 MEMBER package (verified_class=="member") additionally REQUIRES:
@@ -128,9 +140,17 @@ route_open_principal validation and BEFORE route reservation/relay:
   `ModuleControlRequest::RouteBind { ..., admission_facts }`.
 - Destination constraint: `admission_facts_targets: ["..."]`,
   MANDATORY whenever the carrier id is set — config load rejects a
-  carrier without a non-empty target allowlist (fail closed; member
-  identity facts must never be routable to an arbitrary target by a
-  buggy fed). Unset carrier ⇒ the constraint is moot.
+  carrier without a non-empty target allowlist, and rejects
+  empty-string entries (fail closed; member identity facts must never
+  be routable to an arbitrary target by a buggy fed). Unset carrier ⇒
+  the constraint is moot. RUNTIME RULE: entries are exact MODULE IDS;
+  the check compares `RouteTarget.module_id` by exact string equality
+  (target kind and service_id play no part); an out-of-allowlist
+  target on a facts-bearing open rejects with
+  `admission_facts_target_not_allowed`, positioned AFTER the existing
+  target-existence/role/liveness checks and the carrier gate, BEFORE
+  reservation/relay — i.e. the last check before relay, sharing the
+  carrier gate's position in the pinned precedence.
 - ERROR PRECEDENCE (pinned, matches the shipped flow): target
   existence, role, liveness and bind-support checks run BEFORE the
   principal gate, so an unauthorized facts-bearing open toward a
@@ -154,7 +174,13 @@ Route epochs fence HANDLES, not freshness. Pinned consequences:
   subc-client-rs, which gains ONE new one-shot API
   `open_route_with_admission_facts(target, identity, facts)` —
   unmanaged (no cache entry, no auto-reopen, no retry-resend of the
-  facts; a transport failure returns the error to fed). The managed
+  facts; a transport failure returns the error to fed). Implementation
+  pin from the round-3 source check: the API is built OUTSIDE
+  ensure_route/open_route_with_retry (one control_call, one
+  send_request); "synchronous rejection" on managed APIs means before
+  any I/O or first await; the conformance test asserts AT MOST ONE
+  route.open frame is emitted per one-shot invocation across
+  disconnect, timeout, and retryable-daemon-error paths. The managed
   APIs (`open_route`, `call`, cached reopen) REJECT non-None facts
   synchronously (`admission_facts_requires_oneshot`). Tests prove the
   reconnect and retry paths never re-send a previously admitted
@@ -212,7 +238,7 @@ unparseable body → parse reject; absence semantics; immutability
 
 ## 8. Delivery plan
 
-1. Re-gate this v2.
+1. Re-gate this spec (v4).
 2. subc-core change: RouteOpen field + carrier gate + optional target
    constraint + capability token + tests (including the negative:
    non-fed reserved module carrying facts is rejected).

@@ -1,10 +1,10 @@
-# Room 1 Output Contract — Org Grant + Acting-For (v4)
+# Room 1 Output Contract — Org Grant + Acting-For (v5)
 
-Status: REVISED FOR ROUND-4 GATE. Round 1: unanimous NO-GO, nine
-blockers, folded in v2 @ 91734119. Round 2: NO-GO, B1/B6 RESOLVED;
-residue folded in v3 @ 05b899e8. Round 3 (ct_...0b8913ab4488): NO-GO,
-R3/R8 RESOLVED; seven precision findings (F1-F7) folded here with owner
-confirms (room [#35]-[#38]).
+Status: REVISED FOR ROUND-5 GATE. Round 1: unanimous NO-GO, 9 blockers
+(→ v2 @ 91734119). Round 2: NO-GO, B1/B6 RESOLVED (→ v3 @ 05b899e8).
+Round 3: NO-GO, R3/R8 RESOLVED (→ v4 @ f9cf0004). Round 4
+(ct_...35198108d1b8): NO-GO, F2/F3/F4 RESOLVED; residue G1-G6 folded
+here with owner confirms (room [#40]-[#43]).
 Date: 2026-07-17
 Parent: team-mode-design.md v1.1 §7-§9 with the §10 R6 supersession.
 Base docs by reference: cortexkit-account/docs/org-grant-design.md @
@@ -144,15 +144,20 @@ gates on intent_id.** Two tables, two purposes:
   lazy-on-insert or alarm-driven.
 - **(org, intent_id) — the effect ledger**, two transaction points:
   written as ADMITTED in the same durable transaction that admits the
-  dispatch (before any effect), converted to its RECORDED outcome in the
-  same transaction that commits the effect's terminal. Every crash lands
-  in a NAMED state: missing row = never admitted (fresh dispatch OK);
-  ADMITTED-unsettled = dispatch may have run — a re-mint presenting this
-  intent_id receives an explicit **outcome_pending** response, NEVER a
-  silent second dispatch; RECORDED = the recorded outcome is served.
-  Retention ≥ 24 h (org-tunable) under the header inequality; the
-  REMINT HORIZON (§5) guarantees structurally that a swept row can never
-  meet a live re-mint.
+  dispatch (before any effect), converted to its terminal (RECORDED |
+  ABORTED | outcome_unknown) in the transaction that commits it. Every
+  crash lands in a NAMED state: missing row = never admitted (fresh
+  dispatch OK); ADMITTED-unsettled = dispatch may have run — a re-mint
+  presenting this intent_id receives an explicit **outcome_pending**
+  response, NEVER a silent second dispatch; terminal = the recorded
+  outcome is served. **Subject binding**: the row carries {subject,
+  grant_id} from FIRST admission (never from a later presentation); a
+  presentation whose A3 subject or grant differs from the row's is
+  refused as **intent_collision** — loud, structured, never served.
+  Authority was never crossable (jti + A3 binding); the OUTCOME must
+  not cross either. Retention ≥ 24 h (org-tunable) under the header
+  inequality; the REMINT HORIZON (§5) guarantees structurally that a
+  swept row can never meet a live re-mint.
 - **Effect atomicity model (normative — the outbox protocol)**: the
   effect ledger is the authority record and the external effect is
   bracketed by TWO LOCAL TRANSACTIONS, the only authority points:
@@ -160,19 +165,41 @@ gates on intent_id.** Two tables, two purposes:
   (outbox) row in one local transaction BEFORE any external work;
   (2) the terminal is RECORDED in the local transaction that consumes
   the outbox row. No cross-system transaction is assumed to exist.
-  Where the external provider accepts an idempotency key, the executor
-  passes an intent_id-derived key and reconciliation gets exact-once for
-  free; where it does not, the floor is at-most-once-dispatch +
-  outcome_pending — idempotency keys are OPPORTUNISTIC, never
-  load-bearing, and no implementation may build only the optimistic
-  path. RECONCILIATION IS DRIVEN, NOT HOPED: the org daemon's serve
-  layer owns admitted-unsettled rows, re-driving/re-querying them on a
-  schedule and at reconnect boundaries; reconciliation exhaustion
-  (bounded attempts/deadline) writes a durable, explicit
-  **outcome_unknown** terminal under the same transaction discipline —
-  an unsettled row that nothing sweeps is a liveness bug, not a pending
-  outcome. The gateway renders outcome_unknown honestly and never
-  retries it.
+- **Reconciliation discipline (normative): RECONCILIATION RE-QUERIES,
+  IT NEVER RE-SENDS.** That sentence is the whole safety property.
+  Provider class is a STATIC capability of the provider binding,
+  declared at bind time — never inferred per-call; ABSENT an explicit
+  declaration a provider is the NEITHER class (the floor is
+  at-most-once; upgrades are opt-in with proof — a capability you
+  cannot prove, you do not have). Three classes, three exact behaviors:
+  · IDEMPOTENCY-KEY provider: the executor passes an intent_id-derived
+    key; re-send is safe (the key dedups provider-side); reconciliation
+    MAY re-send and re-query; converges to the true terminal.
+  · STATUS-QUERY provider (queryable, no dedup key): reconciliation
+    re-queries ONLY — a re-send without a dedup key is a
+    double-execute; converges when the query returns terminal.
+  · NEITHER: single-dispatch-attempt, full stop. A crash in the send
+    window is unrecoverable-by-protocol and resolves via bounded wait
+    to outcome_unknown. No re-drive exists for this class.
+  RECONCILIATION IS DRIVEN, NOT HOPED: the org daemon's serve layer
+  owns admitted-unsettled rows on a schedule and at reconnect
+  boundaries (within each class's permitted operations); exhaustion
+  (bounded attempts within a pinned deadline; floor 15 min,
+  org-tunable) writes a durable, explicit **outcome_unknown** terminal
+  under the same transaction discipline — an unsettled row that nothing
+  sweeps is a liveness bug, not a pending outcome.
+- **outcome_unknown is an OBSERVATION terminal, not the external
+  effect's terminal.** A later authoritative provider outcome is
+  recorded as a LATE_RECORDED annotation on the unknown terminal
+  (audit + delivered on the notification lane); it never transitions
+  the terminal and never re-executes. The gateway renders
+  outcome_unknown honestly and never retries it.
+- **INITIATE is an effect initiation**: the outbox executor's send step
+  (post-ADMITTED, pre-external-send) runs §3 universal revalidation. A
+  revocation observed between admission and send REFUSES the send and
+  records **ABORTED** — a first-class ledger terminal ("admitted,
+  deliberately not sent, will never be sent"); the intent stays
+  consumed; a new turn needs a fresh intent_id.
 - **Gateway obligation**: outcome_pending is terminal-for-this-turn
   (render "still working"); the gateway MUST NOT auto-remint on it.
 - **Deployment invariant**: serve admission on the org daemon runs
@@ -215,6 +242,16 @@ org_dissolved as the matrix intends.
   closed always. Established sessions continue ZERO-CEILING actions only
   (under the §0 fail-closed interim, that is currently NOTHING);
   ceiling-gated actions park as asks.
+- **A signed refusal kills grace for its subject**: a refusal is
+  POSITIVE knowledge (grace covers the ABSENCE of knowledge —
+  unreachability — and positive non-membership annihilates it). The
+  refusal is SUBJECT-SCOPED: it lands in the §8 snapshot store as a
+  per-subject fact (never a bundle-refresh side effect); only the
+  refused subject's entry flips — the rest of the bundle stays in its
+  current grace phase. For the refused subject it is
+  epoch-bump-equivalent: established standing drops immediately,
+  pending and held asks die (R2 precedence), in-flight effects hit
+  ABORTED at their next revalidation point.
 - **Ask state machine (durable; fsync at each edge; single-winner
   transitions; duplicate answers idempotent on ask id)**:
   `parked → {answered_held | dead}` · `answered_held → {executed |
@@ -269,35 +306,43 @@ org_dissolved as the matrix intends.
   SOLE choke point for gateway-originated authority — rate-limiting and
   anomaly detection are CKCRED-side controls with fleet-wide effect.
 - **Remint horizon (1 h, enforced at the mint choke point)**: the mint
-  records first-seen per (org, intent_id) and refuses mints for an
-  intent older than the horizon (refusal reason `intent_expired`).
-  Consequence: serve admission never reasons about late remints at all —
-  no A3 for an expired intent can exist, so a swept intent row
-  structurally cannot meet a live attestation (see the header
-  inequality). First-seen tracking rides the mint-side rate-limiter
-  storage; no new infrastructure.
+  records first-seen per (org, intent_id) — including the intent's
+  SUBJECT at first mint — and refuses mints for an intent older than
+  the horizon (refusal reason `intent_expired`). A remint request for a
+  known intent_id with a DIFFERENT subject is refused at the mint as
+  `intent_collision` — the choke point catches a buggy or compromised
+  gateway one hop before an A3 for the wrong subject can exist
+  (defense-in-depth with the serve-side §3 subject binding: two loud
+  refusals at two choke points). Consequence: serve admission never
+  reasons about late remints at all — no A3 for an expired intent can
+  exist, so a swept intent row structurally cannot meet a live
+  attestation (see the header inequality). First-seen tracking rides
+  the mint-side rate-limiter storage; no new infrastructure.
 - **Mint limiter (normative shape, room-tunable numbers)**: token bucket
   per (org, gateway): sustained 5/s, burst 20. Exhaustion → 429 +
   retry_after; overload response = SHED mints, never queue them (a
   queued mint outlives its @mention context). Mint refusals carry a
   structured reason {rate_limited | no_delegation | delegation_revoked |
-  unknown_subject | org_gone | intent_expired} — one enum, consumed by
-  gateway UX and the anomaly lane.
-- **Per-subject fairness cap — slot lifecycle (normative)**: the cap is
-  a CONCURRENCY bound of 5 in-flight turns per subject, never an
-  accounting ledger. A slot is HELD from mint until the intent reaches
-  RECORDED or its A3 expires unconsumed, whichever comes first;
-  ADMITTED-unsettled HOLDS the slot (bounding runaway concurrency during
-  reconciliation); RECORDED releases the slot immediately. Retention is
-  irrelevant to the cap. Release signal: the mint learns terminal
-  outcomes lazily at the next mint request — the fairness check counts
-  intents younger than remint_horizon + A3 TTL that are not known
-  terminal, so the cap may briefly over-count (a slot lingers at most
-  ~62 min past its turn's actual finish) and degrades CONSERVATIVE,
-  never open. Exact-release via gateway-reported outcome acks was
-  considered and rejected: zero new wire surface wins, and the org
-  daemon's effect ledger owns re-execution safety regardless.
-  Crash-remint loops do not eat the budget (same intent_id = same slot).
+  unknown_subject | org_gone | intent_expired | intent_collision} — one
+  enum, consumed by gateway UX and the anomaly lane.
+- **Per-subject fairness cap — slot lifecycle (AGE-OUT-ONLY,
+  normative)**: the cap is a mint-side BURST RATE-SHAPER of 5 slots per
+  subject, a pure function of mint-local facts (first_seen + horizon +
+  TTL) — there is NO learn path and none is needed. A slot is held from
+  first mint and releases at age remint_horizon + A3 TTL; a slot NEVER
+  outlives its intent's remint eligibility (both expire together at
+  horizon + TTL, same clock, same row — no drift between the windows is
+  possible). Accepted consequence, named: a turn still executing past
+  ~62 min stops counting against MINT fairness — acceptable because the
+  cap bounds mint-side burst concurrency; ACTUAL execution concurrency
+  is bounded org-daemon-side (its own admission/execution limits + the
+  effect ledger). The cap's error direction: it may over-count briefly
+  (finished turns hold slots until age-out) and under-count only for
+  >62-min still-running turns — a rate-shaper with named error bounds,
+  not an accounting ledger. Exact-release via gateway-reported outcome
+  acks was considered and rejected: zero new wire surface wins.
+  Crash-remint loops do not eat the budget (same intent_id = same
+  slot).
 
 ## 6. Service principals
 
@@ -313,12 +358,15 @@ link_token, step_up}; aud mandatory everywhere.
 
 **Canonical verifier order (ONE order, stated once, every verification
 path references it — including §3 path (b))**:
-1. AUTHENTICITY: signature against the domain's LIVE key set · key
-   presence in the current key set (presence == validity; the JWKS
-   serves only live keys — removal IS retirement; rotation overlap is
-   the two-key window) · temporal validity (exp/nbf + skew).
-2. IDENTITY: issuer · aud · typ · alg (EdDSA allowlist) · exact claim
-   schema · reject unknown typ.
+1. AUTHENTICITY: the EdDSA alg allowlist is IMPOSED HERE — algorithm
+   selection precedes and constrains signature processing (a verifier
+   never trusts the artifact's own alg header) · signature against the
+   domain's LIVE key set · key presence in the current key set
+   (presence == validity; the JWKS serves only live keys — removal IS
+   retirement; rotation overlap is the two-key window) · temporal
+   validity (exp/nbf + skew).
+2. IDENTITY: issuer · aud · typ · alg (completeness re-check of the
+   phase-1 constraint) · exact claim schema · reject unknown typ.
 3. REPLAY-STATE MUTATION, LAST: only after every prior check passes may
    replay state mutate (jti consume for A3; assertions/bundles are
    idempotent reads and mutate nothing). An artifact failing ANY earlier

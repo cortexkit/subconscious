@@ -1,6 +1,6 @@
 # SUBC spec — Admission-Facts Relay + Conformance Corpus (Room-1 share)
 
-Status: DRAFT v3. The v2 re-gate (bg_7d786e11) verified B2/B3-mechanics/
+Status: DRAFT v5 (v4 folded rounds 1-3; v5 folds the round-4 size-metric pin). The v2 re-gate (bg_7d786e11) verified B2/B3-mechanics/
 B5/rollout-token/validation-split CLOSED and returned four blockers,
 folded here: (B1) the frozen contract itself contains a latent
 stamping-ownership inconsistency — resolution rides Amendment A1 (room
@@ -74,11 +74,17 @@ fields: `schema` (integer, ==1; unknown schema → reject
 "member" | "service"; anything else → reject), `peer_static` (string,
 lowercase hex, exactly 64 chars), `org` (string ULID). Epoch/version
 numerics are JSON integers 0..2^53-1 (reject fractional, negative,
-string-typed). Size limit: the COMPACT UTF-8 SERIALIZATION of the
-post-parse JSON value (no whitespace; the metric every validator can
-compute identically, independent of wire bytes — subc's relay
-parse-reserializes, so wire-byte length is not stable) ≤ 4096 bytes;
-reject at 4097. Depth: the root object is depth 1, every nested
+string-typed). Size limit: the byte length of
+`serde_json::to_vec(&post_parse_value)` with serde_json's DEFAULT
+feature configuration (no preserve_order: object keys re-sort per
+serde_json's BTreeMap ordering; default escaping) — pinned to that
+exact serializer because "compact JSON" alone does not determine key
+ordering or optional escaping, and the metric must be computable
+identically by every validator independent of wire bytes (subc's relay
+parse-reserializes, so wire-byte length is not stable). Limit ≤ 4096
+bytes; reject at 4097. Non-Rust validators implement the same
+algorithm: keys sorted lexicographically by UTF-8 bytes, minimal JSON
+escaping per serde_json defaults, no whitespace. Depth: the root object is depth 1, every nested
 container (object OR array) increments; maximum 3; reject at 4. Both
 checks run over the COMPLETE post-parse value BEFORE unknown-field
 tolerance applies (an ignored unknown field still counts toward size
@@ -86,7 +92,10 @@ and depth; duplicate-key content discarded by last-wins does NOT — it
 no longer exists in the post-parse value). Boundary vectors: 4096-byte
 accept, 4097-byte reject, depth-3 accept, depth-4 reject, forbidden
 field with null value (still forbidden — presence is by key, value
-irrelevant), duplicate-key last-wins. Duplicate keys: last-wins per serde
+irrelevant), duplicate-key last-wins, and two serializer-sensitivity
+vectors: one with non-ASCII/escapable characters and one with
+reordered input keys, each sized to cross the 4096 boundary only if
+the serializer diverges from the pinned algorithm. Duplicate keys: last-wins per serde
 default, harmless given exact-field validation.
 
 MEMBER package (verified_class=="member") additionally REQUIRES:

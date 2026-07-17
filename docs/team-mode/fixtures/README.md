@@ -11,5 +11,5 @@ commit named in the room notice accompanying each mirror refresh. On
 any divergence the cortexkit-account copy wins; this mirror is
 evidence, not authority.
 
-Current mirror source: cortexkit-account @ c015c03 (v7 fixture set,
-9/9 verification checks green).
+Current mirror source: cortexkit-account @ cd53a4a (v7.1 fixture set,
+6/6 verification checks green).

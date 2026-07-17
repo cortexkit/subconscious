@@ -243,6 +243,9 @@ struct ObserveView: View {
 
 struct TranscriptSheet: View {
     @ObservedObject var vm: ObserveViewModel
+    /// System rows render collapsed (one-line preview) so long instruction
+    /// blocks don't bury the conversation; tapping a row toggles the full text.
+    @State private var expandedSystemRows: Set<Int64> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -268,21 +271,25 @@ struct TranscriptSheet: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(vm.transcript) { msg in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(msg.role) · #\(msg.ordinal)")
-                                .font(.caption2).foregroundColor(.secondary)
-                            if !msg.text.isEmpty {
-                                Text(msg.text)
-                                    .font(.system(size: 12))
-                                    .textSelection(.enabled)
-                                    .padding(8)
-                                    .background(msg.role == "user"
-                                        ? Color.accentColor.opacity(0.12)
-                                        : Color.gray.opacity(0.10))
-                                    .cornerRadius(8)
-                            }
-                            ForEach(msg.blockSummaries, id: \.self) { s in
-                                Text(s).font(.system(size: 11)).foregroundColor(.secondary)
+                        if msg.role == "system" {
+                            systemRow(msg)
+                        } else {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(msg.role) · #\(msg.ordinal)")
+                                    .font(.caption2).foregroundColor(.secondary)
+                                if !msg.text.isEmpty {
+                                    Text(msg.text)
+                                        .font(.system(size: 12))
+                                        .textSelection(.enabled)
+                                        .padding(8)
+                                        .background(msg.role == "user"
+                                            ? Color.accentColor.opacity(0.12)
+                                            : Color.gray.opacity(0.10))
+                                        .cornerRadius(8)
+                                }
+                                ForEach(msg.blockSummaries, id: \.self) { s in
+                                    Text(s).font(.system(size: 11)).foregroundColor(.secondary)
+                                }
                             }
                         }
                     }
@@ -299,5 +306,42 @@ struct TranscriptSheet: View {
             }
         }
         .frame(minWidth: 640, minHeight: 480)
+    }
+
+    /// Collapsed-by-default system prompt row: header + first line preview,
+    /// tap to expand to the full selectable text.
+    @ViewBuilder
+    private func systemRow(_ msg: TranscriptMessage) -> some View {
+        let expanded = expandedSystemRows.contains(msg.ordinal)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Text("system · #\(msg.ordinal)")
+                    .font(.caption2).foregroundColor(.secondary)
+                if !expanded {
+                    Text(msg.text.split(separator: "\n").first.map(String.init) ?? "")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if expanded { expandedSystemRows.remove(msg.ordinal) } else { expandedSystemRows.insert(msg.ordinal) }
+            }
+            if expanded {
+                Text(msg.text)
+                    .font(.system(size: 12))
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .background(Color.purple.opacity(0.08))
+                    .cornerRadius(8)
+                ForEach(msg.blockSummaries, id: \.self) { s in
+                    Text(s).font(.system(size: 11)).foregroundColor(.secondary)
+                }
+            }
+        }
     }
 }

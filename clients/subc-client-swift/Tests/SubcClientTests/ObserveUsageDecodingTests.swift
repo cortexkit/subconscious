@@ -54,6 +54,23 @@ final class ObserveUsageDecodingTests: XCTestCase {
         XCTAssertEqual(tu.total?.unmeasured, 2)
     }
 
+    func testRollupModelAsObjectDecodes() throws {
+        // Live wire shape that broke the first deploy: models[].model arrives
+        // as a structured {provider, model} object on some rows, a plain
+        // string on others. Both must decode; the object collapses to label.
+        let json = #"""
+        {"consultId":"ct_y","tokenUsage":{"models":[
+            {"model":"openai/gpt-5.6-sol","calls":1,"input":10},
+            {"model":{"provider":"anthropic","model":"claude-opus-4-8"},"calls":2,"output":50}]}}
+        """#
+        let d = try JSONDecoder().decode(ConsultDetail.self, from: Data(json.utf8))
+        let rows = try XCTUnwrap(d.tokenUsage?.models)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0].model, "openai/gpt-5.6-sol")
+        XCTAssertEqual(rows[1].model, "anthropic/claude-opus-4-8")
+        XCTAssertEqual(rows[1].output, 50)
+    }
+
     func testTokenCountFormatting() {
         XCTAssertEqual(TokenFormat.count(999), "999")
         XCTAssertEqual(TokenFormat.count(1_500), "1.5k")

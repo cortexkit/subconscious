@@ -127,6 +127,32 @@ public struct TokenUsageModelRow: Codable {
     public var cacheWrite: Int64?
     public var output: Int64?
     public var reasoning: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case model, calls, unmeasured, retriesUsed
+        case input, cachedInput, cacheWrite, output, reasoning
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // The wire emits model as either a plain string or a structured
+        // {provider, model} object depending on the row's origin; accept both.
+        if let s = try? c.decodeIfPresent(String.self, forKey: .model) {
+            model = s
+        } else if let m = try? c.decodeIfPresent(AttemptModel.self, forKey: .model) {
+            model = m.label
+        } else {
+            model = nil
+        }
+        calls = try c.decodeIfPresent(Int.self, forKey: .calls)
+        unmeasured = try c.decodeIfPresent(Int.self, forKey: .unmeasured)
+        retriesUsed = try c.decodeIfPresent(Int.self, forKey: .retriesUsed)
+        input = try c.decodeIfPresent(Int64.self, forKey: .input)
+        cachedInput = try c.decodeIfPresent(Int64.self, forKey: .cachedInput)
+        cacheWrite = try c.decodeIfPresent(Int64.self, forKey: .cacheWrite)
+        output = try c.decodeIfPresent(Int64.self, forKey: .output)
+        reasoning = try c.decodeIfPresent(Int64.self, forKey: .reasoning)
+    }
 }
 
 /// The store keeps no durable phase-transition history; the wire returns this

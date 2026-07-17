@@ -128,10 +128,14 @@ class:"human" pairing stays distinct; fed enroll pins class:"human".
 **Zone 1 — VERIFIED identity facts** (composed at admission from signed
 artifacts; daemon-internal within R1's security domain): {subject, org,
 role, **target_agent**, grant_ref | (jti, grant_id, intent_id)}.
-target_agent is SERVE-ADMISSION-DERIVED: the org daemon resolves which
-agent the turn addresses and stamps it — infrastructure-derived, never
-gateway-claimed (same stamping discipline as the acting-for subject);
-A3 and the mint stay agent-agnostic. Gateway-path authorization adds
+target_agent is SERVE-ADMISSION-DERIVED, ground truth pinned: **the
+stamped value IS the agent the daemon dispatches the turn to** — stamp
+and dispatch target are one decision in one process (a dispatch to any
+agent other than the stamped one is a contract violation), so no signed
+carrier exists or is needed and no gateway claim is ever consulted; A3
+and the mint stay agent-agnostic. The gateway's addressing
+(@mention/thread) is INPUT to the daemon's resolution, never the
+stamped fact. Gateway-path authorization adds
 one predicate at the same admission read: **target_agent ∈
 grant.agents** (the agent list fetched via the grant_id the A3 already
 carries); refusal is loud and structured like every other admission
@@ -171,8 +175,13 @@ gates on intent_id.** Two tables, two purposes:
 transcription, [#52]). Every other sentence about ledger states in this
 document is commentary on THIS table; on any conflict, the table wins.**
 
-States: `ADMITTED → SENDING → terminal{RECORDED | ABORTED |
-OUTCOME_UNKNOWN}`.
+States: `ADMITTED`, `SENDING`, and three terminals: `RECORDED`,
+`ABORTED`, `OUTCOME_UNKNOWN`. Terminals are NOT reachable from every
+non-terminal: **ABORTED is reachable ONLY from ADMITTED; RECORDED and
+OUTCOME_UNKNOWN ONLY from SENDING.** The Legal-transitions table below
+is the SOLE reachability authority — over every other table in this
+section (including the durable-points table) and every shorthand;
+nothing outside it adds a transition.
 
 Durable transaction points (three, each its own fsync-committed
 transaction):
@@ -181,7 +190,7 @@ transaction):
 |---|---|---|
 | T1 admit | (absent) → ADMITTED | written with the durable effect-intent (outbox) row in one local transaction BEFORE any external work |
 | T2 send-intent | ADMITTED → SENDING | own transaction, fsynced BEFORE the external call; a SENDING mark not durable before the call is the same as no mark |
-| T3 settle | SENDING → terminal | written in the local transaction that consumes the outbox row |
+| T3 settle | SENDING → RECORDED \| OUTCOME_UNKNOWN | written in the local transaction that consumes the outbox row; ABORTED never passes through T3 — it is written from ADMITTED, before any send intent exists |
 
 Legal transitions (anything else is corruption → fail closed):
 

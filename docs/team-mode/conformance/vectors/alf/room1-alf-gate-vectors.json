@@ -1,0 +1,33 @@
+{
+  "$comment": "ALF Room-1 gate vectors — the three consumer-side vectors named at gate close ([#102][#108]), authored against the vendored CKCRED bundle (subconscious docs/team-mode/conformance/vectors/ckcred/ @ 64cb8529, bytes-origin ba5021f) and the corpus README fleet rules (@ c8a2098e). Contract: room1-org-grant-acting-for-contract.md v7.3 @ f02d9b2f. These are FIXTURE vectors: the org-domain conformance suite (Slice A+) consumes them; each test cites the vector id verbatim in its assertion message. Wire law: absent means unknown, present-empty means empty.",
+  "vectors": [
+    {
+      "id": "r1-alf-gate-bundle-predates-grant-bodies",
+      "cites": "v7.3 §5 (target_agent ∈ grant.agents on the SAME snapshot read) + §4 atomic decision rule",
+      "corpus_refs": ["vectors/ckcred/room1-contract-samples.json#serving_envelopes.bundle"],
+      "given": "A serving bundle shaped like the PRE-FIX era: delegation_grants entries carry grant_id and scopes but OMIT the agents[] array and full grant bodies (the shape before CKCRED's r2 full-bodies fix). A ceiling-gate decision needs target_agent ∈ grant.agents.",
+      "expect": "The gate REFUSES (refusal reason bundle_incomplete_for_acl) — it must NOT fall back to an independent grant fetch (a side-fetch violates the atomic-decision rule) and must NOT treat the absent agents[] as empty-list-authorizes-nothing (absent means UNKNOWN, not empty; empty-list semantics apply only to a PRESENT empty array).",
+      "negative_control": "The same decision against the vendored POST-FIX bundle (delegation_grants[0].agents present, 2 entries) with target_agent in the list PASSES the predicate — proving the refusal keys on absence, not on the predicate itself."
+    },
+    {
+      "id": "r1-alf-gate-pre-enrollment-aud-null-refusal",
+      "cites": "v7.3 §7 verifier order + CKCRED spec v5 §3.5 Step 5 (aud = orgs.org_daemon_account_id; NULL → refuse)",
+      "corpus_refs": ["vectors/ckcred/room1-contract-samples.json#acting_for"],
+      "given": "An acting-for token minted during the org's PRE-ENROLLMENT era: structurally valid, signed by the current JWKS, but its aud claim references an org whose org_daemon_account_id was NULL at mint time (the token carries no meaningful audience binding). The org daemon later enrolls with a real account id.",
+      "expect": "Serve admission REFUSES the token — a pre-enrollment token never validates against a later-enrolled aud (temporal edge: aud binding is mint-time, not verify-time). The refusal is the verifier's aud-mismatch arm, reason recorded; no admission context is composed, org-plane ops fail closed.",
+      "negative_control": "A token minted AFTER enrollment with aud = the enrolled org_daemon_account_id passes the aud check (and proceeds to the remaining §7 order) — proving the refusal keys on the aud-era mismatch, not on aud checking generally."
+    },
+    {
+      "id": "r1-alf-gate-three-tolerance-traversal-validator-half",
+      "cites": "v7.3 §3.1 (member package field sets; forbidden-field rejection; unknown-field tolerance; pinned serde_json size metric) + corpus README fleet rule (present-required-claims, never reject-unknown)",
+      "corpus_refs": ["vectors/subc-relay-vectors-v1.json#r1-relay-unknown-field-tolerance"],
+      "given": "An admission_facts member package arriving via on_bind metadata carrying: all required member fields (schema:1, verified_class:member, peer_static, org, account, role, membership_epoch, device_epoch, bundle_version), PLUS one unknown benign extra field (future additive evolution), within the size/depth budget.",
+      "expect": "The §3.1 validator ADMITS the package: required fields present, no forbidden field present, the unknown field IGNORED (not rejected). This is the terminating third hop of the fleet's three-tolerance traversal (fed emits with the extra field, subc relays uninspected, alfonso validates) — the corpus centerpiece vector's expect chain ends here.",
+      "negative_controls": [
+        "The same package WITH a class-forbidden field present → REJECT (forbidden-field arm, named reason).",
+        "The same package MISSING a required field (no membership_epoch) → REJECT (required-field arm).",
+        "The same package with the unknown field inflated past the pinned size budget → REJECT (whole-value size arm) — proving tolerance is bounded by the budget, not unconditional."
+      ]
+    }
+  ]
+}

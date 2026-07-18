@@ -192,12 +192,14 @@ async fn quota_table_renders_providers_and_used_percent() {
     let output = ck_with_subc(&server.connection_file_path, ["quota"]);
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
-    assert!(stdout.contains("anthropic"), "stdout:\n{stdout}");
-    assert!(stdout.contains("openai"), "stdout:\n{stdout}");
-    assert!(stdout.contains("work"), "account column, stdout:\n{stdout}");
+    assert!(stdout.contains("Anthropic"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Openai"), "stdout:\n{stdout}");
+    assert!(stdout.contains("work"), "account label, stdout:\n{stdout}");
+    // The breakdown layout renders utilization as "42% used" in the window
+    // detail string beside the progress bar.
     assert!(
-        stdout.contains("    42"),
-        "expected usedPercent 42.0 in table, stdout:\n{stdout}"
+        stdout.contains("42% used"),
+        "expected usedPercent 42.0 in window details, stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("Bonus credits"),
@@ -240,13 +242,15 @@ async fn quota_filters_by_provider_id() {
     let output = ck_with_subc(&server.connection_file_path, ["quota", "anthropic"]);
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
-    assert!(stdout.contains("anthropic"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Anthropic"), "stdout:\n{stdout}");
+    // Provider sections are headed by the display name; the filtered view
+    // must not contain the other provider's section at all.
     assert!(
-        !stdout.lines().any(|line| line.starts_with("openai")),
-        "stdout:\n{stdout}"
+        !stdout.contains("Openai"),
+        "filtered view leaked openai section, stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("    42"),
+        stdout.contains("42% used"),
         "expected usedPercent 42.0, stdout:\n{stdout}"
     );
 

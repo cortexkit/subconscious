@@ -793,7 +793,7 @@ fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
             .unwrap_or(0);
 
         for entry in group {
-            print_quota_account(entry, &templates, label_width, color_enabled);
+            print_quota_account(entry, &templates, label_width, color_enabled, verbose);
         }
 
         if connected.len() > 1 {
@@ -870,6 +870,7 @@ fn print_quota_account(
     templates: &[String],
     label_width: usize,
     color_enabled: bool,
+    verbose: bool,
 ) {
     // The email is the human identity when the wire carries it; the vault
     // account id (shortened) is the fallback, and the credential source is
@@ -912,6 +913,18 @@ fn print_quota_account(
         header.push_str(&dim_text(&format!(" · {extra}"), color_enabled));
     }
     println!("{header}");
+
+    // A connected account can still carry a degraded-path error (one probe
+    // arm failing while others serve). The default view keeps it quiet;
+    // --verbose surfaces it under the account header.
+    if verbose {
+        if let Some(detail) = entry_error_detail(entry) {
+            println!(
+                "      {}",
+                dim_text(&format!("⚠ {}", truncate_cell(&detail)), color_enabled)
+            );
+        }
+    }
 
     let rows = quota_window_rows_for_entry(entry);
     if rows.is_empty() {

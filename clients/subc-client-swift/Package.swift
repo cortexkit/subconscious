@@ -22,7 +22,10 @@ let package = Package(
         .testTarget(
             name: "SubcClientTests",
             dependencies: ["SubcClient", "SubcChatAskSupport"],
-            resources: [.copy("Fixtures/wire_vectors.json")]
+            resources: [
+                .copy("Fixtures/wire_vectors.json"),
+                .copy("Fixtures/board-wire-fixtures-v1.json"),
+            ]
         ),
     ]
 )

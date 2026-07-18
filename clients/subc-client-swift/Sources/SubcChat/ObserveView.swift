@@ -327,6 +327,14 @@ struct TranscriptSheet: View {
     /// System rows render collapsed (one-line preview) so long instruction
     /// blocks don't bury the conversation; tapping a row toggles the full text.
     @State private var expandedSystemRows: Set<Int64> = []
+    /// Rows whose full (untruncated) body the user asked for. Everything else
+    /// renders a bounded prefix: unbounded Text bodies with selection enabled
+    /// make lazy-scroll layout quadratic and freeze the window on fast scroll.
+    @State private var expandedFullRows: Set<Int64> = []
+
+    /// Beyond this many characters a row renders truncated with a show-all
+    /// toggle. Big enough that normal chat turns never truncate.
+    private static let rowCharBudget = 4_000
 
     var body: some View {
         VStack(spacing: 0) {
@@ -354,25 +362,25 @@ struct TranscriptSheet: View {
                     ForEach(vm.transcript) { msg in
                         if msg.role == "system" {
                             systemRow(msg)
-                        } else {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("\(msg.role) · #\(msg.ordinal)")
-                                    .font(.caption2).foregroundColor(.secondary)
-                                if !msg.text.isEmpty {
-                                    Text(msg.text)
-                                        .font(.system(size: 12))
-                                        .textSelection(.enabled)
-                                        .padding(8)
-                                        .background(msg.role == "user"
-                                            ? Color.accentColor.opacity(0.12)
-                                            : Color.gray.opacity(0.10))
-                                        .cornerRadius(8)
-                                }
-                                ForEach(msg.blockSummaries, id: \.self) { s in
-                                    Text(s).font(.system(size: 11)).foregroundColor(.secondary)
+                            } else {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(msg.role) · #\(msg.ordinal)")
+                                        .font(.caption2).foregroundColor(.secondary)
+                                    if !msg.text.isEmpty {
+                                        boundedBody(msg)
+                                            .padding(8)
+                                            .background(msg.role == "user"
+                                                ? Color.accentColor.opacity(0.12)
+                                                : Color.gray.opacity(0.10))
+                                            .cornerRadius(8)
+                                    }
+                                    // Index-keyed: summary strings can repeat (two identical
+                                    // tool results), and duplicate ForEach ids corrupt diffing.
+                                    ForEach(Array(msg.blockSummaries.enumerated()), id: \.offset) { _, s in
+                                        Text(s).font(.system(size: 11)).foregroundColor(.secondary)
+                                    }
                                 }
                             }
-                        }
                     }
                     if let err = vm.transcriptLineage?.errorText, !err.isEmpty {
                         Text(err)
@@ -387,6 +395,27 @@ struct TranscriptSheet: View {
             }
         }
         .frame(minWidth: 640, minHeight: 480)
+    }
+
+    /// Bounded row body: renders at most `rowCharBudget` characters unless the
+    /// user expands the row. Selection stays enabled; only the byte volume fed
+    /// to a single Text layout pass is capped.
+    @ViewBuilder
+    private func boundedBody(_ msg: TranscriptMessage) -> some View {
+        let full = msg.text
+        let over = full.count > Self.rowCharBudget && !expandedFullRows.contains(msg.ordinal)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(over ? String(full.prefix(Self.rowCharBudget)) : full)
+                .font(.system(size: 12))
+                .textSelection(.enabled)
+            if over {
+                Button("Show all (\(full.count) chars)") {
+                    expandedFullRows.insert(msg.ordinal)
+                }
+                .font(.caption2)
+                .buttonStyle(.link)
+            }
+        }
     }
 
     /// Collapsed-by-default system prompt row: header + first line preview,
@@ -412,17 +441,15 @@ struct TranscriptSheet: View {
             .onTapGesture {
                 if expanded { expandedSystemRows.remove(msg.ordinal) } else { expandedSystemRows.insert(msg.ordinal) }
             }
-            if expanded {
-                Text(msg.text)
-                    .font(.system(size: 12))
-                    .textSelection(.enabled)
-                    .padding(8)
-                    .background(Color.purple.opacity(0.08))
-                    .cornerRadius(8)
-                ForEach(msg.blockSummaries, id: \.self) { s in
-                    Text(s).font(.system(size: 11)).foregroundColor(.secondary)
-                }
-            }
+                    if expanded {
+                        boundedBody(msg)
+                            .padding(8)
+                            .background(Color.purple.opacity(0.08))
+                            .cornerRadius(8)
+                        ForEach(Array(msg.blockSummaries.enumerated()), id: \.offset) { _, s in
+                            Text(s).font(.system(size: 11)).foregroundColor(.secondary)
+                        }
+                    }
         }
     }
 }

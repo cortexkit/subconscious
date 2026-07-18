@@ -189,10 +189,20 @@ final class ObserveViewModel: ObservableObject {
                 let normalized = JSONKeyNormalizer.camelize(result) as? [String: Any] ?? result
                 let (rows, next, lineage) = TranscriptDecoder.decode(normalized)
                 DispatchQueue.main.async {
-                    self.transcript.append(contentsOf: rows)
+                    // Dedupe by ordinal: page boundaries can re-serve the edge row,
+                    // and duplicate Identifiable ids send SwiftUI's ForEach diffing
+                    // into pathological territory (the fast-scroll hang class).
+                    let seen = Set(self.transcript.map(\.ordinal))
+                    self.transcript.append(contentsOf: rows.filter { !seen.contains($0.ordinal) })
                     self.transcriptLineage = lineage
                     self.transcriptStatus = next != nil ? "more available…" : "complete"
-                    if let next { self.loadTranscriptPage(from: next) }
+                    // Progress guard: only follow the cursor if it actually advances,
+                    // otherwise a non-advancing nextFromOrdinal loops forever.
+                    if let next, next > (ordinal ?? -1) {
+                        self.loadTranscriptPage(from: next)
+                    } else if next != nil {
+                        self.transcriptStatus = "complete (cursor stalled)"
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {

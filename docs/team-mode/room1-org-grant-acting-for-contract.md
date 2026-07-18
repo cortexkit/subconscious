@@ -1,6 +1,74 @@
 # Room 1 Output Contract — Org Grant + Acting-For (v7)
 
-Status: REVISED FOR ROUND-7 GATE. Round 6 (ct_...03438e9f10a8, full
+Status: **FROZEN at v7.3 (@ f02d9b2f) — SPEC PHASE CLOSED 2026-07-18.**
+All four implementing seats gate-passed; conformance corpus live; the
+partition moved to implementation. See the CLOSURE ADDENDUM directly
+below before the round history.
+
+---
+
+## Closure Addendum (2026-07-18)
+
+**Contract frozen: v7.3 @ f02d9b2f** (v7.2 + Amendment A1 — fed
+VERIFIES AND SUPPLIES admission facts, serve admission COMPOSES AND
+STAMPS; the "one-process" stamping wording was unimplementable across
+the fed↔alfonso process split and was corrected by A1, room [#74]-[#79]).
+
+**Gate results — all four seats PASSED:**
+- **SUBC** (admission-facts relay + conformance corpus): spec v5,
+  SHIPPED on subconscious master `d8ce4d83`. Gate trajectory 4→4→2→1→GO.
+- **FED** (admission transport + roster authority): spec r4, FROZEN on
+  subc-federation `daf5207`. Trajectory unanimous-REVISE → 2-1 → 2-1
+  (first GO) → 3/3 GO. Steps 1-2 shipped (`5146d1e` class:human pin,
+  `f9679eb` roster-authority spine).
+- **ALF** (serve admission / gate / ask machine / outbox executor):
+  spec v4.2. Trajectory 8 structural → 5 boundary → 1 contradiction →
+  2 sentence → 0.
+- **CKCRED** (mint / grants / schemas / org layer): spec v5, on
+  cortexkit-account `ac011eb`. Trajectory 14→9→4→1→0. Slice-1
+  foundation landed `b8e0fb8`.
+
+**Conformance corpus** (docs/team-mode/conformance/, the cross-seat
+authority — one bundle artifact, four consumers, zero side-fetches):
+- README + three fleet rules @ `c8a2098e`
+- SUBC relay vectors (r1-relay-v1, 14 vectors) @ `3e51f540`
+- CKCRED gated fixture set vendored @ `64cb8529` (from account
+  `ac011eb`; bytes origin `ba5021f` — r4/r5 were server-internal
+  columns, no wire-artifact delta)
+- FED named placeholder slots (A4 + §5 emit) @ `87feabe1`
+- Pending: ALF's three gate vectors, FED's A4/§5 landings (re-runs are
+  corpus refreshes, not phase reopenings)
+
+**Three fleet rules the campaign proved** (corpus README):
+1. JWT artifact verification is PRESENT-REQUIRED-CLAIMS, never
+   reject-unknown-claims; discriminator is typ+aud+signature.
+2. Package validation IGNORES unknown non-forbidden fields (additive
+   evolution); forbidden fields reject by name/presence. A
+   deny-unknown-fields validator is a contract violation reading as
+   rigor.
+3. Header typ="JWT" always; the PAYLOAD typ claim discriminates.
+
+**Method ledger (for the retrospective):** drift has two directions and
+the gate catches both only by re-reading the vendored text, never by
+memory. INTENT_RETENTION — the seat that co-authored the ≥24h line
+shipped a ~1h sweep (fidelity-by-memory ships WEAKER than frozen).
+DENY-UNKNOWN-FIELDS / the fresh-PARK cell — rigor-by-instinct nearly
+shipped STRICTER than frozen. Both struck spec AUTHORS within a revision
+cycle. CKCRED's closing round is the dissent-adjudication standard: a
+quota-degraded 2-seat panel split GO/NO-GO on the rotation-confirm
+phantom-consume race; CKCRED refused the GO, walked the counterexample
+against its own SQL, and killed it with the same causal-marker token
+mechanism its push path already used (one mechanism, two uses).
+
+**Room 2** convening criteria (two-plus gated specs) met with margin at
+four; convening proposal with Ufuk. Charter: reversibility ceilings +
+infrastructure-stamped action taxonomy + org-wide role→agent ACL (which
+the Room-1 grant agent-list narrows against), carrying B2 multi-party
+quorum semantics and the Legion Room-2-adjacent backlog.
+
+---
+
+Prior status: REVISED FOR ROUND-7 GATE. Round 6 (ct_...03438e9f10a8, full
 3-seat panel): H1/H3/H4 RESOLVED; NO-GO on (i) the self-edit
 contradiction between the two ledger bullets (fixed here by collapsing
 both into ONE normative state-machine table, transcribed from FED

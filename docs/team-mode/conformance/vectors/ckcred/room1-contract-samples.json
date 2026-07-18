@@ -1,0 +1,394 @@
+{
+  "comment": "Room-1 contract fixture set (tracks the contract version pinned below). Throwaway test key (kid test-key-1) — see mint script header. A4 device-record assertions are fed-cloud-key domain and live in fed's fixtures, not here.",
+  "contract": "room1-org-grant-acting-for-contract.md @ f02d9b2f (v7.3)",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "kid": "test-key-1",
+        "alg": "EdDSA"
+      }
+    ]
+  },
+  "vector_ids": {
+    "r1-a2-valid-01": "membership_assertion.valid",
+    "r1-a2-expired-01": "membership_assertion.expired",
+    "r1-a2-wrongaud-01": "membership_assertion.wrong_aud",
+    "r1-refusal-revoked-01": "refusal.revoked",
+    "r1-refusal-expired-01": "refusal.expired",
+    "r1-refusal-orggone-01": "refusal.org_gone",
+    "r1-a3-valid-01": "acting_for.valid",
+    "r1-a3-expired-01": "acting_for.expired",
+    "r1-a3-crossgateway-01": "acting_for.cross_gateway",
+    "r1-a3-crossdaemon-01": "acting_for.cross_daemon",
+    "r1-a3-replayed-01": "acting_for.replayed_pair",
+    "r1-a3-remint-01": "acting_for.remint_pair",
+    "r1-a3-collision-01": "acting_for.intent_collision",
+    "r1-typ-a2asa3-01": "typ_confusion.a2_presented_as_a3",
+    "r1-typ-a3asa2-01": "typ_confusion.a3_presented_as_a2",
+    "r1-grant-valid-01": "delegation_grant.valid",
+    "r1-grant-emptylist-01": "delegation_grant.empty_list",
+    "r1-mintref-ratelimited-01": "mint_refusal.rate_limited",
+    "r1-mintref-nodelegation-01": "mint_refusal.no_delegation",
+    "r1-mintref-delegationrevoked-01": "mint_refusal.delegation_revoked",
+    "r1-mintref-unknownsubject-01": "mint_refusal.unknown_subject",
+    "r1-mintref-orggone-01": "mint_refusal.org_gone",
+    "r1-mintref-intentexpired-01": "mint_refusal.intent_expired",
+    "r1-mintref-intentcollision-01": "mint_refusal.intent_collision",
+    "r1-push-revoked-01": "epoch_push.revoked",
+    "r1-push-compromised-01": "epoch_push.compromised",
+    "r1-push-orgdissolved-01": "epoch_push.org_dissolved",
+    "r1-env-bundle-01": "serving_envelopes.bundle",
+    "r1-env-bundleunchanged-01": "serving_envelopes.bundle_unchanged",
+    "r1-env-servicekeys-steady-01": "serving_envelopes.service_keys.steady",
+    "r1-env-servicekeys-rotation-01": "serving_envelopes.service_keys.rotation_overlap",
+    "r1-env-servicekeys-orggone-01": "serving_envelopes.service_keys.org_gone",
+    "r1-env-pushwebhook-01": "serving_envelopes.epoch_push_webhook"
+  },
+  "identities": {
+    "org": "01SAMPLEORG0000000000000000",
+    "alice": "01SAMPLEACCOUNTALICE0000000",
+    "org_daemon_sp": "01SAMPLESVCORGDAEMON0000000",
+    "other_daemon_sp": "01SAMPLESVCOTHERDAEMON00000",
+    "gateway_sp": "01SAMPLESVCGATEWAY000000000",
+    "other_gateway_sp": "01SAMPLESVCOTHERGATEWAY0000",
+    "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+    "membership_epoch": 7,
+    "delegation_epoch": 3,
+    "intent_id": "01SAMPLEINTENTTURN000000000",
+    "bob": "01SAMPLEACCOUNTBOB000000000"
+  },
+  "membership_assertion": {
+    "valid": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6ImFiMjkwNjI0LTY1YWUtNGEwYy1iM2RkLTdjNGQ1MDdkMTBhYiJ9.CR3GIVu2_c0Ph-MWzXHGnii4lbYRqA4mmjV1M3oBsn3ay-WAnnv7nVCqnoqzC6zuKpweub1rinnd3jOYq5krBA",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjk0NjY4NDgwMCwianRpIjoiZmU4Yzc3NTgtMzczMS00NzNmLWE3NzEtZDE4NDM5ODVkZTQ2In0.aHwLfcvtEYfz6XYr_ylQhoT8WzMyzmKA_s32Wg8ZM-Oovt8pgEdB7crpppOcR2C9fH-hXi5RS75ab2nvpxZNAA",
+    "wrong_aud": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1mZWQiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMzZjNzJjNzEtOGZiYS00MjZlLWFlMWMtNzlkMjE3MWUxODdhIn0.eR3Fr7Wy1AgRPgzkH_rpUv6HxdUxrCihvNdmd2MMUnVYfbZl2sm3QYWORgkYSnNnTGtNvGPB6h16Ki9kTCZ5AA"
+  },
+  "refusal": {
+    "revoked": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInJlYXNvbiI6InJldm9rZWQiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiZWZiNDI2OTktOTFjYS00NzY1LTgwNzMtODBhNDkzZTI0MzRlIn0.2jcBblHYESTE1dZZrSAyvlVbdgMazYose4AuhGhNDuEd1dLG6dYjOj3ptADT80asvY-vP-17y7j1CI8hsCokCA",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInJlYXNvbiI6ImV4cGlyZWQiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMTg5YWVkY2EtN2ZlMy00ZmYzLTkyNjYtMWUzYWIxZTgxNzY3In0.sv1cc0jjeEL0TaD3ISf1cSY3NmLo-UpVKMqmKwXqEzZQqFC5HyhHhTfgnl4ZHzDLro2lvNnxYwPaDwV1MYwVAQ",
+    "org_gone": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInJlYXNvbiI6Im9yZ19nb25lIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6Ijk4Y2NlNDlmLThkNGUtNDA1Mi1hYjU3LTdjZDY4ZGE2OWNiZiJ9.iiegBl5XYsaVOKYkUIi8R6kydUVogu2lL6-r1gZi7aa1Fhf9dOmOX8dBs5kaZjkgf7E0Iceu0NT3zO7EVXTtBw"
+  },
+  "acting_for": {
+    "valid": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6ImY0ZWY0YTI2LTE5MTAtNDZlNS04Y2ZmLWExZWM2YWM0NzZlOCJ9.6rrIk_2tdXefxLPPJc4B5CNKX_cWT6v99MqWgb4Kd1hgdjW-eXvx9JDoGkxwmGuEmchj5fr72-YW8cmkOHOeAw",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjk0NjY4NDgwMCwianRpIjoiNDE1OTA0NjctMGViZS00MWRiLTllMDAtYzVjNWRiNGIxZTEzIn0.jXv4ONh4G6yBTgABBhWN-pJkEF_QhAfT53ib4Fr2Hy71Ii4i5791F1WtEBcRli5KDTUW1qIImUXDuYAr0ICHAQ",
+    "cross_gateway": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNPVEhFUkdBVEVXQVkwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6ImQ3M2Y2YzJkLWU1MDMtNGE2MS04NTIwLWU3Yjk0Nzk4MDUyNiJ9.0vVh7O0SjK4ZBAaiY9at86Olf8A_HsptNnV1wNRVzQhSW5rByCmHMUc3fKbk3FvwWMwpiO__TbdiuhqMInBwCw",
+    "cross_daemon": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPVEhFUkRBRU1PTjAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjE3NDAwYmE1LTI2NDQtNDkxYi05NTk5LWZhM2JmMWZmNDgxZCJ9.7WJMZcujTLT947ErmWG8DfHVlDu47FIUy3XVzBYSVwZc1pxbCtpCjIKtE-vTSHDwuPaFCO9CJVXnvPoUF87lDA",
+    "replayed_pair": [
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVwbGF5ZWQtanRpLTAwMDEifQ.p3Ufrpnl8iV5pAIFuNdBtVjHFbo-Mt8G72H_mXP9eS5n4ROMu46LEhN-ApHG2YBtegWmu__GUQT4HfUHGsaUCQ",
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjoxLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVwbGF5ZWQtanRpLTAwMDEifQ.N0ps-slBzrlmyOdbYq6125OlYflTLGp5WjHLrcCVnY27Bmfz8bF19S0CF6VBTBkgSboQW030mdkB5Yj29NhUCQ"
+    ],
+    "remint_pair": [
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVtaW50LWp0aS1hIn0.Av21W28q825g8huCvifBhFihvbHMOrd7e45TgwA4x4FMteBlVtTG0hFzIDdKftgxgPItEQDD4_KnNQ5QxzjWDA",
+      "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6InJvb20xLWZpeHR1cmUtcmVtaW50LWp0aS1iIn0.HPnkIxq0tbCcsEq6utfwcD1Rl6-Mu4fviL8ZU5bNvzNWUO3w7vL6FYw3THAZZ6RLWFh9jvzBsgvxZGwqRIDmCg"
+    ],
+    "intent_collision": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQk9CMDAwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNPUkdEQUVNT04wMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjdjMGIxOWEyLWQ4MjgtNGI2YS1hYjQ2LTMwNWU5MzFlNTc4MSJ9.YC_z6SAjBZFmHuGN3fg_2VrpG0GvmS2jYNwkNcGTfP2_rfq-ByOi6TVxQLte4HPBEmMI9Cs_LSNbiYssr9YUCg"
+  },
+  "typ_confusion": {
+    "comment": "Cross-slot presentations: each verifies cryptographically under the shared JWKS; the verifier MUST die on typ (and would also die on aud). Both directions provided.",
+    "a2_presented_as_a3": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6IjAxU0FNUExFU1ZDT1JHREFFTU9OMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiI3MWQ4NThiMS0wMWFiLTRlM2QtYmMyOS1iZmE4NjRhZDQ2MWEifQ.OVSiUiWhVe7w-FRkP9kflOzKactCxKlFETbn8wxQB1ux7Fprv6L9-z-kCOWjeaOsJLGKXUc6pA4e81achjzcAQ",
+    "a3_presented_as_a2": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJhY3RpbmdfZm9yIiwic3ViIjoiMDFTQU1QTEVBQ0NPVU5UQUxJQ0UwMDAwMDAwIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3VyZmFjZSI6InNsYWNrIiwicGxhdGZvcm1fYmluZGluZyI6IkNnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ29LQ2dvS0Nnb0tDZ28iLCJnYXRld2F5IjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiZ3JhbnRfaWQiOiIwMVNBTVBMRURFTEVHQVRJT05HUkFOVDAwMDAiLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiYmQ5MzM1YWItNTlkYy00ZGI4LWI3YzYtZmU4MTdkMzQyMDMxIn0.2NMoSI7j0yJpZazqbilF9kxeYlosfKINsbXcbdh5gRoQkQFV8VYUgEFb4iqkH_IyMB6jV2kcsmmKS2ycTXrqAA"
+  },
+  "delegation_grant": {
+    "comment": "Contract §5 grant shape with the v7 agent list. Not a JWT on the wire today (grants are D1 rows served via bundles); these samples pin the SCHEMA. agents:[] authorizes NOTHING (fail-closed) — the empty_list sample is the negative.",
+    "valid": {
+      "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+      "gateway_principal": "01SAMPLESVCGATEWAY000000000",
+      "subject_account": "01SAMPLEACCOUNTALICE0000000",
+      "org": "01SAMPLEORG0000000000000000",
+      "scope": {
+        "invoke": true,
+        "agents": [
+          "01SAMPLESVCTRIAGEAGENT00000",
+          "01SAMPLESVCOPSAGENT0000000"
+        ]
+      },
+      "delegation_epoch": 3
+    },
+    "empty_list": {
+      "grant_id": "01SAMPLEDELEGATIONGRANT0001",
+      "gateway_principal": "01SAMPLESVCGATEWAY000000000",
+      "subject_account": "01SAMPLEACCOUNTALICE0000000",
+      "org": "01SAMPLEORG0000000000000000",
+      "scope": {
+        "invoke": true,
+        "agents": []
+      },
+      "delegation_epoch": 1,
+      "expect": "every gateway turn refused: agents:[] authorizes nothing"
+    }
+  },
+  "mint_refusal": {
+    "comment": "Structured mint-refusal reasons (contract §5): the gateway renders honest UX from the reason; the anomaly-detection lane reads the same stream. Signed like any CKCRED artifact.",
+    "rate_limited": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6InJhdGVfbGltaXRlZCIsInJldHJ5X2FmdGVyX3NlY3MiOjEyLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6ImM2YzM2NmNlLTJiODAtNDZmNy1iMTgxLWUyODFmYjlkMThhMCJ9.azplL7ZJB2RounqqIG9OzvxPi56ZiGNReaiFjkfL-9w1EcrLpmeWhc1ZDYso3modXGV2UHT7G_FlIwVx0_NBBg",
+    "no_delegation": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6Im5vX2RlbGVnYXRpb24iLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjY2NGVlZGQ3LTkyMWMtNGE4OS05NGFkLWRjYjQyY2Q2ZjAwNCJ9.pM7phj89YLF0v7Xo5cw4ZXG2vVeBJKwZXX4d0qca7ZTVRGDjj48_hEwD9gcfpdEEMYhJv9Zy2f0Vpkm96kVGDQ",
+    "delegation_revoked": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6ImRlbGVnYXRpb25fcmV2b2tlZCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiIwMVNBTVBMRVNWQ0dBVEVXQVkwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMWVlMTZmYTQtYzA2MC00ZjcxLThkZjctOTk1ZjJiMjc4OTE3In0.CIhqLBqj-SxHb4EJ0Upks4zo6LLAM1S04y_NWak3dqDGiVwe2b1-iFFSXvrJW7m4xeFyAi4WDIFm1CIRGe_MDQ",
+    "unknown_subject": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEJPQjAwMDAwMDAwMCIsInJlYXNvbiI6InVua25vd25fc3ViamVjdCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiIwMVNBTVBMRVNWQ0dBVEVXQVkwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiNDUyNjJiODctYmNlYy00MDcxLWFkYzItNGI5MzkwNTc3ZTdiIn0.eUH-AlQgIVGfj7aH28niLDaEYV35xDSSTwtD2DTDjK5kSoo2r5uC8evYW3WDalIHHjAZWSjzj83MG3Sa9kZdBw",
+    "org_gone": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6Im9yZ19nb25lIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6IjAxU0FNUExFU1ZDR0FURVdBWTAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJiNmNmMjU0NC05YWExLTRmMTAtOTIyZS00MGExNzFkNDFiMmIifQ.GYCSrXb3ldf8fnA7IqRbov8wtqLEpFkec9xFx21IKrdVY-y_oOJZCr2SQmGfC9a0B_iwTKlsa4PCQ2aw32rBBA",
+    "intent_expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsInJlYXNvbiI6ImludGVudF9leHBpcmVkIiwiaW50ZW50X2lkIjoiMDFTQU1QTEVJTlRFTlRUVVJOMDAwMDAwMDAwIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6IjAxU0FNUExFU1ZDR0FURVdBWTAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiI3ZWI4MTU0ZS04ODVkLTRiZjAtYjBjMS1jZTI1ZThmMTJjNzgifQ.BmQSs24o9lgGK-X8Cjz2H6tpGH9Ixo41M0t06CFRQIaHqQdtaNKuWhsjwkU6U6i0O4JZpx4fYjAShNWk8uXpCg",
+    "intent_collision": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwic3ViamVjdCI6IjAxU0FNUExFQUNDT1VOVEJPQjAwMDAwMDAwMCIsInJlYXNvbiI6ImludGVudF9jb2xsaXNpb24iLCJpbnRlbnRfaWQiOiIwMVNBTVBMRUlOVEVOVFRVUk4wMDAwMDAwMDAiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiMDFTQU1QTEVTVkNHQVRFV0FZMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjEyMjA4YzVmLTBhYWQtNGM5OS05MTc4LTZhY2M2ZDNmNzgyMCJ9.YK7POvyHSo8Fc5msGkT-gESgY5dniO94UVOjGhaRWdNwDjxOQ6HuQ9S6hIrBxmhuhMcdd8b22b-9agtCqEOxDg"
+  },
+  "epoch_push": {
+    "revoked": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJlcG9jaF9wdXNoIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiYWNjb3VudCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm5ld19lcG9jaCI6OCwicmVhc29uIjoicmV2b2tlZCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiJjb3J0ZXhraXQtb3JnOjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiIwY2YzZDljMC02ZjBmLTRkNmQtYmFlYy02YzMyOTA1NTQxZGIifQ.LXP3lDDWvAqegp-haOK3t1p4GvHqjwXpGQs366hI4Nm1Y8NxmduA247MTcLiKRClNHlzOXbrqrf-uZCPG7laDA",
+    "compromised": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJlcG9jaF9wdXNoIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiYWNjb3VudCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm5ld19lcG9jaCI6OCwicmVhc29uIjoiY29tcHJvbWlzZWQiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiYzFlNmNkZTgtODEwYy00OTk3LWEwMzEtMzI0MmNkYWNjOGE2In0.nwYML4SGe1gwdFaNbyEQf4TCjz5rqDEj80j-PscBZmvD52uZcPJYBgqALJtqpIzMd4k5tOaco9P5c-GtOA1CCg",
+    "org_dissolved": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJlcG9jaF9wdXNoIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiYWNjb3VudCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm5ld19lcG9jaCI6OCwicmVhc29uIjoib3JnX2Rpc3NvbHZlZCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiJjb3J0ZXhraXQtb3JnOjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiIyYTI2NTMzOC0wY2M4LTQ3ZmEtODNjZS1jMzg4OTkxM2I3OGYifQ.Xczsyy_6mMqTQBC4Y3e1Px31IcsxqbVOsa6sAxtmVGcnXd6HekTGp_KXUdqvs8piSSTYLvfeg7WuTvuTOuLeBw"
+  },
+  "serving_envelopes": {
+    "comment": "Structural serving-surface samples (spec r2 §3.2/3.3/3.4). NOT JWTs themselves — they WRAP signed artifacts (the JWS strings are opaque couriers). These pin the envelope SHAPE consumers read; the wrapped tokens reuse the families above. Added in the v7.3 refresh (r1 gate FIXTURE-FIDELITY: the bundle/service-keys/epoch-push envelopes were previously deferred).",
+    "bundle": {
+      "comment": "GET /v1/org/{org}/bundle response (§3.2). ONE atomic-snapshot read: version + service_keys_version + fresh A2s (one per live member) + FULL delegation grant bodies (agents[] for path-(b) target_agent gate) + the cheap delegation_epochs freshness map. A2s ride exactly `version`.",
+      "version": 42,
+      "service_keys_version": 3,
+      "assertions": [
+        "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjIzNTFhYjY5LWU1N2QtNDRhZS05NTY2LWI0MzE3NTdlNTRjMCJ9.QiBxAfe-XQFMU3Ptodex0L2jeStx0_C7CW4Um0z58LT5918_e6yGi1h5r0e302cNsdMUPGm-bafj30VfR0iBDg"
+      ],
+      "delegation_grants": [
+        {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "subject_account": "01SAMPLEACCOUNTALICE0000000",
+          "gateway_principal": "01SAMPLESVCGATEWAY000000000",
+          "agents": [
+            "01SAMPLESVCTRIAGEAGENT00000",
+            "01SAMPLESVCOPSAGENT0000000"
+          ],
+          "scope_invoke": true,
+          "delegation_epoch": 3
+        }
+      ],
+      "delegation_epochs": {
+        "01SAMPLEDELEGATIONGRANT0000": 3
+      }
+    },
+    "bundle_unchanged": {
+      "comment": "since == current version → no content, just the version echo.",
+      "version": 42,
+      "unchanged": true
+    },
+    "service_keys": {
+      "comment": "GET /v1/org/{org}/service-keys (§3.3). The served doc is the SINGLE source of which keys verify. steady = one key; the rotation-overlap sample lists BOTH (prepared state, either verifies).",
+      "steady": {
+        "service_keys_version": 3,
+        "keys": [
+          {
+            "principal": "01SAMPLESVCORGDAEMON0000000",
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+            "key_epoch": 0
+          }
+        ]
+      },
+      "rotation_overlap": {
+        "service_keys_version": 4,
+        "keys": [
+          {
+            "principal": "01SAMPLESVCORGDAEMON0000000",
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+            "key_epoch": 0
+          },
+          {
+            "principal": "01SAMPLESVCORGDAEMON0000000",
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "3uJj-tc0jQhF9pC6i0BapFnnaE_wAynKFbY24CB4Fw0",
+            "key_epoch": 1
+          }
+        ]
+      },
+      "org_gone": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJyZWZ1c2FsIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwicmVhc29uIjoib3JnX2dvbmUiLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiYmY5NjhkODUtYjAzOS00ZjRjLWE5YjgtNjBhYTM1MzI0OWZlIn0.mckkwGhZBvhUhA4zcO7VYFU8JFVMbHAH0lnN9ENK4qOs1Cf8jnPo6-gc2bXh3tpgTcUO4-auYvhf95OCAsqnCA"
+    },
+    "epoch_push_webhook": {
+      "comment": "POST body to the org daemon's registered webhook (§3.4) AND the /pushes poll-fallback row shape. events[] carries the opaque epoch_push JWS strings verbatim (courier rule: FED fans out as-is, never re-signs). seq is the per-org monotonic poll cursor.",
+      "seq": 91,
+      "events": [
+        "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJlcG9jaF9wdXNoIiwib3JnIjoiMDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiYWNjb3VudCI6IjAxU0FNUExFQUNDT1VOVEFMSUNFMDAwMDAwMCIsIm5ld19lcG9jaCI6OCwicmVhc29uIjoicmV2b2tlZCIsImlzcyI6Imh0dHBzOi8vYWNjb3VudC5jb3J0ZXhraXQuaW8iLCJhdWQiOiJjb3J0ZXhraXQtb3JnOjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiI5MzIzOTExMi01ODA5LTQ5ZmMtOTllNC04YTg1ZDY0NWFhODYifQ.T_FdGUAAKeInVGuDWkX1kx5g_VNFv6MUDsfzK6_3kN2iFGQ9DOIRX-TR_gX48e8ThXfata8udLaBuyGjqMCpCQ"
+      ]
+    }
+  },
+  "ledger_lifecycle_vectors": {
+    "comment": "Contract §3 single-source state machine (v7): ADMITTED → SENDING → terminal{RECORDED|ABORTED|OUTCOME_UNKNOWN}. Three durable txn points (T1 admit, T2 send-intent fsync BEFORE external call, T3 settle). INITIATE order: revalidate → T2 → call → T3; ABORTED reachable ONLY from ADMITTED. Exhaustion is STATE-SCOPED: ADMITTED→ABORTED, SENDING→OUTCOME_UNKNOWN, never crossed. A refused mint (intent_expired/intent_collision/etc.) creates NO ledger row — refusals are mint-surface artifacts.",
+    "crash_recovery": [
+      {
+        "row_state": "absent",
+        "meaning": "never admitted (incl. every refused mint — refusal creates nothing)",
+        "recovery": "fresh dispatch permitted (after §3 revalidation)"
+      },
+      {
+        "row_state": "ADMITTED",
+        "meaning": "admitted, never sent (T2 not durable)",
+        "recovery": "INITIATE may proceed under §3 revalidation; revalidation refusal or exhaustion -> ABORTED (never OUTCOME_UNKNOWN: an ADMITTED row cannot have sent)"
+      },
+      {
+        "row_state": "SENDING",
+        "provider_class": "idempotency_key",
+        "recovery": "re-send permitted (provider dedups) or re-query; converges to true terminal"
+      },
+      {
+        "row_state": "SENDING",
+        "provider_class": "status_query",
+        "recovery": "re-query ONLY, never re-send; converges when query returns terminal"
+      },
+      {
+        "row_state": "SENDING",
+        "provider_class": "neither",
+        "recovery": "bounded wait -> OUTCOME_UNKNOWN; no re-drive exists"
+      },
+      {
+        "row_state": "RECORDED",
+        "meaning": "terminal known",
+        "recovery": "serve recorded outcome to any re-mint presentation"
+      },
+      {
+        "row_state": "ABORTED",
+        "meaning": "admitted, deliberately never sent (revalidation refused at INITIATE, before T2)",
+        "recovery": "serve aborted; turn consumed; fresh turn needs new intent_id"
+      },
+      {
+        "row_state": "OUTCOME_UNKNOWN",
+        "meaning": "reconciliation exhausted from SENDING; may have sent",
+        "recovery": "serve unknown (honest, never retried); late provider outcome -> LATE_RECORDED annotation, never a transition"
+      }
+    ],
+    "re_presentation": [
+      {
+        "row_state": "ADMITTED",
+        "response": "outcome_pending — terminal-for-this-turn; gateway MUST NOT auto-remint"
+      },
+      {
+        "row_state": "SENDING",
+        "response": "outcome_pending — terminal-for-this-turn; gateway MUST NOT auto-remint"
+      },
+      {
+        "row_state": "RECORDED",
+        "response": "recorded outcome"
+      },
+      {
+        "row_state": "ABORTED",
+        "response": "aborted (turn consumed)"
+      },
+      {
+        "row_state": "OUTCOME_UNKNOWN",
+        "response": "unknown (honest render, never retried)"
+      }
+    ],
+    "target_agent_check": [
+      {
+        "target_agent": "01SAMPLESVCTRIAGEAGENT00000",
+        "grant": "valid",
+        "expect": "authorized (agent in grant.agents)"
+      },
+      {
+        "target_agent": "01SAMPLESVCOPSAGENT0000000",
+        "grant": "valid",
+        "expect": "authorized (agent in grant.agents)"
+      },
+      {
+        "target_agent": "01SAMPLESVCUNLISTEDAGENT000",
+        "grant": "valid",
+        "expect": "refused (agent not in grant.agents)"
+      },
+      {
+        "target_agent": "01SAMPLESVCTRIAGEAGENT00000",
+        "grant": "empty_list",
+        "expect": "refused (agents:[] authorizes nothing)"
+      }
+    ],
+    "slot_lifecycle": [
+      {
+        "at": "mint (first-seen insert-if-absent wins)",
+        "slot": "HELD",
+        "note": "atomic; concurrent first mints of one intent_id -> one winner, loser refused intent_collision"
+      },
+      {
+        "at": "remint within horizon, same subject",
+        "slot": "HELD (same slot)",
+        "note": "fresh jti, same intent_id"
+      },
+      {
+        "at": "remint past horizon (1h)",
+        "slot": "n/a",
+        "note": "refused intent_expired; no A3 can exist past horizon"
+      },
+      {
+        "at": "horizon + A3 TTL",
+        "slot": "RELEASED (age-out)",
+        "note": "the last possible A3 expired; slot release and remint eligibility differ by exactly one TTL (H3)"
+      }
+    ]
+  },
+  "ask_authority_vectors": {
+    "comment": "Condition tables for the three-factor ask-time check (durable record + membership_epoch + delegation_epoch of the record's frozen grant_id). Not JWTs — the record is a daemon-internal composition; these pin the expected disposition per state.",
+    "cases": [
+      {
+        "name": "all_fresh",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 7,
+          "delegation_epoch": 3,
+          "grant_exists": true
+        },
+        "expect": "authorized"
+      },
+      {
+        "name": "membership_epoch_stale",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 8,
+          "delegation_epoch": 3,
+          "grant_exists": true
+        },
+        "expect": "denied_pending_asks_die"
+      },
+      {
+        "name": "delegation_epoch_stale",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 7,
+          "delegation_epoch": 4,
+          "grant_exists": true
+        },
+        "expect": "denied_pending_asks_die"
+      },
+      {
+        "name": "grant_deleted",
+        "record": {
+          "grant_id": "01SAMPLEDELEGATIONGRANT0000",
+          "minted_membership_epoch": 7,
+          "minted_delegation_epoch": 3
+        },
+        "current": {
+          "membership_epoch": 7,
+          "delegation_epoch": null,
+          "grant_exists": false
+        },
+        "expect": "fail_closed_unknown_grant"
+      },
+      {
+        "name": "member_path_no_grant",
+        "record": {
+          "grant_id": null,
+          "minted_membership_epoch": 7
+        },
+        "current": {
+          "membership_epoch": 7
+        },
+        "expect": "authorized_membership_only"
+      }
+    ]
+  }
+}

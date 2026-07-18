@@ -43,6 +43,9 @@ impl HealthReport {
 /// subc-to-module channel-0 control RPC body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op")]
+// RouteBind carries the complete bind metadata, while HealthCheck is a marker;
+// preserving the direct wire shape is more useful than boxing every bind field.
+#[allow(clippy::large_enum_variant)]
 pub enum ModuleControlRequest {
     #[serde(rename = "route.bind")]
     RouteBind {
@@ -61,6 +64,9 @@ pub enum ModuleControlRequest {
         /// "roots".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_capabilities: Option<Vec<String>>,
+        /// Opaque admission facts supplied by the configured carrier module.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admission_facts: Option<Value>,
     },
     #[serde(rename = "health.check")]
     HealthCheck {},

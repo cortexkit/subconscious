@@ -1,4 +1,8 @@
 {
+  "admission_facts": {
+    "schema": 1,
+    "verified_class": "member"
+  },
   "consumer_capabilities": [
     "elicitation",
     "roots"

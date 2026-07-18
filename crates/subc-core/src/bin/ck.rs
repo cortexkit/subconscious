@@ -871,7 +871,16 @@ fn print_quota_account(
     label_width: usize,
     color_enabled: bool,
 ) {
-    let mut label = table_account_label(entry);
+    // The email is the human identity when the wire carries it; the vault
+    // account id (shortened) is the fallback, and the credential source is
+    // the last resort so a row is never label-less.
+    let mut label = entry
+        .get("accountInfo")
+        .and_then(|i| i.get("email"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| table_account_label(entry));
     if label.is_empty() {
         label = entry
             .get("source")
@@ -1028,18 +1037,8 @@ fn format_duration_two_units(secs: u64) -> String {
 fn quota_account_header_extras(entry: &Value) -> Vec<String> {
     let mut extras = Vec::new();
     let info = entry.get("accountInfo");
-    let email = info
-        .and_then(|i| i.get("email"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    // When the email is present it usually becomes the better primary label,
-    // but the label is already printed; surface it as detail only when it
-    // differs from what the label shows.
-    if let Some(email) = email {
-        if !account_label(entry).eq_ignore_ascii_case(email) {
-            extras.push(email.to_string());
-        }
-    }
+    // The email is consumed as the primary label upstream; extras start at
+    // the org.
     if let Some(org) = info
         .and_then(|i| i.get("orgName"))
         .and_then(Value::as_str)
@@ -2217,7 +2216,7 @@ mod tests {
             "savedResets": { "availableCount": 4 }
         });
         let extras = quota_account_header_extras(&enriched);
-        // email equals the label, so it is not repeated; plan + resets render.
+        // email is the primary label upstream, never repeated in extras.
         assert_eq!(extras.len(), 2, "extras: {extras:?}");
         assert_eq!(extras[0], "plan: pro");
         assert!(extras[1].starts_with("✦ 4 saved resets"));

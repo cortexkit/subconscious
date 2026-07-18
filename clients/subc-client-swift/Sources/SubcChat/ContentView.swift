@@ -5,6 +5,7 @@ struct ContentView: View {
     @StateObject private var roomsVM = RoomsViewModel()
     @StateObject private var asksVM = AskViewModel()
     @StateObject private var observeVM = ObserveViewModel()
+    @StateObject private var boardVM = BoardViewModel()
 
     var body: some View {
         TabView {
@@ -12,6 +13,8 @@ struct ContentView: View {
                 .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
             RoomsView(vm: roomsVM)
                 .tabItem { Label("Rooms", systemImage: "person.3") }
+            BoardView(vm: boardVM, asksVM: asksVM)
+                .tabItem { Label("Board", systemImage: "square.grid.2x2") }
             AskView(vm: asksVM)
                 .tabItem { Label(asksVM.tabTitle, systemImage: "questionmark.circle") }
             ObserveView(vm: observeVM, lane: .athena)

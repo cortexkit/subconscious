@@ -187,17 +187,28 @@ final class AskViewModel: ObservableObject {
         !isSubmitting && ask.isPending && !completedRequestIDs.contains(ask.requestID)
     }
 
+    /// Board asks use the same persist_answer operation and reply handling as the
+    /// Asks tab. The request id is the join key because a board ask is the same
+    /// server-side ask row, not a second kind of request.
+    func canAnswer(requestID: String) -> Bool {
+        !isSubmitting && !completedRequestIDs.contains(requestID)
+    }
+
     func persistAnswer(_ answer: String) {
+        guard let ask = selectedActionAsk(), canAct(on: ask) else { return }
+        persistAnswer(answer, requestID: ask.requestID)
+    }
+
+    func persistAnswer(_ answer: String, requestID: String) {
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             status = "answer failed: an answer is required"
             return
         }
-        guard let ask = selectedActionAsk(), canAct(on: ask) else { return }
+        guard canAnswer(requestID: requestID) else { return }
 
         isSubmitting = true
         actionNotice = nil
-        let requestID = ask.requestID
         let worker = worker
         work.async { [weak self, worker] in
             do {

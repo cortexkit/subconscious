@@ -22,3 +22,20 @@ notice. subc-federation is the authority; never edit here.
 The §5 emit-side slot (r1-fed-emit-*) remains a named placeholder in
 PLACEHOLDER.md until FED §8 step 5 (emission against SUBC's shipped
 relay) lands.
+
+## admission-facts-emit.jsonl (§5 emit trio — corpus COMPLETE with this set)
+
+Vendored from subc-federation @ dad90c7 (`test-vectors/rdv-wire/admission-facts.jsonl`),
+FED §8 step 5. Verified at vendor time: all three corpus_ids present
+(r1-fed-emit-member-package-boundary, r1-fed-emit-service-package-no-member-fields,
+r1-fed-emit-unknown-field-tolerance-half); declared byte lengths recomputed
+independently over compact sorted serialization (member boundary package is
+EXACTLY 4096 bytes — the emit half of r1-relay-size-boundary-accept's budget
+edge); zero forbidden fields present in any package. The tolerance-half
+vector encodes the emit terminus of the three-tolerance traversal: fed
+emits ONLY schema fields (builders cannot produce forbidden fields by
+construction), the unknown benign field is injected at the relay vector's
+layer, subc relays it opaque, alfonso validates accept — the three-repo
+traversal (fed-emit → subc-relay → alfonso-validate) is now proven with
+every hop real. Refresh rule: re-vendor by commit hash + room notice, as
+with every set.

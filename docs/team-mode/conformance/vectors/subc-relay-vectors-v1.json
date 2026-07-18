@@ -1,0 +1,150 @@
+{
+  "$comment": "SUBC relay conformance vectors for the admission-facts surface (spec v5 @ c5aa69d8, contract v7.3 @ f02d9b2f). Each vector cites the clause it proves. Sizes are computed over the compact serde_json::to_vec serialization of the post-parse value (spec §3.1's pinned metric). Verdicts: relay = subc-core daemon behavior; validate = alfonso-side §3.1 validator behavior (vendored here because the schemas are spec-normative; ALF's suite consumes these ids).",
+  "vocabulary": "r1-relay-v1",
+  "vectors": [
+    {
+      "id": "r1-relay-member-package-minimal",
+      "clause": "spec §3.1 member package required fields",
+      "package": {
+        "schema": 1,
+        "verified_class": "member",
+        "peer_static": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "org": "01J0000000000000000000ORG1",
+        "account": "01J000000000000000000ACCT1",
+        "role": "member",
+        "membership_epoch": 7,
+        "device_epoch": 3,
+        "bundle_version": 41
+      },
+      "expect": { "validate": "accept" }
+    },
+    {
+      "id": "r1-relay-unknown-field-tolerance",
+      "clause": "spec §3.1 unknown-fields-ignored (additive evolution); fleet rule 2",
+      "$comment": "THE tolerance centerpiece: an unknown NON-forbidden field must pass end-to-end (fed emit posture, subc opaque relay, alfonso validate-accept). A deny-unknown-fields validator fails this vector and is a contract violation.",
+      "package": {
+        "schema": 1,
+        "verified_class": "member",
+        "peer_static": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "org": "01J0000000000000000000ORG1",
+        "account": "01J000000000000000000ACCT1",
+        "role": "member",
+        "membership_epoch": 7,
+        "device_epoch": 3,
+        "bundle_version": 41,
+        "future_benign_field": { "anything": true }
+      },
+      "expect": { "relay": "opaque-pass", "validate": "accept" }
+    },
+    {
+      "id": "r1-relay-member-forbidden-grant-id",
+      "clause": "spec §3.1 member forbidden set; presence is by key, value irrelevant",
+      "package": {
+        "schema": 1,
+        "verified_class": "member",
+        "peer_static": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "org": "01J0000000000000000000ORG1",
+        "account": "01J000000000000000000ACCT1",
+        "role": "member",
+        "membership_epoch": 7,
+        "device_epoch": 3,
+        "bundle_version": 41,
+        "grant_id": null
+      },
+      "expect": { "validate": "reject", "error": "admission_facts_forbidden_field" },
+      "$comment": "grant_id is FORBIDDEN on member packages even with a null value — rejection is by key presence."
+    },
+    {
+      "id": "r1-relay-service-package-minimal",
+      "clause": "spec §3.1 service package required fields",
+      "package": {
+        "schema": 1,
+        "verified_class": "service",
+        "peer_static": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "org": "01J0000000000000000000ORG1",
+        "service_principal_ulid": "01J00000000000000000000SP1"
+      },
+      "expect": { "validate": "accept" }
+    },
+    {
+      "id": "r1-relay-service-forbidden-subject",
+      "clause": "spec §3.1 service forbidden set (shared-pipe rule: per-turn subjects are A3 call metadata, never bind facts)",
+      "package": {
+        "schema": 1,
+        "verified_class": "service",
+        "peer_static": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "org": "01J0000000000000000000ORG1",
+        "service_principal_ulid": "01J00000000000000000000SP1",
+        "subject": "01J000000000000000000ACCT1"
+      },
+      "expect": { "validate": "reject", "error": "admission_facts_forbidden_field" }
+    },
+    {
+      "id": "r1-relay-unknown-schema",
+      "clause": "spec §3.1 schema versioning",
+      "package": { "schema": 2, "verified_class": "member", "peer_static": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "org": "01J0000000000000000000ORG1" },
+      "expect": { "validate": "reject", "error": "admission_facts_unsupported_schema" }
+    },
+    {
+      "id": "r1-relay-numeric-strictness",
+      "clause": "spec §3.1 epoch numerics: JSON integers 0..2^53-1; fractional/negative/string-typed reject",
+      "package": {
+        "schema": 1,
+        "verified_class": "member",
+        "peer_static": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "org": "01J0000000000000000000ORG1",
+        "account": "01J000000000000000000ACCT1",
+        "role": "member",
+        "membership_epoch": "7",
+        "device_epoch": 3,
+        "bundle_version": 41
+      },
+      "expect": { "validate": "reject" },
+      "$comment": "membership_epoch string-typed. Companion negatives (fractional 7.5, negative -1) share this id family as -b/-c if a suite wants them enumerated separately."
+    },
+    {
+      "id": "r1-relay-carrier-gate-unauthorized",
+      "clause": "spec §3.2 carrier identity; daemon rejects facts from any principal but the configured reserved module",
+      "setup": "route.open with admission_facts from a direct (non-reserved) client",
+      "expect": { "relay": "reject", "error": "admission_facts_not_permitted" }
+    },
+    {
+      "id": "r1-relay-target-allowlist",
+      "clause": "spec §3.2 mandatory target allowlist; exact module-id equality; positioned after existence/role/liveness, before reservation",
+      "setup": "authorized carrier, facts-bearing open toward a target module absent from admission_facts_targets",
+      "expect": { "relay": "reject", "error": "admission_facts_target_not_allowed" }
+    },
+    {
+      "id": "r1-relay-error-precedence",
+      "clause": "spec §3.2 pinned precedence: target existence before carrier gate",
+      "setup": "unauthorized carrier, facts-bearing open toward a NONEXISTENT target",
+      "expect": { "relay": "reject", "error": "unknown_module" },
+      "$comment": "Asserts the shipped precedence: existence checks run first, so unknown_module wins over admission_facts_not_permitted."
+    },
+    {
+      "id": "r1-relay-oneshot-single-frame",
+      "clause": "spec §4 one-shot SDK: at most one route.open frame per invocation; no cache entry, no auto-reopen, no facts resend",
+      "setup": "open_route_with_admission_facts through disconnect / timeout / retryable-daemon-error paths",
+      "expect": { "sdk": "at-most-one-frame; error surfaces to caller; no reopen" }
+    },
+    {
+      "id": "r1-relay-size-boundary-accept",
+      "clause": "spec §3.1 size metric: compact serialization == 4096 bytes accepts",
+      "construction": "member package padded via a single unknown benign string field to exactly 4096 compact bytes",
+      "expect": { "validate": "accept" }
+    },
+    {
+      "id": "r1-relay-size-boundary-reject",
+      "clause": "spec §3.1 size metric: 4097 compact bytes rejects",
+      "construction": "same package one byte longer",
+      "expect": { "validate": "reject" }
+    },
+    {
+      "id": "r1-relay-depth-boundary",
+      "clause": "spec §3.1 depth: root=1, max 3; depth-4 rejects; checks precede unknown-field tolerance",
+      "construction": "unknown benign field carrying an object nested to depth 4",
+      "expect": { "validate": "reject" },
+      "$comment": "The ignored unknown field still counts toward size and depth — tolerance never exempts a field from the resource bounds."
+    }
+  ]
+}

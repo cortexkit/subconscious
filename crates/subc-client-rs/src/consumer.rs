@@ -374,6 +374,56 @@ impl SubcConsumer {
             .map(|route| route.handle)
     }
 
+    /// Open one admitted route without entering the managed route cache.
+    ///
+    /// Admitted routes are never cached or reopened after a connection drop. If
+    /// this call fails or the route later closes, the caller must perform admission
+    /// again and call this method with fresh facts.
+    pub async fn open_route_with_admission_facts(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        facts: serde_json::Value,
+    ) -> Result<RouteHandle, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let opts = CallOptions::default();
+        let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            target,
+            identity,
+            consumer_identity: route_open_consumer_identity(&opts),
+            consumer_capabilities: None,
+            admission_facts: Some(facts),
+        })
+        .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
+
+        let terminal = self.shared.control_call(body, deadline, true).await?;
+        let TerminalFrame::Response {
+            generation, body, ..
+        } = terminal
+        else {
+            return Err(CallError::not_sent(
+                "route.open returned a non-response frame",
+            ));
+        };
+        let ClientControlResponse::RouteOpen {
+            route_channel,
+            route_epoch,
+        } = serde_json::from_slice(&body).map_err(|err| {
+            CallError::not_sent(format!("failed to decode route.open response: {err}"))
+        })?
+        else {
+            return Err(CallError::not_sent(
+                "route.open returned an unexpected control response",
+            ));
+        };
+        let route = RouteState {
+            handle: RouteHandle::new(route_channel, route_epoch, generation),
+            sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
+        };
+        self.shared.install_one_shot_route(route.clone())?;
+        Ok(route.handle)
+    }
+
     /// Fetch the daemon's module catalog over channel 0.
     pub async fn catalog_list(&self) -> Result<CatalogList, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
@@ -989,6 +1039,7 @@ struct Inner {
     pending: HashMap<PendingKey, PendingEntry>,
     routes: HashMap<RouteKey, RouteState>,
     route_by_channel: HashMap<u16, RouteKey>,
+    one_shot_routes: HashMap<u16, RouteState>,
     route_epochs: HashMap<u16, RouteHandle>,
     dropped_route_frames: u64,
     openings: HashMap<RouteKey, Opening>,
@@ -1020,18 +1071,30 @@ impl Inner {
     }
 
     fn remove_route_by_handle(&mut self, handle: RouteHandle) -> Option<RouteState> {
-        let key = self.route_by_channel.get(&handle.channel)?.clone();
-        let matches = self
-            .routes
-            .get(&key)
-            .is_some_and(|route| route.handle == handle);
-        debug_assert!(matches);
-        matches.then(|| self.remove_route(&key)).flatten()
+        if let Some(key) = self.route_by_channel.get(&handle.channel).cloned() {
+            let matches = self
+                .routes
+                .get(&key)
+                .is_some_and(|route| route.handle == handle);
+            debug_assert!(matches);
+            if matches {
+                return self.remove_route(&key);
+            }
+        }
+        self.one_shot_routes
+            .get(&handle.channel)
+            .is_some_and(|route| route.handle == handle)
+            .then(|| self.one_shot_routes.remove(&handle.channel))
+            .flatten()
     }
 
     fn drain_routes(&mut self) -> Vec<RouteState> {
         self.route_by_channel.clear();
-        self.routes.drain().map(|(_, route)| route).collect()
+        self.routes
+            .drain()
+            .map(|(_, route)| route)
+            .chain(self.one_shot_routes.drain().map(|(_, route)| route))
+            .collect()
     }
 
     fn close_routes(&mut self) {
@@ -1054,6 +1117,7 @@ impl Shared {
                 pending: HashMap::new(),
                 routes: HashMap::new(),
                 route_by_channel: HashMap::new(),
+                one_shot_routes: HashMap::new(),
                 route_epochs: HashMap::new(),
                 dropped_route_frames: 0,
                 openings: HashMap::new(),
@@ -1395,6 +1459,22 @@ impl Shared {
         });
     }
 
+    fn install_one_shot_route(&self, route: RouteState) -> Result<(), CallError> {
+        let handle = route.handle;
+        let mut inner = self.lock_inner();
+        if inner.closed || inner.generation != handle.connection_token() || inner.writer.is_none() {
+            return Err(CallError::StaleRouteHandle(handle));
+        }
+        if inner.route_epochs.contains_key(&handle.channel) {
+            return Err(CallError::not_sent(
+                "daemon returned a route channel already in use",
+            ));
+        }
+        inner.one_shot_routes.insert(handle.channel, route);
+        inner.route_epochs.insert(handle.channel, handle);
+        Ok(())
+    }
+
     async fn ensure_route(
         self: &Arc<Self>,
         key: &RouteKey,
@@ -1470,6 +1550,7 @@ impl Shared {
                 identity: route_open.identity.clone(),
                 consumer_identity: route_open.consumer_identity.clone(),
                 consumer_capabilities: route_open.consumer_capabilities.clone(),
+                admission_facts: None,
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
             match self.control_call(body, route_deadline, true).await {
@@ -2103,7 +2184,8 @@ impl Shared {
         let route = inner
             .route_by_channel
             .get(&handle.channel)
-            .and_then(|key| inner.routes.get(key));
+            .and_then(|key| inner.routes.get(key))
+            .or_else(|| inner.one_shot_routes.get(&handle.channel));
         debug_assert!(route.is_none_or(|route| route.handle == handle));
         route
             .filter(|route| route.handle == handle)
@@ -4151,6 +4233,81 @@ mod tests {
 
         first.abort();
         let _ = first.await;
+    }
+
+    #[tokio::test]
+    async fn admitted_route_open_emits_one_frame_without_retrying_daemon_errors() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions {
+                call_timeout: Duration::from_secs(1),
+                ..ConsumerOptions::default()
+            },
+        ));
+        let (writer, mut rx) = mpsc::channel(4);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+        }
+
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let target = RouteTarget::ToolProvider {
+            module_id: "admitted-target".to_string(),
+        };
+        let identity = BindIdentity {
+            project_root: PathBuf::from("/tmp/project"),
+            harness: "test".to_string(),
+            session: "admitted".to_string(),
+        };
+        let task = tokio::spawn(async move {
+            consumer
+                .open_route_with_admission_facts(
+                    target,
+                    identity,
+                    serde_json::json!({"schema": 1, "verified_class": "member"}),
+                )
+                .await
+        });
+
+        let command = rx.recv().await.expect("one route.open must be queued");
+        let request: ClientControlRequest = serde_json::from_slice(&command.frame.body).unwrap();
+        let ClientControlRequest::RouteOpen {
+            admission_facts, ..
+        } = request
+        else {
+            panic!("expected route.open")
+        };
+        assert_eq!(
+            admission_facts,
+            Some(serde_json::json!({"schema": 1, "verified_class": "member"}))
+        );
+
+        let error_body = serde_json::to_vec(&ErrorBody {
+            code: "admission_facts_not_permitted".to_string(),
+            message: "not permitted".to_string(),
+        })
+        .unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                Frame::build(
+                    FrameType::Error,
+                    Flags::new(false, Priority::Interactive, false),
+                    0,
+                    0,
+                    command.frame.header.corr,
+                    error_body,
+                )
+                .unwrap(),
+            )
+            .await
+        );
+        let result = task.await.unwrap();
+        assert!(matches!(result, Err(CallError::NotSent(_))));
+        assert!(rx.try_recv().is_err(), "one-shot route.open must not retry");
     }
 
     #[tokio::test]

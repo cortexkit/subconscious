@@ -640,6 +640,7 @@ async fn handle_control_request(
             identity,
             principal,
             consumer_capabilities,
+            admission_facts,
         } => {
             state.tentative_channels.insert(route_channel, epoch);
             record_event(
@@ -653,6 +654,7 @@ async fn handle_control_request(
                     "identity": identity,
                     "principal": principal,
                     "consumer_capabilities": consumer_capabilities,
+                    "admission_facts": admission_facts,
                 }),
             )?;
             if config.bind_never_reply {

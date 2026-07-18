@@ -324,6 +324,7 @@ async fn route_open(
         },
         consumer_identity: None,
         consumer_capabilities: None,
+        admission_facts: None,
     };
     let response = control_rpc(stream, serde_json::to_vec(&request)?).await?;
     match response.header.ty {

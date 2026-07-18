@@ -47,11 +47,14 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden("module_hello_ack_body", &module_hello_ack_body());
     assert_golden(
         "module_control_request_route_bind",
-        &module_control_request(Some(vec!["elicitation".to_string(), "roots".to_string()])),
+        &module_control_request(
+            Some(vec!["elicitation".to_string(), "roots".to_string()]),
+            Some(serde_json::json!({"schema": 1, "verified_class": "member"})),
+        ),
     );
     assert_golden(
         "module_control_request_route_bind_without_consumer_capabilities",
-        &module_control_request(None),
+        &module_control_request(None, None),
     );
     assert_golden(
         "module_control_response_route_bind_ack",
@@ -179,7 +182,10 @@ fn module_hello_ack_body() -> ModuleHelloAckBody {
     }
 }
 
-fn module_control_request(consumer_capabilities: Option<Vec<String>>) -> ModuleControlRequest {
+fn module_control_request(
+    consumer_capabilities: Option<Vec<String>>,
+    admission_facts: Option<Value>,
+) -> ModuleControlRequest {
     ModuleControlRequest::RouteBind {
         route_channel: 42,
         epoch: 7,
@@ -189,6 +195,7 @@ fn module_control_request(consumer_capabilities: Option<Vec<String>>) -> ModuleC
         identity: bind_identity(),
         principal: Some(Principal::Direct),
         consumer_capabilities,
+        admission_facts,
     }
 }
 

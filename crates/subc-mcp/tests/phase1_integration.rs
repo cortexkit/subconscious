@@ -3171,6 +3171,7 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
             identity: route_identity("mcp", 2_001),
             consumer_identity: None,
             consumer_capabilities: None,
+            admission_facts: None,
         },
     )
     .await;
@@ -3929,6 +3930,7 @@ where
             identity: route_identity(module_id, corr),
             consumer_identity: None,
             consumer_capabilities: None,
+            admission_facts: None,
         },
     )
     .await

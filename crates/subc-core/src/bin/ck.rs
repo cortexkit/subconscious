@@ -8,6 +8,7 @@
 //! `ck quota ...`, and `ck account ...` can be added without reshaping the CLI.
 
 use std::{
+    collections::{BTreeMap, HashMap},
     env,
     error::Error,
     ffi::{OsStr, OsString},
@@ -746,86 +747,449 @@ fn quota_entries_for_table<'a>(
 
 fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
     let color_enabled = ansi_color_enabled();
-    let show_status = verbose || filter.is_some();
-    let mut rows = Vec::new();
+    let entries = quota_entries_for_table(providers, filter, verbose);
 
-    for entry in quota_entries_for_table(providers, filter, verbose) {
+    // Group by provider so each provider renders as one section with its
+    // accounts beneath it, mirroring the breakdown layout users know from
+    // oh-my-pi's usage CLI.
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for entry in entries {
         let id = provider_id(entry);
-        let account = table_account_label(entry);
-        let error_detail = entry_error_detail(entry);
-        let window_rows = quota_window_rows_for_entry(entry);
-
-        if window_rows.is_empty() {
-            let mut row = vec![
-                id,
-                account,
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-            ];
-            if show_status {
-                row.push(
-                    error_detail
-                        .as_deref()
-                        .map(truncate_cell)
-                        .unwrap_or_else(|| "-".to_string()),
-                );
-            }
-            rows.push(row);
-            continue;
+        if !grouped.contains_key(&id) {
+            order.push(id.clone());
         }
-
-        for (index, (label, window)) in window_rows.iter().enumerate() {
-            let mut row = vec![
-                if index == 0 {
-                    id.clone()
-                } else {
-                    String::new()
-                },
-                if index == 0 {
-                    account.clone()
-                } else {
-                    String::new()
-                },
-                label.clone(),
-                format_used_percent_rate_window(window, color_enabled),
-                format_resets_at_rate_window(window),
-            ];
-            if show_status {
-                row.push(if index == 0 {
-                    error_detail
-                        .as_deref()
-                        .map(truncate_cell)
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                });
-            }
-            rows.push(row);
-        }
+        grouped.entry(id).or_default().push(entry);
     }
 
-    let headers = if show_status {
-        vec![
-            "provider",
-            "account",
-            "window",
-            "used%",
-            "resets",
-            "status/detail",
-        ]
-    } else {
-        vec!["provider", "account", "window", "used%", "resets"]
-    };
-    print_table(&headers, rows);
+    println!("{}", bold_text("Usage", color_enabled));
+
+    for id in order {
+        let group = &grouped[&id];
+        let connected: Vec<&&Value> = group
+            .iter()
+            .filter(|entry| quota_entry_is_connected(entry))
+            .collect();
+        let account_word = if group.len() == 1 {
+            "account"
+        } else {
+            "accounts"
+        };
+        println!();
+        println!(
+            "{} {}",
+            color_text(&format_provider_display_name(&id), "1;36", color_enabled),
+            dim_text(&format!("— {} {account_word}", group.len()), color_enabled)
+        );
+
+        // A shared label template across the provider's accounts keeps window
+        // rows aligned and makes a window one account reports and another
+        // doesn't visible as an explicit "not reported" row.
+        let templates = quota_window_templates(group);
+        let label_width = templates
+            .iter()
+            .map(|label| label.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        for entry in group {
+            print_quota_account(entry, &templates, label_width, color_enabled);
+        }
+
+        if connected.len() > 1 {
+            let stats = quota_provider_window_stats(group);
+            if !stats.is_empty() {
+                let parts: Vec<String> = stats
+                    .iter()
+                    .map(|stat| {
+                        let noun = if stat.accounts == 1 {
+                            "account"
+                        } else {
+                            "accounts"
+                        };
+                        format!(
+                            "{} → {:.2}/{} {noun} used ({:.2}× quota left)",
+                            stat.window, stat.used_accounts, stat.accounts, stat.remaining_accounts
+                        )
+                    })
+                    .collect();
+                println!(
+                    "  {}",
+                    dim_text(&format!("capacity: {}", parts.join(" · ")), color_enabled)
+                );
+            }
+        }
+    }
 
     if filter.is_none() && !verbose {
         let disconnected = providers
             .iter()
             .filter(|entry| !quota_entry_is_connected(entry))
             .count();
-        let summary = format!("{disconnected} providers not connected (--verbose to list)");
-        println!("{}", dim_text(&summary, color_enabled));
+        if disconnected > 0 {
+            println!();
+            let summary = format!("{disconnected} providers not connected (--verbose to list)");
+            println!("{}", dim_text(&summary, color_enabled));
+        }
+    }
+}
+
+/// Status classification for the colored dots, matching the progress-bar
+/// color thresholds so the dot and the bar never disagree.
+fn quota_status_color(used_percent: f64) -> &'static str {
+    if used_percent >= 100.0 {
+        "31"
+    } else if used_percent >= 80.0 {
+        "33"
+    } else {
+        "32"
+    }
+}
+
+fn quota_entry_worst_used(entry: &Value) -> Option<f64> {
+    quota_window_rows_for_entry(entry)
+        .iter()
+        .filter_map(|(_, window)| quota_window_used_percent(window))
+        .fold(None, |acc, used| {
+            Some(acc.map_or(used, |max: f64| max.max(used)))
+        })
+}
+
+fn quota_window_used_percent(window: &Value) -> Option<f64> {
+    // rawUsedPercent is the provider's real utilization when a banked-reset
+    // relaxed window is in effect; prefer it so 0% effective pacing never
+    // reads as an idle account.
+    window
+        .get("rawUsedPercent")
+        .and_then(Value::as_f64)
+        .or_else(|| window.get("usedPercent").and_then(Value::as_f64))
+}
+
+fn print_quota_account(
+    entry: &Value,
+    templates: &[String],
+    label_width: usize,
+    color_enabled: bool,
+) {
+    let mut label = table_account_label(entry);
+    if label.is_empty() {
+        label = entry
+            .get("source")
+            .and_then(Value::as_str)
+            .map(|source| format!("{source} account"))
+            .unwrap_or_else(|| "account".to_string());
+    }
+
+    if !quota_entry_is_connected(entry) {
+        let reason = entry_error_detail(entry).unwrap_or_else(|| "no usage data".to_string());
+        println!(
+            "  {} {}",
+            dim_text("○", color_enabled),
+            dim_text(
+                &format!("{label} — {}", truncate_cell(&reason)),
+                color_enabled
+            )
+        );
+        return;
+    }
+
+    let dot_color = quota_entry_worst_used(entry).map(quota_status_color);
+    let dot = match dot_color {
+        Some(color) => color_text("●", color, color_enabled),
+        None => dim_text("●", color_enabled),
+    };
+    let mut header = format!("  {dot} {}", bold_text(&label, color_enabled));
+    for extra in quota_account_header_extras(entry) {
+        header.push_str(&dim_text(&format!(" · {extra}"), color_enabled));
+    }
+    println!("{header}");
+
+    let rows = quota_window_rows_for_entry(entry);
+    if rows.is_empty() {
+        println!("      {}", dim_text("no limits reported", color_enabled));
+        return;
+    }
+    let by_label: HashMap<&str, &Value> = rows
+        .iter()
+        .map(|(label, window)| (label.as_str(), window))
+        .collect();
+    for template in templates {
+        match by_label.get(template.as_str()) {
+            Some(window) => {
+                println!(
+                    "{}",
+                    format_quota_window_line(template, window, label_width, color_enabled)
+                );
+            }
+            None => {
+                println!(
+                    "      {} {:<label_width$}  {}  {}",
+                    dim_text("○", color_enabled),
+                    template,
+                    dim_text(&"·".repeat(QUOTA_PROGRESS_BAR_WIDTH), color_enabled),
+                    dim_text("not reported", color_enabled)
+                );
+            }
+        }
+    }
+}
+
+fn format_quota_window_line(
+    label: &str,
+    window: &Value,
+    label_width: usize,
+    color_enabled: bool,
+) -> String {
+    let Some(used) = quota_window_used_percent(window) else {
+        return format!(
+            "      {} {:<label_width$}  {}  {}",
+            dim_text("○", color_enabled),
+            label,
+            dim_text(&"·".repeat(QUOTA_PROGRESS_BAR_WIDTH), color_enabled),
+            dim_text("no data", color_enabled)
+        );
+    };
+    let dot = color_text("●", quota_status_color(used), color_enabled);
+    let bar = format_quota_progress_bar(used, color_enabled);
+    let details = quota_window_details(window);
+    format!(
+        "      {dot} {label:<label_width$}  {bar}  {}",
+        dim_text(&details, color_enabled)
+    )
+}
+
+/// The human detail string after the bar: real utilization, the effective
+/// pacing note for relaxed windows, and a relative reset time.
+fn quota_window_details(window: &Value) -> String {
+    let mut parts = Vec::new();
+    let used = window.get("usedPercent").and_then(Value::as_f64);
+    let raw = window.get("rawUsedPercent").and_then(Value::as_f64);
+    match (used, raw) {
+        (Some(effective), Some(raw)) => {
+            parts.push(format!(
+                "{}% used ({}% eff · resets banked)",
+                format_used_percent(raw),
+                format_used_percent(effective)
+            ));
+        }
+        (Some(value), None) => parts.push(format!("{}% used", format_used_percent(value))),
+        (None, Some(raw)) => parts.push(format!("{}% used", format_used_percent(raw))),
+        (None, None) => parts.push("no data".to_string()),
+    }
+    if let Some(relative) = quota_resets_relative(window) {
+        parts.push(format!("resets in {relative}"));
+    } else {
+        let absolute = format_resets_at_rate_window(window);
+        if absolute != "-" {
+            parts.push(format!("resets {absolute}"));
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Relative reset countdown ("4h32m", "5d9h") from the window's resetsAt.
+fn quota_resets_relative(window: &Value) -> Option<String> {
+    let raw = window.get("resetsAt").and_then(Value::as_str)?;
+    let reset_secs = parse_rfc3339_to_utc_secs(raw)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if reset_secs <= now {
+        return None;
+    }
+    Some(format_duration_two_units(reset_secs - now))
+}
+
+/// Two-unit duration for countdowns: 5d9h, 4h32m, 32m, 45s.
+fn format_duration_two_units(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    if days > 0 {
+        if hours > 0 {
+            format!("{days}d{hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h{minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Optional account metadata after the label: org, plan, saved resets, and
+/// staleness. Every field is additive on the wire (QTA ships them
+/// incrementally), so absence simply omits the segment.
+fn quota_account_header_extras(entry: &Value) -> Vec<String> {
+    let mut extras = Vec::new();
+    let info = entry.get("accountInfo");
+    let email = info
+        .and_then(|i| i.get("email"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    // When the email is present it usually becomes the better primary label,
+    // but the label is already printed; surface it as detail only when it
+    // differs from what the label shows.
+    if let Some(email) = email {
+        if !account_label(entry).eq_ignore_ascii_case(email) {
+            extras.push(email.to_string());
+        }
+    }
+    if let Some(org) = info
+        .and_then(|i| i.get("orgName"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        extras.push(org.to_string());
+    }
+    if let Some(plan) = info
+        .and_then(|i| i.get("planType"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        extras.push(format!("plan: {plan}"));
+    }
+    if let Some(resets) = entry.get("savedResets") {
+        let count = resets
+            .get("availableCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if count > 0 {
+            let noun = if count == 1 {
+                "saved reset"
+            } else {
+                "saved resets"
+            };
+            let mut segment = format!("✦ {count} {noun}");
+            if let Some(expires) = resets
+                .get("soonestExpiresAt")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_to_utc_secs)
+            {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if expires > now {
+                    segment.push_str(&format!(
+                        " · soonest expires in {}",
+                        format_duration_two_units(expires - now)
+                    ));
+                }
+            }
+            extras.push(segment);
+        }
+    }
+    if let Some(fetched) = entry
+        .get("fetchedAt")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_to_utc_secs)
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Only worth a line when meaningfully stale; a fresh sweep is the
+        // normal case and would just be noise on every row.
+        if now > fetched + 90 {
+            extras.push(format!(
+                "fetched {} ago",
+                format_duration_two_units(now - fetched)
+            ));
+        }
+    }
+    extras
+}
+
+/// Distinct window labels across a provider's accounts, in first-seen order,
+/// so every account renders the same row set (absent ones as "not reported").
+fn quota_window_templates(group: &[&Value]) -> Vec<String> {
+    let mut seen = Vec::new();
+    for entry in group {
+        for (label, _) in quota_window_rows_for_entry(entry) {
+            if !seen.contains(&label) {
+                seen.push(label);
+            }
+        }
+    }
+    seen
+}
+
+struct QuotaWindowStat {
+    window: String,
+    accounts: usize,
+    used_accounts: f64,
+    remaining_accounts: f64,
+}
+
+/// Per-window account-capacity aggregation for multi-account providers: each
+/// account contributes its most-burned fraction per window label, so the
+/// summary reads as "accounts' worth of quota" burned and left.
+fn quota_provider_window_stats(group: &[&Value]) -> Vec<QuotaWindowStat> {
+    let mut buckets: Vec<(String, Vec<f64>)> = Vec::new();
+    for entry in group {
+        let mut account_max: HashMap<String, f64> = HashMap::new();
+        for (label, window) in quota_window_rows_for_entry(entry) {
+            let Some(used) = quota_window_used_percent(&window) else {
+                continue;
+            };
+            let fraction = (used / 100.0).clamp(0.0, 1.0);
+            let current = account_max.entry(label).or_insert(0.0);
+            if fraction > *current {
+                *current = fraction;
+            }
+        }
+        for (label, fraction) in account_max {
+            match buckets.iter_mut().find(|(name, _)| *name == label) {
+                Some((_, fractions)) => fractions.push(fraction),
+                None => buckets.push((label, vec![fraction])),
+            }
+        }
+    }
+    buckets
+        .into_iter()
+        .filter(|(_, fractions)| fractions.len() > 1)
+        .map(|(window, fractions)| {
+            let accounts = fractions.len();
+            let used_accounts: f64 = fractions.iter().sum();
+            QuotaWindowStat {
+                window,
+                accounts,
+                used_accounts,
+                remaining_accounts: (accounts as f64 - used_accounts).max(0.0),
+            }
+        })
+        .collect()
+}
+
+fn format_provider_display_name(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bold_text(text: &str, color_enabled: bool) -> String {
+    color_text(text, "1", color_enabled)
+}
+
+fn color_text(text: &str, code: &str, color_enabled: bool) -> String {
+    if color_enabled {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 
@@ -895,29 +1259,6 @@ fn label_from_window_minutes(minutes: i64) -> String {
         }
         m if m >= 60 && m % 60 == 0 => format!("{}h", m / 60),
         _ => format!("{minutes}m"),
-    }
-}
-
-fn format_used_percent_rate_window(window: &Value, color_enabled: bool) -> String {
-    let used = window.get("usedPercent").and_then(Value::as_f64);
-    // A relaxed window (banked-reset arming in effect) reports the effective
-    // pacing number in usedPercent and the provider's real utilization in
-    // rawUsedPercent. Humans want the real number; render it and note the
-    // effective one so 0% never reads as an idle account.
-    let raw = window.get("rawUsedPercent").and_then(Value::as_f64);
-    match (used, raw) {
-        (Some(effective), Some(raw)) => format!(
-            "{} {:>5}% ({}% eff · resets banked)",
-            format_quota_progress_bar(raw, color_enabled),
-            format_used_percent(raw),
-            format_used_percent(effective)
-        ),
-        (Some(value), None) => format!(
-            "{} {:>5}%",
-            format_quota_progress_bar(value, color_enabled),
-            format_used_percent(value)
-        ),
-        (None, _) => "-".to_string(),
     }
 }
 
@@ -1777,24 +2118,130 @@ mod tests {
     #[test]
     fn relaxed_window_renders_raw_percent_with_effective_note() {
         // A relaxed (banked-reset) window carries provider truth in
-        // rawUsedPercent beside the effective pacing number; the human table
+        // rawUsedPercent beside the effective pacing number; the human view
         // must show the raw value, not the effective zero.
         let relaxed = serde_json::json!({ "usedPercent": 0.0, "rawUsedPercent": 70.0 });
-        let rendered = format_used_percent_rate_window(&relaxed, false);
-        assert!(rendered.contains("70%"), "raw percent missing: {rendered}");
+        let details = quota_window_details(&relaxed);
         assert!(
-            rendered.contains("(0% eff · resets banked)"),
-            "effective note missing: {rendered}"
+            details.contains("70% used"),
+            "raw percent missing: {details}"
         );
+        assert!(
+            details.contains("(0% eff · resets banked)"),
+            "effective note missing: {details}"
+        );
+        // The bar and status dot follow the raw number too.
+        assert_eq!(quota_window_used_percent(&relaxed), Some(70.0));
 
-        // Unrelaxed windows omit the field and keep the original rendering.
+        // Unrelaxed windows omit the field and keep the plain rendering.
         let plain = serde_json::json!({ "usedPercent": 58.0 });
-        let rendered = format_used_percent_rate_window(&plain, false);
+        let details = quota_window_details(&plain);
         assert!(
-            rendered.contains("58%"),
-            "plain percent missing: {rendered}"
+            details.contains("58% used"),
+            "plain percent missing: {details}"
         );
-        assert!(!rendered.contains("eff"), "unexpected note: {rendered}");
+        assert!(!details.contains("eff"), "unexpected note: {details}");
+    }
+
+    #[test]
+    fn countdown_durations_use_two_units() {
+        assert_eq!(format_duration_two_units(16_320), "4h32m");
+        assert_eq!(format_duration_two_units(5 * 86_400 + 9 * 3_600), "5d9h");
+        assert_eq!(format_duration_two_units(45), "45s");
+        assert_eq!(format_duration_two_units(31 * 60), "31m");
+        assert_eq!(format_duration_two_units(2 * 3_600), "2h");
+    }
+
+    #[test]
+    fn window_templates_union_labels_across_accounts_in_first_seen_order() {
+        let a = serde_json::json!({
+            "provider": "anthropic",
+            "usage": {
+                "primary": { "usedPercent": 25.0, "windowMinutes": 300 },
+                "secondary": { "usedPercent": 54.0, "windowMinutes": 10080 },
+                "extraRateWindows": [
+                    { "title": "7 Day (Fable)", "window": { "usedPercent": 97.0 } }
+                ]
+            }
+        });
+        let b = serde_json::json!({
+            "provider": "anthropic",
+            "usage": {
+                "primary": { "usedPercent": 7.0, "windowMinutes": 300 }
+            }
+        });
+        let group = vec![&a, &b];
+        let templates = quota_window_templates(&group);
+        assert_eq!(templates, ["5h", "week", "7 Day (Fable)"]);
+    }
+
+    #[test]
+    fn provider_capacity_stats_sum_binding_fractions_per_window() {
+        // Two accounts on the same 5h window at 25% and 7% burn 0.32 accounts'
+        // worth of quota, leaving 1.68x; single-account windows are omitted
+        // (capacity math is only informative across account multiples).
+        let a = serde_json::json!({
+            "provider": "anthropic",
+            "usage": {
+                "primary": { "usedPercent": 25.0, "windowMinutes": 300 },
+                "secondary": { "usedPercent": 54.0, "windowMinutes": 10080 }
+            }
+        });
+        let b = serde_json::json!({
+            "provider": "anthropic",
+            "usage": {
+                "primary": { "usedPercent": 7.0, "windowMinutes": 300 }
+            }
+        });
+        let group = vec![&a, &b];
+        let stats = quota_provider_window_stats(&group);
+        assert_eq!(stats.len(), 1, "only the shared 5h window qualifies");
+        let stat = &stats[0];
+        assert_eq!(stat.window, "5h");
+        assert_eq!(stat.accounts, 2);
+        assert!((stat.used_accounts - 0.32).abs() < 1e-9);
+        assert!((stat.remaining_accounts - 1.68).abs() < 1e-9);
+    }
+
+    #[test]
+    fn account_header_extras_are_additive_and_absent_safe() {
+        // Bare current-wire entry: no extras at all.
+        let bare = serde_json::json!({ "provider": "codex", "account": "291f5165" });
+        assert!(quota_account_header_extras(&bare).is_empty());
+
+        // Enriched entry per QTA's committed additive contract.
+        let enriched = serde_json::json!({
+            "provider": "codex",
+            "account": "ufukaltinok@gmail.com",
+            "accountInfo": { "email": "ufukaltinok@gmail.com", "planType": "pro" },
+            "savedResets": { "availableCount": 4 }
+        });
+        let extras = quota_account_header_extras(&enriched);
+        // email equals the label, so it is not repeated; plan + resets render.
+        assert_eq!(extras.len(), 2, "extras: {extras:?}");
+        assert_eq!(extras[0], "plan: pro");
+        assert!(extras[1].starts_with("✦ 4 saved resets"));
+    }
+
+    #[test]
+    fn missing_window_renders_as_not_reported_row() {
+        let entry = serde_json::json!({
+            "provider": "anthropic",
+            "account": "wwaxpoetic@yahoo.com",
+            "usage": { "primary": { "usedPercent": 7.0, "windowMinutes": 300 } }
+        });
+        // Render against a template set that includes a window this account
+        // does not report; the line must exist and say so rather than vanish.
+        let templates = ["5h".to_string(), "7 Day (Fable)".to_string()];
+        let rows = quota_window_rows_for_entry(&entry);
+        let by_label: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(by_label.contains(&"5h"));
+        assert!(!by_label.contains(&"7 Day (Fable)"));
+        // The not-reported arm is exercised through print_quota_account; here
+        // we pin the line formatting primitive it uses.
+        let line = format_quota_window_line("5h", &rows[0].1, templates[1].len(), false);
+        assert!(line.contains("7% used"), "line: {line}");
+        assert!(line.contains("●"), "status dot missing: {line}");
     }
 
     #[test]

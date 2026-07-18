@@ -1,0 +1,142 @@
+{
+  "$comment": "Board wire contract v1 fixtures — canonical shapes SUBC's tab builds against. Casing: camelCase everywhere. Wire law: absent means unknown/not-applicable, present-empty means empty; renderers must distinguish. Unknown `kind` renders as a digest card. `digest` is MODULE-DERIVED from props at post time; agents never author it. Kind vocabulary v1: text, status, ask, show (+ reserved: todos). Version: board-wire-v1.",
+  "blocks": [
+    {
+      "$case": "status block, all digest fields present",
+      "blockId": "blk-status-build",
+      "lane": "status",
+      "kind": "status",
+      "rev": 3,
+      "props": {
+        "text": "Rooms reduction implementing; probe sweep 14/21 tools done",
+        "progress": { "done": 14, "total": 21 },
+        "state": "working"
+      },
+      "digest": {
+        "title": "Rooms reduction implementing",
+        "line2": "probe sweep 14/21 tools done",
+        "badge": "working"
+      }
+    },
+    {
+      "$case": "text block, minimal digest (line2/badge/urgency absent, NOT empty)",
+      "blockId": "blk-note-1",
+      "lane": "status",
+      "kind": "text",
+      "rev": 1,
+      "props": { "text": "Baseline re-measure chosen over epoch reuse; 5 min cost accepted." },
+      "digest": { "title": "Baseline re-measure chosen over epoch reuse; 5 min cost accepted." }
+    },
+    {
+      "$case": "ask block, joined ask row, pending",
+      "blockId": "blk-ask-9f2c",
+      "lane": "asks",
+      "kind": "ask",
+      "rev": 1,
+      "props": {
+        "requestId": "ask_9f2c11aa",
+        "question": "Merge the worktree pool now or after the probe sweep?",
+        "options": ["Merge now", "After sweep"],
+        "allowFreeText": true,
+        "status": "pending",
+        "silencePolicy": { "waitUntil": 1784412000000, "defaultDecision": "After sweep" }
+      },
+      "digest": {
+        "title": "Merge the worktree pool now or after the probe sweep?",
+        "line2": "2 options · default: After sweep",
+        "badge": "ask",
+        "urgency": "normal"
+      }
+    },
+    {
+      "$case": "ask block, answered (status flip arrives as rev bump on the SAME blockId)",
+      "blockId": "blk-ask-9f2c",
+      "lane": "asks",
+      "kind": "ask",
+      "rev": 2,
+      "props": {
+        "requestId": "ask_9f2c11aa",
+        "question": "Merge the worktree pool now or after the probe sweep?",
+        "options": ["Merge now", "After sweep"],
+        "allowFreeText": true,
+        "status": "answered",
+        "answer": "After sweep"
+      },
+      "digest": {
+        "title": "Merge the worktree pool now or after the probe sweep?",
+        "line2": "answered: After sweep",
+        "badge": "answered"
+      }
+    },
+    {
+      "$case": "show block (artifact), monospace + language tag",
+      "blockId": "blk-show-diff",
+      "lane": "artifacts",
+      "kind": "show",
+      "rev": 1,
+      "props": {
+        "title": "settle_canceling fix",
+        "language": "diff",
+        "body": "-                AND state IN ('sent','canceling','failed')\",\n+                AND state IN ('sent','canceling','failed','dead')\","
+      },
+      "digest": { "title": "settle_canceling fix", "line2": "diff · 2 lines", "badge": "show" }
+    },
+    {
+      "$case": "chat block, tee-produced from a well-formed <touser> span",
+      "blockId": "blk-chat-000041",
+      "lane": "chat",
+      "kind": "text",
+      "rev": 1,
+      "props": {
+        "text": "Campaign attempt 23 is through provisioning; first measured round expected within the hour.",
+        "producer": "tee"
+      },
+      "digest": { "title": "Campaign attempt 23 is through provisioning; first measured round expected within the hour." }
+    },
+    {
+      "$case": "chat block, tee captured a MALFORMED tag (unclosed) — degraded render path; module truncated at turn end, flagged in props; counted in health",
+      "blockId": "blk-chat-000042",
+      "lane": "chat",
+      "kind": "text",
+      "rev": 1,
+      "props": {
+        "text": "Heads up: the merge is",
+        "producer": "tee",
+        "teeDefect": "unclosed_tag"
+      },
+      "digest": { "title": "Heads up: the merge is", "badge": "partial" }
+    },
+    {
+      "$case": "UNKNOWN kind from a future vocabulary version — renderer must fall back to digest card, never decode-fail",
+      "blockId": "blk-future-1",
+      "lane": "status",
+      "kind": "flamegraph",
+      "rev": 1,
+      "props": { "$comment": "opaque to a v1 renderer", "columns": [1, 2, 3] },
+      "digest": { "title": "Decode hot path flamegraph", "line2": "unknown block kind (flamegraph)", "badge": "opaque" }
+    }
+  ],
+  "boardState": {
+    "$case": "full board.state reply — the renderer folds this snapshot verbatim; no client-side rev arithmetic",
+    "roomId": "rm_board_ses_example",
+    "sessionId": "ses_example",
+    "vocabulary": "board-wire-v1",
+    "servedSeq": 412,
+    "lanes": ["chat", "asks", "status", "artifacts"],
+    "blocks": [
+      { "$ref": "blk-status-build (rev 3 — newest-wins fold already applied)" },
+      { "$ref": "blk-ask-9f2c (rev 2)" },
+      { "$ref": "blk-show-diff (rev 1)" },
+      { "$ref": "blk-chat-000041 (rev 1)" },
+      { "$ref": "blk-chat-000042 (rev 1)" }
+    ],
+    "health": {
+      "kind": "health",
+      "props": {
+        "rung2Counters": { "proseQuestionsAtTurnEnd": 0 },
+        "rung3Counters": { "nudges": 0, "staleChipShown": false },
+        "teeCounters": { "wellFormed": 41, "malformed": 1, "leakedOtherHarness": 0, "syntaxMimicry": 0 }
+      }
+    }
+  }
+}

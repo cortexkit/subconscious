@@ -1,6 +1,8 @@
 # Room 2 Contract: Reversibility Ceilings, Action Taxonomy, Role ACL, Quorum
 
-Status: DRAFT r2 (seat review) — chair SUBC, seats ALF / CKCRED / FED, Ufuk product calls ratified in-room. r2 folds ALF [#13] (dual-class stamp struct, taxonomy skew check) and CKCRED [#15] (claim names, taxonomy_version carriage, electorate bundle_version citation).
+Status: FROZEN r3 (all seats freeze-ready: ALF [#18], CKCRED [#20], FED [#21]) — chair SUBC, seats ALF / CKCRED / FED, Ufuk product calls ratified in-room. Gate pending. r2 folded ALF [#13] (dual-class stamp struct, taxonomy skew check) and CKCRED [#15] (claim names, taxonomy_version carriage, electorate bundle_version citation). r3 folds the seat-review precision fixes: §2.4 broader step-up scope + pinned step-up identity, §4.2 conjunction eligibility, §4.4 cite fix, §5 artifact-home split, §3 pre-compiled exposure reading + single-row ACL home.
+
+Companion appendix (reviewed by the gate together with this contract): cortexkit-account docs/room2-ckcred-appendix.md @ bc7af59 (DDL + endpoint shapes).
 Lineage: team-mode-design.md v1.1 → Room-1 contract v7.3 (frozen; this document composes with it and amends nothing in it) → Room-2 kickoff + positions ([#5]–[#16] in #team-mode-room-2).
 Amendment discipline: same as Room 1 — post-freeze changes go through the A1 amendment process with all-seat confirm.
 
@@ -33,8 +35,10 @@ The **domain flags** (orthogonal, NOT on the ladder — no cross-domain ranking 
 
 | flag | meaning |
 |---|---|
-| `CREDENTIAL` | any vault, grant, or key surface |
-| `FINANCIAL` | spend or provisioning of paid resources |
+| `credential` | any vault, grant, or key surface |
+| `financial` | spend or provisioning of paid resources |
+
+Flags are **stamp markers**, not classes: every action has exactly one LADDER class, and the flags mark domain involvement orthogonally (a pure credential read is `{OBSERVE, credential: true}`; a vault write is `{MUTATE_DURABLE, credential: true}`).
 
 **The stamp is a struct, not a single class** (ALF [#13] pin 1, CKCRED-endorsed): `{tier_class: 1..5, credential: bool, financial: bool}`. The compiler emits the ladder class AND the flag bits in one stamping pass (params are already classified at stamp time). Dual-class actions are first-class: a git push of a credentials file stamps `{PUBLISH_EXTERNAL, credential: true, financial: false}`; a paid API call that publishes stamps `{PUBLISH_EXTERNAL, credential: false, financial: true}`. An action requiring a flag the member lacks PARKS even when its ladder class is below the member's tier — this kills the escape where a FINANCIAL action hides inside a low-ladder tool.
 
@@ -84,8 +88,9 @@ The ceiling is a **membership fact**: columns on `membership_grants`, surfacing 
 
 - A member may **self-LOWER** any component without admin involvement (shrinking authority is always safe).
 - Raising any component is **admin-only**.
-- Raising to the **top configuration** (tier 5, or either flag to `allowed`… see note) requires the acting admin to present a **fresh-login step-up attestation** (Ufuk-ratified (a2); same ceremony family as org-create). Consumer of the step-up primitive CKCRED reserved in [#10] §4.
-  - Draft note for seat review: the ratified text says "top tier". Chair reads the intent as: step-up required when the raise grants tier 5 OR flips a flag to `allowed` — i.e. any raise into the publish/credential/spend surface. CKCRED/ALF: confirm or narrow to literal tier-5-only before freeze.
+- Raising into the **sensitive surface** — to tier 5, OR either flag `ask`→`allowed` — requires the acting admin to present a **fresh-login step-up attestation** (Ufuk-ratified (a2); broader scope confirmed by all three seats [#18][#20][#21]: a `credential: allowed` grant must never be cheaper than the tier that merely permits publishing).
+- **Step-up identity (contract-pinned, CKCRED [#20])**: purpose `raise_ceiling`, audience `cortexkit-account:raise-ceiling`, 300s TTL, single-use with consume-with-op discipline (jti recorded by the mutation batch it authorizes, same family as `orgs.create_attestation_jti`). The attestation names the acting ADMIN; the raise target stays in the mutation body (single-use jti makes target-binding cost without a threat model — gate to verify this reasoning).
+- Self-lower and non-sensitive raises stay ordinary admin-gated §3.0 mutations; direction rules are enforced in the S1 predicate, not handler prose.
 
 ### 2.5 Enforcement point (ALF [#9], adopted)
 
@@ -99,11 +104,13 @@ Table `org_role_acl (org_id, role, agents_json, acl_epoch)`; org-admin mutations
 
 - Effective agents for a subject = `grant.agents[] ∩ role_acl[member.role]` — two set-intersections on one artifact, no side fetch (the Room-1 composition pin realized).
 - **Fail-closed**: a role with no ACL row authorizes NOTHING via role. The create ceremony seeds the admin role's ACL so day-one orgs work.
+- **Schema home (CKCRED [#20]§[#22])**: ONE `org_role_acl` row per (org, role) carrying `agents_json` AND `exposure_json` under a single `acl_epoch` — both halves of what a role means in one authority row, no cross-table skew. (FED raised no separability need.)
 
 ### 3.2 Role→exposure compiler (FED [#12], adopted)
 
-- The compiler lives **org-side** (CKCRED schema home). It compiles role → `federation_exposure` set: a closed, deny-unknown-fields list of module_id + tool/operation allowlists.
+- The compiler lives **org-side** (CKCRED schema home). It compiles role → `federation_exposure` set: a closed, deny-unknown-fields list of `{module_id, tools: [...], operations: [...]}` allowlists **mirroring fed's existing profile `expose` structure** (`ExposeEntry::Tool` / `ExposeEntry::Operation`, crates/fed-core/src/profile.rs). FED owns this shape; the org-side compiler produces conforming sets; a shape change is a fed-schema amendment the compiler follows (FED [#21]).
 - The compiled exposure set **rides the assertion bundle** — atomic with role + verified state; a role change atomically changes exposure (no drift-capable side object).
+- **Pre-compiled reading (FED [#21], pinned)**: the `federation_exposure` riding the bundle is the PRE-COMPILED per-member set, derived org-side from `role_acls[member.role]`. FED's reconcile reads it directly and NEVER re-runs the role→exposure compilation — the compiler is single-sourced org-side; fed is a pure bundle consumer enforcing at the gate.
 - The org daemon reconciles the exposure set into fed's exposure configuration **live**, on the roster-spine reconciliation path, under 0.3 latch-before-durable ordering.
 - FED's forwarder gate checks **verified AND exposure** (trust axis ∧ capability axis). Static profile `expose` entries are the local/pre-org fallback; a reconciled org-grant exposure set supersedes them (provenance Local < OrgGrant, matching roster provenance).
 - Enforceable without daemon restart (rides the live reconciliation the roster spine already proves).
@@ -120,7 +127,7 @@ Quorum is an **aggregation above `answered_held`**, not a new state machine. App
 
 ### 4.2 Electorate (Ufuk-ratified (c))
 
-- **Eligibility = ceiling-covers-it**: a member may approve an above-ceiling ask iff their own ceiling admits the action's stamped class (ladder: their tier ≥ class ordinal; flag: their flag is `allowed`). Admins qualify by construction at tier 5 + allowed flags.
+- **Eligibility = ceiling-covers-it, as the FULL CONJUNCTION over the stamp struct** (ALF [#18]): an approver qualifies iff their tier admits the stamp's ladder class AND their flags cover every set flag bit (`stamp.credential` ⇒ approver `credential: allowed`; `stamp.financial` ⇒ approver `financial: allowed`). A tier-5 member with `credential: ask` may NOT approve a credential-flagged ask — nobody approves what they could not perform. Admins qualify by construction at tier 5 + allowed flags. `N=2` keys off `stamp.financial`.
 - **N=1 default; N=2 for FINANCIAL-flagged actions.**
 - The voter set is **resolved to concrete subjects at park time and frozen into the ask row**, resolved from the CKCRED bundle at the ask's snapshot version, and the frozen list **cites the bundle_version it resolved from** — "who counted" is auditable after the fact against a specific signed snapshot with no new artifact (CKCRED [#15]). Mid-vote role/ceiling changes cannot expand the electorate; shrinkage events that would invalidate the frozen set arrive as epoch-bumps and kill the ask.
 
@@ -130,13 +137,14 @@ No new token kind. An approval's authority derives from facts the approver alrea
 
 ### 4.4 Composition with wernicke
 
-Ask rendering into chat surfaces follows wernicke's frozen spine (seed 5ee32ea): a-click-is-a-mention, subject-only server-side. Quorum adds no rendering obligations beyond showing per-approval progress (approved k of N), which is display-lane and non-normative.
+Ask rendering into chat surfaces follows wernicke's frozen spine (seed 5ee32ea): approval clicks ride the spine as authority turns carrying `{ask_id, option}`, options matched BY VALUE (never index), subject check server-side (ALF's A2 commitment, in flight). Quorum adds no rendering obligations beyond showing per-approval progress (approved k of N), which is display-lane and non-normative.
 
 ## 5. Wire shapes and refusal enums
 
-All new shapes deny-unknown-fields. Additions:
+All new shapes deny-unknown-fields. Additions, split by artifact home (CKCRED [#20]: the A2 fixture family must not grow org-scoped arrays):
 
-- A2 claims: `ceiling_tier` (u8, 1..=5), `ceiling_flags` (`{credential: "allowed"|"ask", financial: "allowed"|"ask"}`), `role_acls` (array of `{role, agents}`), `federation_exposure` (compiled set, closed shape owned by FED's profile schema).
+- **A2 claim additions** (per-subject): `ceiling_tier` (u8, 1..=5), `ceiling_flags` (`{credential: "allowed"|"ask", financial: "allowed"|"ask"}`), `taxonomy_version` (contract-pinned string, stamped at A2 signing from a constant — deliberately not a stored column), `federation_exposure` (the pre-compiled per-member set, closed shape owned by FED's profile schema).
+- **Bundle-body additions** (org-scoped): `role_acls` (array of `{role, agents, exposure}`).
 - Dispatch envelope (Zone 1): `action_stamp` `{tier_class, credential, financial, taxonomy_version}` — stamped, never client-supplied; a client-supplied value is rejected pre-parse by the same unrepresentability discipline as target_agent.
 - New refusal reasons (contract-pinned): `ceiling_exceeded` (carries the stamped class + the subject's ceiling tier/flag), `quorum_pending` (carries k-of-N progress), `quorum_electorate_empty` (park refused because zero eligible approvers exist at park time — surfaced loudly rather than parking an unanswerable ask), `acl_role_absent` (role has no ACL row).
 - Step-up: the top-raise mutation carries `step_up_jws` verified against the same audience discipline as org-create; absent/expired → `step_up_required`.
@@ -149,13 +157,13 @@ Vectors before implementation claims (Room-1 discipline):
 2. Ceiling gate vectors: admit-at-boundary (class == tier), deny-above, flag ask/allowed both ways, self-tighten never relaxes.
 3. Ceiling mutation vectors: self-lower ok, member-raise refused, admin raise ok, top-raise without step-up → `step_up_required`, kick/re-invite reset.
 4. ACL vectors: intersection math, absent-row fail-closed, admin seed at create.
-5. Quorum vectors: N=1 flip, N=2 FINANCIAL accumulation, park-time electorate freeze vs later role change, epoch-bump kill mid-vote, empty electorate refusal, non-qualifying approval rejected by ceiling check.
+5. Quorum vectors: N=1 flip, N=2 FINANCIAL accumulation, park-time electorate freeze vs later role change, epoch-bump kill mid-vote, empty electorate refusal, non-qualifying approval rejected by the FULL conjunction (incl. tier-5-with-ask-flag rejected on a flagged ask).
 6. Exposure vectors (FED): org-grant supersedes static, live reconcile without restart, verified∧exposure both required.
 
 ## 7. Open items at draft r1
 
 - ~~ALF PIN-2 confirm~~ CLOSED [#13]: comparison confirmed clean; unrepresentability lives in who stamps, not the comparison shape.
-- §2.4 scope note: "top tier" = tier-5-only vs any raise into tier-5/flag-allowed. Chair leans the latter; seats confirm.
+- ~~§2.4 scope note~~ CLOSED: broader reading confirmed by all three seats; pinned in §2.4 with the step-up identity.
 - Gate posture: full-panel if tonight's Athena recovery holds, else panel with explicit shortfall disclosure + heavier author line-cites.
 
 ## 8. Implementation partition (pre-agreed shape, activates at freeze)

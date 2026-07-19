@@ -1,5 +1,10 @@
 # ck-projects v6: the fleet project/workspace registry
 
+> STATUS: BUILD-FINAL — confirm re-gate ct_...5d4110e62fc8 returned GO 3-0 (sol, qwen,
+> grok), all four v6 folds verified mechanism-complete, no cross-fold regressions.
+> Two panel editorial clarifications folded post-verdict (workspace-removal both-kinds
+> wording; identity_split nullable new-project field). Build owner: SUBC.
+
 Drafted from the ratified fold of #workspace-projects-design (rm_toolu_01ByRWpGZeSjyJC3om18Y7ds):
 S1-S11 settled in round 1 (four seats), ratified by Ufuk with three additions S12-S14 and the
 store-of-record call (module-owned DB, journal spine). v2 folds the round-1 blind-gate findings
@@ -144,8 +149,9 @@ legal precisely because membership does not transfer — the merged roots land i
 successor's existing workspace context, and the report of the remove op names the dropped
 membership (workspace id) so the operator sees what detached.
 
-Removing a workspace detaches its projects (project_workspace AND the mirroring
-workspace_member locals cleared), never deletes them. All in one journal entry, one
+Removing a workspace deletes ALL its member rows — project_workspace, workspace_member
+locals AND remotes (both kinds; workspace removal is one of the two remote-row deleters)
+— detaching its projects, never deleting them. All in one journal entry, one
 generation.
 
 MEMBERSHIP READ INVARIANT: for local members, workspace_member and project_workspace are
@@ -415,7 +421,9 @@ workspaces: [...], members: [...] } }:
      (I1); the pair is recorded as skipped. When this splits an mc_identity group — some
      of its roots skipped to an existing project, the rest grouped into a new one — the
      report additionally records an explicit `identity_split` entry naming the
-     mc_identity, both project ids, and the roots on each side. A silent split would
+     mc_identity, the project ids involved, and the roots on each side — the new-project
+     field explicitly NULLABLE (null when no roots remained to group, or when
+     alias_occupied suppressed minting and unregistered roots fell to implicit). A silent split would
      understate an I3 violation; the split still happens (I1 outranks I3 on import), but
      it happens on the record.
 - ATOMICITY: the whole import is ONE journal entry and one generation transition — this is

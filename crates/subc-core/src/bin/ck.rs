@@ -109,8 +109,7 @@ const MODULE_HELP: &str = "ck module — inspect and control supervised modules\
 
 const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
-const HEALTH_HELP: &str =
-    "ck health — one-line health for every supervised module\n\nusage: ck [--json] health";
+const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with FULL metrics — bypasses\n                       the supervisor cache and its size truncation";
 
 const DAEMON_HELP: &str =
     "ck daemon — daemon version, uptime, and connection info\n\nusage: ck [--json] daemon";
@@ -158,6 +157,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             module_set_enabled(&mut client, &module_id, true, args.json).await
         }
         Command::Health => health(&mut client, args.json).await,
+        Command::HealthDetail { module_id } => {
+            health_detail(&mut client, &module_id, args.json).await
+        }
         Command::Daemon => daemon(&mut client, args.json).await,
         Command::Quota {
             provider_id,
@@ -192,6 +194,9 @@ struct CkArgs {
 enum Command {
     Module(ModuleCommand),
     Health,
+    HealthDetail {
+        module_id: String,
+    },
     Daemon,
     Quota {
         provider_id: Option<String>,
@@ -551,6 +556,71 @@ async fn health(client: &mut CkClient, json_output: bool) -> Result<(), CkError>
         print_health_table(modules_array(&value));
     }
     Ok(())
+}
+
+/// `ck health <id>` — issue a FRESH health.check to the module (via the
+/// daemon's supervisor.health_probe one-shot) and render the full report.
+/// The probe path carries the module's complete metrics object; nothing
+/// passes through the supervisor's cached-status blob or its size cap.
+async fn health_detail(
+    client: &mut CkClient,
+    module_id: &str,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let value = client
+        .rpc_value(ClientControlRequest::SupervisorHealthProbe {
+            module_id: module_id.to_string(),
+        })
+        .await?;
+    if json_output {
+        print_json(&value)?;
+        return Ok(());
+    }
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("?");
+    println!("{module_id}: {status}");
+    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
+        if !detail.is_empty() {
+            println!("  {detail}");
+        }
+    }
+    if let Some(metrics) = value.get("metrics") {
+        if !metrics.is_null() {
+            print_metrics_tree(metrics, 1);
+        }
+    }
+    Ok(())
+}
+
+/// Render a metrics JSON object as an indented tree. Health metrics are
+/// module-defined free-form JSON; a tree keeps nested sections (memory
+/// roots, dispatch lanes) readable without knowing their schema.
+fn print_metrics_tree(value: &Value, depth: usize) {
+    let indent = "  ".repeat(depth);
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                match child {
+                    Value::Object(_) | Value::Array(_) => {
+                        println!("{indent}{key}:");
+                        print_metrics_tree(child, depth + 1);
+                    }
+                    other => println!("{indent}{key}: {other}"),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::Object(_) | Value::Array(_) => {
+                        println!("{indent}-");
+                        print_metrics_tree(item, depth + 1);
+                    }
+                    other => println!("{indent}- {other}"),
+                }
+            }
+        }
+        other => println!("{indent}{other}"),
+    }
 }
 
 async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError> {
@@ -1883,7 +1953,16 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         }
         "health" => match tail.first() {
             None => Ok(Command::Health),
-            Some(_) => Ok(Command::Help(HEALTH_HELP.into())),
+            Some(argument) => {
+                let argument = argument.to_string_lossy();
+                if argument == "-h" || argument == "--help" || argument == "help" {
+                    Ok(Command::Help(HEALTH_HELP.into()))
+                } else {
+                    Ok(Command::HealthDetail {
+                        module_id: argument.into_owned(),
+                    })
+                }
+            }
         },
         "daemon" => match tail.first() {
             None => Ok(Command::Daemon),

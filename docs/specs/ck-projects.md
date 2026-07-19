@@ -217,6 +217,17 @@ mutation; gate finding on query-side generation bumps closed).
 
 An unregistered root resolves to `pj-implicit1-<16hex>`:
 
+- UNICODE / BYTE-FORM GUARANTEE (adopted from AFT's source answer, channel
+  [#37]): cortexkit-paths performs no unicode normalization by explicit
+  policy; safety is filesystem-first — realpath returns each component's
+  on-disk byte form, and normalization-insensitive filesystems (APFS)
+  converge NFC/NFD spellings of an existing directory to the same bytes.
+  The non-existent-path corner is closed by EXISTENCE-AT-REGISTRATION:
+  register and derived-parent declaration reject non-existent roots with a
+  typed error, so every hash-contract input stored by the registry is an
+  on-disk byte form. resolve() may still mint an implicit id for a
+  non-existent queried path (gone:true answers); such ids inherit the
+  offline-derivation caveat — hints, never persistable.
 - ALGORITHM (version tag "1", AFT's proposal, MC co-signed): blake3 over the UTF-8 bytes of
   the cortexkit-paths canonical absolute path, first 16 lowercase hex characters. A future
   algorithm change mints `pj-implicit2-...` — distinguishable, never silently colliding.

@@ -15,6 +15,9 @@ struct BoardView: View {
     @State private var expandedBlocks: Set<String> = []
 
     private static let blockCharBudget = 4_000
+    /// Newest blocks rendered per lane before a show-earlier toggle.
+    private static let laneBlockCap = 30
+    @State private var expandedLanes: Set<String> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -119,7 +122,17 @@ struct BoardView: View {
                     .foregroundColor(.secondary)
                     .padding(.leading, 4)
             } else {
-                ForEach(blocks) { block in
+                // Live sessions grow the chat lane on every poll; an unbounded
+                // ForEach makes each re-diff proportional to session length.
+                let visible = expandedLanes.contains(lane) ? blocks : Array(blocks.suffix(Self.laneBlockCap))
+                if blocks.count > visible.count {
+                    Button("Show \(blocks.count - visible.count) earlier") {
+                        expandedLanes.insert(lane)
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                }
+                ForEach(visible) { block in
                     blockView(block)
                 }
             }
@@ -294,16 +307,19 @@ struct BoardView: View {
 
     private func digestHeader(_ block: BoardBlock, suppressTitle: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 4) {
+            // No text selection on headers: every selection-enabled Text adds
+            // a SelectionOverlay whose update cost is paid on EVERY re-diff —
+            // with hundreds of blocks this alone wedged the main thread
+            // (watchdog samples, 2026-07-19). Bodies keep selection; titles
+            // are digest summaries with copyable bodies below them.
             if !suppressTitle {
                 Text(block.digest.title)
                     .font(.system(size: 13, weight: .bold))
-                    .textSelection(.enabled)
             }
             if let line2 = block.digest.line2 {
                 Text(line2)
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .textSelection(.enabled)
             }
             HStack(spacing: 5) {
                 if let badge = block.digest.badge {

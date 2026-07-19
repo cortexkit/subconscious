@@ -122,6 +122,14 @@ states (contract §4.1); three additive pieces:
    authority at exercise). One added snapshot read inside the CAS transaction
    Slice C already owns.
 
+   VERSION MONOTONICITY GUARD (CKCRED [#34] dependency, made explicit): the
+   revalidation records the bundle_version it read, and the flip REFUSES
+   (stays parked, NO lapse annotations) if that version is older than the
+   highest bundle_version any counted approval was cast under. Lapsing
+   approvals against a stale snapshot would reintroduce the F1 hole from the
+   other side; the normal case is monotone so the guard is free, existing only
+   to make a broken snapshot resolution loud instead of quietly wrong.
+
 3. EPOCH KILL: unchanged Slice C semantics — membership_epoch bump kills
    parked AND answered_held asks including partial quorum (no resurrection,
    §4.1). Because the electorate is frozen at park, a role change that would
@@ -143,6 +151,7 @@ states (contract §4.1); three additive pieces:
   requester-excluded-from-own-electorate; flip-time revalidation (counted
   approval lapses on ceiling lowering between count and flip → approval_lapsed,
   flip refused at N-1 surviving; re-approval by a still-qualified subject then
-  flips).
+  flips); version-monotonicity refusal (approval cast under bundle_version 7,
+  flip attempted with observed version 5 → refuse, zero annotations).
 
 Vectors land as fixtures before any implementation claim (Room-1 discipline).

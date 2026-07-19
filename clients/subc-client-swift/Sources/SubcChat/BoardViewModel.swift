@@ -3,30 +3,50 @@ import SubcChatAskSupport
 import SubcClient
 import SwiftUI
 
-/// Polls the session-scoped board surface while the Board tab is visible. The
-/// management call and JSON decoding stay on a serialized worker queue so a slow
-/// daemon cannot block SwiftUI's main actor.
+/// Polls one agent session's board while the Board tab is visible. The board is
+/// owned by the AGENT's room identity (harness + session); this app reads it as
+/// the human seat. The management call and JSON decoding stay on a serialized
+/// worker queue so a slow daemon cannot block SwiftUI's main actor.
 @MainActor
 final class BoardViewModel: ObservableObject {
     @Published var board: BoardState?
     @Published var status: String = "idle"
     @Published var opsAvailable: Bool?
-
-    let sessionId: String
+    /// The agent session whose board we read. Nil until the user picks one;
+    /// board.list discovery will replace manual entry when the module ships it.
+    @Published var targetHarness: String
+    @Published var targetSession: String
 
     private let work = DispatchQueue(label: "subc-board.client", qos: .userInitiated)
     private let worker: BoardWorker
     private var timer: Timer?
     private var visible = false
+    private static let targetFile = "board-target.txt"
 
     init() {
         let dir = Self.appDataDir()
-        sessionId = Self.loadOrMintSessionId(dir: dir)
+        let saved = Self.loadTarget(dir: dir)
+        targetHarness = saved?.harness ?? "opencode"
+        targetSession = saved?.session ?? ""
         worker = BoardWorker(
             connectionFile: NSString(string: "~/.local/share/cortexkit/run/subc-connection.json").expandingTildeInPath,
-            harness: "ck-app",
-            sessionId: sessionId,
             callerDirectory: dir.path)
+    }
+
+    var hasTarget: Bool {
+        !targetSession.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func applyTarget() {
+        let harness = targetHarness.trimmingCharacters(in: .whitespacesAndNewlines)
+        let session = targetSession.trimmingCharacters(in: .whitespacesAndNewlines)
+        targetHarness = harness.isEmpty ? "opencode" : harness
+        targetSession = session
+        Self.saveTarget(dir: Self.appDataDir(), harness: targetHarness, session: session)
+        board = nil
+        opsAvailable = nil
+        status = hasTarget ? "connecting" : "no target"
+        refresh()
     }
 
     func appear() {
@@ -45,11 +65,17 @@ final class BoardViewModel: ObservableObject {
     }
 
     func refresh() {
-        guard visible else { return }
+        guard visible, hasTarget else { return }
         let worker = worker
+        let harness = targetHarness
+        let session = targetSession
         work.async { [weak self, worker] in
             do {
-                let raw = try worker.alfonsoCallBlocking("board.state", [:])
+                // Owner identity params per the board dispatch contract: the
+                // AGENT's harness + session ("session", not "sessionId").
+                let raw = try worker.alfonsoCallBlocking(
+                    "board.state",
+                    ["harness": harness, "session": session])
                 let state = try worker.decode(BoardState.self, from: raw)
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -58,9 +84,8 @@ final class BoardViewModel: ObservableObject {
                     self.status = "live"
                 }
             } catch {
-                // A missing module operation is expected during staged rollout. Keep
-                // the empty state and poll again without putting transport errors in
-                // the board itself or displaying a new error on every tick.
+                // A missing board (flag off, wrong session id) is an expected
+                // state during rollout. Keep polling without spamming errors.
                 worker.resetConnection()
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -80,15 +105,18 @@ final class BoardViewModel: ObservableObject {
         return dir
     }
 
-    private static func loadOrMintSessionId(dir: URL) -> String {
-        let file = dir.appendingPathComponent("rooms-identity.txt")
-        if let existing = try? String(contentsOf: file, encoding: .utf8),
-           !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return existing.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        let minted = "ckapp-\(UUID().uuidString)"
-        try? minted.write(to: file, atomically: true, encoding: .utf8)
-        return minted
+    private static func loadTarget(dir: URL) -> (harness: String, session: String)? {
+        let file = dir.appendingPathComponent(targetFile)
+        guard let raw = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard lines.count >= 2, !lines[1].isEmpty else { return nil }
+        return (harness: lines[0].isEmpty ? "opencode" : lines[0], session: lines[1])
+    }
+
+    private static func saveTarget(dir: URL, harness: String, session: String) {
+        let file = dir.appendingPathComponent(targetFile)
+        try? "\(harness)\n\(session)\n".write(to: file, atomically: true, encoding: .utf8)
     }
 }
 
@@ -96,16 +124,16 @@ final class BoardViewModel: ObservableObject {
 /// separate from the main-actor view model, matching the ObserveWorker pattern.
 private final class BoardWorker: @unchecked Sendable {
     private let connectionFile: String
-    private let harness: String
-    private let sessionId: String
     private let callerDirectory: String
     private var client: SubcClient?
     private var route: RouteHandle?
+    /// The app's own route identity for the management connection. Distinct from
+    /// the board OWNER identity, which rides in call params: ensure_board_room
+    /// rejects "ck-app" as an owner harness (it is the reserved human seat).
+    private let routeSession = "ckapp-board-\(UUID().uuidString)"
 
-    init(connectionFile: String, harness: String, sessionId: String, callerDirectory: String) {
+    init(connectionFile: String, callerDirectory: String) {
         self.connectionFile = connectionFile
-        self.harness = harness
-        self.sessionId = sessionId
         self.callerDirectory = callerDirectory
     }
 
@@ -117,8 +145,6 @@ private final class BoardWorker: @unchecked Sendable {
 
     func alfonsoCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
         var merged = params
-        merged["harness"] = harness
-        merged["sessionId"] = sessionId
         merged["callerDirectory"] = callerDirectory
         let (client, route) = try ensureRouteBlocking()
         let reply = try client.callManagement(route: route, method: method, params: merged)
@@ -139,8 +165,8 @@ private final class BoardWorker: @unchecked Sendable {
         let opened = try c.routeOpenManagementSurface(
             moduleId: "alfonso-core",
             projectRoot: callerDirectory,
-            harness: harness,
-            session: sessionId)
+            harness: "ck-app",
+            session: routeSession)
         client = c
         route = opened
         return (c, opened)

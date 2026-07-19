@@ -13,8 +13,9 @@ struct BoardView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            targetBar
             Divider()
-            if vm.opsAvailable == false {
+            if vm.hasTarget && vm.opsAvailable == false {
                 unavailable
             }
             boardContent
@@ -46,12 +47,29 @@ struct BoardView: View {
     private var unavailable: some View {
         HStack(spacing: 6) {
             Image(systemName: "square.grid.2x2")
-            Text("Board not available for this session")
+            Text("No board for this session (flag off, or session id mismatch)")
                 .font(.caption)
         }
         .padding(8)
         .frame(maxWidth: .infinity)
         .background(Color.orange.opacity(0.12))
+    }
+
+    /// Manual board targeting until the module ships board.list discovery: the
+    /// board is owned by an AGENT session, so the app must be pointed at one.
+    private var targetBar: some View {
+        HStack(spacing: 8) {
+            TextField("harness", text: $vm.targetHarness)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 110)
+            TextField("agent session id (owns the board)", text: $vm.targetSession)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { vm.applyTarget() }
+            Button("Connect") { vm.applyTarget() }
+                .disabled(vm.targetSession.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 8)
     }
 
     @ViewBuilder
@@ -64,6 +82,14 @@ struct BoardView: View {
                     }
                 }
                 .padding(12)
+            }
+        } else if !vm.hasTarget {
+            VStack(spacing: 8) {
+                Spacer()
+                Image(systemName: "square.grid.2x2").font(.title2).foregroundColor(.secondary)
+                Text("Enter the agent session id whose board to show")
+                    .foregroundColor(.secondary)
+                Spacer()
             }
         } else if vm.opsAvailable == false {
             Spacer()

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>SUBC — The CortexKit Landscape</title>
+<title>SUBC: The CortexKit Landscape</title>
 <style>
   :root {
     --bg:#0b0e14; --panel:#11161f; --panel2:#161c28; --line:#222b3a;
@@ -17,7 +17,7 @@
   body { background:var(--bg); color:var(--txt); font-family:var(--sans); font-size:15px; line-height:1.6; display:flex; }
   a { color:var(--acc); text-decoration:none; }
 
-  /* ---- sidebar ---- */
+  /* sidebar */
   nav.side {
     width:248px; flex:0 0 248px; height:100vh; position:sticky; top:0;
     background:linear-gradient(180deg,#0d1119,#0b0e14); border-right:1px solid var(--line);
@@ -35,10 +35,8 @@
   .nav-link.active { background:var(--panel2); color:var(--txt); border-color:var(--line); }
   .nav-link .ix { width:20px; height:20px; border-radius:5px; background:#0c1119; border:1px solid var(--line);
     display:flex; align-items:center; justify-content:center; font-size:11px; color:var(--acc); font-family:var(--mono); }
-  .nav-link.soon { opacity:.5; }
-  .nav-link.soon .tag { margin-left:auto; font-size:9px; color:var(--faint); border:1px solid var(--line); padding:1px 5px; border-radius:20px; }
 
-  /* ---- content ---- */
+  /* content */
   main { flex:1; min-width:0; max-width:1080px; padding:40px 56px 120px; }
   section.page { display:none; animation:fade .25s ease; }
   section.page.show { display:block; }
@@ -48,8 +46,8 @@
   h1 { font-size:34px; margin:6px 0 8px; letter-spacing:-.5px; }
   h2 { font-size:21px; margin:38px 0 6px; letter-spacing:-.2px; }
   h3 { font-size:15px; margin:22px 0 6px; color:var(--txt); }
-  p.lead { color:var(--dim); font-size:16.5px; max-width:760px; }
-  p { max-width:760px; }
+  p.lead { color:var(--dim); font-size:16.5px; max-width:780px; }
+  p { max-width:780px; }
   .muted { color:var(--dim); }
   code { font-family:var(--mono); background:#0c1119; border:1px solid var(--line); padding:1px 6px; border-radius:5px; font-size:12.5px; color:#cfe7ff; }
 
@@ -57,7 +55,7 @@
     border-radius:10px; padding:14px 18px; margin:18px 0; max-width:780px; }
   .callout b { color:#fff; }
 
-  /* ---- overview diagram ---- */
+  /* overview diagram */
   .diagram { background:radial-gradient(120% 120% at 50% 0%, #10172180, transparent), var(--panel);
     border:1px solid var(--line); border-radius:16px; padding:30px; margin:26px 0; }
   .tier { display:flex; gap:14px; justify-content:center; flex-wrap:wrap; }
@@ -67,11 +65,11 @@
     min-width:130px; text-align:center; position:relative;
   }
   .node b { display:block; font-size:13.5px; }
-  .node small { color:var(--dim); font-size:11px; }
+  .node small { color:var(--dim); font-size:11px; display:block; }
   .node.client { border-color:#2a3550; }
   .daemon {
     background:linear-gradient(180deg,#13233a,#0f1626); border:1px solid var(--acc);
-    border-radius:14px; padding:18px 26px; text-align:center; margin:8px auto; max-width:520px;
+    border-radius:14px; padding:18px 26px; text-align:center; margin:8px auto; max-width:560px;
     box-shadow:0 0 0 1px #5cc8ff22, 0 8px 40px #5cc8ff14;
   }
   .daemon b { font-size:16px; color:#fff; }
@@ -82,48 +80,71 @@
   .mod { border-color:#23402f; }
   .mod b { color:#bdebd6; }
 
-  /* ---- envelope ---- */
+  /* envelope */
   .env { display:flex; border:1px solid var(--line); border-radius:12px; overflow:hidden; margin:22px 0 10px; font-family:var(--mono); }
-  .field { padding:16px 10px; text-align:center; cursor:pointer; border-right:1px solid var(--line); position:relative; transition:background .15s; flex:1; }
+  .field { padding:16px 8px; text-align:center; cursor:pointer; border-right:1px solid var(--line); position:relative; transition:background .15s; flex:1; min-width:54px; }
   .field:last-child { border-right:none; }
   .field:hover, .field.sel { background:#16202f; }
   .field .nm { font-size:13px; color:#fff; }
-  .field .bytes { font-size:10px; color:var(--faint); margin-top:4px; }
+  .field .bytes { font-size:10px; color:var(--faint); margin-top:4px; white-space:nowrap; }
   .field .bar { height:3px; border-radius:3px; margin-top:8px; background:var(--acc); opacity:.55; }
   .field[data-frozen="1"] .bar { background:var(--warn); }
   .env-meta { display:flex; gap:8px; align-items:center; color:var(--faint); font-family:var(--mono); font-size:11px; margin-bottom:8px; }
-  .env-detail { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; min-height:92px; }
+  .env-detail { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; min-height:104px; }
   .env-detail h4 { margin:0 0 4px; font-family:var(--mono); color:var(--acc); font-size:13px; }
   .env-detail .b { font-family:var(--mono); color:var(--warn); font-size:11px; }
   .pill { display:inline-block; font-size:10px; font-family:var(--mono); padding:2px 7px; border-radius:20px; border:1px solid var(--line); color:var(--dim); margin-right:5px; }
 
   table.frames { width:100%; border-collapse:collapse; margin:14px 0; font-size:13px; }
   table.frames th { text-align:left; color:var(--faint); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.5px; padding:6px 10px; border-bottom:1px solid var(--line); }
-  table.frames td { padding:7px 10px; border-bottom:1px solid #1a2230; }
+  table.frames td { padding:7px 10px; border-bottom:1px solid #1a2230; vertical-align:top; }
   table.frames td.k { font-family:var(--mono); color:var(--acc); }
   table.frames tr:hover td { background:#0f1622; }
 
-  /* ---- module cards ---- */
+  /* module cards */
   .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(232px,1fr)); gap:12px; margin:22px 0; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:15px 16px; cursor:pointer; transition:border-color .15s, transform .1s; }
   .card:hover { border-color:var(--acc2); transform:translateY(-2px); }
   .card.sel { border-color:var(--acc); background:var(--panel2); }
-  .card .top { display:flex; align-items:center; justify-content:space-between; }
+  .card .top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
   .card .nm { font-weight:600; font-size:14.5px; }
   .card .role { color:var(--faint); font-size:11px; font-family:var(--mono); margin-top:1px; }
   .card .desc { color:var(--dim); font-size:12.5px; margin-top:9px; }
-  .st { font-size:9.5px; font-family:var(--mono); padding:2px 7px; border-radius:20px; }
+  .st { font-size:9.5px; font-family:var(--mono); padding:2px 7px; border-radius:20px; white-space:nowrap; }
   .st.live { color:var(--ok); border:1px solid #1f5240; background:#0e2118; }
-  .st.design { color:var(--warn); border:1px solid #5a4420; background:#211a0e; }
+  .st.building { color:var(--warn); border:1px solid #5a4420; background:#211a0e; }
   .mod-detail { background:var(--panel); border:1px solid var(--acc); border-radius:12px; padding:20px 22px; margin-top:14px; min-height:120px; }
   .mod-detail h3 { margin:0 0 2px; font-size:17px; }
   .mod-detail .kv { display:grid; grid-template-columns:118px 1fr; gap:6px 14px; margin-top:14px; font-size:13px; }
   .mod-detail .kv .k { color:var(--faint); font-family:var(--mono); font-size:11.5px; }
   .empty-hint { color:var(--faint); font-size:13px; text-align:center; padding:28px; }
 
-  .soon-banner { background:var(--panel); border:1px dashed var(--line); border-radius:12px; padding:34px; text-align:center; color:var(--dim); }
-  .soon-banner b { color:var(--txt); }
+  /* compact diagrams for the detail pages */
+  .flow-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; margin:24px 0; }
+  .flow-step { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .flow-step .num { width:25px; height:25px; display:flex; align-items:center; justify-content:center; border:1px solid var(--acc2); border-radius:50%; color:var(--acc); font-family:var(--mono); font-size:11px; }
+  .flow-step h3 { margin:10px 0 8px; }
+  .route-line { color:var(--dim); font-family:var(--mono); font-size:11px; line-height:1.9; }
+  .route-line strong { color:var(--acc); font-weight:500; }
+  .status-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:24px 0; }
+  .status-col { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
+  .status-col.shipped { border-top:3px solid var(--ok); }
+  .status-col.building { border-top:3px solid var(--warn); }
+  .status-col h2 { margin:0 0 10px; font-size:17px; }
+  .status-col ul { margin:0; padding-left:19px; color:var(--dim); }
+  .status-col li { margin:6px 0; }
   footer { color:var(--faint); font-size:11.5px; margin-top:60px; border-top:1px solid var(--line); padding-top:16px; font-family:var(--mono); }
+
+  @media (max-width:760px) {
+    body { display:block; }
+    nav.side { width:100%; height:auto; position:static; display:flex; flex-wrap:wrap; gap:3px; padding:14px; }
+    .brand, nav.side > small { width:100%; }
+    .nav-link { margin:0; }
+    main { padding:28px 20px 80px; }
+    .env { overflow-x:auto; }
+    .field { flex:none !important; min-width:86px; }
+    .status-grid { grid-template-columns:1fr; }
+  }
 </style>
 </head>
 <body>
@@ -133,117 +154,247 @@
   <div class="nav-link active" data-go="overview"><span class="ix">◇</span> Overview</div>
   <div class="nav-link" data-go="protocol"><span class="ix">⊟</span> Protocol &amp; Envelope</div>
   <div class="nav-link" data-go="modules"><span class="ix">⊞</span> Module Ecosystem</div>
-  <div class="nav-link soon" data-go="flows"><span class="ix">⇄</span> Data Flows <span class="tag">SOON</span></div>
-  <div class="nav-link soon" data-go="transport"><span class="ix">⚷</span> Transport &amp; Auth <span class="tag">SOON</span></div>
-  <div class="nav-link soon" data-go="storage"><span class="ix">▤</span> Storage <span class="tag">SOON</span></div>
-  <div class="nav-link soon" data-go="auth"><span class="ix">⊙</span> Multi-Auth <span class="tag">SOON</span></div>
-  <div class="nav-link soon" data-go="cache"><span class="ix">❄</span> Cache-Policy Core <span class="tag">SOON</span></div>
-  <div class="nav-link soon" data-go="status"><span class="ix">✓</span> Status <span class="tag">SOON</span></div>
+  <div class="nav-link" data-go="flows"><span class="ix">⇄</span> Data Flows</div>
+  <div class="nav-link" data-go="transport"><span class="ix">⚷</span> Transport &amp; Auth</div>
+  <div class="nav-link" data-go="storage"><span class="ix">▤</span> Storage</div>
+  <div class="nav-link" data-go="auth"><span class="ix">⊙</span> Multi-Auth</div>
+  <div class="nav-link" data-go="cache"><span class="ix">❄</span> Cache-Policy Core</div>
+  <div class="nav-link" data-go="status"><span class="ix">✓</span> Status</div>
 </nav>
 
 <main>
-  <!-- ============ OVERVIEW ============ -->
+  <!-- OVERVIEW -->
   <section class="page show" id="overview">
     <div class="eyebrow">The CortexKit Landscape</div>
-    <h1>SUBC — the multiplexed splice-router</h1>
-    <p class="lead">A per-user local daemon that supervises CortexKit's modules and routes their traffic — forwarding packets by reading only a fixed 17-byte header, never deserializing the body.</p>
+    <h1>SUBC: the multiplexed splice-router</h1>
+    <p class="lead">The per-user <code>ck-subc</code> daemon supervises CortexKit modules and routes their traffic by reading a fixed 21-byte WIRE v2 header. Payload bodies remain opaque.</p>
 
     <div class="callout">
-      <b>Why it exists.</b> AFT (the tool engine) ran as an OpenCode/Pi-managed binary behind a <i>single NDJSON lane</i> — every tool call queued behind the previous one (head-of-line blocking). SUBC moves AFT to a daemon-supervised <b>module</b>, makes it MCP-capable, and removes the single-lane constraint so non-mutating tools run concurrently.
+      <b>Shipped outcome.</b> AFT is a subc consumer in production. Tool traffic moved off the retired NDJSON lane, so independent calls can run concurrently through supervised routes instead of queueing behind one stream.
     </div>
 
     <div class="diagram">
-      <div class="tier-label">Clients &amp; Harnesses</div>
+      <div class="tier-label">Clients and Harnesses</div>
       <div class="tier">
-        <div class="node client"><b>CK App</b><small>native Swift client</small></div>
-        <div class="node client"><b>OpenCode / Pi</b><small>plugin → subc-client</small></div>
-        <div class="node client"><b>Claude Code</b><small>MCP stdio shim</small></div>
+        <div class="node client"><b>subc-chat</b><small>Swift observability testbed</small></div>
+        <div class="node client"><b>OpenCode / Pi</b><small>@cortexkit/subc-client</small></div>
+        <div class="node client"><b>Claude Code / Codex</b><small>ck-subc-mcp shim</small></div>
+        <div class="node client"><b>brocatui</b><small>TUI, building</small></div>
+        <div class="node client"><b>Cortex app</b><small>future app, design</small></div>
       </div>
-      <div class="conn">│ &nbsp; loopback TCP + HMAC handshake &nbsp; │</div>
+      <div class="conn">│ &nbsp; loopback TCP + server-first HMAC &nbsp; │</div>
       <div class="daemon">
-        <b>subc-core daemon</b>
-        <div class="sub">17-byte envelope router · channel mux · supervisor</div>
+        <b>ck-subc</b>
+        <div class="sub">WIRE v2 · channel/epoch mux · process supervisor</div>
         <div class="crates">
-          <span class="chip">subc-protocol</span><span class="chip">subc-transport</span>
-          <span class="chip">subc-control</span><span class="chip">subc-core</span><span class="chip">subc-mcp</span>
+          <span class="chip">ck operator CLI</span><span class="chip">ck-subc-mcp</span>
+          <span class="chip">subc-protocol</span><span class="chip">subc-transport</span><span class="chip">subc-core</span>
         </div>
       </div>
-      <div class="conn">│ &nbsp; spawns · supervises · routes channels &nbsp; │</div>
-      <div class="tier-label">Supervised Modules</div>
+      <div class="conn">│ &nbsp; spawns · supervises · routes &nbsp; │</div>
+      <div class="tier-label">Supervised Fleet</div>
       <div class="tier">
-        <div class="node mod"><b>AFT</b><small>tool provider</small></div>
-        <div class="node mod"><b>llm-runner</b><small>agentic loop</small></div>
-        <div class="node mod"><b>ai-provider-quota</b><small>usage windows</small></div>
-        <div class="node mod"><b>alfonso-routing</b><small>model select</small></div>
-        <div class="node mod"><b>credentials</b><small>secret vault</small></div>
+        <div class="node mod"><b>AFT</b><small>tools</small></div>
+        <div class="node mod"><b>broca</b><small>durable LLM loop</small></div>
+        <div class="node mod"><b>magic-context</b><small>context lifecycle</small></div>
+        <div class="node mod"><b>alfonso</b><small>agent runtime</small></div>
+        <div class="node mod"><b>callosum</b><small>federation</small></div>
       </div>
     </div>
 
     <h2>The thin-core bet</h2>
-    <p class="muted">SUBC reads only the envelope header to make a routing decision; payloads are opaque bytes it forwards without parsing. That keeps it fast, schema-decoupled, and means a new module needs <b>zero edits to subc-core</b> — a module is just a process that speaks the wire and declares a manifest. <b>Channel 0</b> is the control plane (RPCs); non-zero channels are data-plane routes the router rewrites between independent client-side and module-side channel spaces.</p>
+    <p class="muted">SUBC reads only the envelope header to route opaque payloads. A new module declares a manifest and speaks the wire without adding module-specific parsing to the daemon. Channel 0 carries control RPCs; non-zero routes use independent client-side and module-side channel spaces.</p>
+    <p class="muted">Fleet binaries follow the <code>ck-*</code> naming convention. The <code>ck</code> operator CLI covers module list, status, restart and rescan, health with a per-module fresh-probe detail verb, quota, and daemon operations. The daemon also self-watchdogs with a 60-second loopback self-probe and connection-file integrity check, and raises file-descriptor limits for its children.</p>
   </section>
 
-  <!-- ============ PROTOCOL ============ -->
+  <!-- PROTOCOL -->
   <section class="page" id="protocol">
-    <div class="eyebrow">Wire Contract · subc-protocol</div>
-    <h1>The 17-byte envelope</h1>
-    <p class="lead">Every frame is prefixed with a fixed 17-byte header. The router makes its entire decision from this header — the first 5 bytes are a frozen prefix that never changes across protocol versions.</p>
+    <div class="eyebrow">Wire Contract · WIRE v2</div>
+    <h1>The 21-byte envelope</h1>
+    <p class="lead">Every frame starts with this fixed little-endian header. The first five bytes, <code>len</code> plus the version byte location, remain the frozen prefix. All following fields are the version-2 layout.</p>
 
-    <div class="env-meta"><span>byte&nbsp;0</span><span style="flex:1; border-bottom:1px dashed var(--line)"></span><span>byte&nbsp;17</span></div>
+    <div class="env-meta"><span>byte&nbsp;0</span><span class="pill">orange: frozen prefix</span><span style="flex:1; border-bottom:1px dashed var(--line)"></span><span>byte&nbsp;21</span></div>
     <div class="env" id="env">
-      <div class="field sel" data-f="len" style="flex:4"><div class="nm">len</div><div class="bytes">u32 · 0–4</div><div class="bar"></div></div>
-      <div class="field" data-f="ver" style="flex:1"><div class="nm">ver</div><div class="bytes">u8 · 4</div><div class="bar"></div></div>
+      <div class="field sel" data-f="len" data-frozen="1" style="flex:4"><div class="nm">len</div><div class="bytes">u32 · 0–4</div><div class="bar"></div></div>
+      <div class="field" data-f="ver" data-frozen="1" style="flex:1"><div class="nm">ver</div><div class="bytes">u8 · 4</div><div class="bar"></div></div>
       <div class="field" data-f="type" style="flex:1"><div class="nm">type</div><div class="bytes">u8 · 5</div><div class="bar"></div></div>
-      <div class="field" data-f="flags" style="flex:1" data-frozen="1"><div class="nm">flags</div><div class="bytes">u8 · 6</div><div class="bar"></div></div>
-      <div class="field" data-f="channel" style="flex:2" data-frozen="1"><div class="nm">channel</div><div class="bytes">u16 · 7–9</div><div class="bar"></div></div>
-      <div class="field" data-f="corr" style="flex:8" data-frozen="1"><div class="nm">corr</div><div class="bytes">u64 · 9–17</div><div class="bar"></div></div>
+      <div class="field" data-f="flags" style="flex:1"><div class="nm">flags</div><div class="bytes">u8 · 6</div><div class="bar"></div></div>
+      <div class="field" data-f="channel" style="flex:2"><div class="nm">channel</div><div class="bytes">u16 · 7–9</div><div class="bar"></div></div>
+      <div class="field" data-f="epoch" style="flex:4"><div class="nm">epoch</div><div class="bytes">u32 · 9–13</div><div class="bar"></div></div>
+      <div class="field" data-f="corr" style="flex:8"><div class="nm">corr</div><div class="bytes">u64 · 13–21</div><div class="bar"></div></div>
     </div>
     <div class="env-detail" id="envDetail"></div>
 
+    <div class="callout"><b>Exact-match tripwire.</b> The version byte is exactly <code>2</code>. There is no negotiation: a v2 binary talking to a v1 daemon fails loudly on its first frame.</div>
+
     <h2>Frame types</h2>
-    <p class="muted">The <code>type</code> byte selects one of twelve frame kinds — locked and AFT-co-signed.</p>
+    <p class="muted">The <code>type</code> byte selects one of twelve unchanged frame kinds.</p>
     <table class="frames">
       <thead><tr><th>#</th><th>Frame</th><th>Plane</th><th>Purpose</th></tr></thead>
       <tbody>
-        <tr><td class="k">0</td><td class="k">Request</td><td>data</td><td>A tool/RPC call on a route channel</td></tr>
+        <tr><td class="k">0</td><td class="k">Request</td><td>data</td><td>A tool or RPC call on a route channel</td></tr>
         <tr><td class="k">1</td><td class="k">Response</td><td>data</td><td>Terminal reply to a Request</td></tr>
-        <tr><td class="k">2</td><td class="k">Push</td><td>data</td><td>Unsolicited module→client (fan-out)</td></tr>
+        <tr><td class="k">2</td><td class="k">Push</td><td>data</td><td>Unsolicited module-to-client fan-out</td></tr>
         <tr><td class="k">3</td><td class="k">StreamData</td><td>data</td><td>Interim streaming chunk</td></tr>
         <tr><td class="k">4</td><td class="k">StreamEnd</td><td>data</td><td>Terminal stream marker</td></tr>
         <tr><td class="k">5</td><td class="k">Error</td><td>data</td><td>Structured error body</td></tr>
         <tr><td class="k">6</td><td class="k">Cancel</td><td>data</td><td>Abort an in-flight request</td></tr>
-        <tr><td class="k">7 / 8</td><td class="k">Ping / Pong</td><td>—</td><td>Liveness</td></tr>
-        <tr><td class="k">9 / 10</td><td class="k">Hello / HelloAck</td><td>ctrl</td><td>Module registration + manifest</td></tr>
-        <tr><td class="k">11</td><td class="k">Goodbye</td><td>ctrl</td><td>Route / connection teardown</td></tr>
+        <tr><td class="k">7 / 8</td><td class="k">Ping / Pong</td><td>either</td><td>Liveness</td></tr>
+        <tr><td class="k">9 / 10</td><td class="k">Hello / HelloAck</td><td>control</td><td>Module registration and manifest</td></tr>
+        <tr><td class="k">11</td><td class="k">Goodbye</td><td>control</td><td>Route or connection teardown</td></tr>
       </tbody>
     </table>
 
-    <div class="callout"><b>Zero-deserialization routing.</b> The router reads <code>channel</code> to pick the connection and <code>type</code> to track flow-control credit — then forwards the opaque body untouched, rewriting only the <code>channel</code> field between client and module channel spaces. It never parses a tool's arguments or results.</div>
+    <div class="callout"><b>RouteHandle safety.</b> SDKs wrap <code>(channel, epoch)</code> with a private per-connection token. Mandatory endpoint-side epoch validation rejects frames from a previous binding, and the token prevents a stale handle from one socket from acting on a later socket.</div>
   </section>
 
-  <!-- ============ MODULES ============ -->
+  <!-- MODULES -->
   <section class="page" id="modules">
-    <div class="eyebrow">The Ecosystem</div>
+    <div class="eyebrow">The Fleet</div>
     <h1>Module ecosystem</h1>
-    <p class="lead">Each module is its own repo and process. To add one, you spawn it from <code>subc.jsonc</code> and it HELLO-registers a role — subc-core is never edited. Click a module for detail.</p>
-
+    <p class="lead">Each module is an independently supervised process with an explicit role and storage boundary. Click a card for current detail.</p>
     <div class="grid" id="modGrid"></div>
     <div class="mod-detail" id="modDetail"><div class="empty-hint">Select a module above to inspect it.</div></div>
   </section>
 
-  <!-- ============ SOON SECTIONS ============ -->
-  <section class="page" id="flows"><div class="eyebrow">Data Flows</div><h1>Data flows</h1><div class="soon-banner"><b>Coming in the full build.</b><br>Steppable diagrams: the HMAC handshake, <code>route.open</code> → <code>route.bind</code> binding, tool invocation with channel rewrite, and PUSH fan-out.</div></section>
-  <section class="page" id="transport"><div class="eyebrow">Transport &amp; Auth</div><h1>Transport &amp; auth</h1><div class="soon-banner"><b>Coming in the full build.</b><br>Loopback TCP, the server-proves-first HMAC-SHA256 handshake, the connection file, and the singleton start-lock.</div></section>
-  <section class="page" id="storage"><div class="eyebrow">Storage</div><h1>Storage</h1><div class="soon-banner"><b>Coming in the full build.</b><br>Database-per-module isolation, descriptor delivery via HELLO_ACK, and the shared store/lease libraries.</div></section>
-  <section class="page" id="auth"><div class="eyebrow">Multi-Auth</div><h1>Multi-auth credentials</h1><div class="soon-banner"><b>Coming in the full build.</b><br>Vault-as-login-root, the oauth/apikey/chatgpt/antigravity method matrix, and freeze-into-run-config for cache stability.</div></section>
-  <section class="page" id="cache"><div class="eyebrow">Cache-Policy Core</div><h1>Cache-policy core</h1><div class="soon-banner"><b>Coming in the full build.</b><br>The single-unit render-config epoch, observed-vs-authored harnesses, the shared frozen-set state machine, and the MC golden vectors.</div></section>
-  <section class="page" id="status"><div class="eyebrow">Status</div><h1>Where we are</h1><div class="soon-banner"><b>Coming in the full build.</b><br>A shipped-vs-frontier map: built &amp; live-proven systems vs the open edges (AFT cutover, cache-policy build, CK app).</div></section>
+  <!-- DATA FLOWS -->
+  <section class="page" id="flows">
+    <div class="eyebrow">Data Flows</div>
+    <h1>Three paths through the daemon</h1>
+    <p class="lead">Connection, binding, and invocation stay separate so authentication and route ownership can be checked before opaque traffic moves.</p>
+    <div class="flow-grid">
+      <div class="flow-step">
+        <div class="num">1</div><h3>Connect and authenticate</h3>
+        <div class="route-line"><strong>connection file</strong> → client nonce<br><strong>server proof first</strong> → client proof<br><strong>channel 0</strong> live</div>
+        <p class="muted">The proofs use domain-separated HMAC-SHA256. The client sends no proof until it validates the server.</p>
+      </div>
+      <div class="flow-step">
+        <div class="num">2</div><h3>Open and bind a route</h3>
+        <div class="route-line"><strong>route.open</strong> → canonical root<br><strong>consumer_identity</strong> → route.bind<br><strong>on_bind / on_bound</strong> → (channel, epoch)</div>
+        <p class="muted">The daemon canonicalizes with <code>cortexkit-paths</code>. Spawn nonces resolve to <code>Principal reserved:&lt;id&gt;</code>; direct consumers are also validated. The module decides in <code>on_bind</code>, then <code>on_bound</code> may emit.</p>
+      </div>
+      <div class="flow-step">
+        <div class="num">3</div><h3>Call a tool</h3>
+        <div class="route-line"><strong>client channel</strong> → header rewrite<br><strong>opaque body</strong> → module channel<br><strong>response</strong> → reverse rewrite</div>
+        <p class="muted">Only the channel header changes between independent spaces, with zero body parsing. The reverse-request lane runs module-to-client on the same route without consuming forward credits.</p>
+      </div>
+    </div>
+    <div class="callout"><b>The body is not a routing input.</b> Authentication establishes the connection, binding establishes the route, and the 21-byte header is enough to splice traffic in both directions.</div>
+  </section>
 
-  <footer>SUBC landscape explainer · spike build · sections 1–3 live, 4–9 stubbed</footer>
+  <!-- TRANSPORT -->
+  <section class="page" id="transport">
+    <div class="eyebrow">Transport &amp; Auth</div>
+    <h1>A local, authenticated boundary</h1>
+    <p class="lead">SUBC listens only on loopback TCP and publishes connection material through a user-owned <code>0600</code> file.</p>
+    <table class="frames">
+      <thead><tr><th>Boundary</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td class="k">Singleton</td><td>An advisory start lock prevents competing daemons.</td></tr>
+        <tr><td class="k">Handshake</td><td>Server-proves-first, domain-separated HMAC-SHA256 before channel 0 opens.</td></tr>
+        <tr><td class="k">Pre-auth budgets</td><td>A bounded queue-wait budget plus a fresh handshake deadline keep restart herds from creating false handshake timeouts.</td></tr>
+        <tr><td class="k">Spawn attestation</td><td>Every daemon-spawned module receives a launch nonce; <code>route.open</code> validates the presented consumer identity against it.</td></tr>
+        <tr><td class="k">Self-watchdog</td><td>A 60-second loopback self-probe checks service health and connection-file integrity.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>Two clocks, two meanings.</b> Queue pressure is measured separately from the fresh handshake deadline. A valid process waiting behind a restart herd does not spend its authentication time budget before it reaches the handshake.</div>
+  </section>
+
+  <!-- STORAGE -->
+  <section class="page" id="storage">
+    <div class="eyebrow">Storage</div>
+    <h1>Isolation by module and path</h1>
+    <p class="lead">Each module owns a path-scoped SQLite database under <code>~/.local/share/cortexkit/&lt;module&gt;/</code>. Modules do not receive a fleet-wide database handle.</p>
+    <div class="diagram">
+      <div class="tier-label">Daemon-resolved capability</div>
+      <div class="daemon"><b>HELLO_ACK storage descriptor</b><div class="sub">resolved path · least privilege · module scope</div></div>
+      <div class="conn">↓</div>
+      <div class="tier">
+        <div class="node mod"><b>cortexkit-store</b><small>SQLite + Postgres backend</small></div>
+        <div class="node mod"><b>cortexkit-lease</b><small>OS lock + epoch-CAS fence</small></div>
+        <div class="node mod"><b>@cortexkit/store</b><small>TypeScript parity</small></div>
+      </div>
+    </div>
+    <div class="callout"><b>One writer means two guards.</b> <code>cortexkit-lease</code> combines an OS-level single-writer lock with an epoch-CAS fence. Cross-language golden vectors keep Rust and TypeScript storage behavior aligned.</div>
+  </section>
+
+  <!-- MULTI-AUTH -->
+  <section class="page" id="auth">
+    <div class="eyebrow">Multi-Auth</div>
+    <h1>The vault is the login root</h1>
+    <p class="lead"><code>ck auth login</code> runs vault-native OAuth flows. The vault owns crash-safe token rotation and its audit chain instead of delegating credential custody to a provider client.</p>
+    <table class="frames">
+      <thead><tr><th>Provider method</th><th>How broca uses it</th></tr></thead>
+      <tbody>
+        <tr><td class="k">oauth</td><td>Vault-managed access and refresh credentials.</td></tr>
+        <tr><td class="k">apikey</td><td>Provider API key selected through a capability handle.</td></tr>
+        <tr><td class="k">chatgpt-account</td><td>Account-backed endpoint and credential family.</td></tr>
+        <tr><td class="k">antigravity</td><td>Antigravity endpoint family with its matching account method.</td></tr>
+        <tr><td class="k">auth_selection</td><td>Broca freezes the chosen method into <code>run_config</code> so retries and cache keys remain stable.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>Handles, not raw secrets.</b> Credential handles are capability tokens. Never-strand fallback keeps a usable provider path available when a preferred account or method cannot serve a run.</div>
+  </section>
+
+  <!-- CACHE -->
+  <section class="page" id="cache">
+    <div class="eyebrow">Cache-Policy Core · Shipped</div>
+    <h1>One policy across owned and unowned harnesses</h1>
+    <p class="lead"><code>cortexkit-cache-core</code> ships in commons and is consumed by broca and magic-context in production.</p>
+    <div class="diagram">
+      <div class="tier-label">Single HARD render-config epoch</div>
+      <div class="daemon"><b>tools + model + system</b><div class="sub">one unit · boundary-presence anchored</div></div>
+      <div class="conn">↓</div>
+      <div class="tier">
+        <div class="node mod"><b>freeze-on-bust</b><small>do not drift a broken prefix</small></div>
+        <div class="node mod"><b>replay verbatim</b><small>when work is deferred</small></div>
+        <div class="node mod"><b>coordinator</b><small>deferred-work ownership</small></div>
+      </div>
+    </div>
+    <div class="callout"><b>Cross-language contract.</b> Nine golden vectors shared with magic-context lock boundary presence, state transitions, and replay behavior across implementations.</div>
+  </section>
+
+  <!-- STATUS -->
+  <section class="page" id="status">
+    <div class="eyebrow">Status · 2026-07-19</div>
+    <h1>Shipped and building</h1>
+    <p class="lead">The production substrate is broad. Current work is concentrated in new surfaces, resilience, and the next distributed phases.</p>
+    <div class="status-grid">
+      <div class="status-col shipped">
+        <h2>Shipped</h2>
+        <ul>
+          <li>WIRE v2 fleet-wide across 9+ modules</li>
+          <li>AFT over subc in production</li>
+          <li>Magic-context compaction on both legs: owned via broca and Claude Code via thalamus</li>
+          <li>Health system v2</li>
+          <li>Federation proven over WAN</li>
+          <li>Credentials vault and CortexKit Account service</li>
+          <li>Astrocyte v1 personal scope</li>
+          <li>Engram cloud plane and garbage collection</li>
+          <li>Team-mode Room-1 org authority, implementation-complete for four seats</li>
+          <li>Board v1</li>
+        </ul>
+      </div>
+      <div class="status-col building">
+        <h2>Building</h2>
+        <ul>
+          <li>Wernicke chat gateway</li>
+          <li>Chaos suite</li>
+          <li>brocatui</li>
+          <li>Cortex app design</li>
+          <li>Room-2 ceilings and quorum</li>
+          <li>Engram restore</li>
+          <li>Federation phase 3</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Honest boundary.</b> “Shipped” means implemented and proven at the scope named. Later phases remain listed as building even when their contracts are already designed.</div>
+  </section>
+
+  <footer>SUBC landscape explainer · updated 2026-07-19 · all sections live</footer>
 </main>
 
 <script>
-  // ---- nav ----
   const links = document.querySelectorAll('.nav-link');
   links.forEach(l => l.addEventListener('click', () => {
     const id = l.dataset.go;
@@ -254,20 +405,20 @@
     window.scrollTo({top:0});
   }));
 
-  // ---- envelope detail ----
   const ENV = {
-    len:    { t:"len — u32 (bytes 0–4)", b:"NOT frozen", d:"Total body length following the header. Lets the reader frame the message before touching a single payload byte." },
-    ver:    { t:"ver — u8 (byte 4)", b:"NOT frozen", d:"Protocol version, negotiated at HELLO. The router tolerates version skew because it only ever reads the frozen prefix." },
-    type:   { t:"type — u8 (byte 5)", b:"NOT frozen", d:"The frame kind (Request/Response/Push/…). The router reads this to track per-channel flow-control credit — without parsing the body." },
-    flags:  { t:"flags — u8 (byte 6)", b:"FROZEN PREFIX", d:"bit0 BINARY · bits1–2 PRIORITY (Passive/Interactive/Background) · bit3 LAST. Priority is how llm-runner maps its control vs display lanes onto one socket." },
-    channel:{ t:"channel — u16 (bytes 7–9)", b:"FROZEN PREFIX", d:"The route. Channel 0 = control plane (RPCs). Non-zero = a data-plane route; the router REWRITES this between independent client-side and module-side channel spaces." },
-    corr:   { t:"corr — u64 (bytes 9–17)", b:"FROZEN PREFIX", d:"Correlation id. Clients demux concurrent in-flight replies on one connection by (channel, corr) — never by arrival order." }
+    len: { t:"len · u32 · bytes 0–4", b:"FROZEN PREFIX", d:"Little-endian body length following the 21-byte header. The position and width are part of the frozen first five bytes." },
+    ver: { t:"ver · u8 · byte 4", b:"FROZEN PREFIX · MUST EQUAL 2", d:"Exact-match protocol tripwire. There is no negotiation, so a v2 binary fails loudly on the first frame it receives from a v1 peer." },
+    type: { t:"type · u8 · byte 5", b:"WIRE v2 LAYOUT · NOT FROZEN PREFIX", d:"Selects Request, Response, Push, StreamData, StreamEnd, Error, Cancel, Ping, Pong, Hello, HelloAck, or Goodbye." },
+    flags: { t:"flags · u8 · byte 6", b:"WIRE v2 LAYOUT · NOT FROZEN PREFIX", d:"bit0 BINARY · bits1–2 PRIORITY (Passive, Interactive, Background) · bit3 LAST · bits4–5 ADMISSION CLASS (normal, EXPEDITE, SHEDDABLE). Admission value 3 is invalid." },
+    channel: { t:"channel · u16 · bytes 7–9", b:"WIRE v2 LAYOUT · NOT FROZEN PREFIX", d:"One half of the route identity. Channel 0 is the control plane. Other channels are rewritten between independent endpoint spaces." },
+    epoch: { t:"epoch · u32 · bytes 9–13", b:"WIRE v2 LAYOUT · NOT FROZEN PREFIX", d:"The per-route epoch. Every route is (channel, epoch); epoch 0 is reserved for channel 0. Clients must reject a prior binding's stale epoch instead of delivering its frame to a reused channel slot." },
+    corr: { t:"corr · u64 · bytes 13–21", b:"WIRE v2 LAYOUT · NOT FROZEN PREFIX", d:"Correlation id for concurrent work. Endpoints demultiplex replies using route identity plus corr rather than arrival order." }
   };
   const envDetail = document.getElementById('envDetail');
-  function showField(f){
-    document.querySelectorAll('#env .field').forEach(x => x.classList.toggle('sel', x.dataset.f===f));
+  function showField(f) {
+    document.querySelectorAll('#env .field').forEach(x => x.classList.toggle('sel', x.dataset.f === f));
     const e = ENV[f];
-    envDetail.innerHTML = '<h4>'+e.t+'</h4><div class="b">'+e.b+'</div><p style="margin:6px 0 0">'+e.d+'</p>';
+    envDetail.innerHTML = '<h4>' + e.t + '</h4><div class="b">' + e.b + '</div><p style="margin:6px 0 0">' + e.d + '</p>';
   }
   document.querySelectorAll('#env .field').forEach(x => {
     x.addEventListener('mouseenter', () => showField(x.dataset.f));
@@ -275,42 +426,43 @@
   });
   showField('len');
 
-  // ---- modules ----
   const MODS = [
-    { id:'aft', nm:'AFT', role:'tool_provider', st:'live', desc:'The tool engine — read/grep/edit/search/outline/inspect. Its full move behind subc is the v1 finish line.',
-      provides:'read · grep · edit · search · outline · inspect · status · write', storage:'own index + filters', repo:'cortexkit/aft', note:'Today still an OpenCode plugin in prod; subc-mode joint-wire-proven against a real daemon.' },
-    { id:'llmr', nm:'llm-runner', role:'management_surface', st:'live', desc:'Durable, crash-safe agentic loop. A session is a lineage of runs; persistence is WAL + SQLite projection + single-writer lease.',
-      provides:'session.* · run.*', storage:'WAL (source of truth) + SqliteStore + lease', repo:'cortexkit/llm-runner', note:'5 native provider wire families; multi-auth credential routing; shipped + live-proven across families.' },
-    { id:'quota', nm:'ai-provider-quota', role:'management_surface', st:'live', desc:'Usage windows for 27 providers — full parity with CodexBar, including browser-cookie and local-probe sources.',
-      provides:'usage.get', storage:'own sqlite', repo:'cortexkit/ai-provider-quota', note:'Live in the production daemon; alfonso-routing consumes it module-to-module.' },
-    { id:'routing', nm:'alfonso-routing', role:'management_surface', st:'live', desc:'Cost-primary model + account selection. route.select returns the cheapest model clearing an iq/eq bar.',
-      provides:'route.select · route.set_decision_outcome', storage:'own store.db', repo:'cortexkit/alfonso', note:'Consumes quota module for live pressure; migrating TS→Rust.' },
-    { id:'cred', nm:'cortexkit-credentials', role:'management_surface', st:'live', desc:'Encrypted secret vault. XChaCha20-Poly1305 envelope, keychain-scoped master key, HMAC audit chain, crash-safe refresh engine.',
-      provides:'vault read · mint-handle (offline CLI write)', storage:'own sqlite + keychain master key', repo:'cortexkit/cortexkit-credentials', note:'reserved module_id (launch-nonce bound); vault-as-login-root is the end state.' },
-    { id:'mcp', nm:'subc-mcp', role:'gateway', st:'live', desc:'An MCP server so generic hosts (Claude Code) reach the whole landscape. Thin stdio shim → supervised MCP module → subc.',
-      provides:'tools/list · tools/call (MCP)', storage:'none', repo:'subconscious (in-tree)', note:'Namespace + per-tool enabling via mcp.jsonc; dumb arg passthrough (AFT owns translation).' },
-    { id:'cache', nm:'cache-policy core', role:'shared library', st:'design', desc:'Designed, not built. The shared brain for prompt-cache stability across harnesses — render-config epoch + frozen-set state machine.',
-      provides:'(in-process library, not a module)', storage:'harness-persisted, version-stamped CAS', repo:'TBD (commons)', note:'Contract converged with MC; golden vectors verified; awaiting design-before-code sign-off.' }
+    { id:"aft", nm:"AFT", role:"tool_provider", status:"LIVE", desc:"About 21 code-perception and editing tools, with semantic and callgraph indexes.", binary:"aft · v0.47.x", provides:"search · outline · zoom · callgraph · edit · inspect · bash", storage:"workspace indexes and filters", repo:"cortexkit/aft", note:"The subc transport is in production. The old OpenCode-managed NDJSON tool lane is retired." },
+    { id:"broca", nm:"broca", role:"management_surface", status:"LIVE", desc:"WAL-first exactly-once agent loop across five provider wire families.", binary:"ck-broca", provides:"sessions · runs · usage.export · cap admission", storage:"WAL source of truth + SQLite projection + lease", repo:"cortexkit/broca", note:"Owns session lineage. Usage export and cap enforcement integrate with astrocyte." },
+    { id:"magic-context", nm:"magic-context", role:"tool_provider", status:"LIVE", desc:"Context transformation, compaction, historian, memory, and cache-stability tools.", binary:"ck-mc", provides:"transform · ctx_* · compaction · historian · memory", storage:"context state + cortexkit-cache-core policy", repo:"cortexkit/magic-context", note:"Serves owned harnesses through broca and unowned harnesses through thalamus." },
+    { id:"thalamus", nm:"thalamus", role:"MITM proxy module", status:"LIVE", desc:"Provider-wire compaction and capture for Claude Code and Codex.", binary:"ck-thalamus", provides:"byte-splice compaction · capture · cache-read verification", storage:"capture and compaction state", repo:"cortexkit/thalamus", note:"Handles unowned harnesses without requiring them to adopt a CortexKit client SDK." },
+    { id:"quota", nm:"quota", role:"management_surface", status:"LIVE", desc:"Quota and usage windows for 30+ providers with multi-account support.", binary:"ck-quota · ai-provider-quota", provides:"provider usage windows · account pressure", storage:"module-scoped SQLite", repo:"cortexkit/ai-provider-quota", note:"Feeds ck quota and the cost-primary router." },
+    { id:"credentials", nm:"cortexkit-credentials", role:"management_surface", status:"LIVE", desc:"Encrypted vault, vault-native OAuth root, and the cloud CortexKit Account service.", binary:"ck-credentials", provides:"ck auth login · credential handles · account and org identity", storage:"encrypted local vault + audit chain", repo:"cortexkit/cortexkit-credentials", note:"account.cortexkit.io ships five login methods. The organization layer is live." },
+    { id:"alfonso", nm:"alfonso", role:"management_surface + tool_provider", status:"LIVE", desc:"Agent runtime for asks, rooms, Board, work graphs, athena, and masons.", binary:"ck-alfonso-core + ck-alfonso-routing", provides:"agent runtime · background tasks · model routing", storage:"runtime, Board, and work-graph state", repo:"cortexkit/alfonso", note:"Routing is cost-primary across models and accounts that clear the requested capability bar." },
+    { id:"synapse", nm:"synapse", role:"management_surface", status:"LIVE", desc:"Certified local AI infrastructure lanes for embeddings and rerankers.", binary:"ck-synapse", provides:"embeddings · rerankers · local model lanes", storage:"certification and local model state", repo:"cortexkit/synapse", note:"Runs as a supervised production module." },
+    { id:"callosum", nm:"callosum", role:"federation_transport", status:"LIVE", desc:"Noise IK cross-machine transport with default-deny exposure and exactly-once effects.", binary:"ck-callosum · subc-federation", provides:"device and org transport · Room-1 authority carriage", storage:"peer, exposure, and effect state", repo:"cortexkit/subc-federation", note:"Phases 1–2 are WAN-proven. Phase 3 rendezvous, relay, and pairing UX are designed." },
+    { id:"astrocyte", nm:"astrocyte", role:"management_surface", status:"LIVE", desc:"AI spend metering, price snapshots, and cap admission verdicts.", binary:"ck-astrocyte", provides:"spend facts · price snapshots · cap verdicts", storage:"v1 personal-scope spend store", repo:"cortexkit/astrocyte", note:"Deny is a verdict, never enforcement. Broca applies enforcement." },
+    { id:"engram", nm:"engram", role:"backup_plane", status:"LIVE", desc:"Zero-knowledge encrypted backup with per-device manifest chains.", binary:"ck-engram", provides:"encrypted backup · cloud manifests · garbage collection", storage:"client ciphertext + Cloudflare Durable Objects", repo:"cortexkit/engram", note:"The cloud plane and garbage collection are live. Restore is designed." },
+    { id:"wernicke", nm:"wernicke", role:"chat_gateway", status:"BUILDING", desc:"Slack, Teams, Telegram, and Discord gateway with linked-owner authority.", binary:"ck-wernicke", provides:"chat ingress · Room-1 acting-for consumer", storage:"store-nothing-durable gateway posture", repo:"cortexkit/wernicke", note:"The authority spine is frozen and the walking skeleton runs. Product completion is still in progress." },
+    { id:"subc-mcp", nm:"subc-mcp", role:"gateway", status:"LIVE", desc:"Policy-aware MCP surface for clients that do not speak subc directly.", binary:"ck-subc-mcp", provides:"search mode · ack_only · tombstones · prompts · elicitation", storage:"no tool data; policy and attestation state only", repo:"cortexkit/subconscious", note:"Ships status and wrapup prompts, elicitation relay, and spawn attestation." }
   ];
   const grid = document.getElementById('modGrid');
   const detail = document.getElementById('modDetail');
   MODS.forEach(m => {
     const c = document.createElement('div');
-    c.className = 'card'; c.dataset.id = m.id;
-    c.innerHTML = '<div class="top"><div><div class="nm">'+m.nm+'</div><div class="role">'+m.role+'</div></div>'
-      + '<span class="st '+(m.st==='live'?'live':'design')+'">'+(m.st==='live'?'LIVE':'DESIGN')+'</span></div>'
-      + '<div class="desc">'+m.desc+'</div>';
+    const statusClass = m.status.toLowerCase();
+    c.className = 'card';
+    c.dataset.id = m.id;
+    c.innerHTML = '<div class="top"><div><div class="nm">' + m.nm + '</div><div class="role">' + m.role + '</div></div>'
+      + '<span class="st ' + statusClass + '">' + m.status + '</span></div>'
+      + '<div class="desc">' + m.desc + '</div>';
     c.addEventListener('click', () => {
-      document.querySelectorAll('#modGrid .card').forEach(x=>x.classList.remove('sel'));
+      document.querySelectorAll('#modGrid .card').forEach(x => x.classList.remove('sel'));
       c.classList.add('sel');
       detail.innerHTML = '<div class="top" style="display:flex;align-items:center;justify-content:space-between">'
-        + '<div><h3>'+m.nm+'</h3><div class="role" style="color:var(--faint);font-family:var(--mono);font-size:12px">'+m.role+'</div></div>'
-        + '<span class="st '+(m.st==='live'?'live':'design')+'">'+(m.st==='live'?'LIVE':'DESIGN')+'</span></div>'
+        + '<div><h3>' + m.nm + '</h3><div class="role" style="color:var(--faint);font-family:var(--mono);font-size:12px">' + m.role + '</div></div>'
+        + '<span class="st ' + statusClass + '">' + m.status + '</span></div>'
         + '<div class="kv">'
-        + '<div class="k">provides</div><div>'+m.provides+'</div>'
-        + '<div class="k">storage</div><div>'+m.storage+'</div>'
-        + '<div class="k">repo</div><div><code>'+m.repo+'</code></div>'
-        + '<div class="k">note</div><div class="muted">'+m.note+'</div>'
+        + '<div class="k">binary</div><div><code>' + m.binary + '</code></div>'
+        + '<div class="k">provides</div><div>' + m.provides + '</div>'
+        + '<div class="k">storage</div><div>' + m.storage + '</div>'
+        + '<div class="k">repo</div><div><code>' + m.repo + '</code></div>'
+        + '<div class="k">note</div><div class="muted">' + m.note + '</div>'
         + '</div>';
     });
     grid.appendChild(c);

@@ -1,4 +1,4 @@
-# ck-projects v5: the fleet project/workspace registry
+# ck-projects v6: the fleet project/workspace registry
 
 Drafted from the ratified fold of #workspace-projects-design (rm_toolu_01ByRWpGZeSjyJC3om18Y7ds):
 S1-S11 settled in round 1 (four seats), ratified by Ufuk with three additions S12-S14 and the
@@ -103,8 +103,12 @@ Projection tables:
   same (workspace, project) MAY legitimately appear as both a local row and remote rows
   (the same repo on several machines); enumerate reports them as distinct members with
   their refKind, and consumers join twins on content identity (S12), not on the registry.
-- project(project_id TEXT PK, name TEXT, implicit INTEGER NOT NULL DEFAULT 0, created_at,
-  updated_at)
+- project(project_id TEXT PK, name TEXT, implicit INTEGER NOT NULL DEFAULT 0,
+  seed_identity TEXT NULL, created_at, updated_at)
+  — seed_identity (v6): the mc_identity a seed-minted project was grouped from; NULL for
+  caller-created projects. Written only by seed_import, immutable thereafter (merges
+  delete the row; the successor keeps its own provenance). This is the durable provenance
+  the re-import rejoined test reads — never inferred from id shape.
 - project_workspace(project_id TEXT PK REFERENCES project, workspace_id TEXT REFERENCES
   workspace) — I2 (one workspace per project) enforced by the PK; membership rows in
   workspace_member for locals mirror this projection and the pair is written in the same
@@ -126,6 +130,14 @@ collides with project_workspace's PK and workspace_member's UNIQUE):
 | project_alias (rows targeting removed) | deleted | RETARGETED to successor + new alias(removed -> successor) written |
 | project_workspace | deleted | DELETED — membership NEVER transfers on merge. The successor keeps its own membership (or none); transferring would collide with the successor's PK row or silently re-home the successor. If the operator wants the successor in the removed project's workspace, that is an explicit follow-up assign_workspace. |
 | workspace_member (locals naming removed) | deleted | DELETED (mirrors project_workspace in the same transaction, I2 dual-representation preserved) |
+| workspace_member (ref_kind='remote') | NEVER TOUCHED by project remove | NEVER TOUCHED |
+
+REMOTE-ROW RULE (v6): `remove` targets a LOCAL project. Remote workspace_member rows
+reference a REMOTE device's project id (their project_id is not an FK into the local
+project table and shares no identity with it — a string coincidence carries no meaning
+across ref_kind). No local project mutation ever disposes remote rows. Remote rows are
+deleted by exactly two ops: workspace removal (all member rows of the workspace, both
+kinds) and a future explicit remote-member detach op (S12 transport era, out of v1 scope).
 
 MERGE PRECONDITION: none beyond successor-is-live-and-distinct. Cross-workspace merge is
 legal precisely because membership does not transfer — the merged roots land in the
@@ -169,8 +181,10 @@ NO-OP MUTATIONS (v5, I8): a mutation whose application would leave every project
 byte-identical is a SEMANTIC NO-OP: it returns `{noop: true, generation}` (current head)
 WITHOUT a journal append — generation moves iff topology moves, in both directions, which
 is the property MC's exactly-one-HARD fingerprint requires. Enumerated per op:
-- register: all named roots already owned by the target project, no new roots, no
-  name/workspace change → no-op. Any conflicting owner is still the I1 ERROR, not a no-op.
+- register: all named roots already owned by the target project, all named
+  derivedRootParents already registered to it, no new roots or parents, no name/workspace
+  change → no-op (closed over register's full argument list). Any conflicting owner is
+  still the I1 ERROR, not a no-op.
 - assign_workspace: project already in the named workspace → no-op.
 - upgrade_implicit: alias already present and target identical → no-op.
 - remove: absent target → typed ERROR `not_found` (no append). Removing an already-removed
@@ -359,10 +373,19 @@ workspaces: [...], members: [...] } }:
     group in lexicographic canonical-path order; report entries in processing order.
   - Minted project ids: `pj-<16hex>` = first 16 lowercase hex of
     blake3("seed1:" || mc_identity) — deterministic, outside the reserved implicit
-    namespace, versioned by the seed1 domain tag. If the minted id already exists in the
-    store (re-import into a non-empty store), the EXISTING project is extended iff it was
-    seed-minted from the same mc_identity (recorded as `rejoined`); otherwise the group is
-    recorded `conflicted` and excluded (no silent adoption of a caller-created id).
+    namespace, versioned by the seed1 domain tag. Re-import occupancy rules (v6), decided
+    from durable state, no inference from id shape:
+    - Minted id exists as a LIVE project row: extended iff project.seed_identity equals
+      the group's mc_identity (recorded `rejoined`); otherwise recorded `conflicted` and
+      excluded — covers both caller-created ids (seed_identity NULL) and the negligible
+      cross-identity mint collision.
+    - Minted id exists as an ALIAS KEY (the seed project was later merged away): the group
+      is recorded `alias_occupied` and NOT auto-joined to the alias target — the operator
+      merged that project deliberately; an import must not silently re-route roots into
+      the successor. Individual roots still fall through rules 3-4 normally (already-
+      registered roots skip to their owners; unregistered roots fall to implicit).
+    - Minted id absent: a new project row is created with seed_identity = the group's
+      mc_identity.
   - Project names: the export's per-identity name when present, else the last path
     component of the lexicographically-first root in the group.
   - Workspace mapping: export workspaces are created verbatim (id, name); each surviving
@@ -445,6 +468,13 @@ open wire item, settled with SUBC before build.
   that is a cortexkit-paths defect to fix fleet-wide, not a ck-projects workaround.
 
 ## 15. Gate and adversarial-pass dispositions
+
+v5 -> v6 (confirm re-gate ct_...5a46d6350a20, BLOCK with 4 fold-scoped residuals — folded):
+remote workspace_member rows never touched by local project remove (workspace removal and
+future explicit detach are the only remote-row deleters); project.seed_identity column as
+durable seed provenance (rejoined test reads it, never id shape); alias-occupied minted id
+→ alias_occupied record, no auto-join to merge successor; register no-op enumeration
+closed over derivedRootParents. Folds 2/5/6 confirmed mechanism-complete by the panel.
 
 v4 -> v5 (FULL-PANEL AUDIT ct_...5bd5ae19bb00, 3 families, BLOCK with 6 findings — all
 folded above): (1) per-relation merge/remove disposition table replaces the blanket

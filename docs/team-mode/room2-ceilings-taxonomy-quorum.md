@@ -1,6 +1,6 @@
 # Room 2 Contract: Reversibility Ceilings, Action Taxonomy, Role ACL, Quorum
 
-Status: DRAFT r1 (seat review) — chair SUBC, seats ALF / CKCRED / FED, Ufuk product calls ratified in-room.
+Status: DRAFT r2 (seat review) — chair SUBC, seats ALF / CKCRED / FED, Ufuk product calls ratified in-room. r2 folds ALF [#13] (dual-class stamp struct, taxonomy skew check) and CKCRED [#15] (claim names, taxonomy_version carriage, electorate bundle_version citation).
 Lineage: team-mode-design.md v1.1 → Room-1 contract v7.3 (frozen; this document composes with it and amends nothing in it) → Room-2 kickoff + positions ([#5]–[#16] in #team-mode-room-2).
 Amendment discipline: same as Room 1 — post-freeze changes go through the A1 amendment process with all-seat confirm.
 
@@ -36,7 +36,7 @@ The **domain flags** (orthogonal, NOT on the ladder — no cross-domain ranking 
 | `CREDENTIAL` | any vault, grant, or key surface |
 | `FINANCIAL` | spend or provisioning of paid resources |
 
-A stamped action class is exactly one of: a ladder class, or a flag class. A tool that touches both a flag domain and the ladder compiles to the flag class (flags dominate: they exist because their risk is not expressible as blast radius).
+**The stamp is a struct, not a single class** (ALF [#13] pin 1, CKCRED-endorsed): `{tier_class: 1..5, credential: bool, financial: bool}`. The compiler emits the ladder class AND the flag bits in one stamping pass (params are already classified at stamp time). Dual-class actions are first-class: a git push of a credentials file stamps `{PUBLISH_EXTERNAL, credential: true, financial: false}`; a paid API call that publishes stamps `{PUBLISH_EXTERNAL, credential: false, financial: true}`. An action requiring a flag the member lacks PARKS even when its ladder class is below the member's tier — this kills the escape where a FINANCIAL action hides inside a low-ladder tool.
 
 ### 1.2 The compiler contract
 
@@ -49,6 +49,7 @@ Pins (ALF [#9], adopted verbatim):
 - Param-sensitive splits within one tool are legal (bash compiles through the command classifier the InitiatorToolGate already uses).
 - **Fail-closed**: a tool whose class cannot be determined from the envelope compiles to the highest plausible class; an unknown tool compiles to `PUBLISH_EXTERNAL` at minimum, never below.
 - **Floor/tighten rule**: the infrastructure class sets the floor. An agent's self-scored reversibility (the ask.reversibility field) may only TIGHTEN (claim less reversible / higher class), never relax. Below the ceiling it is purely advisory UX math; above it is purely additive. It has no enforcement authority in either direction.
+- **Taxonomy skew check** (ALF [#13] pin 2): the stamp carries the compiler's taxonomy version; the ceiling's A2 claims carry `taxonomy_version` (CKCRED column, contract-pinned string). The gate REFUSES to compare a stamp whose taxonomy version differs from the ceiling's — fail-closed on skew, never coerce. Inside one daemon skew is impossible; the check exists for the federated future. A taxonomy amendment deploys as: contract amendment → CKCRED one-column value flip in the same deploy class as the compiler.
 
 ### 1.3 Vocabulary custody
 
@@ -60,9 +61,12 @@ The class vocabulary is contract-pinned text. CKCRED schemas store ceilings as t
 
 A member's ceiling is `{ceiling_tier: 1..5, credential_flag: allowed|ask, financial_flag: allowed|ask}`.
 
-- A dispatch whose stamped class is a **ladder** class is admitted iff `class_ordinal <= ceiling_tier`.
-- A dispatch whose stamped class is a **flag** class is admitted iff the member's corresponding flag is `allowed`.
-- Everything not admitted **parks to the org_ask machine** (Slice C, no new states for single-approver; §4 for quorum).
+Admission compares the stamp struct to the ceiling field-for-field (two branch kinds, one snapshot):
+
+- Ladder: `stamp.tier_class <= ceiling_tier`, AND
+- Flags: `stamp.credential` requires `ceiling.credential == allowed`; `stamp.financial` requires `ceiling.financial == allowed`.
+
+ALL predicates must pass; any failure **parks to the org_ask machine** (Slice C, no new states for single-approver; §4 for quorum). CKCRED's membership row carries `ceiling_tier INTEGER + ceiling_credential BOOL + ceiling_financial BOOL` — the gate's comparison is struct-to-columns field-for-field.
 
 ### 2.2 Defaults (Ufuk-ratified (a))
 
@@ -72,7 +76,7 @@ A member's ceiling is `{ceiling_tier: 1..5, credential_flag: allowed|ask, financ
 
 ### 2.3 Home and carriage (CKCRED [#10], adopted)
 
-The ceiling is a **membership fact**: columns on `membership_grants`, surfacing as A2 claims `{ceiling_tier, ceiling_flags}` in the signed assertion artifact, riding the bundle snapshot's version. Serve admission reads the ceiling from the same signed artifact + snapshot it already trusts — zero new reads, R1 §8 holds. A ceiling change is a §3.0 guarded-batch mutation bumping `bundle_version`, observed at next poll (same latency class as delegation changes).
+The ceiling is a **membership fact**: columns on `membership_grants`, surfacing as A2 claims `{subject, role, membership_epoch, ceiling_tier, ceiling_flags: {credential, financial}, taxonomy_version}` in the signed assertion artifact (exact claim names pinned here for byte-stable fixtures, per the Room-1 A2/A3 family discipline), riding the bundle snapshot's version. Serve admission reads the ceiling from the same signed artifact + snapshot it already trusts — zero new reads, R1 §8 holds. A ceiling change is a §3.0 guarded-batch mutation bumping `bundle_version`, observed at next poll (same latency class as delegation changes).
 
 ### 2.4 Mutation surface
 
@@ -118,7 +122,7 @@ Quorum is an **aggregation above `answered_held`**, not a new state machine. App
 
 - **Eligibility = ceiling-covers-it**: a member may approve an above-ceiling ask iff their own ceiling admits the action's stamped class (ladder: their tier ≥ class ordinal; flag: their flag is `allowed`). Admins qualify by construction at tier 5 + allowed flags.
 - **N=1 default; N=2 for FINANCIAL-flagged actions.**
-- The voter set is **resolved to concrete subjects at park time and frozen into the ask row**. Mid-vote role/ceiling changes cannot expand the electorate; shrinkage events that would invalidate the frozen set arrive as epoch-bumps and kill the ask.
+- The voter set is **resolved to concrete subjects at park time and frozen into the ask row**, resolved from the CKCRED bundle at the ask's snapshot version, and the frozen list **cites the bundle_version it resolved from** — "who counted" is auditable after the fact against a specific signed snapshot with no new artifact (CKCRED [#15]). Mid-vote role/ceiling changes cannot expand the electorate; shrinkage events that would invalidate the frozen set arrive as epoch-bumps and kill the ask.
 
 ### 4.3 Approval authority (CKCRED [#10], adopted)
 
@@ -133,7 +137,7 @@ Ask rendering into chat surfaces follows wernicke's frozen spine (seed 5ee32ea):
 All new shapes deny-unknown-fields. Additions:
 
 - A2 claims: `ceiling_tier` (u8, 1..=5), `ceiling_flags` (`{credential: "allowed"|"ask", financial: "allowed"|"ask"}`), `role_acls` (array of `{role, agents}`), `federation_exposure` (compiled set, closed shape owned by FED's profile schema).
-- Dispatch envelope (Zone 1): `action_class` (taxonomy1 enum string) — stamped, never client-supplied; a client-supplied value is rejected pre-parse by the same unrepresentability discipline as target_agent.
+- Dispatch envelope (Zone 1): `action_stamp` `{tier_class, credential, financial, taxonomy_version}` — stamped, never client-supplied; a client-supplied value is rejected pre-parse by the same unrepresentability discipline as target_agent.
 - New refusal reasons (contract-pinned): `ceiling_exceeded` (carries the stamped class + the subject's ceiling tier/flag), `quorum_pending` (carries k-of-N progress), `quorum_electorate_empty` (park refused because zero eligible approvers exist at park time — surfaced loudly rather than parking an unanswerable ask), `acl_role_absent` (role has no ACL row).
 - Step-up: the top-raise mutation carries `step_up_jws` verified against the same audience discipline as org-create; absent/expired → `step_up_required`.
 
@@ -141,7 +145,7 @@ All new shapes deny-unknown-fields. Additions:
 
 Vectors before implementation claims (Room-1 discipline):
 
-1. Compiler vectors: every taxonomy1 class reachable; unknown-tool → fail-closed-high; param-split (bash) both branches; flag-dominates-ladder cases.
+1. Compiler vectors: every taxonomy1 class reachable; unknown-tool → fail-closed-high; param-split (bash) both branches; dual-class stamps (flag bit + low ladder class parks on missing flag; both-flags actions; flag bit + tier-5).
 2. Ceiling gate vectors: admit-at-boundary (class == tier), deny-above, flag ask/allowed both ways, self-tighten never relaxes.
 3. Ceiling mutation vectors: self-lower ok, member-raise refused, admin raise ok, top-raise without step-up → `step_up_required`, kick/re-invite reset.
 4. ACL vectors: intersection math, absent-row fail-closed, admin seed at create.
@@ -150,7 +154,7 @@ Vectors before implementation claims (Room-1 discipline):
 
 ## 7. Open items at draft r1
 
-- ALF PIN-2 confirm: Zone-1 stamp comparison under ladder+flags (two branches, still unrepresentable).
+- ~~ALF PIN-2 confirm~~ CLOSED [#13]: comparison confirmed clean; unrepresentability lives in who stamps, not the comparison shape.
 - §2.4 scope note: "top tier" = tier-5-only vs any raise into tier-5/flag-allowed. Chair leans the latter; seats confirm.
 - Gate posture: full-panel if tonight's Athena recovery holds, else panel with explicit shortfall disclosure + heavier author line-cites.
 

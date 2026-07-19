@@ -81,6 +81,19 @@ final class BoardViewModel: ObservableObject {
                 // ForEach duplicate ids, which corrupts diffing.
                 var seen = Set<String>()
                 folded.lanes = folded.lanes.filter { seen.insert($0).inserted }
+                // Strip volatile read-time fields (ageMs changes every poll).
+                // Leaving them in defeats the publish-only-on-change guard:
+                // every 2.5s tick re-diffs the whole board, and with enough
+                // selectable blocks the re-diff outruns the poll interval and
+                // wedges the main thread. Age renders locally from askedAt.
+                folded.blocks = folded.blocks.map { block in
+                    var block = block
+                    if case .ask(var props) = block.props {
+                        props.ageMs = nil
+                        block.props = .ask(props)
+                    }
+                    return block
+                }
                 DispatchQueue.main.async {
                     guard let self else { return }
                     // Publish only on change: an unconditional set forces a

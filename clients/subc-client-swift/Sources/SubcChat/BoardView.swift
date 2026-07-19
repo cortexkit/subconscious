@@ -222,12 +222,16 @@ struct BoardView: View {
                let countdown = countdown(for: waitUntil) {
                 countdownChip(countdown)
             }
-            // Projected asks carry read-time age; board-minted asks from older
-            // module builds don't, so the row simply doesn't render there.
-            if let age = props.ageMs {
-                Text("asked \(formatAge(age)) ago")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+            // Age computed locally from the stable askedAt timestamp: the
+            // wire's ageMs is stripped at ingest because a per-poll-changing
+            // field defeats change-detection and forces full re-diffs.
+            if let askedAt = props.askedAt {
+                let age = Int64(Date().timeIntervalSince1970 * 1_000) - askedAt
+                if age > 0 {
+                    Text("asked \(formatAge(age)) ago")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
             }
         }
     }

@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        HangWatchdog.shared.start()
         let hosting = NSHostingController(rootView: ContentView())
         window = NSWindow(contentViewController: hosting)
         window.title = "CortexKit Chat — subc + broca"

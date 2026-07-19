@@ -9,6 +9,12 @@ struct BoardView: View {
     @ObservedObject var asksVM: AskViewModel
 
     @State private var freeText: [String: String] = [:]
+    /// Blocks whose full (untruncated) body the user asked for. Unbounded Text
+    /// bodies with selection enabled make layout quadratic and freeze the window
+    /// (same class as the transcript-sheet fast-scroll hang).
+    @State private var expandedBlocks: Set<String> = []
+
+    private static let blockCharBudget = 4_000
 
     var body: some View {
         VStack(spacing: 0) {
@@ -149,8 +155,7 @@ struct BoardView: View {
                         .foregroundColor(.secondary)
                         .help("tee-produced")
                 }
-                Text(props.text)
-                    .textSelection(.enabled)
+                boundedBody(props.text, blockId: block.blockId)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if let defect = props.teeDefect {
@@ -257,10 +262,29 @@ struct BoardView: View {
                 .buttonStyle(.borderless)
                 .font(.caption)
             }
-            Text(props.body)
+            boundedBody(props.body, blockId: block.blockId)
                 .font(.system(size: 11, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// Renders a body string truncated to the char budget with a show-all
+    /// toggle. Selection stays enabled on the bounded prefix only.
+    @ViewBuilder
+    private func boundedBody(_ full: String, blockId: String) -> some View {
+        if full.count <= Self.blockCharBudget || expandedBlocks.contains(blockId) {
+            Text(full).textSelection(.enabled)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(String(full.prefix(Self.blockCharBudget)) + " …")
+                    .textSelection(.enabled)
+                Button("Show all (\(full.count) chars)") {
+                    expandedBlocks.insert(blockId)
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+            }
         }
     }
 

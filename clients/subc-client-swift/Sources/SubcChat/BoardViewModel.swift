@@ -76,12 +76,19 @@ final class BoardViewModel: ObservableObject {
                 let raw = try worker.alfonsoCallBlocking(
                     "board.state",
                     ["harness": harness, "session": session])
-                let state = try worker.decode(BoardState.self, from: raw)
+                var folded = try worker.decode(BoardState.self, from: raw).folded()
+                // Defensive dedup: duplicate lane names would give SwiftUI's
+                // ForEach duplicate ids, which corrupts diffing.
+                var seen = Set<String>()
+                folded.lanes = folded.lanes.filter { seen.insert($0).inserted }
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.board = state.folded()
-                    self.opsAvailable = true
-                    self.status = "live"
+                    // Publish only on change: an unconditional set forces a
+                    // full view-graph re-diff every poll tick, which is what
+                    // wedged the main thread on boards with large blocks.
+                    if self.board != folded { self.board = folded }
+                    if self.opsAvailable != true { self.opsAvailable = true }
+                    if self.status != "live" { self.status = "live" }
                 }
             } catch {
                 // A missing board (flag off, wrong session id) is an expected

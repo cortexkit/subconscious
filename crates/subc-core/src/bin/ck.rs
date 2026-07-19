@@ -593,33 +593,101 @@ async fn health_detail(
 
 /// Render a metrics JSON object as an indented tree. Health metrics are
 /// module-defined free-form JSON; a tree keeps nested sections (memory
-/// roots, dispatch lanes) readable without knowing their schema.
+/// roots, dispatch lanes) readable without knowing their schema. Three
+/// readability rules on top of the raw structure: strings print unquoted,
+/// small all-scalar objects collapse onto one line, and array items that
+/// carry an identity-ish field (project_root, id, name, …) print that
+/// identity as the item header instead of an anonymous dash.
 fn print_metrics_tree(value: &Value, depth: usize) {
     let indent = "  ".repeat(depth);
     match value {
         Value::Object(map) => {
             for (key, child) in map {
-                match child {
-                    Value::Object(_) | Value::Array(_) => {
-                        println!("{indent}{key}:");
-                        print_metrics_tree(child, depth + 1);
-                    }
-                    other => println!("{indent}{key}: {other}"),
-                }
+                print_metrics_entry(key, child, depth);
             }
         }
         Value::Array(items) => {
             for item in items {
-                match item {
-                    Value::Object(_) | Value::Array(_) => {
-                        println!("{indent}-");
-                        print_metrics_tree(item, depth + 1);
-                    }
-                    other => println!("{indent}- {other}"),
-                }
+                print_metrics_array_item(item, depth);
             }
         }
-        other => println!("{indent}{other}"),
+        other => println!("{indent}{}", scalar_text(other)),
+    }
+}
+
+fn print_metrics_entry(key: &str, child: &Value, depth: usize) {
+    let indent = "  ".repeat(depth);
+    match child {
+        Value::Object(map) => {
+            if let Some(inline) = inline_scalar_object(map) {
+                println!("{indent}{key}: {inline}");
+            } else {
+                println!("{indent}{key}:");
+                print_metrics_tree(child, depth + 1);
+            }
+        }
+        Value::Array(items) if items.is_empty() => println!("{indent}{key}: []"),
+        Value::Array(_) => {
+            println!("{indent}{key}:");
+            print_metrics_tree(child, depth + 1);
+        }
+        other => println!("{indent}{key}: {}", scalar_text(other)),
+    }
+}
+
+fn print_metrics_array_item(item: &Value, depth: usize) {
+    let indent = "  ".repeat(depth);
+    match item {
+        Value::Object(map) => {
+            // Lead with the item's identity so a list of roots reads as a
+            // list of roots, not a list of anonymous dashes.
+            const IDENTITY_KEYS: [&str; 6] =
+                ["project_root", "id", "name", "module_id", "path", "root"];
+            let identity = IDENTITY_KEYS
+                .iter()
+                .find_map(|k| map.get(*k).and_then(Value::as_str).map(|v| (*k, v)));
+            if let Some((id_key, id_value)) = identity {
+                println!("{indent}- {id_value}");
+                for (key, child) in map {
+                    if key != id_key {
+                        print_metrics_entry(key, child, depth + 1);
+                    }
+                }
+            } else if let Some(inline) = inline_scalar_object(map) {
+                println!("{indent}- {inline}");
+            } else {
+                println!("{indent}-");
+                print_metrics_tree(item, depth + 1);
+            }
+        }
+        other => println!("{indent}- {}", scalar_text(other)),
+    }
+}
+
+/// Collapse an all-scalar object onto one line when it stays short:
+/// `bash: pending_completions=0 · running=0`. Anything nested or long
+/// keeps the tree form.
+fn inline_scalar_object(map: &serde_json::Map<String, Value>) -> Option<String> {
+    if map.is_empty() {
+        return Some("{}".to_string());
+    }
+    let mut parts = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        match value {
+            Value::Object(_) | Value::Array(_) => return None,
+            other => parts.push(format!("{key}={}", scalar_text(other))),
+        }
+    }
+    let line = parts.join(" · ");
+    (line.chars().count() <= 88).then_some(line)
+}
+
+/// Scalar leaf rendering: strings unquoted (these are human-facing labels
+/// and paths, not re-parseable JSON — `--json` serves that need).
+fn scalar_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 

@@ -40,6 +40,11 @@ public struct BoardAskProps: Codable, Equatable {
     public var status: String
     public var answer: String?
     public var silencePolicy: BoardSilencePolicy?
+    // Board v2 projected-ask read-time fields (absent on board-minted asks
+    // from older module builds; render only when present).
+    public var askedAt: Int64?
+    public var ageMs: Int64?
+    public var resolvedAt: Int64?
 }
 
 public struct BoardShowProps: Codable, Equatable {

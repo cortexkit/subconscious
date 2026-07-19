@@ -191,7 +191,22 @@ struct BoardView: View {
                let countdown = countdown(for: waitUntil) {
                 countdownChip(countdown)
             }
+            // Projected asks carry read-time age; board-minted asks from older
+            // module builds don't, so the row simply doesn't render there.
+            if let age = props.ageMs {
+                Text("asked \(formatAge(age)) ago")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
         }
+    }
+
+    private func formatAge(_ ms: Int64) -> String {
+        let s = ms / 1_000
+        if s < 60 { return "\(s)s" }
+        if s < 3_600 { return "\(s / 60)m" }
+        if s < 86_400 { return "\(s / 3_600)h \((s % 3_600) / 60)m" }
+        return "\(s / 86_400)d \((s % 86_400) / 3_600)h"
     }
 
     private func showCard(_ block: BoardBlock, props: BoardShowProps) -> some View {
@@ -296,6 +311,7 @@ struct BoardView: View {
         case "working": return .blue
         case "ask": return .orange
         case "answered": return .green
+        case "auto_proceeded": return .purple
         case "partial": return .yellow
         case "opaque": return .gray
         default: return .gray

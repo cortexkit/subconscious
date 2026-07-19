@@ -1,4 +1,4 @@
-# ck-projects v4: the fleet project/workspace registry
+# ck-projects v5: the fleet project/workspace registry
 
 Drafted from the ratified fold of #workspace-projects-design (rm_toolu_01ByRWpGZeSjyJC3om18Y7ds):
 S1-S11 settled in round 1 (four seats), ratified by Ufuk with three additions S12-S14 and the
@@ -114,13 +114,27 @@ Projection tables:
 - derived_root_parent(canonical_parent TEXT PK, project_id TEXT REFERENCES project)
 - project_alias(old_id TEXT PK, project_id TEXT REFERENCES project, created_at)
 
-Deletion semantics (journal op `remove`): removing a project retires, IN THE SAME
-TRANSACTION, every row that references it: project_root, derived_root_parent,
-project_workspace, workspace_member (local rows naming the project_id), and its aliases —
-retargeted to the successor if the removal names one (merge), deleted otherwise (a
-dangling alias is a lie, and so is a dangling membership row). Removing a workspace
-detaches its projects (project_workspace AND the mirroring workspace_member locals
-cleared), never deletes them. All in one journal entry, one generation.
+Deletion semantics (journal op `remove`), PER-RELATION disposition (v5: the blanket
+"retarget everything on merge" rule was unimplementable — retargeting membership rows
+collides with project_workspace's PK and workspace_member's UNIQUE):
+
+| relation | remove (no successor) | remove with successor (merge) |
+|---|---|---|
+| project (the row itself) | DELETED | DELETED |
+| project_root | deleted | RETARGETED to successor (successor absorbs the roots; I1 holds — roots were exclusively the removed project's) |
+| derived_root_parent | deleted | RETARGETED (same argument; two-sided ancestry cannot newly conflict because both projects' claims were already mutually valid and now share one owner) |
+| project_alias (rows targeting removed) | deleted | RETARGETED to successor + new alias(removed -> successor) written |
+| project_workspace | deleted | DELETED — membership NEVER transfers on merge. The successor keeps its own membership (or none); transferring would collide with the successor's PK row or silently re-home the successor. If the operator wants the successor in the removed project's workspace, that is an explicit follow-up assign_workspace. |
+| workspace_member (locals naming removed) | deleted | DELETED (mirrors project_workspace in the same transaction, I2 dual-representation preserved) |
+
+MERGE PRECONDITION: none beyond successor-is-live-and-distinct. Cross-workspace merge is
+legal precisely because membership does not transfer — the merged roots land in the
+successor's existing workspace context, and the report of the remove op names the dropped
+membership (workspace id) so the operator sees what detached.
+
+Removing a workspace detaches its projects (project_workspace AND the mirroring
+workspace_member locals cleared), never deletes them. All in one journal entry, one
+generation.
 
 MEMBERSHIP READ INVARIANT: for local members, workspace_member and project_workspace are
 dual representations of one fact and must satisfy: a local workspace_member row exists
@@ -151,6 +165,25 @@ can therefore carry project ids that were later merged away — consumers that p
 id from a mutation reply follow the same rule as offline hints: re-validate via
 resolve_project_id before durable keying. (One rule for both staleness classes.)
 
+NO-OP MUTATIONS (v5, I8): a mutation whose application would leave every projection table
+byte-identical is a SEMANTIC NO-OP: it returns `{noop: true, generation}` (current head)
+WITHOUT a journal append — generation moves iff topology moves, in both directions, which
+is the property MC's exactly-one-HARD fingerprint requires. Enumerated per op:
+- register: all named roots already owned by the target project, no new roots, no
+  name/workspace change → no-op. Any conflicting owner is still the I1 ERROR, not a no-op.
+- assign_workspace: project already in the named workspace → no-op.
+- upgrade_implicit: alias already present and target identical → no-op.
+- remove: absent target → typed ERROR `not_found` (no append). Removing an already-removed
+  id is not a no-op success; the caller's model is stale and must hear it.
+- seed_import: an import whose every pair is skipped/conflicted/duplicate and whose
+  resulting topology is unchanged → no-op; the report is still returned (recomputed — it
+  is a pure function of the payload and the topology).
+REQUEST_KEY interaction: request_key rows are recorded ONLY with journal appends. A no-op
+reply is not frozen; a re-sent no-op re-evaluates against current state. This is safe
+because every ck-projects mutation is DECLARATIVE (ensure-state, not apply-delta): if the
+world changed so the same request is now effectful, executing it is exactly the caller's
+declared intent. Errors likewise never append and never freeze.
+
 ## 5. Invariants
 
 I1. One root belongs to at most ONE project (PK-enforced; register rejects with the
@@ -171,6 +204,9 @@ I6. The registry never re-implements path identity, and canonical discipline is 
     a query path is a pure function of the filesystem, so determinism is preserved.
 I7. One mutation = one journal entry = one generation transition (section 4). No observable
     intermediate topology states.
+I8. Generation moves IFF topology moves (v5): semantic no-ops and errors never append or
+    bump; every append changes at least one projection row. Together with I7 this is MC's
+    exactly-one-HARD contract stated as a store invariant.
 
 ## 6. Resolution
 
@@ -178,10 +214,19 @@ resolve { canonicalRoot } -> { projectId, workspaceId?, projectName?, via, gone,
 
 Order:
 1. Exact project_root match -> via:"root".
-2. Nearest registered derived_root_parent whose canonical path is a strict prefix (path
-   component boundary) of the query -> via:"containment". Nested parents: nearest (longest)
-   wins. The parent path ITSELF resolves to its project via containment (it is project
-   infrastructure, e.g. the per-repo worktree pool dir).
+2. Nearest registered derived_root_parent whose canonical path is a PREFIX-OR-EQUAL (path
+   component boundary; equality explicit — v5 closes the strict-prefix reading under which
+   the parent path itself would fall through to implicit) of the query -> via:"containment".
+   Nested parents: nearest (longest) wins. The parent path ITSELF resolves to its project
+   via containment (it is project infrastructure, e.g. the per-repo worktree pool dir).
+   ST_DEV CANDIDATE RULE (v5): candidates are evaluated nearest-first. When the query path
+   exists AND the candidate parent can be statted AND st_dev differs, that CANDIDATE is
+   rejected and evaluation continues with the NEXT-nearest qualifying parent (never a
+   direct fall-through to implicit while qualifying candidates remain). When the candidate
+   parent cannot be statted (registered parent since vanished), the boundary check for
+   that candidate is unavoidably skipped and canonical-prefix matching decides — same
+   posture as the query-path-gone case, and consistent with it: filesystem checks apply
+   when the filesystem can answer, prefix logic is the fallback truth.
    ANCESTRY VALIDATION IS TWO-SIDED (both directions of the same rule, checked in the
    mutating transaction): registering a derived parent rejects if it is an ancestor of any
    OTHER project's registered root, AND registering a root rejects if it falls under any
@@ -194,10 +239,20 @@ ALIAS IS NOT IN THIS ORDER (gate finding 1): aliases key on project IDs, not roo
 that was upgraded resolves via its project_root row (step 1). Aliases serve consumers that
 PERSISTED an old project id; they use the dedicated op:
 
-resolve_project_id { projectId } -> { projectId (current), via: "current"|"alias", gone:
-false, generation } — follows the alias chain (chains are collapsed at write time: an alias
-always points at a live project, upgrades/merges rewrite existing alias targets in the same
-transaction, so lookup is one hop).
+resolve_project_id { projectId } -> { projectId, via: "current"|"alias"|"gone", gone:
+bool, generation } — TOTAL over all inputs (v5):
+- live project id → { projectId (echoed), via:"current", gone:false }
+- alias key → { projectId (the live target), via:"alias", gone:false } (chains are
+  collapsed at write time: an alias always points at a live project, upgrades/merges
+  rewrite existing alias targets in the same transaction, so lookup is one hop)
+- anything else → { projectId (echoed back), via:"gone", gone:true } — never an error.
+  Unknown-forever and removed-without-successor are DELIBERATELY indistinguishable here
+  (a non-merge remove deletes the aliases; retaining tombstones would leak removed
+  topology forever for no consumer need). A gone:true answer tells the consumer exactly
+  what to do: drop the durable key and re-key from resolve() on the path.
+A well-formed but reserved id (pj-implicit1-<16hex>) resolves like any other input: alias
+hit if the root was absorbed into a project, gone:true otherwise — consumers holding
+offline-derived hints get a truthful answer either way.
 
 Filesystem boundary and existence: when the queried path exists, containment additionally
 requires same st_dev as the matched parent (I5). When it does not exist (reclaimed worktree,
@@ -235,6 +290,20 @@ An unregistered root resolves to `pj-implicit1-<16hex>`:
   makes no cross-machine claim beyond that (different mount layouts produce different
   canonical paths and thus different implicit ids — federation joins use content identity
   where available, S12).
+- NAMESPACE RESERVATION (v5): every `pj-implicit<n>-` prefix is RESERVED for
+  module-derived ids. register/upgrade_implicit/seed_import reject a caller-supplied
+  projectId under a reserved prefix with typed `reserved_project_id_namespace`. Seed-minted
+  ids (§10) use `pj-<16hex>` outside the reserved space. Without the reservation, an
+  explicit project could squat an id the hash contract may later derive for a real root.
+- TRUNCATION-COLLISION HANDLING (v5): 16 hex = 64 bits; a collision between two distinct
+  roots is cryptographically negligible but DEFINED: if the universal-alias write finds
+  project_alias(old_id) already present pointing at a DIFFERENT project (and the id is
+  implicit-derived from a different root), the alias write is SKIPPED, the collision is
+  recorded in the journal entry's payload, and the mutation reply carries a typed
+  `implicit_alias_collision` warning. Consequence is bounded by design: resolve() on
+  either root still answers correctly (root/containment precede implicit); only the
+  offline-hint path for the second root degrades — and offline hints are already
+  non-persistable and re-validated by contract.
 - IMPLICIT ALIASES ARE UNIVERSAL: every root entering a project — via register,
   upgrade_implicit, or seed_import — writes project_alias(pj-implicit1-<hash(root)> ->
   projectId) in the same journal entry. Online implicit answers are legitimate registry
@@ -285,6 +354,24 @@ workspaces: [...], members: [...] } }:
 
 - Grouping: roots sharing an mc_identity form one project (I3). Path-derived grouping is
   forbidden.
+- GENERATED OUTPUT DETERMINISM (v5 — the same corpus forces one topology AND one report):
+  - Processing order: identity groups in lexicographic mc_identity order; roots within a
+    group in lexicographic canonical-path order; report entries in processing order.
+  - Minted project ids: `pj-<16hex>` = first 16 lowercase hex of
+    blake3("seed1:" || mc_identity) — deterministic, outside the reserved implicit
+    namespace, versioned by the seed1 domain tag. If the minted id already exists in the
+    store (re-import into a non-empty store), the EXISTING project is extended iff it was
+    seed-minted from the same mc_identity (recorded as `rejoined`); otherwise the group is
+    recorded `conflicted` and excluded (no silent adoption of a caller-created id).
+  - Project names: the export's per-identity name when present, else the last path
+    component of the lexicographically-first root in the group.
+  - Workspace mapping: export workspaces are created verbatim (id, name); each surviving
+    group maps to the single workspace the export's members claim for its mc_identity
+    (post rule-2: multi-claim → detached + recorded).
+  - MULTI-OWNER identity_split (v5): when rule 4 skips a group's roots to MORE THAN ONE
+    existing owner, the identity_split entry names the mc_identity, EVERY existing owner
+    id with its skipped roots, and the new project id (if any roots remained to group) —
+    one entry per mc_identity, however many owners.
 - CONFLICT RULES, all deterministic, applied in this order, every decision recorded in
   the import report:
   0. IDENTITY-CLASS PRECEDENCE (MC's cooldown semantics, co-signed [#33]): for a root
@@ -358,6 +445,19 @@ open wire item, settled with SUBC before build.
   that is a cortexkit-paths defect to fix fleet-wide, not a ck-projects workaround.
 
 ## 15. Gate and adversarial-pass dispositions
+
+v4 -> v5 (FULL-PANEL AUDIT ct_...5bd5ae19bb00, 3 families, BLOCK with 6 findings — all
+folded above): (1) per-relation merge/remove disposition table replaces the blanket
+retarget rule (membership never transfers; project row deleted); (2) resolve_project_id
+made total with via:"gone"/gone:true for unknown and removed ids; (3) I8 no-op semantics —
+no-ops and errors never append, request_key freezes only appended entries, declarative-op
+re-evaluation argument recorded; (4) seed output determinism — processing order, minted-id
+derivation (blake3 seed1 domain), name rule, workspace mapping, multi-owner identity_split;
+(5) containment: prefix-or-equal explicit + st_dev next-nearest-candidate rule +
+unstattable-parent posture; (6) pj-implicit namespace reservation + truncation-collision
+skip-record-warn handling. Non-blocking residuals accepted as build-time pins:
+assign_workspace field spec, detached-project enumerate visibility, explicit-id minting
+when register.projectId omitted.
 
 v3 -> v4 (SUBC adversarial pass [#31], reconciled [#34]): F1 universal implicit aliases
 (every root entering a project writes its alias \u2014 register/upgrade_implicit/seed_import);

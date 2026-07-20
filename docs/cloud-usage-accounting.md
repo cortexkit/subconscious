@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r1 (seat review) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r2 (folds CKCRED [#8] custody review + ENGRAM [#9] producer review; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -63,7 +63,14 @@ Field rules:
   (worker retry, crash replay) is an idempotent upsert; a re-emission with a DIFFERENT
   quantity for an existing factId is a LOUD conflict (`fact_conflict`), recorded and
   alerting — it means a meter double-ran with different readings, which is a bug, never
-  averaged away.
+  averaged away. Projection stays first-write-wins on conflict.
+- **RESTATEMENT (r2, CKCRED)**: calibration will eventually prove some approximated meter
+  wrong over already-emitted hours; the correction path is a NEW emission event
+  `{kind: "correction", supersedes: factId, quantity, reason, meterVersion}` — the
+  projection updates to the corrected quantity CARRYING correction provenance (surfaces
+  render "restated"), the log keeps original + correction forever, and corrections are
+  themselves conflict-checked (correcting a correction chains explicitly). History is
+  never edited; known-wrong facts are never left uncorrected.
 - **Late facts are legal** (a worker may fold an hour late); consumers read
   watermark-style (facts through hour H complete when the service's emission watermark
   passes H). Each service publishes its watermark as part of emission.
@@ -86,14 +93,38 @@ Three classes, declared per resource in the registry:
 - The **usage ledger lives in the account-service cloud infra** (CKCRED custody): it is
   account-scoped, must survive any single service, and the account service already has
   D1 + per-account DOs + JWKS + the org layer the ledger will need for team mode.
-- Storage shape (CKCRED to refine in seat review): per-account append-only fact rows +
-  a per-account hash chain head (the audit-chain discipline), with hour-bucket upsert
-  semantics per §2. D1 rows are fine at these volumes (~thousands of rows/account/month).
-- **Emission path**: services emit facts to the account service over an authenticated
-  service-to-service call (worker-to-worker; the service identity is the emitter, no
-  user token involved — usage accrues whether or not the user is logged in anywhere).
-- **Read path**: account-authenticated (the user's own facts) and org-admin (org
-  member rollups, later). ASTRO pulls through the same read path.
+- **Storage is TWO structures (r2, CKCRED — resolves the append-only-vs-upsert tension)**:
+  (a) `usage_emissions` — append-only, hash-chained per account; EVERY emission event
+  lands verbatim (first emission, idempotent re-emission, conflict, correction), chain
+  head updated in the same guarded batch. (b) `usage_facts` — the current-state
+  PROJECTION with §2's upsert semantics, derivable from the log at any time. Consumers
+  read the projection; auditors read the log. D1 rows suffice at these volumes.
+  HONESTY CAVEAT (stated, not implied away): the chain is tamper-EVIDENT for interior
+  edits/reorders but NOT rollback/truncation-resistant without an external anchor — an
+  operator with D1 write access can drop a suffix. Acceptable v1 threat posture (bugs
+  and drift, not a hostile platform); an external anchor can be added later.
+- **Emission path (r2, both seats converged): Cloudflare SERVICE BINDING** — emitting
+  worker → account service, worker-to-worker within one Cloudflare account: no public
+  HTTP surface, no bearer credential, no rotation, unforgeable within the account by
+  construction. THE ATTRIBUTION PIN: ingest stamps `service` FROM THE BINDING IDENTITY
+  (one binding per emitting service); a payload `service` value must MATCH the binding
+  or reject `service_mismatch` — a buggy/compromised service structurally cannot mint
+  facts as another service. `accountId` remains the only attribution the emitter
+  asserts. Usage accrues whether or not the user is logged in anywhere. Future
+  cross-account emitters (org daemons) use the fleet service-JWT profile — same claim
+  shape, different transport; NOT built now.
+- **Producer-side buffering (r2, ENGRAM)**: emitters buffer facts durably at the point
+  of measurement (engram: a pending-facts table + emitted-watermark register in the
+  account DO's SQL state, committed in the SAME transaction as the mutation being
+  metered — crash/replay can neither lose nor double a fact; factId upsert absorbs
+  replays). Emission to the ledger activates independently of measurement — late facts
+  are legal, so producers instrument before the ingest endpoint exists and drain when
+  it does.
+- **Read path**: account-authenticated self-read (verified by the same account-JWT
+  verification the org endpoints use) and org-admin rollups later via the org layer.
+  Responses carry per-service emission WATERMARKS so consumers render "complete through
+  hour H" honestly rather than implying a live total. ASTRO pulls through the same read
+  path.
 
 ## 5. Closed registries
 
@@ -102,16 +133,36 @@ Two registries, versioned in this doc (amendment = seat-reviewed doc change):
 **Service registry**: `engram` (first), `rendezvous`, `relay`, `wernicke`, `org-daemon`
 (reserved, not yet emitting).
 
-**Resource registry v1 (engram)**:
+**Resource registry v1 (engram)** (r2: ENGRAM's producer review added the DO-SQL class —
+stage-2 economics showed ROW WRITES, not R2, are the dominant engram cost driver; omitting
+them would show users pennies of R2 while hiding the actual dollar driver, the precise
+dishonesty this doc exists to prevent):
 
 | resource | unit | class | notes |
 |---|---|---|---|
-| `r2_storage_byte_hours` | byte_hours | sampled | fold of stored bytes over the hour |
+| `r2_storage_byte_hours` | byte_hours | **derived-exact** | the DO's transactional used_bytes gauge changes only at reserve/finalize/expire/GC; byte_hours for completed hours derive exactly at next wake (late facts) — no hourly DO wakes, idle accounts fold lazily |
 | `r2_class_a_ops` | count | counted | writes/lists |
 | `r2_class_b_ops` | count | counted | reads |
+| `do_sql_rows_written` | count | approximated | proxy from drain plans; provider analytics calibrate |
+| `do_sql_rows_read` | count | approximated | |
+| `do_storage_byte_hours` | byte_hours | sampled | DO SQL state size |
 | `do_compute_gb_s` | gb_seconds | approximated | wall-clock active duration proxy |
 | `do_requests` | count | counted | |
+| `worker_requests` | count | counted | Workers-standard billing |
+| `worker_cpu_ms` | ms | approximated | |
 | `egress_bytes` | bytes | counted | worker-measured response bytes |
+
+Storage-gauge honesty tiers (ENGRAM): DO gauge (exact, free) → periodic R2 list-by-prefix
+reconciliation (catches divergence; quarantined/delete-pending/preimages/wrapper/marker
+are all billed bytes and MUST be in the gauge) → monthly Cloudflare billing calibration
+(ground truth). Known gauge divergences (reserve-before-upload, 24h expiry refunds) are
+recorded in the calibration notes.
+
+**ZERO-KNOWLEDGE FENCE (r2, ENGRAM — contract-level, applies to every service)**: facts
+carry account + blind quantities ONLY. No resource dimension may ever be content-shaped
+(no per-catalog/per-path/per-session server-side breakdowns — for zero-knowledge
+services the server structurally cannot know them, and the registry must never create
+pressure to learn them).
 
 ## 6. Calibration (the step that makes the numbers honest)
 
@@ -149,6 +200,11 @@ instruments. Re-calibrate on meterVersion changes to measurement code.
     the period).
   - No limit configured = unlimited (metering is always on regardless).
 - Limits math uses the same facts users see — one truth, no shadow meter.
+- **v1 reality (r2, ENGRAM)**: the storage cap is ALREADY BUILT — engram's reserve op
+  enforces used_bytes vs quota_bytes with exactly this posture (reject new, never
+  delete); user-set storage limits are quota_bytes becoming account-author-writable
+  through the limit config. Ops/compute caps come after calibration establishes normal
+  ranges.
 
 ## 9. Local surfacing
 

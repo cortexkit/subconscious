@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r2 (folds CKCRED [#8] custody review + ENGRAM [#9] producer review; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r3 (r2 + the crossed seam pins [#10][#11]: batch outcome vector, `derived` meter class, correction-aware buffer schema; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -81,6 +81,11 @@ Three classes, declared per resource in the registry:
 
 - **counted**: the serving code increments counters in-band (class A/B ops, egress bytes,
   chunks stored). Exact by construction.
+- **derived** (r3): exact-by-construction FOLD over transactional state — the state
+  changes only under recorded mutations, so past-period quantities derive exactly and
+  retroactively (engram's R2 gauge × 3600 per completed hour, folded lazily at next
+  wake as late facts). Distinct from sampled: no cadence bound, exactness inherited
+  from the state's transactionality.
 - **sampled**: point-in-time gauge folded over the hour (R2 bytes stored -> byte_hours).
   Exactness bounded by sample cadence; cadence declared in the registry.
 - **approximated**: self-measured proxy for a provider-billed quantity (DO wall-clock
@@ -117,9 +122,20 @@ Three classes, declared per resource in the registry:
   of measurement (engram: a pending-facts table + emitted-watermark register in the
   account DO's SQL state, committed in the SAME transaction as the mutation being
   metered — crash/replay can neither lose nor double a fact; factId upsert absorbs
-  replays). Emission to the ledger activates independently of measurement — late facts
-  are legal, so producers instrument before the ingest endpoint exists and drain when
-  it does.
+  replays). The buffer schema carries `{kind: emission|correction, supersedes?, reason?}`
+  from day one so restatements ride the same drain. Emission to the ledger activates
+  independently of measurement — late facts are legal, so producers instrument before
+  the ingest endpoint exists and drain when it does.
+- **Batch ingest outcome vector (r3, CKCRED [#10])**: emission is a batch, idempotency
+  is PER-FACT — the ingest response is a per-factId outcome vector
+  `[{factId, outcome: accepted | duplicate | conflict | rejected(reason)}]`, never a
+  batch-level status. The producer's emitted-watermark advances past a fact ONLY on
+  accepted|duplicate (both mean the ledger durably holds the event); conflict|rejected
+  facts stay buffered, flagged for inspection, never silently retried into the same
+  conflict. Partial success is normal (one malformed fact never wedges a batch). The
+  ingest applies the whole batch in ONE guarded write (log appends + projection upserts
+  + chain head) so a mid-ingest crash is all-or-nothing and the outcome vector is
+  truthful by construction.
 - **Read path**: account-authenticated self-read (verified by the same account-JWT
   verification the org endpoints use) and org-admin rollups later via the org layer.
   Responses carry per-service emission WATERMARKS so consumers render "complete through
@@ -140,7 +156,7 @@ dishonesty this doc exists to prevent):
 
 | resource | unit | class | notes |
 |---|---|---|---|
-| `r2_storage_byte_hours` | byte_hours | **derived-exact** | the DO's transactional used_bytes gauge changes only at reserve/finalize/expire/GC; byte_hours for completed hours derive exactly at next wake (late facts) — no hourly DO wakes, idle accounts fold lazily |
+| `r2_storage_byte_hours` | byte_hours | derived | the DO's transactional used_bytes gauge changes only at reserve/finalize/expire/GC; byte_hours for completed hours derive exactly at next wake (late facts) — no hourly DO wakes, idle accounts fold lazily |
 | `r2_class_a_ops` | count | counted | writes/lists |
 | `r2_class_b_ops` | count | counted | reads |
 | `do_sql_rows_written` | count | approximated | proxy from drain plans; provider analytics calibrate |

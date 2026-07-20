@@ -725,6 +725,7 @@ dependencies = [
  "subc-jsonc",
  "subc-protocol",
  "subc-transport",
+ "terminal_size",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -789,6 +790,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]

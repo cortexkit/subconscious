@@ -1,0 +1,323 @@
+{
+  "comment": "Room-2 contract fixtures (ceilings / taxonomy / quorum). Throwaway test key kid test-key-1 — see the mint script header. Signed families: a2_ceiling (the A2 extension), raise_ceiling (the step-up family incl. F5 substitution/cross-org/replay negatives). Condition-table families: ceiling_gate (§6.2, pure {stamp,ceiling} comparison), ceiling_mutation (§6.3, request→outcome). Non-signed families are input/expected rows, NOT JWTs — same precedent as Room-1's ask_authority tables.",
+  "contract": "room2-ceilings-taxonomy-quorum.md @ d3cf7487 (FROZEN r5)",
+  "a2_ceiling": {
+    "comment": "membership_assertion + ceiling claims {ceiling_tier, ceiling_flags, taxonomy_version, federation_exposure}. federation_exposure is the pre-compiled per-member set (FED ExposeEntry shape). role_acls is NOT here — it is a bundle-body array, never an A2 claim (the §5 split).",
+    "valid": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiY2VpbGluZ190aWVyIjozLCJjZWlsaW5nX2ZsYWdzIjp7ImNyZWRlbnRpYWwiOiJhc2siLCJmaW5hbmNpYWwiOiJhc2sifSwidGF4b25vbXlfdmVyc2lvbiI6InRheG9ub215MSIsImZlZGVyYXRpb25fZXhwb3N1cmUiOlt7Im1vZHVsZSI6ImNvcnRleGtpdC1jcmVkZW50aWFscyIsInRvb2wiOiJjcmVkZW50aWFsX2dldCJ9LHsibW9kdWxlIjoiY2stcXVvdGEiLCJvcGVyYXRpb24iOiJ1c2FnZS5yZWFkIn1dLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiYjA5ZjJiMjUtN2IzMi00OTc3LThlYWUtNjAxZTIyNGIwMDE1In0.2zUvmHz1PKRkuKV_pm-kqEgcHoV8lgvFnyFQjONEIiQW1Hqx8ZtPVAA3NEJd4kUHucDqjt5WbfN4dpkBqjvzCQ",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiY2VpbGluZ190aWVyIjozLCJjZWlsaW5nX2ZsYWdzIjp7ImNyZWRlbnRpYWwiOiJhc2siLCJmaW5hbmNpYWwiOiJhc2sifSwidGF4b25vbXlfdmVyc2lvbiI6InRheG9ub215MSIsImZlZGVyYXRpb25fZXhwb3N1cmUiOlt7Im1vZHVsZSI6ImNvcnRleGtpdC1jcmVkZW50aWFscyIsInRvb2wiOiJjcmVkZW50aWFsX2dldCJ9LHsibW9kdWxlIjoiY2stcXVvdGEiLCJvcGVyYXRpb24iOiJ1c2FnZS5yZWFkIn1dLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LW9yZzowMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJpYXQiOjAsImV4cCI6OTQ2Njg0ODAwLCJqdGkiOiI3MmNiZDUxMC0xMjJmLTQ2MmItOTQwYS1mNDMwZGQ2MGRkNGQifQ.x_XjmuyKVFBpd_-8fTxqoY_t9CvUiawo6lzzEfwgYZHRuJmo3XFS2MZvMGWPbZknb7L24EOBLBa4LDOF5F8DBw",
+    "wrong_aud": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBTElDRTAwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoibWVtYmVyIiwibWVtYmVyc2hpcF9lcG9jaCI6NywiY2VpbGluZ190aWVyIjozLCJjZWlsaW5nX2ZsYWdzIjp7ImNyZWRlbnRpYWwiOiJhc2siLCJmaW5hbmNpYWwiOiJhc2sifSwidGF4b25vbXlfdmVyc2lvbiI6InRheG9ub215MSIsImZlZGVyYXRpb25fZXhwb3N1cmUiOlt7Im1vZHVsZSI6ImNvcnRleGtpdC1jcmVkZW50aWFscyIsInRvb2wiOiJjcmVkZW50aWFsX2dldCJ9LHsibW9kdWxlIjoiY2stcXVvdGEiLCJvcGVyYXRpb24iOiJ1c2FnZS5yZWFkIn1dLCJpc3MiOiJodHRwczovL2FjY291bnQuY29ydGV4a2l0LmlvIiwiYXVkIjoiY29ydGV4a2l0LWZlZCIsImlhdCI6MCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiI0MDJiYWJmOC04NDRiLTQ3NDQtOTAzYS0yMGEzOGUyYTc1OGUifQ.7HrCvql93KEY8iPVWqx7jjULv4bgi5bC0NF2kfWyJ_Pq2BkQzpRAY-D6_EjgQNc9Zg3iLoGkCwOh5jUBOVlaDQ",
+    "admin_tier5": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJtZW1iZXJzaGlwX2Fzc2VydGlvbiIsInN1YmplY3QiOiIwMVNBTVBMRUFDQ09VTlRBRE1JTlgwMDAwMDAiLCJvcmciOiIwMVNBTVBMRU9SRzAwMDAwMDAwMDAwMDAwMDAiLCJyb2xlIjoiYWRtaW4iLCJtZW1iZXJzaGlwX2Vwb2NoIjo3LCJjZWlsaW5nX3RpZXIiOjUsImNlaWxpbmdfZmxhZ3MiOnsiY3JlZGVudGlhbCI6ImFsbG93ZWQiLCJmaW5hbmNpYWwiOiJhbGxvd2VkIn0sInRheG9ub215X3ZlcnNpb24iOiJ0YXhvbm9teTEiLCJmZWRlcmF0aW9uX2V4cG9zdXJlIjpbeyJtb2R1bGUiOiJjb3J0ZXhraXQtY3JlZGVudGlhbHMiLCJ0b29sIjoiY3JlZGVudGlhbF9nZXQifSx7Im1vZHVsZSI6ImNrLXF1b3RhIiwib3BlcmF0aW9uIjoidXNhZ2UucmVhZCJ9XSwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1vcmc6MDFTQU1QTEVPUkcwMDAwMDAwMDAwMDAwMDAwIiwiaWF0IjowLCJleHAiOjQxMDI0NDQ4MDAsImp0aSI6IjMyYmNiNjI5LWUyMzUtNGMxMy1hNzA5LTVjYzk2ZjNiNDk0NiJ9.VLaLy8MBsFyOxhlgG9FsuTnq6nzOjwe-FmZzackChLuHsYqQhNIlTe7LK_The9MX0OTiQlgpOt2ypq9ySas3DQ"
+  },
+  "raise_ceiling": {
+    "comment": "The step-up attestation for a sensitive ceiling raise. purpose=raise_ceiling, aud=cortexkit-account:raise-ceiling, 300s TTL, account_id=acting admin. The consuming batch's S1 predicate enforces account_id==caller AND org==mutation-org in the jti-consuming transaction. valid is minted by ADMIN_X for ORG; the negatives are the substitution / cross-org / replay / expired holes single-use alone does not close.",
+    "valid": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJzdGVwX3VwIiwiYWNjb3VudF9pZCI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsInN1YiI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInB1cnBvc2UiOiJyYWlzZV9jZWlsaW5nIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1hY2NvdW50OnJhaXNlLWNlaWxpbmciLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiODFiNzhmODctYTUyZS00MzUwLWI4NzAtMTQ2YzUzYmYxYjdmIn0.hFJ0_XcW_qje3KsnisCh1wxidDfHsRMjZEqq67lv0LdCAlsy1iRYhorpPXKQmUVzh9Z-Fgwf9vJEdVBLCkJXBw",
+    "substitution_wrong_caller": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJzdGVwX3VwIiwiYWNjb3VudF9pZCI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsInN1YiI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInB1cnBvc2UiOiJyYWlzZV9jZWlsaW5nIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1hY2NvdW50OnJhaXNlLWNlaWxpbmciLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiOWYxMDBhYjItODU0Ny00Y2JjLWIzM2UtNTM0Y2Y5NGQwNWI2In0.A_EdyeKgRS8-RWI8oLDheSJyaBVFC3XMRoEOEkZYbCdsSWxlT-3_IuwBAzQoxnVcP8YO0k-qFvpyNURX20QGCw",
+    "cross_org": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJzdGVwX3VwIiwiYWNjb3VudF9pZCI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsInN1YiI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMjAwMDAwMDAwMDAwMDAwMCIsInB1cnBvc2UiOiJyYWlzZV9jZWlsaW5nIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1hY2NvdW50OnJhaXNlLWNlaWxpbmciLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiYzM1NzNiNjUtZDdkYS00NjY2LTkyODctNjg5NTU0ZDI5ZDZkIn0.bGnZekokCCHsF4pNKkM1ROtplvbqd3qfXTy6eE7neSTWHfHpZ25R5W4oroLxD0k2G6fXfpkF9iNFW0_cV51SBg",
+    "replay_first": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJzdGVwX3VwIiwiYWNjb3VudF9pZCI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsInN1YiI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInB1cnBvc2UiOiJyYWlzZV9jZWlsaW5nIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1hY2NvdW50OnJhaXNlLWNlaWxpbmciLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMDFTQU1QTEUtUkFJU0UtSlRJLVJFUExBWS0wIn0.W1sBSgq5yRPtXS2xV-t8yniA1QllHmvnb6kvQPy-4BdzkEdiHE6yBGdYczhebrzdWZSEjz8gTAvJZ_rw1n3_AA",
+    "replay_second": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJzdGVwX3VwIiwiYWNjb3VudF9pZCI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsInN1YiI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInB1cnBvc2UiOiJyYWlzZV9jZWlsaW5nIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1hY2NvdW50OnJhaXNlLWNlaWxpbmciLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMDFTQU1QTEUtUkFJU0UtSlRJLVJFUExBWS0wIn0.W1sBSgq5yRPtXS2xV-t8yniA1QllHmvnb6kvQPy-4BdzkEdiHE6yBGdYczhebrzdWZSEjz8gTAvJZ_rw1n3_AA",
+    "expired": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJzdGVwX3VwIiwiYWNjb3VudF9pZCI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsInN1YiI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInB1cnBvc2UiOiJyYWlzZV9jZWlsaW5nIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1hY2NvdW50OnJhaXNlLWNlaWxpbmciLCJpYXQiOjAsImV4cCI6OTQ2Njg0ODAwLCJqdGkiOiIwMWFmZWZlNC1lZjVmLTQyYzItOWVlYy0xZmIxMGM3NWZiOGYifQ.J86pFCsn7FBmPQpeV6hqiEPoqAppfapSUVe8IqQhlDmTZ8lTtcn6AY7wZPY1c3upI-J_9D_0hCElA7vtTpIhAg",
+    "wrong_purpose": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3Qta2V5LTEiLCJ0eXAiOiJKV1QifQ.eyJ0eXAiOiJzdGVwX3VwIiwiYWNjb3VudF9pZCI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsInN1YiI6IjAxU0FNUExFQUNDT1VOVEFETUlOWDAwMDAwMCIsIm9yZyI6IjAxU0FNUExFT1JHMDAwMDAwMDAwMDAwMDAwMCIsInB1cnBvc2UiOiJjcmVhdGVfb3JnIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50LmNvcnRleGtpdC5pbyIsImF1ZCI6ImNvcnRleGtpdC1hY2NvdW50OnJhaXNlLWNlaWxpbmciLCJpYXQiOjAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoiMDE3NjI2MDAtZThiOC00M2JhLWFmNzMtM2JiZDJiZGZhZjhkIn0.3f-1rfnCKA7_gVqafTRnwgptEmbdc8Ygu1iY9lmSdpP0h9-c6cjEdb3sDim-Rw_ZjkqdellzxGmJ0cTVEeCJBg"
+  },
+  "ceiling_gate": {
+    "comment": "Input rows {stamp, ceiling} → expected {decision, reason?}. decision is 'admit' or 'park'; a parked row names which predicate failed (contract §6.2). Ladder classes: 1 OBSERVE .. 5 PUBLISH_EXTERNAL.",
+    "vectors": [
+      {
+        "name": "admit_at_boundary",
+        "stamp": {
+          "tier_class": 3,
+          "credential": false,
+          "financial": false,
+          "taxonomy_version": "taxonomy1"
+        },
+        "ceiling": {
+          "ceiling_tier": 3,
+          "credential": "ask",
+          "financial": "ask"
+        },
+        "expect": {
+          "decision": "admit"
+        }
+      },
+      {
+        "name": "deny_above_ladder",
+        "stamp": {
+          "tier_class": 4,
+          "credential": false,
+          "financial": false,
+          "taxonomy_version": "taxonomy1"
+        },
+        "ceiling": {
+          "ceiling_tier": 3,
+          "credential": "ask",
+          "financial": "ask"
+        },
+        "expect": {
+          "decision": "park",
+          "reason": "ceiling_exceeded",
+          "failed": "ladder"
+        }
+      },
+      {
+        "name": "credential_flag_ask_parks",
+        "stamp": {
+          "tier_class": 1,
+          "credential": true,
+          "financial": false,
+          "taxonomy_version": "taxonomy1"
+        },
+        "ceiling": {
+          "ceiling_tier": 5,
+          "credential": "ask",
+          "financial": "ask"
+        },
+        "expect": {
+          "decision": "park",
+          "reason": "ceiling_exceeded",
+          "failed": "credential"
+        }
+      },
+      {
+        "name": "credential_flag_allowed_admits",
+        "stamp": {
+          "tier_class": 1,
+          "credential": true,
+          "financial": false,
+          "taxonomy_version": "taxonomy1"
+        },
+        "ceiling": {
+          "ceiling_tier": 5,
+          "credential": "allowed",
+          "financial": "ask"
+        },
+        "expect": {
+          "decision": "admit"
+        }
+      },
+      {
+        "name": "financial_flag_ask_parks",
+        "stamp": {
+          "tier_class": 2,
+          "credential": false,
+          "financial": true,
+          "taxonomy_version": "taxonomy1"
+        },
+        "ceiling": {
+          "ceiling_tier": 5,
+          "credential": "allowed",
+          "financial": "ask"
+        },
+        "expect": {
+          "decision": "park",
+          "reason": "ceiling_exceeded",
+          "failed": "financial"
+        }
+      },
+      {
+        "name": "flag_in_low_ladder_tool_still_parks",
+        "stamp": {
+          "tier_class": 1,
+          "credential": false,
+          "financial": true,
+          "taxonomy_version": "taxonomy1"
+        },
+        "ceiling": {
+          "ceiling_tier": 5,
+          "credential": "allowed",
+          "financial": "ask"
+        },
+        "expect": {
+          "decision": "park",
+          "reason": "ceiling_exceeded",
+          "failed": "financial"
+        },
+        "note": "the escape F3/ALF closed: a FINANCIAL action hiding in an OBSERVE-ladder tool still parks on the flag"
+      },
+      {
+        "name": "dual_flag_both_needed",
+        "stamp": {
+          "tier_class": 5,
+          "credential": true,
+          "financial": true,
+          "taxonomy_version": "taxonomy1"
+        },
+        "ceiling": {
+          "ceiling_tier": 5,
+          "credential": "allowed",
+          "financial": "ask"
+        },
+        "expect": {
+          "decision": "park",
+          "reason": "ceiling_exceeded",
+          "failed": "financial"
+        },
+        "note": "tier + credential pass, financial fails → parks; conjunction requires ALL"
+      },
+      {
+        "name": "taxonomy_skew_refuses",
+        "stamp": {
+          "tier_class": 1,
+          "credential": false,
+          "financial": false,
+          "taxonomy_version": "taxonomy2"
+        },
+        "ceiling": {
+          "ceiling_tier": 5,
+          "credential": "allowed",
+          "financial": "allowed",
+          "taxonomy_version": "taxonomy1"
+        },
+        "expect": {
+          "decision": "refuse",
+          "reason": "taxonomy_skew"
+        },
+        "note": "version mismatch refuses BEFORE any comparison — fail-closed, never coerce"
+      }
+    ]
+  },
+  "ceiling_mutation": {
+    "comment": "Input {caller_role, caller_is_target, change, step_up?} → expected {outcome}. 'change' names the component move; a move INTO the sensitive surface (tier→5 or a flag ask→allowed) needs step_up. self=caller_is_target true.",
+    "vectors": [
+      {
+        "name": "self_lower_ok",
+        "caller_role": "member",
+        "caller_is_target": true,
+        "change": {
+          "tier": "3->2"
+        },
+        "expect": {
+          "outcome": "applied"
+        }
+      },
+      {
+        "name": "self_lower_flag_ok",
+        "caller_role": "member",
+        "caller_is_target": true,
+        "change": {
+          "credential": "allowed->ask"
+        },
+        "expect": {
+          "outcome": "applied"
+        },
+        "note": "shrinking authority is always safe, no admin, no step-up"
+      },
+      {
+        "name": "self_raise_refused",
+        "caller_role": "member",
+        "caller_is_target": true,
+        "change": {
+          "tier": "2->3"
+        },
+        "expect": {
+          "outcome": "forbidden_403"
+        },
+        "note": "a member can never raise their own ceiling"
+      },
+      {
+        "name": "admin_plain_raise_ok",
+        "caller_role": "admin",
+        "caller_is_target": false,
+        "change": {
+          "tier": "3->4"
+        },
+        "expect": {
+          "outcome": "applied"
+        },
+        "note": "tier 4 is not the sensitive surface, no step-up"
+      },
+      {
+        "name": "admin_sensitive_raise_needs_stepup",
+        "caller_role": "admin",
+        "caller_is_target": false,
+        "change": {
+          "tier": "4->5"
+        },
+        "step_up": null,
+        "expect": {
+          "outcome": "step_up_required"
+        }
+      },
+      {
+        "name": "admin_flag_raise_needs_stepup",
+        "caller_role": "admin",
+        "caller_is_target": false,
+        "change": {
+          "credential": "ask->allowed"
+        },
+        "step_up": null,
+        "expect": {
+          "outcome": "step_up_required"
+        },
+        "note": "a flag to allowed IS the sensitive surface — a credential grant must not be cheaper than tier 5"
+      },
+      {
+        "name": "admin_sensitive_raise_with_stepup_ok",
+        "caller_role": "admin",
+        "caller_is_target": false,
+        "change": {
+          "tier": "4->5"
+        },
+        "step_up": "raise_ceiling.valid",
+        "expect": {
+          "outcome": "applied"
+        }
+      },
+      {
+        "name": "stepup_substituted_caller_refused",
+        "caller_role": "admin",
+        "caller_is_target": false,
+        "caller_account": "01SAMPLEACCOUNTADMINY000000",
+        "change": {
+          "tier": "4->5"
+        },
+        "step_up": "raise_ceiling.substitution_wrong_caller",
+        "expect": {
+          "outcome": "step_up_required"
+        },
+        "note": "attestation account_id ADMIN_X != caller ADMIN_Y → S1 predicate refuses"
+      },
+      {
+        "name": "stepup_cross_org_refused",
+        "caller_role": "admin",
+        "caller_is_target": false,
+        "change": {
+          "tier": "4->5"
+        },
+        "step_up": "raise_ceiling.cross_org",
+        "expect": {
+          "outcome": "step_up_required"
+        },
+        "note": "attestation org OTHER_ORG != mutation org ORG"
+      },
+      {
+        "name": "stepup_replayed_refused",
+        "caller_role": "admin",
+        "caller_is_target": false,
+        "change": {
+          "tier": "4->5"
+        },
+        "step_up": "raise_ceiling.replay_second",
+        "expect": {
+          "outcome": "step_up_required"
+        },
+        "note": "jti already consumed by replay_first → UNIQUE index aborts the second batch"
+      },
+      {
+        "name": "kick_reinvite_resets_to_default",
+        "caller_role": "system",
+        "caller_is_target": false,
+        "change": {
+          "event": "kick_then_reinvite"
+        },
+        "expect": {
+          "outcome": "ceiling_is_default",
+          "ceiling": {
+            "ceiling_tier": 3,
+            "credential": "ask",
+            "financial": "ask"
+          }
+        },
+        "note": "re-invite mints a NEW grant row → DDL defaults → zero-code reset"
+      }
+    ]
+  }
+}

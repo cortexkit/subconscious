@@ -1729,34 +1729,144 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
 }
 
 fn print_health_table(modules: &[Value]) {
-    let rows = modules
+    let color = ansi_color_enabled();
+    let width = terminal_width();
+
+    let id_width = modules
         .iter()
-        .map(|module| {
-            vec![
-                display_field(module, "module_id"),
-                display_field(module, "status"),
-                display_field(module, "consecutive_failures"),
-                display_field(module, "last_action"),
-                display_field(module, "detail"),
-                module
-                    .get("metrics")
-                    .map(display_json_value)
-                    .map(|metrics| truncate_cell(&metrics))
-                    .unwrap_or_else(|| "-".to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    print_table(
-        &[
-            "id",
-            "status",
-            "failures",
-            "last_action",
-            "detail",
-            "metrics",
-        ],
-        rows,
+        .map(|module| display_field(module, "module_id").chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("module".len());
+    // id + gap + dot + status word + gap; detail wraps in the remainder.
+    let status_width = "unresponsive".len();
+    let detail_col = id_width + 2 + 2 + status_width + 2;
+    let detail_width = width.saturating_sub(detail_col).max(20);
+
+    for module in modules {
+        let id = display_field(module, "module_id");
+        let status = display_field(module, "status");
+        let failures = module
+            .get("consecutive_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let last_action = display_field(module, "last_action");
+
+        let (dot_code, status_code) = match status.as_str() {
+            "ok" => ("32", "32"),
+            "degraded" => ("33", "33"),
+            "unresponsive" | "failed" => ("31", "1;31"),
+            _ => ("2", "2"),
+        };
+        let dot = color_text("●", dot_code, color);
+        let status_cell = color_text(&format!("{status:<status_width$}"), status_code, color);
+
+        // First line: id, status, and the start of the detail text.
+        let mut annotations = Vec::new();
+        if failures > 0 {
+            annotations.push(format!("{failures} missed probe(s)"));
+        }
+        if last_action != "-" {
+            annotations.push(format!("last action: {last_action}"));
+        }
+        let detail = display_field(module, "detail");
+        let mut detail_text = if detail == "-" { String::new() } else { detail };
+        if !annotations.is_empty() {
+            let joined = annotations.join(" · ");
+            if detail_text.is_empty() {
+                detail_text = joined;
+            } else {
+                detail_text = format!("{detail_text} · {joined}");
+            }
+        }
+
+        let lines = wrap_text(&detail_text, detail_width);
+        let first = lines.first().map(String::as_str).unwrap_or("");
+        println!("{id:<id_width$}  {dot} {status_cell}  {first}");
+        for line in lines.iter().skip(1) {
+            println!("{:detail_col$}{line}", "");
+        }
+    }
+
+    println!(
+        "{}",
+        dim_text(
+            "ck health <id> — full metrics for one module · --json — raw",
+            color
+        )
     );
+}
+
+/// Best-effort terminal width: $COLUMNS, then the tty query, then 100.
+fn terminal_width() -> usize {
+    if let Some(cols) = env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if cols >= 40 {
+            return cols;
+        }
+    }
+    if let Some((terminal_size::Width(cols), _)) = terminal_size::terminal_size() {
+        if cols >= 40 {
+            return usize::from(cols);
+        }
+    }
+    100
+}
+
+/// Greedy word wrap. Words longer than the width are hard-split so a single
+/// unbroken token (a path, a JSON fragment) cannot push past the margin.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current_len > 0 && current_len + 1 + word_len > width {
+            lines.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        if word_len > width {
+            let mut chars = word.chars().peekable();
+            while chars.peek().is_some() {
+                let take = if current_len > 0 {
+                    if current_len + 1 > width {
+                        lines.push(std::mem::take(&mut current));
+                        current_len = 0;
+                        width
+                    } else {
+                        current.push(' ');
+                        current_len += 1;
+                        width - current_len
+                    }
+                } else {
+                    width
+                };
+                let chunk: String = chars.by_ref().take(take.max(1)).collect();
+                current_len += chunk.chars().count();
+                current.push_str(&chunk);
+                if current_len >= width {
+                    lines.push(std::mem::take(&mut current));
+                    current_len = 0;
+                }
+            }
+            continue;
+        }
+        if current_len > 0 {
+            current.push(' ');
+            current_len += 1;
+        }
+        current.push_str(word);
+        current_len += word_len;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// Cap a table cell so one module's large opaque metrics blob cannot make the

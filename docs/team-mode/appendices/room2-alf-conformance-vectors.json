@@ -1,0 +1,53 @@
+{
+  "contract": "room2-ceilings-taxonomy-quorum r5 @ subconscious d3cf7487",
+  "taxonomy_version": "taxonomy1",
+  "comment": "Committed BEFORE implementation per Room-2 §6 (vectors precede implementation claims). Families owned by the ALF partition: 1 (compiler), 2 (ceiling gate, shared shapes), 5 (quorum) plus the monotonicity and denial-short-circuit vectors. Table-driven: the future taxonomy/gate/quorum tests consume this file verbatim; a vector change is a contract event, not a test refactor.",
+  "family_1_compiler": [
+    { "name": "read_is_observe", "tool": "read", "params": {}, "expect": { "class": "OBSERVE", "credential": false, "financial": false } },
+    { "name": "search_is_observe", "tool": "aft_search", "params": { "query": "x" }, "expect": { "class": "OBSERVE", "credential": false, "financial": false } },
+    { "name": "draft_compose", "tool": "work", "params": { "action": "draft", "title": "t" }, "expect": { "class": "COMPOSE", "credential": false, "financial": false } },
+    { "name": "edit_in_worktree", "tool": "edit", "params": { "filePath": "src/a.ts" }, "expect": { "class": "MUTATE_WORKSPACE", "credential": false, "financial": false } },
+    { "name": "bash_git_status_observe", "tool": "bash", "params": { "command": "git status" }, "expect": { "class": "OBSERVE", "credential": false, "financial": false } },
+    { "name": "bash_git_commit_mutates_workspace", "tool": "bash", "params": { "command": "git commit -m x" }, "expect": { "class": "MUTATE_WORKSPACE", "credential": false, "financial": false } },
+    { "name": "bash_git_push_publishes", "tool": "bash", "params": { "command": "git push origin main" }, "expect": { "class": "PUBLISH_EXTERNAL", "credential": false, "financial": false } },
+    { "name": "bash_unknown_command_fail_closed", "tool": "bash", "params": { "command": "frobnicate --yes" }, "expect": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": true } },
+    { "name": "db_write_mutates_durable", "tool": "bash", "params": { "command": "sqlite3 data.db 'UPDATE x SET y=1'" }, "expect": { "class": "MUTATE_DURABLE", "credential": false, "financial": false } },
+    { "name": "vault_read_is_observe_plus_credential", "tool": "credential_read", "params": { "handle": "apikey:x" }, "expect": { "class": "OBSERVE", "credential": true, "financial": false } },
+    { "name": "vault_write_durable_plus_credential", "tool": "credential_store", "params": { "handle": "apikey:x" }, "expect": { "class": "MUTATE_DURABLE", "credential": true, "financial": false } },
+    { "name": "provision_paid_machine_financial", "tool": "machine_acquire", "params": { "factory": "vast" }, "expect": { "class": "MUTATE_DURABLE", "credential": false, "financial": true } },
+    { "name": "push_of_credentials_file_dual_stamp", "tool": "bash", "params": { "command": "git push origin main", "classified_paths": ["secrets/vault.json"] }, "expect": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": false } },
+    { "name": "unknown_tool_fail_closed_all_dimensions", "tool": "never_heard_of_it", "params": {}, "expect": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": true } },
+    { "name": "partially_classifiable_flags_true", "tool": "bash", "params": { "command": "sh -c \"$DYNAMIC\"" }, "expect": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": true } }
+  ],
+  "family_2_ceiling_gate": [
+    { "name": "admit_at_boundary", "stamp": { "class": "MUTATE_WORKSPACE", "credential": false, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 3, "credential": "ask", "financial": "ask" }, "view_version": "taxonomy1", "expect": "dispatch" },
+    { "name": "deny_above_tier_parks", "stamp": { "class": "MUTATE_DURABLE", "credential": false, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 3, "credential": "ask", "financial": "ask" }, "view_version": "taxonomy1", "expect": "park:ceiling_exceeded" },
+    { "name": "low_ladder_credential_action_parks_on_flag", "stamp": { "class": "OBSERVE", "credential": true, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 5, "credential": "ask", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "park:ceiling_exceeded" },
+    { "name": "flag_allowed_does_not_lift_tier", "stamp": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 2, "credential": "allowed", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "park:ceiling_exceeded" },
+    { "name": "financial_flag_allowed_admits", "stamp": { "class": "MUTATE_DURABLE", "credential": false, "financial": true }, "stamp_version": "taxonomy1", "ceiling": { "tier": 4, "credential": "ask", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "dispatch" },
+    { "name": "taxonomy_skew_refuses", "stamp": { "class": "OBSERVE", "credential": false, "financial": false }, "stamp_version": "taxonomy2", "ceiling": { "tier": 5, "credential": "allowed", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "refuse:taxonomy_skew" }
+  ],
+  "family_5_quorum": [
+    { "name": "n1_single_qualified_approval_flips", "quorum_n": 1, "electorate": ["m:alice"], "events": [{ "approve": "m:alice" }], "expect": { "state": "answered_held", "surviving": 1 } },
+    { "name": "n2_financial_accumulates_then_flips", "quorum_n": 2, "electorate": ["m:alice", "m:bob"], "events": [{ "approve": "m:alice", "after_state": "parked" }, { "approve": "m:bob" }], "expect": { "state": "answered_held", "surviving": 2 } },
+    { "name": "ineligible_approver_annotated_no_count", "quorum_n": 1, "electorate": ["m:alice"], "events": [{ "approve": "m:mallory" }], "expect": { "state": "parked", "annotations": ["approval_ineligible"] } },
+    { "name": "duplicate_approval_idempotent", "quorum_n": 2, "electorate": ["m:alice", "m:bob"], "events": [{ "approve": "m:alice" }, { "approve": "m:alice" }], "expect": { "state": "parked", "surviving": 1 } },
+    { "name": "requester_excluded_at_park", "requester": "m:alice", "candidates": ["m:alice", "m:bob"], "quorum_n": 1, "expect": { "electorate": ["m:bob"] } },
+    { "name": "insufficient_electorate_refuses_park", "requester": "m:alice", "candidates": ["m:alice"], "quorum_n": 1, "expect": { "refusal": "quorum_electorate_insufficient", "ask_created": false } },
+    { "name": "insufficient_for_n2_refuses", "requester": "m:alice", "candidates": ["m:alice", "m:bob"], "quorum_n": 2, "expect": { "refusal": "quorum_electorate_insufficient", "ask_created": false } },
+    { "name": "epoch_bump_kills_partial_quorum", "quorum_n": 2, "electorate": ["m:alice", "m:bob"], "events": [{ "approve": "m:alice" }, { "epoch_bump": true }], "expect": { "state": "dead", "resurrectable": false } },
+    { "name": "flip_time_revalidation_lapses_lowered_approver", "quorum_n": 2, "electorate": ["m:alice", "m:bob"], "events": [{ "approve": "m:alice", "cast_under_version": 7 }, { "ceiling_lowered": "m:alice", "bundle_version": 8 }, { "approve": "m:bob", "cast_under_version": 8 }], "flip_observed_version": 8, "expect": { "state": "parked", "surviving": 1, "annotations": ["approval_lapsed"] } },
+    { "name": "reapproval_after_lapse_flips", "quorum_n": 2, "electorate": ["m:alice", "m:bob", "m:carol"], "events": [{ "approve": "m:alice", "cast_under_version": 7 }, { "ceiling_lowered": "m:alice", "bundle_version": 8 }, { "approve": "m:bob", "cast_under_version": 8 }, { "approve": "m:carol", "cast_under_version": 8 }], "flip_observed_version": 8, "expect": { "state": "answered_held", "surviving": 2 } },
+    { "name": "park_time_freeze_blocks_late_eligibility", "quorum_n": 1, "electorate": ["m:alice"], "events": [{ "role_grants_eligibility": "m:dave", "bundle_version": 9 }, { "approve": "m:dave", "cast_under_version": 9 }], "expect": { "state": "parked", "annotations": ["approval_ineligible"] } }
+  ],
+  "monotonicity_vectors": [
+    { "name": "version_regression_refuses_flip_no_annotations", "quorum_n": 1, "electorate": ["m:alice"], "events": [{ "approve": "m:alice", "cast_under_version": 7 }], "flip_observed_version": 5, "expect": { "state": "parked", "flip_refused": "version_regression", "annotations": [] } },
+    { "name": "equal_version_proceeds", "quorum_n": 1, "electorate": ["m:alice"], "events": [{ "approve": "m:alice", "cast_under_version": 7 }], "flip_observed_version": 7, "expect": { "state": "answered_held", "surviving": 1 } },
+    { "name": "per_approval_cast_versions_recorded", "quorum_n": 2, "electorate": ["m:alice", "m:bob"], "events": [{ "approve": "m:alice", "cast_under_version": 6 }, { "approve": "m:bob", "cast_under_version": 8 }], "flip_observed_version": 8, "expect": { "state": "answered_held", "annotation_versions": [6, 8] } }
+  ],
+  "denial_short_circuit_vectors": [
+    { "name": "qualified_denial_resolves_immediately", "quorum_n": 2, "electorate": ["m:alice", "m:bob"], "events": [{ "approve": "m:alice" }, { "deny": "m:bob" }], "expect": { "state": "resolved_denied", "immediate": true } },
+    { "name": "unqualified_denial_annotated_only", "quorum_n": 1, "electorate": ["m:alice"], "events": [{ "deny": "m:mallory" }], "expect": { "state": "parked", "annotations": ["approval_ineligible"] } },
+    { "name": "denial_beats_simultaneous_nth_approval_via_cas", "quorum_n": 1, "electorate": ["m:alice", "m:bob"], "events": [{ "race": [{ "deny": "m:alice" }, { "approve": "m:bob" }] }], "expect": { "single_winner": true, "states_allowed": ["resolved_denied", "answered_held"], "never": "both" } }
+  ]
+}

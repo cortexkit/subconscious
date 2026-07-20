@@ -1,0 +1,194 @@
+{
+  "family": "fed-exposure-conformance",
+  "contract": "room2-ceilings-taxonomy-quorum r5 (d3cf7487)",
+  "appendix": "subc-federation docs/room2-fed-appendix.md r3",
+  "note": "FED §8 partition first deliverable: §6.6 exposure gate + §6.8 exposure-transition vectors (incl. r5 N1 widening-order). The exposure gate is a pure {verified, org_grant_exposure, static_expose, request} -> decision comparison (condition-table form, per CKCRED's ceiling_gate precedent). The transition vectors are state-machine scenarios; effective_before_durable is the in-memory latch state, effective_after_durable is post-durable-commit. Consumers vendor by commit hash. ExposeEntry shape: exactly-one-of {module, tool} | {module, operation}, deny-unknown-fields (crates/fed-core/src/profile.rs:133-137).",
+  "gate_vectors": [
+    {
+      "name": "org_grant_supersedes_static_tool_only_in_static_denied",
+      "verified": true,
+      "org_grant_exposure": [{"module": "aft", "tool": "read"}],
+      "static_expose": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "write"}],
+      "request": {"module": "aft", "tool": "write"},
+      "decision": "fed_not_exposed",
+      "rationale": "org-grant governs (provenance Local < OrgGrant); write is in static but not org-grant -> denied"
+    },
+    {
+      "name": "org_grant_supersedes_static_tool_only_in_org_grant_allowed",
+      "verified": true,
+      "org_grant_exposure": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "write"}],
+      "static_expose": [{"module": "aft", "tool": "read"}],
+      "request": {"module": "aft", "tool": "write"},
+      "decision": "allowed",
+      "rationale": "org-grant governs; write is in org-grant -> allowed if verified"
+    },
+    {
+      "name": "verified_and_exposed_allowed",
+      "verified": true,
+      "org_grant_exposure": [{"module": "aft", "tool": "read"}],
+      "static_expose": [],
+      "request": {"module": "aft", "tool": "read"},
+      "decision": "allowed"
+    },
+    {
+      "name": "verified_but_not_exposed_denied",
+      "verified": true,
+      "org_grant_exposure": [{"module": "aft", "tool": "read"}],
+      "static_expose": [],
+      "request": {"module": "aft", "tool": "write"},
+      "decision": "fed_not_exposed",
+      "rationale": "exposure axis fails -> denied even though verified"
+    },
+    {
+      "name": "exposed_but_not_verified_denied",
+      "verified": false,
+      "org_grant_exposure": [{"module": "aft", "tool": "read"}],
+      "static_expose": [],
+      "request": {"module": "aft", "tool": "read"},
+      "decision": "fed_not_exposed",
+      "rationale": "verified axis (roster) fails -> denied even though exposed; the conjunction requires both"
+    },
+    {
+      "name": "absent_org_grant_falls_back_to_static",
+      "verified": true,
+      "org_grant_exposure": null,
+      "static_expose": [{"module": "aft", "tool": "read"}],
+      "request": {"module": "aft", "tool": "read"},
+      "decision": "allowed",
+      "rationale": "absent (None) -> static fallback governs (pre-org)"
+    },
+    {
+      "name": "empty_org_grant_denies_all_not_static_fallback",
+      "verified": true,
+      "org_grant_exposure": [],
+      "static_expose": [{"module": "aft", "tool": "read"}],
+      "request": {"module": "aft", "tool": "read"},
+      "decision": "fed_not_exposed",
+      "rationale": "empty [] = org-grant explicitly exposes nothing -> deny all (empty != absent); static NOT consulted"
+    },
+    {
+      "name": "both_absent_denied",
+      "verified": true,
+      "org_grant_exposure": null,
+      "static_expose": [],
+      "request": {"module": "aft", "tool": "read"},
+      "decision": "fed_not_exposed",
+      "rationale": "no org-grant, no static -> nothing exposed (fail-closed)"
+    },
+    {
+      "name": "operation_entry_matches_operation_request",
+      "verified": true,
+      "org_grant_exposure": [{"module": "quota", "operation": "grant.show"}],
+      "static_expose": [],
+      "request": {"module": "quota", "operation": "grant.show"},
+      "decision": "allowed"
+    },
+    {
+      "name": "tool_entry_does_not_match_operation_request",
+      "verified": true,
+      "org_grant_exposure": [{"module": "quota", "tool": "grant.show"}],
+      "static_expose": [],
+      "request": {"module": "quota", "operation": "grant.show"},
+      "decision": "fed_not_exposed",
+      "rationale": "a Tool entry does not satisfy an Operation request (surface mismatch)"
+    }
+  ],
+  "shape_vectors": [
+    {
+      "name": "valid_tool_entry",
+      "entry": {"module": "aft", "tool": "read"},
+      "valid": true
+    },
+    {
+      "name": "valid_operation_entry",
+      "entry": {"module": "quota", "operation": "grant.show"},
+      "valid": true
+    },
+    {
+      "name": "both_tool_and_operation_rejected",
+      "entry": {"module": "aft", "tool": "read", "operation": "x"},
+      "valid": false,
+      "rationale": "exactly-one-of; both present -> rejected at parse (fail-closed)"
+    },
+    {
+      "name": "neither_tool_nor_operation_rejected",
+      "entry": {"module": "aft"},
+      "valid": false,
+      "rationale": "exactly-one-of; neither present -> rejected"
+    },
+    {
+      "name": "unknown_field_rejected",
+      "entry": {"module": "aft", "tool": "read", "unexpected": true},
+      "valid": false,
+      "rationale": "deny-unknown-fields"
+    },
+    {
+      "name": "duplicate_entry_rejected",
+      "exposure": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "read"}],
+      "valid": false,
+      "rationale": "duplicate (module, tool) -> rejected (matches existing profile validation)"
+    }
+  ],
+  "transition_vectors": [
+    {
+      "name": "withdrawal_to_broader_static_delays_until_durable_N1",
+      "initial_org_grant": [{"module": "aft", "tool": "read"}],
+      "static_expose": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "write"}],
+      "event": "explicit_withdrawal_complete",
+      "effective_before_durable": [{"module": "aft", "tool": "read"}],
+      "effective_after_durable": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "write"}],
+      "crash_between_latch_and_durable": "effective set never wider than last durable state (read only); write (the widening) is NOT exposed before the durable commit",
+      "rationale": "r5 N1: static {read,write} is BROADER than org-grant {read}; the widening (write) delays until durable; never widen in-memory before durable (fail-open)"
+    },
+    {
+      "name": "withdrawal_to_narrower_static_latches_immediately",
+      "initial_org_grant": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "write"}],
+      "static_expose": [{"module": "aft", "tool": "read"}],
+      "event": "explicit_withdrawal_complete",
+      "effective_before_durable": [{"module": "aft", "tool": "read"}],
+      "effective_after_durable": [{"module": "aft", "tool": "read"}],
+      "crash_between_latch_and_durable": "effective set already narrowed (write removed in-memory immediately); fail-closed shrink",
+      "rationale": "static {read} is NARROWER than org-grant {read,write}; the narrowing (write removed) latches in-memory immediately under 0.3 latch-before-durable"
+    },
+    {
+      "name": "withdrawal_partial_overlap_decomposes",
+      "initial_org_grant": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "write"}],
+      "static_expose": [{"module": "aft", "tool": "write"}, {"module": "aft", "tool": "delete"}],
+      "event": "explicit_withdrawal_complete",
+      "effective_before_durable": [{"module": "aft", "tool": "write"}],
+      "effective_after_durable": [{"module": "aft", "tool": "write"}, {"module": "aft", "tool": "delete"}],
+      "crash_between_latch_and_durable": "read removed immediately (narrowing); delete (widening) NOT exposed before durable; write persists throughout",
+      "rationale": "partial overlap: read is org-grant-only (removed immediately, narrowing); delete is static-only (added only after durable, widening); write is in both (persists)"
+    },
+    {
+      "name": "interruption_never_widens",
+      "initial_org_grant": [{"module": "aft", "tool": "read"}],
+      "static_expose": [{"module": "aft", "tool": "read"}, {"module": "aft", "tool": "write"}],
+      "event": "reconcile_failed_or_partial_or_stale",
+      "effective_before_durable": [{"module": "aft", "tool": "read"}],
+      "effective_after_durable": [{"module": "aft", "tool": "read"}],
+      "crash_between_latch_and_durable": "no change; last durable org-grant {read} governs; the broader static {read,write} is NOT applied on a transient fault",
+      "rationale": "F4: a failed/partial/stale reconcile changes NOTHING; never widen to static on a transient fault (fail-open). The forwarder holds the last durable org-grant set; no representable mid-reconcile provenance"
+    },
+    {
+      "name": "explicit_withdrawal_vs_interruption_distinction",
+      "initial_org_grant": [{"module": "aft", "tool": "read"}],
+      "static_expose": [],
+      "event": "explicit_withdrawal_complete",
+      "effective_before_durable": [],
+      "effective_after_durable": [],
+      "crash_between_latch_and_durable": "narrowing to empty (deny all) latches immediately; fail-closed",
+      "rationale": "a COMPLETE reconcile carrying grant-absent -> None (static governs; here static is empty -> deny all). Contrast: a failed reconcile with the same inputs would leave org-grant {read} governing (no change)"
+    },
+    {
+      "name": "org_grant_arrives_supersedes_static",
+      "initial_org_grant": null,
+      "static_expose": [{"module": "aft", "tool": "read"}],
+      "event": "org_grant_arrives_complete",
+      "arriving_org_grant": [{"module": "aft", "tool": "write"}],
+      "effective_before_durable": [{"module": "aft", "tool": "read"}],
+      "effective_after_durable": [{"module": "aft", "tool": "write"}],
+      "rationale": "a COMPLETE authoritative reconcile sets org_grant_exposure; it supersedes static (provenance Local < OrgGrant). The arrival is a capability change reconciled under 0.3 ordering"
+    }
+  ]
+}

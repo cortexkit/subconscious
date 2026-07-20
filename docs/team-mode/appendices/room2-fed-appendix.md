@@ -100,9 +100,16 @@ WITHDRAWAL from INTERRUPTION — the fail-open fix):
   set; forwarder now gates on it (supersedes static).
 - org-grant EXPLICIT WITHDRAWAL (Some → None, a COMPLETE reconcile authoritatively carrying
   grant-absent — the org relationship ENDED, e.g. peer dropped from org): org_grant_exposure
-  cleared; forwarder falls back to static `expose` (or denies all if no static). Reconciled
-  live under 0.3 latch-before-durable (capability shrinks in-memory before the durable
-  commit, fail-closed).
+  cleared; forwarder falls back to static `expose` (or denies all if no static). The
+  widen-after-durable discipline applies to the EFFECTIVE set (r5 N1 — a withdrawal is NOT
+  categorically a shrink): a withdrawal whose static fallback NARROWS or equals the effective
+  set (static ⊆ org-grant) latches in-memory immediately under 0.3 latch-before-durable
+  (fail-closed shrink); a withdrawal whose static fallback WIDENS the effective set (static ⊃
+  org-grant — static exposes tools the org-grant did not) becomes visible only AFTER the
+  durable commit (the widening components delay until durable; never widen in-memory before
+  durable, which would be fail-open). For a partial overlap, the narrowing components
+  (org-grant-only exposures removed) latch immediately and the widening components
+  (static-only exposures added) delay until durable commit.
 - INTERRUPTION / STALENESS (a FAILED, PARTIAL, or STALE reconcile): changes NOTHING — the
   last durable org_grant_exposure keeps governing. NEVER widen to static on a transient
   fault: a transient fault must not expose MORE than the org last authorized (that would be
@@ -115,12 +122,16 @@ WITHDRAWAL from INTERRUPTION — the fail-open fix):
 - BOTH absent: nothing exposed (fail-closed).
 - org-grant EMPTY `[]` + static present: org-grant governs → deny all (empty != absent).
 
-The forwarder shape for F4: `org_grant_exposure: Option<Vec<ExposeEntry>>` transitions to
-`None` ONLY on a complete authoritative reconcile carrying grant-absent (explicit
+The forwarder shape for F4 + N1: `org_grant_exposure: Option<Vec<ExposeEntry>>` transitions
+to `None` ONLY on a complete authoritative reconcile carrying grant-absent (explicit
 withdrawal). A failed/partial/stale reconcile leaves `org_grant_exposure` UNCHANGED (the
 last durable set governs); `effective_expose()` therefore never widens to static on a
 transient fault. The reconcile path must distinguish "the bundle authoritatively says no
-grant for this member" (→ None) from "the reconcile did not complete" (→ no change).
+grant for this member" (→ None) from "the reconcile did not complete" (→ no change). On an
+explicit withdrawal, the in-memory transition respects the widen-after-durable rule (N1):
+narrowing components apply at the in-memory latch; widening components (a broader static
+fallback) apply only at the durable commit, so a crash between latch and durable commit
+never leaves the effective set WIDER than the last durable state.
 
 ## 4. Conformance vectors (contract §6.6, FED)
 
@@ -132,10 +143,31 @@ grant for this member" (→ None) from "the reconcile did not complete" (→ no 
 3. verified∧exposure both required: verified+exposed → allowed; verified+not-exposed →
    fed_not_exposed; not-verified+exposed → fed_not_exposed (the verified axis still gates).
 4. absent-vs-empty: absent federation_exposure → static fallback; empty `[]` → deny all.
-5. withdrawal fallback: org-grant withdrawal restores static fallback (or deny-all if no
-   static), reconciled live.
+5. withdrawal (narrowing): org-grant withdrawal whose static fallback ⊆ org-grant restores
+   the (narrower) static fallback, latched in-memory immediately (fail-closed shrink),
+   reconciled live.
 6. shape conformance: deny-unknown-fields; both-tool-and-operation rejected; duplicate
    rejected.
+
+### §6.8 Exposure-transition vectors (r5 N1 — the widening-order discipline)
+
+1. withdrawal-to-broader-static delays until durable (N1): org-grant exposes {A}; static
+   exposes {A, B} (broader). Explicit withdrawal: B (the widening) is NOT exposed in-memory
+   before the durable commit; a crash between the in-memory latch and the durable commit
+   leaves the effective set ⊆ the last durable state (never wider). After durable commit, B
+   is exposed.
+2. withdrawal-to-narrower-static latches immediately: org-grant exposes {A, B}; static
+   exposes {A}. Explicit withdrawal: B is removed in-memory immediately (fail-closed shrink);
+   the effective set narrows before the durable commit.
+3. withdrawal-partial-overlap decomposes: org-grant {A, B}; static {B, C}. Withdrawal: A
+   removed immediately (narrowing), C added only after durable commit (widening); B persists
+   throughout.
+4. interruption never widens: a failed reconcile with a broader static fallback does NOT
+   change the effective set (the last durable org-grant governs; no widening on a transient
+   fault).
+5. explicit-withdrawal-vs-interruption: a complete reconcile carrying grant-absent → None
+   (static governs, subject to the widen-after-durable rule above); a failed/partial/stale
+   reconcile → no change (last durable set governs).
 
 ## 5. Gate attack surfaces (FED seam, per the chair's scope)
 

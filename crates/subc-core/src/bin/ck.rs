@@ -1136,6 +1136,9 @@ fn quota_window_details(window: &Value) -> String {
         (None, Some(raw)) => parts.push(format!("{}% used", format_used_percent(raw))),
         (None, None) => parts.push("no data".to_string()),
     }
+    if let Some(counts) = quota_window_counts(window) {
+        parts.push(counts);
+    }
     if let Some(relative) = quota_resets_relative(window) {
         parts.push(format!("resets in {relative}"));
     } else {
@@ -1145,6 +1148,34 @@ fn quota_window_details(window: &Value) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// Absolute consumed/total ("10,336 / 40,000") when the provider reports
+/// counts (cortexkit-provider-usage 0.3.0 usedCount/totalCount).
+fn quota_window_counts(window: &Value) -> Option<String> {
+    let used = window.get("usedCount").and_then(Value::as_f64)?;
+    let total = window.get("totalCount").and_then(Value::as_f64);
+    let fmt = |v: f64| -> String {
+        let rounded = v.round() as i64;
+        // Thousands separators for readability at token scale.
+        let raw = rounded.abs().to_string();
+        let sep: String = raw
+            .as_bytes()
+            .rchunks(3)
+            .rev()
+            .map(|c| std::str::from_utf8(c).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(",");
+        if rounded < 0 {
+            format!("-{sep}")
+        } else {
+            sep
+        }
+    };
+    match total {
+        Some(total) => Some(format!("{} / {}", fmt(used), fmt(total))),
+        None => Some(fmt(used)),
+    }
 }
 
 /// Relative reset countdown ("4h32m", "5d9h") from the window's resetsAt.
@@ -2382,6 +2413,25 @@ mod tests {
             assert_eq!(actual, expected, "unexpected bar for {percent}%");
             assert_eq!(display_width(&actual), QUOTA_PROGRESS_BAR_WIDTH);
         }
+    }
+
+    #[test]
+    fn window_details_include_used_and_total_counts_when_present() {
+        let enriched = serde_json::json!({
+            "usedPercent": 25.8, "usedCount": 10336.0, "totalCount": 40000.0
+        });
+        let details = quota_window_details(&enriched);
+        assert!(
+            details.contains("10,336 / 40,000"),
+            "counts must render with separators: {details}"
+        );
+        // Absent counts leave the line unchanged (no stray separators).
+        let plain = serde_json::json!({ "usedPercent": 25.8 });
+        let details = quota_window_details(&plain);
+        assert!(!details.contains('/'), "no counts, no slash: {details}");
+        // used without total renders alone.
+        let used_only = serde_json::json!({ "usedPercent": 25.8, "usedCount": 512.0 });
+        assert!(quota_window_details(&used_only).contains("512"));
     }
 
     #[test]

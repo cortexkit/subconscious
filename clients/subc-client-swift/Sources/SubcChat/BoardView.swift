@@ -22,24 +22,137 @@ struct BoardView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            targetBar
-            Divider()
-            if vm.hasTarget && vm.opsAvailable == false {
-                unavailable
-            }
-            boardContent
-            if let health = vm.board?.health {
+            if vm.hasTarget {
                 Divider()
-                healthStrip(health)
+                if vm.opsAvailable == false {
+                    unavailable
+                }
+                boardContent
+                if let health = vm.board?.health {
+                    Divider()
+                    healthStrip(health)
+                }
+            } else if let summaries = vm.summaries {
+                Divider()
+                pickerGrid(summaries)
+            } else {
+                // board.list unavailable (older alfonso-core): manual targeting.
+                targetBar
+                Divider()
+                Spacer()
+                Text("Enter an agent session id to view its board")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
             }
         }
         .onAppear { vm.appear() }
         .onDisappear { vm.disappear() }
     }
 
+    // MARK: Picker grid (sessions with board data)
+
+    private func pickerGrid(_ summaries: [BoardSummary]) -> some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
+                ForEach(summaries) { s in
+                    boardCard(s)
+                        .contentShape(Rectangle())
+                        .onTapGesture { vm.open(s) }
+                }
+            }
+            .padding(10)
+            if summaries.isEmpty {
+                Text("No sessions have board data yet")
+                    .font(.caption).foregroundColor(.secondary)
+                    .padding(30)
+            }
+        }
+    }
+
+    private func boardCard(_ s: BoardSummary) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(cardStateColor(s.statusState))
+                    .frame(width: 8, height: 8)
+                Text(s.harness).font(.caption).foregroundColor(.secondary)
+                Spacer()
+                if let asks = s.openAsks, asks > 0 {
+                    Text("\(asks) ask\(asks == 1 ? "" : "s")")
+                        .font(.caption2).bold()
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.orange.opacity(0.25)))
+                }
+            }
+            Text(cardTitle(s))
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+            if let status = s.statusText, !status.isEmpty {
+                Text(status)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
+            } else {
+                Text("no status posted")
+                    .font(.system(size: 11)).foregroundColor(.secondary).italic()
+            }
+            HStack(spacing: 8) {
+                if let blocks = s.blockCount {
+                    Text("\(blocks) block\(blocks == 1 ? "" : "s")").font(.caption2).foregroundColor(.secondary)
+                }
+                Spacer()
+                if let ts = s.updatedAtMs {
+                    Text(BoardView.relativeTime(ts)).font(.caption2).foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity((s.blockCount ?? 0) == 0 ? 0.03 : 0.06)))
+        .opacity((s.blockCount ?? 0) == 0 ? 0.6 : 1.0)
+    }
+
+    /// Card title: project folder name when known, else the session id tail.
+    private func cardTitle(_ s: BoardSummary) -> String {
+        if let root = s.projectRoot, !root.isEmpty {
+            let name = (root as NSString).lastPathComponent
+            if !name.isEmpty { return name }
+        }
+        return String(s.session.suffix(20))
+    }
+
+    private func cardStateColor(_ state: String?) -> Color {
+        switch state {
+        case "working": return .blue
+        case "done": return .green
+        case "blocked", "error": return .red
+        default: return .gray
+        }
+    }
+
+    static func relativeTime(_ epochMs: Int64) -> String {
+        let delta = max(0, Date().timeIntervalSince1970 - Double(epochMs) / 1000)
+        if delta < 90 { return "now" }
+        if delta < 3600 { return "\(Int(delta / 60))m ago" }
+        if delta < 86_400 { return "\(Int(delta / 3600))h ago" }
+        return "\(Int(delta / 86_400))d ago"
+    }
+
     private var header: some View {
         HStack(spacing: 8) {
-            Text("Board").font(.headline)
+            if vm.hasTarget, vm.summaries != nil {
+                Button {
+                    vm.closeBoard()
+                } label: {
+                    Label("Boards", systemImage: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+            }
+            Text(vm.hasTarget ? "Board" : "Boards").font(.headline)
+            if vm.hasTarget {
+                Text(String(vm.targetSession.suffix(12))).font(.caption2).foregroundColor(.secondary)
+            }
             if let board = vm.board {
                 Text(board.vocabulary).font(.caption).foregroundColor(.secondary)
                 Text("seq \(board.servedSeq)").font(.caption2).foregroundColor(.secondary)

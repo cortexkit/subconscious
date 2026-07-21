@@ -204,3 +204,22 @@ public struct BoardState: Codable, Equatable {
         return copy
     }
 }
+
+// MARK: - Board discovery (board.list)
+
+/// One row of alfonso-core's board.list projection: a session that owns board
+/// data, with enough summary for a picker card. statusText/statusState mirror
+/// the board's current status.main block.
+public struct BoardSummary: Codable, Identifiable, Equatable {
+    public var harness: String
+    public var session: String
+    public var projectRoot: String?
+    public var updatedAtMs: Int64?
+    public var statusText: String?
+    public var statusState: String?
+    public var openAsks: Int?
+    public var blockCount: Int?
+    public var laneCounts: [String: Int]?
+
+    public var id: String { "\(harness)\u{1}\(session)" }
+}

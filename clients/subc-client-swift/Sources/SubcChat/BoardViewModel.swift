@@ -12,8 +12,11 @@ final class BoardViewModel: ObservableObject {
     @Published var board: BoardState?
     @Published var status: String = "idle"
     @Published var opsAvailable: Bool?
-    /// The agent session whose board we read. Nil until the user picks one;
-    /// board.list discovery will replace manual entry when the module ships it.
+    /// Discovered boards for the picker grid (board.list). Nil = op not yet
+    /// probed or unavailable on this alfonso-core build (picker hides, manual
+    /// target entry remains the fallback).
+    @Published var summaries: [BoardSummary]?
+    /// The agent session whose board we read. Empty = picker mode.
     @Published var targetHarness: String
     @Published var targetSession: String
 
@@ -35,6 +38,23 @@ final class BoardViewModel: ObservableObject {
 
     var hasTarget: Bool {
         !targetSession.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Enter a specific board from a picker card.
+    func open(_ summary: BoardSummary) {
+        targetHarness = summary.harness
+        targetSession = summary.session
+        applyTarget()
+    }
+
+    /// Back out of the detail view into the picker grid.
+    func closeBoard() {
+        targetSession = ""
+        board = nil
+        opsAvailable = nil
+        status = summaries == nil ? "idle" : "live"
+        Self.saveTarget(dir: Self.appDataDir(), harness: targetHarness, session: "")
+        refresh()
     }
 
     func applyTarget() {
@@ -65,7 +85,11 @@ final class BoardViewModel: ObservableObject {
     }
 
     func refresh() {
-        guard visible, hasTarget else { return }
+        guard visible else { return }
+        guard hasTarget else {
+            refreshSummaries()
+            return
+        }
         let worker = worker
         let harness = targetHarness
         let session = targetSession
@@ -112,6 +136,34 @@ final class BoardViewModel: ObservableObject {
                     self.board = nil
                     self.opsAvailable = false
                     self.status = "unavailable"
+                }
+            }
+        }
+    }
+
+    /// Picker-mode poll: list all boards. Unknown-method (older alfonso-core)
+    /// leaves summaries nil so the view falls back to manual target entry.
+    private func refreshSummaries() {
+        let worker = worker
+        work.async { [weak self, worker] in
+            do {
+                let raw = try worker.alfonsoCallBlocking("board.list", [:])
+                let rows = (raw as? [String: Any])?["boards"] ?? raw
+                var list = try worker.decode([BoardSummary].self, from: rows)
+                list.sort { ($0.updatedAtMs ?? 0) > ($1.updatedAtMs ?? 0) }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if self.summaries != list { self.summaries = list }
+                    if self.status != "live" { self.status = "live" }
+                }
+            } catch {
+                worker.resetConnection()
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.summaries = nil
+                    if self.status == "idle" || self.status == "connecting" {
+                        self.status = "picker unavailable"
+                    }
                 }
             }
         }

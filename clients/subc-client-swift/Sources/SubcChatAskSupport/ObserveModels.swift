@@ -322,7 +322,7 @@ public enum TranscriptDecoder {
 /// One auto-dispatched implementation slice in a spec campaign's ladder.
 /// `dispatch` stays nil until a mason launches for the slice; `failureReason`
 /// appears only when the dispatch reached a terminal-bad state.
-public struct SpecSlice: Codable, Identifiable {
+public struct SpecSlice: Codable, Identifiable, Equatable {
     public var sliceId: String?
     public var title: String?
     public var status: String?
@@ -338,24 +338,24 @@ public struct SpecSlice: Codable, Identifiable {
     public var id: String { sliceId ?? title ?? UUID().uuidString }
 }
 
-public struct SpecVerifyLeaf: Codable {
+public struct SpecVerifyLeaf: Codable, Equatable {
     public var id: String?
     public var status: String?
 }
 
-public struct SpecDispatch: Codable {
+public struct SpecDispatch: Codable, Equatable {
     public var backgroundTaskId: String?
     public var taskState: String?
     public var scores: SpecScores?
     public var failureReason: String?
 }
 
-public struct SpecScores: Codable {
+public struct SpecScores: Codable, Equatable {
     public var correctness: Int?
     public var codeQuality: Int?
 }
 
-public struct SpecEpic: Codable {
+public struct SpecEpic: Codable, Equatable {
     public var id: String?
     public var title: String?
     public var status: String?
@@ -365,12 +365,17 @@ public struct SpecEpic: Codable {
 /// as served by alfonso-core's joined `athena.spec_status` projection.
 /// `epic == nil` with empty slices means the consult is still in
 /// clarify/rounds and the work graph has not been minted yet.
-public struct SpecCampaign: Codable, Identifiable {
+public struct SpecCampaign: Codable, Identifiable, Equatable {
     public var consultId: String
     public var phase: String?
     public var round: Int?
     public var updatedAtMs: Int64?
     public var draftPath: String?
+    /// Attribution fields (additive; absent until alfonso-core serves them):
+    /// the agent session that fired the campaign, for project/agent grouping.
+    public var callerSessionId: String?
+    public var callerHarness: String?
+    public var displayName: String?
     public var epic: SpecEpic?
     public var slices: [SpecSlice]?
 

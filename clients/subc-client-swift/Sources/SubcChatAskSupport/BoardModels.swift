@@ -213,6 +213,9 @@ public struct BoardState: Codable, Equatable {
 public struct BoardSummary: Codable, Identifiable, Equatable {
     public var harness: String
     public var session: String
+    /// Agent display name (ALF, MC, SUBC...) from the rooms name source;
+    /// additive projection field, absent on older alfonso-core builds.
+    public var displayName: String?
     public var projectRoot: String?
     public var updatedAtMs: Int64?
     public var statusText: String?

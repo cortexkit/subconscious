@@ -68,6 +68,7 @@ struct BoardView: View {
                 }
             }
             .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -89,7 +90,11 @@ struct BoardView: View {
                     Text(Self.relativeTime(ts)).font(.caption2).foregroundColor(.secondary)
                 }
             }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 8)], spacing: 8) {
+            // Plain rows, deliberately not a LazyVGrid: an adaptive grid
+            // inside a ScrollView's sizing pass measures every cell at
+            // multiple width proposals (LazyStack.measureEstimates walked the
+            // whole subtree for seconds — stall-2026-07-21T17-47-57Z).
+            VStack(spacing: 6) {
                 ForEach(group.agents) { agent in
                     agentCard(agent)
                         .contentShape(Rectangle())

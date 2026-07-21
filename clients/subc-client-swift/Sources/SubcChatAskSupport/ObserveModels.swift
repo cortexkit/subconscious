@@ -316,3 +316,63 @@ public enum TranscriptDecoder {
         return (rows, next, lineage)
     }
 }
+
+// MARK: - Spec campaigns (athena.spec_status)
+
+/// One auto-dispatched implementation slice in a spec campaign's ladder.
+/// `dispatch` stays nil until a mason launches for the slice; `failureReason`
+/// appears only when the dispatch reached a terminal-bad state.
+public struct SpecSlice: Codable, Identifiable {
+    public var sliceId: String?
+    public var title: String?
+    public var status: String?
+    public var updatedAtMs: Int64?
+    public var verifyLeaf: SpecVerifyLeaf?
+    public var dispatch: SpecDispatch?
+
+    enum CodingKeys: String, CodingKey {
+        case sliceId = "id"
+        case title, status, updatedAtMs, verifyLeaf, dispatch
+    }
+
+    public var id: String { sliceId ?? title ?? UUID().uuidString }
+}
+
+public struct SpecVerifyLeaf: Codable {
+    public var id: String?
+    public var status: String?
+}
+
+public struct SpecDispatch: Codable {
+    public var backgroundTaskId: String?
+    public var taskState: String?
+    public var scores: SpecScores?
+    public var failureReason: String?
+}
+
+public struct SpecScores: Codable {
+    public var correctness: Int?
+    public var codeQuality: Int?
+}
+
+public struct SpecEpic: Codable {
+    public var id: String?
+    public var title: String?
+    public var status: String?
+}
+
+/// A spec-kind Athena consult with its minted work graph and dispatch states,
+/// as served by alfonso-core's joined `athena.spec_status` projection.
+/// `epic == nil` with empty slices means the consult is still in
+/// clarify/rounds and the work graph has not been minted yet.
+public struct SpecCampaign: Codable, Identifiable {
+    public var consultId: String
+    public var phase: String?
+    public var round: Int?
+    public var updatedAtMs: Int64?
+    public var draftPath: String?
+    public var epic: SpecEpic?
+    public var slices: [SpecSlice]?
+
+    public var id: String { consultId }
+}

@@ -16,6 +16,9 @@ final class BoardViewModel: ObservableObject {
     /// probed or unavailable on this alfonso-core build (picker hides, manual
     /// target entry remains the fallback).
     @Published var summaries: [BoardSummary]?
+    /// Spec campaigns for project/agent grouping; polled alongside board.list
+    /// in picker mode (athena.spec_status, optional-tolerant).
+    @Published var specCampaigns: [SpecCampaign] = []
     /// The agent session whose board we read. Empty = picker mode.
     @Published var targetHarness: String
     @Published var targetSession: String
@@ -146,24 +149,41 @@ final class BoardViewModel: ObservableObject {
     private func refreshSummaries() {
         let worker = worker
         work.async { [weak self, worker] in
+            var boards: [BoardSummary]?
             do {
                 let raw = try worker.alfonsoCallBlocking("board.list", [:])
                 let rows = (raw as? [String: Any])?["boards"] ?? raw
                 var list = try worker.decode([BoardSummary].self, from: rows)
                 list.sort { ($0.updatedAtMs ?? 0) > ($1.updatedAtMs ?? 0) }
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    if self.summaries != list { self.summaries = list }
-                    if self.status != "live" { self.status = "live" }
-                }
+                boards = list
             } catch {
                 worker.resetConnection()
-                DispatchQueue.main.async {
-                    guard let self else { return }
+            }
+            // Campaigns are a separate optional projection: a missing op must
+            // not take down the project grid (and vice versa).
+            var campaigns: [SpecCampaign] = []
+            do {
+                let raw = try worker.alfonsoCallBlocking("athena.spec_status", [:])
+                let rows = (raw as? [String: Any])?["consults"] ?? raw
+                campaigns = try worker.decode([SpecCampaign].self, from: rows)
+                campaigns.sort { ($0.updatedAtMs ?? 0) > ($1.updatedAtMs ?? 0) }
+            } catch {
+                // Keep the previous snapshot on transient failure.
+                campaigns = []
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let boards {
+                    if self.summaries != boards { self.summaries = boards }
+                    if self.status != "live" { self.status = "live" }
+                } else {
                     self.summaries = nil
                     if self.status == "idle" || self.status == "connecting" {
                         self.status = "picker unavailable"
                     }
+                }
+                if !campaigns.isEmpty, self.specCampaigns != campaigns {
+                    self.specCampaigns = campaigns
                 }
             }
         }

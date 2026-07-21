@@ -34,7 +34,7 @@ struct BoardView: View {
                 }
             } else if let summaries = vm.summaries {
                 Divider()
-                pickerGrid(summaries)
+                projectsList(summaries)
             } else {
                 // board.list unavailable (older alfonso-core): manual targeting.
                 targetBar
@@ -49,26 +49,159 @@ struct BoardView: View {
         .onDisappear { vm.disappear() }
     }
 
-    // MARK: Picker grid (sessions with board data)
+    // MARK: Projects level (project -> agents -> agent board)
 
-    private func pickerGrid(_ summaries: [BoardSummary]) -> some View {
-        ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
-                ForEach(summaries) { s in
-                    boardCard(s)
-                        .contentShape(Rectangle())
-                        .onTapGesture { vm.open(s) }
+    private func projectsList(_ summaries: [BoardSummary]) -> some View {
+        let groups = ProjectGrouping.build(
+            boards: summaries,
+            campaigns: vm.specCampaigns,
+            pendingAsks: asksVM.asks)
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(groups) { group in
+                    projectSection(group)
+                }
+                if groups.isEmpty {
+                    Text("No agents have board data yet")
+                        .font(.caption).foregroundColor(.secondary)
+                        .padding(30)
                 }
             }
             .padding(10)
-            if summaries.isEmpty {
-                Text("No sessions have board data yet")
-                    .font(.caption).foregroundColor(.secondary)
-                    .padding(30)
-            }
         }
     }
 
+    private func projectSection(_ group: ProjectGroup) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text(group.name).font(.system(size: 13, weight: .bold))
+                if group.openAsks > 0 {
+                    Text("\(group.openAsks) ask\(group.openAsks == 1 ? "" : "s")")
+                        .font(.caption2).bold()
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.orange.opacity(0.25)))
+                }
+                Spacer()
+                if let ts = group.latestActivityMs {
+                    Text(Self.relativeTime(ts)).font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 8)], spacing: 8) {
+                ForEach(group.agents) { agent in
+                    agentCard(agent)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if let board = agent.board { vm.open(board) }
+                        }
+                }
+            }
+            // Campaigns not yet attributable to one agent ride the project
+            // (spec_status grows callerSessionId; until then draftPath only
+            // proves the project).
+            ForEach(group.unattributedCampaigns) { campaign in
+                campaignRow(campaign)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
+    }
+
+    private func agentCard(_ agent: AgentPresence) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(cardStateColor(agent.board?.statusState))
+                    .frame(width: 8, height: 8)
+                Text(agent.label).font(.system(size: 12, weight: .semibold))
+                Text(agent.harness).font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                if agent.openAsks > 0 {
+                    Text("\(agent.openAsks)")
+                        .font(.caption2).bold()
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.orange.opacity(0.3)))
+                        .help("\(agent.openAsks) open ask(s)")
+                }
+            }
+            if let status = agent.board?.statusText, !status.isEmpty {
+                Text(status)
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+                    .lineLimit(3)
+            } else {
+                Text("no status posted")
+                    .font(.system(size: 11)).foregroundColor(.secondary).italic()
+            }
+            ForEach(agent.campaigns) { campaign in
+                campaignRow(campaign)
+            }
+            HStack(spacing: 8) {
+                if let blocks = agent.board?.blockCount {
+                    Text("\(blocks) block\(blocks == 1 ? "" : "s")")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Spacer()
+                if let ts = agent.board?.updatedAtMs {
+                    Text(Self.relativeTime(ts)).font(.caption2).foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+    }
+
+    /// Compact campaign strip: phase, round, title, slice progress; the full
+    /// ladder stays in the Athena tab (tap-through comes with deep links).
+    private func campaignRow(_ c: SpecCampaign) -> some View {
+        HStack(spacing: 6) {
+            Text(c.phase ?? "?")
+                .font(.caption2).bold()
+                .padding(.horizontal, 5).padding(.vertical, 1)
+                .background(Capsule().fill(phaseColor(c.phase).opacity(0.2)))
+            if let r = c.round {
+                Text("r\(r)").font(.caption2).foregroundColor(.secondary)
+            }
+            Text(c.epic?.title ?? Self.draftTitle(c.draftPath) ?? c.consultId)
+                .font(.system(size: 11))
+                .lineLimit(1)
+            Spacer()
+            if let slices = c.slices, !slices.isEmpty {
+                let done = slices.filter { $0.status == "done" }.count
+                Text("\(done)/\(slices.count)")
+                    .font(.caption2).foregroundColor(.secondary)
+                    .help("slices done")
+            } else {
+                Text("in rounds").font(.caption2).foregroundColor(.secondary).italic()
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func phaseColor(_ phase: String?) -> Color {
+        switch phase {
+        case "dispatch": return .blue
+        case "done", "completed": return .green
+        case "failed": return .red
+        default: return .gray
+        }
+    }
+
+    /// Draft filename with the date prefix and extension stripped: the human
+    /// title until the epic exists.
+    static func draftTitle(_ path: String?) -> String? {
+        guard let path else { return nil }
+        var base = (path as NSString).lastPathComponent
+        if base.hasSuffix(".md") { base = String(base.dropLast(3)) }
+        // Drop a leading YYYY-MM-DD- date stamp.
+        if base.count > 11, base.prefix(11).allSatisfy({ $0.isNumber || $0 == "-" }) {
+            base = String(base.dropFirst(11))
+        }
+        return base.isEmpty ? nil : base.replacingOccurrences(of: "-", with: " ")
+    }
+
+    // Retained for the manual-target fallback path (older alfonso-core).
     private func boardCard(_ s: BoardSummary) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {

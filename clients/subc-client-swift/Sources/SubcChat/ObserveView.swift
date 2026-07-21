@@ -72,6 +72,14 @@ struct ObserveView: View {
                     Divider()
                 }
                 athenaSplit
+                    // Fill-and-win: without an explicit flexible frame plus
+                    // layout priority, the enclosing VStack asks this
+                    // platform-backed split (NSTableView List) for its IDEAL
+                    // height to divide space — which walks Auto Layout
+                    // constraints for every row subtree and froze the main
+                    // thread for seconds (stall-2026-07-21T17-12-10Z).
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .layoutPriority(1)
             }
         case .gather: runList(vm.gathers)
         case .checks: runList(vm.checks)
@@ -90,7 +98,10 @@ struct ObserveView: View {
             }
             .padding(8)
         }
-        .frame(maxHeight: 260)
+        // Fixed height, deliberately not maxHeight: clamping to a maximum
+        // requires measuring the NSScrollView's ideal content height, which
+        // re-enters the same whole-subtree constraint walk as the List below.
+        .frame(height: 240)
     }
 
     private func specCampaignCard(_ c: SpecCampaign) -> some View {

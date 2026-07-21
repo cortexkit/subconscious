@@ -65,10 +65,94 @@ struct ObserveView: View {
     @ViewBuilder
     private var content: some View {
         switch lane {
-        case .athena: athenaSplit
+        case .athena:
+            VStack(spacing: 0) {
+                if !vm.specCampaigns.isEmpty {
+                    specCampaignSection
+                    Divider()
+                }
+                athenaSplit
+            }
         case .gather: runList(vm.gathers)
         case .checks: runList(vm.checks)
         }
+    }
+
+    // MARK: Spec campaigns (draft -> rounds -> minted graph -> dispatched slices)
+
+    private var specCampaignSection: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Spec Campaigns").font(.caption).bold().foregroundColor(.secondary)
+                ForEach(vm.specCampaigns) { campaign in
+                    specCampaignCard(campaign)
+                }
+            }
+            .padding(8)
+        }
+        .frame(maxHeight: 260)
+    }
+
+    private func specCampaignCard(_ c: SpecCampaign) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                stateChip(c.phase ?? "?")
+                if let r = c.round { Text("round \(r)").font(.caption2).foregroundColor(.secondary) }
+                Text(c.epic?.title ?? draftName(c.draftPath) ?? c.consultId)
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                Spacer()
+                if let ts = c.updatedAtMs {
+                    Text(Self.timeString(ts)).font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            if let slices = c.slices, !slices.isEmpty {
+                // Ladder order is dispatch order: the pipeline reads top-to-bottom.
+                ForEach(slices) { slice in
+                    specSliceRow(slice)
+                }
+            } else {
+                Text("work graph not minted yet")
+                    .font(.caption2).foregroundColor(.secondary).italic()
+                    .padding(.leading, 12)
+            }
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func specSliceRow(_ s: SpecSlice) -> some View {
+        HStack(spacing: 6) {
+            stateChip(s.status ?? "?")
+            Text(s.title ?? s.id).font(.system(size: 11)).lineLimit(1)
+            if let v = s.verifyLeaf?.status, v != "open" {
+                Text("verify: \(v)").font(.caption2).foregroundColor(.secondary)
+            }
+            Spacer()
+            if let d = s.dispatch {
+                if let scores = d.scores, let corr = scores.correctness, let q = scores.codeQuality {
+                    Text("\(corr)/\(q)").font(.caption2).foregroundColor(.secondary)
+                        .help("correctness \(corr) · code quality \(q)")
+                }
+                if let state = d.taskState {
+                    stateChip(state)
+                }
+                if let reason = d.failureReason {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2).foregroundColor(.red)
+                        .help(reason)
+                }
+            } else {
+                Text("queued").font(.caption2).foregroundColor(.secondary)
+            }
+        }
+        .padding(.leading, 12)
+    }
+
+    private func draftName(_ path: String?) -> String? {
+        guard let path else { return nil }
+        let base = (path as NSString).lastPathComponent
+        return base.isEmpty ? nil : base
     }
 
     // MARK: Athena lane (list + detail split)

@@ -17,6 +17,7 @@ final class ObserveViewModel: ObservableObject {
     @Published var consults: [ConsultRow] = []
     @Published var consultDetail: ConsultDetail?
     @Published var selectedConsultId: String?
+    @Published var specCampaigns: [SpecCampaign] = []
     @Published var gathers: [ObservedRun] = []
     @Published var checks: [ObservedRun] = []
     @Published var status: String = "idle"
@@ -85,8 +86,18 @@ final class ObserveViewModel: ObservableObject {
         let worker = worker
         work.async { [weak self, worker] in
             do {
-                let consultsRaw = try worker.alfonsoCallBlocking("athena.list_consults", ["limit": 50])
-                let consults = try worker.decode([ConsultRow].self, from: worker.rowsArray(consultsRaw, key: "consults"))
+            let consultsRaw = try worker.alfonsoCallBlocking("athena.list_consults", ["limit": 50])
+            let consults = try worker.decode([ConsultRow].self, from: worker.rowsArray(consultsRaw, key: "consults"))
+            // Spec campaigns are optional: older alfonso-core builds lack the op,
+            // and the Athena tab must keep working without it.
+            var specCampaigns: [SpecCampaign] = []
+            do {
+                let specRaw = try worker.alfonsoCallBlocking("athena.spec_status", [:])
+                specCampaigns = try worker.decode([SpecCampaign].self, from: worker.rowsArray(specRaw, key: "consults"))
+                specCampaigns.sort { ($0.updatedAtMs ?? 0) > ($1.updatedAtMs ?? 0) }
+            } catch {
+                // Missing op or transient failure: keep the last snapshot.
+            }
                 let gathersRaw = try worker.alfonsoCallBlocking("observe.recent_runs", ["kind": "gather", "limit": 50])
                 let gathers = try worker.decode([ObservedRun].self, from: worker.rowsArray(gathersRaw, key: "runs"))
                 let checksRaw = try worker.alfonsoCallBlocking("observe.recent_runs", ["kind": "oneshot", "limit": 50])
@@ -94,6 +105,7 @@ final class ObserveViewModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.consults = consults
+                    self.specCampaigns = specCampaigns
                     self.gathers = gathers
                     self.checks = checks
                     self.opsAvailable = true

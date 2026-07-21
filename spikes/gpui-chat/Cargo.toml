@@ -1,0 +1,20 @@
+[package]
+name = "gpui-subcchat-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+# gpui_platform is not published on crates.io at 0.2.x; gpui 0.2.2 now owns
+# platform selection directly. runtime_shaders also makes CLT-only Macs usable.
+gpui = { version = "=0.2.2", features = ["font-kit", "runtime_shaders"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subc-client-rs = { path = "../../crates/subc-client-rs" }
+subc-protocol = { path = "../../crates/subc-protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+unicode-segmentation = "1"
+uuid = { version = "1", features = ["v4"] }

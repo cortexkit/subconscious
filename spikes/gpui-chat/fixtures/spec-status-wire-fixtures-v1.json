@@ -1,0 +1,108 @@
+{
+  "comment": "Wire fixtures for athena.spec_status (single joined projection: spec consult + slice ladder + dispatch states). CamelCase per wire contract. callerSessionId and callerHarness mirror the consult columns; displayName is the optional durable board-room seat name. slices[] is LADDER ORDER (dispatch order), never status-grouped. dispatch is null until a slice's mason launches. failureReason present only when taskState is terminal-bad (rejected|cancelled|error). Rides the existing alfonso-core ManagementSurface route.",
+  "requests": [
+    { "comment": "All spec consults: non-terminal + last 5 terminal.", "method": "athena.spec_status", "params": {} },
+    { "comment": "One consult by id.", "method": "athena.spec_status", "params": { "consultId": "ct_00000000-0000-4000-98c4-f1ff935b7990" } }
+  ],
+  "response_running": {
+    "consults": [
+      {
+        "consultId": "ct_00000000-0000-4000-98c4-f1ff935b7990",
+        "phase": "dispatch",
+        "round": 4,
+        "updatedAtMs": 1784958301000,
+        "draftPath": "/Users/u/project/.cortexkit/alfonso/drafts/2026-07-19-knowhow-semantic-ranking-via-synapse-embeddings.md",
+        "callerSessionId": "ses_alf",
+        "callerHarness": "opencode",
+        "displayName": "ALF",
+        "epic": {
+          "id": "wi:ct_00000000-0000-4000-98c4-f1ff935b7990:4:e",
+          "title": "Knowhow semantic ranking via Synapse embeddings",
+          "status": "open"
+        },
+        "slices": [
+          {
+            "id": "wi:ct_00000000-0000-4000-98c4-f1ff935b7990:4:s1",
+            "title": "S1-synapse-wire-contract-appendix",
+            "status": "done",
+            "updatedAtMs": 1784900000000,
+            "verifyLeaf": { "id": "wi:ct_00000000-0000-4000-98c4-f1ff935b7990:4:s1v", "status": "open" },
+            "dispatch": {
+              "backgroundTaskId": "bg_dispatch_02cb6b607881a177afe99188",
+              "taskState": "completed",
+              "scores": { "correctness": 95, "codeQuality": 94 }
+            }
+          },
+          {
+            "id": "wi:ct_00000000-0000-4000-98c4-f1ff935b7990:4:s5",
+            "title": "S5-offline-regression-and-concurrency-verification",
+            "status": "in_progress",
+            "updatedAtMs": 1784958301000,
+            "verifyLeaf": { "id": "wi:ct_00000000-0000-4000-98c4-f1ff935b7990:4:s5v", "status": "open" },
+            "dispatch": {
+              "backgroundTaskId": "bg_dispatch_c7f637cffe78015b831325c6",
+              "taskState": "running",
+              "scores": null
+            }
+          },
+          {
+            "id": "wi:ct_00000000-0000-4000-98c4-f1ff935b7990:4:s6",
+            "title": "S6-R2-live-verifier",
+            "status": "open",
+            "updatedAtMs": 1784890000000,
+            "verifyLeaf": { "id": "wi:ct_00000000-0000-4000-98c4-f1ff935b7990:4:s6v", "status": "open" },
+            "dispatch": null
+          }
+        ]
+      },
+      {
+        "consultId": "ct_00000000-0000-4001-98c4-deadbeef0001",
+        "phase": "spec_rounds",
+        "round": 2,
+        "updatedAtMs": 1784958200000,
+        "draftPath": "/Users/u/project/.cortexkit/alfonso/drafts/2026-07-21-example-still-in-rounds.md",
+        "callerSessionId": "ses_rounds",
+        "callerHarness": "opencode",
+        "epic": null,
+        "slices": []
+      },
+      {
+        "consultId": "ct_00000000-0000-4001-98c4-deadbeef0002",
+        "phase": "failed",
+        "round": 1,
+        "updatedAtMs": 1784950000000,
+        "draftPath": "/Users/u/project/.cortexkit/alfonso/drafts/2026-07-20-example-with-red-slice.md",
+        "callerSessionId": "ses_failed",
+        "callerHarness": "opencode",
+        "epic": {
+          "id": "wi:ct_00000000-0000-4001-98c4-deadbeef0002:1:e",
+          "title": "Example with a terminal-bad slice",
+          "status": "open"
+        },
+        "slices": [
+          {
+            "id": "wi:ct_00000000-0000-4001-98c4-deadbeef0002:1:s1",
+            "title": "S1-example-rejected-slice",
+            "status": "in_progress",
+            "updatedAtMs": 1784949000000,
+            "verifyLeaf": { "id": "wi:ct_00000000-0000-4001-98c4-deadbeef0002:1:s1v", "status": "open" },
+            "dispatch": {
+              "backgroundTaskId": "bg_dispatch_ffffffffffffffffffffffff",
+              "taskState": "rejected",
+              "scores": { "correctness": 30, "codeQuality": 25 },
+              "failureReason": "placeholder implementation; core acceptance criteria unmet"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "notes": [
+    "updatedAtMs (consult) = max(consult row update, newest slice update) so running-first-then-recency sorting needs no phase parsing.",
+    "updatedAtMs (slice) = work_item updated_at joined with the dispatch task's time_updated when present.",
+    "epic:null + slices:[] = graph not minted yet (consult still in clarify/rounds).",
+    "scores appear only after finalize (accept/reject); null while running.",
+    "failureReason sources: finalize-reject notes (first line), cancel reason, or task last_error - whichever the terminal state carries.",
+    "taskState vocabulary is the manager_task task_state column verbatim (running, completed, rejected, cancelled, error, starting, pending)."
+  ]
+}

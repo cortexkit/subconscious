@@ -1,6 +1,6 @@
 {
   "contract": "room2-ceilings-taxonomy-quorum r5 @ subconscious d3cf7487",
-  "taxonomy_version": "taxonomy1",
+  "taxonomy_version": "ck-action-severity/v1",
   "comment": "Committed BEFORE implementation per Room-2 §6 (vectors precede implementation claims). Families owned by the ALF partition: 1 (compiler), 2 (ceiling gate, shared shapes), 5 (quorum) plus the monotonicity and denial-short-circuit vectors. Table-driven: the future taxonomy/gate/quorum tests consume this file verbatim; a vector change is a contract event, not a test refactor.",
   "family_1_compiler": [
     { "name": "read_is_observe", "tool": "read", "params": {}, "expect": { "class": "OBSERVE", "credential": false, "financial": false } },
@@ -20,12 +20,12 @@
     { "name": "partially_classifiable_flags_true", "tool": "bash", "params": { "command": "sh -c \"$DYNAMIC\"" }, "expect": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": true } }
   ],
   "family_2_ceiling_gate": [
-    { "name": "admit_at_boundary", "stamp": { "class": "MUTATE_WORKSPACE", "credential": false, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 3, "credential": "ask", "financial": "ask" }, "view_version": "taxonomy1", "expect": "dispatch" },
-    { "name": "deny_above_tier_parks", "stamp": { "class": "MUTATE_DURABLE", "credential": false, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 3, "credential": "ask", "financial": "ask" }, "view_version": "taxonomy1", "expect": "park:ceiling_exceeded" },
-    { "name": "low_ladder_credential_action_parks_on_flag", "stamp": { "class": "OBSERVE", "credential": true, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 5, "credential": "ask", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "park:ceiling_exceeded" },
-    { "name": "flag_allowed_does_not_lift_tier", "stamp": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": false }, "stamp_version": "taxonomy1", "ceiling": { "tier": 2, "credential": "allowed", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "park:ceiling_exceeded" },
-    { "name": "financial_flag_allowed_admits", "stamp": { "class": "MUTATE_DURABLE", "credential": false, "financial": true }, "stamp_version": "taxonomy1", "ceiling": { "tier": 4, "credential": "ask", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "dispatch" },
-    { "name": "taxonomy_skew_refuses", "stamp": { "class": "OBSERVE", "credential": false, "financial": false }, "stamp_version": "taxonomy2", "ceiling": { "tier": 5, "credential": "allowed", "financial": "allowed" }, "view_version": "taxonomy1", "expect": "refuse:taxonomy_skew" }
+    { "name": "admit_at_boundary", "stamp": { "class": "MUTATE_WORKSPACE", "credential": false, "financial": false }, "stamp_version": "ck-action-severity/v1", "ceiling": { "tier": 3, "credential": "ask", "financial": "ask" }, "view_version": "ck-action-severity/v1", "expect": "dispatch" },
+    { "name": "deny_above_tier_parks", "stamp": { "class": "MUTATE_DURABLE", "credential": false, "financial": false }, "stamp_version": "ck-action-severity/v1", "ceiling": { "tier": 3, "credential": "ask", "financial": "ask" }, "view_version": "ck-action-severity/v1", "expect": "park:ceiling_exceeded" },
+    { "name": "low_ladder_credential_action_parks_on_flag", "stamp": { "class": "OBSERVE", "credential": true, "financial": false }, "stamp_version": "ck-action-severity/v1", "ceiling": { "tier": 5, "credential": "ask", "financial": "allowed" }, "view_version": "ck-action-severity/v1", "expect": "park:ceiling_exceeded" },
+    { "name": "flag_allowed_does_not_lift_tier", "stamp": { "class": "PUBLISH_EXTERNAL", "credential": true, "financial": false }, "stamp_version": "ck-action-severity/v1", "ceiling": { "tier": 2, "credential": "allowed", "financial": "allowed" }, "view_version": "ck-action-severity/v1", "expect": "park:ceiling_exceeded" },
+    { "name": "financial_flag_allowed_admits", "stamp": { "class": "MUTATE_DURABLE", "credential": false, "financial": true }, "stamp_version": "ck-action-severity/v1", "ceiling": { "tier": 4, "credential": "ask", "financial": "allowed" }, "view_version": "ck-action-severity/v1", "expect": "dispatch" },
+    { "name": "taxonomy_skew_refuses", "stamp": { "class": "OBSERVE", "credential": false, "financial": false }, "stamp_version": "ck-action-severity/v2", "ceiling": { "tier": 5, "credential": "allowed", "financial": "allowed" }, "view_version": "ck-action-severity/v1", "expect": "refuse:taxonomy_skew" }
   ],
   "family_5_quorum": [
     { "name": "n1_single_qualified_approval_flips", "quorum_n": 1, "electorate": ["m:alice"], "events": [{ "approve": "m:alice" }], "expect": { "state": "answered_held", "surviving": 1 } },

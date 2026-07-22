@@ -177,9 +177,9 @@ pub(crate) struct RoomsState {
     composer: gpui::Entity<Composer>,
     status: SharedString,
     connected: bool,
-    session_id: String,
-    caller_directory: PathBuf,
-    identity_ready: bool,
+    pub(crate) session_id: String,
+    pub(crate) caller_directory: PathBuf,
+    pub(crate) identity_ready: bool,
     list_in_flight: bool,
     read_in_flight: bool,
     ack_in_flight: bool,
@@ -231,6 +231,7 @@ impl SubcChat {
                         if this.surface == Surface::Rooms {
                             this.refresh_rooms_list(cx);
                         }
+                        this.poll_ask_notifications(cx);
                     }
                     Err(error) => {
                         this.rooms.status =

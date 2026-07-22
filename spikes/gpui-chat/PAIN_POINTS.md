@@ -120,6 +120,13 @@ This log distinguishes framework capability from documentation/package friction.
 
 Copy/paste and direct option-fill were exercised in code. Full IME composition, accessibility, VoiceOver, undo grouping, and multiline caret navigation require hands-on QA beyond automated tests. The app does not claim otherwise.
 
+### Dock badges and user alerts require a narrow AppKit escape
+
+- **Trying to do:** notify about asks while any tab is active, with a dock badge, attention request, sound, and Notification Center banner.
+- **What GPUI offered:** GPUI 0.2.2 exposes dock menus but no dock-tile badge, attention, sound, or notification-center API.
+- **Workaround:** the notifier calls the existing `NSApplication` on GPUI's UI thread for the badge, bounce, and `NSSound`. The unbundled executable has no stable bundle identifier, so banners use `/usr/bin/osascript` on the background executor, matching the Swift client.
+- **Diagnosis:** a bounded platform integration rather than a renderer limitation. Ask polling, decoding, and banner process launch remain off the UI thread.
+
 ## Data and concurrency
 
 ### Native Rust wire access is materially cleaner than FFI
@@ -189,7 +196,7 @@ The condition is a funded component layer before product work begins. Stock GPUI
 - sustained CJK/complex-script IME behavior, bidi text, dictation, and emoji palette edge cases
 - undo/redo grouping and production multiline editing
 - light/system-following theme and reduced-motion behavior
-- window restoration, native menus, sheets/modals, drag-and-drop, and notifications
+- window restoration, native menus, sheets/modals, drag-and-drop, and bundled `UNUserNotificationCenter` delivery (the app currently uses AppKit plus `osascript`)
 - large heterogeneous board virtualization and hours-long memory/GPU behavior
 - signed/notarized distribution, binary size, cold-start time, and runtime shader policy
 - live fleet behavior under daemon restart, route restoration, and high-volume poll churn

@@ -40,10 +40,14 @@ impl SubcChat {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
+                let sent = result.is_ok();
                 this.notice = Some(match result {
                     Ok(message) => message.into(),
                     Err(error) => format!("Send failed: {}", short_error(&error)).into(),
                 });
+                if sent {
+                    this.poll_ask_notifications(cx);
+                }
                 cx.notify();
             })
             .ok();

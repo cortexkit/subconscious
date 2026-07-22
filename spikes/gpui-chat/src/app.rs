@@ -5,6 +5,7 @@ use crate::{
     components::{chip, short_error, status_dot},
     input::Composer,
     models::{Snapshot, fixture_snapshot},
+    notify::AskNotificationState,
     rooms::RoomsState,
     wire,
 };
@@ -39,6 +40,7 @@ pub(crate) struct SubcChat {
     pub(crate) surface: Surface,
     pub(crate) chat: ChatState,
     pub(crate) rooms: RoomsState,
+    pub(crate) ask_notifications: AskNotificationState,
     pub(crate) snapshot: Snapshot,
     pub(crate) fixture: Snapshot,
     pub(crate) source: SharedString,
@@ -58,10 +60,12 @@ impl SubcChat {
         let composer = cx.new(|cx| Composer::new(cx, "Write a considered answer…"));
         let chat = ChatState::new(cx);
         let rooms = RoomsState::new(cx);
+        let ask_notifications = AskNotificationState::default();
         let mut this = Self {
             surface: Surface::Chat,
             chat,
             rooms,
+            ask_notifications,
             snapshot: fixture.clone(),
             fixture,
             source: "FIXTURE · connecting to local daemon".into(),
@@ -79,6 +83,7 @@ impl SubcChat {
         this.initialize_rooms(cx);
         this.start_polling(cx);
         this.start_rooms_polling(cx);
+        this.start_ask_notifications(cx);
         this
     }
 

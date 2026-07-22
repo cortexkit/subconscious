@@ -756,6 +756,19 @@ pub(crate) fn rooms_call_blocking(
     result
 }
 
+pub(crate) fn load_pending_asks_blocking(
+    caller_directory: PathBuf,
+    session_id: String,
+) -> Result<Vec<AskRequest>> {
+    let value = rooms_call_blocking(
+        caller_directory,
+        session_id,
+        "ask.list_pending_for_user".into(),
+        json!({}),
+    )?;
+    decode_rows(value, "asks")
+}
+
 pub(crate) fn probe_rooms_blocking() -> Result<usize> {
     let caller_directory = std::env::current_dir()?.canonicalize()?;
     let value = rooms_call_blocking(

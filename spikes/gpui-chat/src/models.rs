@@ -95,7 +95,7 @@ pub struct SilencePolicy {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AskRequest {
-    #[serde(alias = "request_id")]
+    #[serde(alias = "request_id", alias = "requestID")]
     pub request_id: String,
     pub asker_session_id: Option<String>,
     pub question: String,

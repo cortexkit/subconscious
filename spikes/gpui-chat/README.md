@@ -17,6 +17,7 @@ GPUI 0.2.2 compiles Metal shaders at runtime so a Command Line Tools-only macOS 
 
 - Chat sessions persist locally and stream broca display/control events through `SubcConsumer::subscribe`. Command and subscription routes use separate managed consumers so a held-open stream never blocks `session.send`. Tool calls, tool results, typed provider errors, non-completed finish reasons, stale cursors, and mid-turn route teardown are rendered explicitly.
 - Chat offers the Swift client's verified model presets, an editable `provider/model` field, and the live aft tool catalog, plus a native directory picker for each session's project root. The root locks after the first message because it is part of the module bind identity.
+- Pending asks poll every 5 seconds for the app's whole lifetime. The first backlog is quiet, while later arrivals update the dock badge and trigger an urgency-aware AppKit bounce/sound plus a background `osascript` banner.
 - Rooms polls the open transcript every 2.5 seconds and the room list every 10 seconds while visible. It supports invitations, enter/leave, UUID-deduplicated posts and signals, automatic ACKs, transcript replay, and the member reaction/stage board strip.
 - Boards refresh every 2.5 seconds only while the Boards surface is selected. Socket and decoding work runs on GPUI's background executor, with a small bounded Tokio runtime for the asynchronous Rust client. Snapshots replace UI state only when data changes.
 - Ask and consult master lists use `uniform_list` virtualization.

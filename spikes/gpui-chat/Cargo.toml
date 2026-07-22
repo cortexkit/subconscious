@@ -18,3 +18,7 @@ subc-protocol = { path = "../../crates/subc-protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"

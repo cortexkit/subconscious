@@ -99,11 +99,11 @@ This log distinguishes framework capability from documentation/package friction.
 - **Trying to do:** provide a trustworthy answer composer with Unicode, IME, selection, clipboard, and multiple lines.
 - **What GPUI offered:** `EntityInputHandler`, focus/key routing, shaped text, clipboard APIs, and low-level painting. The stock `examples/input.rs` is effectively the reference implementation and is hundreds of lines, not a reusable control.
 - **Severity:** **blocker for shipping without an owned component layer**
-- **Time lost:** about 2 hours for a deliberately reduced composer
-- **Workaround:** port the pattern from GPUI's own `examples/input.rs`: UTF-8/UTF-16 conversion, marked ranges, `ElementInputHandler`, custom cursor/selection paint, grapheme movement, and explicit key bindings. No code was taken from `gpui-component`; reviewing its `InputState` (its `EntityInputHandler` implementation is around line 2816) confirmed that a production implementation is correspondingly large rather than revealing a small hidden primitive.
+- **Time cost:** the initial reduced composer took about 2 hours; multiline layout, history, and pointer selection required a second dedicated implementation pass.
+- **Workaround:** own the component built from GPUI's `examples/input.rs` pattern: UTF-8/UTF-16 conversion, marked ranges, `ElementInputHandler`, soft-wrapped shaping, custom cursor/selection paint, grapheme and vertical movement, bounded grouped history, pointer hit testing, and explicit key bindings. No code was taken from `gpui-component`; reviewing its large `InputState` confirmed that there is no small hidden stock control.
 - **Diagnosis:** missing stock framework capability/component, not just missing docs.
 
-### Honest behavior matrix for this spike's composer
+### Current behavior matrix for the owned composer
 
 | Behavior | Result |
 |---|---|
@@ -112,13 +112,20 @@ This log distinguishes framework capability from documentation/package friction.
 | Marked text / IME protocol | Implemented through `replace_and_mark_text_in_range`; visually underlined |
 | Copy/cut/paste | Implemented with explicit key bindings |
 | Select all and shift-arrow selection | Implemented |
-| Mouse drag selection / precise hit testing | Not implemented |
-| Undo/redo | **Not implemented** |
+| Mouse drag selection / precise hit testing | Implemented across logical and soft-wrapped lines in the visible viewport; edge-triggered drag autoscroll beyond the editor bounds remains |
+| Undo/redo | Implemented with 750ms typing/deletion/IME grouping and a bounded history |
 | Multiline storage | Implemented; Return inserts `\n` |
-| Multiline layout/caret | **Not implemented**; compact renderer shows line breaks as `↵` on one shaped line |
+| Multiline layout/caret | Implemented with soft wrapping, vertical navigation, visual-line home/end, selection painting, and cursor-following viewport |
 | Accessibility semantics | Not evaluated |
 
-Copy/paste and direct option-fill were exercised in code. Full IME composition, accessibility, VoiceOver, undo grouping, and multiline caret navigation require hands-on QA beyond automated tests. The app does not claim otherwise.
+Copy/paste, grouped history, Unicode offset conversion, and direct option-fill are covered in code and focused tests. Sustained CJK/complex-script IME composition, bidi caret behavior, accessibility, and VoiceOver still require hands-on QA; the app does not claim those are complete.
+
+### Dock badges and user alerts require a narrow AppKit escape
+
+- **Trying to do:** notify about asks while any tab is active, with a dock badge, attention request, sound, and Notification Center banner.
+- **What GPUI offered:** GPUI 0.2.2 exposes dock menus but no dock-tile badge, attention, sound, or notification-center API.
+- **Workaround:** the notifier calls the existing `NSApplication` on GPUI's UI thread for the badge, bounce, and `NSSound`. The unbundled executable has no stable bundle identifier, so banners use `/usr/bin/osascript` on the background executor, matching the Swift client.
+- **Diagnosis:** a bounded platform integration rather than a renderer limitation. Ask polling, decoding, and banner process launch remain off the UI thread.
 
 ## Data and concurrency
 
@@ -179,7 +186,7 @@ The condition is a funded component layer before product work begins. Stock GPUI
 
 ### Top three risks
 
-1. **Text editing and accessibility ownership.** A production multiline editor with IME, undo grouping, mouse selection, bidi, VoiceOver, and validation is far beyond this spike's reduced composer.
+1. **Text editing and accessibility ownership.** The owned composer now covers multiline layout, grouped history, mouse selection, hit testing, and the GPUI IME protocol, but sustained complex-script IME, bidi, VoiceOver, and accessibility semantics still need dedicated platform QA.
 2. **Versioned documentation/package churn.** The official package instruction was unresolvable and recommended source examples had several API generations of drift from the pinned crate.
 3. **Component and navigation ecosystem gap.** Polished primitives are easy, but dialogs, menus, focus traversal, heterogeneous virtual lists, transitions, forms, and system-consistent controls need an internal or third-party layer.
 
@@ -187,9 +194,8 @@ The condition is a funded component layer before product work begins. Stock GPUI
 
 - VoiceOver/accessibility tree quality and full keyboard traversal
 - sustained CJK/complex-script IME behavior, bidi text, dictation, and emoji palette edge cases
-- undo/redo grouping and production multiline editing
 - light/system-following theme and reduced-motion behavior
-- window restoration, native menus, sheets/modals, drag-and-drop, and notifications
+- window restoration, native menus, sheets/modals, drag-and-drop, and bundled `UNUserNotificationCenter` delivery (the app currently uses AppKit plus `osascript`)
 - large heterogeneous board virtualization and hours-long memory/GPU behavior
 - signed/notarized distribution, binary size, cold-start time, and runtime shader policy
 - live fleet behavior under daemon restart, route restoration, and high-volume poll churn

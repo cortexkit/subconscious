@@ -2164,7 +2164,9 @@ name = "gpui-subcchat-spike"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cocoa 0.26.0",
  "gpui",
+ "objc",
  "serde",
  "serde_json",
  "subc-client-rs",

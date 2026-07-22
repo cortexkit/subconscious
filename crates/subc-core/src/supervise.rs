@@ -2242,6 +2242,12 @@ async fn on_child_exit(
 ) -> NextAction {
     match exit_report.kind {
         ExitKind::Clean => {
+            info!(
+                module_id = %spec.module_id,
+                exit_code = ?exit_report.code,
+                exit_signal = ?exit_report.signal,
+                "supervised module exited cleanly"
+            );
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.state = ModuleState::Stopped;
                 state.process_alive = false;
@@ -2268,6 +2274,12 @@ async fn on_child_exit(
             }
         }
         ExitKind::Crash => {
+            warn!(
+                module_id = %spec.module_id,
+                exit_code = ?exit_report.code,
+                exit_signal = ?exit_report.signal,
+                "supervised module exited abnormally (crash)"
+            );
             let mut should_restart = false;
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.process_alive = false;

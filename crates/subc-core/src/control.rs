@@ -1289,6 +1289,8 @@ impl ControlHandler {
                     live: status.live,
                     health: status.health.status,
                     last_probe_ms: status.health.last_probe_ms,
+                    last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
+                    last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;

@@ -185,6 +185,16 @@ pub struct SupervisorEntry {
     pub health: SupervisorHealthStatus,
     #[serde(default)]
     pub last_probe_ms: Option<u64>,
+    /// Exit code of the module's most recent process exit, if the process has
+    /// exited at least once. Survives respawn so a now-`running` module still
+    /// reports what killed its previous incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    /// Terminating signal of the module's most recent process exit (Unix), if
+    /// any. `Some(9)` = SIGKILL (OOM/jetsam/kill-on-drop), `Some(6)` = SIGABRT
+    /// (often a panic-abort). Survives respawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_signal: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

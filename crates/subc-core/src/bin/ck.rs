@@ -1732,6 +1732,7 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
     let last_action = health
         .map(|entry| display_field(entry, "last_action"))
         .unwrap_or_else(|| "-".to_string());
+    let last_exit = format_last_exit(module);
 
     print_table(
         &[
@@ -1742,6 +1743,7 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             "health",
             "failures",
             "last_action",
+            "last_exit",
             "detail",
             "metrics",
         ],
@@ -1753,10 +1755,26 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             health_status,
             failures,
             last_action,
+            last_exit,
             detail,
             truncate_cell(&metrics),
         ]],
     );
+}
+
+/// Render the module's most recent process exit as a compact cell, e.g.
+/// `sig9` (SIGKILL), `code101` (panic-abort exit), or `-` when the module has
+/// never exited. Survives respawn, so a running module still shows what killed
+/// its previous incarnation — the signal that tells a crash-loop apart from a
+/// clean restart.
+fn format_last_exit(module: &Value) -> String {
+    let signal = module.get("last_exit_signal").and_then(Value::as_i64);
+    let code = module.get("last_exit_code").and_then(Value::as_i64);
+    match (signal, code) {
+        (Some(sig), _) => format!("sig{sig}"),
+        (None, Some(c)) => format!("code{c}"),
+        (None, None) => "-".to_string(),
+    }
 }
 
 fn print_health_table(modules: &[Value]) {

@@ -297,6 +297,8 @@ fn supervisor_entry() -> SupervisorEntry {
         live: true,
         health: SupervisorHealthStatus::Degraded,
         last_probe_ms: Some(1_700_000_000_000),
+        last_exit_code: None,
+        last_exit_signal: None,
     }
 }
 

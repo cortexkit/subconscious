@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::{
+    chat::ChatState,
     components::{chip, short_error, status_dot},
     input::Composer,
     models::{Snapshot, fixture_snapshot},
@@ -26,6 +27,7 @@ pub(crate) const RED: u32 = 0xff6b81;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Surface {
+    Chat,
     Boards,
     Asks,
     Athena,
@@ -33,6 +35,7 @@ pub(crate) enum Surface {
 
 pub(crate) struct SubcChat {
     pub(crate) surface: Surface,
+    pub(crate) chat: ChatState,
     pub(crate) snapshot: Snapshot,
     pub(crate) fixture: Snapshot,
     pub(crate) source: SharedString,
@@ -50,8 +53,10 @@ impl SubcChat {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let fixture = fixture_snapshot().expect("bundled fixtures must decode");
         let composer = cx.new(|cx| Composer::new(cx, "Write a considered answer…"));
+        let chat = ChatState::new(cx);
         let mut this = Self {
-            surface: Surface::Boards,
+            surface: Surface::Chat,
+            chat,
             snapshot: fixture.clone(),
             fixture,
             source: "FIXTURE · connecting to local daemon".into(),
@@ -65,6 +70,7 @@ impl SubcChat {
             notice: None,
         };
         this.load_live(cx);
+        this.load_chat_sessions(cx);
         this.start_polling(cx);
         this
     }
@@ -195,6 +201,7 @@ impl SubcChat {
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .child(self.nav_item("◉", "Chat", "Broca sessions", Surface::Chat, cx))
                     .child(self.nav_item("◫", "Boards", "Fleet pulse", Surface::Boards, cx))
                     .child(self.nav_item(
                         "?",
@@ -389,6 +396,7 @@ impl Render for SubcChat {
                     .h_full()
                     .overflow_hidden()
                     .child(match self.surface {
+                        Surface::Chat => self.chat(cx),
                         Surface::Boards => self.boards(cx),
                         Surface::Asks => self.asks(cx),
                         Surface::Athena => self.athena(cx),

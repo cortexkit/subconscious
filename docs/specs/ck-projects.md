@@ -255,6 +255,23 @@ Order:
    CHILD paths leaked to the foreign project via containment.
 3. Otherwise -> implicit project (section 7), via:"implicit".
 
+RESOLUTION IDENTITY IS CONSUMER-UNIFORM (canonical, do not flip): a mason/subagent
+worktree (under the per-repo worktree pool dir) resolves BACK to its PARENT project id via
+step-2 containment, not to a distinct id of its own. This is deliberate and load-bearing.
+The project id is a shared identity axis consumed by many modules (MC keys memory pools by
+it, AFT keys checkout/artifact caches, cerebellum keys durable browser profiles) — a mason
+IS working on the parent project, so its provenance, evidence, liveness, and cache identity
+all correctly belong to that project. A security or isolation property that some ONE consumer
+needs (e.g. cerebellum must keep a mason off the primary's logged-in browser profile) MUST
+ride a SEPARATE, purpose-built axis carried by that consumer's caller — cerebellum uses a
+`sessionKind` (primary|subagent|ephemeral) bit stamped by alfonso-core from durable state, so
+its profile lookup is (projectId, sessionKind) with the boundary in the second element. Do
+NOT change worktree resolution to mint an own-project id for a worktree in order to get such
+isolation: that would poison every other consumer of the identity (splitting a project's
+memory pool and caches across its own worktrees) to serve one product's security property,
+and the isolation belongs on the security axis regardless. Identity answers "which project";
+a separate axis answers "may this session act on that project's owned state."
+
 ALIAS IS NOT IN THIS ORDER (gate finding 1): aliases key on project IDs, not roots. A root
 that was upgraded resolves via its project_root row (step 1). Aliases serve consumers that
 PERSISTED an old project id; they use the dedicated op:

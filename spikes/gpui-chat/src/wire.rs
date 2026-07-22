@@ -710,6 +710,66 @@ pub(crate) fn probe_chat_blocking() -> Result<String> {
     result
 }
 
+pub(crate) fn rooms_call_blocking(
+    caller_directory: PathBuf,
+    session_id: String,
+    method: String,
+    params: Value,
+) -> Result<Value> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let connection_file = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?
+                .join(CONNECTION_FILE);
+            let consumer =
+                SubcConsumer::connect(&connection_file, ConsumerOptions::default()).await?;
+            let target = RouteTarget::ManagementSurface {
+                module_id: "alfonso-core".into(),
+            };
+            let identity = BindIdentity {
+                project_root: caller_directory.clone(),
+                harness: "ck-app".into(),
+                session: session_id.clone(),
+            };
+            let result = call(
+                &consumer,
+                target,
+                identity,
+                caller_directory,
+                session_id,
+                &method,
+                params,
+            )
+            .await;
+            consumer.close().await;
+            result
+        })
+        .await
+        .map_err(|_| anyhow!("{method} deadline elapsed"))?
+    });
+    runtime.shutdown_background();
+    result
+}
+
+pub(crate) fn probe_rooms_blocking() -> Result<usize> {
+    let caller_directory = std::env::current_dir()?.canonicalize()?;
+    let value = rooms_call_blocking(
+        caller_directory,
+        format!("gpui-rooms-probe-{}", uuid::Uuid::new_v4()),
+        "rooms.list".into(),
+        json!({}),
+    )?;
+    value
+        .as_array()
+        .map(Vec::len)
+        .context("rooms.list returned a non-array result")
+}
+
 #[cfg(test)]
 mod chat_tests {
     use super::{ChatCursor, ChatEvent, decode_chat_event};

@@ -5,6 +5,7 @@ use crate::{
     components::{chip, short_error, status_dot},
     input::Composer,
     models::{Snapshot, fixture_snapshot},
+    rooms::RoomsState,
     wire,
 };
 use gpui::{
@@ -28,6 +29,7 @@ pub(crate) const RED: u32 = 0xff6b81;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Surface {
     Chat,
+    Rooms,
     Boards,
     Asks,
     Athena,
@@ -36,6 +38,7 @@ pub(crate) enum Surface {
 pub(crate) struct SubcChat {
     pub(crate) surface: Surface,
     pub(crate) chat: ChatState,
+    pub(crate) rooms: RoomsState,
     pub(crate) snapshot: Snapshot,
     pub(crate) fixture: Snapshot,
     pub(crate) source: SharedString,
@@ -54,9 +57,11 @@ impl SubcChat {
         let fixture = fixture_snapshot().expect("bundled fixtures must decode");
         let composer = cx.new(|cx| Composer::new(cx, "Write a considered answer…"));
         let chat = ChatState::new(cx);
+        let rooms = RoomsState::new(cx);
         let mut this = Self {
             surface: Surface::Chat,
             chat,
+            rooms,
             snapshot: fixture.clone(),
             fixture,
             source: "FIXTURE · connecting to local daemon".into(),
@@ -71,7 +76,9 @@ impl SubcChat {
         };
         this.load_live(cx);
         this.load_chat_sessions(cx);
+        this.initialize_rooms(cx);
         this.start_polling(cx);
+        this.start_rooms_polling(cx);
         this
     }
 
@@ -144,6 +151,9 @@ impl SubcChat {
     fn switch(&mut self, surface: Surface, cx: &mut Context<Self>) {
         self.surface = surface;
         self.notice = None;
+        if surface == Surface::Rooms {
+            self.activate_rooms(cx);
+        }
         cx.notify();
     }
     fn sidebar(&self, cx: &mut Context<Self>) -> Div {
@@ -202,6 +212,7 @@ impl SubcChat {
                     .flex_col()
                     .gap_2()
                     .child(self.nav_item("◉", "Chat", "Broca sessions", Surface::Chat, cx))
+                    .child(self.nav_item("♟", "Rooms", "Multi-agent meetings", Surface::Rooms, cx))
                     .child(self.nav_item("◫", "Boards", "Fleet pulse", Surface::Boards, cx))
                     .child(self.nav_item(
                         "?",
@@ -397,6 +408,7 @@ impl Render for SubcChat {
                     .overflow_hidden()
                     .child(match self.surface {
                         Surface::Chat => self.chat(cx),
+                        Surface::Rooms => self.rooms(cx),
                         Surface::Boards => self.boards(cx),
                         Surface::Asks => self.asks(cx),
                         Surface::Athena => self.athena(cx),

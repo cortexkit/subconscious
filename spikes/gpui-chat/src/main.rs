@@ -14,6 +14,16 @@ use app::SubcChat;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--probe-rooms") {
+        match wire::probe_rooms_blocking() {
+            Ok(count) => println!("rooms: {count} visible rooms"),
+            Err(error) => {
+                eprintln!("rooms probe failed: {error:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--probe-chat") {
         match wire::probe_chat_blocking() {
             Ok(message) => println!("chat: {message}"),

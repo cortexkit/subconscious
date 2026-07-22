@@ -6,6 +6,7 @@ use crate::{
     input::Composer,
     models::{Snapshot, fixture_snapshot},
     notify::AskNotificationState,
+    observe::ObserveState,
     rooms::RoomsState,
     wire,
 };
@@ -40,6 +41,7 @@ pub(crate) struct SubcChat {
     pub(crate) surface: Surface,
     pub(crate) chat: ChatState,
     pub(crate) rooms: RoomsState,
+    pub(crate) observe: ObserveState,
     pub(crate) ask_notifications: AskNotificationState,
     pub(crate) snapshot: Snapshot,
     pub(crate) fixture: Snapshot,
@@ -48,7 +50,6 @@ pub(crate) struct SubcChat {
     pub(crate) loading: bool,
     pub(crate) in_flight: bool,
     pub(crate) selected_ask: usize,
-    pub(crate) selected_consult: usize,
     pub(crate) show_board: bool,
     pub(crate) composer: Entity<Composer>,
     pub(crate) notice: Option<SharedString>,
@@ -61,10 +62,12 @@ impl SubcChat {
         let chat = ChatState::new(cx);
         let rooms = RoomsState::new(cx);
         let ask_notifications = AskNotificationState::default();
+        let observe = ObserveState::new(&fixture);
         let mut this = Self {
             surface: Surface::Chat,
             chat,
             rooms,
+            observe,
             ask_notifications,
             snapshot: fixture.clone(),
             fixture,
@@ -73,7 +76,6 @@ impl SubcChat {
             loading: true,
             in_flight: false,
             selected_ask: 0,
-            selected_consult: 0,
             show_board: false,
             composer,
             notice: None,
@@ -84,6 +86,7 @@ impl SubcChat {
         this.start_polling(cx);
         this.start_rooms_polling(cx);
         this.start_ask_notifications(cx);
+        this.start_observe_polling(cx);
         this
     }
 
@@ -158,6 +161,8 @@ impl SubcChat {
         self.notice = None;
         if surface == Surface::Rooms {
             self.activate_rooms(cx);
+        } else if surface == Surface::Athena {
+            self.activate_observe(cx);
         }
         cx.notify();
     }
@@ -226,7 +231,13 @@ impl SubcChat {
                         Surface::Asks,
                         cx,
                     ))
-                    .child(self.nav_item("✦", "Athena", "Consults & specs", Surface::Athena, cx)),
+                    .child(self.nav_item(
+                        "✦",
+                        "Observe",
+                        "Athena · gathers · checks",
+                        Surface::Athena,
+                        cx,
+                    )),
             )
             .child(div().flex_1())
             .child(
@@ -416,7 +427,7 @@ impl Render for SubcChat {
                         Surface::Rooms => self.rooms(cx),
                         Surface::Boards => self.boards(cx),
                         Surface::Asks => self.asks(cx),
-                        Surface::Athena => self.athena(cx),
+                        Surface::Athena => self.observe(cx),
                     }),
             )
     }

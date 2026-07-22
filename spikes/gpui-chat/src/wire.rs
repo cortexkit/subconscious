@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::mpsc::Sender, time::Duration};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::mpsc::Sender, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -6,8 +6,11 @@ use serde_json::{Value, json};
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, SubcConsumer, SubscribeOptions};
 use subc_protocol::{BindIdentity, RouteTarget, manifest::ProviderRole};
 
-use crate::models::{
-    AskRequest, BoardState, BoardSummary, ConsultDetail, ConsultRow, Snapshot, SpecCampaign,
+use crate::{
+    models::{
+        AskRequest, BoardState, BoardSummary, ConsultDetail, ConsultRow, Snapshot, SpecCampaign,
+    },
+    observe::{ObserveConsultDetail, ObserveSnapshot, TranscriptResult, decode_transcript_page},
 };
 
 const CONNECTION_FILE: &str = ".local/share/cortexkit/run/subc-connection.json";
@@ -67,13 +70,15 @@ async fn load_live() -> Result<Snapshot> {
             json!({"harness": summary.harness, "session": summary.session}),
         )
         .await?;
-        Some(serde_json::from_value::<BoardState>(result)?.fold_newest())
+        Some(serde_json::from_value::<BoardState>(camelize_json_keys(result))?.fold_newest())
     } else {
         None
     };
     let consult_detail = if let Some(row) = consults.first() {
         let result = call("athena.get_consult", json!({"consultId": row.consult_id})).await?;
-        Some(serde_json::from_value::<ConsultDetail>(result)?)
+        Some(serde_json::from_value::<ConsultDetail>(
+            camelize_json_keys(result),
+        )?)
     } else {
         None
     };
@@ -129,7 +134,36 @@ async fn call(
 
 fn decode_rows<T: DeserializeOwned>(value: Value, key: &str) -> Result<Vec<T>> {
     let rows = value.get(key).cloned().unwrap_or(value);
-    serde_json::from_value(rows).with_context(|| format!("decode {key}"))
+    serde_json::from_value(camelize_json_keys(rows)).with_context(|| format!("decode {key}"))
+}
+
+fn camelize_json_keys(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (camel_key(&key), camelize_json_keys(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(camelize_json_keys).collect()),
+        other => other,
+    }
+}
+
+fn camel_key(key: &str) -> String {
+    let mut parts = key.split('_');
+    let Some(first) = parts.next() else {
+        return key.to_string();
+    };
+    let mut result = first.to_string();
+    for part in parts {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            result.extend(first.to_uppercase());
+            result.extend(chars);
+        }
+    }
+    result
 }
 
 pub fn persist_answer_blocking(request_id: String, answer: String) -> Result<String> {
@@ -781,6 +815,256 @@ pub(crate) fn probe_rooms_blocking() -> Result<usize> {
         .as_array()
         .map(Vec::len)
         .context("rooms.list returned a non-array result")
+}
+
+pub(crate) fn load_observe_blocking(
+    caller_directory: PathBuf,
+    session_id: String,
+) -> Result<ObserveSnapshot> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let connection_file = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?
+                .join(CONNECTION_FILE);
+            let consumer =
+                SubcConsumer::connect(&connection_file, ConsumerOptions::default()).await?;
+            let operation = async {
+                let target = RouteTarget::ManagementSurface {
+                    module_id: "alfonso-core".into(),
+                };
+                let identity = BindIdentity {
+                    project_root: caller_directory.clone(),
+                    harness: "ck-app".into(),
+                    session: session_id.clone(),
+                };
+                let consults = decode_rows(
+                    call(
+                        &consumer,
+                        target.clone(),
+                        identity.clone(),
+                        caller_directory.clone(),
+                        session_id.clone(),
+                        "athena.list_consults",
+                        json!({"limit": 50}),
+                    )
+                    .await?,
+                    "consults",
+                )?;
+                // `athena.spec_status` is an optional derived view; keep the core
+                // Observe lists live when older or delayed servers cannot return it.
+                let campaigns = call(
+                    &consumer,
+                    target.clone(),
+                    identity.clone(),
+                    caller_directory.clone(),
+                    session_id.clone(),
+                    "athena.spec_status",
+                    json!({}),
+                )
+                .await
+                .ok()
+                .and_then(|value| decode_rows(value, "consults").ok());
+                let gathers = decode_rows(
+                    call(
+                        &consumer,
+                        target.clone(),
+                        identity.clone(),
+                        caller_directory.clone(),
+                        session_id.clone(),
+                        "observe.recent_runs",
+                        json!({"kind": "gather", "limit": 50}),
+                    )
+                    .await?,
+                    "runs",
+                )?;
+                let checks = decode_rows(
+                    call(
+                        &consumer,
+                        target,
+                        identity,
+                        caller_directory.clone(),
+                        session_id.clone(),
+                        "observe.recent_runs",
+                        json!({"kind": "oneshot", "limit": 50}),
+                    )
+                    .await?,
+                    "runs",
+                )?;
+                Ok::<_, anyhow::Error>(ObserveSnapshot {
+                    consults,
+                    campaigns,
+                    gathers,
+                    checks,
+                })
+            }
+            .await;
+            consumer.close().await;
+            operation
+        })
+        .await
+        .map_err(|_| anyhow!("observe poll deadline elapsed"))?
+    });
+    runtime.shutdown_background();
+    result
+}
+
+pub(crate) fn load_observe_consult_blocking(
+    caller_directory: PathBuf,
+    session_id: String,
+    consult_id: String,
+) -> Result<ObserveConsultDetail> {
+    let value = rooms_call_blocking(
+        caller_directory,
+        session_id,
+        "athena.get_consult".into(),
+        json!({"consultId": consult_id}),
+    )?;
+    serde_json::from_value(camelize_json_keys(value)).context("decode athena.get_consult")
+}
+
+pub(crate) fn load_observe_transcript_blocking(
+    caller_directory: PathBuf,
+    project_root: Option<String>,
+    session_id: String,
+) -> Result<TranscriptResult> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let connection_file = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?
+                .join(CONNECTION_FILE);
+            let consumer =
+                SubcConsumer::connect(&connection_file, ConsumerOptions::default()).await?;
+            let operation = async {
+                let root = project_root
+                    .map(PathBuf::from)
+                    .filter(|root| root.is_dir())
+                    .unwrap_or(caller_directory);
+                let broca_session = if session_id.starts_with("alfonso:") {
+                    session_id
+                } else {
+                    format!("alfonso:{session_id}")
+                };
+                let target = RouteTarget::ManagementSurface {
+                    module_id: "broca".into(),
+                };
+                let identity = BindIdentity {
+                    project_root: root.clone(),
+                    harness: "runner".into(),
+                    session: broca_session.clone(),
+                };
+                let mut from_ordinal = None;
+                let mut rows = BTreeMap::new();
+                let mut lineage = None;
+                let mut cursor_stalled = false;
+                for _ in 0..100 {
+                    let mut params = json!({
+                        "limit": 400,
+                        "session": {
+                            "project_root": root,
+                            "harness": "runner",
+                            "session": broca_session,
+                        }
+                    });
+                    if let Some(ordinal) = from_ordinal {
+                        params["from_ordinal"] = json!(ordinal);
+                    }
+                    let body = serde_json::to_vec(&json!({
+                        "method": "session.read",
+                        "params": params,
+                    }))?;
+                    let bytes = consumer
+                        .call(
+                            target.clone(),
+                            identity.clone(),
+                            body,
+                            CallOptions {
+                                timeout: Duration::from_secs(12),
+                                route_retry_deadline: Duration::from_secs(10),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    let envelope: Value = serde_json::from_slice(&bytes)?;
+                    let page = envelope
+                        .get("result")
+                        .cloned()
+                        .context("session.read reply had no result")?;
+                    let (messages, next, next_lineage) = decode_transcript_page(&page)?;
+                    for message in messages {
+                        rows.entry(message.ordinal).or_insert(message);
+                    }
+                    if next_lineage.is_some() {
+                        lineage = next_lineage;
+                    }
+                    let Some(next) = next else { break };
+                    if next <= from_ordinal.unwrap_or(-1) {
+                        cursor_stalled = true;
+                        break;
+                    }
+                    from_ordinal = Some(next);
+                }
+                Ok::<_, anyhow::Error>(TranscriptResult {
+                    messages: rows.into_values().collect(),
+                    lineage,
+                    cursor_stalled,
+                })
+            }
+            .await;
+            consumer.close().await;
+            operation
+        })
+        .await
+        .map_err(|_| anyhow!("session.read deadline elapsed"))?
+    });
+    runtime.shutdown_background();
+    result
+}
+
+pub(crate) fn probe_observe_blocking() -> Result<String> {
+    let directory = std::env::current_dir()?.canonicalize()?;
+    let session = format!("gpui-observe-probe-{}", uuid::Uuid::new_v4());
+    let snapshot = load_observe_blocking(directory.clone(), session.clone())?;
+    let detail_attempts = if let Some(consult) = snapshot.consults.first() {
+        load_observe_consult_blocking(directory.clone(), session, consult.consult_id.clone())?
+            .attempts
+            .map(|attempts| attempts.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let transcript_rows = if let Some(run) = snapshot
+        .gathers
+        .iter()
+        .chain(snapshot.checks.iter())
+        .find(|run| run.session_id.is_some())
+    {
+        load_observe_transcript_blocking(
+            directory,
+            run.project_root.clone(),
+            run.session_id.clone().unwrap_or_default(),
+        )?
+        .messages
+        .len()
+    } else {
+        0
+    };
+    Ok(format!(
+        "{} consults; {} gathers; {} checks; {} spec campaigns; {detail_attempts} detail attempts; {transcript_rows} transcript rows",
+        snapshot.consults.len(),
+        snapshot.gathers.len(),
+        snapshot.checks.len(),
+        snapshot.campaigns.as_ref().map(Vec::len).unwrap_or(0)
+    ))
 }
 
 #[cfg(test)]

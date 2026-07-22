@@ -34,6 +34,16 @@ fn main() {
         }
         return;
     }
+    if std::env::args().any(|arg| arg == "--probe-observe") {
+        match wire::probe_observe_blocking() {
+            Ok(summary) => println!("observe: {summary}"),
+            Err(error) => {
+                eprintln!("observe probe failed: {error:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--probe-live") {
         match wire::load_live_blocking() {
             Ok(snapshot) => println!(

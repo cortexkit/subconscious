@@ -230,6 +230,8 @@ impl SubcChat {
                         this.rooms.status = "idle".into();
                         if this.surface == Surface::Rooms {
                             this.refresh_rooms_list(cx);
+                        } else if this.surface == Surface::Athena {
+                            this.activate_observe(cx);
                         }
                         this.poll_ask_notifications(cx);
                     }

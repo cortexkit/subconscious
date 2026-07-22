@@ -134,6 +134,8 @@ pub struct ConsultRow {
     pub consult_class: Option<String>,
     pub question_preview: Option<String>,
     pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+    pub ordinal: Option<i64>,
     pub member_routes: Option<Vec<String>>,
     pub sentinels: Option<Vec<String>>,
     pub evidence_count: Option<usize>,
@@ -162,6 +164,7 @@ pub struct Scores {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Dispatch {
+    pub background_task_id: Option<String>,
     pub task_state: Option<String>,
     pub scores: Option<Scores>,
     pub failure_reason: Option<String>,
@@ -174,8 +177,16 @@ pub struct SpecSlice {
     pub slice_id: Option<String>,
     pub title: Option<String>,
     pub status: Option<String>,
-    pub verify_leaf: Option<Value>,
+    pub updated_at_ms: Option<i64>,
+    pub verify_leaf: Option<SpecVerifyLeaf>,
     pub dispatch: Option<Dispatch>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SpecVerifyLeaf {
+    pub id: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

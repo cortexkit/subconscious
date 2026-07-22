@@ -112,7 +112,7 @@ This log distinguishes framework capability from documentation/package friction.
 | Marked text / IME protocol | Implemented through `replace_and_mark_text_in_range`; visually underlined |
 | Copy/cut/paste | Implemented with explicit key bindings |
 | Select all and shift-arrow selection | Implemented |
-| Mouse drag selection / precise hit testing | Implemented across logical and soft-wrapped lines |
+| Mouse drag selection / precise hit testing | Implemented across logical and soft-wrapped lines in the visible viewport; edge-triggered drag autoscroll beyond the editor bounds remains |
 | Undo/redo | Implemented with 750ms typing/deletion/IME grouping and a bounded history |
 | Multiline storage | Implemented; Return inserts `\n` |
 | Multiline layout/caret | Implemented with soft wrapping, vertical navigation, visual-line home/end, selection painting, and cursor-following viewport |
@@ -194,7 +194,6 @@ The condition is a funded component layer before product work begins. Stock GPUI
 
 - VoiceOver/accessibility tree quality and full keyboard traversal
 - sustained CJK/complex-script IME behavior, bidi text, dictation, and emoji palette edge cases
-- VoiceOver semantics and accessibility-focused editing QA
 - light/system-following theme and reduced-motion behavior
 - window restoration, native menus, sheets/modals, drag-and-drop, and bundled `UNUserNotificationCenter` delivery (the app currently uses AppKit plus `osascript`)
 - large heterogeneous board virtualization and hours-long memory/GPU behavior

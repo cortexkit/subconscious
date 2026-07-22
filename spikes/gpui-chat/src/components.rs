@@ -258,11 +258,30 @@ pub(crate) fn campaign_card(c: &SpecCampaign) -> Div {
                         c.epic
                             .as_ref()
                             .and_then(|e| e.title.clone())
-                            .unwrap_or_else(|| "Work graph not minted".into()),
+                            .or_else(|| c.display_name.clone())
+                            .or_else(|| {
+                                c.draft_path.as_ref().and_then(|path| {
+                                    std::path::Path::new(path)
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                })
+                            })
+                            .unwrap_or_else(|| c.consult_id.clone()),
                     ),
                 ),
         );
-    for slice in c.slices.clone().unwrap_or_default() {
+    let slices = c.slices.clone().unwrap_or_default();
+    if slices.is_empty() {
+        card = card.child(
+            div()
+                .mt_3()
+                .pl_3()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child("work graph not minted yet"),
+        );
+    }
+    for slice in slices {
         let state = slice
             .dispatch
             .as_ref()
@@ -295,6 +314,13 @@ pub(crate) fn campaign_card(c: &SpecCampaign) -> Div {
                         .text_sm()
                         .flex_1()
                         .child(slice.title.unwrap_or_else(|| "Untitled slice".into())),
+                )
+                .when_some(
+                    slice
+                        .verify_leaf
+                        .and_then(|verify| verify.status)
+                        .filter(|status| status != "open"),
+                    |d, status| d.child(chip(&format!("verify: {status}"), MUTED)),
                 )
                 .when_some(score, |d, s| d.child(chip(&s, CYAN)))
                 .when_some(slice.dispatch.and_then(|d| d.failure_reason), |d, r| {

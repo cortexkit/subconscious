@@ -327,6 +327,11 @@ impl SubcChat {
         self.rooms.last_acked_seq = 0;
         self.rooms.transcript_scroll = ScrollHandle::new();
         self.refresh_open_room(true, cx);
+        // Opening a room means participating in it: enter automatically so the
+        // member's posts fan out to others without a separate manual step. The
+        // prior UX required a distinct "Enter" click after opening, so messages
+        // typed before that click were accepted locally but never delivered.
+        self.enter_room(cx);
         cx.notify();
     }
 
@@ -695,7 +700,11 @@ impl SubcChat {
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
+                                        // Accept and open in one step: RSVP marks
+                                        // membership, then opening the room auto-enters
+                                        // so the member can speak immediately.
                                         this.rsvp_room(accept_id.clone(), true, cx);
+                                        this.select_room(accept_id.clone(), cx);
                                     }),
                                 )
                                 .child("Accept"),
@@ -826,11 +835,6 @@ impl SubcChat {
                     room_state_color(&snapshot.room.state),
                 ))
             })
-            .child(room_action_button(
-                "enter-room",
-                "Enter",
-                cx.listener(|this, _, _, cx| this.enter_room(cx)),
-            ))
             .child(room_action_button(
                 "leave-room",
                 "Leave",

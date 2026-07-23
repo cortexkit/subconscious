@@ -213,30 +213,36 @@ public final class FedNoiseIKInitiator {
             throw FedNoiseError.handshakeState
         }
         guard message.count == 48 else { throw FedNoiseError.invalidMessage }
-        let responderEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
-        let responderEphemeralBytes = responderEphemeral.rawRepresentation
-        symmetric.mixHash(responderEphemeralBytes)
-        symmetric.mixKey(try dh(ephemeralKey.privateKey, responderEphemeralBytes))
-        symmetric.mixKey(try dh(staticKey.privateKey, responderEphemeralBytes))
-        let payload: Data
+
         do {
-            payload = try symmetric.decryptAndHash(Data(message.dropFirst(32)))
+            let responderEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
+            let responderEphemeralBytes = responderEphemeral.rawRepresentation
+            symmetric.mixHash(responderEphemeralBytes)
+            symmetric.mixKey(try dh(ephemeralKey.privateKey, responderEphemeralBytes))
+            symmetric.mixKey(try dh(staticKey.privateKey, responderEphemeralBytes))
+            let payload = try symmetric.decryptAndHash(Data(message.dropFirst(32)))
+            guard payload.isEmpty else { throw FedNoiseError.invalidHandshakePayload }
+
+            let split = symmetric.split()
+            let completed = FedNoiseHandshakeResult(
+                sendKey: split.initiatorToResponder,
+                receiveKey: split.responderToInitiator,
+                handshakeHash: symmetric.handshakeHash
+            )
+            handshakeComplete = true
+            return completed
         } catch FedNoiseError.authenticationFailed {
             // The initiator has no responder identity field to trust. An IK
             // response that cannot authenticate against the pinned transcript
             // is therefore surfaced as a pin mismatch, never as a new peer.
             throw FedNoiseError.pinnedResponderKeyMismatch
+        } catch let error as FedNoiseError {
+            throw error
+        } catch {
+            // CryptoKit can reject an unauthenticated responder ephemeral key
+            // before AEAD verification; it is still an untrusted IK response.
+            throw FedNoiseError.pinnedResponderKeyMismatch
         }
-        guard payload.isEmpty else { throw FedNoiseError.invalidHandshakePayload }
-
-        let split = symmetric.split()
-        let completed = FedNoiseHandshakeResult(
-            sendKey: split.initiatorToResponder,
-            receiveKey: split.responderToInitiator,
-            handshakeHash: symmetric.handshakeHash
-        )
-        handshakeComplete = true
-        return completed
     }
 
     private func dh(_ privateKey: Curve25519.KeyAgreement.PrivateKey, _ publicKeyBytes: Data) throws -> Data {
@@ -384,6 +390,8 @@ enum FedNoiseChaChaPoly {
                 tag: tag
             )
             return try ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: authenticatedData)
+        } catch let error as FedNoiseError {
+            throw error
         } catch {
             throw FedNoiseError.authenticationFailed
         }

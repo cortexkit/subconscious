@@ -373,6 +373,14 @@ impl SubcChat {
                         }
                         this.rooms.connected = true;
                         this.maybe_ack_room(room_id, cx);
+                        // On the first read after opening a room, jump to the tail
+                        // (newest message). merge_room_events also scrolls, but on
+                        // the initial open the transcript is not yet laid out, so
+                        // that scroll is a no-op; a deferred scroll lands after the
+                        // first paint.
+                        if initial {
+                            this.scroll_room_to_tail_deferred(cx);
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => this.rooms_failed("rooms.read", &error),
@@ -531,6 +539,24 @@ impl SubcChat {
         .detach();
     }
 
+    /// Scroll the transcript to its newest event after the next paint. Used on
+    /// initial room open, where an inline scroll runs before the list is laid
+    /// out and therefore does not take effect.
+    fn scroll_room_to_tail_deferred(&self, cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            executor.timer(Duration::from_millis(16)).await;
+            this.update(cx, |this, cx| {
+                this.rooms
+                    .transcript_scroll
+                    .scroll_to_item(this.rooms.events.len().saturating_sub(1));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn merge_room_events(&mut self, incoming: Vec<RoomEvent>) {
         if incoming.is_empty() {
             return;
@@ -589,6 +615,13 @@ impl SubcChat {
 
     pub(crate) fn rooms(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .key_context("Rooms")
+            // cmd-enter is bound to SendChat in the shared "Composer" key context;
+            // route it to posting the room message so the composer submits from
+            // the keyboard the same way the Chat page does (parity with Broca chat).
+            .on_action(cx.listener(|this, _: &crate::chat::SendChat, _window, cx| {
+                this.post_room(cx)
+            }))
             .size_full()
             .flex()
             .child(self.rooms_sidebar(cx))

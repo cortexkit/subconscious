@@ -1,8 +1,8 @@
 use crate::{
     app::{BORDER, CYAN, GREEN, MUTED, ORANGE, PANEL, PANEL_2, SubcChat},
     components::{
-        board_block, campaign_strip, chip, empty_state, progress_bar, relative_time, state_color,
-        status_dot,
+        board_block, campaign_card, campaign_strip, chip, empty_state, progress_bar, relative_time,
+        state_color, status_dot,
     },
     models::group_projects,
 };
@@ -86,7 +86,18 @@ impl SubcChat {
                                 .when(group.open_asks() > 0, |d| {
                                     d.child(chip(&format!("{} asks", group.open_asks()), ORANGE))
                                 })
-                                .child(chip(&format!("{} agents", group.agents.len()), MUTED)),
+                                .when(!group.agents.is_empty(), |d| {
+                                    d.child(chip(&format!("{} agents", group.agents.len()), MUTED))
+                                })
+                                .when(!group.unattributed_campaigns.is_empty(), |d| {
+                                    d.child(chip(
+                                        &format!(
+                                            "{} campaigns",
+                                            group.unattributed_campaigns.len()
+                                        ),
+                                        CYAN,
+                                    ))
+                                }),
                         ),
                 );
                 let mut agents = div().p_4().flex().flex_col().gap_3();
@@ -174,6 +185,23 @@ impl SubcChat {
                         )
                         .children(campaigns.iter().map(campaign_strip));
                     agents = agents.child(card);
+                }
+                // Campaigns whose caller session has no board (e.g. board.list
+                // discovery unavailable on this alfonso-core build) would otherwise
+                // be dropped, leaving an empty project shell. Render them directly
+                // so the spec-campaign progress stays visible without agent boards.
+                for campaign in &group.unattributed_campaigns {
+                    agents = agents.child(campaign_card(campaign));
+                }
+                if group.agents.is_empty() && group.unattributed_campaigns.is_empty() {
+                    agents = agents.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("No agent boards or campaigns for this project."),
+                    );
                 }
                 section = section.child(agents);
                 list = list.child(section);

@@ -4,7 +4,7 @@ Purpose: the complete picture of what CortexKit is and what exists today,
 written as source material for product/website work. Substance only, no
 copywriting. Companion to `fleet-map.md` (which is the internal seat-onboarding
 version); this one explains the system to someone meeting it for the first
-time. Maintained by the SUBC seat. Last updated: 2026-07-19.
+time. Maintained by the SUBC seat. Last updated: 2026-07-23.
 
 ## The thesis
 
@@ -29,7 +29,8 @@ third-party harnesses) consumes it.
 Most modules are named for brain anatomy, honestly mapped to function:
 subconscious routes beneath awareness, broca produces speech, wernicke
 comprehends it, thalamus relays, callosum connects hemispheres, engram is
-memory trace, astrocyte regulates metabolism, synapse connects locally.
+memory trace, astrocyte regulates metabolism, synapse connects locally,
+cerebellum coordinates movement — it drives the browser and the computer.
 
 ## The substrate: subconscious
 
@@ -41,14 +42,16 @@ module. The daemon is single-principal by design: one security domain per
 daemon, forever. Orgs get their own daemons rather than multi-tenancy.
 
 Around it: a wire protocol with per-route epochs and HMAC-authenticated
-loopback transport; client SDKs in TypeScript, Rust, and Swift; the `ck`
+loopback transport; client SDKs in TypeScript, Rust, and Swift (the Swift
+SDK adds a Noise-encrypted federation transport for reaching a home daemon
+over the open internet); the `ck`
 operator CLI (module control, health drill-downs, quota views, git-style
 dispatch to module CLIs); and an MCP gateway that exposes the whole module
 fleet to any MCP-capable host with per-tool policy control.
 
 Everything below is a supervised module — separate process, own repo, own
 store, zero daemon code. The daemon has needed no per-module edits since the
-architecture landed; that invariant has held through fourteen modules.
+architecture landed; that invariant has held across fifteen modules.
 
 ## The organs
 
@@ -89,7 +92,10 @@ questions to the human with urgency and default-on-silence), rooms (multi-
 agent meetings and channels with transcripts), the Board (structured
 agent-to-human surface: status, asks, artifacts), a work graph (epics/tasks
 with dependency gating), and Athena (multi-model adversarial review panels —
-the design-gate machinery the fleet itself is built with).
+the design-gate machinery the fleet itself is built with). Agents are
+becoming durable hires: long-lived instances with their own prompt state,
+memory, and history that a lead agent staffs and manages like a team (one
+lead running separate hires for the desktop app, the mobile app, and more).
 
 **Quota — provider usage truth.** Live usage windows for 30+ AI providers
 (OAuth quotas, cookie-based, local probes), multi-account, feeding both the
@@ -125,11 +131,25 @@ collection, and (designed) cross-machine session restore. The cloud provider
 cannot read anything. The master key lives in the local vault and moves
 between devices only over federation.
 
+**Cerebellum — computer and browser control (building).** The actuation
+plane: an agent that can see and drive a real web browser (Chrome DevTools
+Protocol) and, in parallel, the macOS desktop (screen capture and synthetic
+input). Built on a fail-closed safety spine — default-deny by caller trust, a
+hard structural refusal to type into credential or payment fields, and
+double-verification that sends zero keystrokes if the target field changed
+under the agent between deciding and acting. Read-only capture and navigation
+proceed on ordinary review; every path that injects synthetic input is gated
+for explicit human approval. Two planes on one shared identity/health/
+severity/audit spine, so the safety contract is written and audited once.
+
 **Wernicke — the chat gateway (building).** Slack, Teams, Telegram, Discord.
 Org-installed bots where only the linked account owner's direct mention
 carries authority — every other message is untrusted context, structurally
-segregated against prompt injection. The bridge between org chat and org
-agents, built on the team-mode authority contract.
+segregated against prompt injection. Chat identities bind to personas —
+durable, named hires rather than one handle per agent — so a CEO-like persona
+can front all chat while division agents work beneath it, and a growing
+agent roster needs no new platform registrations. The bridge between org chat
+and org agents, built on the team-mode authority contract.
 
 **ck-projects — topology (designing).** The just-settled workspace/project
 registry: workspace → projects → each project owning N directories. Built for
@@ -143,7 +163,10 @@ for grouping; none for identity.
 Electron). Board-first: the agent communicates through structured lanes
 (chat, asks, status, artifacts) rather than a wall of text. Bundles the
 daemon and modules; will be the config editor and OAuth custodian. The
-long-term human home for the platform.
+long-term human home for the platform. Under active prototyping on a
+Rust-native GPUI shell that links the client SDK directly with no webview
+boundary; an iOS companion reaches the home daemon over the federation
+transport.
 
 **subc-chat** — the Swift proving ground for Cortex: live sessions, rooms,
 asks with notifications, the Board tab, observability into agent lanes
@@ -181,12 +204,17 @@ sessions (via thalamus) with proven cache neutrality; the full metering path
 (broca facts → astrocyte pricing → live cap refusals); the credential vault
 as OAuth login root; federation across real WANs; engram's cloud plane and
 GC; the Room-1 org authority layer conformance-tested across four repos; the
-Board surfaces. Building: wernicke, the chaos suite, brocatui, Cortex app,
-Room-2 (ceilings/quorum), engram restore, federation phase 3, ck-projects.
+Board surfaces; and the Swift federation transport (SubcFed), whose
+security-audited Noise-IK core just merged as the foundation for reaching the
+home daemon from a phone. Building: cerebellum (browser control merged and
+multi-model security-audited, macOS computer control in design), wernicke
+(chat gateway plus the persona model), the chaos suite, brocatui, the Cortex
+desktop app (GPUI) and an iOS companion, Room-2 (ceilings/quorum), engram
+restore, federation phase 3, ck-projects.
 
 ## How it is built (the part that does not show but explains the quality)
 
-The fleet is built by the fleet: fifteen AI agent seats, each owning its
+The fleet is built by the fleet: sixteen AI agent seats, each owning its
 repo, coordinating through the same rooms/asks/board machinery the product
 ships. Every cross-module contract goes through adversarial multi-model
 design gates before code; every seam is proven by live cross-module drives

@@ -55,30 +55,48 @@ async fn load_live() -> Result<Snapshot> {
             params,
         )
     };
-    let boards_value = call("board.list", json!({})).await?;
-    let boards: Vec<BoardSummary> = decode_rows(boards_value, "boards")?;
+    // The pending-asks request is required for a live view: answering asks is the
+    // point of this screen, so only its failure sends the app to the fixture-data
+    // fallback. The other lists (boards, consults, campaigns) are optional; a failed
+    // or undecodable request becomes an empty list instead of stranding the whole app.
     let asks_value = call("ask.list_pending_for_user", json!({})).await?;
     let asks: Vec<AskRequest> = decode_rows(asks_value, "asks")?;
-    let consults_value = call("athena.list_consults", json!({"limit": 50})).await?;
-    let consults: Vec<ConsultRow> = decode_rows(consults_value, "consults")?;
-    let campaigns_value = call("athena.spec_status", json!({})).await?;
-    let campaigns: Vec<SpecCampaign> = decode_rows(campaigns_value, "consults")?;
+
+    let boards: Vec<BoardSummary> = match call("board.list", json!({})).await {
+        Ok(value) => decode_rows(value, "boards").unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let consults: Vec<ConsultRow> = match call("athena.list_consults", json!({"limit": 50})).await {
+        Ok(value) => decode_rows(value, "consults").unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let campaigns: Vec<SpecCampaign> = match call("athena.spec_status", json!({})).await {
+        Ok(value) => decode_rows(value, "consults").unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
 
     let board = if let Some(summary) = boards.first() {
-        let result = call(
+        call(
             "board.state",
             json!({"harness": summary.harness, "session": summary.session}),
         )
-        .await?;
-        Some(serde_json::from_value::<BoardState>(camelize_json_keys(result))?.fold_newest())
+        .await
+        .ok()
+        .and_then(|result| {
+            serde_json::from_value::<BoardState>(camelize_json_keys(result))
+                .ok()
+                .map(BoardState::fold_newest)
+        })
     } else {
         None
     };
     let consult_detail = if let Some(row) = consults.first() {
-        let result = call("athena.get_consult", json!({"consultId": row.consult_id})).await?;
-        Some(serde_json::from_value::<ConsultDetail>(
-            camelize_json_keys(result),
-        )?)
+        call("athena.get_consult", json!({"consultId": row.consult_id}))
+            .await
+            .ok()
+            .and_then(|result| {
+                serde_json::from_value::<ConsultDetail>(camelize_json_keys(result)).ok()
+            })
     } else {
         None
     };

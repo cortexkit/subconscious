@@ -143,17 +143,18 @@ public struct FedRelayAuthenticator: Sendable {
         guard let decoded = Data(base64URLEncoded: material.pipeToken), decoded.count == 124 else {
             throw FedCarrierError.invalidRelayProof
         }
-        guard decoded[0] == 0x01 else { throw FedCarrierError.invalidRelayProof }
-        let pipeID = String(decoding: decoded[1..<27], as: UTF8.self)
+        let start = decoded.startIndex
+        guard decoded[start] == 0x01 else { throw FedCarrierError.invalidRelayProof }
+        let pipeID = String(decoding: decoded[(start + 1)..<(start + 27)], as: UTF8.self)
         guard pipeID == material.pipeID else { throw FedCarrierError.invalidRelayProof }
         let tokenSide: FedRelaySide
-        switch decoded[27] {
+        switch decoded[start + 27] {
         case 0: tokenSide = .a
         case 1: tokenSide = .b
         default: throw FedCarrierError.invalidRelayProof
         }
         guard tokenSide == material.side else { throw FedCarrierError.invalidRelayProof }
-        guard Data(decoded[28..<60]) == material.x25519Key.publicKey else {
+        guard Data(decoded[(start + 28)..<(start + 60)]) == material.x25519Key.publicKey else {
             throw FedCarrierError.invalidRelayProof
         }
         guard readBigEndianUInt64(decoded, at: 60) == material.tokenVersion else {
@@ -162,7 +163,8 @@ public struct FedRelayAuthenticator: Sendable {
     }
 
     private func readBigEndianUInt64(_ data: Data, at offset: Int) -> UInt64 {
-        data[offset..<offset + 8].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let start = data.startIndex + offset
+        return data[start..<(start + 8)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
     }
 
     private func makeProof(material: FedRelayMaterial, challenge: FedRelayChallenge) throws -> FedRelayProof {

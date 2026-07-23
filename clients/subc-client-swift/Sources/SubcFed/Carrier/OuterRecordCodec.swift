@@ -46,7 +46,8 @@ public struct FedOuterRecordCodec: Sendable {
         guard record.count == expected else {
             throw FedCarrierError.incompleteRecord(expected: expected, actual: record.count)
         }
-        return record.subdata(in: prefixLength..<expected)
+        let start = record.startIndex + prefixLength
+        return record.subdata(in: start..<(start + Int(declared)))
     }
 
     /// Decode a complete WebSocket binary message. Unlike TCP, no incomplete
@@ -85,14 +86,16 @@ public struct FedOuterRecordCodec: Sendable {
                 actualPayload: actualPayload
             )
         }
-        return message.subdata(in: prefixLength..<message.count)
+        let start = message.startIndex + prefixLength
+        return message.subdata(in: start..<(start + actualPayload))
     }
 
     private static func readLittleEndianUInt32(_ data: Data, at offset: Int) -> UInt32 {
-        UInt32(data[offset])
-            | (UInt32(data[offset + 1]) << 8)
-            | (UInt32(data[offset + 2]) << 16)
-            | (UInt32(data[offset + 3]) << 24)
+        let start = data.startIndex + offset
+        return UInt32(data[start])
+            | (UInt32(data[start + 1]) << 8)
+            | (UInt32(data[start + 2]) << 16)
+            | (UInt32(data[start + 3]) << 24)
     }
 }
 
@@ -159,10 +162,11 @@ public struct FedTCPRecordDecoder: Sendable {
     }
 
     private func readLength(from data: Data) -> UInt32 {
-        UInt32(data[0])
-            | (UInt32(data[1]) << 8)
-            | (UInt32(data[2]) << 16)
-            | (UInt32(data[3]) << 24)
+        let start = data.startIndex
+        return UInt32(data[start])
+            | (UInt32(data[start + 1]) << 8)
+            | (UInt32(data[start + 2]) << 16)
+            | (UInt32(data[start + 3]) << 24)
     }
 }
 

@@ -35,12 +35,16 @@ final class NoiseIKTests: XCTestCase {
         let receiver = try FedNoiseTransport(sendKey: receiveKey, receiveKey: sendKey)
         let ciphertext = try sender.encrypt(Data([1, 2, 3]))
         var altered = ciphertext
-        altered[0] ^= 0x80
+        altered[altered.startIndex] ^= 0x80
         XCTAssertThrowsError(try receiver.decrypt(altered)) { error in
             XCTAssertEqual(error as? FedNoiseError, .authenticationFailed)
         }
-        XCTAssertEqual(try receiver.decrypt(ciphertext), Data([1, 2, 3]))
-        XCTAssertThrowsError(try receiver.decrypt(ciphertext)) { error in
+        // The outer bytes are deliberately taken from a non-zero-based slice.
+        // Decrypting this record must remain a thrown-error API, never a trap.
+        let wrapped = Data([0x09]) + ciphertext + Data([0x0a])
+        let slicedRecord = wrapped[1..<(wrapped.count - 1)]
+        XCTAssertEqual(try receiver.decrypt(Data(slicedRecord)), Data([1, 2, 3]))
+        XCTAssertThrowsError(try receiver.decrypt(Data(slicedRecord))) { error in
             XCTAssertEqual(error as? FedNoiseError, .authenticationFailed)
         }
     }

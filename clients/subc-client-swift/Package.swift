@@ -11,14 +11,17 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .library(name: "SubcClient", targets: ["SubcClient"]),
+        .library(name: "SubcFed", targets: ["SubcFed"]),
         .executable(name: "subc-swift-probe", targets: ["SubcSwiftProbe"]),
         .executable(name: "subc-chat", targets: ["SubcChat"]),
     ],
     targets: [
         .target(name: "SubcClient"),
+        .target(name: "SubcFed"),
         .target(name: "SubcChatAskSupport"),
         .executableTarget(name: "SubcSwiftProbe", dependencies: ["SubcClient"]),
         .executableTarget(name: "SubcChat", dependencies: ["SubcClient", "SubcChatAskSupport"]),
+        .testTarget(name: "SubcFedTests", dependencies: ["SubcFed"]),
         .testTarget(
             name: "SubcClientTests",
             dependencies: ["SubcClient", "SubcChatAskSupport"],

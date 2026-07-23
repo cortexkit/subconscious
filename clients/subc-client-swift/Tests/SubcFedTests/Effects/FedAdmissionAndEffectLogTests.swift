@@ -228,14 +228,54 @@ final class FedAdmissionAndEffectLogTests: XCTestCase {
         )
         XCTAssertEqual(fenced.disposition, .ambiguous)
 
-        let partition = FedOriginEffectLog.classifyTerminalFrame(
+        // fed_target_unavailable is not_sent only when provably before dispatch.
+        let before = FedOriginEffectLog.classifyTerminalFrame(
             kind: "error",
             body: Data(),
             bodyOmitted: false,
-            errorCode: "fed_partition"
+            errorCode: "fed_target_unavailable",
+            provenance: .provablyBeforeDispatch
         )
-        XCTAssertNil(partition.disposition)
-        XCTAssertFalse(partition.settle)
+        XCTAssertEqual(before.disposition, .notSent)
+
+        let after = FedOriginEffectLog.classifyTerminalFrame(
+            kind: "error",
+            body: Data(),
+            bodyOmitted: false,
+            errorCode: "fed_target_unavailable",
+            provenance: .afterDispatchOrUnknown
+        )
+        XCTAssertNil(after.disposition)
+        XCTAssertFalse(after.settle)
+
+        let internalAfter = FedOriginEffectLog.classifyTerminalFrame(
+            kind: "error",
+            body: Data(),
+            bodyOmitted: false,
+            errorCode: "fed_internal",
+            provenance: .afterDispatchOrUnknown
+        )
+        XCTAssertNil(internalAfter.disposition)
+
+        // Unknown fed_ control codes never become recorded.
+        let unknown = FedOriginEffectLog.classifyTerminalFrame(
+            kind: "error",
+            body: Data(),
+            bodyOmitted: false,
+            errorCode: "fed_future_control_xyz"
+        )
+        XCTAssertNil(unknown.disposition)
+        XCTAssertFalse(unknown.settle)
+
+        // Module-originated non-fed errors are recorded.
+        let module = FedOriginEffectLog.classifyTerminalFrame(
+            kind: "error",
+            body: Data(),
+            bodyOmitted: false,
+            errorCode: "module_boom",
+            provenance: .moduleOriginated
+        )
+        XCTAssertEqual(module.disposition, .recorded)
 
         let omitted = FedOriginEffectLog.classifyTerminalFrame(
             kind: "response",

@@ -39,17 +39,22 @@ public struct FedAdmissionPermit: Sendable, Equatable, Hashable {
     public let responderKeyDigest: Data
     public let deadlineMs: UInt64
     public let grantedAtNanoseconds: UInt64
+    /// Ledgered (mutating) permits track real dispatch and survive non-settling
+    /// advisories and session loss until durable settle.
+    public let isLedgered: Bool
 
     public init(
         id: UUID = UUID(),
         responderKeyDigest: Data,
         deadlineMs: UInt64,
-        grantedAtNanoseconds: UInt64
+        grantedAtNanoseconds: UInt64,
+        isLedgered: Bool = false
     ) {
         self.id = id
         self.responderKeyDigest = responderKeyDigest
         self.deadlineMs = deadlineMs
         self.grantedAtNanoseconds = grantedAtNanoseconds
+        self.isLedgered = isLedgered
     }
 }
 
@@ -70,6 +75,7 @@ public actor FedAdmissionController {
     private struct QueuedRequest {
         let id: UUID
         let policy: FedAdmissionPolicySnapshot
+        let isLedgered: Bool
         let enqueuedAt: UInt64
         var continuation: CheckedContinuation<FedAdmissionPermit, Error>?
         var timeoutTask: Task<Void, Never>?
@@ -79,6 +85,8 @@ public actor FedAdmissionController {
     private let responderKeyDigest: Data
     private var configuration: Configuration
     private var outstandingPermits: [UUID: FedAdmissionPermit] = [:]
+    /// Ledgered permits retained across session teardown for recovery ownership.
+    private var retainedLedgeredPermits: [UUID: FedAdmissionPermit] = [:]
     private var queue: [QueuedRequest] = []
     private var cancelled = false
 
@@ -92,9 +100,12 @@ public actor FedAdmissionController {
         self.clock = clock
     }
 
-    public var inFlightCount: Int { outstandingPermits.count }
+    public var inFlightCount: Int {
+        outstandingPermits.count + retainedLedgeredPermits.count
+    }
     public var queuedCount: Int { queue.count }
     public var peerMaxInFlight: Int { configuration.peerMaxInFlight }
+    public var retainedLedgeredCount: Int { retainedLedgeredPermits.count }
 
     /// Updates capacity from a replacement primary hello. Existing permits are
     /// never revoked; new acquisitions wait until usage falls below capacity.
@@ -110,12 +121,15 @@ public actor FedAdmissionController {
 
     /// Acquires a permit or waits in the bounded local queue. Pre-admission
     /// failures emit neither call nor call_cancel.
-    public func acquire(policy: FedAdmissionPolicySnapshot? = nil) async throws -> FedAdmissionPermit {
+    public func acquire(
+        policy: FedAdmissionPolicySnapshot? = nil,
+        isLedgered: Bool = false
+    ) async throws -> FedAdmissionPermit {
         let snapshot = policy ?? configuration.policy
         if cancelled { throw FedFailure.cancelled }
 
-        if outstandingPermits.count < configuration.peerMaxInFlight {
-            return grant(deadlineMs: snapshot.defaultDeadlineMs)
+        if inFlightCount < configuration.peerMaxInFlight {
+            return grant(deadlineMs: snapshot.defaultDeadlineMs, isLedgered: isLedgered)
         }
 
         if snapshot.queueCapacity == 0 || queue.count >= snapshot.queueCapacity {
@@ -129,6 +143,7 @@ public actor FedAdmissionController {
                 var request = QueuedRequest(
                     id: requestID,
                     policy: snapshot,
+                    isLedgered: isLedgered,
                     enqueuedAt: enqueuedAt,
                     continuation: continuation,
                     timeoutTask: nil
@@ -152,15 +167,32 @@ public actor FedAdmissionController {
         }
     }
 
-    /// Releases a permit when the call reaches a terminal condition or its
-    /// owning session is lost. Progress frames do not release permits.
+    /// Releases a pure-call permit, or a ledgered permit after durable settle.
+    /// Progress frames and non-settling advisories must not call this for
+    /// ledgered permits.
     public func release(_ permit: FedAdmissionPermit) {
-        guard outstandingPermits.removeValue(forKey: permit.id) != nil else { return }
-        drainQueue()
+        if outstandingPermits.removeValue(forKey: permit.id) != nil {
+            drainQueue()
+            return
+        }
+        if retainedLedgeredPermits.removeValue(forKey: permit.id) != nil {
+            drainQueue()
+        }
     }
 
-    /// Completes every queued waiter locally without granting a permit. Used on
-    /// disconnect, suspend, and session replacement for non-transferred work.
+    /// Marks a ledgered permit as retained by recovery after session loss or a
+    /// non-settling advisory. Capacity remains consumed until durable settle.
+    public func retainLedgeredForRecovery(_ permit: FedAdmissionPermit) {
+        guard permit.isLedgered else {
+            release(permit)
+            return
+        }
+        if let held = outstandingPermits.removeValue(forKey: permit.id) {
+            retainedLedgeredPermits[held.id] = held
+        }
+    }
+
+    /// Completes every queued waiter locally without granting a permit.
     public func cancelAllQueued(with failure: FedFailure = .cancelled) {
         let pending = queue
         queue.removeAll()
@@ -170,12 +202,25 @@ public actor FedAdmissionController {
         }
     }
 
-    /// Releases every outstanding permit and cancels the queue. Session teardown
-    /// path for disconnect and suspend.
+    /// Session teardown: cancel the queue and release pure permits. Ledgered
+    /// permits transfer to recovery ownership and keep consuming capacity.
+    public func teardownSession(with failure: FedFailure = .disconnected) {
+        cancelAllQueued(with: failure)
+        let pure = outstandingPermits.values.filter { !$0.isLedgered }
+        for permit in pure {
+            outstandingPermits.removeValue(forKey: permit.id)
+        }
+        for (id, permit) in outstandingPermits where permit.isLedgered {
+            retainedLedgeredPermits[id] = permit
+            outstandingPermits.removeValue(forKey: id)
+        }
+    }
+
+    /// Full controller shutdown (client disconnect). Drops pure permits; ledgered
+    /// retained permits stay until explicit release after durable settle.
     public func shutdown(with failure: FedFailure = .disconnected) {
         cancelled = true
-        cancelAllQueued(with: failure)
-        outstandingPermits.removeAll()
+        teardownSession(with: failure)
     }
 
     public func resetForReconnect() {
@@ -184,21 +229,25 @@ public actor FedAdmissionController {
 
     // MARK: - Private
 
-    private func grant(deadlineMs: UInt64) -> FedAdmissionPermit {
+    private func grant(deadlineMs: UInt64, isLedgered: Bool) -> FedAdmissionPermit {
         let permit = FedAdmissionPermit(
             responderKeyDigest: responderKeyDigest,
             deadlineMs: deadlineMs,
-            grantedAtNanoseconds: clock.nowNanoseconds()
+            grantedAtNanoseconds: clock.nowNanoseconds(),
+            isLedgered: isLedgered
         )
         outstandingPermits[permit.id] = permit
         return permit
     }
 
     private func drainQueue() {
-        while outstandingPermits.count < configuration.peerMaxInFlight, !queue.isEmpty {
+        while inFlightCount < configuration.peerMaxInFlight, !queue.isEmpty {
             let request = queue.removeFirst()
             request.timeoutTask?.cancel()
-            let permit = grant(deadlineMs: request.policy.defaultDeadlineMs)
+            let permit = grant(
+                deadlineMs: request.policy.defaultDeadlineMs,
+                isLedgered: request.isLedgered
+            )
             request.continuation?.resume(returning: permit)
         }
     }

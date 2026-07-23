@@ -3973,6 +3973,40 @@ struct RouteToolCallRequest {
     progress_token: Option<ProgressToken>,
 }
 
+/// Magic-context mutation tools whose module-side replay ledger dedups on a
+/// shim-supplied `command_id` argument. Only these tools get the injected id:
+/// other providers' tools must receive their arguments untouched because their
+/// schemas may reject unknown members.
+fn mutation_replay_protected_tool(bare_tool_name: &str) -> bool {
+    matches!(bare_tool_name, "ctx_memory" | "ctx_note")
+}
+
+/// Replay-protection id for a mutation tool call: stable when the host retries
+/// the same JSON-RPC request on the same shim connection (the module then
+/// returns the stored response instead of double-writing), distinct across
+/// connections so per-connection request-id counters restarting from 1 can
+/// never collide two different logical calls into a false dedup, which would
+/// silently drop a write. The relay session id is minted per shim connection
+/// from a CSPRNG, so it is exactly the scope where request ids are unique. A
+/// conscious re-issue (new request id, or a reconnect creating a new session)
+/// deliberately writes twice.
+fn mutation_command_id(session_id: &str, request_id: &RequestId) -> String {
+    let id_json =
+        serde_json::to_string(request_id).unwrap_or_else(|_| String::from("unserializable"));
+    let raw = format!("{session_id}:{id_json}");
+    if raw.len() <= 128 {
+        return raw;
+    }
+    // Pathologically long string request ids: keep the session prefix (the
+    // cross-connection uniqueness component) and collapse the request id to a
+    // fixed-width hash. DefaultHasher is deterministic within one build, and
+    // stability is only required within one live session anyway.
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(id_json.as_bytes());
+    format!("{session_id}:h{:016x}", hasher.finish())
+}
+
 /// v1 subc-mcp ↔ provider progress contract carried as an opaque route-channel
 /// `PUSH` body before the terminal response for the same correlation id.
 #[derive(Debug, Deserialize)]
@@ -4255,9 +4289,18 @@ impl SubcMcpServer {
     async fn call_bound_tool(
         &self,
         binding: ForwardBinding,
-        arguments: JsonObject,
+        mut arguments: JsonObject,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
+        if mutation_replay_protected_tool(&binding.bare_tool_name) {
+            arguments.insert(
+                "command_id".to_string(),
+                serde_json::Value::String(mutation_command_id(
+                    self.relay_session.id(),
+                    &context.id,
+                )),
+            );
+        }
         let route = binding.route;
         let progress_token = context.meta.get_progress_token();
         let body = RouteToolCallRequest {
@@ -5154,6 +5197,49 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
     use super::*;
+
+    #[test]
+    fn mutation_command_id_is_stable_per_request_and_distinct_across_sessions() {
+        let number_id = RequestId::Number(5);
+        let same_session_same_request = mutation_command_id("shim-aaaa", &number_id)
+            == mutation_command_id("shim-aaaa", &number_id);
+        assert!(
+            same_session_same_request,
+            "same session + request id must derive the same command id"
+        );
+
+        assert_ne!(
+            mutation_command_id("shim-aaaa", &number_id),
+            mutation_command_id("shim-bbbb", &number_id),
+            "request id 5 on two different connections must never collide"
+        );
+        assert_ne!(
+            mutation_command_id("shim-aaaa", &RequestId::Number(5)),
+            mutation_command_id("shim-aaaa", &RequestId::String("5".into())),
+            "number 5 and string \"5\" are distinct JSON-RPC ids"
+        );
+
+        let long_id = RequestId::String("x".repeat(4096).into());
+        let derived = mutation_command_id("shim-aaaa", &long_id);
+        assert!(
+            derived.len() <= 128,
+            "command id must stay within the 128-byte contract"
+        );
+        assert_eq!(
+            derived,
+            mutation_command_id("shim-aaaa", &long_id),
+            "hash fallback must stay stable"
+        );
+    }
+
+    #[test]
+    fn mutation_replay_protection_covers_exactly_the_mc_mutation_tools() {
+        assert!(mutation_replay_protected_tool("ctx_memory"));
+        assert!(mutation_replay_protected_tool("ctx_note"));
+        assert!(!mutation_replay_protected_tool("ctx_search"));
+        assert!(!mutation_replay_protected_tool("ctx_reduce"));
+        assert!(!mutation_replay_protected_tool("aft_edit"));
+    }
 
     struct MockPromptRouteClient {
         responses: StdMutex<VecDeque<std::result::Result<serde_json::Value, PromptRouteFailure>>>,

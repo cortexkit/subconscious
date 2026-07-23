@@ -1,0 +1,302 @@
+import Foundation
+
+/// The bounded stages of one candidate dial. Keeping the stage vocabulary closed
+/// lets callers distinguish a retryable network partition from an authenticated
+/// protocol failure without inspecting platform error strings.
+public enum FedCandidateStage: String, Codable, Sendable, Equatable {
+    case carrierConnect
+    case webSocketUpgrade
+    case relayAuthentication
+    case noiseHandshake
+    case fedNegotiation
+}
+
+public enum CandidateRejectionReason: String, Codable, Sendable, Equatable {
+    case unverifiedPeerLAN
+    case missingObservedPrivateSubnet
+    case invalidAddress
+    case addressClassNotAllowed
+    case outsideObservedPrivateSubnet
+    case unsupportedCandidateClass
+}
+
+public enum CandidateTransportFailureKind: String, Codable, Sendable, Equatable {
+    case dns
+    case connectionRefused
+    case networkUnreachable
+    case connectionReset
+    case eof
+    case tls
+    case webSocket
+    case relayPressure
+    case otherTransport
+}
+
+public enum CandidateFailureReason: Codable, Sendable, Equatable {
+    case rejected(CandidateRejectionReason)
+    case timedOut(FedCandidateStage)
+    case transport(CandidateTransportFailureKind)
+    case relayAuthenticationFailed(code: String)
+    case responderKeyMismatch
+    case noiseAuthenticationFailed
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case value
+    }
+
+    private enum Kind: String, Codable {
+        case rejected
+        case timedOut
+        case transport
+        case relayAuthenticationFailed
+        case responderKeyMismatch
+        case noiseAuthenticationFailed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decode(Kind.self, forKey: .kind)
+        switch kind {
+        case .rejected:
+            self = .rejected(try container.decode(CandidateRejectionReason.self, forKey: .value))
+        case .timedOut:
+            self = .timedOut(try container.decode(FedCandidateStage.self, forKey: .value))
+        case .transport:
+            self = .transport(try container.decode(CandidateTransportFailureKind.self, forKey: .value))
+        case .relayAuthenticationFailed:
+            self = .relayAuthenticationFailed(code: try container.decode(String.self, forKey: .value))
+        case .responderKeyMismatch:
+            self = .responderKeyMismatch
+        case .noiseAuthenticationFailed:
+            self = .noiseAuthenticationFailed
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .rejected(let reason):
+            try container.encode(Kind.rejected, forKey: .kind)
+            try container.encode(reason, forKey: .value)
+        case .timedOut(let stage):
+            try container.encode(Kind.timedOut, forKey: .kind)
+            try container.encode(stage, forKey: .value)
+        case .transport(let kind):
+            try container.encode(Kind.transport, forKey: .kind)
+            try container.encode(kind, forKey: .value)
+        case .relayAuthenticationFailed(let code):
+            try container.encode(Kind.relayAuthenticationFailed, forKey: .kind)
+            try container.encode(code, forKey: .value)
+        case .responderKeyMismatch:
+            try container.encode(Kind.responderKeyMismatch, forKey: .kind)
+        case .noiseAuthenticationFailed:
+            try container.encode(Kind.noiseAuthenticationFailed, forKey: .kind)
+        }
+    }
+
+/// Authentication failures apply only to the current candidate. They close that
+/// carrier but still allow another configured endpoint expected to authenticate
+/// as the same pinned responder to be tried.
+    public var permitsCandidateFallback: Bool {
+        switch self {
+        case .rejected, .timedOut, .transport, .relayAuthenticationFailed,
+             .responderKeyMismatch, .noiseAuthenticationFailed:
+            return true
+        }
+    }
+
+    /// Only ordinary transport partitions authorize automatic reconnect. A key
+    /// or proof failure needs changed profile material before it is retried.
+    public var permitsAutomaticReconnect: Bool {
+        if case .transport = self { return true }
+        return false
+    }
+}
+
+public struct CandidateFailure: Codable, Sendable, Equatable {
+    public let candidateID: String
+    public let stage: FedCandidateStage
+    public let reason: CandidateFailureReason
+
+    public init(candidateID: String, stage: FedCandidateStage, reason: CandidateFailureReason) {
+        self.candidateID = candidateID
+        self.stage = stage
+        self.reason = reason
+    }
+}
+
+public enum FedFailure: Error, Codable, Sendable, Equatable {
+    case notDialOwner
+    case unsupportedEnrollmentClass
+    case invalidProfile(field: String)
+    case candidateRejected(reason: CandidateRejectionReason)
+    case candidateTimedOut(stage: FedCandidateStage)
+    case relayAuthenticationFailed(code: String)
+    case responderKeyMismatch
+    case accountKeyMismatch
+    case noiseAuthenticationFailed
+    case framingViolation
+    case protocolViolation(byeCode: String)
+    case catalogTargetUnavailable
+    case fedBodyTooLarge
+    case fedEffectsUnsupported
+    case storeCorrupt
+    case storeUnavailable
+    case storeMigrationFailed
+    case reservationFailed
+    case persistenceFailed
+    case cancelled
+    case suspended
+    case disconnected
+    case indeterminateMutation
+    case admissionQueueFull
+    case admissionQueueTimedOut
+    case noEligibleCandidates([CandidateFailure])
+    case allCandidatesFailed([CandidateFailure])
+
+    private enum CodingKeys: String, CodingKey { case kind, field, code, stage, failures }
+    private enum Kind: String, Codable {
+        case notDialOwner, unsupportedEnrollmentClass, invalidProfile, candidateRejected,
+             candidateTimedOut, relayAuthenticationFailed, responderKeyMismatch,
+             accountKeyMismatch, noiseAuthenticationFailed, framingViolation,
+             protocolViolation, catalogTargetUnavailable, fedBodyTooLarge,
+             fedEffectsUnsupported, storeCorrupt, storeUnavailable, storeMigrationFailed,
+             reservationFailed, persistenceFailed, cancelled, suspended, disconnected,
+             indeterminateMutation, admissionQueueFull, admissionQueueTimedOut,
+             noEligibleCandidates, allCandidatesFailed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(Kind.self, forKey: .kind) {
+        case .notDialOwner: self = .notDialOwner
+        case .unsupportedEnrollmentClass: self = .unsupportedEnrollmentClass
+        case .invalidProfile: self = .invalidProfile(field: try c.decode(String.self, forKey: .field))
+        case .candidateRejected: self = .candidateRejected(reason: try c.decode(CandidateRejectionReason.self, forKey: .code))
+        case .candidateTimedOut: self = .candidateTimedOut(stage: try c.decode(FedCandidateStage.self, forKey: .stage))
+        case .relayAuthenticationFailed: self = .relayAuthenticationFailed(code: try c.decode(String.self, forKey: .code))
+        case .responderKeyMismatch: self = .responderKeyMismatch
+        case .accountKeyMismatch: self = .accountKeyMismatch
+        case .noiseAuthenticationFailed: self = .noiseAuthenticationFailed
+        case .framingViolation: self = .framingViolation
+        case .protocolViolation: self = .protocolViolation(byeCode: try c.decode(String.self, forKey: .code))
+        case .catalogTargetUnavailable: self = .catalogTargetUnavailable
+        case .fedBodyTooLarge: self = .fedBodyTooLarge
+        case .fedEffectsUnsupported: self = .fedEffectsUnsupported
+        case .storeCorrupt: self = .storeCorrupt
+        case .storeUnavailable: self = .storeUnavailable
+        case .storeMigrationFailed: self = .storeMigrationFailed
+        case .reservationFailed: self = .reservationFailed
+        case .persistenceFailed: self = .persistenceFailed
+        case .cancelled: self = .cancelled
+        case .suspended: self = .suspended
+        case .disconnected: self = .disconnected
+        case .indeterminateMutation: self = .indeterminateMutation
+        case .admissionQueueFull: self = .admissionQueueFull
+        case .admissionQueueTimedOut: self = .admissionQueueTimedOut
+        case .noEligibleCandidates: self = .noEligibleCandidates(try c.decode([CandidateFailure].self, forKey: .failures))
+        case .allCandidatesFailed: self = .allCandidatesFailed(try c.decode([CandidateFailure].self, forKey: .failures))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .notDialOwner: try c.encode(Kind.notDialOwner, forKey: .kind)
+        case .unsupportedEnrollmentClass: try c.encode(Kind.unsupportedEnrollmentClass, forKey: .kind)
+        case .invalidProfile(let field):
+            try c.encode(Kind.invalidProfile, forKey: .kind); try c.encode(field, forKey: .field)
+        case .candidateRejected(let reason):
+            try c.encode(Kind.candidateRejected, forKey: .kind); try c.encode(reason, forKey: .code)
+        case .candidateTimedOut(let stage):
+            try c.encode(Kind.candidateTimedOut, forKey: .kind); try c.encode(stage, forKey: .stage)
+        case .relayAuthenticationFailed(let code):
+            try c.encode(Kind.relayAuthenticationFailed, forKey: .kind); try c.encode(code, forKey: .code)
+        case .responderKeyMismatch: try c.encode(Kind.responderKeyMismatch, forKey: .kind)
+        case .accountKeyMismatch: try c.encode(Kind.accountKeyMismatch, forKey: .kind)
+        case .noiseAuthenticationFailed: try c.encode(Kind.noiseAuthenticationFailed, forKey: .kind)
+        case .framingViolation: try c.encode(Kind.framingViolation, forKey: .kind)
+        case .protocolViolation(let code):
+            try c.encode(Kind.protocolViolation, forKey: .kind); try c.encode(code, forKey: .code)
+        case .catalogTargetUnavailable: try c.encode(Kind.catalogTargetUnavailable, forKey: .kind)
+        case .fedBodyTooLarge: try c.encode(Kind.fedBodyTooLarge, forKey: .kind)
+        case .fedEffectsUnsupported: try c.encode(Kind.fedEffectsUnsupported, forKey: .kind)
+        case .storeCorrupt: try c.encode(Kind.storeCorrupt, forKey: .kind)
+        case .storeUnavailable: try c.encode(Kind.storeUnavailable, forKey: .kind)
+        case .storeMigrationFailed: try c.encode(Kind.storeMigrationFailed, forKey: .kind)
+        case .reservationFailed: try c.encode(Kind.reservationFailed, forKey: .kind)
+        case .persistenceFailed: try c.encode(Kind.persistenceFailed, forKey: .kind)
+        case .cancelled: try c.encode(Kind.cancelled, forKey: .kind)
+        case .suspended: try c.encode(Kind.suspended, forKey: .kind)
+        case .disconnected: try c.encode(Kind.disconnected, forKey: .kind)
+        case .indeterminateMutation: try c.encode(Kind.indeterminateMutation, forKey: .kind)
+        case .admissionQueueFull: try c.encode(Kind.admissionQueueFull, forKey: .kind)
+        case .admissionQueueTimedOut: try c.encode(Kind.admissionQueueTimedOut, forKey: .kind)
+        case .noEligibleCandidates(let failures):
+            try c.encode(Kind.noEligibleCandidates, forKey: .kind); try c.encode(failures, forKey: .failures)
+        case .allCandidatesFailed(let failures):
+            try c.encode(Kind.allCandidatesFailed, forKey: .kind); try c.encode(failures, forKey: .failures)
+        }
+    }
+
+    public var isTerminalProfileFailure: Bool {
+        switch self {
+        case .notDialOwner, .unsupportedEnrollmentClass, .invalidProfile, .accountKeyMismatch,
+             .protocolViolation, .storeCorrupt, .storeUnavailable, .storeMigrationFailed,
+             .reservationFailed, .persistenceFailed, .cancelled, .suspended:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+public enum FedAuthenticationKind: String, Codable, Sendable, Equatable {
+    case relay
+    case noise
+}
+
+public enum FedCarrierKind: String, Codable, Sendable, Equatable {
+    case tcp
+    case webSocket
+}
+
+public enum FedCandidateAttemptResult<Value: Sendable>: Sendable {
+    case ready(Value)
+    case candidateFailure(CandidateFailureReason)
+    case terminal(FedFailure)
+}
+
+public enum FedDeadlineError: Error, Sendable, Equatable {
+    case timedOut(FedCandidateStage)
+}
+
+public enum FedCarrierError: Error, Sendable, Equatable {
+    case emptyRecord
+    case recordTooLarge(declared: UInt32, maximum: UInt32)
+    case incompleteRecord(expected: Int, actual: Int)
+    case webSocketText
+    case webSocketMessageEmpty
+    case webSocketRecordMismatch(declared: UInt32, actualPayload: Int)
+    case webSocketRecordSplit
+    case webSocketMultipleRecords
+    case carrierClosed
+    case relayNotReady
+    case invalidRelayChallenge
+    case invalidRelayProof
+    case relayReadyMissing
+    case timeout(FedCandidateStage)
+}
+
+/// Returns whether a failure can advance to another candidate in the same dial.
+public func fedFailurePermitsCandidateFallback(_ reason: CandidateFailureReason) -> Bool {
+    reason.permitsCandidateFallback
+}
+
+/// Only transport failures enter automatic reconnect/backoff. Authentication,
+/// responder-key pinning, and malformed or invalid input failures are suppressed
+/// until credentials, configuration, or protocol input changes.
+public func fedFailurePermitsAutomaticReconnect(_ reason: CandidateFailureReason) -> Bool {
+    reason.permitsAutomaticReconnect
+}

@@ -1,5 +1,27 @@
 import Foundation
 
+/// Whether a control-class error was emitted before local dispatch began.
+/// Provenance decides not_sent versus non-settling for fed_target_unavailable
+/// and fed_internal.
+public enum FedDispatchProvenance: String, Sendable, Equatable {
+    /// Refusal occurred before any admitted-row or dispatch (proof of non-execution).
+    case provablyBeforeDispatch
+    /// Dispatch may have started; outcome cannot be treated as not_sent.
+    case afterDispatchOrUnknown
+    /// Error body originated from the remote module (recorded outcome).
+    case moduleOriginated
+}
+
+/// Capability returned after a durable intent commit. The holder may perform the
+/// first network write; the ordered mutating lane stays claimed until settle.
+public struct FedMutationSendCapability: Sendable, Equatable {
+    public let effect: FedEffectID
+
+    public init(effect: FedEffectID) {
+        self.effect = effect
+    }
+}
+
 /// Origin-side effects-v1 send-log and recovery. Mutations reserve a sequence,
 /// commit intent before the first network write, commit terminal disposition
 /// before surfacing, and reconcile without blind replay after loss.
@@ -17,8 +39,8 @@ public actor FedOriginEffectLog {
         }
     }
 
-    /// Codes that prove non-execution and settle as not_sent.
-    public static let notSentCodes: Set<String> = [
+    /// Codes that always prove non-execution and settle as not_sent.
+    public static let alwaysNotSentCodes: Set<String> = [
         "fed_not_exposed",
         "fed_unknown_module",
         "fed_bad_call",
@@ -27,24 +49,46 @@ public actor FedOriginEffectLog {
         "fed_duplicate_effect",
     ]
 
+    /// Codes that settle as not_sent only when provenance is provably-before-dispatch.
+    public static let conditionalNotSentCodes: Set<String> = [
+        "fed_target_unavailable",
+        "fed_internal",
+    ]
+
     /// Codes that settle as ambiguous without retry.
     public static let ambiguousCodes: Set<String> = [
         "fed_seq_fenced",
         "fed_outcome_expired",
     ]
 
-    /// Non-settling advisories that leave the row unknown for reconciliation.
+    /// Exhaustive non-settling advisory list from fed-wire §8.8.
     public static let nonSettlingCodes: Set<String> = [
         "fed_deadline",
         "fed_cancelled",
         "fed_shutdown",
         "fed_dispatch_ambiguous",
-        "fed_partition",
     ]
+
+    /// Closed set of known fed_ control codes. Anything else prefixed fed_ is
+    /// treated as an unknown protocol control code (non-settling).
+    public static let knownFedControlCodes: Set<String> =
+        alwaysNotSentCodes
+        .union(conditionalNotSentCodes)
+        .union(ambiguousCodes)
+        .union(nonSettlingCodes)
+        .union([
+            "fed_body_too_large",
+            "fed_deadline",
+            "fed_effects_unsupported",
+            "fed_feature_downgrade",
+        ])
 
     private let store: any FedStateStore
     private let responderStaticPublicKey: Data
-    /// Tracks the single ordered mutating lane: highest unsettled mutating seq.
+    /// Single ordered mutating lane claim. Set synchronously before any await
+    /// that could re-enter the actor, and held until durable settle or loss.
+    private var laneClaimed = false
+    private var laneWaiters: [CheckedContinuation<Void, Error>] = []
     private var openMutatingSequences: Set<UInt64> = []
     private var cancelled = false
 
@@ -74,40 +118,69 @@ public actor FedOriginEffectLog {
         return isMutation ? .mutation() : .pureQuery
     }
 
-    /// Reserves a sequence and commits the intent row. Pure queries skip the
-    /// durable send-log entirely.
+    /// Atomically claims the ordered mutating lane, reserves a sequence, and
+    /// commits the intent row before returning a send capability. Concurrent
+    /// callers wait on the lane rather than check-then-act across awaits.
+    public func claimMutationAndCommitIntent(
+        peerIncarnation: String?,
+        peerLedgerEpoch: String?
+    ) async throws -> FedMutationSendCapability {
+        try await acquireLane()
+        do {
+            if cancelled {
+                releaseLane()
+                throw FedFailure.cancelled
+            }
+            let unsettled = try await store.unsettledEffects(
+                forResponderPublicKey: responderStaticPublicKey
+            )
+            if !unsettled.isEmpty {
+                releaseLane()
+                throw FedFailure.indeterminateMutation
+            }
+
+            let reservation = try await store.reserveEffectSequence()
+            let snapshot = try await store.snapshot()
+            let effect = FedEffectID(
+                incarnation: snapshot.global.localIncarnation,
+                seq: reservation.value
+            )
+            let record = FedUnresolvedEffectRecord(
+                effect: effect,
+                responderStaticPublicKey: responderStaticPublicKey,
+                phase: .intent,
+                disposition: .unknown,
+                peerLedgerEpoch: peerLedgerEpoch,
+                peerIncarnation: peerIncarnation
+            )
+            do {
+                try await store.commitIntent(record)
+            } catch {
+                releaseLane()
+                throw FedFailure.reservationFailed
+            }
+            openMutatingSequences.insert(effect.seq)
+            return FedMutationSendCapability(effect: effect)
+        } catch {
+            if laneClaimed && openMutatingSequences.isEmpty {
+                releaseLane()
+            }
+            throw error
+        }
+    }
+
+    /// Compatibility wrapper around claimMutationAndCommitIntent.
     public func beginMutation(
         peerIncarnation: String?,
         peerLedgerEpoch: String?
     ) async throws -> FedEffectID {
-        if cancelled { throw FedFailure.cancelled }
-        // Ordered mutating lane: wait is the caller's responsibility; we refuse
-        // if an earlier seq toward this peer is still open on the wire.
-        // During rekey drain, new mutations wait until open set drains.
-        let reservation = try await store.reserveEffectSequence()
-        let snapshot = try await store.snapshot()
-        let effect = FedEffectID(
-            incarnation: snapshot.global.localIncarnation,
-            seq: reservation.value
-        )
-        let record = FedUnresolvedEffectRecord(
-            effect: effect,
-            responderStaticPublicKey: responderStaticPublicKey,
-            phase: .intent,
-            disposition: .unknown,
-            peerLedgerEpoch: peerLedgerEpoch,
-            peerIncarnation: peerIncarnation
-        )
-        do {
-            try await store.commitIntent(record)
-        } catch {
-            throw FedFailure.reservationFailed
-        }
-        openMutatingSequences.insert(effect.seq)
-        return effect
+        try await claimMutationAndCommitIntent(
+            peerIncarnation: peerIncarnation,
+            peerLedgerEpoch: peerLedgerEpoch
+        ).effect
     }
 
-    /// Pure-query correlation id. Never touches the durable send-log.
+    /// Pure-query correlation id. Never touches the durable send-log or lane.
     public func mintPureCorrelation() async throws -> FedEffectID {
         if cancelled { throw FedFailure.cancelled }
         let reservation = try await store.reserveEffectSequence()
@@ -143,36 +216,62 @@ public actor FedOriginEffectLog {
             terminalCode: code
         )
         openMutatingSequences.remove(effect.seq)
+        if openMutatingSequences.isEmpty {
+            releaseLane()
+        }
     }
 
     /// Classifies a terminal call_frame for a ledgered mutation.
+    ///
+    /// - Parameters:
+    ///   - provenance: Required for control codes whose settlement depends on
+    ///     whether dispatch had begun. Module errors use `.moduleOriginated`.
     public nonisolated static func classifyTerminalFrame(
         kind: String,
         body: Data,
         bodyOmitted: Bool,
-        errorCode: String?
+        errorCode: String?,
+        provenance: FedDispatchProvenance = .afterDispatchOrUnknown
     ) -> (disposition: FedEffectDisposition?, settle: Bool) {
         if bodyOmitted {
-            // Non-settling: body must be recovered via effect_status.
             return (nil, false)
         }
         if kind == "response" {
             return (.recorded, true)
         }
-        if kind == "error", let code = errorCode {
-            if Self.nonSettlingCodes.contains(code) {
-                return (nil, false)
-            }
-            if Self.notSentCodes.contains(code) {
+        guard kind == "error", let code = errorCode else {
+            return (nil, false)
+        }
+
+        if Self.nonSettlingCodes.contains(code) {
+            return (nil, false)
+        }
+        if Self.alwaysNotSentCodes.contains(code) {
+            return (.notSent, true)
+        }
+        if Self.conditionalNotSentCodes.contains(code) {
+            if provenance == .provablyBeforeDispatch {
                 return (.notSent, true)
             }
-            if Self.ambiguousCodes.contains(code) {
-                return (.ambiguous, true)
-            }
-            // Module-originated errors are recorded outcomes.
+            // After dispatch (or unknown): leave unsettled for reconciliation.
+            return (nil, false)
+        }
+        if Self.ambiguousCodes.contains(code) {
+            return (.ambiguous, true)
+        }
+        if code == "fed_body_too_large" {
+            // Oversized-body rejection is a recorded serving-side outcome, not
+            // an ambiguous transport failure.
             return (.recorded, true)
         }
-        // Progress frames are non-terminal.
+        if code.hasPrefix("fed_") {
+            // Unknown fed_-reserved control code: never fabricate a recorded outcome.
+            return (nil, false)
+        }
+        // Non-fed error codes are module-originated and recorded.
+        if provenance == .moduleOriginated || !code.hasPrefix("fed_") {
+            return (.recorded, true)
+        }
         return (nil, false)
     }
 
@@ -183,13 +282,15 @@ public actor FedOriginEffectLog {
         kind: String,
         body: Data,
         bodyOmitted: Bool,
-        errorCode: String?
+        errorCode: String?,
+        provenance: FedDispatchProvenance = .afterDispatchOrUnknown
     ) async throws -> (disposition: FedEffectDisposition, body: Data)? {
         let classification = Self.classifyTerminalFrame(
             kind: kind,
             body: body,
             bodyOmitted: bodyOmitted,
-            errorCode: errorCode
+            errorCode: errorCode,
+            provenance: provenance
         )
         guard classification.settle, let disposition = classification.disposition else {
             return nil
@@ -206,19 +307,21 @@ public actor FedOriginEffectLog {
 
     /// Session loss for a ledgered mutation: fail the caller-facing wait, but
     /// leave the durable row unknown for reconciliation. Never blind-replays.
+    /// Releases the ordered lane so recovery can admit status queries and later
+    /// mutations after reconciliation completes.
     public func noteIndeterminateLoss(_ effect: FedEffectID) {
-        // Intent/sent rows remain unsettled by design. Only remove from the
-        // open wire-lane set so recovery can proceed.
         openMutatingSequences.remove(effect.seq)
+        if openMutatingSequences.isEmpty {
+            releaseLane()
+        }
     }
 
     /// Pure query loss: no durable row; caller receives disconnected/indeterminate.
     public func notePureQueryLoss(_ effect: FedEffectID) {
-        // No durable state for pure queries.
         _ = effect
     }
 
-    public var hasOpenMutatingLane: Bool { !openMutatingSequences.isEmpty }
+    public var hasOpenMutatingLane: Bool { laneClaimed || !openMutatingSequences.isEmpty }
 
     public func lowestOpenMutatingSequence() -> UInt64? {
         openMutatingSequences.min()
@@ -226,7 +329,7 @@ public actor FedOriginEffectLog {
 
     /// Whether a new mutation may enter the network toward this peer.
     public func canAdmitNewMutation() -> Bool {
-        openMutatingSequences.isEmpty
+        !laneClaimed && openMutatingSequences.isEmpty
     }
 
     /// Confirmed watermark that is already durably committed, if any.
@@ -261,7 +364,6 @@ public actor FedOriginEffectLog {
             .first(where: { $0.effect == effect })?
             .peerLedgerEpoch
 
-        // Epoch mismatch → ambiguous for every status value.
         if resultLedgerEpoch != liveHelloEpoch {
             try await commitTerminal(effect, disposition: .ambiguous)
             return .ambiguous
@@ -325,10 +427,40 @@ public actor FedOriginEffectLog {
     public func shutdown() {
         cancelled = true
         openMutatingSequences.removeAll()
+        releaseLane()
+        let waiters = laneWaiters
+        laneWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(throwing: FedFailure.cancelled)
+        }
     }
 
     public func resetForReconnect() {
         cancelled = false
+    }
+
+    // MARK: - Ordered lane
+
+    /// Claims the lane with no await between the free-check and the claim bit.
+    /// Contended callers suspend on a waiter list and retry the claim after wake.
+    private func acquireLane() async throws {
+        while true {
+            if cancelled { throw FedFailure.cancelled }
+            if !laneClaimed {
+                laneClaimed = true
+                return
+            }
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                laneWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func releaseLane() {
+        laneClaimed = false
+        guard !laneWaiters.isEmpty else { return }
+        let next = laneWaiters.removeFirst()
+        next.resume()
     }
 }
 

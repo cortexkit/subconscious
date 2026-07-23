@@ -2,16 +2,31 @@ import Foundation
 
 /// Default durable store: one identity-bound document under Application Support,
 /// committed via temp-write + fsync + atomic rename + directory sync.
+///
+/// Every mutation holds an exclusive advisory lock for the full
+/// load → validate → temp-write → rename → directory-sync window so concurrent
+/// store instances cannot both reserve the same sequence.
 public actor FedAtomicFileStateStore: FedStateStore {
     public static let documentFileName = "fed-state.json"
+    public static let lockFileName = "fed-state.lock"
     public static let schemaVersion = FedStateDocument.currentSchemaVersion
+
+    /// Test hook: invoked under the exclusive lock at named commit boundaries.
+    public enum CommitBarrier: String, Sendable {
+        case afterTempWrite
+        case afterTempFsync
+        case afterRename
+        case beforeDirSync
+    }
 
     private let directoryURL: URL
     private let documentURL: URL
+    private let lockURL: URL
     private var document: FedStateDocument?
     private var localPublicKey: Data?
     private let fileManager: FileManager
-    private let lock = NSLock()
+    /// Optional barrier for kill-window tests. Throws abort the commit as failed.
+    private var commitBarrier: (@Sendable (CommitBarrier) throws -> Void)?
 
     /// Derives the store directory from an Application Support base URL and a
     /// stable identity namespace dedicated to one local X25519 public key.
@@ -23,6 +38,7 @@ public actor FedAtomicFileStateStore: FedStateStore {
             .appendingPathComponent(trimmed, isDirectory: true)
         self.directoryURL = directory
         self.documentURL = directory.appendingPathComponent(Self.documentFileName)
+        self.lockURL = directory.appendingPathComponent(Self.lockFileName)
         self.fileManager = .default
     }
 
@@ -30,39 +46,47 @@ public actor FedAtomicFileStateStore: FedStateStore {
     public init(directoryURL: URL) {
         self.directoryURL = directoryURL
         self.documentURL = directoryURL.appendingPathComponent(Self.documentFileName)
+        self.lockURL = directoryURL.appendingPathComponent(Self.lockFileName)
         self.fileManager = .default
+    }
+
+    /// Installs a commit-boundary hook used by kill-window tests.
+    public func setCommitBarrier(_ barrier: (@Sendable (CommitBarrier) throws -> Void)?) {
+        commitBarrier = barrier
     }
 
     public func open(localPublicKey: Data) async throws -> FedStateDocument {
         self.localPublicKey = localPublicKey
-        try ensureDirectory()
-        removeStaleTemporaryFiles()
+        return try withExclusiveLock {
+            try ensureDirectory()
+            removeStaleTemporaryFiles()
 
-        if fileManager.fileExists(atPath: documentURL.path) {
-            let loaded = try loadCommittedDocument()
-            let digest = FedStateDocument.identityDigest(forPublicKey: localPublicKey)
-            guard loaded.localIdentityDigest == digest else {
-                throw FedFailure.storeCorrupt
+            if fileManager.fileExists(atPath: documentURL.path) {
+                let loaded = try loadCommittedDocument()
+                let digest = FedStateDocument.identityDigest(forPublicKey: localPublicKey)
+                guard loaded.localIdentityDigest == digest else {
+                    throw FedFailure.storeCorrupt
+                }
+                var migrated = try migrateIfNeeded(loaded, localPublicKey: localPublicKey)
+                if migrated.localPublicKey == nil {
+                    migrated.localPublicKey = localPublicKey
+                    migrated.revision += 1
+                    try commitDocumentUnlocked(migrated)
+                }
+                document = migrated
+                return migrated
             }
-            var migrated = try migrateIfNeeded(loaded, localPublicKey: localPublicKey)
-            if migrated.localPublicKey == nil {
-                migrated.localPublicKey = localPublicKey
-                migrated.revision += 1
-                try commitDocument(migrated)
-            }
-            document = migrated
-            return migrated
+
+            let created = FedStateDocument(
+                localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localPublicKey),
+                localPublicKey: localPublicKey,
+                revision: 1,
+                global: .mintFresh()
+            )
+            try commitDocumentUnlocked(created)
+            document = created
+            return created
         }
-
-        let created = FedStateDocument(
-            localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localPublicKey),
-            localPublicKey: localPublicKey,
-            revision: 1,
-            global: .mintFresh()
-        )
-        try commitDocument(created)
-        document = created
-        return created
     }
 
     public func reserveCatalogGeneration() async throws -> FedReservation {
@@ -230,8 +254,15 @@ public actor FedAtomicFileStateStore: FedStateStore {
     }
 
     public func snapshot() async throws -> FedStateDocument {
-        guard let document else { throw FedFailure.storeUnavailable }
-        return document
+        try withExclusiveLock {
+            if fileManager.fileExists(atPath: documentURL.path) {
+                let onDisk = try loadCommittedDocument()
+                document = onDisk
+                return onDisk
+            }
+            guard let document else { throw FedFailure.storeUnavailable }
+            return document
+        }
     }
 
     public func destination(forResponderPublicKey publicKey: Data) async throws -> FedDestinationState? {
@@ -246,28 +277,47 @@ public actor FedAtomicFileStateStore: FedStateStore {
         return destination.unresolvedEffects.filter { !$0.isSettled }
     }
 
-    // MARK: - Commit path
+    // MARK: - Exclusive lock + commit path
 
-    private func mutate(_ body: (inout FedStateDocument) throws -> UInt64) throws -> FedReservation {
-        guard var doc = document else { throw FedFailure.storeUnavailable }
-        let expectedRevision = doc.revision
-        // Compare-and-swap: reload if another writer advanced the committed revision.
-        if fileManager.fileExists(atPath: documentURL.path) {
-            let onDisk = try loadCommittedDocument()
-            if onDisk.revision != expectedRevision {
-                // Stale writer: adopt latest state and fail without emission.
-                document = onDisk
-                throw FedFailure.reservationFailed
-            }
+    /// Holds an exclusive advisory lock across load → mutate → durable commit so
+    /// two store instances cannot both mint the same reserved sequence.
+    private func withExclusiveLock<T>(_ body: () throws -> T) throws -> T {
+        try ensureDirectory()
+        if !fileManager.fileExists(atPath: lockURL.path) {
+            fileManager.createFile(atPath: lockURL.path, contents: Data(), attributes: [
+                .posixPermissions: 0o600,
+            ])
         }
-        let value = try body(&doc)
-        doc.revision += 1
-        try commitDocument(doc)
-        document = doc
-        return FedReservation(value: value, revision: doc.revision)
+        let fd = Darwin.open(lockURL.path, O_RDWR)
+        guard fd >= 0 else { throw FedFailure.storeUnavailable }
+        defer { Darwin.close(fd) }
+        if flock(fd, LOCK_EX) != 0 {
+            throw FedFailure.storeUnavailable
+        }
+        defer { _ = flock(fd, LOCK_UN) }
+        return try body()
     }
 
-    private func commitDocument(_ document: FedStateDocument) throws {
+    private func mutate(_ body: (inout FedStateDocument) throws -> UInt64) throws -> FedReservation {
+        try withExclusiveLock {
+            // Authoritative state is always the on-disk document under the lock.
+            var doc: FedStateDocument
+            if fileManager.fileExists(atPath: documentURL.path) {
+                doc = try loadCommittedDocument()
+            } else if let memory = document {
+                doc = memory
+            } else {
+                throw FedFailure.storeUnavailable
+            }
+            let value = try body(&doc)
+            doc.revision += 1
+            try commitDocumentUnlocked(doc)
+            document = doc
+            return FedReservation(value: value, revision: doc.revision)
+        }
+    }
+
+    private func commitDocumentUnlocked(_ document: FedStateDocument) throws {
         try ensureDirectory()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -281,17 +331,19 @@ public actor FedAtomicFileStateStore: FedStateStore {
         let tempName = "fed-state.\(UUID().uuidString).tmp"
         let tempURL = directoryURL.appendingPathComponent(tempName)
         do {
-            // Write the temp file in place (no nested atomic rename). The
-            // durable commit is the explicit fsync + rename sequence below.
             try data.write(to: tempURL, options: [])
             try applyOwnerOnlyPermissions(at: tempURL, directory: false)
+            try commitBarrier?(.afterTempWrite)
             try fsyncFile(at: tempURL)
+            try commitBarrier?(.afterTempFsync)
             if fileManager.fileExists(atPath: documentURL.path) {
                 _ = try fileManager.replaceItemAt(documentURL, withItemAt: tempURL)
             } else {
                 try fileManager.moveItem(at: tempURL, to: documentURL)
             }
+            try commitBarrier?(.afterRename)
             try fsyncFile(at: documentURL)
+            try commitBarrier?(.beforeDirSync)
             try fsyncDirectory(at: directoryURL)
         } catch let failure as FedFailure {
             try? fileManager.removeItem(at: tempURL)
@@ -326,14 +378,12 @@ public actor FedAtomicFileStateStore: FedStateStore {
         if document.schemaVersion > Self.schemaVersion {
             throw FedFailure.storeMigrationFailed
         }
-        // v1 is the first schema; older unsupported versions fail closed.
         throw FedFailure.storeMigrationFailed
     }
 
     private func ensureDirectory() throws {
         do {
             try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-            // Directories need the execute bit so the process can enter them.
             try applyOwnerOnlyPermissions(at: directoryURL, directory: true)
         } catch {
             throw FedFailure.storeUnavailable
@@ -378,7 +428,11 @@ public actor FedAtomicFileStateStore: FedStateStore {
         guard fd >= 0 else { throw FedFailure.persistenceFailed }
         defer { Darwin.close(fd) }
         if fcntl(fd, F_FULLFSYNC) == -1 {
-            _ = Darwin.fsync(fd)
+            // Directory-entry durability is part of the commit contract. A failed
+            // fallback fsync must not report success.
+            if Darwin.fsync(fd) == -1 {
+                throw FedFailure.persistenceFailed
+            }
         }
     }
 

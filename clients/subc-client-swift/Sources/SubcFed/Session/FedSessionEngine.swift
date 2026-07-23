@@ -14,6 +14,10 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
     private var waiters: [CheckedContinuation<Data, Error>] = []
     private var closed = false
     public private(set) var sent: [Data] = []
+    /// When true, send throws before recording bytes (commitIntent-fault tests).
+    public var failNextSend = false
+    /// When true, send records bytes then throws (markSent-failure tests).
+    public var failAfterSend = false
 
     public init() {}
 
@@ -26,9 +30,20 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
         }
     }
 
+    public func setFailNextSend(_ value: Bool) { failNextSend = value }
+    public func setFailAfterSend(_ value: Bool) { failAfterSend = value }
+
     public func send(_ bytes: Data) async throws {
         if closed { throw FedFailure.disconnected }
+        if failNextSend {
+            failNextSend = false
+            throw FedFailure.disconnected
+        }
         sent.append(bytes)
+        if failAfterSend {
+            failAfterSend = false
+            throw FedFailure.disconnected
+        }
     }
 
     public func receive() async throws -> Data {
@@ -66,6 +81,10 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
         }
         return frames
     }
+
+    public func clearSent() {
+        sent.removeAll()
+    }
 }
 
 /// Established-session state machine: hello-first negotiation, empty local
@@ -81,6 +100,10 @@ public actor FedSessionEngine {
         public var helloPolicy: FedHelloPolicy
         public var connectionAttemptID: String
         public var sessionID: String
+        /// Peer-scoped admission budget shared across primary/draining/replacement.
+        public var sharedAdmission: FedAdmissionController?
+        /// Peer-scoped origin effect log shared across sessions for one responder.
+        public var sharedEffectLog: FedOriginEffectLog?
 
         public init(
             transport: any FedSessionByteTransport,
@@ -90,7 +113,9 @@ public actor FedSessionEngine {
             responderStaticPublicKey: Data,
             helloPolicy: FedHelloPolicy,
             connectionAttemptID: String,
-            sessionID: String = UUID().uuidString.lowercased()
+            sessionID: String = UUID().uuidString.lowercased(),
+            sharedAdmission: FedAdmissionController? = nil,
+            sharedEffectLog: FedOriginEffectLog? = nil
         ) {
             self.transport = transport
             self.store = store
@@ -100,6 +125,8 @@ public actor FedSessionEngine {
             self.helloPolicy = helloPolicy
             self.connectionAttemptID = connectionAttemptID
             self.sessionID = sessionID
+            self.sharedAdmission = sharedAdmission
+            self.sharedEffectLog = sharedEffectLog
         }
     }
 
@@ -122,6 +149,7 @@ public actor FedSessionEngine {
     private var drain: FedRekeyDrainPolicy?
     private var admission: FedAdmissionController?
     private var effectLog: FedOriginEffectLog?
+    private var ownsAdmission = false
     private var localCatalogSent = false
     private var remoteCatalogReceived = false
     private var cancelledActivities = false
@@ -142,6 +170,8 @@ public actor FedSessionEngine {
     public var remoteCatalog: FedRemoteCatalog? { catalogTracker.applied }
     public var isCancelled: Bool { cancelledActivities }
     public var sessionRole: FedSessionRole { role }
+    public var admissionController: FedAdmissionController? { admission }
+    public var originEffectLog: FedOriginEffectLog? { effectLog }
 
     /// Runs hello exchange and initial catalog exchange until ready or failure.
     public func establish() async throws {
@@ -160,7 +190,6 @@ public actor FedSessionEngine {
         try await sendFrame(localHello, negotiationComplete: false)
         helloGate.noteLocalHelloSent()
 
-        // Receive remote hello (must be first).
         let remoteHello = try await receiveOneFrame()
         try helloGate.acceptRemote(
             frame: remoteHello,
@@ -182,20 +211,34 @@ public actor FedSessionEngine {
             peerLedgerEpoch: negotiated.peerLedgerEpoch
         )
 
-        admission = FedAdmissionController(
-            responderStaticPublicKey: deps.responderStaticPublicKey,
-            configuration: .init(
-                policy: try FedAdmissionPolicySnapshot(
-                    defaultDeadlineMs: FedAdmissionPolicySnapshot.defaultDeadlineMs
+        if let shared = deps.sharedAdmission {
+            admission = shared
+            ownsAdmission = false
+            await shared.updatePeerMaxInFlight(Int(negotiated.peerMaxInFlight))
+            await shared.resetForReconnect()
+        } else {
+            admission = FedAdmissionController(
+                responderStaticPublicKey: deps.responderStaticPublicKey,
+                configuration: .init(
+                    policy: try FedAdmissionPolicySnapshot(
+                        defaultDeadlineMs: FedAdmissionPolicySnapshot.defaultDeadlineMs
+                    ),
+                    peerMaxInFlight: Int(negotiated.peerMaxInFlight)
                 ),
-                peerMaxInFlight: Int(negotiated.peerMaxInFlight)
-            ),
-            clock: deps.clock
-        )
-        effectLog = FedOriginEffectLog(
-            store: deps.store,
-            responderStaticPublicKey: deps.responderStaticPublicKey
-        )
+                clock: deps.clock
+            )
+            ownsAdmission = true
+        }
+
+        if let sharedLog = deps.sharedEffectLog {
+            effectLog = sharedLog
+            await sharedLog.resetForReconnect()
+        } else {
+            effectLog = FedOriginEffectLog(
+                store: deps.store,
+                responderStaticPublicKey: deps.responderStaticPublicKey
+            )
+        }
 
         phase = .exchangingCatalog
         let generation = try await deps.store.reserveCatalogGeneration()
@@ -233,8 +276,8 @@ public actor FedSessionEngine {
         return operation
     }
 
-    /// Admits a management call under the peer-scoped budget. Mutations commit
-    /// intent before the first network write.
+    /// Admits a management call under the peer-scoped budget. Mutations claim the
+    /// ordered lane and commit intent before the first network write.
     public func admitManagementCall(
         moduleID: String,
         method: String,
@@ -242,9 +285,6 @@ public actor FedSessionEngine {
         policy: FedAdmissionPolicySnapshot
     ) async throws -> (effect: FedEffectID, permit: FedAdmissionPermit, isMutation: Bool) {
         guard phase == .ready, role == .primary else {
-            if phase == .draining {
-                throw FedFailure.disconnected
-            }
             throw FedFailure.disconnected
         }
         guard let negotiation, let admission, let effectLog else {
@@ -260,28 +300,27 @@ public actor FedSessionEngine {
             throw refusal
         }
 
-        // Refuse new mutations while any prior effect for this peer is still
-        // unsettled or the ordered mutating lane is open.
-        if classification.isMutation {
-            let unsettled = try await effectLog.unsettled()
-            let canAdmit = await effectLog.canAdmitNewMutation()
-            if !unsettled.isEmpty || !canAdmit {
-                throw FedFailure.indeterminateMutation
-            }
-        }
-
-        let permit = try await admission.acquire(policy: policy)
+        let permit = try await admission.acquire(
+            policy: policy,
+            isLedgered: classification.isMutation
+        )
+        var intentCommitted = false
+        var effectID: FedEffectID?
         do {
             let effect: FedEffectID
             if classification.isMutation {
-                effect = try await effectLog.beginMutation(
+                // Lane claim + intent commit are one atomic API on the effect log.
+                let capability = try await effectLog.claimMutationAndCommitIntent(
                     peerIncarnation: negotiation.peerIncarnation,
                     peerLedgerEpoch: negotiation.peerLedgerEpoch
                 )
+                effect = capability.effect
+                intentCommitted = true
             } else {
                 effect = try await effectLog.mintPureCorrelation()
                 openPureQuerySequences.insert(effect.seq)
             }
+            effectID = effect
 
             var fields: [String: FedJSONValue] = [
                 "effect": .object(effect.asJSONObject),
@@ -301,12 +340,29 @@ public actor FedSessionEngine {
             // Intent is already durable for mutations; first network write next.
             try await sendFrame(frame)
             if classification.isMutation {
-                try await effectLog.markSent(effect)
+                do {
+                    try await effectLog.markSent(effect)
+                } catch {
+                    // Transport succeeded; row stays reconcilable, permit retained.
+                    await admission.retainLedgeredForRecovery(permit)
+                    admittedEffectSequences.insert(effect.seq)
+                    throw error
+                }
                 admittedEffectSequences.insert(effect.seq)
             }
             return (effect, permit, classification.isMutation)
         } catch {
-            await admission.release(permit)
+            if classification.isMutation {
+                if intentCommitted, let effect = effectID {
+                    // Leave durable row for reconciliation; retain permit.
+                    await effectLog.noteIndeterminateLoss(effect)
+                    await admission.retainLedgeredForRecovery(permit)
+                } else {
+                    await admission.release(permit)
+                }
+            } else {
+                await admission.release(permit)
+            }
             throw error
         }
     }
@@ -322,30 +378,33 @@ public actor FedSessionEngine {
         bodyOmitted: Bool,
         errorCode: String?,
         isMutation: Bool,
-        permit: FedAdmissionPermit
+        permit: FedAdmissionPermit,
+        provenance: FedDispatchProvenance = .afterDispatchOrUnknown
     ) async throws -> Data {
-        defer {
-            Task { await self.releasePermit(permit) }
-        }
         if isMutation, let effectLog {
             if let applied = try await effectLog.applyTerminalFrame(
                 effect: effect,
                 kind: kind,
                 body: body,
                 bodyOmitted: bodyOmitted,
-                errorCode: errorCode
+                errorCode: errorCode,
+                provenance: provenance
             ) {
                 admittedEffectSequences.remove(effect.seq)
                 if var activeDrain = drain {
                     activeDrain.noteEffectSettled(effect.seq)
                     drain = activeDrain
                 }
+                // Durable settle releases the ledgered permit.
+                await admission?.release(permit)
                 return applied.body
             }
-            // Non-settling advisory: leave durable row unknown.
+            // Non-settling advisory: retain ledgered permit for recovery.
+            await admission?.retainLedgeredForRecovery(permit)
             throw FedFailure.indeterminateMutation
         }
         openPureQuerySequences.remove(effect.seq)
+        await admission?.release(permit)
         if kind == "error" {
             throw FedFailure.disconnected
         }
@@ -357,13 +416,11 @@ public actor FedSessionEngine {
         let now = now ?? deps.clock.nowNanoseconds()
         role = .draining
         phase = .draining
-        // Pure queries on the old session terminate immediately.
         openPureQuerySequences.removeAll()
         drain = FedRekeyDrainPolicy(
             drainStartedAt: now,
             admittedEffectSequences: admittedEffectSequences
         )
-        // Primary-only admission stops; draining keeps effect settlement.
         await admission?.cancelAllQueued(with: .disconnected)
     }
 
@@ -399,9 +456,17 @@ public actor FedSessionEngine {
         timerTask?.cancel()
         receiveTask = nil
         timerTask = nil
-        await admission?.shutdown(with: reason)
-        await effectLog?.shutdown()
-        // Best-effort bye when possible.
+        // Peer-scoped admission: tear down session permits without dropping
+        // ledgered recovery ownership. Full shutdown only if we own the controller.
+        if ownsAdmission {
+            await admission?.shutdown(with: reason)
+        } else {
+            await admission?.teardownSession(with: reason)
+        }
+        // Effect log lane is peer-scoped; only shut down if we own it.
+        if deps.sharedEffectLog == nil {
+            await effectLog?.shutdown()
+        }
         if helloGate.isComplete {
             let bye = FedFrame(
                 type: FedFrameType.bye.rawValue,
@@ -416,8 +481,7 @@ public actor FedSessionEngine {
         await disconnect(reason: .suspended)
     }
 
-    /// Tick keepalive and staleness using the injected clock. Returns a frame
-    /// that should be sent, or a failure if the session must close.
+    /// Tick keepalive and staleness using the injected clock.
     public func pollTimers() async throws -> FedFrame? {
         guard !cancelledActivities, let keepalive, phase == .ready || phase == .draining else {
             return nil
@@ -491,7 +555,6 @@ public actor FedSessionEngine {
             _ = catalogTracker.apply(catalog)
         case .bye:
             if case .string(let code) = frame.header["code"], code == "fed_rekey_needed" {
-                // Caller observes and starts replacement; do not close yet.
                 return
             }
             await disconnect(reason: .protocolViolation(
@@ -501,7 +564,6 @@ public actor FedSessionEngine {
                 }()
             ))
         case .keepalive:
-            // Inbound keepalive only resets staleness (already noted).
             return
         default:
             return
@@ -589,7 +651,6 @@ public struct FedDialCyclePlanner: Sendable {
             let retained = suppression.retainedFailures(inProfileOrder: profileOrder)
             return .failure(.noEligibleCandidates(retained))
         }
-        // LAN-direct before relay is the caller's profile order responsibility.
         return .success(eligible)
     }
 
@@ -608,11 +669,6 @@ public struct FedDialCyclePlanner: Sendable {
     }
 
     public mutating func nextReconnectDelay(jitterUnit: Double) -> UInt64? {
-        let retained = suppression.allRecords
-        let hasPartition = retained.contains { $0.failure.reason.permitsAutomaticReconnect }
-        // Reconnect only when at least one retry-eligible partition exists among
-        // candidates that are not suppressed. Suppressed terminal failures stay out.
-        _ = hasPartition
         return backoff.nextDelayNanoseconds(jitterUnit: jitterUnit)
     }
 

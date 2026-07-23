@@ -157,7 +157,7 @@ final class FedStateStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path))
     }
 
-    func testConcurrentWriterConflictRejectsStaleCommit() async throws {
+    func testConcurrentWriterLockSerializesWithoutDuplicateSeq() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -166,20 +166,17 @@ final class FedStateStoreTests: XCTestCase {
         let writerB = FedAtomicFileStateStore(directoryURL: dir)
         _ = try await writerB.open(localPublicKey: localKey)
 
-        _ = try await writerA.reserveEffectSequence()
-        // B still holds the pre-A revision and must fail without reusing sequences.
-        do {
-            _ = try await writerB.reserveEffectSequence()
-            XCTFail("stale writer should fail")
-        } catch let error as FedFailure {
-            XCTAssertEqual(error, .reservationFailed)
-        }
+        // Exclusive lock reloads on-disk state per mutation, so both writers
+        // succeed serially with distinct sequences (never the same seq twice).
+        let a = try await writerA.reserveEffectSequence()
+        let b = try await writerB.reserveEffectSequence()
+        XCTAssertNotEqual(a.value, b.value)
+        XCTAssertEqual(Set([a.value, b.value]).count, 2)
 
-        // After reopening, B adopts the latest state and continues past A's reservation.
         let writerB2 = FedAtomicFileStateStore(directoryURL: dir)
         _ = try await writerB2.open(localPublicKey: localKey)
         let next = try await writerB2.reserveEffectSequence()
-        XCTAssertGreaterThanOrEqual(next.value, 2)
+        XCTAssertGreaterThan(next.value, max(a.value, b.value))
     }
 
     func testCatalogGenerationMonotonicAcrossRestart() async throws {

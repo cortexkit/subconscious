@@ -61,11 +61,13 @@ Adapted from paperclip's `AppDefinition`, trimmed to CortexKit vocabulary:
   "auth": {
     "mode": "oauth",                  // oauth | api_key | app_install | none
     "oauth": {
-      "provider": "linear",
-      "scopes": ["read", "write"],
-      "authorization_url": "https://linear.app/oauth/authorize",
-      "token_url": "https://api.linear.app/oauth/token",
-      "pkce": true
+      // Reference into CKCRED's reviewed OAuth-profile registry — the
+      // manifest NEVER carries endpoints, client credentials, or refresh
+      // quirks (a manifest-chosen token_url would be an SSRF +
+      // client-secret-exfiltration primitive; CKCRED ruling, §5).
+      "profile_id": "linear",
+      "profile_digest": "sha256:…",    // pinned at connect; drift = re-review
+      "requested_scopes": ["read", "write"]  // informational; profile is authoritative
     }
   },
   "credential_bindings": [            // shape of refs, never values
@@ -182,6 +184,22 @@ risk; osaurus's rule); idle client sweep with lease protection for in-flight
 calls (openclaw's lifecycle); vendor stderr/response payloads redacted before
 they can reach logs or agent-visible errors.
 
+**Write outcomes are tri-state** (the subc clients' NotSent-vs-OutcomeUnknown
+distinction, applied to vendors): every failure is classified as
+`not_sent` (failed before the request left plexus — gate denial, credential
+resolution failure, connect failure; safe to retry, and the only class
+plexus will auto-retry), `failed` (vendor returned a definitive error), or
+`outcome_unknown` (request sent, no definitive response — timeout, closed
+connection mid-call). `outcome_unknown` on a write is never retried by
+plexus: it is recorded in the audit journal with `outcome=unknown`, surfaced
+to the agent as explicitly unresolved, and resolved by *reconciliation* — a
+read-back where the action's catalog entry declares one (e.g. search for the
+just-created issue), or operator/agent judgment where it doesn't. Where a
+vendor supports idempotency keys, the transport attaches one per
+action-request id so a deliberate agent-level retry is vendor-deduplicated;
+the manifest records per-action idempotency support so the agent-visible
+error can say whether retry is safe.
+
 ## 5. Credential custody **[CONFIRMED:CKCRED — designed against the shipped contract]**
 
 CKCRED's shipped contract (source: `crates/credentials-module/src/read_surface.rs`,
@@ -222,12 +240,21 @@ Plexus consequences **[DECIDED]**:
    our grant/policy tables are the authorization plane. This was the plan
    anyway (complete mediation); the correction is that it is not
    defense-in-depth — it is the only layer.
-2. **Handles are themselves secrets.** A `ckh_` handle in the `connections`
-   table is a bearer capability: it gets the same handling discipline as
-   token material — encrypted at rest via the store's protections, never in
-   audit rows, errors, exports, or agent-visible payloads (connection rows
-   expose a handle *fingerprint* only), redacted like a credential
-   everywhere. "Refs are safe to log" is FALSE under this contract.
+2. **INVARIANT — handle-leak surface is the #1 security property.** The
+   vault will not stop a leaked handle (possession = authority), so a `ckh_`
+   handle gets the same handling discipline as token material. Raw handles
+   exist in exactly two places: the encrypted-at-rest `connections` column
+   and the in-memory resolution path during an invoke. **Every other surface
+   is fingerprint-only** (`sha256(handle)` prefix), enumerated:
+   audit-journal rows, error payloads and logs (including transport/vendor
+   errors, which are redacted before they can echo request headers),
+   `plexus.connections`/`plexus.catalog`/`plexus.requests` tool results and
+   every other agent-visible payload, the cerebellum `setup_descriptor`
+   (names a vault *destination*, never a live handle), exports/backups of
+   plexus state outside the store, health snapshots, and conformance-harness
+   fixtures. The conformance harness (§11) includes a negative test that
+   greps every one of these surfaces for the raw-handle pattern. "Refs are
+   safe to log" is FALSE under this contract.
 3. **Fail-closed mapping**: `permanent` ⇒ connection → `revoked`/`failed`
    (operator attention); `auth_required` ⇒ connection → `auth_required`
    (re-auth flow); `transient` ⇒ deny this call, bounded retry policy, no
@@ -246,14 +273,39 @@ Plexus consequences **[DECIDED]**:
 **New CKCRED seams (joint work, co-designed with CKCRED before any schema
 freeze encodes them) [PENDING:CKCRED-NEW]:**
 
-- **(a) Delegated deposit** — a vault-native way for a plexus setup flow to
-  land a new token as a record + handle without operator ceremony and without
-  granting plexus admin authority (deposit ticket or vault-driven connector
-  login). Required for self-service OAuth connect (§8A).
-- **(b) Connector refresh adapters** — vault-owned refresh for standard
-  RFC-6749 refresh-token vendors (Linear, Notion, Slack, GitHub apps), ideally
-  one generic adapter rather than per-vendor code. Required before OAuth
-  vendors get durable connections.
+- **(a) Vault-driven connect (delegated exchange)** — CKCRED's ruling, which
+  this note adopts: NOT a deposit of module-supplied token bytes (plexus
+  would still see refresh material and become a credential-injection
+  surface). Instead: an external authority mints a short-TTL single-use
+  CONNECT grant bound to {provider profile digest, connection id, credential
+  id, redirect class, account/org, nonce}; plexus presents it to CKCRED
+  `connect.begin` and receives only {flow_handle, authorization_url};
+  **state + PKCE verifier are generated and held vault-side** — plexus owns
+  only redirect carriage and returns {flow_handle, code, state} to
+  `connect.complete`; CKCRED exchanges the code itself, persists the tokens,
+  and mints a dedicated handle. Tokens and verifier never transit plexus;
+  the auth code does (short-lived, single-use, PKCE-bound), unavoidable
+  while plexus owns the redirect. Grant-minting authority (master-key
+  `ck auth` locally; account-service step-up attestation for org
+  self-service) is the open sub-seam, to be settled with SUBC/account trust
+  before wire freeze.
+- **(b) Generic RFC-6749 refresh engine over a CKCRED-owned profile
+  registry** — one generic engine, but NOT parameterized from plexus catalog
+  data. CKCRED owns a trusted immutable OAuth-profile registry (closed
+  schema, reviewed/signed entries, exact-allowlisted HTTPS origins,
+  vault-owned client-credential slots referenced by id); the AppManifest
+  references `{oauth_profile_id, profile_digest}` only, and a credential
+  record pins the profile digest used at connect so registry drift cannot
+  silently change refresh semantics. Common vendors become data-only profile
+  additions with captured-response conformance fixtures; a vendor outside
+  the closed schema gets a small reviewed adapter, never an escape hatch.
+
+Cross-seat ownership boundary (agreed with CKCRED, to be jointly spec'd and
+gated): plexus owns catalog/provider selection, redirect carriage,
+connection ACL, raw-handle custody; CKCRED owns the profile registry,
+PKCE/state, code exchange, client credentials, token records + refresh,
+handle mint; account/org authority owns who may create/replace a connector
+connection; subc owns carriage/principal provenance only.
 
 Until (a)+(b) land: OAuth vendors are operator-provisioned (`ck auth` puts
 the token, mints the handle, operator configures the connection with it) —
@@ -302,6 +354,20 @@ refresh finding a new or schema-changed write/destructive action stores it
 `invoke` until re-reviewed. Name similarity to a previously-active action
 grants nothing.
 
+**Catalog-refresh cadence [DECIDED]** — quarantine is only as good as
+catalog freshness, so refresh triggers are pinned: (1) at connect and at
+every health probe; (2) on vendor `listChanged` where the transport delivers
+one (MCP); (3) periodic TTL per connection, manifest-tunable, default 24h;
+(4) **staleness ceiling for writes**: if the connection's catalog is older
+than the write-staleness bound (default = the TTL), a write/destructive
+invoke triggers a synchronous refresh *before* gate 2 evaluates — a write is
+never authorized against a catalog older than the bound. Reads proceed on a
+stale catalog (worst case: a call that fails vendor-side), because the
+schema-hash pin still blocks approval replay onto drifted schemas either
+way. Refresh failure leaves the previous catalog in place, marks the
+connection `degraded`, and (past the write-staleness bound) blocks writes —
+stale-open for reads, fail-closed for writes.
+
 **Severity mapping** to `ck-action-severity`: risk class gives the base
 (read→S1, write→S2, destructive→S3), manifest tier acts as a floor
 (a "read" on an S4 provider like Stripe is still ≥S2; any write on an S4
@@ -340,12 +406,13 @@ end-state flow, gated on the CKCRED delegated-deposit seam (§5):
 2. User completes vendor consent in a browser.
 3. Callback validated (state match, expiry, redirect match, single-use — the
    threat-model's replay controls verbatim).
-4. Token exchange + deposit: the target is vault-side — plexus hands CKCRED
-   the auth code + verifier via the delegated-deposit seam; CKCRED performs
-   the exchange, stores the record, returns a fresh handle; raw tokens never
-   transit plexus **[PENDING:CKCRED-NEW seam (a), co-design before freeze]**.
-   No current vault op supports this (module deposit is refused by design),
-   so this step defines the seam rather than consumes it.
+4. Token exchange: vault-driven via seam (a) — plexus presents the CONNECT
+   grant to `connect.begin`, sends the user to the returned authorization
+   URL, and hands {flow_handle, code, state} to `connect.complete`; CKCRED
+   holds PKCE, exchanges the code, and returns only a dedicated handle
+   **[PENDING:CKCRED-NEW seam (a), joint spec before freeze]**. Plexus's
+   `oauth_flow` row therefore shrinks to {flow_handle, connection, principal,
+   expiry} — no state or verifier custody on our side.
 5. Connection flips to configurable; filters + grants; health + catalog
    discovery.
 
@@ -424,7 +491,8 @@ No connector is done until its checklist is green against the real vendor
 connect → discover catalog → allowed read → ask-first write (approve →
 executes; exact-shape only) → denied call (ungranted principal / disallowed
 resource / quarantined action) → revoke (immediate fail-closed) → audit rows
-prove every step.
+prove every step → raw-handle leak scan across every fingerprint-only
+surface (§5.2) comes up empty.
 
 The harness is substrate code (one runner, per-connector fixture), built
 *with* the substrate, not after: substrate acceptance = the harness passing

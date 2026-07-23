@@ -33,7 +33,7 @@ final class OuterRecordCodecTests: XCTestCase {
             XCTAssertEqual(error as? FedCarrierError, .webSocketMultipleRecords)
         }
         var mismatch = record
-        mismatch[0] = 3
+        mismatch[mismatch.startIndex] = 3
         XCTAssertThrowsError(try FedOuterRecordCodec.decodeWebSocketMessage(.binary(mismatch))) { error in
             XCTAssertEqual(error as? FedCarrierError, .webSocketRecordMismatch(declared: 3, actualPayload: 2))
         }

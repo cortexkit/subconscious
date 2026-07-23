@@ -82,7 +82,7 @@ struct FedBLAKE2s {
     private static func compress(_ h: inout [UInt32], block: Data, counter: UInt64, final: Bool) {
         var message = [UInt32](repeating: 0, count: 16)
         for index in 0..<16 {
-            let offset = index * 4
+            let offset = block.startIndex + index * 4
             message[index] = UInt32(block[offset])
                 | (UInt32(block[offset + 1]) << 8)
                 | (UInt32(block[offset + 2]) << 16)

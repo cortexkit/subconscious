@@ -204,7 +204,7 @@ public final class FedNoiseIKInitiator: @unchecked Sendable {
             throw FedNoiseError.handshakeState
         }
         guard message.count == 48 else { throw FedNoiseError.invalidMessage }
-        let responderEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: message.prefix(32))
+        let responderEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
         let responderEphemeralBytes = responderEphemeral.rawRepresentation
         symmetric.mixHash(responderEphemeralBytes)
         symmetric.mixKey(try dh(ephemeralKey.privateKey, responderEphemeralBytes))
@@ -277,13 +277,14 @@ public final class FedNoiseIKResponder: @unchecked Sendable {
 
     public func readMessage1(_ message: Data) throws -> Data {
         guard !handshakeComplete, message.count == 96 else { throw FedNoiseError.invalidMessage }
-        let initiatorEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: message.prefix(32))
+        let start = message.startIndex
+        let initiatorEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
         let initiatorEphemeralBytes = initiatorEphemeral.rawRepresentation
         self.initiatorEphemeral = initiatorEphemeralBytes
         symmetric.mixHash(initiatorEphemeralBytes)
         symmetric.mixKey(try dh(staticKey.privateKey, initiatorEphemeralBytes))
 
-        let encryptedStatic = Data(message[32..<80])
+        let encryptedStatic = Data(message[(start + 32)..<(start + 80)])
         let initiatorStatic = try symmetric.decryptAndHash(encryptedStatic)
         guard initiatorStatic.count == 32 else { throw FedNoiseError.invalidMessage }
         if let expectedInitiatorStatic, expectedInitiatorStatic != initiatorStatic {
@@ -292,7 +293,7 @@ public final class FedNoiseIKResponder: @unchecked Sendable {
         self.initiatorStatic = initiatorStatic
 
         symmetric.mixKey(try dh(staticKey.privateKey, initiatorStatic))
-        let payload = try symmetric.decryptAndHash(Data(message[80..<96]))
+        let payload = try symmetric.decryptAndHash(Data(message[(start + 80)..<(start + 96)]))
         guard payload.isEmpty else { throw FedNoiseError.invalidHandshakePayload }
 
         let ephemeral = try FedNoiseKeyPair.generate(using: SystemFedNoiseEntropy())
@@ -314,19 +315,20 @@ public final class FedNoiseIKResponder: @unchecked Sendable {
     public func readMessage1(_ message: Data, using entropy: any FedNoiseEntropy) throws -> Data {
         // This overload gives test responders deterministic ephemeral output.
         guard !handshakeComplete, message.count == 96 else { throw FedNoiseError.invalidMessage }
-        let initiatorEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: message.prefix(32))
+        let start = message.startIndex
+        let initiatorEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
         let initiatorEphemeralBytes = initiatorEphemeral.rawRepresentation
         self.initiatorEphemeral = initiatorEphemeralBytes
         symmetric.mixHash(initiatorEphemeralBytes)
         symmetric.mixKey(try dh(staticKey.privateKey, initiatorEphemeralBytes))
-        let initiatorStatic = try symmetric.decryptAndHash(Data(message[32..<80]))
+        let initiatorStatic = try symmetric.decryptAndHash(Data(message[(start + 32)..<(start + 80)]))
         guard initiatorStatic.count == 32 else { throw FedNoiseError.invalidMessage }
         if let expectedInitiatorStatic, expectedInitiatorStatic != initiatorStatic {
             throw FedNoiseError.pinnedResponderKeyMismatch
         }
         self.initiatorStatic = initiatorStatic
         symmetric.mixKey(try dh(staticKey.privateKey, initiatorStatic))
-        guard try symmetric.decryptAndHash(Data(message[80..<96])).isEmpty else {
+        guard try symmetric.decryptAndHash(Data(message[(start + 80)..<(start + 96)])).isEmpty else {
             throw FedNoiseError.invalidHandshakePayload
         }
 
@@ -363,13 +365,18 @@ enum FedNoiseChaChaPoly {
             nonce: try ChaChaPoly.Nonce(data: noiseNonce(nonce)),
             authenticating: authenticatedData
         )
-        return box.ciphertext + box.tag
+        var result = Data(capacity: box.ciphertext.count + box.tag.count)
+        result.append(contentsOf: box.ciphertext)
+        result.append(contentsOf: box.tag)
+        return result
     }
 
     static func open(_ ciphertextAndTag: Data, key: Data, nonce: UInt64, authenticatedData: Data) throws -> Data {
         guard ciphertextAndTag.count >= 16 else { throw FedNoiseError.authenticationFailed }
-        let ciphertext = ciphertextAndTag.dropLast(16)
-        let tag = ciphertextAndTag.suffix(16)
+        // Data slices can retain a non-zero start index. CryptoKit's
+        // SealedBox initializer requires fresh, zero-based Data values.
+        let ciphertext = Data(ciphertextAndTag.dropLast(16))
+        let tag = Data(ciphertextAndTag.suffix(16))
         do {
             let box = try ChaChaPoly.SealedBox(
                 nonce: ChaChaPoly.Nonce(data: noiseNonce(nonce)),

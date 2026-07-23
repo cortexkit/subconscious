@@ -121,7 +121,8 @@ public struct FedCandidateSuppressionTable: Sendable {
         profileOrder.filter { records[$0] == nil }
     }
 
-    /// Historical retained failures in profile order for noEligibleCandidates.
+    /// Historical retained failures in profile order, used when building the
+    /// no-eligible-candidates failure.
     public func retainedFailures(inProfileOrder profileOrder: [String]) -> [CandidateFailure] {
         profileOrder.compactMap { records[$0]?.failure }
     }

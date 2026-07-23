@@ -61,7 +61,9 @@ public actor FedOriginEffectLog {
         "fed_outcome_expired",
     ]
 
-    /// Exhaustive non-settling advisory list from fed-wire §8.8.
+    /// Exhaustive non-settling advisory list per fed-wire §8.8: deadline,
+    /// cancelled, shutdown, dispatch_ambiguous. Any other fed_ control code is
+    /// unknown and classifies as non-settling, never recorded.
     public static let nonSettlingCodes: Set<String> = [
         "fed_deadline",
         "fed_cancelled",

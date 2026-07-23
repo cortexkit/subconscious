@@ -1,7 +1,8 @@
 import Foundation
 
-/// Effects-only drain rules for a session that has been replaced by rekey
-/// (fed-wire §3.5). Pure queries do not continue on the draining session.
+/// Effects-only drain rules for a session replaced by rekey: only
+/// already-admitted effects may finish; pure queries do not continue on the
+/// draining session.
 public struct FedRekeyDrainPolicy: Sendable {
     public static let maximumDrainNanoseconds: UInt64 = 60_000_000_000
     public static let rekeyAgeNanoseconds: UInt64 = 24 * 60 * 60 * 1_000_000_000

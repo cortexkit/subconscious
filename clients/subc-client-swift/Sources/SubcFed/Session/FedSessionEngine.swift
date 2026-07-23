@@ -14,9 +14,11 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
     private var waiters: [CheckedContinuation<Data, Error>] = []
     private var closed = false
     public private(set) var sent: [Data] = []
-    /// When true, send throws before recording bytes (commitIntent-fault tests).
+    /// When true, send throws before recording bytes (simulates failure before
+    /// the first network write reaches the wire).
     public var failNextSend = false
-    /// When true, send records bytes then throws (markSent-failure tests).
+    /// When true, send records bytes then throws (simulates failure after the
+    /// first network write).
     public var failAfterSend = false
 
     public init() {}

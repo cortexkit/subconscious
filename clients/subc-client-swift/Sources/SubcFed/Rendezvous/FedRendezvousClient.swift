@@ -1,0 +1,517 @@
+import Foundation
+import CryptoKit
+
+/// The identity material the control-WS client consumes from enrollment. The
+/// device token is opaque — it is sent verbatim as the `Authorization: Bearer`
+/// credential and never interpreted (docs/rdv-wire.md §3.3). The hello PoP
+/// context fields (`account_id`, `token_id`, `token_version`) are supplied
+/// alongside the token so the client can build the §2.3 hello context without
+/// decoding the sealed token.
+public struct FedRendezvousIdentity: @unchecked Sendable {
+    public let accountId: String
+    public let tokenId: String
+    public let tokenVersion: String
+    public let deviceToken: String
+    public let x25519Key: FedNoiseKeyPair
+    public let ed25519PrivateKey: Curve25519.Signing.PrivateKey
+
+    public init(
+        accountId: String,
+        tokenId: String,
+        tokenVersion: String,
+        deviceToken: String,
+        x25519Key: FedNoiseKeyPair,
+        ed25519PrivateKey: Data
+    ) throws {
+        self.accountId = accountId
+        self.tokenId = tokenId
+        self.tokenVersion = tokenVersion
+        self.deviceToken = deviceToken
+        self.x25519Key = x25519Key
+        self.ed25519PrivateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: ed25519PrivateKey)
+    }
+}
+
+/// Lifecycle states of the rendezvous control-WS client. The client is not
+/// usable for discovery until it reaches `.ready` (the registry barrier has
+/// landed). `.lockout` is the fatal §2.2 account_key_mismatch condition.
+public enum FedRendezvousState: Sendable, Equatable {
+    case disconnected
+    case connecting
+    case awaitingHelloChallenge
+    case awaitingBarrier
+    case ready
+    case resyncing
+    case lockout(RdvSignatureError)
+    case failed(String)
+
+    public static func == (lhs: FedRendezvousState, rhs: FedRendezvousState) -> Bool {
+        switch (lhs, rhs) {
+        case (.disconnected, .disconnected),
+             (.connecting, .connecting),
+             (.awaitingHelloChallenge, .awaitingHelloChallenge),
+             (.awaitingBarrier, .awaitingBarrier),
+             (.ready, .ready),
+             (.resyncing, .resyncing):
+            return true
+        case (.lockout(let lhsError), .lockout(let rhsError)):
+            return lhsError == rhsError
+        case (.failed(let lhsMessage), .failed(let rhsMessage)):
+            return lhsMessage == rhsMessage
+        default:
+            return false
+        }
+    }
+}
+
+public enum FedRendezvousError: Error, Equatable, Sendable {
+    case closedBeforeHelloChallenge
+    case closedBeforeBarrier
+    case malformedMessage
+    case barrierViolation
+    case refused(RdvRefusal)
+}
+
+/// The rendezvous control-WS client (docs/rdv-wire.md §4). This is a CONNECTION
+/// STATE MACHINE over one persistent WebSocket with push-based registry state —
+/// NOT a fetch/publish RPC set. The server pushes every account device's
+/// registry row; the client keeps a local MIRROR the server updates.
+///
+/// Lifecycle: connect (Bearer device token) → answer the `hello_challenge` with
+/// the dual-PoP hello → apply the signed `registry_snapshot` barrier as truth →
+/// consume signed deltas maintaining the per-recipient contiguous `server_seq`
+/// cursor. A `server_seq` gap quarantines the stream and resyncs (reconnect for
+/// a fresh barrier). A differing signed `key_id` is the fatal account_key_mismatch
+/// lockout. `refresh()` tears down and reconnects (the app calls it on network
+/// change); a fresh connect re-barriers with a new snapshot.
+public actor FedRendezvousClient {
+    public struct Configuration: @unchecked Sendable {
+        /// Base control-WS URL, e.g. `wss://rdv.cortexkit.io/v1/ws`. Tests point
+        /// this elsewhere; the transport factory receives it verbatim.
+        public var controlURL: URL
+        public var identity: FedRendezvousIdentity
+        public var signingKeyPin: RdvAccountSigningKeyPin
+
+        public init(controlURL: URL, identity: FedRendezvousIdentity, signingKeyPin: RdvAccountSigningKeyPin) {
+            self.controlURL = controlURL
+            self.identity = identity
+            self.signingKeyPin = signingKeyPin
+        }
+    }
+
+    private let configuration: Configuration
+    private let streamFactory: @Sendable (URL) async throws -> any FedWebSocketStream
+    private let verifier: RdvSignedEnvelopeVerifier
+
+    private var stream: (any FedWebSocketStream)?
+    private var readTask: Task<Void, Never>?
+
+    private(set) public var state: FedRendezvousState = .disconnected
+    private var mirror: [String: RdvRegistryRow] = [:]
+    private var expectedNextSeq: UInt64?
+    private var sessionSeq: UInt64 = 0
+    private var quarantined = false
+    private var lockoutError: RdvSignatureError?
+
+    // Observable signal counts and surfaced state (read by tests and by the
+    // notice/tombstone obligations the fed-module slices enforce).
+    private(set) public var resyncCount = 0
+    private(set) public var gapCount = 0
+    private(set) public var droppedFrameCount = 0
+    private(set) public var invalidSignatureCount = 0
+    private(set) public var joinNotices: [RdvDeviceJoined] = []
+    private(set) public var tombstones: [RdvTombstone] = []
+    private(set) public var lastRefusal: RdvRefusal?
+    private(set) public var lastJoinReceipt: RdvDeviceJoinedReceipt?
+
+    /// Designated initializer with an injectable transport factory. Tests supply
+    /// a scripted in-memory peer; production uses the URLSession convenience
+    /// initializer below.
+    public init(
+        configuration: Configuration,
+        streamFactory: @escaping @Sendable (URL) async throws -> any FedWebSocketStream
+    ) {
+        self.configuration = configuration
+        self.streamFactory = streamFactory
+        self.verifier = RdvSignedEnvelopeVerifier(pin: configuration.signingKeyPin)
+    }
+
+    /// Production initializer: upgrades with the native URLSessionWebSocketTask
+    /// transport, authenticating the upgrade with the device token.
+    public init(configuration: Configuration) {
+        let deviceToken = configuration.identity.deviceToken
+        self.configuration = configuration
+        self.streamFactory = { url in
+            try await FedURLSessionWebSocketStream.connect(url: url, bearerToken: deviceToken)
+        }
+        self.verifier = RdvSignedEnvelopeVerifier(pin: configuration.signingKeyPin)
+    }
+
+    // MARK: - Connection lifecycle
+
+    /// Open the control WS, complete the hello dual-PoP, and apply the registry
+    /// barrier. Returns once the client is `.ready`; a background read loop then
+    /// consumes the server's pushed deltas for the life of the session.
+    public func connect() async throws {
+        try await establishSession()
+        startReadLoop()
+    }
+
+    /// Refresh on network change: tear down the current control WS and reconnect.
+    /// A fresh connect re-barriers with a new authoritative snapshot. The app
+    /// calls this when the phone hops networks.
+    public func refresh() async throws {
+        await teardown()
+        try await connect()
+    }
+
+    /// Tear down the session and stop consuming. The mirror is retained (R1:
+    /// local state keeps working while discovery is down).
+    public func disconnect() async {
+        await teardown()
+    }
+
+    private func establishSession() async throws {
+        state = .connecting
+        let stream = try await streamFactory(configuration.controlURL)
+        self.stream = stream
+
+        state = .awaitingHelloChallenge
+        let challenge = try await readHelloChallenge(from: stream)
+        try await sendHello(answering: challenge, on: stream)
+
+        state = .awaitingBarrier
+        try await awaitBarrier(on: stream)
+        state = .ready
+    }
+
+    private func teardown() async {
+        let task = readTask
+        readTask = nil
+        task?.cancel()
+        let currentStream = stream
+        stream = nil
+        if let currentStream {
+            await currentStream.close()
+        }
+        // Wait for the old supervisor to finish so its cleanup (which closes the
+        // stream and resets state) cannot race with a subsequent connect()'s new
+        // session — refresh() reconnects immediately after teardown.
+        _ = await task?.value
+        state = .disconnected
+        expectedNextSeq = nil
+        quarantined = false
+        sessionSeq = 0
+    }
+
+    private func startReadLoop() {
+        readTask?.cancel()
+        readTask = Task { await self.readLoopSupervisor() }
+    }
+
+    // MARK: - Hello handshake
+
+    private func readHelloChallenge(from stream: any FedWebSocketStream) async throws -> RdvHelloChallenge {
+        while true {
+            guard let message = try await stream.receive() else {
+                throw FedRendezvousError.closedBeforeHelloChallenge
+            }
+            guard case .text(let text) = message else { continue }
+            let object = try Self.parseObject(text)
+            guard case .string(let type)? = object["type"] else { throw FedRendezvousError.malformedMessage }
+            switch type {
+            case "hello_challenge":
+                return try RdvHelloChallenge.decode(object)
+            case "refusal":
+                throw FedRendezvousError.refused(try RdvRefusal.decode(object))
+            default:
+                // Ignore unexpected pre-hello frames (forward-compat).
+                continue
+            }
+        }
+    }
+
+    private func sendHello(answering challenge: RdvHelloChallenge, on stream: any FedWebSocketStream) async throws {
+        // The hello PoP context (docs/rdv-wire.md §2.3): all fields required, all
+        // strings. The domain tag binds this proof to the control-WS hello surface.
+        let context: [String: String] = [
+            "domain": "rdv-v1/hello",
+            "account_id": configuration.identity.accountId,
+            "token_id": configuration.identity.tokenId,
+            "token_version": configuration.identity.tokenVersion,
+            "challenge_id": challenge.challengeId,
+            "nonce": challenge.nonce,
+            "server_eph_x25519_pubkey": challenge.serverEphX25519Pubkey,
+            "x25519_pubkey_hex": configuration.identity.x25519Key.publicKey.lowercaseHex,
+        ]
+        let proof = try FedDualPoP(
+            context: context,
+            ed25519PrivateKey: configuration.identity.ed25519PrivateKey,
+            x25519Key: configuration.identity.x25519Key,
+            serverEphemeralX25519PublicKey: Data(hex: challenge.serverEphX25519Pubkey)
+        )
+        // hello consumes per-session seq "1".
+        let hello = RdvHello(
+            seq: "1",
+            challengeId: challenge.challengeId,
+            ed25519SigHex: proof.ed25519Signature.lowercaseHex,
+            x25519ProofHex: proof.x25519Proof.lowercaseHex
+        )
+        try await stream.send(.text(try hello.encode()))
+        sessionSeq = 1
+    }
+
+    /// Read post-hello frames until the signed registry_snapshot barrier lands and
+    /// is applied as truth. The barrier is always the first server_seq frame the
+    /// server sends after hello (§4 client cursor); anything signed before it is a
+    /// protocol violation.
+    private func awaitBarrier(on stream: any FedWebSocketStream) async throws {
+        while true {
+            guard let message = try await stream.receive() else {
+                throw FedRendezvousError.closedBeforeBarrier
+            }
+            guard case .text(let text) = message else { continue }
+            let object = try Self.parseObject(text)
+            guard case .string(let type)? = object["type"] else { throw FedRendezvousError.malformedMessage }
+            guard type == "signed" else { continue }
+            let envelope = try RdvSignedEnvelope.decode(object)
+            try verifier.verify(envelope) // key_id pin + signature; lockout throws
+            let payload = try RdvSignedPayload.decode(envelope.payload)
+            guard case .registrySnapshot(let snapshot) = payload else {
+                throw FedRendezvousError.barrierViolation
+            }
+            applySnapshot(snapshot)
+            return
+        }
+    }
+
+    // MARK: - Post-barrier read loop
+
+    private enum ReadLoopOutcome {
+        case needsResync
+        case lockout
+        case closed
+    }
+
+    private func readLoopSupervisor() async {
+        while !Task.isCancelled {
+            let outcome = await runReadLoop()
+            switch outcome {
+            case .needsResync:
+                resyncCount += 1
+                if let stream { await stream.close() }
+                stream = nil
+                state = .resyncing
+                do {
+                    try await establishSession()
+                } catch {
+                    state = .failed("\(error)")
+                    return
+                }
+            case .lockout:
+                if let stream { await stream.close() }
+                stream = nil
+                if let lockoutError {
+                    state = .lockout(lockoutError)
+                } else {
+                    state = .disconnected
+                }
+                return
+            case .closed:
+                if let stream { await stream.close() }
+                stream = nil
+                state = .disconnected
+                return
+            }
+        }
+    }
+
+    private func runReadLoop() async -> ReadLoopOutcome {
+        guard let stream else { return .closed }
+        while true {
+            let message: FedWebSocketMessage?
+            do {
+                message = try await stream.receive()
+            } catch {
+                return .closed
+            }
+            guard let message else { return .closed }
+            // The control WS is text-only; binary frames belong to the relay pipe.
+            guard case .text(let text) = message else { continue }
+            if let outcome = processInbound(text) { return outcome }
+        }
+    }
+
+    /// Process one inbound text frame. Returns a terminal outcome only when the
+    /// stream must stop (resync, lockout); nil means keep reading.
+    private func processInbound(_ text: String) -> ReadLoopOutcome? {
+        guard let object = try? Self.parseObject(text) else { return nil }
+        guard case .string(let type)? = object["type"] else { return nil }
+        switch type {
+        case "signed":
+            return processSigned(object)
+        case "refusal":
+            if let refusal = try? RdvRefusal.decode(object) {
+                lastRefusal = refusal
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    private func processSigned(_ object: RdvJSONObject) -> ReadLoopOutcome? {
+        guard let envelope = try? RdvSignedEnvelope.decode(object) else { return nil }
+
+        // key_id pin FIRST: a differing key_id is the account_key_mismatch lockout
+        // — stop consuming ALL cloud state for this account (§2.2).
+        do {
+            try RdvSignedEnvelopeVerifier.verifyKeyId(envelope.keyId, pinned: verifier.pin.keyId)
+        } catch let error as RdvSignatureError {
+            lockoutError = error
+            return .lockout
+        } catch {
+            return .lockout
+        }
+
+        // Verify the signature over the canonical payload. An invalid signature is
+        // dropped and counted — never acted on, never advances the cursor.
+        do {
+            try RdvSignedEnvelopeVerifier.verifySignature(
+                payload: envelope.payload,
+                signatureHex: envelope.signatureHex,
+                publicKey: verifier.pin.ed25519PublicKey
+            )
+        } catch {
+            invalidSignatureCount += 1
+            return nil
+        }
+
+        guard let payload = try? RdvSignedPayload.decode(envelope.payload) else { return nil }
+
+        // A VERIFIED registry_snapshot is always authoritative: it resets the
+        // cursor, applies as truth, and ends any quarantine — even mid-gap, without
+        // a reconnect (§4 verified-snapshot exception).
+        if case .registrySnapshot(let snapshot) = payload {
+            applySnapshot(snapshot)
+            return nil
+        }
+
+        // Quarantined after a gap: act on nothing but a verified snapshot.
+        if quarantined { return nil }
+
+        guard let expected = expectedNextSeq else { return nil }
+        guard let seq = try? RdvDecimalString.parse(payload.serverSeq) else { return nil }
+
+        if seq < expected {
+            // Regression or duplicate → drop + count, never act.
+            droppedFrameCount += 1
+            return nil
+        }
+        if seq > expected {
+            // GAP → quarantine and resync (reconnect for a fresh barrier snapshot).
+            quarantined = true
+            gapCount += 1
+            return .needsResync
+        }
+
+        // seq == expected: apply and advance the contiguous cursor.
+        let outcome = applyPayload(payload)
+        if outcome == nil {
+            expectedNextSeq = expected + 1
+        }
+        return outcome
+    }
+
+    /// Apply a verified, in-sequence signed payload to local state. Returns
+    /// `.needsResync` only for `resync_required`; nil otherwise.
+    private func applyPayload(_ payload: RdvSignedPayload) -> ReadLoopOutcome? {
+        switch payload {
+        case .registrySnapshot(let snapshot):
+            applySnapshot(snapshot)
+            return nil
+        case .registryDelta(let delta):
+            applyDelta(delta)
+            return nil
+        case .deviceJoined(let notice):
+            // NOTICE-ONLY: surface the un-dismissible join notice; never overwrite
+            // registry truth from it (§5.5 rematerialized-notice rule).
+            joinNotices.append(notice)
+            return nil
+        case .deviceJoinedReceipt(let receipt):
+            lastJoinReceipt = receipt
+            return nil
+        case .tombstone(let tombstone):
+            tombstones.append(tombstone)
+            mirror[tombstone.x25519PubkeyHex] = nil
+            return nil
+        case .resyncRequired:
+            quarantined = true
+            return .needsResync
+        case .epochPush:
+            // Recognized; the cursor already advanced. No registry action (the
+            // field set is not pinned in §13a — see RdvEpochPush).
+            return nil
+        }
+    }
+
+    // MARK: - Mirror mutation
+
+    /// Apply the barrier snapshot as truth: it supersedes the entire prior mirror.
+    private func applySnapshot(_ snapshot: RdvRegistrySnapshot) {
+        var next: [String: RdvRegistryRow] = [:]
+        for device in snapshot.devices {
+            next[device.x25519PubkeyHex] = device
+        }
+        mirror = next
+        if let seq = try? RdvDecimalString.parse(snapshot.serverSeq) {
+            expectedNextSeq = seq + 1
+        }
+        quarantined = false
+    }
+
+    private func applyDelta(_ delta: RdvRegistryDelta) {
+        switch delta.change {
+        case .removed:
+            mirror[delta.device.x25519PubkeyHex] = nil
+        case .added, .updated, .online, .offline:
+            mirror[delta.device.x25519PubkeyHex] = delta.device
+        }
+    }
+
+    // MARK: - Candidate mirror query (read by the dial ladder built on this client)
+
+    /// The current candidates for a peer by its X25519 pubkey hex, or nil if the
+    /// peer is not in the mirror. This is the query the dial ladder (built on this
+    /// client) uses to find a peer's reachability candidates.
+    public func candidates(forPubkey pubkey: String) -> [RdvCandidate]? {
+        mirror[pubkey]?.candidates
+    }
+
+    /// The full registry row for a peer by its X25519 pubkey hex.
+    public func deviceRow(forPubkey pubkey: String) -> RdvRegistryRow? {
+        mirror[pubkey]
+    }
+
+    /// A snapshot of the whole mirror (every account device's registry row).
+    public func currentMirror() -> [RdvRegistryRow] {
+        Array(mirror.values)
+    }
+
+    public var isReady: Bool {
+        state == .ready
+    }
+
+    /// True once the client has entered the fatal §2.2 account_key_mismatch
+    /// lockout (a signed envelope arrived with a key_id differing from the pin).
+    public var isLockedOut: Bool {
+        if case .lockout = state { return true }
+        return false
+    }
+
+    // MARK: - Helpers
+
+    private static func parseObject(_ text: String) throws -> RdvJSONObject {
+        try RdvJSONValue.parseObject(Data(text.utf8))
+    }
+}

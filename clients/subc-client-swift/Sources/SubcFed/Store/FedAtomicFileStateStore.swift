@@ -457,6 +457,12 @@ public actor FedAtomicFileStateStore: FedStateStore {
     fileprivate static func advanceWatermark(in doc: inout FedStateDocument, responder: Data) {
         let key = FedStateDocument.destinationKey(forResponderPublicKey: responder)
         guard var destination = doc.destinations[key] else { return }
+        // A poisoned serving ledger epoch is proof of regression or corruption at
+        // that epoch. Never advance the watermark past the contradiction: freezing
+        // the watermark keeps the serving ledger from pruning evidence the origin
+        // can no longer trust. The freeze lifts only when the peer presents a new,
+        // honest epoch (poison is keyed per epoch, not per peer).
+        guard destination.poisonedLedgerEpochs.isEmpty else { return }
         let incarnation = doc.global.localIncarnation
         let settledSeqs = destination.unresolvedEffects
             .filter { $0.effect.incarnation == incarnation && $0.isSettled }

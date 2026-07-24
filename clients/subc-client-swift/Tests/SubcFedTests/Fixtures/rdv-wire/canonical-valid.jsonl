@@ -1,0 +1,12 @@
+{"name":"key-sort-flat","value":{"b":"2","a":"1"},"canonical":"{\"a\":\"1\",\"b\":\"2\"}"}
+{"name":"key-sort-nested","value":{"o":{"z":"1","a":"2"},"a":"3"},"canonical":"{\"a\":\"3\",\"o\":{\"a\":\"2\",\"z\":\"1\"}}"}
+{"name":"decimal-string-numerics","value":{"seq":"42","gen":"1783419580000"},"canonical":"{\"gen\":\"1783419580000\",\"seq\":\"42\"}"}
+{"name":"array-order-preserved","value":{"c":["3","1","2"]},"canonical":"{\"c\":[\"3\",\"1\",\"2\"]}"}
+{"name":"bool-null-sorted","value":{"online":true,"addr":null,"stale":false},"canonical":"{\"addr\":null,\"online\":true,\"stale\":false}"}
+{"name":"array-of-objects-inner-sort","value":{"cands":[{"kind":"lan","addr":"192.168.1.34:7841"},{"kind":"relay"}]},"canonical":"{\"cands\":[{\"addr\":\"192.168.1.34:7841\",\"kind\":\"lan\"},{\"kind\":\"relay\"}]}"}
+{"name":"control-escape-tab","value":{"s":"a\tb"},"canonical":"{\"s\":\"a\\u0009b\"}"}
+{"name":"control-escape-newline","value":{"s":"a\nb"},"canonical":"{\"s\":\"a\\u000ab\"}"}
+{"name":"mandatory-escapes","value":{"s":"q\"\\z"},"canonical":"{\"s\":\"q\\\"\\\\z\"}"}
+{"name":"nfc-non-ascii-literal","value":{"name":"café"},"canonical":"{\"name\":\"café\"}"}
+{"name":"empty-object-and-array","value":{"o":{},"a":[]},"canonical":"{\"a\":[],\"o\":{}}"}
+{"name":"key-sort-by-byte-not-locale","value":{"Z":"1","a":"2"},"canonical":"{\"Z\":\"1\",\"a\":\"2\"}"}

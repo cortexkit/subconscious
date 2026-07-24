@@ -1,0 +1,6 @@
+{"name":"empty","value":"","valid":false}
+{"name":"non_digit","value":"not-decimal","valid":false}
+{"name":"double_zero","value":"00","valid":false}
+{"name":"leading_zero","value":"01","valid":false}
+{"name":"zero","value":"0","valid":true}
+{"name":"positive","value":"12","valid":true}

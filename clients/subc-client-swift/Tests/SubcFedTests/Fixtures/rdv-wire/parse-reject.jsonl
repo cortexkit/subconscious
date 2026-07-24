@@ -1,0 +1,8 @@
+{"name":"duplicate-key","raw":"{\"a\":\"1\",\"a\":\"2\"}","reason":"duplicate object key"}
+{"name":"duplicate-key-nested","raw":"{\"o\":{\"x\":\"1\",\"x\":\"2\"}}","reason":"duplicate object key at depth"}
+{"name":"number-literal-in-signed-payload","raw":"{\"seq\":42}","reason":"JSON number literal; signed payloads use decimal strings"}
+{"name":"float-literal","raw":"{\"v\":1.5}","reason":"JSON number literal (float)"}
+{"name":"escaped-solidus","raw":"{\"s\":\"a\\/b\"}","reason":"non-minimal escape: solidus must be literal"}
+{"name":"uppercase-hex-escape","raw":"{\"s\":\"a\\u000Ab\"}","reason":"control escape hex must be lowercase"}
+{"name":"escaped-printable","raw":"{\"s\":\"\\u0061\"}","reason":"printable character must be literal, not \\u escaped"}
+{"name":"non-nfc-string","raw":"{\"name\":\"é\"}","reason":"string is not NFC-normalized"}

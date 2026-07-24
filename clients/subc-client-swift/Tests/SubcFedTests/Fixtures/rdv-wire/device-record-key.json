@@ -1,0 +1,11 @@
+{
+  "_comment": "Public verification key for the A4 device-record vectors in device-record.jsonl. Vendored so every implementation can verify the ORIGINAL vector signatures instead of re-signing payloads locally (re-signing preserves field values but silently drops the cross-implementation signature check).",
+  "key_id": "fed-cloud-test",
+  "ed25519_pubkey_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+  "domain": "fed-cloud",
+  "vectors": "device-record.jsonl",
+  "_signature_construction": "Ed25519 over SHA-256(canonical_bytes(payload)) — the signature covers the PRE-HASHED DIGEST, not the canonical JSON bytes. Verifying the raw canonical bytes fails; that is the trap that pushes an independent implementation into re-signing instead of verifying.",
+  "_expected_results": "6 of the 8 vectors verify with this key. r1-a4-wrong-cloud-key and r1-a4-wrong-cloud-key-expired are deliberate negatives signed by a different key and MUST NOT verify — a harness where all 8 verify has lost the wrong-key rejection case.",
+  "_key_domain": "The fed-cloud signing domain is deliberately distinct from the account-signing domain used by registry envelopes, so an A4 assertion can never be spliced into a registry position. Test material only: the seed is 32 bytes of 0x42 and never appears in production.",
+  "_cross_verified": "Confirmed 2026-07-25 from an independent implementation (TypeScript/noble) against the Rust-authored signatures in device-record.jsonl."
+}

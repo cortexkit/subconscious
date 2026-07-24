@@ -447,25 +447,132 @@ public struct RdvResyncRequired: Sendable, Equatable {
     }
 }
 
-/// `epoch_push` is named by the slice as a signed payload but its field set is
-/// not pinned in docs/rdv-wire.md §13a. Every signed payload carries
-/// `server_seq`, so this decodes that minimum and nothing else; the client
-/// recognizes it and advances its cursor without acting on registry state.
-public struct RdvEpochPush: Sendable, Equatable {
-    public let serverSeq: String
+/// The membership-revocation reason carried in an `epoch_push` CKCRED JWS
+/// (fed-core `EpochPushReason`, snake_case). An unrecognized reason is refused
+/// (fail closed), never ignored: a reason this client does not know is a
+/// revocation it cannot interpret, so it must not be silently accepted.
+public enum RdvEpochPushReason: String, Sendable, Equatable {
+    case revoked
+    case compromised
+    case orgDissolved = "org_dissolved"
+}
 
-    public init(serverSeq: String) {
-        self.serverSeq = serverSeq
+/// `epoch_push` (fed-core `pub struct EpochPush { pub jws: String }`,
+/// docs/rdv-wire.md §6.4.1). The wire shape is exactly
+/// `{"type":"epoch_push","jws":"<compact CKCRED JWS>"}` and NOTHING else. An
+/// epoch_push carries NO `server_seq`: it is a membership revocation for the
+/// receiving device's own org, not a peer-registry change, so it contributes
+/// no cursor advance and is excluded from gap detection (cursor advance is
+/// per-payload-kind; see `RdvSignedPayload.serverSeq`).
+///
+/// The compact JWS is carried verbatim. Its payload segment is parsed — NOT
+/// signature-verified — for the revocation claims
+/// `{typ:"epoch_push", org, account, new_epoch, reason}`.
+public struct RdvEpochPush: Sendable, Equatable {
+    public let jws: String
+    public let org: String
+    public let account: String
+    /// The new epoch, validated canonical decimal-string text (fed-core
+    /// `new_epoch` is a DecimalString). Stored as text, not re-parsed.
+    public let newEpoch: String
+    public let reason: RdvEpochPushReason
+
+    public init(jws: String, org: String, account: String, newEpoch: String, reason: RdvEpochPushReason) {
+        self.jws = jws
+        self.org = org
+        self.account = account
+        self.newEpoch = newEpoch
+        self.reason = reason
     }
 
     public static func decode(_ object: RdvJSONObject) throws -> RdvEpochPush {
         var decoder = RdvFieldDecoder(object)
         let type = try decoder.string("type")
         guard type == "epoch_push" else { throw RdvJSONError.wrongType(field: "type") }
-        let push = RdvEpochPush(serverSeq: try decoder.decimalString("server_seq"))
+        let jws = try decoder.string("jws")
+        guard !jws.isEmpty else { throw RdvJSONError.missingField("jws") }
+        // deny-unknown-fields: the envelope carries `type` + `jws` and nothing
+        // else (in particular NO `server_seq`).
         try decoder.finish()
-        return push
+        let claims = try parseClaims(jws: jws)
+        return RdvEpochPush(
+            jws: jws,
+            org: claims.org,
+            account: claims.account,
+            newEpoch: claims.newEpoch,
+            reason: claims.reason
+        )
     }
+
+    /// The decoded revocation claims of the JWS payload segment.
+    private struct Claims {
+        let org: String
+        let account: String
+        let newEpoch: String
+        let reason: RdvEpochPushReason
+    }
+
+    /// Parse the payload segment of a compact CKCRED JWS WITHOUT verifying its
+    /// signature. Signature verification is deliberately NOT performed here:
+    /// the phone holds no account JWKS, so it cannot correctly verify a CKCRED
+    /// JWS. The WORKER verifies the JWS against the account JWKS before
+    /// fan-out, and the signed rendezvous envelope (already verified by this
+    /// client) is the courier attestation. Do not "harden" this by bolting on a
+    /// client-side signature check — it would reject every real epoch push.
+    private static func parseClaims(jws: String) throws -> Claims {
+        // A compact JWS is exactly three non-empty segments: protected header,
+        // payload, signature (mirrors fed-core `parse_epoch_push_jws`).
+        let segments = jws.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count == 3,
+              !segments[0].isEmpty,
+              !segments[1].isEmpty,
+              !segments[2].isEmpty
+        else {
+            throw RdvJSONError.invalidString
+        }
+        guard let payloadData = rdvBase64URLNoPadDecode(String(segments[1])) else {
+            throw RdvJSONError.invalidString
+        }
+        // The JWS payload is ordinary CKCRED JSON, not rdv-wire canonical JSON,
+        // so parse it with JSONSerialization: extra claims (iat/exp/iss as JSON
+        // numbers, etc.) are allowed and ignored, exactly as fed-core's serde
+        // parse ignores unknown fields. The rdv-wire strict parser would wrongly
+        // reject a real JWS that carries a numeric claim.
+        guard let raw = (try? JSONSerialization.jsonObject(with: payloadData)) as? [String: Any] else {
+            throw RdvJSONError.invalidSyntax
+        }
+        guard let typ = raw["typ"] as? String, typ == "epoch_push" else {
+            throw RdvJSONError.wrongType(field: "typ")
+        }
+        // An empty required identifier is treated as absent (fail closed).
+        guard let org = raw["org"] as? String, !org.isEmpty else {
+            throw RdvJSONError.missingField("org")
+        }
+        guard let account = raw["account"] as? String, !account.isEmpty else {
+            throw RdvJSONError.missingField("account")
+        }
+        guard let newEpoch = raw["new_epoch"] as? String, RdvDecimalString.isValid(newEpoch) else {
+            throw RdvJSONError.invalidDecimalString("\(raw["new_epoch"] ?? "<absent>")")
+        }
+        // Unknown or malformed reason → refuse, fail closed; never ignore.
+        guard let reasonRaw = raw["reason"] as? String,
+              let reason = RdvEpochPushReason(rawValue: reasonRaw)
+        else {
+            throw RdvJSONError.wrongType(field: "reason")
+        }
+        return Claims(org: org, account: account, newEpoch: newEpoch, reason: reason)
+    }
+}
+
+/// Decode a base64url (RFC 4648 §5, no padding) string, as used by compact JWS
+/// segments. Returns nil on any malformed input. Mirrors fed-core's
+/// `URL_SAFE_NO_PAD` decode of the JWS payload segment.
+private func rdvBase64URLNoPadDecode(_ value: String) -> Data? {
+    var base64 = value
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    base64.append(String(repeating: "=", count: (4 - base64.count % 4) % 4))
+    return Data(base64Encoded: base64)
 }
 
 /// A decoded signed payload, dispatched on the payload's `type`.
@@ -478,8 +585,13 @@ public enum RdvSignedPayload: Sendable, Equatable {
     case resyncRequired(RdvResyncRequired)
     case epochPush(RdvEpochPush)
 
-    /// The per-recipient contiguous server_seq this payload carries (§4).
-    public var serverSeq: String {
+    /// The per-recipient contiguous server_seq this payload carries (§4), or
+    /// `nil` for a payload that carries NO sequence cursor. `epoch_push` carries
+    /// no `server_seq` (fed-core `EpochPush { jws }`): it is a membership
+    /// revocation, not a registry change, so it contributes no cursor advance
+    /// and is excluded from gap detection. Every other signed payload kind
+    /// carries `server_seq`.
+    public var serverSeq: String? {
         switch self {
         case .registrySnapshot(let value): return value.serverSeq
         case .registryDelta(let value): return value.serverSeq
@@ -487,7 +599,7 @@ public enum RdvSignedPayload: Sendable, Equatable {
         case .deviceJoinedReceipt(let value): return value.serverSeq
         case .tombstone(let value): return value.serverSeq
         case .resyncRequired(let value): return value.serverSeq
-        case .epochPush(let value): return value.serverSeq
+        case .epochPush: return nil
         }
     }
 

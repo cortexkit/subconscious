@@ -93,6 +93,10 @@ public actor FedOriginEffectLog {
     private var laneWaiters: [CheckedContinuation<Void, Error>] = []
     private var openMutatingSequences: Set<UInt64> = []
     private var cancelled = false
+    /// Reconciliation barrier: while a reconnect reconciliation is in flight, new
+    /// mutating admissions wait on it. Pure queries never touch this barrier.
+    private var reconciliationInProgress = false
+    private var reconciliationWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(store: any FedStateStore, responderStaticPublicKey: Data) {
         self.store = store
@@ -350,6 +354,51 @@ public actor FedOriginEffectLog {
         return unsettled.isEmpty
     }
 
+    // MARK: - Reconciliation barrier
+
+    /// Raises the reconciliation barrier. New mutating admissions wait on it
+    /// until ``finishReconciliationBarrier()`` is called. Pure queries are never
+    /// gated by this barrier. Idempotent.
+    public func beginReconciliationBarrier() {
+        reconciliationInProgress = true
+    }
+
+    /// Suspends until the reconciliation barrier is released. Returns immediately
+    /// when no reconciliation is in progress. New mutating admissions call this
+    /// before acquiring an admission permit so they do not consume budget while
+    /// waiting; pure queries never call it.
+    public func awaitReconciliationBarrier() async {
+        if !reconciliationInProgress { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            reconciliationWaiters.append(continuation)
+        }
+    }
+
+    /// Releases the reconciliation barrier, admitting every waiting mutation.
+    public func finishReconciliationBarrier() {
+        reconciliationInProgress = false
+        let waiters = reconciliationWaiters
+        reconciliationWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    /// Whether a reconciliation barrier is currently raised (test observability).
+    public var isReconciliationInProgress: Bool { reconciliationInProgress }
+
+    /// Highest durably-recorded effect at the live epoch, used as the regression
+    /// sentinel. If the peer reports this already-settled effect as not_found with
+    /// a complete ledger at the same epoch, the serving ledger has regressed and
+    /// the epoch must be poisoned. Returns nil when no recorded row matches.
+    public func regressionSentinel(liveEpoch: String) async throws -> FedEffectID? {
+        let destination = try await store.destination(forResponderPublicKey: responderStaticPublicKey)
+        let candidates = destination?.unresolvedEffects.filter {
+            $0.disposition == .recorded && $0.peerLedgerEpoch == liveEpoch
+        } ?? []
+        return candidates.max(by: { $0.effect.seq < $1.effect.seq })?.effect
+    }
+
     /// Reconciles one effect_status_result without ever blind-replaying a call.
     public func applyStatusResult(
         effect: FedEffectID,
@@ -400,6 +449,12 @@ public actor FedOriginEffectLog {
         case "expired":
             try await commitTerminal(effect, disposition: .ambiguous)
             return .ambiguous
+        case "fed_seq_fenced", "fed_outcome_expired":
+            // Neither status proves non-execution, so both settle ambiguous and
+            // never not_sent. A fenced sequence or an expired retained outcome
+            // means the mutation may have executed.
+            try await commitTerminal(effect, disposition: .ambiguous)
+            return .ambiguous
         case "busy":
             return nil
         default:
@@ -435,10 +490,16 @@ public actor FedOriginEffectLog {
         for waiter in waiters {
             waiter.resume(throwing: FedFailure.cancelled)
         }
+        // Release any mutations waiting on reconciliation so they proceed to the
+        // cancelled lane check instead of stranding on a dead session.
+        finishReconciliationBarrier()
     }
 
     public func resetForReconnect() {
         cancelled = false
+        // A previous session may have raised the barrier and died mid-reconciliation;
+        // clear it so the new session starts from a clean barrier and raises its own.
+        finishReconciliationBarrier()
     }
 
     // MARK: - Ordered lane

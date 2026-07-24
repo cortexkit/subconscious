@@ -41,7 +41,14 @@ final class ObserveViewModel: ObservableObject {
         NSString(string: "~/.local/share/cortexkit/run/subc-connection.json").expandingTildeInPath
     private let callerDirectory: String
 
-    init() {
+    convenience init() {
+        self.init(transport: .local)
+    }
+
+    /// Transport-selection initializer. The default `.local` path is unchanged;
+    /// `.fed` routes through `FedManagementAdapter` and never touches a
+    /// `RouteHandle`, channel ID, route epoch, or the local 21-byte envelope.
+    init(transport: TransportSelection, fedAdapter: FedManagementAdapter? = nil) {
         // Reuse the rooms identity (one app identity across tabs; alfonso-core
         // sees a single ck-app consumer).
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -60,6 +67,8 @@ final class ObserveViewModel: ObservableObject {
             sessionId = minted
         }
         worker = ObserveWorker(
+            transport: transport,
+            fedAdapter: fedAdapter,
             connectionFile: connectionFile,
             harness: "ck-app",
             sessionId: sessionId,
@@ -228,8 +237,13 @@ final class ObserveViewModel: ObservableObject {
 /// Owns the blocking alfonso-core client for the observe tabs. Lives off the main
 /// actor (same split as AskManagementWorker): every call here runs on the view
 /// model's private work queue, which also serializes access to the mutable
-/// client/route state.
+/// client/route state. The local path opens a `SubcClient` route via
+/// `routeOpenManagementSurface` and uses the 21-byte envelope; the fed path routes
+/// through `FedManagementAdapter` and never touches a `RouteHandle`, channel ID,
+/// route epoch, or local envelope.
 private final class ObserveWorker: @unchecked Sendable {
+    private let transport: TransportSelection
+    private let fedAdapter: FedManagementAdapter?
     private let connectionFile: String
     private let harness: String
     private let sessionId: String
@@ -237,7 +251,16 @@ private final class ObserveWorker: @unchecked Sendable {
     private var client: SubcClient?
     private var alfonsoRoute: RouteHandle?
 
-    init(connectionFile: String, harness: String, sessionId: String, callerDirectory: String) {
+    init(
+        transport: TransportSelection,
+        fedAdapter: FedManagementAdapter? = nil,
+        connectionFile: String,
+        harness: String,
+        sessionId: String,
+        callerDirectory: String
+    ) {
+        self.transport = transport
+        self.fedAdapter = fedAdapter
         self.connectionFile = connectionFile
         self.harness = harness
         self.sessionId = sessionId
@@ -246,12 +269,25 @@ private final class ObserveWorker: @unchecked Sendable {
 
     /// Drops the cached connection so the next call reconnects.
     func resetConnection() {
+        // The fed path has no cached connection to drop: the `SubcFedClient`
+        // actor owns session lifecycle and reconnect. Only the local path caches
+        // a `SubcClient` + `RouteHandle`.
+        guard transport == .local else { return }
         client?.close()
         client = nil
         alfonsoRoute = nil
     }
 
     func alfonsoCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
+        switch transport {
+        case .local:
+            return try localCallBlocking(method, params)
+        case .fed:
+            return try fedCallBlocking(method, params)
+        }
+    }
+
+    private func localCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
         var merged = params
         merged["harness"] = harness
         merged["sessionId"] = sessionId
@@ -262,6 +298,29 @@ private final class ObserveWorker: @unchecked Sendable {
             throw SubcError(message: "\(method): reply had no result field")
         }
         return JSONKeyNormalizer.camelize(result)
+    }
+
+    /// Fed path: the adapter converts params to `FedJSONObject` before concurrency
+    /// transfer, invokes `callManagement(target:method:params:)`, and decodes the
+    /// opaque result body on the caller side. No `RouteHandle`, `route.open`,
+    /// channel ID, route epoch, or 21-byte envelope reaches the fed carrier.
+    private func fedCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
+        guard let adapter = fedAdapter else {
+            throw SubcError(message: "fed transport selected but no adapter was supplied")
+        }
+        let semaphore = DispatchSemaphore(value: 0)
+        var captured: Result<Any, Error>!
+        Task { [adapter] in
+            do {
+                let result = try await adapter.callManagement(method, params)
+                captured = .success(result)
+            } catch {
+                captured = .failure(error)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return try captured.get()
     }
 
     func decode<T: Decodable>(_ type: T.Type, from any: Any) throws -> T {

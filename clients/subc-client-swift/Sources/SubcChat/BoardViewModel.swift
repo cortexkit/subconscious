@@ -29,12 +29,21 @@ final class BoardViewModel: ObservableObject {
     private var visible = false
     private static let targetFile = "board-target.txt"
 
-    init() {
+    convenience init() {
+        self.init(transport: .local)
+    }
+
+    /// Transport-selection initializer. The default `.local` path is unchanged;
+    /// `.fed` routes through `FedManagementAdapter` and never touches a
+    /// `RouteHandle`, channel ID, route epoch, or the local 21-byte envelope.
+    init(transport: TransportSelection, fedAdapter: FedManagementAdapter? = nil) {
         let dir = Self.appDataDir()
         let saved = Self.loadTarget(dir: dir)
         targetHarness = saved?.harness ?? "opencode"
         targetSession = saved?.session ?? ""
         worker = BoardWorker(
+            transport: transport,
+            fedAdapter: fedAdapter,
             connectionFile: NSString(string: "~/.local/share/cortexkit/run/subc-connection.json").expandingTildeInPath,
             callerDirectory: dir.path)
     }
@@ -214,7 +223,12 @@ final class BoardViewModel: ObservableObject {
 
 /// Owns the blocking alfonso-core connection for BoardViewModel. It is deliberately
 /// separate from the main-actor view model, matching the ObserveWorker pattern.
+/// The local path opens a `SubcClient` route via `routeOpenManagementSurface` and
+/// uses the 21-byte envelope; the fed path routes through `FedManagementAdapter`
+/// and never touches a `RouteHandle`, channel ID, route epoch, or local envelope.
 private final class BoardWorker: @unchecked Sendable {
+    private let transport: TransportSelection
+    private let fedAdapter: FedManagementAdapter?
     private let connectionFile: String
     private let callerDirectory: String
     private var client: SubcClient?
@@ -224,18 +238,38 @@ private final class BoardWorker: @unchecked Sendable {
     /// rejects "ck-app" as an owner harness (it is the reserved human seat).
     private let routeSession = "ckapp-board-\(UUID().uuidString)"
 
-    init(connectionFile: String, callerDirectory: String) {
+    init(
+        transport: TransportSelection,
+        fedAdapter: FedManagementAdapter? = nil,
+        connectionFile: String,
+        callerDirectory: String
+    ) {
+        self.transport = transport
+        self.fedAdapter = fedAdapter
         self.connectionFile = connectionFile
         self.callerDirectory = callerDirectory
     }
 
     func resetConnection() {
+        // The fed path has no cached connection to drop: the `SubcFedClient`
+        // actor owns session lifecycle and reconnect. Only the local path caches
+        // a `SubcClient` + `RouteHandle`.
+        guard transport == .local else { return }
         client?.close()
         client = nil
         route = nil
     }
 
     func alfonsoCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
+        switch transport {
+        case .local:
+            return try localCallBlocking(method, params)
+        case .fed:
+            return try fedCallBlocking(method, params)
+        }
+    }
+
+    private func localCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
         var merged = params
         merged["callerDirectory"] = callerDirectory
         let (client, route) = try ensureRouteBlocking()
@@ -244,6 +278,33 @@ private final class BoardWorker: @unchecked Sendable {
             throw SubcError(message: "\(method): reply had no result field")
         }
         return JSONKeyNormalizer.camelize(result)
+    }
+
+    /// Fed path: the adapter converts params to `FedJSONObject` before concurrency
+    /// transfer, invokes `callManagement(target:method:params:)`, and decodes the
+    /// opaque result body on the caller side. No `RouteHandle`, `route.open`,
+    /// channel ID, route epoch, or 21-byte envelope reaches the fed carrier.
+    private func fedCallBlocking(_ method: String, _ params: [String: Any]) throws -> Any {
+        guard let adapter = fedAdapter else {
+            throw SubcError(message: "fed transport selected but no adapter was supplied")
+        }
+        // The adapter is async; bridge to the blocking worker queue with a
+        // dedicated `Task` and a semaphore so the existing synchronous call sites
+        // (poll timers) are unchanged. The `SubcFedClient` actor serializes the
+        // actual wire work.
+        let semaphore = DispatchSemaphore(value: 0)
+        var captured: Result<Any, Error>!
+        Task { [adapter] in
+            do {
+                let result = try await adapter.callManagement(method, params)
+                captured = .success(result)
+            } catch {
+                captured = .failure(error)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return try captured.get()
     }
 
     func decode<T: Decodable>(_ type: T.Type, from any: Any) throws -> T {

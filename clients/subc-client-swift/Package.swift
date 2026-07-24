@@ -36,6 +36,10 @@ let package = Package(
             dependencies: ["SubcFed"]
         ),
         .testTarget(
+            name: "SubcChatIntegrationTests",
+            dependencies: ["SubcClient", "SubcChatAskSupport", "SubcFed", "SubcChat"]
+        ),
+        .testTarget(
             name: "SubcClientTests",
             dependencies: ["SubcClient", "SubcChatAskSupport"],
             resources: [

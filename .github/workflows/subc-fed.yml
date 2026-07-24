@@ -1,0 +1,98 @@
+name: SubcFed
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "clients/subc-client-swift/**"
+      - ".github/workflows/subc-fed.yml"
+  pull_request:
+    paths:
+      - "clients/subc-client-swift/**"
+      - ".github/workflows/subc-fed.yml"
+  workflow_call:
+
+concurrency:
+  group: subc-fed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Package tests on macOS 13 or later. The SubcFed library targets iOS 16+
+  # and macOS 13+, so the test runner must be macOS 13 or later to satisfy the
+  # deployment floor. Xcode provides the Swift toolchain that builds and runs
+  # the SwiftPM test suite.
+  test:
+    name: swift test (macOS)
+    runs-on: macos-13
+    defaults:
+      run:
+        working-directory: clients/subc-client-swift
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Resolve package dependencies
+        run: swift package resolve
+
+      - name: Run package tests
+        run: |
+          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+            swift test --package-path clients/subc-client-swift
+
+  # Build the SubcFed scheme for generic iOS with the package's declared iOS 16
+  # deployment floor. Code signing is disabled because the CI runner has no
+  # matching signing identity; the build only needs to prove the library
+  # compiles for the iOS target.
+  build-ios:
+    name: xcodebuild (generic/platform=iOS)
+    runs-on: macos-13
+    defaults:
+      run:
+        working-directory: clients/subc-client-swift
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Resolve package dependencies
+        run: swift package resolve
+
+      - name: Build SubcFed for generic iOS
+        run: |
+          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+            xcodebuild -scheme SubcFed \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath .build/xcode-derived \
+              CODE_SIGNING_ALLOWED=NO \
+              build
+
+  # Build the SubcFed scheme for generic macOS with an explicit macOS 13
+  # deployment target. Together with the package declaration, unavailable
+  # post-macOS-13 API use is a build failure. Code signing is disabled.
+  build-macos:
+    name: xcodebuild (generic/platform=macOS, MACOSX_DEPLOYMENT_TARGET=13.0)
+    runs-on: macos-13
+    defaults:
+      run:
+        working-directory: clients/subc-client-swift
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Resolve package dependencies
+        run: swift package resolve
+
+      - name: Build SubcFed for generic macOS
+        run: |
+          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+            xcodebuild -scheme SubcFed \
+              -destination 'generic/platform=macOS' \
+              -derivedDataPath .build/xcode-derived-macos \
+              MACOSX_DEPLOYMENT_TARGET=13.0 \
+              CODE_SIGNING_ALLOWED=NO \
+              build

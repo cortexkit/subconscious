@@ -233,6 +233,9 @@ public struct FedPeerProfile: Sendable, Equatable {
     public let queueCapacity: Int
     public let queueWaitTimeoutMs: UInt64?
     public let helloPolicy: FedHelloPolicy
+    /// Validated admission policy stored at construction so `admissionPolicy`
+    /// never re-validates (and can never trap) on already-stored values.
+    private let admissionSnapshot: FedAdmissionPolicySnapshot
 
     public init(
         peerIdentity: String,
@@ -282,15 +285,12 @@ public struct FedPeerProfile: Sendable, Equatable {
         self.queueCapacity = admission.queueCapacity
         self.queueWaitTimeoutMs = admission.queueWaitTimeoutMs
         self.helloPolicy = try helloPolicy ?? FedHelloPolicy()
+        self.admissionSnapshot = admission
     }
 
     public var admissionPolicy: FedAdmissionPolicySnapshot {
-        // Validated at construction; force-try is unreachable for stored values.
-        try! FedAdmissionPolicySnapshot(
-            queueCapacity: queueCapacity,
-            queueWaitTimeoutMs: queueWaitTimeoutMs,
-            defaultDeadlineMs: defaultDeadlineMs
-        )
+        // Validated at construction and stored directly; no re-validation trap.
+        admissionSnapshot
     }
 
     public var candidateIDsInOrder: [String] {
@@ -308,32 +308,83 @@ public struct FedPeerProfile: Sendable, Equatable {
     }
 }
 
-/// Vendored single-initiator evaluation. Uses the actual local static public key
-/// from the key store and the profile-pinned responder key.
+/// Per-candidate-class dial-initiation role. Gates INITIATION only: who sends
+/// connect_request / relay_open for a candidate. It never gates redeeming a relay
+/// grant the remote side already initiated — that is a separate path, so a
+/// higher-key peer behind NAT can still complete a relay pipe the lower-key peer
+/// opened (the iOS app's primary WAN topology).
+public enum FedDialInitiationRole: Sendable, Equatable {
+    /// This side initiates the candidate (direct dial or relay connect_request).
+    case initiator
+    /// This side does not initiate. For relay candidates it may still redeem a
+    /// grant the remote side initiated; for direct candidates it simply awaits.
+    case responder
+}
+
+/// Per-candidate-class single-initiator evaluation. Uses the actual local static
+/// public key from the key store and the profile-pinned responder key to decide
+/// which side may initiate each candidate.
 public enum FedDialOwnership {
-    /// Returns whether the local peer must initiate the connection.
+    /// Returns whether the local peer may INITIATE the given candidate class.
+    ///
+    /// Direct (public/LAN) candidates keep the conservative lower-key
+    /// single-dialer rule: SubcFed has no choose_session_winner glare
+    /// arbitration, so exactly one side may open a direct candidate. This is
+    /// load-bearing and must not be relaxed to "either reachable side may dial".
+    /// Relay initiation is lower-key-exclusive as well (relay pipes are paid
+    /// resources). The one refinement over the old single-Bool rule is the
+    /// both-unreachable (double-NAT) case: direct is impossible there, so the
+    /// lower key initiates the RELAY path and the higher key awaits and redeems
+    /// its grant, letting double-NAT pairs connect.
+    public static func initiationRole(
+        for candidateClass: FedCandidateClass,
+        localPublicKey: Data,
+        responderPublicKey: Data,
+        facts: FedDialOwnershipFacts
+    ) -> FedDialInitiationRole {
+        guard localPublicKey.count == 32, responderPublicKey.count == 32 else {
+            // Fail closed: never initiate on malformed keys.
+            return .responder
+        }
+        let localIsLowerKey = localPublicKey.fedLexicographicallyPrecedes(responderPublicKey)
+        switch (facts.localPublishesAddress, facts.remotePublishesAddress) {
+        case (false, true):
+            // Remote is dialable and local does not listen — local is the dialer.
+            return .initiator
+        case (true, false):
+            // Local publishes an address and remote does not — local awaits.
+            return .responder
+        case (true, true):
+            // Both reachable directly: lower key is the single dialer for direct
+            // and relay alike.
+            return localIsLowerKey ? .initiator : .responder
+        case (false, false):
+            // Neither publishes a dialable address (double-NAT). Direct is
+            // impossible; the lower key initiates the relay path so the pair can
+            // connect, the higher key awaits and redeems its grant.
+            switch candidateClass {
+            case .relay:
+                return localIsLowerKey ? .initiator : .responder
+            case .lanDirect:
+                return .responder
+            }
+        }
+    }
+
+    /// Backward-compatible direct-candidate decision derived from the
+    /// per-candidate-class rule (the reachability-first + lower-key-tiebreak Bool
+    /// the audit confirmed correct for direct candidates).
     public static func isLocalDialOwner(
         localPublicKey: Data,
         responderPublicKey: Data,
         facts: FedDialOwnershipFacts
     ) -> Bool {
-        guard localPublicKey.count == 32, responderPublicKey.count == 32 else {
-            return false
-        }
-        switch (facts.localPublishesAddress, facts.remotePublishesAddress) {
-        case (false, true):
-            // Remote is dialable and local does not listen — local dials.
-            return true
-        case (true, false):
-            // Local publishes an address and remote does not — local awaits.
-            return false
-        case (true, true):
-            // Both publish addresses: lower 32-byte static public key dials.
-            return localPublicKey.fedLexicographicallyPrecedes(responderPublicKey)
-        case (false, false):
-            // Neither side publishes a dialable address.
-            return false
-        }
+        initiationRole(
+            for: .lanDirect,
+            localPublicKey: localPublicKey,
+            responderPublicKey: responderPublicKey,
+            facts: facts
+        ) == .initiator
     }
 }
 

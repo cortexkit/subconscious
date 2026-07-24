@@ -286,6 +286,53 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         XCTAssertThrowsError(try FedManagementTarget(moduleID: "  "))
     }
 
+    func testManagementTargetDecodeValidatesModuleID() throws {
+        let decoder = JSONDecoder()
+        // A synthesized decode would accept a blank moduleID and bypass the
+        // validating init; the custom decode must reject it.
+        let blank = Data("{\"moduleID\":\"   \"}".utf8)
+        XCTAssertThrowsError(try decoder.decode(FedManagementTarget.self, from: blank))
+        let missing = Data("{}".utf8)
+        XCTAssertThrowsError(try decoder.decode(FedManagementTarget.self, from: missing))
+
+        // A valid payload decodes, trims, and round-trips through encode/decode.
+        let valid = Data("{\"moduleID\":\"  alfonso-core  \"}".utf8)
+        let decoded = try decoder.decode(FedManagementTarget.self, from: valid)
+        XCTAssertEqual(decoded.moduleID, "alfonso-core")
+        let encoded = try JSONEncoder().encode(decoded)
+        let roundTripped = try decoder.decode(FedManagementTarget.self, from: encoded)
+        XCTAssertEqual(roundTripped, decoded)
+    }
+
+    func testAdmissionPolicyReturnsStoredValidatedSnapshotWithoutTrapping() throws {
+        let profile = try FedPublicTestSupport.humanProfile()
+        // Accessing admissionPolicy must return the validated snapshot built at
+        // construction (no re-validation, no force-try trap).
+        let policy = profile.admissionPolicy
+        XCTAssertEqual(policy.queueCapacity, profile.queueCapacity)
+        XCTAssertEqual(policy.queueWaitTimeoutMs, profile.queueWaitTimeoutMs)
+        XCTAssertEqual(policy.defaultDeadlineMs, profile.defaultDeadlineMs)
+
+        // Custom policy ranges survive construction and are reflected exactly.
+        let custom = try FedPeerProfile(
+            peerIdentity: "peer",
+            responderStaticPublicKey: try FedPublicTestSupport.responderPublicKey(),
+            enrollmentClass: .human,
+            isVerified: true,
+            candidates: [
+                .lanDirect(try FedLANDirectCandidate(
+                    candidateID: "lan-1", host: "192.168.1.10", port: 7700
+                )),
+            ],
+            defaultDeadlineMs: 5_000,
+            queueCapacity: 8,
+            queueWaitTimeoutMs: 250
+        )
+        XCTAssertEqual(custom.admissionPolicy.defaultDeadlineMs, 5_000)
+        XCTAssertEqual(custom.admissionPolicy.queueCapacity, 8)
+        XCTAssertEqual(custom.admissionPolicy.queueWaitTimeoutMs, 250)
+    }
+
     func testDialPolicyAndStateStoreProtocolsArePublic() async throws {
         let policy = FedDialPolicy()
         XCTAssertEqual(policy.noiseHandshake, .seconds(10))

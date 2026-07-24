@@ -89,6 +89,24 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
     }
 }
 
+/// An admitted management call whose request frame is encoded but not yet
+/// written to the wire. The caller registers its response continuation under
+/// `effect.seq` BEFORE dispatching so a fast response can never be processed
+/// before the continuation exists.
+public struct FedPreparedManagementCall: Sendable {
+    public let effect: FedEffectID
+    public let permit: FedAdmissionPermit
+    public let isMutation: Bool
+    let frame: FedFrame
+
+    init(effect: FedEffectID, permit: FedAdmissionPermit, isMutation: Bool, frame: FedFrame) {
+        self.effect = effect
+        self.permit = permit
+        self.isMutation = isMutation
+        self.frame = frame
+    }
+}
+
 /// Established-session state machine: hello-first negotiation, empty local
 /// catalog, remote catalog filtering, keepalive/staleness, admission hooks,
 /// effects-only drain, and full activity cancellation on disconnect/suspend.
@@ -278,14 +296,39 @@ public actor FedSessionEngine {
         return operation
     }
 
-    /// Admits a management call under the peer-scoped budget. Mutations claim the
-    /// ordered lane and commit intent before the first network write.
+    /// Admits a management call under the peer-scoped budget and dispatches it.
+    /// Mutations claim the ordered lane and commit intent before the first network
+    /// write. This is the combined prepare-then-dispatch path; callers that must
+    /// register a response continuation before the first write use
+    /// prepareManagementCall and dispatchPreparedCall directly.
     public func admitManagementCall(
         moduleID: String,
         method: String,
         params: FedJSONObject,
         policy: FedAdmissionPolicySnapshot
     ) async throws -> (effect: FedEffectID, permit: FedAdmissionPermit, isMutation: Bool) {
+        let prepared = try await prepareManagementCall(
+            moduleID: moduleID,
+            method: method,
+            params: params,
+            policy: policy
+        )
+        try await dispatchPreparedCall(prepared)
+        return (prepared.effect, prepared.permit, prepared.isMutation)
+    }
+
+    /// Admits a management call (acquire permit, mint effect, encode the request
+    /// frame) WITHOUT writing it to the wire. The caller must register its response
+    /// continuation under the returned effect.seq and then call
+    /// dispatchPreparedCall so a fast response can never be processed before the
+    /// continuation exists. On any failure here the permit is released (or retained
+    /// for an indeterminate mutation) and nothing is sent.
+    public func prepareManagementCall(
+        moduleID: String,
+        method: String,
+        params: FedJSONObject,
+        policy: FedAdmissionPolicySnapshot
+    ) async throws -> FedPreparedManagementCall {
         guard phase == .ready, role == .primary else {
             throw FedFailure.disconnected
         }
@@ -338,21 +381,14 @@ public actor FedSessionEngine {
             }
             let body = try FedManagementCallBody(method: method, params: params).jsonData()
             let frame = FedFrame(type: FedFrameType.call.rawValue, fields: fields, body: body)
-
-            // Intent is already durable for mutations; first network write next.
-            try await sendFrame(frame)
-            if classification.isMutation {
-                do {
-                    try await effectLog.markSent(effect)
-                } catch {
-                    // Transport succeeded; row stays reconcilable, permit retained.
-                    await admission.retainLedgeredForRecovery(permit)
-                    admittedEffectSequences.insert(effect.seq)
-                    throw error
-                }
-                admittedEffectSequences.insert(effect.seq)
-            }
-            return (effect, permit, classification.isMutation)
+            // Intent is durable for mutations; the first network write happens in
+            // dispatchPreparedCall, after the caller registers its continuation.
+            return FedPreparedManagementCall(
+                effect: effect,
+                permit: permit,
+                isMutation: classification.isMutation,
+                frame: frame
+            )
         } catch {
             if classification.isMutation {
                 if intentCommitted, let effect = effectID {
@@ -366,6 +402,41 @@ public actor FedSessionEngine {
                 await admission.release(permit)
             }
             throw error
+        }
+    }
+
+    /// Writes a prepared management call's request frame and performs the
+    /// post-send mutation bookkeeping. The caller must have registered its
+    /// response continuation under prepared.effect.seq before calling this. On
+    /// send failure the permit is released (pure query) or retained for recovery
+    /// (mutation whose intent is already durable); the caller resumes its own
+    /// continuation with the thrown error.
+    public func dispatchPreparedCall(_ prepared: FedPreparedManagementCall) async throws {
+        guard let admission, let effectLog else {
+            throw FedFailure.disconnected
+        }
+        do {
+            try await sendFrame(prepared.frame)
+        } catch {
+            if prepared.isMutation {
+                // Intent is already durable; leave the row for reconciliation.
+                await effectLog.noteIndeterminateLoss(prepared.effect)
+                await admission.retainLedgeredForRecovery(prepared.permit)
+            } else {
+                await admission.release(prepared.permit)
+            }
+            throw error
+        }
+        if prepared.isMutation {
+            do {
+                try await effectLog.markSent(prepared.effect)
+            } catch {
+                // Transport succeeded; row stays reconcilable, permit retained.
+                await admission.retainLedgeredForRecovery(prepared.permit)
+                admittedEffectSequences.insert(prepared.effect.seq)
+                throw error
+            }
+            admittedEffectSequences.insert(prepared.effect.seq)
         }
     }
 

@@ -6,9 +6,16 @@ import PackageDescription
 // envelope layout, and the frame codec must produce identical bytes. This is the
 // wire layer for native CortexKit apps (macOS first), so it is held to the same
 // golden-vector parity bar as the other two clients.
+//
+// SubcFed implements the client/origin side of the fed-wire protocol and starts
+// Noise handshakes for iOS 16+ and macOS 13+. It stays free of AppKit/UIKit and
+// only makes outbound connections; it never listens for incoming connections.
 let package = Package(
     name: "SubcClient",
-    platforms: [.macOS(.v13)],
+    platforms: [
+        .iOS(.v16),
+        .macOS(.v13),
+    ],
     products: [
         .library(name: "SubcClient", targets: ["SubcClient"]),
         .library(name: "SubcFed", targets: ["SubcFed"]),
@@ -20,8 +27,14 @@ let package = Package(
         .target(name: "SubcFed"),
         .target(name: "SubcChatAskSupport"),
         .executableTarget(name: "SubcSwiftProbe", dependencies: ["SubcClient"]),
-        .executableTarget(name: "SubcChat", dependencies: ["SubcClient", "SubcChatAskSupport"]),
-        .testTarget(name: "SubcFedTests", dependencies: ["SubcFed"]),
+        .executableTarget(
+            name: "SubcChat",
+            dependencies: ["SubcClient", "SubcChatAskSupport", "SubcFed"]
+        ),
+        .testTarget(
+            name: "SubcFedTests",
+            dependencies: ["SubcFed"]
+        ),
         .testTarget(
             name: "SubcClientTests",
             dependencies: ["SubcClient", "SubcChatAskSupport"],

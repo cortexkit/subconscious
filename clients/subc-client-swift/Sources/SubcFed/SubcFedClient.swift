@@ -83,6 +83,11 @@ public actor SubcFedClient {
     private var connectionState: FedConnectionState = .idle
     private var explicitlyDisconnected = true
     private var reconnectTask: Task<Void, Never>?
+    /// Test-only hook awaited by the reconnect task immediately before it would
+    /// publish .reconnectWaiting, so a test can force a concurrent disconnect to
+    /// land first and prove the stale task no longer stomps the published state.
+    /// Never set in production.
+    private var reconnectTestBarrier: (@Sendable () async -> Void)?
     private var activeSession: FedDialedSession?
     private var receiveTask: Task<Void, Never>?
     private var pendingCalls: [UInt64: PendingCall] = [:]
@@ -688,16 +693,31 @@ public actor SubcFedClient {
         }
         guard retryable else { return }
 
+        // Capture the generation this reconnect belongs to. A concurrent
+        // disconnect/suspend/profile-change bumps it; the task body re-checks it
+        // after every await and bails when stale, so it never publishes
+        // .reconnectWaiting over a state a disconnect already owns, nor starts a
+        // dial cycle that was superseded. Task cancellation alone is not enough:
+        // cancelling a running task with no cancellation checks does not stop it.
+        let generation = dialGeneration
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             guard let self else { return }
             // Deterministic midpoint jitter for production path; tests inject clocks.
             let delay = await self.nextReconnectDelay()
+            if await self.isDialStale(generation) { return }
             let now = await self.currentClockNanoseconds()
+            if await self.isDialStale(generation) { return }
             let deadline = now &+ delay
-            await self.publishReconnectWaiting(deadline: deadline, failure: failure)
+            await self.runReconnectBarrier()
+            if await self.isDialStale(generation) { return }
+            await self.publishReconnectWaiting(deadline: deadline, failure: failure, generation: generation)
             do {
                 try await self.clock.sleep(untilNanoseconds: deadline)
+                // A disconnect during the sleep must not start a fresh dial cycle.
+                // beginDialCycle also guards on the generation, but bailing here
+                // avoids spinning up a doomed cycle at all.
+                if await self.isDialStale(generation) { return }
                 try await self.beginDialCycle(reason: .reconnect)
             } catch {
                 // Terminal failure already published by beginDialCycle.
@@ -713,7 +733,22 @@ public actor SubcFedClient {
         clock.nowNanoseconds()
     }
 
-    private func publishReconnectWaiting(deadline: UInt64, failure: FedFailure) {
+    /// Test seam: install (or clear, with nil) the barrier awaited just before the
+    /// reconnect task publishes .reconnectWaiting.
+    func setReconnectTestBarrier(_ barrier: (@Sendable () async -> Void)?) {
+        reconnectTestBarrier = barrier
+    }
+
+    private func runReconnectBarrier() async {
+        if let barrier = reconnectTestBarrier {
+            await barrier()
+        }
+    }
+
+    private func publishReconnectWaiting(deadline: UInt64, failure: FedFailure, generation: UInt64) {
+        // Runs on the actor, so this check is race-free: refuse to stomp a state a
+        // concurrent disconnect/suspend already owns.
+        guard !isDialStale(generation) else { return }
         publish(.reconnectWaiting(deadlineNanoseconds: deadline, lastFailure: failure))
     }
 

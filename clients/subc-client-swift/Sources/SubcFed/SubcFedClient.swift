@@ -13,6 +13,10 @@ public struct FedDialAttemptContext: Sendable {
     public let entropy: any FedNoiseEntropy
     public let stateStore: any FedStateStore
     public let observedNetwork: FedObservedNetworkSnapshot
+    /// Whether this side initiates the candidate or, for a relay candidate it does
+    /// not initiate, redeems a grant the remote side opened. The factory must not
+    /// send connect_request / relay_open when this is `.responder`.
+    public let initiationRole: FedDialInitiationRole
 }
 
 /// Result of a successful candidate dial through Noise and fed negotiation.
@@ -66,6 +70,15 @@ public actor SubcFedClient {
     private var activeProfile: FedPeerProfile
     private var pendingProfile: FedPeerProfile?
     private var profileGeneration: UInt64 = 1
+    /// Bumped on disconnect/suspend/profile-change to invalidate in-flight dial
+    /// cycles. A dial cycle captures the generation at start and aborts once it
+    /// goes stale, so a concurrent disconnect cannot be resurrected into a ready
+    /// session and overlapping connects cannot mint two attempt IDs.
+    private var dialGeneration: UInt64 = 0
+    /// The generation of the dial cycle currently running, if any. A second
+    /// connect for the same generation joins the running cycle instead of starting
+    /// a parallel one.
+    private var activeDialGeneration: UInt64?
     private var planner = FedDialCyclePlanner()
     private var connectionState: FedConnectionState = .idle
     private var explicitlyDisconnected = true
@@ -136,6 +149,7 @@ public actor SubcFedClient {
 
     public func disconnect() async {
         explicitlyDisconnected = true
+        dialGeneration &+= 1
         cancelBackgroundWork()
         await tearDownSession(reason: .disconnected)
         publish(.idle)
@@ -143,6 +157,7 @@ public actor SubcFedClient {
 
     public func suspend() async {
         explicitlyDisconnected = false
+        dialGeneration &+= 1
         cancelBackgroundWork()
         await tearDownSession(reason: .suspended)
         publish(.dormant)
@@ -169,9 +184,13 @@ public actor SubcFedClient {
         // Validation already ran in FedPeerProfile.init.
         profileGeneration &+= 1
         if isDialCycleActive {
+            // The running dial cycle activates the pending profile at its next
+            // checkpoint; do not invalidate its generation mid-flight.
             pendingProfile = profile
             return
         }
+        // Invalidate any pending reconnect for the old profile.
+        dialGeneration &+= 1
         activeProfile = profile
         pendingProfile = nil
         try await maybeRedialAfterProfileActivation()
@@ -202,19 +221,40 @@ public actor SubcFedClient {
         guard case .ready = connectionState else { throw FedFailure.disconnected }
 
         let policy = activeProfile.admissionPolicy
-        let admitted = try await session.engine.admitManagementCall(
+
+        // First admit (acquire permit, mint effect, encode the request frame) but
+        // do NOT write it to the wire yet. On admission failure this throws and
+        // the engine has already released/retained the permit, so nothing leaks
+        // and no continuation is created.
+        let prepared = try await session.engine.prepareManagementCall(
             moduleID: target.moduleID,
             method: method,
             params: params,
             policy: policy
         )
 
+        // Then register the response continuation under the actor's isolation
+        // BEFORE the first network write, and dispatch. Registering first is what
+        // closes the race: a fast response cannot be processed before the
+        // continuation exists, and a session-loss drain either resumes it
+        // (completePendingCalls) or leaves it for the dispatch-failure abort below.
+        // The dispatch-failure path keeps permit cleanup mutation-aware (release
+        // pure / retain ledgered), and abortInstalledCall is idempotent with a
+        // concurrent drain, so the continuation resumes exactly once with no leak.
+        let seq = prepared.effect.seq
         return try await withCheckedThrowingContinuation { continuation in
-            pendingCalls[admitted.effect.seq] = PendingCall(
-                isMutation: admitted.isMutation,
-                permit: admitted.permit,
+            pendingCalls[seq] = PendingCall(
+                isMutation: prepared.isMutation,
+                permit: prepared.permit,
                 continuation: continuation
             )
+            Task { [weak self] in
+                do {
+                    try await session.engine.dispatchPreparedCall(prepared)
+                } catch {
+                    await self?.abortInstalledCall(seq: seq, error: error)
+                }
+            }
         }
     }
 
@@ -236,13 +276,38 @@ public actor SubcFedClient {
         }
     }
 
+    /// One candidate cleared for dialing this cycle, with the role this side
+    /// plays for it (initiate, or redeem a relay grant).
+    private struct FedEligibleCandidate {
+        let id: String
+        let role: FedDialInitiationRole
+    }
+
+    /// Whether a dial cycle started at `generation` must abort: the generation was
+    /// invalidated (disconnect/suspend/profile-change), the peer was explicitly
+    /// disconnected, or the task was cancelled.
+    private func isDialStale(_ generation: UInt64) -> Bool {
+        generation != dialGeneration || explicitlyDisconnected || Task.isCancelled
+    }
+
     private func beginDialCycle(reason: DialStartReason) async throws {
         activatePendingProfileIfNeeded()
+
+        // Serialize dial cycles: only one per generation. A concurrent connect for
+        // an already-active generation joins the running cycle instead of minting
+        // a second attempt ID.
+        guard activeDialGeneration != dialGeneration else { return }
+        activeDialGeneration = dialGeneration
+        defer {
+            if activeDialGeneration == dialGeneration { activeDialGeneration = nil }
+        }
+        let generation = dialGeneration
 
         // Ownership and enrollment use the live key-store public key and the
         // profile-pinned responder key before any attempt identifier is minted
         // and before any carrier or DNS work begins.
         let localPublicKey = try await keyStore.staticPublicKey()
+        if isDialStale(generation) { throw FedFailure.cancelled }
         guard localPublicKey.count == 32 else {
             throw finishPreCarrier(with: .invalidProfile(field: "localPublicKey"))
         }
@@ -251,33 +316,31 @@ public actor SubcFedClient {
             throw finishPreCarrier(with: .unsupportedEnrollmentClass)
         }
 
-        let isOwner = FedDialOwnership.isLocalDialOwner(
-            localPublicKey: localPublicKey,
-            responderPublicKey: activeProfile.responderStaticPublicKey,
-            facts: activeProfile.dialOwnership
-        )
-        if !isOwner {
-            throw finishPreCarrier(with: .notDialOwner)
-        }
-
         let snapshot = await observedNetworkProvider()
-        let eligibility = evaluateEligibility(snapshot: snapshot)
+        if isDialStale(generation) { throw FedFailure.cancelled }
+
+        // Ownership is evaluated per candidate class inside eligibility: a peer
+        // that does not own a direct candidate may still redeem a relay grant, so
+        // a single notDialOwner gate no longer refuses the whole cycle.
+        let eligibility = evaluateEligibility(snapshot: snapshot, localPublicKey: localPublicKey)
         switch eligibility {
         case .failure(let failure):
             throw finishPreCarrier(with: failure)
-        case .success(let eligibleIDs):
+        case .success(let eligible):
             try await runEligibleDial(
-                eligibleIDs: eligibleIDs,
+                eligible: eligible,
                 localPublicKey: localPublicKey,
                 snapshot: snapshot,
-                reason: reason
+                reason: reason,
+                generation: generation
             )
         }
     }
 
     private func evaluateEligibility(
-        snapshot: FedObservedNetworkSnapshot
-    ) -> Result<[String], FedFailure> {
+        snapshot: FedObservedNetworkSnapshot,
+        localPublicKey: Data
+    ) -> Result<[FedEligibleCandidate], FedFailure> {
         let profile = activeProfile
         let planned = planner.planEligible(
             profileOrder: profile.candidateIDsInOrder,
@@ -292,10 +355,13 @@ public actor SubcFedClient {
         case .failure(let failure):
             return .failure(failure)
         case .success(let ids):
-            // Apply LAN hygiene without minting an attempt ID. Rejected candidates
-            // are suppressed and removed from the eligible list for this cycle.
-            var eligible: [String] = []
+            // Apply LAN hygiene and per-candidate ownership without minting an
+            // attempt ID. Hygiene-rejected candidates are suppressed; ownership
+            // decides whether this side may initiate (or, for relay, redeem) each
+            // remaining candidate.
+            var eligible: [FedEligibleCandidate] = []
             var hygieneFailures: [CandidateFailure] = []
+            var ownershipBlocked = false
             for id in ids {
                 guard let candidate = profile.candidate(id: id) else { continue }
                 if case .lanDirect(let lan) = candidate {
@@ -319,57 +385,75 @@ public actor SubcFedClient {
                         continue
                     }
                 }
-                eligible.append(id)
+                let role = FedDialOwnership.initiationRole(
+                    for: candidate.candidateClass,
+                    localPublicKey: localPublicKey,
+                    responderPublicKey: profile.responderStaticPublicKey,
+                    facts: profile.dialOwnership
+                )
+                // Actionable if we may initiate, or it is a relay candidate we may
+                // redeem a grant for (initiation withheld on the higher-key side).
+                let actionable: Bool
+                switch (role, candidate.candidateClass) {
+                case (.initiator, _):
+                    actionable = true
+                case (.responder, .relay):
+                    actionable = true
+                case (.responder, .lanDirect):
+                    actionable = false
+                }
+                if !actionable {
+                    ownershipBlocked = true
+                    continue
+                }
+                eligible.append(FedEligibleCandidate(id: id, role: role))
             }
             if eligible.isEmpty {
-                if hygieneFailures.isEmpty {
+                if !hygieneFailures.isEmpty {
+                    // All candidates rejected during hygiene — still no attempt ID.
                     let retained = planner.suppression.retainedFailures(
                         inProfileOrder: profile.candidateIDsInOrder
                     )
-                    return .failure(.noEligibleCandidates(retained))
+                    return .failure(.noEligibleCandidates(retained.isEmpty ? hygieneFailures : retained))
                 }
-                // All candidates rejected during eligibility — still no attempt ID.
+                if ownershipBlocked {
+                    // Candidates exist but this side may neither initiate nor redeem
+                    // any of them — refuse before minting an attempt ID or opening a
+                    // carrier.
+                    return .failure(.notDialOwner)
+                }
                 let retained = planner.suppression.retainedFailures(
                     inProfileOrder: profile.candidateIDsInOrder
                 )
-                return .failure(.noEligibleCandidates(retained.isEmpty ? hygieneFailures : retained))
+                return .failure(.noEligibleCandidates(retained))
             }
             return .success(eligible)
         }
     }
 
     private func runEligibleDial(
-        eligibleIDs: [String],
+        eligible: [FedEligibleCandidate],
         localPublicKey: Data,
         snapshot: FedObservedNetworkSnapshot,
-        reason: DialStartReason
+        reason: DialStartReason,
+        generation: UInt64
     ) async throws {
+        if isDialStale(generation) { throw FedFailure.cancelled }
         let attemptEntropy = try entropy.randomBytes(count: 16)
         let attemptID = FedHelloCodec.mintConnectionAttemptID(entropy: attemptEntropy)
         lastAttemptID = attemptID
         let localPrivateKey = try await keyStore.staticPrivateKey()
         let companionKey = try await keyStore.companionSigningPrivateKey()
 
-        let context = FedDialAttemptContext(
-            attemptID: attemptID,
-            localPublicKey: localPublicKey,
-            localPrivateKey: localPrivateKey,
-            responderStaticPublicKey: activeProfile.responderStaticPublicKey,
-            companionSigningPrivateKey: companionKey,
-            dialPolicy: dialPolicy,
-            helloPolicy: activeProfile.helloPolicy,
-            clock: clock,
-            entropy: entropy,
-            stateStore: stateStore,
-            observedNetwork: snapshot
-        )
-
         var failures = FedCandidateFailureAccumulator()
-        let orderedCandidates = eligibleIDs.compactMap { activeProfile.candidate(id: $0) }
+        let orderedCandidates: [(FedPeerCandidate, FedDialInitiationRole)] = eligible.compactMap { entry in
+            guard let candidate = activeProfile.candidate(id: entry.id) else { return nil }
+            return (candidate, entry.role)
+        }
 
-        for candidate in orderedCandidates {
-            if Task.isCancelled || explicitlyDisconnected {
-                throw finishAttempt(with: .cancelled, attemptID: attemptID)
+        for (candidate, role) in orderedCandidates {
+            if isDialStale(generation) {
+                throw FedFailure.cancelled
             }
             publish(.dialing(
                 attemptID: attemptID,
@@ -377,9 +461,31 @@ public actor SubcFedClient {
                 stage: .carrierConnect
             ))
             carrierOperationsStarted &+= 1
+            let context = FedDialAttemptContext(
+                attemptID: attemptID,
+                localPublicKey: localPublicKey,
+                localPrivateKey: localPrivateKey,
+                responderStaticPublicKey: activeProfile.responderStaticPublicKey,
+                companionSigningPrivateKey: companionKey,
+                dialPolicy: dialPolicy,
+                helloPolicy: activeProfile.helloPolicy,
+                clock: clock,
+                entropy: entropy,
+                stateStore: stateStore,
+                observedNetwork: snapshot,
+                initiationRole: role
+            )
             do {
                 let dialed = try await dialFactory.dial(candidate: candidate, context: context)
                 try await dialed.engine.establish()
+                // Re-validate after the establish await: a concurrent disconnect or
+                // a newer dial generation must not be resurrected into a ready
+                // session. Tear the just-established session down and abort.
+                if isDialStale(generation) {
+                    await dialed.engine.disconnect(reason: .cancelled)
+                    await dialed.transport.close()
+                    throw FedFailure.cancelled
+                }
                 activeSession = dialed
                 startReceiveLoop(session: dialed)
                 planner.resetBackoff()
@@ -387,8 +493,13 @@ public actor SubcFedClient {
                 activatePendingProfileIfNeeded()
                 return
             } catch is CancellationError {
-                throw finishAttempt(with: .cancelled, attemptID: attemptID)
+                throw FedFailure.cancelled
             } catch let failure as FedFailure {
+                if failure == .cancelled {
+                    // Stale-dial abort: the invalidating event owns the published
+                    // state; propagate without overwrite or reconnect scheduling.
+                    throw failure
+                }
                 if failure.isTerminalProfileFailure {
                     throw finishAttempt(with: failure, attemptID: attemptID)
                 }
@@ -529,6 +640,15 @@ public actor SubcFedClient {
         for (_, call) in pending {
             call.continuation.resume(throwing: failure)
         }
+    }
+
+    /// Removes a registered pending call and resumes it with an error after a
+    /// dispatch failure. removeValue makes this idempotent with a concurrent
+    /// session-loss drain (completePendingCalls), which may already have removed
+    /// and resumed the same continuation; exactly one site resumes it.
+    private func abortInstalledCall(seq: UInt64, error: Error) {
+        guard let removed = pendingCalls.removeValue(forKey: seq) else { return }
+        removed.continuation.resume(throwing: error)
     }
 
     // MARK: - State helpers

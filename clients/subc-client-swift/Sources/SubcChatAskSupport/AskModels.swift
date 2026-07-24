@@ -58,6 +58,14 @@ public struct AskOption: Codable, Equatable, Identifiable {
     public var id: String { label }
 }
 
+// Identity-based Hashable so these models can drive SwiftUI NavigationStack
+// destinations and ForEach directly. Hashing by the stable identity field
+// (not the full value graph) keeps conformance independent of the optional
+// JSONValue/silence-policy fields and matches Identifiable semantics.
+extension AskOption: Hashable {
+    public func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
 /// Describes how an unanswered ask is handled after its silence window closes.
 /// Strings are intentionally retained verbatim so newer server enum values remain
 /// visible instead of making the whole record fail to decode.
@@ -102,6 +110,7 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     public var id: String { requestID }
 
     /// Converts the wire's epoch-millisecond timestamp for SwiftUI date formatting.
+    /// (Hashable conformance below hashes by requestID; see the extension after this type.)
     public var askedDate: Date {
         Date(timeIntervalSince1970: TimeInterval(askedAt) / 1_000)
     }
@@ -115,6 +124,13 @@ public struct AskRequest: Codable, Equatable, Identifiable {
             "auto-proceeded", "expired",
         ].contains(state)
     }
+}
+
+// Identity-based Hashable so an AskRequest can drive NavigationStack destinations
+// directly. Hashing by requestID keeps conformance independent of the optional
+// JSONValue-bearing fields and matches Identifiable semantics.
+extension AskRequest: Hashable {
+    public func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 /// A parsed answer reply. Conflict and cancellation are normal server outcomes, not

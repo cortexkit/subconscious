@@ -6,6 +6,63 @@ public enum FedRelaySide: String, Codable, Sendable, Equatable {
     case b
 }
 
+/// Typed disposition of a relay-pipe close (docs/rdv-wire.md §7.3, §9). The byte
+/// bridge surfaces the relay-specific application close codes as these outcomes
+/// so the dial ladder and the app can tell a dormancy signal (idle) from a
+/// partition (peer_closed, pressure) from an auth/dead-pipe failure without
+/// parsing platform error strings.
+public enum FedRelayCloseOutcome: Sendable, Equatable {
+    /// 4000 — idle teardown. A dormancy signal, NOT a partition: the pipe went
+    /// quiet for the relay idle window; fed keepalives would have held it open.
+    case idle
+    /// 4001 — token revoked or token_version stale.
+    case revoked
+    /// 4003 — auth/PoP failure, including PoP deadline and token expiry at PoP.
+    case authFailed
+    /// 4004 — grant side consumed, pipe retired, or uninitialized pipe.
+    case deadPipe
+    /// 4005 — the peer side closed (fed-wire partition classification).
+    case peerClosed
+    /// 4008 — protocol violation (early binary before relay_ready, text after
+    /// ready, schema/authority).
+    case violation
+    /// 4009 — a single message exceeded the 16 MiB frame cap.
+    case frameCap
+    /// 4010 — lifetime per-direction byte budget exhausted (A-B6). Treated as a
+    /// partition-equivalent: recovery is a fresh relay_open, not a protocol fault.
+    case pressure
+    /// Any other close or transport failure: a generic partition.
+    case transport
+
+    /// Dormant (idle) rather than a partition. Only `4000 idle` is dormancy.
+    public var isDormant: Bool { self == .idle }
+
+    /// Map an rdv-wire application close code to its typed relay outcome.
+    public static func classify(_ code: FedWebSocketCloseCode) -> FedRelayCloseOutcome {
+        switch code {
+        case .idle: return .idle
+        case .revoked: return .revoked
+        case .authFailed: return .authFailed
+        case .consumed: return .deadPipe
+        case .peerClosed: return .peerClosed
+        case .violation: return .violation
+        case .frameCap: return .frameCap
+        case .pressure: return .pressure
+        case .superseded: return .transport
+        }
+    }
+
+    /// Classify any error thrown by the WebSocket transport. A typed application
+    /// close code maps to its relay outcome; everything else is a generic
+    /// transport partition.
+    public static func classify(_ error: Error) -> FedRelayCloseOutcome {
+        if case FedWebSocketError.close(let code) = error {
+            return classify(code)
+        }
+        return .transport
+    }
+}
+
 public struct FedRelayMaterial: @unchecked Sendable {
     public let relayURL: URL
     public let pipeToken: Data
@@ -89,11 +146,15 @@ public struct FedRelayProof: Sendable, Equatable {
         self.x25519Proof = x25519Proof
     }
 
+    /// The wire text answering a relay challenge (docs/rdv-wire.md §13a
+    /// `relay_hello`, device→RelayDO): `{type, challenge_id, ed25519_sig_hex,
+    /// x25519_proof_hex}` with no `seq` (the relay pipe is post-PoP binary and
+    /// sits outside the control-WS seq domain).
     public var message: String {
         let fields: [String: String] = [
             "challenge_id": challengeID,
             "ed25519_sig_hex": ed25519Signature.lowercaseHex,
-            "type": "relay_auth",
+            "type": "relay_hello",
             "x25519_proof_hex": x25519Proof.lowercaseHex
         ]
         return FedCanonicalJSON.object(fields)
@@ -139,32 +200,30 @@ public struct FedRelayAuthenticator: Sendable {
         }
     }
 
+    /// Cheap structural sanity check on the client side before spending a PoP.
+    /// The client never holds the relay secret, so it cannot authenticate the
+    /// MAC; it parses the fixed-width layout (length, version byte) and binds the
+    /// token to this device, side, pipe, and token version. A structurally
+    /// invalid or mis-bound token fails fast with `invalidRelayProof` instead of
+    /// opening a relay socket that the DO would reject anyway. Expiry is a server
+    /// trust decision (§1.2: devices never make TTL decisions on a local clock),
+    /// so it is deliberately NOT checked here.
     private func validatePipeToken(_ material: FedRelayMaterial) throws {
-        guard let decoded = Data(base64URLEncoded: material.pipeToken), decoded.count == 124 else {
+        // `material.pipeToken` is the base64url wire text (as UTF-8 bytes) carried
+        // in the relay_grant; decode it to the fixed-width layout first.
+        let token: FedPipeToken
+        do {
+            let base64URL = String(decoding: material.pipeToken, as: UTF8.self)
+            token = try FedPipeToken.parse(base64URL: base64URL)
+        } catch {
             throw FedCarrierError.invalidRelayProof
         }
-        let start = decoded.startIndex
-        guard decoded[start] == 0x01 else { throw FedCarrierError.invalidRelayProof }
-        let pipeID = String(decoding: decoded[(start + 1)..<(start + 27)], as: UTF8.self)
-        guard pipeID == material.pipeID else { throw FedCarrierError.invalidRelayProof }
-        let tokenSide: FedRelaySide
-        switch decoded[start + 27] {
-        case 0: tokenSide = .a
-        case 1: tokenSide = .b
-        default: throw FedCarrierError.invalidRelayProof
-        }
-        guard tokenSide == material.side else { throw FedCarrierError.invalidRelayProof }
-        guard Data(decoded[(start + 28)..<(start + 60)]) == material.x25519Key.publicKey else {
+        guard token.pipeID == material.pipeID,
+              token.side == material.side,
+              token.deviceX25519PublicKey == material.x25519Key.publicKey,
+              token.tokenVersion == material.tokenVersion else {
             throw FedCarrierError.invalidRelayProof
         }
-        guard readBigEndianUInt64(decoded, at: 60) == material.tokenVersion else {
-            throw FedCarrierError.invalidRelayProof
-        }
-    }
-
-    private func readBigEndianUInt64(_ data: Data, at offset: Int) -> UInt64 {
-        let start = data.startIndex + offset
-        return data[start..<(start + 8)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
     }
 
     private func makeProof(material: FedRelayMaterial, challenge: FedRelayChallenge) throws -> FedRelayProof {
@@ -268,7 +327,7 @@ public actor FedRelayRecordCarrier {
             closed = true
             readyToUse = false
             await stream.close()
-            throw error
+            throw Self.translateRelayClose(error)
         }
     }
 
@@ -286,8 +345,18 @@ public actor FedRelayRecordCarrier {
             closed = true
             readyToUse = false
             await stream.close()
-            throw error
+            throw Self.translateRelayClose(error)
         }
+    }
+
+    /// Surface a relay application close code (4000/4003/4004/4005/4009/4010 …)
+    /// as the typed `relayClosed` outcome; any other error passes through
+    /// unchanged so framing/codec errors keep their own vocabulary.
+    private static func translateRelayClose(_ error: Error) -> Error {
+        if case FedWebSocketError.close(let code) = error {
+            return FedCarrierError.relayClosed(FedRelayCloseOutcome.classify(code))
+        }
+        return error
     }
 
     public func close() async {
@@ -334,13 +403,3 @@ private enum FedCanonicalJSON {
     }
 }
 
-private extension Data {
-    init?(base64URLEncoded value: Data) {
-        var base64 = String(decoding: value, as: UTF8.self)
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        base64.append(String(repeating: "=", count: (4 - base64.count % 4) % 4))
-        guard let decoded = Data(base64Encoded: base64) else { return nil }
-        self = decoded
-    }
-}

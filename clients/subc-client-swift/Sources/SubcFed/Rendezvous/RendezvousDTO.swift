@@ -662,3 +662,115 @@ public struct RdvHello: Sendable, Equatable {
         return hello
     }
 }
+
+// MARK: - Relay signaling (control WS)
+
+/// The `relay_open` message (device→server; docs/rdv-wire.md §6.6, §13a). Only
+/// the lower-key initiator of a pair ever sends it (§6.5 relay reservation); the
+/// higher-key peer never sends `relay_open` and instead redeems the unsolicited
+/// `relay_grant` the server pushes to it. `nonce` is 16 bytes of hex; a replayed
+/// open (same nonce within retention) is refused `duplicate_rejected`.
+public struct RdvRelayOpen: Sendable, Equatable {
+    public let seq: String
+    public let to: String
+    public let nonce: String
+
+    public init(seq: String, to: String, nonce: String) {
+        self.seq = seq
+        self.to = to
+        self.nonce = nonce
+    }
+
+    /// Serialize as canonical rdv-wire JSON for the wire.
+    public func encode() throws -> String {
+        let object = RdvJSONObject([
+            "type": .string("relay_open"),
+            "seq": .string(seq),
+            "to": .string(to),
+            "nonce": .string(nonce),
+        ])
+        return try RdvCanonicalJSON.canonicalString(.object(object))
+    }
+
+    /// Server-side decode (deny-unknown-fields, as a device→server message).
+    public static func decode(_ object: RdvJSONObject) throws -> RdvRelayOpen {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "relay_open" else { throw RdvJSONError.wrongType(field: "type") }
+        let open = RdvRelayOpen(
+            seq: try decoder.decimalString("seq"),
+            to: try decoder.string("to"),
+            nonce: try decoder.string("nonce")
+        )
+        try decoder.finish()
+        return open
+    }
+}
+
+/// The `relay_grant` message (server→device, PLAIN — unsigned; docs/rdv-wire.md
+/// §6.6, §13a). The server delivers one to EACH side of the pipe: the OPENER's
+/// copy carries `of_seq` echoing the `relay_open.seq` it answers (A-C8, so a
+/// client with several outstanding opens correlates exactly); the TARGET's copy
+/// omits `of_seq` and is UNSOLICITED — the target must act on it (dial the pipe),
+/// never drop it. The grant is single-redemption per side with a ~60 s redemption
+/// TTL (`expires_at_ms`); there is no refresh — a dead grant is re-minted by a
+/// fresh `relay_open`.
+public struct RdvRelayGrant: Sendable, Equatable {
+    public let serverSeq: String
+    /// Present only on the opener's copy (echoes the answered relay_open.seq).
+    public let ofSeq: String?
+    public let pipeID: String
+    public let relayURL: String
+    /// base64url pipe token (§7.1), carried verbatim as the redemption credential.
+    public let pipeToken: String
+    public let side: FedRelaySide
+    /// The OTHER device's X25519 pubkey hex (the peer this grant connects to).
+    public let peer: String
+    public let issuedAtMs: String
+    public let expiresAtMs: String
+
+    public init(
+        serverSeq: String,
+        ofSeq: String?,
+        pipeID: String,
+        relayURL: String,
+        pipeToken: String,
+        side: FedRelaySide,
+        peer: String,
+        issuedAtMs: String,
+        expiresAtMs: String
+    ) {
+        self.serverSeq = serverSeq
+        self.ofSeq = ofSeq
+        self.pipeID = pipeID
+        self.relayURL = relayURL
+        self.pipeToken = pipeToken
+        self.side = side
+        self.peer = peer
+        self.issuedAtMs = issuedAtMs
+        self.expiresAtMs = expiresAtMs
+    }
+
+    /// True for the opener's copy (carries `of_seq`); false for the target's
+    /// unsolicited copy.
+    public var isOpenerGrant: Bool { ofSeq != nil }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvRelayGrant {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "relay_grant" else { throw RdvJSONError.wrongType(field: "type") }
+        let grant = RdvRelayGrant(
+            serverSeq: try decoder.decimalString("server_seq"),
+            ofSeq: try decoder.optionalDecimalString("of_seq"),
+            pipeID: try decoder.string("pipe_id"),
+            relayURL: try decoder.string("relay_url"),
+            pipeToken: try decoder.string("pipe_token"),
+            side: try decoder.rawRepresentable("side"),
+            peer: try decoder.string("peer"),
+            issuedAtMs: try decoder.decimalString("issued_at_ms"),
+            expiresAtMs: try decoder.decimalString("expires_at_ms")
+        )
+        try decoder.finish()
+        return grant
+    }
+}

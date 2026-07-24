@@ -52,12 +52,17 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
     public static func connect(
         url: URL,
         bearerToken: String,
-        subprotocol: String = "rdv-v1",
+        subprotocol: String? = "rdv-v1",
         session: URLSession = URLSession(configuration: .default)
     ) async throws -> FedURLSessionWebSocketStream {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(subprotocol, forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        // The control WS negotiates `rdv-v1`; the relay pipe upgrade (§7.2) carries
+        // only the bearer token and names no subprotocol, so callers pass nil to
+        // omit the header rather than advertising a version the relay rejects.
+        if let subprotocol {
+            request.setValue(subprotocol, forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        }
         let task = session.webSocketTask(with: request)
         task.resume()
         let stream = FedURLSessionWebSocketStream(task: task, session: session)
@@ -126,5 +131,31 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
         guard !closed else { return }
         closed = true
         task.cancel(with: .normalClosure, reason: nil)
+    }
+}
+
+extension FedRelayRecordCarrier {
+    /// Production relay-pipe establishment: upgrade `material.relayURL` with the
+    /// pipe token as the bearer credential (no subprotocol — the relay pipe
+    /// upgrade carries only the token, docs/rdv-wire.md §7.2), then run the
+    /// relay_challenge → relay_hello → relay_ready PoP barrier. The returned
+    /// carrier is a ready byte-bridge: binary outer records only, with the relay
+    /// application close codes surfaced as typed `relayClosed` outcomes.
+    public static func establishOverURLSession(
+        material: FedRelayMaterial,
+        clock: any FedMonotonicClock,
+        deadlines: FedStageDeadlinePolicy = FedStageDeadlinePolicy(),
+        session: URLSession = URLSession(configuration: .default)
+    ) async throws -> FedRelayRecordCarrier {
+        let relayURL = material.relayURL
+        let bearerToken = String(decoding: material.pipeToken, as: UTF8.self)
+        return try await establish(material: material, clock: clock, deadlines: deadlines) {
+            try await FedURLSessionWebSocketStream.connect(
+                url: relayURL,
+                bearerToken: bearerToken,
+                subprotocol: nil,
+                session: session
+            )
+        }
     }
 }

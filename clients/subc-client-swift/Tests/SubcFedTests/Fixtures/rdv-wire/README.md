@@ -26,6 +26,12 @@ rather than shipping.
   signature-domain separation, temporal checks, account binding, and the
   device-epoch rollback/conflict rules. Rust and TypeScript consume every
   line with field-specific outcomes; `r1-a4-ttl-pin` pins the one-hour TTL.
+- `device-record-key.json` — the public verification key for the
+  `device-record.jsonl` signatures (key_id `fed-cloud-test`), vendored from
+  subc-federation so the ORIGINAL vector signatures are verified instead of
+  re-signed locally. The signature is Ed25519 over
+  `SHA-256(canonical_bytes(payload))` (a pre-hashed digest); exactly 6 of the
+  8 vectors verify, and the two `r1-a4-wrong-cloud-key*` negatives must not.
 
 Signature conformance (added by slices B and C): a fixed Ed25519 test
 keypair signs each canonical-valid payload; each side commits its signed

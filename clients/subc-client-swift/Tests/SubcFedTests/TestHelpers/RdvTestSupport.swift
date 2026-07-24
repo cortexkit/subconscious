@@ -39,6 +39,24 @@ enum RdvWireFixtures {
         let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: Data(hex: publicHex))
         return (keyId, privateKey, publicKey)
     }
+
+    /// The public verification key for the A4 device-record vectors
+    /// (`device-record.jsonl`), vendored from subc-federation so the ORIGINAL
+    /// vector signatures are verified instead of re-signed locally. Only the
+    /// pubkey is vendored (fed-cloud test domain; the seed never leaves the
+    /// signing side), so this returns just `key_id` + public key.
+    static func deviceRecordKey() throws -> (keyId: String, publicKey: Curve25519.Signing.PublicKey) {
+        let url = URL(fileURLWithPath: directory).appendingPathComponent("device-record-key.json")
+        let data = try Data(contentsOf: url)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let keyId = object["key_id"] as? String,
+              let publicHex = object["ed25519_pubkey_hex"] as? String
+        else {
+            throw FedCarrierError.invalidRelayChallenge
+        }
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: Data(hex: publicHex))
+        return (keyId, publicKey)
+    }
 }
 
 // MARK: - In-memory WebSocket peer

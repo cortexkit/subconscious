@@ -118,8 +118,8 @@ enum FixtureGenerator {
 
     // MARK: - Fed frames
 
-    /// Every baseline fed-frame wire form required by the normative
-    /// acceptance criteria, encoded as u32 LE header_len || header ||
+    /// Baseline Fed frame wire forms used by the fixture parity tests,
+    /// encoded as u32 LE header_len || header ||
     /// u32 LE body_len || body.
     static func generateFedFrames() throws -> [(name: String, bytes: Data)] {
         let effects = Set<String>(["mgmt-v1", "effects-v1"])

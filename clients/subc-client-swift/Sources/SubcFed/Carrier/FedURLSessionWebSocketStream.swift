@@ -89,17 +89,27 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
         if let subprotocol {
             request.setValue(subprotocol, forHTTPHeaderField: "Sec-WebSocket-Protocol")
         }
+        // Validate the upgrade from the delegate's open callback, NOT with a ping
+        // round-trip. Both surfaces this transport serves are server-speaks-first:
+        // the control WS receives `hello_challenge` unprompted, and the relay pipe
+        // receives `relay_challenge`. A ping-based validator therefore waits on a
+        // pong while an unread server frame is already queued, and on Apple's
+        // WebSocket task that pong completion is not guaranteed to arrive — the
+        // upgrade succeeds, the socket is live, and connect() never returns, so it
+        // can only be killed by a caller's own deadline. The open callback fires on
+        // a successful 101 and consumes no frame, which keeps the read contract
+        // intact for the caller that must read the server's first frame.
+        let observer = FedWebSocketOpenObserver()
         let task = session.webSocketTask(with: request)
+        observer.attach(to: task)
         task.resume()
         let stream = FedURLSessionWebSocketStream(task: task, session: session)
         do {
-            try await stream.ping()
+            try await observer.awaitOpen()
         } catch {
             await stream.close()
-            // Report the transport's own cause. A ping only resolves once the
-            // upgrade completes, so a failure here is the upgrade failing, and
-            // the URLError code is the difference between "refused", "reset",
-            // and "accepted nothing and never answered".
+            // Report the transport's own cause: the URLError code is the difference
+            // between "refused", "reset", and "accepted nothing and never answered".
             if let urlError = error as? URLError {
                 throw FedWebSocketError.upgradeFailed(
                     urlErrorCode: urlError.errorCode,
@@ -170,6 +180,77 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
         guard !closed else { return }
         closed = true
         task.cancel(with: .normalClosure, reason: nil)
+    }
+}
+
+/// Resolves once the WebSocket upgrade completes, so `connect` can validate it
+/// without exchanging a frame. `didOpenWithProtocol` fires only on a successful
+/// 101; `didCompleteWithError` and `didCloseWith` cover a rejected or dropped
+/// upgrade. Exactly one of them settles the continuation.
+private final class FedWebSocketOpenObserver: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var outcome: Result<Void, Error>?
+
+    func attach(to task: URLSessionWebSocketTask) {
+        task.delegate = self
+    }
+
+    func awaitOpen() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            // The upgrade can settle before the caller suspends; replay the stored
+            // outcome rather than waiting for a callback that already fired.
+            if let outcome {
+                lock.unlock()
+                continuation.resume(with: outcome)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    private func settle(_ result: Result<Void, Error>) {
+        lock.lock()
+        guard outcome == nil else { return lock.unlock() }
+        outcome = result
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(with: result)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didOpenWithProtocol protocol: String?
+    ) {
+        settle(.success(()))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+        reason: Data?
+    ) {
+        // A close before open means the upgrade was rejected or torn down.
+        settle(.failure(FedWebSocketError.upgradeFailed(
+            urlErrorCode: nil,
+            description: "closed before open (code \(closeCode.rawValue))"
+        )))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            settle(.failure(error))
+        } else {
+            settle(.failure(FedWebSocketError.upgradeFailed(
+                urlErrorCode: nil,
+                description: "task completed before the upgrade opened"
+            )))
+        }
     }
 }
 

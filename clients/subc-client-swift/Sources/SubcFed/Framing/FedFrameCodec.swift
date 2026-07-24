@@ -389,8 +389,13 @@ public enum FedFrameCodec {
                 throw FedFrameError.invalidHeaderField(type: type, field: "type")
             }
             try validateEffect(header, type: type)
+            // Status grammar per fed-wire §8.8. recorded/not_found/expired are the
+            // ledger-answer statuses; fed_seq_fenced and fed_outcome_expired are
+            // served when the queried sequence was fenced or its retained outcome
+            // expired. Both reconcile to ambiguous (never not_sent), so admitting
+            // them here carries no double-execution risk.
             guard let status = header["status"], case .string(let status) = status,
-                  ["recorded", "not_found", "expired"].contains(status)
+                  ["recorded", "not_found", "expired", "fed_seq_fenced", "fed_outcome_expired"].contains(status)
             else { throw FedFrameError.invalidHeaderField(type: type, field: "status") }
             if let omitted = header["body_omitted"] {
                 guard case .boolean = omitted else {

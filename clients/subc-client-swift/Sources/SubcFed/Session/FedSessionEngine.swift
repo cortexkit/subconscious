@@ -177,6 +177,9 @@ public actor FedSessionEngine {
     private var openPureQuerySequences: Set<UInt64> = []
     private var receiveTask: Task<Void, Never>?
     private var timerTask: Task<Void, Never>?
+    /// In-flight origin-side reconciliation for this reconnect, if any. Present
+    /// between sending the effect_status queries and collecting every answer.
+    private var reconciliation: FedPendingReconciliation?
     public private(set) var lastFailure: FedFailure?
     public private(set) var emittedFrames: [FedFrame] = []
 
@@ -275,6 +278,14 @@ public actor FedSessionEngine {
         _ = catalogTracker.apply(remoteCatalog)
         remoteCatalogReceived = true
 
+        // Origin-side reconciliation (fed-wire §8.8): on every reconnect that has
+        // unsettled rows for this peer, query the peer for each unsettled effect
+        // and settle from its authoritative answer BEFORE admitting new mutating
+        // calls. This raises the mutating-admission barrier (pure calls are not
+        // gated) and puts the effect_status queries on the wire; answers are
+        // collected through the inbound frame path and finalize settlement.
+        try await startReconciliation()
+
         let now = deps.clock.nowNanoseconds()
         keepalive = FedKeepaliveController(
             localIntervalMs: negotiated.localKeepaliveIntervalMs,
@@ -343,6 +354,20 @@ public actor FedSessionEngine {
         )
         if let refusal = classification.refusal {
             throw refusal
+        }
+
+        if classification.isMutation {
+            // New mutating admissions wait for any in-flight reconciliation to
+            // settle the peer's unsettled rows first. Pure queries skip this
+            // barrier entirely so reads are never stalled by a reconnect. The wait
+            // happens before permit acquisition so waiting mutations do not consume
+            // admission budget.
+            await effectLog.awaitReconciliationBarrier()
+            // The session may have gone away while we waited; fail closed rather
+            // than admit a mutation on a dead session.
+            guard phase == .ready, role == .primary else {
+                throw FedFailure.disconnected
+            }
         }
 
         let permit = try await admission.acquire(
@@ -482,6 +507,95 @@ public actor FedSessionEngine {
             throw FedFailure.disconnected
         }
         return body
+    }
+
+    // MARK: - Origin-side reconciliation (fed-wire §8.8)
+
+    /// Starts origin-side reconciliation for this reconnect. When the peer has
+    /// unsettled rows, raises the mutating-admission barrier and puts an
+    /// `effect_status` query on the wire for each unsettled effect plus the
+    /// regression sentinel. Answers are collected via ``handleInboundStatusResult``
+    /// and settlement is finalized once every query is answered. Pure calls are
+    /// never gated; only new mutating admissions wait on the barrier.
+    private func startReconciliation() async throws {
+        guard let effectLog, let negotiation else { return }
+        let unsettled = try await effectLog.unsettled()
+        guard !unsettled.isEmpty else { return }
+        let liveEpoch = negotiation.peerLedgerEpoch
+        let sentinel = try await effectLog.regressionSentinel(liveEpoch: liveEpoch)
+
+        // Raise the barrier before any query is sent so a mutating admission that
+        // races the reconnect waits for settlement rather than slipping through.
+        await effectLog.beginReconciliationBarrier()
+
+        let pending = FedPendingReconciliation(
+            liveEpoch: liveEpoch,
+            unsettled: unsettled,
+            sentinel: sentinel
+        )
+        for record in unsettled {
+            try await sendFrame(FedEffectStatusCodec.statusQuery(effect: record.effect))
+        }
+        if let sentinel {
+            try await sendFrame(FedEffectStatusCodec.statusQuery(effect: sentinel))
+        }
+        // A peer that answers nothing leaves the barrier up until the session is
+        // torn down by staleness; record the pending state so inbound results can
+        // finalize settlement.
+        reconciliation = pending
+    }
+
+    /// Collects one inbound `effect_status_result` answer. When every outstanding
+    /// query has been answered, finalizes settlement: the regression sentinel is
+    /// evaluated first (it may poison the epoch), then each unsettled miss is
+    /// settled through the effect log's existing guards, and the mutating-admission
+    /// barrier is released.
+    private func handleInboundStatusResult(_ frame: FedFrame) async throws {
+        guard var pending = reconciliation else { return }
+        guard let answer = FedEffectStatusAnswer(frame: frame) else { return }
+        pending.record(answer)
+        reconciliation = pending
+        guard pending.isComplete else { return }
+        reconciliation = nil
+        try await finalizeReconciliation(pending)
+    }
+
+    /// Settles a completed reconciliation. The sentinel is evaluated before any
+    /// miss is classified so a proven serving-ledger regression poisons the epoch
+    /// first; the effect log's poisoned-epoch guard then forces subsequent misses
+    /// at that epoch to ambiguous. Settlement of every disposition advances the
+    /// durable watermark (handled by the store on terminal commit). Finally the
+    /// mutating-admission barrier is released.
+    private func finalizeReconciliation(_ pending: FedPendingReconciliation) async throws {
+        guard let effectLog else { return }
+        // Sentinel first: a same-epoch not_found for a durably recorded effect is
+        // proof the serving ledger regressed; poison before classifying misses.
+        if let sentinel = pending.sentinel, let answer = pending.sentinelAnswer {
+            try await effectLog.evaluateRegressionSentinel(
+                effect: sentinel,
+                status: answer.status,
+                ledgerComplete: answer.ledgerComplete,
+                resultLedgerEpoch: answer.ledgerEpoch,
+                previouslyRecorded: true
+            )
+        }
+        // Then settle each unsettled miss from the peer's authoritative answer.
+        // applyStatusResult preserves the epoch-mismatch and poisoned-epoch guards
+        // and never blind-replays a call.
+        for record in pending.unsettled {
+            guard let answer = pending.answers[record.effect.seq] else { continue }
+            _ = try await effectLog.applyStatusResult(
+                effect: record.effect,
+                status: answer.status,
+                ledgerComplete: answer.ledgerComplete,
+                resultLedgerEpoch: answer.ledgerEpoch,
+                liveHelloEpoch: pending.liveEpoch,
+                kind: answer.kind,
+                body: answer.body,
+                bodyOmitted: answer.bodyOmitted
+            )
+        }
+        await effectLog.finishReconciliationBarrier()
     }
 
     /// Begins effects-only drain after a replacement becomes primary.
@@ -638,6 +752,8 @@ public actor FedSessionEngine {
             ))
         case .keepalive:
             return
+        case .effectStatusResult:
+            try await handleInboundStatusResult(frame)
         default:
             return
         }

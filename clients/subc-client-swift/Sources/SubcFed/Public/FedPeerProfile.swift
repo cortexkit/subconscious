@@ -141,7 +141,7 @@ public struct FedRelayCandidate: Sendable, Equatable {
     }
 }
 
-/// Reachability facts used by the vendored single-initiator rule. These are
+/// Reachability facts used by the single-initiator decision. These are
 /// distinct from candidate lists: they describe whether each side publishes a
 /// dialable address in the trusted profile.
 public struct FedDialOwnershipFacts: Sendable, Equatable, Codable {
@@ -388,7 +388,7 @@ public enum FedDialOwnership {
     }
 }
 
-/// LAN-direct hygiene checks accounted to the `carrierConnect` stage.
+/// LAN-direct hygiene checks are performed and reported during the `carrierConnect` stage.
 public enum FedLANCandidateHygiene {
     /// Classifies a concrete IP for LAN-direct eligibility without performing
     /// DNS or opening a socket. Returns `nil` when the address is eligible.

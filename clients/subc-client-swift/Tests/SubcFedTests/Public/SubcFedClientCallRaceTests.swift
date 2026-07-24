@@ -275,6 +275,60 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         XCTAssertEqual(FedDialOwnership.initiationRole(for: .relay, localPublicKey: Data(), responderPublicKey: lower, facts: bothUnreachable), .responder)
     }
 
+    // MARK: - Reconnect task invalidation
+
+    /// A dial failure schedules a reconnect task that publishes .reconnectWaiting
+    /// after a couple of actor hops. If a disconnect lands in that window it
+    /// publishes .idle and bumps the generation; the stale task must then bail
+    /// rather than stomp .idle with .reconnectWaiting. The barrier holds the
+    /// reconnect task immediately before its publish so the disconnect is forced
+    /// to land first (deterministic, not a repeated-until-flake race).
+    func testDisconnectBeforeReconnectPublishDoesNotStompIdle() async throws {
+        let profile = try FedPublicTestSupport.humanProfile()
+        let client = SubcFedClient(
+            profile: profile,
+            keyStore: try FedPublicTestSupport.keyStore(),
+            stateStore: FedMemoryStateStore(),
+            observedNetwork: { try! FedPublicTestSupport.observedHomeLAN() },
+            clock: FedFakeClock(),
+            dialFactory: RecordingDialFactory()  // throws .disconnected -> schedules reconnect
+        )
+
+        let states = StateCollector()
+        let stateTask = Task {
+            for await state in await client.states() {
+                await states.record(state)
+            }
+        }
+        defer { stateTask.cancel() }
+
+        // Hold the reconnect task right before it would publish .reconnectWaiting.
+        let gate = ReconnectGate()
+        await client.setReconnectTestBarrier { await gate.block() }
+
+        // The dial fails (.disconnected) and schedules the reconnect task, which
+        // runs up to the barrier and blocks there.
+        do {
+            try await client.connect()
+            XCTFail("expected the dial to fail")
+        } catch {
+            // Expected: the recording factory fails every candidate.
+        }
+        await gate.waitForBlocked()
+
+        // Disconnect while the reconnect task is blocked before its publish.
+        await client.disconnect()
+        // Release the task; it must observe the stale generation and bail without
+        // publishing .reconnectWaiting over the .idle disconnect published.
+        await gate.release()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let finalState = await client.state
+        XCTAssertEqual(finalState, .idle)
+        let stomped = await states.reconnectWaitingAfterIdle
+        XCTAssertFalse(stomped, "stale reconnect task published .reconnectWaiting after .idle")
+    }
+
     // MARK: - Setup helpers
 
     private func makeEngine(transport: GatedMgmtTransport) throws -> FedSessionEngine {
@@ -616,6 +670,16 @@ private actor StateCollector {
             return false
         }
     }
+    /// True if a .reconnectWaiting was published after a .idle — the signature of
+    /// a stale reconnect task stomping the state a disconnect already published.
+    var reconnectWaitingAfterIdle: Bool {
+        var sawIdle = false
+        for state in recorded {
+            if case .idle = state { sawIdle = true }
+            if sawIdle, case .reconnectWaiting = state { return true }
+        }
+        return false
+    }
 }
 
 private actor RoleBox {
@@ -626,5 +690,40 @@ private actor RoleBox {
     private(set) var roles: [Entry] = []
     func record(_ role: FedDialInitiationRole, candidateClass: FedCandidateClass) {
         roles.append(Entry(role: role, candidateClass: candidateClass))
+    }
+}
+
+/// One-shot gate used to hold the reconnect task at its test barrier until the
+/// test has disconnected, forcing the disconnect-before-publish interleave.
+private actor ReconnectGate {
+    private var blocked = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func block() async {
+        blocked = true
+        let pending = blockedWaiters
+        blockedWaiters.removeAll()
+        for waiter in pending { waiter.resume() }
+        if !released {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                releaseWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitForBlocked() async {
+        if blocked { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let pending = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in pending { waiter.resume() }
     }
 }

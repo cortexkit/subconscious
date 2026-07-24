@@ -1,0 +1,552 @@
+import Foundation
+
+/// Strict field decoder over an rdv-wire JSON object. Every consumed key is
+/// tracked so `finish()` rejects any field the DTO does not know — the
+/// deny-unknown-fields rule (docs/rdv-wire.md §1.2) applied to every rdv-wire
+/// message in both directions.
+struct RdvFieldDecoder {
+    let object: RdvJSONObject
+    private var consumed: Set<String> = []
+
+    init(_ object: RdvJSONObject) {
+        self.object = object
+    }
+
+    mutating func value(_ key: String) throws -> RdvJSONValue {
+        guard let value = object[key] else { throw RdvJSONError.missingField(key) }
+        consumed.insert(key)
+        return value
+    }
+
+    mutating func string(_ key: String) throws -> String {
+        guard case .string(let value) = try value(key) else { throw RdvJSONError.wrongType(field: key) }
+        return value
+    }
+
+    /// A string field that must also be canonical decimal-string text (§1.2).
+    mutating func decimalString(_ key: String) throws -> String {
+        let value = try string(key)
+        guard RdvDecimalString.isValid(value) else { throw RdvJSONError.invalidDecimalString(value) }
+        return value
+    }
+
+    mutating func bool(_ key: String) throws -> Bool {
+        guard case .boolean(let value) = try value(key) else { throw RdvJSONError.wrongType(field: key) }
+        return value
+    }
+
+    mutating func object(_ key: String) throws -> RdvJSONObject {
+        guard case .object(let value) = try value(key) else { throw RdvJSONError.wrongType(field: key) }
+        return value
+    }
+
+    mutating func array(_ key: String) throws -> [RdvJSONValue] {
+        guard case .array(let value) = try value(key) else { throw RdvJSONError.wrongType(field: key) }
+        return value
+    }
+
+    /// An optional string field: absent is allowed, but a present value must be a
+    /// string (a present-but-wrong-typed field is still an error).
+    mutating func optionalString(_ key: String) throws -> String? {
+        guard object[key] != nil else { return nil }
+        return try string(key)
+    }
+
+    mutating func optionalDecimalString(_ key: String) throws -> String? {
+        guard object[key] != nil else { return nil }
+        return try decimalString(key)
+    }
+
+    mutating func rawRepresentable<T: RawRepresentable>(_ key: String) throws -> T where T.RawValue == String {
+        let raw = try string(key)
+        guard let value = T(rawValue: raw) else { throw RdvJSONError.wrongType(field: key) }
+        return value
+    }
+
+    /// Reject any field that was not consumed during decoding.
+    func finish() throws {
+        for key in object.keys where !consumed.contains(key) {
+            throw RdvJSONError.unknownField(key)
+        }
+    }
+}
+
+// MARK: - Candidate and registry row
+
+public enum RdvCandidateKind: String, Sendable, Equatable {
+    case lan = "lan"
+    case publicAddress = "public"
+    case relay = "relay"
+}
+
+public enum RdvCandidateProvenance: String, Sendable, Equatable {
+    case observed = "observed"
+    case selfReported = "self_reported"
+}
+
+/// One reachability candidate from a registry row (docs/rdv-wire.md §13a).
+/// `provenance` is mandatory on every kind; `addr` is absent only for `relay`.
+public struct RdvCandidate: Sendable, Equatable {
+    public let kind: RdvCandidateKind
+    public let provenance: RdvCandidateProvenance
+    public let addr: String?
+    public let generation: String
+    public let observedAtMs: String
+    public let expiresAtMs: String
+
+    public init(
+        kind: RdvCandidateKind,
+        provenance: RdvCandidateProvenance,
+        addr: String?,
+        generation: String,
+        observedAtMs: String,
+        expiresAtMs: String
+    ) {
+        self.kind = kind
+        self.provenance = provenance
+        self.addr = addr
+        self.generation = generation
+        self.observedAtMs = observedAtMs
+        self.expiresAtMs = expiresAtMs
+    }
+
+    static func decode(_ object: RdvJSONObject) throws -> RdvCandidate {
+        var decoder = RdvFieldDecoder(object)
+        let candidate = try RdvCandidate(
+            kind: decoder.rawRepresentable("kind"),
+            provenance: decoder.rawRepresentable("provenance"),
+            addr: try decoder.optionalString("addr"),
+            generation: try decoder.decimalString("generation"),
+            observedAtMs: try decoder.decimalString("observed_at_ms"),
+            expiresAtMs: try decoder.decimalString("expires_at_ms")
+        )
+        try decoder.finish()
+        return candidate
+    }
+}
+
+/// A full account-device registry row (docs/rdv-wire.md §13a shared registry
+/// row). This is the unit the candidate mirror stores and the dial ladder reads.
+public struct RdvRegistryRow: Sendable, Equatable {
+    public let x25519PubkeyHex: String
+    public let ed25519PubkeyHex: String
+    public let name: String
+    public let platform: String
+    public let candidates: [RdvCandidate]
+    public let lastSeenMs: String
+    public let online: Bool
+    public let reenrolledAfterTombstone: Bool
+
+    public init(
+        x25519PubkeyHex: String,
+        ed25519PubkeyHex: String,
+        name: String,
+        platform: String,
+        candidates: [RdvCandidate],
+        lastSeenMs: String,
+        online: Bool,
+        reenrolledAfterTombstone: Bool
+    ) {
+        self.x25519PubkeyHex = x25519PubkeyHex
+        self.ed25519PubkeyHex = ed25519PubkeyHex
+        self.name = name
+        self.platform = platform
+        self.candidates = candidates
+        self.lastSeenMs = lastSeenMs
+        self.online = online
+        self.reenrolledAfterTombstone = reenrolledAfterTombstone
+    }
+
+    static func decode(_ object: RdvJSONObject) throws -> RdvRegistryRow {
+        var decoder = RdvFieldDecoder(object)
+        let candidateValues = try decoder.array("candidates")
+        var candidates: [RdvCandidate] = []
+        for value in candidateValues {
+            guard case .object(let candidateObject) = value else {
+                throw RdvJSONError.wrongType(field: "candidates")
+            }
+            candidates.append(try RdvCandidate.decode(candidateObject))
+        }
+        let row = RdvRegistryRow(
+            x25519PubkeyHex: try decoder.string("x25519_pubkey_hex"),
+            ed25519PubkeyHex: try decoder.string("ed25519_pubkey_hex"),
+            name: try decoder.string("name"),
+            platform: try decoder.string("platform"),
+            candidates: candidates,
+            lastSeenMs: try decoder.decimalString("last_seen_ms"),
+            online: try decoder.bool("online"),
+            reenrolledAfterTombstone: try decoder.bool("reenrolled_after_tombstone")
+        )
+        try decoder.finish()
+        return row
+    }
+
+    /// The public-class candidates in dial order: `observed` before
+    /// `self_reported` (docs/rdv-wire.md §5.6 dual-stack fix). LAN and relay
+    /// candidates are excluded; this orders only the public class.
+    public var publicDialOrder: [RdvCandidate] {
+        let publics = candidates.filter { $0.kind == .publicAddress }
+        let observed = publics.filter { $0.provenance == .observed }
+        let selfReported = publics.filter { $0.provenance == .selfReported }
+        return observed + selfReported
+    }
+}
+
+// MARK: - Plain server messages
+
+/// `hello_challenge` (plain, pre-auth; docs/rdv-wire.md §13a). Carries the
+/// server's fresh challenge that the device answers with the hello dual-PoP.
+public struct RdvHelloChallenge: Sendable, Equatable {
+    public let challengeId: String
+    public let nonce: String
+    public let serverEphX25519Pubkey: String
+    public let expiresAtMs: String
+
+    public init(challengeId: String, nonce: String, serverEphX25519Pubkey: String, expiresAtMs: String) {
+        self.challengeId = challengeId
+        self.nonce = nonce
+        self.serverEphX25519Pubkey = serverEphX25519Pubkey
+        self.expiresAtMs = expiresAtMs
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvHelloChallenge {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "hello_challenge" else { throw RdvJSONError.wrongType(field: "type") }
+        let challenge = RdvHelloChallenge(
+            challengeId: try decoder.string("challenge_id"),
+            nonce: try decoder.string("nonce"),
+            serverEphX25519Pubkey: try decoder.string("server_eph_x25519_pubkey"),
+            expiresAtMs: try decoder.decimalString("expires_at_ms")
+        )
+        try decoder.finish()
+        return challenge
+    }
+}
+
+/// `refusal` (plain, unsigned; docs/rdv-wire.md §8.1). Carries no account state.
+public struct RdvRefusal: Sendable, Equatable {
+    public let serverSeq: String
+    public let ofType: String
+    public let ofSeq: String
+    public let code: String
+    public let message: String
+    public let retryAfterMs: String?
+
+    public init(serverSeq: String, ofType: String, ofSeq: String, code: String, message: String, retryAfterMs: String?) {
+        self.serverSeq = serverSeq
+        self.ofType = ofType
+        self.ofSeq = ofSeq
+        self.code = code
+        self.message = message
+        self.retryAfterMs = retryAfterMs
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvRefusal {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "refusal" else { throw RdvJSONError.wrongType(field: "type") }
+        let refusal = RdvRefusal(
+            serverSeq: try decoder.decimalString("server_seq"),
+            ofType: try decoder.string("of_type"),
+            ofSeq: try decoder.string("of_seq"),
+            code: try decoder.string("code"),
+            message: try decoder.string("message"),
+            retryAfterMs: try decoder.optionalDecimalString("retry_after_ms")
+        )
+        try decoder.finish()
+        return refusal
+    }
+}
+
+// MARK: - Signed envelope and its payloads
+
+/// The `{type:"signed", key_id, payload, sig_hex}` envelope (docs/rdv-wire.md
+/// §5.1). `payload` is retained as the raw object so the verifier can
+/// re-canonicalize exactly what was signed before any typed decoding.
+public struct RdvSignedEnvelope: Sendable, Equatable {
+    public let keyId: String
+    public let payload: RdvJSONObject
+    public let signatureHex: String
+
+    public init(keyId: String, payload: RdvJSONObject, signatureHex: String) {
+        self.keyId = keyId
+        self.payload = payload
+        self.signatureHex = signatureHex
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvSignedEnvelope {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "signed" else { throw RdvJSONError.wrongType(field: "type") }
+        let envelope = RdvSignedEnvelope(
+            keyId: try decoder.string("key_id"),
+            payload: try decoder.object("payload"),
+            signatureHex: try decoder.string("sig_hex")
+        )
+        try decoder.finish()
+        return envelope
+    }
+}
+
+public enum RdvRegistryChange: String, Sendable, Equatable {
+    case added
+    case removed
+    case updated
+    case online
+    case offline
+}
+
+public struct RdvRegistrySnapshot: Sendable, Equatable {
+    public let serverSeq: String
+    public let devices: [RdvRegistryRow]
+
+    public init(serverSeq: String, devices: [RdvRegistryRow]) {
+        self.serverSeq = serverSeq
+        self.devices = devices
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvRegistrySnapshot {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "registry_snapshot" else { throw RdvJSONError.wrongType(field: "type") }
+        let deviceValues = try decoder.array("devices")
+        var devices: [RdvRegistryRow] = []
+        for value in deviceValues {
+            guard case .object(let rowObject) = value else { throw RdvJSONError.wrongType(field: "devices") }
+            devices.append(try RdvRegistryRow.decode(rowObject))
+        }
+        let snapshot = RdvRegistrySnapshot(serverSeq: try decoder.decimalString("server_seq"), devices: devices)
+        try decoder.finish()
+        return snapshot
+    }
+}
+
+public struct RdvRegistryDelta: Sendable, Equatable {
+    public let serverSeq: String
+    public let device: RdvRegistryRow
+    public let change: RdvRegistryChange
+
+    public init(serverSeq: String, device: RdvRegistryRow, change: RdvRegistryChange) {
+        self.serverSeq = serverSeq
+        self.device = device
+        self.change = change
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvRegistryDelta {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "registry_delta" else { throw RdvJSONError.wrongType(field: "type") }
+        let delta = RdvRegistryDelta(
+            serverSeq: try decoder.decimalString("server_seq"),
+            device: try RdvRegistryRow.decode(decoder.object("device")),
+            change: try decoder.rawRepresentable("change")
+        )
+        try decoder.finish()
+        return delta
+    }
+}
+
+/// `device_joined` (docs/rdv-wire.md §5.3, A-C5). NOTICE-ONLY: clients surface
+/// the un-dismissible join notice but never overwrite registry truth from it.
+public struct RdvDeviceJoined: Sendable, Equatable {
+    public let serverSeq: String
+    public let joinEventId: String
+    public let device: RdvRegistryRow
+    public let issuedAtMs: String
+
+    public init(serverSeq: String, joinEventId: String, device: RdvRegistryRow, issuedAtMs: String) {
+        self.serverSeq = serverSeq
+        self.joinEventId = joinEventId
+        self.device = device
+        self.issuedAtMs = issuedAtMs
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvDeviceJoined {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "device_joined" else { throw RdvJSONError.wrongType(field: "type") }
+        let notice = RdvDeviceJoined(
+            serverSeq: try decoder.decimalString("server_seq"),
+            joinEventId: try decoder.string("join_event_id"),
+            device: try RdvRegistryRow.decode(decoder.object("device")),
+            issuedAtMs: try decoder.decimalString("issued_at_ms")
+        )
+        try decoder.finish()
+        return notice
+    }
+}
+
+public struct RdvDeviceJoinedReceipt: Sendable, Equatable {
+    public let serverSeq: String
+    public let joinEventId: String
+
+    public init(serverSeq: String, joinEventId: String) {
+        self.serverSeq = serverSeq
+        self.joinEventId = joinEventId
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvDeviceJoinedReceipt {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "device_joined_receipt" else { throw RdvJSONError.wrongType(field: "type") }
+        let receipt = RdvDeviceJoinedReceipt(
+            serverSeq: try decoder.decimalString("server_seq"),
+            joinEventId: try decoder.string("join_event_id")
+        )
+        try decoder.finish()
+        return receipt
+    }
+}
+
+public struct RdvTombstone: Sendable, Equatable {
+    public let serverSeq: String
+    public let x25519PubkeyHex: String
+    public let enrollmentId: String
+    public let generation: String
+    public let issuedAtMs: String
+
+    public init(serverSeq: String, x25519PubkeyHex: String, enrollmentId: String, generation: String, issuedAtMs: String) {
+        self.serverSeq = serverSeq
+        self.x25519PubkeyHex = x25519PubkeyHex
+        self.enrollmentId = enrollmentId
+        self.generation = generation
+        self.issuedAtMs = issuedAtMs
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvTombstone {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "tombstone" else { throw RdvJSONError.wrongType(field: "type") }
+        let tombstone = RdvTombstone(
+            serverSeq: try decoder.decimalString("server_seq"),
+            x25519PubkeyHex: try decoder.string("x25519_pubkey_hex"),
+            enrollmentId: try decoder.string("enrollment_id"),
+            generation: try decoder.decimalString("generation"),
+            issuedAtMs: try decoder.decimalString("issued_at_ms")
+        )
+        try decoder.finish()
+        return tombstone
+    }
+}
+
+public struct RdvResyncRequired: Sendable, Equatable {
+    public let serverSeq: String
+
+    public init(serverSeq: String) {
+        self.serverSeq = serverSeq
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvResyncRequired {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "resync_required" else { throw RdvJSONError.wrongType(field: "type") }
+        let resync = RdvResyncRequired(serverSeq: try decoder.decimalString("server_seq"))
+        try decoder.finish()
+        return resync
+    }
+}
+
+/// `epoch_push` is named by the slice as a signed payload but its field set is
+/// not pinned in docs/rdv-wire.md §13a. Every signed payload carries
+/// `server_seq`, so this decodes that minimum and nothing else; the client
+/// recognizes it and advances its cursor without acting on registry state.
+public struct RdvEpochPush: Sendable, Equatable {
+    public let serverSeq: String
+
+    public init(serverSeq: String) {
+        self.serverSeq = serverSeq
+    }
+
+    public static func decode(_ object: RdvJSONObject) throws -> RdvEpochPush {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "epoch_push" else { throw RdvJSONError.wrongType(field: "type") }
+        let push = RdvEpochPush(serverSeq: try decoder.decimalString("server_seq"))
+        try decoder.finish()
+        return push
+    }
+}
+
+/// A decoded signed payload, dispatched on the payload's `type`.
+public enum RdvSignedPayload: Sendable, Equatable {
+    case registrySnapshot(RdvRegistrySnapshot)
+    case registryDelta(RdvRegistryDelta)
+    case deviceJoined(RdvDeviceJoined)
+    case deviceJoinedReceipt(RdvDeviceJoinedReceipt)
+    case tombstone(RdvTombstone)
+    case resyncRequired(RdvResyncRequired)
+    case epochPush(RdvEpochPush)
+
+    /// The per-recipient contiguous server_seq this payload carries (§4).
+    public var serverSeq: String {
+        switch self {
+        case .registrySnapshot(let value): return value.serverSeq
+        case .registryDelta(let value): return value.serverSeq
+        case .deviceJoined(let value): return value.serverSeq
+        case .deviceJoinedReceipt(let value): return value.serverSeq
+        case .tombstone(let value): return value.serverSeq
+        case .resyncRequired(let value): return value.serverSeq
+        case .epochPush(let value): return value.serverSeq
+        }
+    }
+
+    public static func decode(_ payload: RdvJSONObject) throws -> RdvSignedPayload {
+        guard case .string(let type)? = payload["type"] else { throw RdvJSONError.missingField("type") }
+        switch type {
+        case "registry_snapshot": return .registrySnapshot(try RdvRegistrySnapshot.decode(payload))
+        case "registry_delta": return .registryDelta(try RdvRegistryDelta.decode(payload))
+        case "device_joined": return .deviceJoined(try RdvDeviceJoined.decode(payload))
+        case "device_joined_receipt": return .deviceJoinedReceipt(try RdvDeviceJoinedReceipt.decode(payload))
+        case "tombstone": return .tombstone(try RdvTombstone.decode(payload))
+        case "resync_required": return .resyncRequired(try RdvResyncRequired.decode(payload))
+        case "epoch_push": return .epochPush(try RdvEpochPush.decode(payload))
+        default: throw RdvJSONError.unknownField("payload.type=\(type)")
+        }
+    }
+}
+
+// MARK: - Client → server messages
+
+/// The `hello` message (device→server; docs/rdv-wire.md §13a). `seq` is the
+/// per-session monotonic decimal-string counter; hello consumes "1".
+public struct RdvHello: Sendable, Equatable {
+    public let seq: String
+    public let challengeId: String
+    public let ed25519SigHex: String
+    public let x25519ProofHex: String
+
+    public init(seq: String, challengeId: String, ed25519SigHex: String, x25519ProofHex: String) {
+        self.seq = seq
+        self.challengeId = challengeId
+        self.ed25519SigHex = ed25519SigHex
+        self.x25519ProofHex = x25519ProofHex
+    }
+
+    /// Serialize as canonical rdv-wire JSON for the wire.
+    public func encode() throws -> String {
+        let object = RdvJSONObject([
+            "type": .string("hello"),
+            "seq": .string(seq),
+            "challenge_id": .string(challengeId),
+            "ed25519_sig_hex": .string(ed25519SigHex),
+            "x25519_proof_hex": .string(x25519ProofHex),
+        ])
+        return try RdvCanonicalJSON.canonicalString(.object(object))
+    }
+
+    /// Server-side decode (deny-unknown-fields, as a device→server message).
+    public static func decode(_ object: RdvJSONObject) throws -> RdvHello {
+        var decoder = RdvFieldDecoder(object)
+        let type = try decoder.string("type")
+        guard type == "hello" else { throw RdvJSONError.wrongType(field: "type") }
+        let hello = RdvHello(
+            seq: try decoder.decimalString("seq"),
+            challengeId: try decoder.string("challenge_id"),
+            ed25519SigHex: try decoder.string("ed25519_sig_hex"),
+            x25519ProofHex: try decoder.string("x25519_proof_hex")
+        )
+        try decoder.finish()
+        return hello
+    }
+}

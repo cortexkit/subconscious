@@ -129,6 +129,28 @@ final class FedRendezvousClientTests: XCTestCase {
         return hello
     }
 
+    /// Push a plain (unsigned) `refusal`. Like `relay_grant`, a refusal is
+    /// dispatched through the per-recipient queue and consumes a `server_seq`
+    /// from the contiguous space.
+    private func sendRefusal(
+        server: LoopbackWebSocketStream,
+        serverSeq: String,
+        ofType: String,
+        ofSeq: String,
+        code: String
+    ) async throws {
+        let fields: [String: RdvJSONValue] = [
+            "type": .string("refusal"),
+            "server_seq": .string(serverSeq),
+            "of_type": .string(ofType),
+            "of_seq": .string(ofSeq),
+            "code": .string(code),
+            "message": .string("peer unreachable"),
+        ]
+        let text = try RdvCanonicalJSON.canonicalString(.object(RdvJSONObject(fields)))
+        try await server.send(.text(text))
+    }
+
     private func sendSigned(
         server: LoopbackWebSocketStream,
         payload: RdvJSONObject,
@@ -579,6 +601,76 @@ final class FedRendezvousClientTests: XCTestCase {
         // non-decimal new_epoch also reject.
         XCTAssertThrowsError(try RdvEpochPush.decode(epochPushObject(jws: "only-one-segment")))
         XCTAssertThrowsError(try RdvEpochPush.decode(try object(overriding: ["new_epoch": "8.0"])))
+    }
+
+    /// A `refusal` is dispatched through the same per-recipient queue as signed
+    /// payloads and `relay_grant`, so it consumes a `server_seq` and MUST advance
+    /// the cursor. Before the fix the handler stored the refusal and returned
+    /// without advancing, so the very next frame read as a gap — and because
+    /// refusals arrive in bursts exactly when a dial ladder is falling through
+    /// rungs on a bad link, that turned into a burst of full registry resyncs
+    /// over a metered connection.
+    func testRefusalAdvancesCursorAndDoesNotTripResync() async throws {
+        let (identity, edPub) = try makeIdentity()
+        let (client, registry) = makeClient(identity: identity, pin: try signingPin())
+
+        let server = try await connectWithBarrier(
+            client: client, registry: registry, identity: identity, deviceEd25519Pub: edPub,
+            snapshotPayload: snapshot("1", [rowA(candidateCount: 1)])
+        )
+
+        // A refusal at seq 2 consumes that sequence number (cursor → 3).
+        try await sendRefusal(
+            server: server, serverSeq: "2", ofType: "relay_open", ofSeq: "7",
+            code: "peer_unreachable"
+        )
+        try await waitFor { await client.lastRefusal?.code == "peer_unreachable" }
+
+        // The next in-sequence frame is seq 3, which applies ONLY if the refusal
+        // advanced the cursor to 3. Under the old code the cursor was still at 2,
+        // so this delta read as seq > expected → gap → resync.
+        try await sendSigned(server: server, payload: delta("3", rowB(), "added"))
+        try await waitFor { await client.deviceRow(forPubkey: self.pubkeyB) != nil }
+
+        let gapCount = await client.gapCount
+        let resyncCount = await client.resyncCount
+        XCTAssertEqual(gapCount, 0, "a refusal must not leave the cursor behind")
+        XCTAssertEqual(resyncCount, 0, "a refusal must not trigger a resync")
+        await client.disconnect()
+    }
+
+    /// A refusal replayed after a reconnect classifies as already-seen and must
+    /// not be surfaced a second time — a duplicate would otherwise double-complete
+    /// a pending relay_open.
+    func testReplayedRefusalIsDroppedNotResurfaced() async throws {
+        let (identity, edPub) = try makeIdentity()
+        let (client, registry) = makeClient(identity: identity, pin: try signingPin())
+
+        let server = try await connectWithBarrier(
+            client: client, registry: registry, identity: identity, deviceEd25519Pub: edPub,
+            snapshotPayload: snapshot("1", [rowA(candidateCount: 1)])
+        )
+
+        try await sendRefusal(
+            server: server, serverSeq: "2", ofType: "relay_open", ofSeq: "7",
+            code: "peer_unreachable"
+        )
+        try await waitFor { await client.lastRefusal?.code == "peer_unreachable" }
+
+        // Replay the SAME sequence number carrying a different code. It is behind
+        // the cursor, so it must be dropped rather than replacing lastRefusal.
+        try await sendRefusal(
+            server: server, serverSeq: "2", ofType: "relay_open", ofSeq: "7",
+            code: "rate_limited"
+        )
+        try await sendSigned(server: server, payload: delta("3", rowB(), "added"))
+        try await waitFor { await client.deviceRow(forPubkey: self.pubkeyB) != nil }
+
+        let lastCode = await client.lastRefusal?.code
+        let resyncCount = await client.resyncCount
+        XCTAssertEqual(lastCode, "peer_unreachable", "a replayed refusal must not be resurfaced")
+        XCTAssertEqual(resyncCount, 0, "a replayed refusal must not trigger a resync")
+        await client.disconnect()
     }
 
     func testEpochPushBetweenSeqPayloadsDoesNotResyncOrAdvanceCursor() async throws {

@@ -397,10 +397,7 @@ public actor FedRendezvousClient {
         case "relay_grant":
             return processRelayGrant(object)
         case "refusal":
-            if let refusal = try? RdvRefusal.decode(object) {
-                lastRefusal = refusal
-            }
-            return nil
+            return processRefusal(object)
         default:
             return nil
         }
@@ -423,6 +420,34 @@ public actor FedRendezvousClient {
             return .needsResync
         case .apply:
             deliverRelayGrant(grant)
+            advanceCursor()
+            return nil
+        }
+    }
+
+    /// Handle a plain (unsigned) `refusal` control frame (§8.1). A refusal is
+    /// dispatched through the same per-recipient queue as signed payloads and
+    /// `relay_grant`, so it consumes a `server_seq` from the contiguous space and
+    /// must advance the cursor. Skipping it leaves the cursor behind and makes the
+    /// NEXT frame read as a gap — and refusals cluster exactly when the network is
+    /// already degraded (a dial ladder falling through rungs, rate-limited
+    /// requests), so a burst would otherwise turn into a burst of full registry
+    /// resyncs over a metered link.
+    ///
+    /// The cursor is processed BEFORE and INDEPENDENT of any interest in the
+    /// refusal's contents: a kind this client ignores still consumed a sequence
+    /// number. A replayed refusal after a reconnect classifies as `.dropped` and
+    /// must not be surfaced again, or a pending relay_open would complete twice.
+    private func processRefusal(_ object: RdvJSONObject) -> ReadLoopOutcome? {
+        guard let refusal = try? RdvRefusal.decode(object) else { return nil }
+        if quarantined { return nil }
+        switch classifyCursor(refusal.serverSeq) {
+        case .uninitialized, .dropped:
+            return nil
+        case .gap:
+            return .needsResync
+        case .apply:
+            lastRefusal = refusal
             advanceCursor()
             return nil
         }

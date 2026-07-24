@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import OSLog
 
 /// The identity material the control-WS client consumes from enrollment. The
 /// device token is opaque — it is sent verbatim as the `Authorization: Bearer`
@@ -121,8 +122,17 @@ public actor FedRendezvousClient {
     private(set) public var invalidSignatureCount = 0
     private(set) public var joinNotices: [RdvDeviceJoined] = []
     private(set) public var tombstones: [RdvTombstone] = []
+    /// Verified `epoch_push` payloads received (membership revocations). This
+    /// client has no org membership, so each is a logged no-op; the array makes
+    /// receipt observable to tests and to the notice obligations above.
+    private(set) public var epochPushes: [RdvEpochPush] = []
     private(set) public var lastRefusal: RdvRefusal?
     private(set) public var lastJoinReceipt: RdvDeviceJoinedReceipt?
+
+    /// Loud, greppable line for an epoch_push that names an org this device is
+    /// not a member of (every epoch push, for this non-member client). The fixed
+    /// `RDV_EPOCH_PUSH_NOOP` token is what operators grep for.
+    private let epochPushLog = Logger(subsystem: "io.cortexkit.subcfed", category: "rendezvous")
 
     /// Designated initializer with an injectable transport factory. Tests supply
     /// a scripted in-memory peer; production uses the URLSession convenience
@@ -400,8 +410,18 @@ public actor FedRendezvousClient {
         // Quarantined after a gap: act on nothing but a verified snapshot.
         if quarantined { return nil }
 
+        // A payload that carries NO server_seq (epoch_push) is not part of the
+        // per-recipient contiguous sequence: it contributes no cursor advance
+        // and must not be gap-checked against the cursor. Apply it (a logged
+        // no-op for this non-member client) and keep reading. Gap detection
+        // below runs only over the seq-carrying kinds, so an epoch_push landing
+        // between two seq-carrying payloads can never trip a resync.
+        guard let seqString = payload.serverSeq else {
+            return applyPayload(payload)
+        }
+
         guard let expected = expectedNextSeq else { return nil }
-        guard let seq = try? RdvDecimalString.parse(payload.serverSeq) else { return nil }
+        guard let seq = try? RdvDecimalString.parse(seqString) else { return nil }
 
         if seq < expected {
             // Regression or duplicate → drop + count, never act.
@@ -448,9 +468,21 @@ public actor FedRendezvousClient {
         case .resyncRequired:
             quarantined = true
             return .needsResync
-        case .epochPush:
-            // Recognized; the cursor already advanced. No registry action (the
-            // field set is not pinned in §13a — see RdvEpochPush).
+        case .epochPush(let push):
+            // An epoch_push is a MEMBERSHIP REVOCATION for the receiving
+            // device's own org — NOT a peer-registry change. It carried no
+            // server_seq, so it contributed no cursor advance upstream. This
+            // client (the phone) is a statically-paired Local(Verified) peer
+            // with NO org membership, so every epoch push names an org it is
+            // not a member of: a logged no-op. Receipt is NEVER grounds to
+            // widen, reset, or refresh local trust.
+            epochPushes.append(push)
+            // SEAM — org-membership hard-stop (NOT implemented): if/when this
+            // client gains org membership, THIS is the point that must hard-stop
+            // its own sessions when `push.org` / `push.account` match its own
+            // membership (the Mac daemon drains and fences live sessions here).
+            // Until then there is no membership to revoke, so this stays a no-op.
+            epochPushLog.notice("RDV_EPOCH_PUSH_NOOP org=\(push.org, privacy: .public) account=\(push.account, privacy: .public) new_epoch=\(push.newEpoch, privacy: .public) reason=\(push.reason.rawValue, privacy: .public): no membership in this org; logged no-op, no trust change")
             return nil
         }
     }

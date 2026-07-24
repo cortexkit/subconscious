@@ -183,6 +183,45 @@ final class FedRendezvousClientTests: XCTestCase {
         RdvTestSigning.registryDeltaPayload(serverSeq: serverSeq, device: device, change: change)
     }
 
+    // MARK: - epoch_push JWS builders
+
+    /// base64url (RFC 4648 §5, no padding) encode — the compact-JWS segment
+    /// alphabet the client's epoch_push parser decodes.
+    private func base64URLEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    /// Build a compact CKCRED-shaped JWS whose payload segment encodes `claims`.
+    /// The header and signature segments are opaque filler: the client parses
+    /// the payload but does NOT verify the signature (the worker does that), so
+    /// their contents are irrelevant to decoding.
+    private func epochPushJWS(claims: [String: Any]) throws -> String {
+        let payloadData = try JSONSerialization.data(withJSONObject: claims)
+        let header = base64URLEncode(Data(#"{"alg":"EdDSA"}"#.utf8))
+        let payload = base64URLEncode(payloadData)
+        let signature = base64URLEncode(Data(repeating: 0xAB, count: 64))
+        return "\(header).\(payload).\(signature)"
+    }
+
+    /// A well-formed epoch_push CKCRED claims set (every field valid).
+    private func validEpochPushClaims() -> [String: Any] {
+        [
+            "typ": "epoch_push",
+            "org": "org-acme",
+            "account": "acct-123",
+            "new_epoch": "8",
+            "reason": "revoked",
+        ]
+    }
+
+    /// The rdv-wire signed-payload object for an epoch_push carrying `jws`.
+    private func epochPushObject(jws: String) -> RdvJSONObject {
+        RdvJSONObject(["type": .string("epoch_push"), "jws": .string(jws)])
+    }
+
     // MARK: - Tests
 
     func testConnectHandshakeBarrierAndMirrorQuery() async throws {
@@ -466,6 +505,153 @@ final class FedRendezvousClientTests: XCTestCase {
         XCTAssertEqual(peerCount, 2)
         XCTAssertNotNil(cRow)
         XCTAssertNil(aRow)
+        await client.disconnect()
+    }
+
+    // MARK: - epoch_push (membership revocation, no server_seq)
+
+    func testEpochPushDecodesRealShapeAndCarriesNoServerSeq() throws {
+        // A real epoch_push is {"type":"epoch_push","jws":"..."} and NOTHING
+        // else — it carries NO server_seq (fed-core `EpochPush { jws }`,
+        // docs/rdv-wire.md §6.4.1). The OLD decode read server_seq as a required
+        // decimal string, so this exact frame threw missingField("server_seq")
+        // and was dropped before any real one could land. New code decodes it.
+        let jws = try epochPushJWS(claims: validEpochPushClaims())
+        let payload = try RdvSignedPayload.decode(epochPushObject(jws: jws))
+        guard case .epochPush(let push) = payload else {
+            return XCTFail("expected epochPush, got \(payload)")
+        }
+        // The parsed CKCRED revocation claims.
+        XCTAssertEqual(push.org, "org-acme")
+        XCTAssertEqual(push.account, "acct-123")
+        XCTAssertEqual(push.newEpoch, "8")
+        XCTAssertEqual(push.reason, .revoked)
+        // No cursor: an epoch_push contributes no server_seq advance.
+        XCTAssertNil(payload.serverSeq, "epoch_push must carry no server_seq cursor")
+    }
+
+    func testEpochPushRejectsExtraServerSeqField() throws {
+        // The envelope is exactly type + jws (deny-unknown-fields). A smuggled
+        // server_seq — the old, wrong shape — is an unknown field and rejects.
+        let jws = try epochPushJWS(claims: validEpochPushClaims())
+        let object = RdvJSONObject([
+            "type": .string("epoch_push"),
+            "jws": .string(jws),
+            "server_seq": .string("5"),
+        ])
+        XCTAssertThrowsError(try RdvEpochPush.decode(object)) { error in
+            guard case RdvJSONError.unknownField(let field) = error else {
+                return XCTFail("expected unknownField, got \(error)")
+            }
+            XCTAssertEqual(field, "server_seq")
+        }
+    }
+
+    func testEpochPushJWSValidationRejectsBadClaims() throws {
+        func object(overriding overrides: [String: Any]) throws -> RdvJSONObject {
+            var claims = validEpochPushClaims()
+            for (key, value) in overrides { claims[key] = value }
+            return epochPushObject(jws: try epochPushJWS(claims: claims))
+        }
+
+        // 1. typ != "epoch_push" → REJECT.
+        XCTAssertThrowsError(try RdvEpochPush.decode(try object(overriding: ["typ": "not_epoch_push"]))) { error in
+            guard case RdvJSONError.wrongType(let field) = error else { return XCTFail("got \(error)") }
+            XCTAssertEqual(field, "typ")
+        }
+        // 2. empty org → REJECT.
+        XCTAssertThrowsError(try RdvEpochPush.decode(try object(overriding: ["org": ""]))) { error in
+            guard case RdvJSONError.missingField(let field) = error else { return XCTFail("got \(error)") }
+            XCTAssertEqual(field, "org")
+        }
+        // 3. empty account → REJECT.
+        XCTAssertThrowsError(try RdvEpochPush.decode(try object(overriding: ["account": ""]))) { error in
+            guard case RdvJSONError.missingField(let field) = error else { return XCTFail("got \(error)") }
+            XCTAssertEqual(field, "account")
+        }
+        // 4. UNKNOWN reason → REFUSE, fail closed (never ignore).
+        XCTAssertThrowsError(try RdvEpochPush.decode(try object(overriding: ["reason": "frobnicated"]))) { error in
+            guard case RdvJSONError.wrongType(let field) = error else { return XCTFail("got \(error)") }
+            XCTAssertEqual(field, "reason")
+        }
+
+        // Robustness: a malformed JWS (not three non-empty segments) and a
+        // non-decimal new_epoch also reject.
+        XCTAssertThrowsError(try RdvEpochPush.decode(epochPushObject(jws: "only-one-segment")))
+        XCTAssertThrowsError(try RdvEpochPush.decode(try object(overriding: ["new_epoch": "8.0"])))
+    }
+
+    func testEpochPushBetweenSeqPayloadsDoesNotResyncOrAdvanceCursor() async throws {
+        let (identity, edPub) = try makeIdentity()
+        let (client, registry) = makeClient(identity: identity, pin: try signingPin())
+
+        let server = try await connectWithBarrier(
+            client: client, registry: registry, identity: identity, deviceEd25519Pub: edPub,
+            snapshotPayload: snapshot("1", [rowA(candidateCount: 1)])
+        )
+
+        // In-sequence delta at seq 2 (cursor → 3).
+        try await sendSigned(server: server, payload: delta("2", rowA(candidateCount: 2), "updated"))
+        try await waitFor { await client.candidates(forPubkey: self.pubkeyA)?.count == 3 }
+
+        // A real-shaped epoch_push lands BETWEEN seq 2 and seq 3. It carries no
+        // server_seq, so it must NOT advance the cursor and must NOT trip gap
+        // detection. Under the old code this frame was dropped at decode (no
+        // server_seq); here it is parsed and recorded as a logged no-op.
+        let jws = try epochPushJWS(claims: validEpochPushClaims())
+        try await sendSigned(server: server, payload: epochPushObject(jws: jws))
+        try await waitFor { await client.epochPushes.count == 1 }
+
+        // The next in-sequence delta is seq 3 — it applies ONLY if the epoch_push
+        // left the cursor at 3 (advanced nothing). Had the epoch_push advanced
+        // the cursor, seq 3 would be a regression and be dropped.
+        try await sendSigned(server: server, payload: delta("3", rowB(), "added"))
+        try await waitFor { await client.deviceRow(forPubkey: self.pubkeyB) != nil }
+
+        let gapCount = await client.gapCount
+        let resyncCount = await client.resyncCount
+        let dropped = await client.droppedFrameCount
+        let peerCount = await registry.count
+        let pushes = await client.epochPushes
+        XCTAssertEqual(gapCount, 0, "epoch_push must not trip gap detection")
+        XCTAssertEqual(resyncCount, 0, "epoch_push must not trigger a resync")
+        XCTAssertEqual(dropped, 0, "neither the epoch_push nor the seq-3 delta is dropped")
+        XCTAssertEqual(peerCount, 1, "no reconnect: the epoch_push did not quarantine the stream")
+        XCTAssertEqual(pushes.count, 1)
+        XCTAssertEqual(pushes.first?.org, "org-acme")
+        XCTAssertEqual(pushes.first?.reason, .revoked)
+        await client.disconnect()
+    }
+
+    func testInvalidEpochPushIsDroppedWithoutResync() async throws {
+        let (identity, edPub) = try makeIdentity()
+        let (client, registry) = makeClient(identity: identity, pin: try signingPin())
+
+        let server = try await connectWithBarrier(
+            client: client, registry: registry, identity: identity, deviceEd25519Pub: edPub,
+            snapshotPayload: snapshot("1", [rowA(candidateCount: 1)])
+        )
+
+        // An epoch_push whose JWS carries an UNKNOWN reason must be refused (fail
+        // closed): dropped at decode, never recorded, and — carrying no
+        // server_seq — it must not disturb the cursor or trip a resync.
+        var claims = validEpochPushClaims()
+        claims["reason"] = "frobnicated"
+        let jws = try epochPushJWS(claims: claims)
+        try await sendSigned(server: server, payload: epochPushObject(jws: jws))
+
+        // The next in-sequence delta at seq 2 still applies — proving the
+        // refused epoch_push neither advanced the cursor nor quarantined the
+        // stream.
+        try await sendSigned(server: server, payload: delta("2", rowA(candidateCount: 2), "updated"))
+        try await waitFor { await client.candidates(forPubkey: self.pubkeyA)?.count == 3 }
+
+        let pushes = await client.epochPushes
+        let gapCount = await client.gapCount
+        let resyncCount = await client.resyncCount
+        XCTAssertEqual(pushes.count, 0, "refused epoch_push must not be recorded")
+        XCTAssertEqual(gapCount, 0)
+        XCTAssertEqual(resyncCount, 0)
         await client.disconnect()
     }
 }

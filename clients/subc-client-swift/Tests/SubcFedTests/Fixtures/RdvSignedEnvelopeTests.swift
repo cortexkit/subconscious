@@ -198,20 +198,22 @@ final class RdvSignedEnvelopeTests: XCTestCase {
     }
 
     func testDeviceRecordVectorsProduceExpectedOutcomes() throws {
-        // The vendored A4 signatures are produced by fed cloud-domain test keys
-        // whose public key is deliberately NOT vendored in this repo (PROVENANCE:
-        // "test keys never cross trust boundaries"). To exercise the full A4
-        // verification logic cryptographically against every vector's real field
-        // values, each vector's canonical payload is re-signed with a local cloud
-        // key; the two bad_signature vectors are re-signed with a WRONG key. This
-        // preserves every payload, now_ms, recorded state, and expected outcome.
-        let cloudKey = Curve25519.Signing.PrivateKey()
-        let wrongKey = Curve25519.Signing.PrivateKey()
-        let verifier = A4Verifier(cloudPublicKey: cloudKey.publicKey, cloudKeyId: "fed-cloud-test")
+        // The A4 device-record signatures are verified against the vendored
+        // fed-cloud test pubkey (device-record-key.json) — the cross-implementation
+        // signature check this corpus exists for. The signature is Ed25519 over
+        // SHA-256(canonical_bytes(payload)): a PRE-HASHED DIGEST, not the raw
+        // canonical bytes. The shared verifySignature primitive hashes first, so
+        // the trap that once forced a local re-sign (verifying raw canonical
+        // bytes, which fails every time) never applies here.
+        let cloudKey = try RdvWireFixtures.deviceRecordKey()
+        XCTAssertEqual(cloudKey.keyId, "fed-cloud-test")
+        let verifier = A4Verifier(cloudPublicKey: cloudKey.publicKey, cloudKeyId: cloudKey.keyId)
 
         let lines = try RdvWireFixtures.jsonlLines("device-record.jsonl")
         XCTAssertGreaterThan(lines.count, 0)
         var consumed = Set<String>()
+        var signatureVerified: [String] = []
+        var signatureRejected: [String] = []
 
         for line in lines {
             let entry = try XCTUnwrap(try JSONSerialization.jsonObject(with: line) as? [String: Any])
@@ -223,13 +225,27 @@ final class RdvSignedEnvelopeTests: XCTestCase {
             let envelopeAny = try XCTUnwrap(entry["envelope"] as? [String: Any])
             let keyId = try XCTUnwrap(envelopeAny["key_id"] as? String)
             XCTAssertEqual(keyId, "fed-cloud-test", "vector \(vectorId) key_id")
+            let sigHex = try XCTUnwrap(envelopeAny["sig_hex"] as? String)
             let payloadValue = try RdvJSONValue(any: XCTUnwrap(envelopeAny["payload"]))
             guard case .object(let payloadObject) = payloadValue else {
                 throw RdvJSONError.topLevelMustBeObject
             }
 
-            let signingKey = (expected == .badSignature) ? wrongKey : cloudKey
-            let envelope = try reSignedEnvelope(payload: payloadObject, keyId: keyId, key: signingKey)
+            // Build the envelope from the fixture's OWN vendored signature — no
+            // re-signing — so the original cross-impl signature is what's checked.
+            let envelope = RdvSignedEnvelope(keyId: keyId, payload: payloadObject, signatureHex: sigHex)
+
+            // Track the raw signature outcome so the 6/2 split is asserted
+            // explicitly below (independent of the temporal/account/epoch rules).
+            if (try? RdvSignedEnvelopeVerifier.verifySignature(
+                payload: payloadObject,
+                signatureHex: sigHex,
+                publicKey: cloudKey.publicKey
+            )) != nil {
+                signatureVerified.append(vectorId)
+            } else {
+                signatureRejected.append(vectorId)
+            }
 
             let expectedAccountUlid = entry["expected_account_ulid"] as? String ?? "acct-a4-valid"
             let recordedEpoch = (entry["recorded_epoch"] as? String).flatMap { try? RdvDecimalString.parse($0) }
@@ -256,16 +272,31 @@ final class RdvSignedEnvelopeTests: XCTestCase {
 
         // Every vector in the file drove an assertion (non-vacuous consumption).
         XCTAssertEqual(consumed.count, lines.count, "all device-record vectors must be consumed")
+
+        // THE COUNT THAT PROVES IT: exactly 6 of the 8 vectors verify with the
+        // vendored key. r1-a4-wrong-cloud-key and r1-a4-wrong-cloud-key-expired
+        // are deliberate negatives signed by a different key and MUST NOT verify.
+        // If all 8 verify, the wrong-key rejection case has been destroyed — that
+        // is a failure, not a pass.
+        XCTAssertEqual(signatureVerified.count, 6, "exactly 6 vectors must verify with the vendored key")
+        XCTAssertEqual(signatureRejected.count, 2, "exactly 2 vectors must fail signature")
+        XCTAssertEqual(
+            Set(signatureRejected),
+            Set(["r1-a4-wrong-cloud-key", "r1-a4-wrong-cloud-key-expired"]),
+            "the two wrong-key negatives are the only signature failures"
+        )
         XCTAssertTrue(consumed.contains("r1-a4-wrong-cloud-key-expired"), "order-pin vector present")
     }
 
     func testDeviceRecordOrderPinSignatureBeforeTemporal() throws {
         // Explicit order-pin: a payload that is BOTH wrongly-signed AND expired
         // must yield bad_signature, never expired — an implementer must not leak
-        // temporal information about an unauthenticated artifact.
-        let cloudKey = Curve25519.Signing.PrivateKey()
+        // temporal information about an unauthenticated artifact. The verifier
+        // checks against the vendored cloud key; the envelope is signed with a
+        // different key so its signature is invalid against that key.
+        let cloudKey = try RdvWireFixtures.deviceRecordKey()
         let wrongKey = Curve25519.Signing.PrivateKey()
-        let verifier = A4Verifier(cloudPublicKey: cloudKey.publicKey, cloudKeyId: "fed-cloud-test")
+        let verifier = A4Verifier(cloudPublicKey: cloudKey.publicKey, cloudKeyId: cloudKey.keyId)
 
         let expiredPayload = RdvJSONObject([
             "typ": .string("device_record"),
@@ -275,7 +306,7 @@ final class RdvSignedEnvelopeTests: XCTestCase {
             "iat_ms": .string("1783000000000"),
             "exp_ms": .string("1783003600000"), // already expired relative to now below
         ])
-        let envelope = try reSignedEnvelope(payload: expiredPayload, keyId: "fed-cloud-test", key: wrongKey)
+        let envelope = try reSignedEnvelope(payload: expiredPayload, keyId: cloudKey.keyId, key: wrongKey)
         let outcome = try verifier.verify(
             envelope: envelope,
             nowMs: 1_784_001_000_000,

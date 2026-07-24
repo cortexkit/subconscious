@@ -73,7 +73,16 @@ final class FedURLSessionWebSocketStreamTests: XCTestCase {
         } catch is FedTestTimeout {
             XCTFail("connect must fail fast, not hang")
         } catch let error as FedWebSocketError {
-            XCTAssertEqual(error, .connectionFailed)
+            // The transport must report WHY, not just that it failed: an outer
+            // deadline cannot distinguish a refused connection from a blocked
+            // one, which is exactly the ambiguity a bare failure produces.
+            guard case .upgradeFailed(let urlErrorCode, _) = error else {
+                return XCTFail("expected a typed upgrade failure, got \(error)")
+            }
+            XCTAssertEqual(
+                urlErrorCode, URLError.cannotConnectToHost.rawValue,
+                "nothing listening must surface as cannot-connect, not an opaque failure"
+            )
         } catch {
             // Any surfaced error is acceptable so long as it fails fast.
         }

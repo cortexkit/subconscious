@@ -24,6 +24,12 @@ public enum FedWebSocketCloseCode: Int, Sendable, Equatable {
 public enum FedWebSocketError: Error, Sendable, Equatable {
     case close(FedWebSocketCloseCode)
     case connectionFailed
+    /// The upgrade failed with a transport-level cause. `urlErrorCode` is the
+    /// `URLError.Code` raw value when the failure came from URLSession, so a
+    /// caller can distinguish refused from reset from blackholed instead of
+    /// reading one opaque failure. Without this the only signal is a caller's
+    /// own deadline, which cannot tell "blocked" from "merely slow".
+    case upgradeFailed(urlErrorCode: Int?, description: String)
     case unsupportedMessage
 }
 
@@ -49,12 +55,32 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
     /// The returned stream has a validated upgrade: a ping/pong round-trip fails
     /// fast if the server rejected the upgrade (for example HTTP 426 when no
     /// common subprotocol exists) or the connection could not be established.
+    /// Transport deadline for the upgrade itself. Deliberately shorter than the
+    /// 60s `URLSessionConfiguration.default` request timeout: a caller wrapping
+    /// `connect` in its own bound would otherwise always win the race, so the
+    /// transport could never report a typed cause and every failure looked the
+    /// same. Generous enough for a cold cellular upgrade, where radio wake plus a
+    /// full TLS handshake dominates (measured cold establish runs several seconds
+    /// even on a wired path).
+    public static let defaultUpgradeTimeout: TimeInterval = 25
+
+    private static func upgradeSession(timeout: TimeInterval) -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = timeout
+        // Never silently park waiting for connectivity: on a blocked path that
+        // turns a diagnosable failure into an indefinite hang.
+        configuration.waitsForConnectivity = false
+        return URLSession(configuration: configuration)
+    }
+
     public static func connect(
         url: URL,
         bearerToken: String,
         subprotocol: String? = "rdv-v1",
-        session: URLSession = URLSession(configuration: .default)
+        session: URLSession? = nil,
+        upgradeTimeout: TimeInterval = FedURLSessionWebSocketStream.defaultUpgradeTimeout
     ) async throws -> FedURLSessionWebSocketStream {
+        let session = session ?? upgradeSession(timeout: upgradeTimeout)
         var request = URLRequest(url: url)
         request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
         // The control WS negotiates `rdv-v1`; the relay pipe upgrade (§7.2) carries
@@ -70,7 +96,20 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
             try await stream.ping()
         } catch {
             await stream.close()
-            throw FedWebSocketError.connectionFailed
+            // Report the transport's own cause. A ping only resolves once the
+            // upgrade completes, so a failure here is the upgrade failing, and
+            // the URLError code is the difference between "refused", "reset",
+            // and "accepted nothing and never answered".
+            if let urlError = error as? URLError {
+                throw FedWebSocketError.upgradeFailed(
+                    urlErrorCode: urlError.errorCode,
+                    description: urlError.localizedDescription
+                )
+            }
+            throw FedWebSocketError.upgradeFailed(
+                urlErrorCode: nil,
+                description: String(describing: error)
+            )
         }
         return stream
     }

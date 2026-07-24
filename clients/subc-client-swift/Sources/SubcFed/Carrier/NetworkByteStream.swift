@@ -27,14 +27,22 @@ public actor FedNetworkByteStream: FedTCPByteStream {
     }
 
     /// Opens a TCP connection to `host:port` and waits until it is ready.
+    ///
+    /// TCP_NODELAY is enabled: the carrier writes each Noise record as a
+    /// length prefix followed by the body, so with Nagle's algorithm on, the
+    /// small prefix write waits for the delayed ACK of the previous segment —
+    /// ~150 ms of head-of-line stall per record over a real link. Disabling
+    /// Nagle sends each record immediately.
     public static func connect(host: String, port: UInt16) async throws -> FedNetworkByteStream {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw FedFailure.invalidProfile(field: "port")
         }
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
         let connection = NWConnection(
             host: NWEndpoint.Host(host),
             port: nwPort,
-            using: .tcp
+            using: NWParameters(tls: nil, tcp: tcpOptions)
         )
         return try await start(connection)
     }

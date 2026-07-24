@@ -681,7 +681,8 @@ public actor SubcFedClient {
     private func scheduleReconnectIfNeeded(after failure: FedFailure) {
         guard !explicitlyDisconnected else { return }
         if case .dormant = connectionState { return }
-        // Only partition-bearing aggregates or plain disconnect schedule retry.
+        // Only an allCandidatesFailed error containing at least one retryable
+        // candidate failure, or a plain disconnected error, schedules automatic retry.
         let retryable: Bool
         switch failure {
         case .allCandidatesFailed(let failures):

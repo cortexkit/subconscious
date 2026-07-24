@@ -19,6 +19,10 @@ let package = Package(
     products: [
         .library(name: "SubcClient", targets: ["SubcClient"]),
         .library(name: "SubcFed", targets: ["SubcFed"]),
+        // Shared alfonso-surface models (Ask/Board/Observe/Projects) with the
+        // decode-tolerance discipline. Exported as a product so native apps
+        // (iOS, GPUI) consume the models without forking them.
+        .library(name: "SubcChatAskSupport", targets: ["SubcChatAskSupport"]),
         .executable(name: "subc-swift-probe", targets: ["SubcSwiftProbe"]),
         .executable(name: "subc-chat", targets: ["SubcChat"]),
     ],

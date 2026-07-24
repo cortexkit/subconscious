@@ -69,6 +69,14 @@ actor RdvMessageQueue {
         }
     }
 
+    /// Non-blocking dequeue: returns the next message if one is already queued,
+    /// else nil without suspending. Tests use it to assert a frame was (or was
+    /// not) sent without risking a hang.
+    func popNow() -> FedWebSocketMessage? {
+        guard !messages.isEmpty else { return nil }
+        return messages.removeFirst()
+    }
+
     func close() {
         guard !closed else { return }
         closed = true
@@ -100,6 +108,11 @@ actor LoopbackWebSocketStream: FedWebSocketStream {
     func receive() async throws -> FedWebSocketMessage? {
         guard !closed else { return nil }
         return try await inbox.pop()
+    }
+
+    /// Non-blocking receive for test assertions (see `RdvMessageQueue.popNow`).
+    func tryReceiveNow() async -> FedWebSocketMessage? {
+        await inbox.popNow()
     }
 
     func close() async {
@@ -251,5 +264,107 @@ enum RdvTestSigning {
             "expires_at_ms": .string(expiresAtMs),
         ])
         return try RdvCanonicalJSON.canonicalString(.object(object))
+    }
+}
+
+
+// MARK: - Relay signaling harness
+
+/// A connected rendezvous control-WS client driven by a scripted in-memory peer,
+/// for relay-signaling tests (relay_open / relay_grant). The peer plays the
+/// AccountDO: it issues the hello challenge, accepts the hello, and pushes the
+/// signed registry barrier so the client reaches `.ready`; the test then drives
+/// relay grants and observes relay_open frames off the wire.
+struct RelayOpsHarness {
+    let client: FedRendezvousClient
+    let server: LoopbackWebSocketStream
+
+    static func connect(localX25519Priv: Data) async throws -> RelayOpsHarness {
+        let registry = RdvServerPeerRegistry()
+        let x25519Key = try FedNoiseKeyPair(privateKey: localX25519Priv)
+        let identity = try FedRendezvousIdentity(
+            accountId: "acct-relay-ops",
+            tokenId: "token-relay-ops",
+            tokenVersion: "1",
+            deviceToken: "opaque-device-token",
+            x25519Key: x25519Key,
+            ed25519PrivateKey: Data(repeating: 0x22, count: 32)
+        )
+        let key = try RdvWireFixtures.signingKey()
+        let pin = RdvAccountSigningKeyPin(keyId: key.keyId, ed25519PublicKey: key.publicKey)
+        let configuration = FedRendezvousClient.Configuration(
+            controlURL: URL(string: "wss://rdv.test.invalid/v1/ws")!,
+            identity: identity,
+            signingKeyPin: pin
+        )
+        let client = FedRendezvousClient(configuration: configuration) { _ in
+            let pair = LoopbackWebSocketPair()
+            await registry.add(pair.server)
+            return pair.client
+        }
+
+        let connectTask = Task { try await client.connect() }
+        var resolved: LoopbackWebSocketStream?
+        for _ in 0..<5000 {
+            if let peer = await registry.peer(at: 0) {
+                resolved = peer
+                break
+            }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        guard let server = resolved else { throw FedCarrierError.carrierClosed }
+
+        // Drive the hello handshake (the peer need not verify the PoP; it only
+        // has to deliver the challenge and then the barrier).
+        let serverEphPubHex = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.lowercaseHex
+        try await server.send(.text(try RdvTestSigning.helloChallengeText(serverEphX25519PubkeyHex: serverEphPubHex)))
+        _ = try await server.receive() // the client's hello
+        let barrier = RdvTestSigning.registrySnapshotPayload(serverSeq: "1", devices: [])
+        try await server.send(.text(try RdvTestSigning.signedEnvelopeText(signPayload: barrier)))
+        try await connectTask.value
+        return RelayOpsHarness(client: client, server: server)
+    }
+
+    /// Read the next frame off the wire and decode it as a `relay_open`.
+    func awaitRelayOpen() async throws -> RdvRelayOpen {
+        let message = try await fedTestWithTimeout { () -> FedWebSocketMessage? in
+            try await self.server.receive()
+        }
+        guard let message, case .text(let text) = message else { throw FedCarrierError.carrierClosed }
+        return try RdvRelayOpen.decode(try RdvJSONValue.parseObject(Data(text.utf8)))
+    }
+
+    /// Push a plain (unsigned) `relay_grant` to the client. `ofSeq` is set only
+    /// for the opener's copy; the target's unsolicited copy passes nil.
+    func sendRelayGrant(serverSeq: String, ofSeq: String?, side: FedRelaySide, peer: String) async throws {
+        var fields: [String: RdvJSONValue] = [
+            "type": .string("relay_grant"),
+            "server_seq": .string(serverSeq),
+            "pipe_id": .string("01HZPIPEPIPEPIPEPIPEPIPEPI"),
+            "relay_url": .string("wss://rdv.test.invalid/v1/pipe/01HZPIPEPIPEPIPEPIPEPIPEPI"),
+            "pipe_token": .string("relay-pipe-token"),
+            "side": .string(side.rawValue),
+            "peer": .string(peer),
+            "issued_at_ms": .string("1700000000000"),
+            "expires_at_ms": .string("1700000060000"),
+        ]
+        if let ofSeq {
+            fields["of_seq"] = .string(ofSeq)
+        }
+        let text = try RdvCanonicalJSON.canonicalString(.object(RdvJSONObject(fields)))
+        try await server.send(.text(text))
+    }
+
+    /// Whether a `relay_open` is sitting in the server inbox. Used to prove the
+    /// higher-key peer never opens: after its grant is claimed, the wire carries
+    /// no relay_open. A short settle guards against an in-flight send racing the
+    /// check.
+    func hasPendingRelayOpen() async -> Bool {
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        guard let message = await server.tryReceiveNow() else { return false }
+        guard case .text(let text) = message,
+              let object = try? RdvJSONValue.parseObject(Data(text.utf8)),
+              case .string(let type)? = object["type"] else { return false }
+        return type == "relay_open"
     }
 }

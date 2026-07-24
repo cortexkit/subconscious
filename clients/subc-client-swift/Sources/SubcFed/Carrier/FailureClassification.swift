@@ -286,6 +286,9 @@ public enum FedCarrierError: Error, Sendable, Equatable {
     case invalidRelayChallenge
     case invalidRelayProof
     case relayReadyMissing
+    /// The relay pipe closed with a typed rdv-wire application close code. The
+    /// ladder and app classify dormancy vs partition vs auth/dead-pipe from it.
+    case relayClosed(FedRelayCloseOutcome)
     case timeout(FedCandidateStage)
 }
 

@@ -74,12 +74,60 @@ final class NetworkDialFactoryTests: XCTestCase {
         }
     }
 
-    func testRelayCandidateGetsTypedUnsupportedRefusalWithoutConnecting() async throws {
+    func testRelayCandidateIsRoutedToTheRelayUpgradeNotRefused() async throws {
+        // SUPERSEDES Slice-1's `testRelayCandidateGetsTypedUnsupportedRefusal…`.
+        // Slice 1 typed-refused relay candidates with `unsupportedCandidateClass`
+        // because the relay carrier was not wired yet; Slice 2 implements that
+        // path, so a relay candidate must now be ROUTED to the relay-pipe upgrade
+        // (never the direct TCP connect, never refused). We observe the routing
+        // via the injected seams: the relay upgrade is invoked exactly once and
+        // the direct connect is never invoked for a relay candidate.
         let connectCount = CallCounter()
-        let factory = FedNetworkDialFactory(connect: { _, _ in
-            await connectCount.increment()
-            throw FedFailure.disconnected
-        })
+        let relayUpgradeCount = CallCounter()
+        let factory = FedNetworkDialFactory(
+            connect: { _, _ in
+                await connectCount.increment()
+                throw FedFailure.disconnected
+            },
+            relayUpgrade: { _ in
+                await relayUpgradeCount.increment()
+                throw FedFailure.disconnected
+            }
+        )
+        let relay = FedPeerCandidate.relay(try FedRelayCandidate(
+            candidateID: "relay-1",
+            relayURL: URL(string: "wss://relay.example/pipe")!,
+            pipeToken: Data("token".utf8),
+            accountID: "acct",
+            pipeID: String(repeating: "0", count: 26),
+            side: .a,
+            tokenVersion: 1,
+            accountSigningPublicKey: Data(repeating: 0x01, count: 32),
+            accountKeyID: "key-1"
+        ))
+
+        // A relay dial needs the companion Ed25519 key for the relay PoP; supply
+        // one so the path reaches the upgrade seam rather than refusing earlier.
+        _ = try? await factory.dial(candidate: relay, context: try makeContext(role: .initiator, withCompanionKey: true))
+
+        let relayCalls = await relayUpgradeCount.count
+        let directCalls = await connectCount.count
+        XCTAssertEqual(relayCalls, 1, "a relay candidate must take the relay-pipe upgrade path")
+        XCTAssertEqual(directCalls, 0, "a relay candidate must never open a direct TCP socket")
+    }
+
+    func testRelayDialWithoutCompanionKeyRefusesBeforeConnecting() async throws {
+        // The relay PoP answers the relay challenge with the companion Ed25519
+        // key; a profile lacking it cannot redeem a pipe and must fail closed
+        // BEFORE any relay socket is opened.
+        let relayUpgradeCount = CallCounter()
+        let factory = FedNetworkDialFactory(
+            connect: { _, _ in throw FedFailure.disconnected },
+            relayUpgrade: { _ in
+                await relayUpgradeCount.increment()
+                throw FedFailure.disconnected
+            }
+        )
         let relay = FedPeerCandidate.relay(try FedRelayCandidate(
             candidateID: "relay-1",
             relayURL: URL(string: "wss://relay.example/pipe")!,
@@ -93,13 +141,13 @@ final class NetworkDialFactoryTests: XCTestCase {
         ))
 
         do {
-            _ = try await factory.dial(candidate: relay, context: try makeContext(role: .initiator))
-            XCTFail("relay candidate must be refused in this build")
+            _ = try await factory.dial(candidate: relay, context: try makeContext(role: .initiator, withCompanionKey: false))
+            XCTFail("a relay dial without the companion key must fail closed")
         } catch let failure as FedFailure {
-            XCTAssertEqual(failure, .candidateRejected(reason: .unsupportedCandidateClass))
+            XCTAssertEqual(failure, .invalidProfile(field: "companionSigningPrivateKey"))
         }
-        let calls = await connectCount.count
-        XCTAssertEqual(calls, 0, "a refused candidate must never open a socket")
+        let relayCalls = await relayUpgradeCount.count
+        XCTAssertEqual(relayCalls, 0, "no relay socket may open without the companion key")
     }
 
     func testResponderRoleOnDirectCandidateIsRefusedWithoutConnecting() async throws {
@@ -190,7 +238,7 @@ final class NetworkDialFactoryTests: XCTestCase {
 
     // MARK: - Context
 
-    private func makeContext(role: FedDialInitiationRole) throws -> FedDialAttemptContext {
+    private func makeContext(role: FedDialInitiationRole, withCompanionKey: Bool = false) throws -> FedDialAttemptContext {
         let responderKey = try FedNoiseKeyPair(privateKey: responderPrivateKey)
         let initiatorKey = try FedNoiseKeyPair(privateKey: initiatorPrivateKey)
         return FedDialAttemptContext(
@@ -198,7 +246,7 @@ final class NetworkDialFactoryTests: XCTestCase {
             localPublicKey: initiatorKey.publicKey,
             localPrivateKey: initiatorPrivateKey,
             responderStaticPublicKey: responderKey.publicKey,
-            companionSigningPrivateKey: nil,
+            companionSigningPrivateKey: withCompanionKey ? Data(repeating: 0x33, count: 32) : nil,
             dialPolicy: FedDialPolicy(),
             helloPolicy: try FedHelloPolicy(),
             clock: SystemFedMonotonicClock(),

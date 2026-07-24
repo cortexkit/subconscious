@@ -70,6 +70,15 @@ public enum FedRendezvousError: Error, Equatable, Sendable {
     case malformedMessage
     case barrierViolation
     case refused(RdvRefusal)
+    /// `relay_open` (and other post-barrier signaling) requires the `.ready`
+    /// state — the registry barrier must have landed before the client may open
+    /// a relay pipe toward a peer it has discovered.
+    case relayOpenRequiresReady
+    /// A pending `awaitRelayGrant` waiter was released because the control
+    /// session tore down (disconnect/resync) before a grant arrived. Grants are
+    /// session-scoped signaling; the dial re-drives a fresh relay_open after
+    /// reconnect rather than acting on a stale grant.
+    case relayGrantSessionEnded
 }
 
 /// The rendezvous control-WS client (docs/rdv-wire.md §4). This is a CONNECTION
@@ -123,6 +132,18 @@ public actor FedRendezvousClient {
     private(set) public var tombstones: [RdvTombstone] = []
     private(set) public var lastRefusal: RdvRefusal?
     private(set) public var lastJoinReceipt: RdvDeviceJoinedReceipt?
+
+    // Relay signaling state (docs/rdv-wire.md §6.6). Grants are session-scoped:
+    // buffered per peer until the dial ladder claims them, with waiters parked
+    // for a peer whose grant has not arrived yet. The ledger enforces grant
+    // single-use + redemption-TTL expiry at redemption time.
+    private var grantLedger = FedRelayGrantLedger()
+    private var bufferedGrants: [String: [RdvRelayGrant]] = [:]
+    private var grantWaiters: [String: [CheckedContinuation<RdvRelayGrant, Error>]] = [:]
+    /// The most recent relay_grant delivered (surfaced for tests and the app).
+    private(set) public var lastRelayGrant: RdvRelayGrant?
+    /// Count of relay_grant frames accepted off the control WS (both sides).
+    private(set) public var relayGrantCount = 0
 
     /// Designated initializer with an injectable transport factory. Tests supply
     /// a scripted in-memory peer; production uses the URLSession convenience
@@ -202,6 +223,19 @@ public actor FedRendezvousClient {
         expectedNextSeq = nil
         quarantined = false
         sessionSeq = 0
+        // Grants are session-scoped signaling (§4 rollover disposition: both the
+        // opener's of_seq-bound grant and the target's unsolicited grant are
+        // dropped with the session and re-driven by a fresh relay_open after
+        // reconnect). Release any parked waiters and drop buffered grants so a
+        // stale grant can never be acted on across a reconnect.
+        let waiters = grantWaiters
+        grantWaiters = [:]
+        bufferedGrants = [:]
+        for peerWaiters in waiters.values {
+            for waiter in peerWaiters {
+                waiter.resume(throwing: FedRendezvousError.relayGrantSessionEnded)
+            }
+        }
     }
 
     private func startReadLoop() {
@@ -350,6 +384,8 @@ public actor FedRendezvousClient {
         switch type {
         case "signed":
             return processSigned(object)
+        case "relay_grant":
+            return processRelayGrant(object)
         case "refusal":
             if let refusal = try? RdvRefusal.decode(object) {
                 lastRefusal = refusal
@@ -357,6 +393,72 @@ public actor FedRendezvousClient {
             return nil
         default:
             return nil
+        }
+    }
+
+    /// Handle a plain (unsigned) `relay_grant` control frame (§6.6). The grant
+    /// carries a per-recipient `server_seq` and participates in the contiguous
+    /// cursor exactly like a signed frame; because it is unsigned, a gap
+    /// quarantines by sequence alone (§4 plain-frame rule). On an in-sequence
+    /// grant the cursor advances and the grant is delivered to the dial ladder —
+    /// BOTH the opener's `of_seq`-bound copy (side a) and the target's
+    /// UNSOLICITED copy (side b), which the target must act on, never drop.
+    private func processRelayGrant(_ object: RdvJSONObject) -> ReadLoopOutcome? {
+        guard let grant = try? RdvRelayGrant.decode(object) else { return nil }
+        if quarantined { return nil }
+        switch classifyCursor(grant.serverSeq) {
+        case .uninitialized, .dropped:
+            return nil
+        case .gap:
+            return .needsResync
+        case .apply:
+            deliverRelayGrant(grant)
+            advanceCursor()
+            return nil
+        }
+    }
+
+    /// Classify a frame's `server_seq` against the per-recipient contiguous
+    /// cursor (§4), recording the drop/gap side effects (counts, quarantine).
+    /// `.apply` means act on the frame and then call `advanceCursor()`.
+    private enum CursorDisposition {
+        case apply, dropped, gap, uninitialized
+    }
+
+    private func classifyCursor(_ serverSeq: String) -> CursorDisposition {
+        guard let expected = expectedNextSeq else { return .uninitialized }
+        guard let seq = try? RdvDecimalString.parse(serverSeq) else { return .uninitialized }
+        if seq < expected {
+            droppedFrameCount += 1
+            return .dropped
+        }
+        if seq > expected {
+            quarantined = true
+            gapCount += 1
+            return .gap
+        }
+        return .apply
+    }
+
+    private func advanceCursor() {
+        if let expected = expectedNextSeq {
+            expectedNextSeq = expected + 1
+        }
+    }
+
+    /// Deliver an in-sequence grant: resume a waiter parked for the grant's peer,
+    /// or buffer it until the dial ladder claims it. Keyed by `peer` (the remote
+    /// pubkey the grant connects to), which is the same lookup both the opener
+    /// (side a) and the target (side b) use.
+    private func deliverRelayGrant(_ grant: RdvRelayGrant) {
+        relayGrantCount += 1
+        lastRelayGrant = grant
+        if var waiters = grantWaiters[grant.peer], !waiters.isEmpty {
+            let waiter = waiters.removeFirst()
+            grantWaiters[grant.peer] = waiters
+            waiter.resume(returning: grant)
+        } else {
+            bufferedGrants[grant.peer, default: []].append(grant)
         }
     }
 
@@ -500,6 +602,51 @@ public actor FedRendezvousClient {
 
     public var isReady: Bool {
         state == .ready
+    }
+
+    // MARK: - Relay signaling (relay_open / relay_grant)
+
+    /// Send `relay_open` toward `peerPubkey` (docs/rdv-wire.md §6.6). ONLY the
+    /// lower-key initiator of the pair calls this — the dial ladder makes that
+    /// ownership decision; the higher-key peer never opens and instead redeems
+    /// the unsolicited grant via `awaitRelayGrant(fromPeer:)`. Consumes the next
+    /// per-session `seq`. `nonce` is 16 bytes of hex minted by the caller; a
+    /// replayed open (same nonce) is refused `duplicate_rejected` server-side.
+    public func relayOpen(to peerPubkey: String, nonce: String) async throws {
+        guard state == .ready, let stream else { throw FedRendezvousError.relayOpenRequiresReady }
+        sessionSeq += 1
+        let open = RdvRelayOpen(seq: String(sessionSeq), to: peerPubkey, nonce: nonce)
+        try await stream.send(.text(try open.encode()))
+    }
+
+    /// Await the next relay_grant whose `peer` is `peerPubkey` (the remote pubkey
+    /// this device connects to). Returns a buffered grant immediately if one has
+    /// already arrived; otherwise parks until the control WS delivers one. Both
+    /// the opener (side a, `of_seq`-bound) and the target (side b, unsolicited)
+    /// claim their grant through this one path. Throws
+    /// `relayGrantSessionEnded` if the session tears down before a grant lands.
+    public func awaitRelayGrant(fromPeer peerPubkey: String) async throws -> RdvRelayGrant {
+        if var buffered = bufferedGrants[peerPubkey], !buffered.isEmpty {
+            let grant = buffered.removeFirst()
+            bufferedGrants[peerPubkey] = buffered
+            return grant
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            grantWaiters[peerPubkey, default: []].append(continuation)
+        }
+    }
+
+    /// Validate and record redemption of `grant` at wall-clock `nowMs`
+    /// (server-authoritative time, §1.2). Enforces grant single-use and the
+    /// redemption-TTL expiry: a reused grant throws `alreadyRedeemed` and is
+    /// never retried; an expired grant (zero remaining ms) throws `expired`.
+    public func redeemRelayGrant(_ grant: RdvRelayGrant, nowMs: UInt64) throws {
+        try grantLedger.redeem(grant: grant, nowMs: nowMs)
+    }
+
+    /// Whether a pipe has already been redeemed on this device (single-use).
+    public func isGrantRedeemed(pipeID: String) -> Bool {
+        grantLedger.isRedeemed(pipeID: pipeID)
     }
 
     /// True once the client has entered the fatal §2.2 account_key_mismatch

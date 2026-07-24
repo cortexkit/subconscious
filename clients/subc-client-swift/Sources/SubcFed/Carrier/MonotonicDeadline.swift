@@ -207,6 +207,7 @@ public func fedCandidateFailure(
         case .carrierClosed: return .transport(.eof)
         case .relayNotReady, .invalidRelayChallenge, .invalidRelayProof, .relayReadyMissing:
             return .relayAuthenticationFailed(code: "relay_authentication_failed")
+        case .relayClosed(let outcome): return relayCloseFailureReason(outcome)
         }
     }
     if let failure = error as? FedFailure {
@@ -220,6 +221,25 @@ public func fedCandidateFailure(
         }
     }
     return .transport(.otherTransport)
+}
+
+/// Map a typed relay-pipe close to the candidate-failure vocabulary. Partition-
+/// equivalent closes (idle dormancy, peer_closed, pressure, frame cap, generic
+/// transport) become ordinary transport failures so the ladder may fall through
+/// and the session may reconnect; auth/dead-pipe/revoked/violation closes become
+/// relay-authentication failures, which suppress automatic reconnect until a
+/// fresh relay_open mints a new grant (docs/rdv-wire.md §7.3).
+private func relayCloseFailureReason(_ outcome: FedRelayCloseOutcome) -> CandidateFailureReason {
+    switch outcome {
+    case .idle, .peerClosed:
+        return .transport(.eof)
+    case .pressure:
+        return .transport(.relayPressure)
+    case .frameCap, .transport:
+        return .transport(.webSocket)
+    case .revoked, .authFailed, .deadPipe, .violation:
+        return .relayAuthenticationFailed(code: "relay_\(outcome)")
+    }
 }
 
 private func deadlineStage(_ error: FedDeadlineError) -> FedCandidateStage {

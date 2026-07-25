@@ -49,6 +49,15 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Paired with the post-build check at the end of this job. Snapshotting
+      # first means the property tested is "the build rewrote a tracked file"
+      # rather than "the tree is clean" — the latter is satisfied by a fresh CI
+      # checkout for reasons unrelated to the build, so it would pass here while
+      # being useless anywhere a tree can legitimately carry other changes.
+      - name: Snapshot tree state
+        run: git status --porcelain | sort > "$RUNNER_TEMP/tree-before.txt"
+        shell: bash
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -80,12 +89,17 @@ jobs:
       # mason dispatch (it refuses a dirty parent checkout). By this point the
       # steps above have built every target, so anything cargo intended to
       # rewrite has been rewritten.
-      - name: Tree is clean after building
+      #
+      # Compares against the snapshot rather than requiring an empty tree, so
+      # the delta is attributable to the build. Pre-existing changes appear in
+      # both snapshots and cancel; only what the build touched survives.
+      - name: Build did not modify tracked files
         if: ${{ !cancelled() }}
         run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "build modified tracked files:" >&2
-            git status --short >&2
+          git status --porcelain | sort > "$RUNNER_TEMP/tree-after.txt"
+          if ! diff -q "$RUNNER_TEMP/tree-before.txt" "$RUNNER_TEMP/tree-after.txt" >/dev/null; then
+            echo "the build rewrote tracked files:" >&2
+            diff "$RUNNER_TEMP/tree-before.txt" "$RUNNER_TEMP/tree-after.txt" >&2 || true
             git diff >&2
             exit 1
           fi

@@ -604,6 +604,20 @@ you had, and a lean reads to them as a considered judgement. So the honest park
 is **the option set plus the unknown**, not a lean. Same defect as publishing a
 number with a caveat: the qualifier evaporates and the confident part travels.
 
+The same mechanism reaches design items. CALLO parked "build a recovery path for
+a mistaken self-tombstone" with a plausible story, then killed it on
+re-examination: the daemon cannot distinguish a mistaken compromise push from a
+real one, so **any clear-path is equally available to whoever caused the push** —
+a recovery mechanism that cannot authenticate the recoverer is a bypass with
+better manners. The real recovery already existed (mint a new key; a fresh key
+never matches an old tombstone).
+
+So: **an open item that should stay unbuilt has to say so explicitly, or its mere
+presence is an instruction.** A to-do list is a queue by default, and silence
+about whether something *should* be done reads as assent. The note has to say DO
+NOT BUILD THIS with the reasoning, or the next session re-derives the plausible
+story and builds it.
+
 Related pair, from two ungated scripts found the same night: **a failing ungated
 script is a dormant alarm; a passing one is an active false assurance.** The
 failing one turns red the moment anyone runs it by hand. The passing one is

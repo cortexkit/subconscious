@@ -208,6 +208,20 @@ questionable one costs at most one stale read.
 silent, take it.** A guard whose correctness depends on a value unmeasurable
 from the running machine must not ship.
 
+## Ask the mutation question of fixes, not just guards
+
+The constant-accept lesson has a twin on the delivery side. A reclamation fix
+arrived with every delivered test passing **against an implementation that reaps
+unconditionally** — the positive tests prove the change happens and say nothing
+about whether it is bounded. The author caught it by adding a live-root control
+himself.
+
+So before merging anything that removes, reclaims, or refuses: **ask what the
+tests would say if it did that to everything.** If the answer is "they would
+still pass", the suite cannot distinguish the fix from its unbounded version,
+and shipping it is worse than the leak it repairs. The load-bearing test for a
+narrowing change is always the negative one.
+
 ## Verification is non-delegable
 
 **Five of eighteen proposed fix shapes were wrong as written.** Finding quality

@@ -510,6 +510,19 @@ against input you know it should match. Five seconds, and it is the entire
 difference between a finding and a blank line. This is the mutation rule wearing
 different clothes — confirm the instrument can produce the other answer.
 
+**The unexamined surface is the ad-hoc verification command, not the test suite.**
+Everything else in this document lives in committed test code, where a culture of
+mutating already exists. The one-off commands we run to check each other's claims
+have no such culture: typed once, trusted on sight, and their output becomes the
+record a peer acts on. So the standing form is **any command whose output will be
+quoted as evidence gets one positive control first.**
+
+And do not over-correct into a narrower filter. `*/src/*` fixes the broken
+pathspec but answers only "did any Rust source change" — a Cargo.toml dependency
+bump, a build.rs, or a catalog manifest all reach the served binary and match
+none of it. For "does this reach production," the honest instrument is an
+unfiltered `--stat` read by eye.
+
 Related, from the same investigation: **do not read git's hunk-header text to
 decide where a change landed.** That header is a heuristic guess at enclosing
 context, and on a file carrying raw fixture strings it picks the fixture. A hunk

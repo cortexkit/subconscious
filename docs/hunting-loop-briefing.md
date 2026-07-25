@@ -26,10 +26,31 @@ knowing the other's backoff semantics. Four messages, not sixteen rounds.
 So **the next move after a loop is not another loop.** It is writing the contract
 with whoever consumes you, and checking it from both ends.
 
+The tally from doing that across four seams in one evening: two live defects in
+one consumer, one in another, one error in the producer's own description of its
+wire, and **zero found by anyone reading their own code**. Enumerate *every*
+consumer, not the ones already in the conversation — settling with whoever asked
+is the same guard-the-instance mistake in a different costume.
+
+A design property worth building in rather than discovering: **put the
+provenance stamp in the thing being measured, never in the thing doing the
+measuring.** When a build commit comes from the running module's own health
+report, a stale reader can fail to *ask*, but it cannot report a stale answer as
+current.
+
 ## The targeting principle
 
 **The value of a hunting round is inversely proportional to how observable the
 defect class is from production.**
+
+The sharpest form of unobservable is a system that says **nothing** when it has
+the most to say. One quota view printed a bare header when the producing module
+was cold or broken — so the only case where something was genuinely wrong
+rendered as the calmest possible screen. Two independent suppressions composed
+it: the table emitted nothing at zero rows, and the one line that could have
+contradicted the calm was itself keyed on the same zero. Neither branch is wrong
+alone; nobody owns the pair. Pair this with the yes-path rule below — same root,
+opposite sign, and the quiet path has no natural author either way.
 
 If you want one cheap sweep and nothing else: **list every place your code grants
 something** — a permission, a capacity claim, a freshness assertion, a success

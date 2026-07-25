@@ -34,8 +34,25 @@ Before handing an idle seat new work, read its `awaiting settle` count. A seat i
 often idle *precisely because* it delivered something nobody merged, and new work
 buries the old — that column is review debt owed to the seat, not spare capacity.
 
+A seat blocked on a genuine dependency chain also reads as idle, and is the one
+case where dispatching around it is actively wrong: if the next slice consumes
+the property the blocking slice is repairing, starting it early builds on the
+thing under repair. Ask the seat before treating a long idle number as capacity.
+
 Per-seat expected cadence is also unsolved; baselines drift with the kind of work
 a seat is doing, so there is no threshold here to tune.
+
+## Campaign rows undercount completed work
+
+The campaign lines come from terminal status, and a campaign whose slices were
+recovered by standalone re-dispatch stays `cancelled` while its work sits merged
+on main. The row is not wrong — it is accurate about its own lifecycle and
+silent about work that completed outside it.
+
+So a terminal campaign is not evidence that work was lost, and a rollup
+undercounts exactly the epics that had trouble and recovered, which are the ones
+most worth auditing. Read completion slice by slice, and check for a superseding
+re-fire before treating any terminal as stranded work.
 
 ## Consume the op, not the tables
 

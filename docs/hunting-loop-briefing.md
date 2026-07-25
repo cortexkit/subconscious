@@ -57,6 +57,7 @@ Before believing a green result:
 | 9 | For a fix that removes, reclaims or refuses: would the tests pass if it did that to *everything*? | The suite cannot tell the fix from its unbounded version |
 | 10 | When a mutation reddens something, which test died? | Three tests named for other things means defended by accident |
 | 10a | When a probe is *expected* to fail, did the failing phase's label appear in the output? | A timeout, a crash and a genuine finding all exit nonzero |
+| 10b | Before writing off a measurement as contaminated, do its neighbours agree? | An aggregate caveat silently retires a true finding |
 | 11 | Did the new CI step *execute*, or was the run cancelled before reaching it? | A green list showing passes for runs that never ran the new logic |
 
 Before calling a class closed:
@@ -393,6 +394,16 @@ error.
 The practical cost is that this needs a **recording double** rather than a
 return-value assertion: a spy that logs its calls, then assert the log is empty.
 Cheap to build, and the only way an ordering invariant becomes visible at all.
+
+**A contamination claim is a hypothesis about a population, and it is falsifiable
+per-datum.** Environmental noise — memory pressure, a loaded box, a bad window —
+slows a *window*; it does not produce an isolated spike in an otherwise fast
+period. So before discarding a measurement on those grounds, read its
+neighbours: one 82-second transform pass sat between neighbours of 30ms, 17ms,
+18ms and 5ms against a day median of 6ms, which kills the environmental
+explanation for that point no matter how true it is on average. Getting this
+wrong is worse than the contamination it guards against, because **nobody goes
+looking for what a caveat deleted.**
 
 A verification that never reaches its assertion looks exactly like one that
 passed. A gate run with a deliberately-broken input timed out before reaching

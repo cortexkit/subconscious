@@ -24,7 +24,18 @@ that the sweep-the-property rule had no section to point at, which no amount of
 re-reading the sections could have surfaced. And **a table transcribed from
 memory is prose with borders**: it inherits the errors of the recollection that
 produced it while looking more authoritative than the prose did. Two rows here
-pointed at nothing on the first pass. Re-derive every row from the source.
+pointed at nothing on the first pass. A reader seeing a table assumes someone
+went and looked, so the format launders unverified recall into apparent
+verification — which makes re-deriving every row from source a precondition for
+the format being honest, not diligence on top of it.
+
+Why any of this works: **review is good at inspecting what is present and
+structurally blind to what is not there.** A reviewer reads a diff, and an
+absence has no diff. Every defect that survived review on the day this document
+was assembled was an absence — an unasserted guard, an unrendered screen, an
+unowned transition, an uncounted member, a contract nobody had written down. So
+the instruments that find them enumerate a population rather than examine an
+artifact.
 
 Before briefing a round:
 

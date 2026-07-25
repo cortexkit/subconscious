@@ -6216,6 +6216,108 @@ mod tests {
         }
     }
 
+    /// Every tool the gateway ADVERTISES must resolve to something dispatchable.
+    ///
+    /// An advertised tool with no binding is the worst shape of bug this surface
+    /// can have, because nothing anywhere reports it: the model is offered the
+    /// tool, calls it, and gets an unknown-tool error, while the catalog, the
+    /// policy, and every health surface agree the tool is present. A failure that
+    /// leaves every component individually healthy is one nobody goes looking
+    /// for, so it can persist for as long as it takes someone to notice a
+    /// capability quietly not working.
+    ///
+    /// What prevents it is one loop pushing the tool and inserting its binding
+    /// together, which is how the code reads today. This test exists so that
+    /// stays true: split those two statements and it goes red.
+    #[tokio::test]
+    async fn every_advertised_tool_resolves_to_a_binding() {
+        // Build the session the way production does, through
+        // session_inner_from_desired, rather than by hand. A hand-built fixture
+        // would assert only that a HashMap this test populated has the keys this
+        // test gave it -- true regardless of what the real construction does, and
+        // therefore blind to the exact regression the test is here to catch.
+        fn desired(names: &[&str]) -> DesiredSession {
+            let tools = names
+                .iter()
+                .map(|name| {
+                    let manifest = ManifestTool {
+                        name: (*name).to_owned(),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: serde_json::json!({ "type": "object" }),
+                    };
+                    DesiredTool {
+                        bare_tool: manifest.clone(),
+                        exposed_tool: ExposedTool {
+                            manifest,
+                            description: format!("test tool {name}"),
+                        },
+                        mode: ToolMode::Forward,
+                    }
+                })
+                .collect();
+            DesiredSession {
+                providers: vec![DesiredProvider {
+                    module_id: "test-provider".to_owned(),
+                    tools,
+                }],
+            }
+        }
+
+        let names = ["aft_read", "aft_edit", "ctx_search"];
+        let route = RouteHandle {
+            channel: 4,
+            epoch: 1,
+            connection_token: 9,
+        };
+        let routes = HashMap::from([("test-provider".to_owned(), route)]);
+        let (client_stream, _server_stream) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(client_stream);
+        let inner =
+            session_inner_from_desired(&subc, 0, desired(&names), routes, SurfaceMode::Full)
+                .expect("the desired session should compose");
+        let state = test_session_state(inner);
+        for tool in state.exposed_tools() {
+            assert!(
+                state.direct_binding(&tool.manifest.name).is_some(),
+                "advertised tool {} has no binding, so the model would be offered a tool that answers unknown-tool",
+                tool.manifest.name
+            );
+        }
+
+        // Search mode advertises only the two reserved meta-tools, and those
+        // dispatch by name rather than through the binding table, so
+        // direct_binding returns None for them by design. The totality property
+        // still has to hold; here it is checked against the dispatcher's own arms.
+        let search_inner = session_inner_from_desired(
+            &subc,
+            0,
+            desired(&names),
+            HashMap::new(),
+            SurfaceMode::Search,
+        );
+        let search = test_session_state(match search_inner {
+            Ok(inner) => inner,
+            // Search mode needs no provider routes, but the composer still
+            // demands one per enabled provider; fall back to a direct value so
+            // this half tests the advertised set rather than the composer.
+            Err(_) => SessionInner {
+                surface_mode: SurfaceMode::Search,
+                catalog_generation: 0,
+                routes: HashMap::new(),
+                tools: Vec::new(),
+                bindings: HashMap::new(),
+            },
+        });
+        for tool in search.exposed_tools() {
+            assert!(
+                is_reserved_meta_tool_name(&tool.manifest.name),
+                "search mode advertised {}, which call_search_mode_tool has no arm for and would reject as unknown",
+                tool.manifest.name
+            );
+        }
+    }
+
     #[test]
     fn policy_refresh_keeps_ack_only_tombstone_counter_stable() {
         const TOOL_NAME: &str = "aft_read";

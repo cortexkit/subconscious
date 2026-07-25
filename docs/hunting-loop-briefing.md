@@ -58,6 +58,7 @@ Before believing a green result:
 | 10 | When a mutation reddens something, which test died? | Three tests named for other things means defended by accident |
 | 10a | When a probe is *expected* to fail, did the failing phase's label appear in the output? | A timeout, a crash and a genuine finding all exit nonzero |
 | 10b | Before writing off a measurement as contaminated, do its neighbours agree? | An aggregate caveat silently retires a true finding |
+| 10c | For a causal claim: did you run the control arm, with only the one variable differing? | An uncontrolled measurement is an observation, not an attribution |
 | 11 | Did the new CI step *execute*, or was the run cancelled before reaching it? | A green list showing passes for runs that never ran the new logic |
 
 Before calling a class closed:
@@ -394,6 +395,23 @@ error.
 The practical cost is that this needs a **recording double** rather than a
 return-value assertion: a spy that logs its calls, then assert the log is empty.
 Cheap to build, and the only way an ordering invariant becomes visible at all.
+
+**An uncontrolled measurement is an observation, not an attribution.** A striking
+spread is not a mechanism. One investigation produced self-overwrite timings of
+2174, 4941, 14015 and 20003ms and wrote them up as a root cause with a fix
+attached — but the slow arm created a fresh file per iteration while the fast
+baseline reused one file three hundred times, so the comparison carried two
+variables and isolated neither. Rerun with one variable flipped, both arms
+landed at ~100ms and the hypothesis died in four minutes. The numbers were real;
+the attribution was never earned.
+
+Two failure directions here, and they produce identically confident writeups:
+claiming a control you never ran, and running an arm and never claiming the
+control. When an intermittent resists explanation, **eliminating a category is
+real progress even when it leaves you with nothing** — and an intermittent you
+cannot trigger is one whose fix you cannot verify, so shipping a repair produces
+a green suite that proves nothing and retires the investigation, because nobody
+re-opens a bug marked fixed.
 
 **A contamination claim is a hypothesis about a population, and it is falsifiable
 per-datum.** Environmental noise — memory pressure, a loaded box, a bad window —

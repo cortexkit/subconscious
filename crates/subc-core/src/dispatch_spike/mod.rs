@@ -6,6 +6,25 @@
 //! `cargo test -p subc-core dispatch_spike --features loom`; the package build script scopes
 //! `cfg(loom)` to this crate because a workspace-wide setting disables Tokio networking.
 //!
+//! # Why it is still dormant, and what would promote it
+//!
+//! It exists to answer one question ahead of the work: can cancellation reach a request
+//! that is already queued behind a saturated serial route? Today it cannot -- the connection
+//! read loop blocks on the route's credit semaphore, so a CANCEL for a queued request waits
+//! behind the request it is trying to cancel. This skeleton demonstrates the fix (per-route
+//! bounded queues with a single drain owner) without touching daemon routing, so the
+//! mechanism could be model-checked before anything depended on it.
+//!
+//! It stays dormant because the starvation it addresses has not been observed in production;
+//! the cost of the redesign is currently larger than the harm. That is a judgement about
+//! today's evidence, not a permanent verdict -- a reproducible case of a cancel failing to
+//! land on a busy serial route is what would justify wiring it, and the mechanism is proven
+//! and waiting when that arrives.
+//!
+//! Recorded because dormancy and abandonment look identical from the outside: a reader
+//! finding unreferenced code cannot tell whether it is waiting or forgotten, and deleting
+//! a proven mechanism is expensive to undo.
+//!
 //! # Single-writer invariant
 //!
 //! [`RouteDrain`] owns the only `FrameSink` for a route and is consumed by one drain task.

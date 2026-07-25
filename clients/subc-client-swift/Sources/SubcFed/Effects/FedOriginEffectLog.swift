@@ -557,7 +557,7 @@ public enum FedEffectStatusCodec {
             complete = false
         }
         let kind: String?
-        if case .string(let value) = frame.header["k"] {
+        if let value = frame.terminalKind {
             kind = value
         } else {
             kind = nil

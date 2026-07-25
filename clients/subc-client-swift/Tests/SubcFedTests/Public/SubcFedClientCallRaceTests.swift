@@ -15,7 +15,8 @@ final class SubcFedClientCallRaceTests: XCTestCase {
 
     private let catalogJSON = """
     {"modules":[{"module_id":"alfonso-core","management":{"operations":[
-      {"name":"board.state","kind":"query"}
+      {"name":"board.state","kind":"query"},
+      {"name":"ask.persist_answer","kind":"mutate"}
     ]}}]}
     """
 
@@ -25,6 +26,45 @@ final class SubcFedClientCallRaceTests: XCTestCase {
     /// under the old register-after-send ordering (which discarded it and hung);
     /// with register-before-send the continuation is already installed and the call
     /// completes with the response body.
+    /// A MUTATION must SETTLE from a real daemon-shaped terminal frame. The wire
+    /// spells the terminal kind `k`; a reader that spelled it `kind` fell back to a
+    /// value classifying as non-terminal, so every ledgered mutation was retained
+    /// for recovery and surfaced as indeterminate even though the peer had already
+    /// recorded it. Pure queries could not catch this — their path only branches on
+    /// the error case, so the wrong fallback is harmless there, which is why every
+    /// read surface worked while the app's core mutation never once did.
+    func testMutationSettlesFromWireShapedTerminalFrame() async throws {
+        let transport = GatedMgmtTransport()
+        let engine = try makeEngine(transport: transport)
+        let client = try await makeReadyClient(transport: transport, engine: engine)
+        defer { Task { await client.disconnect() } }
+
+        await transport.armGate()
+        let target = try FedManagementTarget(moduleID: "alfonso-core")
+
+        let callTask = Task {
+            try await client.callManagement(
+                target: target,
+                method: "ask.persist_answer",
+                params: FedJSONObject(["answer": .string("Recorded via phone")])
+            )
+        }
+
+        try await waitForCondition { await transport.requestSent }
+        let responseBytes = try await terminalResponseBytes(
+            transport: transport, body: Data("{\"ok\":true}".utf8)
+        )
+        await transport.enqueueInbound(responseBytes)
+        try await waitForCondition { await transport.deliveredCount >= 1 }
+        await transport.releaseGate()
+
+        // The call must RETURN the recorded body rather than throwing
+        // indeterminateMutation. This is the assertion that fails when the terminal
+        // kind is read under the wrong key.
+        let body = try await withTimeout(3_000_000_000) { try await callTask.value }
+        XCTAssertEqual(body, Data("{\"ok\":true}".utf8))
+    }
+
     func testFastResponseBeforeRegisterIsMatchedNotDiscarded() async throws {
         let transport = GatedMgmtTransport()
         let engine = try makeEngine(transport: transport)

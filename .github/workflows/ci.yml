@@ -105,16 +105,25 @@ jobs:
           fi
         shell: bash
 
-  # The TypeScript client (@cortexkit/subc-client) ships from this repo and is
-  # wire-compatible with the Rust crates, so its typecheck + tests gate here too
-  # — otherwise a TS-only break (e.g. a private-member test-harness type error)
-  # stays invisible until a release workflow that runs typecheck fails.
+  # Both TypeScript packages ship from this repo and are wire-compatible with the
+  # Rust crates, so their typecheck + tests gate here too — otherwise a TS-only
+  # break (e.g. a private-member test-harness type error) stays invisible until a
+  # release workflow that runs typecheck fails.
+  #
+  # @cortexkit/store was in exactly that position: declared scripts, a passing
+  # suite, and no PR-time job running either. Release-time checks are not a gate,
+  # because they only report once someone is already publishing — the failure
+  # arrives attached to the one action you least want to abort.
   ts-client:
-    name: TS client (subc-client)
+    name: TS (${{ matrix.pkg }})
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [subc-client, store]
     defaults:
       run:
-        working-directory: clients/subc-client
+        working-directory: clients/${{ matrix.pkg }}
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2

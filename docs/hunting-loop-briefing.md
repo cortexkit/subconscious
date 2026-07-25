@@ -194,6 +194,14 @@ each one invisible from the consumer boundary.
   microseconds into a latency problem. After the brief said so with real
   numbers, the next round measured a hundred runs, reported the aggregate as
   small, and argued from a contiguous stall instead. Same lane, scored 74 then 93.
+- **Build an enumeration, not a warning.** Documenting a bias does not immunise
+  you against it. One seat had written the exact warning — "you will be tempted
+  to guard it once and call the class closed" — in their own words, in a file
+  they had edited that hour, about a gap they had just found, and it still did
+  not fire: the feeling of completion arrives before the memory of the warning,
+  and prose has to be *remembered and consulted*. A list has items on it, and an
+  unchecked item is visible without introspection. A warning asks you to feel
+  differently; a list asks you to check something.
 - **Say an honest null is acceptable, and mean it.** Two nulls scored 90 and 92;
   one benchmarked the change it was tempted by and declined to report a 15.6µs
   saving. A lane that believes it must produce will produce speculative hardening.
@@ -257,6 +265,14 @@ that actually carries the extra field. Deleting it left 424 tests green.
 The cheap check: if there is a branch for the simple case and a branch for the
 full case, **diff the two branches against each other** rather than reading each
 on its own. Every condition in one wants a counterpart in the other.
+
+This also predicts how the naming proxy fails, which is not by being absent. If
+every guard exists twice and gets tested once, the named test almost always
+*exists* — attached to the other branch. So the proxy fails by being **present
+and pointing at the wrong site**: searching "is there a test for this condition"
+returns yes, correctly, and the answer is useless. Ask instead: **is this
+condition tested at this site?** The first question has a misleading true answer
+whenever a twin exists.
 
 Note the ordering this produces on one guard: nobody asserted it → the verdict
 was asserted → **the enforcement was still separately deletable**. Three

@@ -83,3 +83,37 @@ struct RecordingDialFactory: FedCandidateDialFactory, Sendable {
         try await onDial(candidate, context)
     }
 }
+
+extension FedPublicTestSupport {
+    /// Mints the base64url wire text of a structurally valid pipe token (§7.1).
+    ///
+    /// Built through the real layout rather than as a placeholder string: the
+    /// candidate now validates this layout at construction, so a fixture that
+    /// faked it would only prove the fixture matched itself. The MAC is zeroed
+    /// because the client never holds the relay secret and so never checks it.
+    static func pipeTokenWireText(
+        pipeID: String,
+        side: FedRelaySide,
+        deviceX25519PublicKey: Data,
+        tokenVersion: UInt64,
+        expiresAtMs: UInt64 = 1_700_000_060_000
+    ) -> String {
+        func bigEndian(_ value: UInt64) -> Data {
+            var be = value.bigEndian
+            return withUnsafeBytes(of: &be) { Data($0) }
+        }
+        var body = Data()
+        body.append(0x01)                                   // layout version
+        body.append(Data(pipeID.utf8))                      // 26 bytes
+        body.append(side == .a ? 0x00 : 0x01)
+        body.append(deviceX25519PublicKey)                  // 32 bytes
+        body.append(bigEndian(tokenVersion))
+        body.append(bigEndian(expiresAtMs))
+        body.append(Data(repeating: 0x22, count: 16))       // nonce
+        body.append(Data(repeating: 0x00, count: 32))       // MAC, unchecked client-side
+        return body.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}

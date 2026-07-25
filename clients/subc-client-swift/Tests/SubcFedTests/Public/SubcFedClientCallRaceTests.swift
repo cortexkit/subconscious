@@ -243,7 +243,11 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         let relay = try FedRelayCandidate(
             candidateID: "relay-1",
             relayURL: URL(string: "wss://relay.example.com")!,
-            pipeToken: Data(repeating: 0xAA, count: 16),
+            pipeToken: Data(FedPublicTestSupport.pipeTokenWireText(
+                pipeID: String(repeating: "p", count: 26),
+                side: .a,
+                deviceX25519PublicKey: localPublic,
+                tokenVersion: 1).utf8),
             accountID: "acct",
             pipeID: String(repeating: "p", count: 26),
             side: .a,

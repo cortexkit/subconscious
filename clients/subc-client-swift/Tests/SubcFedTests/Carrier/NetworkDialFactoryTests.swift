@@ -97,7 +97,11 @@ final class NetworkDialFactoryTests: XCTestCase {
         let relay = FedPeerCandidate.relay(try FedRelayCandidate(
             candidateID: "relay-1",
             relayURL: URL(string: "wss://relay.example/pipe")!,
-            pipeToken: Data("token".utf8),
+            pipeToken: Data(FedPublicTestSupport.pipeTokenWireText(
+                pipeID: String(repeating: "0", count: 26),
+                side: .a,
+                deviceX25519PublicKey: try FedPublicTestSupport.localPublicKey(),
+                tokenVersion: 1).utf8),
             accountID: "acct",
             pipeID: String(repeating: "0", count: 26),
             side: .a,
@@ -131,7 +135,11 @@ final class NetworkDialFactoryTests: XCTestCase {
         let relay = FedPeerCandidate.relay(try FedRelayCandidate(
             candidateID: "relay-1",
             relayURL: URL(string: "wss://relay.example/pipe")!,
-            pipeToken: Data("token".utf8),
+            pipeToken: Data(FedPublicTestSupport.pipeTokenWireText(
+                pipeID: String(repeating: "0", count: 26),
+                side: .a,
+                deviceX25519PublicKey: try FedPublicTestSupport.localPublicKey(),
+                tokenVersion: 1).utf8),
             accountID: "acct",
             pipeID: String(repeating: "0", count: 26),
             side: .a,

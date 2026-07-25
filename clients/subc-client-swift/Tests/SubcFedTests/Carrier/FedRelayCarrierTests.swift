@@ -539,3 +539,77 @@ private extension Duration {
         return c.seconds * 1_000 + c.attoseconds / 1_000_000_000_000_000
     }
 }
+
+/// The pipe token is carried in TWO forms that both matter and differ: the
+/// Authorization bearer sends the base64url wire TEXT, while the PoP hashes what
+/// that text DECODES to. A caller who passes the decoded bytes gets a garbage
+/// bearer and a wrong hash, and the only symptom is an authentication failure at
+/// the relay — after a socket is open and a single-use grant is spent.
+/// Validating the layout at construction turns that into a named local error.
+final class FedRelayCandidateTokenValidationTests: XCTestCase {
+
+    private let pipeID = "01HZPIPEPIPEPIPEPIPEPIPEPI"
+
+    private func candidate(pipeToken: Data, side: FedRelaySide = .a, tokenVersion: UInt64 = 7) throws -> FedRelayCandidate {
+        try FedRelayCandidate(
+            candidateID: "relay-1",
+            relayURL: URL(string: "wss://rdv.test.invalid/v1/pipe/\(pipeID)")!,
+            pipeToken: pipeToken,
+            accountID: "acct",
+            pipeID: pipeID,
+            side: side,
+            tokenVersion: tokenVersion,
+            accountSigningPublicKey: Data(repeating: 0x01, count: 32),
+            accountKeyID: "key-1"
+        )
+    }
+
+    private func wireText(side: FedRelaySide = .a, tokenVersion: UInt64 = 7, pipeID: String? = nil) throws -> String {
+        FedPublicTestSupport.pipeTokenWireText(
+            pipeID: pipeID ?? self.pipeID,
+            side: side,
+            deviceX25519PublicKey: try FedPublicTestSupport.localPublicKey(),
+            tokenVersion: tokenVersion)
+    }
+
+    func testTheWireTextFormIsAccepted() throws {
+        _ = try candidate(pipeToken: Data(try wireText().utf8))
+    }
+
+    /// The exact mistake this check exists for: passing the DECODED token where
+    /// the wire text belongs. It is indistinguishable from the correct value by
+    /// type — both are `Data` — so only a layout check can catch it.
+    func testDecodedBytesAreRejectedRatherThanCarriedToTheRelay() throws {
+        let decoded = try XCTUnwrap(Data(base64URLEncoded: try wireText()))
+        XCTAssertThrowsError(try candidate(pipeToken: decoded)) { error in
+            XCTAssertEqual(error as? FedFailure, .invalidProfile(field: "pipeToken"))
+        }
+    }
+
+    func testATokenMintedForAnotherPipeIsRejected() throws {
+        let otherPipe = try wireText(pipeID: "01HZOTHEROTHEROTHEROTHEROT")
+        XCTAssertThrowsError(try candidate(pipeToken: Data(otherPipe.utf8))) { error in
+            XCTAssertEqual(error as? FedFailure, .invalidProfile(field: "pipeToken.pipeID"))
+        }
+    }
+
+    func testATokenMintedForTheOtherSideIsRejected() throws {
+        let otherSide = try wireText(side: .b)
+        XCTAssertThrowsError(try candidate(pipeToken: Data(otherSide.utf8), side: .a)) { error in
+            XCTAssertEqual(error as? FedFailure, .invalidProfile(field: "pipeToken.side"))
+        }
+    }
+
+    func testATokenForAnotherTokenVersionIsRejected() throws {
+        let stale = try wireText(tokenVersion: 6)
+        XCTAssertThrowsError(try candidate(pipeToken: Data(stale.utf8), tokenVersion: 7)) { error in
+            XCTAssertEqual(error as? FedFailure, .invalidProfile(field: "pipeToken.tokenVersion"))
+        }
+    }
+
+    func testAnArbitraryStringIsRejected() throws {
+        XCTAssertThrowsError(try candidate(pipeToken: Data("token".utf8))) { error in
+            XCTAssertEqual(error as? FedFailure, .invalidProfile(field: "pipeToken"))
+        }
+    }
+}

@@ -96,6 +96,20 @@ public struct FedRelayCandidate: Sendable, Equatable {
     /// Pinned account signing public key used to validate server assertions.
     public let accountSigningPublicKey: Data
     public let accountKeyID: String
+    /// How long this side may wait at the peer-meeting barrier for the other
+    /// side to arrive on the pipe.
+    ///
+    /// Callers should compute this from the grant's ABSOLUTE `expires_at_ms`
+    /// (`RdvRelayGrant.barrierTimeout(nowMs:)`) at the moment the candidate is
+    /// built, never as a fixed local duration. The two sides learn of a grant at
+    /// different moments — the opener directly, the peer through a strictly
+    /// later fan-out — so a local window leaves them offset and able to miss
+    /// each other no matter how generous it is. The conversion to a duration
+    /// happens here, where wall-clock time is available, so the carrier keeps
+    /// using only its monotonic clock.
+    ///
+    /// Nil falls back to the authenticator's default.
+    public let peerBarrierTimeout: Duration?
 
     public init(
         candidateID: String,
@@ -106,7 +120,8 @@ public struct FedRelayCandidate: Sendable, Equatable {
         side: FedRelaySide,
         tokenVersion: UInt64,
         accountSigningPublicKey: Data,
-        accountKeyID: String
+        accountKeyID: String,
+        peerBarrierTimeout: Duration? = nil
     ) throws {
         let id = candidateID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { throw FedFailure.invalidProfile(field: "candidateID") }
@@ -140,8 +155,14 @@ public struct FedRelayCandidate: Sendable, Equatable {
         self.tokenVersion = tokenVersion
         self.accountSigningPublicKey = accountSigningPublicKey
         self.accountKeyID = accountKeyID
+        self.peerBarrierTimeout = peerBarrierTimeout
     }
 
+    /// Equality is candidate IDENTITY, so `peerBarrierTimeout` is deliberately
+    /// excluded: it is a remaining-time budget computed at construction, so the
+    /// same candidate built a second later would carry a smaller one. Including
+    /// it would make identity depend on when the value was built and let a
+    /// candidate stop equalling itself.
     public static func == (lhs: FedRelayCandidate, rhs: FedRelayCandidate) -> Bool {
         lhs.candidateID == rhs.candidateID
             && lhs.relayURL == rhs.relayURL

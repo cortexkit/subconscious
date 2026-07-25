@@ -164,11 +164,32 @@ public struct FedRelayProof: Sendable, Equatable {
 public struct FedRelayAuthenticator: Sendable {
     public init() {}
 
+    /// Runs the relay handshake as TWO differently-bounded phases.
+    ///
+    /// `timeout` bounds the crypto exchange (challenge in, proof out), which is
+    /// transport-shaped: it depends only on this side's round trip and its own
+    /// signing work, so a tight budget is correct and a slow one means trouble.
+    ///
+    /// `barrierTimeout` bounds the wait for `relay_ready`, which is NOT a
+    /// transport step. The relay emits it only once BOTH sides have
+    /// authenticated on the pipe, so its duration is set by when the PEER dials
+    /// in — seconds later on a cold cellular path, through no fault of this
+    /// connection. Sharing one budget across both abandons a pipe the peer is
+    /// still walking toward; and because each abandonment mints a fresh grant
+    /// and therefore a fresh pipe id, the peer then arrives at a pipe this side
+    /// has already left. The retry does not recover the miss, it guarantees it.
+    ///
+    /// Callers holding a relay grant should derive `barrierTimeout` from its
+    /// absolute `expires_at_ms` rather than passing a local duration: the grant
+    /// is precisely the window in which the peer may still legitimately arrive,
+    /// and deriving from it makes both sides converge on the same wall-clock
+    /// instant regardless of when each received its own grant.
     public func authenticate(
         material: FedRelayMaterial,
         on stream: any FedWebSocketStream,
         clock: any FedMonotonicClock,
-        timeout: Duration = .seconds(3)
+        timeout: Duration = .seconds(3),
+        barrierTimeout: Duration = .seconds(60)
     ) async throws {
         let runner = FedStageDeadlineRunner(clock: clock)
         do {
@@ -183,6 +204,11 @@ public struct FedRelayAuthenticator: Sendable {
                 let challenge = try FedRelayChallenge(message: challengeText)
                 let proof = try makeProof(material: material, challenge: challenge)
                 try await stream.send(.text(proof.message))
+            }
+            // Reported under the same stage on purpose: the stage vocabulary is
+            // shared across implementations, so a new case would have to be
+            // agreed on every side before it could be emitted here.
+            try await runner.run(stage: .relayAuthentication, duration: barrierTimeout) {
                 guard let readyMessage = try await stream.receive() else {
                     throw FedCarrierError.carrierClosed
                 }
@@ -292,6 +318,10 @@ public actor FedRelayRecordCarrier {
         material: FedRelayMaterial,
         clock: any FedMonotonicClock,
         deadlines: FedStageDeadlinePolicy = FedStageDeadlinePolicy(),
+        /// How long to wait for the peer to arrive on the pipe; nil takes the
+        /// authenticator's default. Derive it from the grant's absolute expiry
+        /// so both sides stop waiting at the same instant.
+        barrierTimeout: Duration? = nil,
         upgrade: @escaping @Sendable () async throws -> any FedWebSocketStream
     ) async throws -> FedRelayRecordCarrier {
         let runner = FedStageDeadlineRunner(clock: clock)
@@ -304,7 +334,11 @@ public actor FedRelayRecordCarrier {
         }
         let carrier = FedRelayRecordCarrier(stream: stream)
         do {
-            try await carrier.authenticate(material: material, clock: clock, timeout: deadlines.relayAuthentication)
+            try await carrier.authenticate(
+                material: material,
+                clock: clock,
+                timeout: deadlines.relayAuthentication,
+                barrierTimeout: barrierTimeout)
         } catch {
             await carrier.close()
             throw error
@@ -312,10 +346,22 @@ public actor FedRelayRecordCarrier {
         return carrier
     }
 
-    public func authenticate(material: FedRelayMaterial, clock: any FedMonotonicClock, timeout: Duration = .seconds(3)) async throws {
+    public func authenticate(
+        material: FedRelayMaterial,
+        clock: any FedMonotonicClock,
+        timeout: Duration = .seconds(3),
+        barrierTimeout: Duration? = nil
+    ) async throws {
         guard !closed, !readyToUse else { throw FedNoiseError.handshakeState }
         do {
-            try await authenticator.authenticate(material: material, on: stream, clock: clock, timeout: timeout)
+            if let barrierTimeout {
+                try await authenticator.authenticate(
+                    material: material, on: stream, clock: clock,
+                    timeout: timeout, barrierTimeout: barrierTimeout)
+            } else {
+                try await authenticator.authenticate(
+                    material: material, on: stream, clock: clock, timeout: timeout)
+            }
             readyToUse = true
         } catch {
             closed = true

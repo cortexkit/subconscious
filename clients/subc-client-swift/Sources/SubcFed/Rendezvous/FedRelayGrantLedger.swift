@@ -42,3 +42,22 @@ public struct FedRelayGrantLedger: Sendable {
         redeemedPipeIDs.insert(grant.pipeID)
     }
 }
+
+extension RdvRelayGrant {
+    /// How long this side may wait at the peer-meeting barrier, derived from the
+    /// grant's ABSOLUTE `expires_at_ms` rather than a local duration.
+    ///
+    /// The distinction is correctness, not tuning. The two sides do not learn
+    /// they may proceed at the same moment — the opener's grant arrives
+    /// directly, the peer's copy arrives through a strictly later fan-out — so
+    /// a local `now + N` gives each side an OFFSET window and leaves them able
+    /// to miss each other no matter how large N is. Anchoring both to the same
+    /// wall-clock instant makes them converge by construction.
+    ///
+    /// A grant already at or past its expiry yields zero: there is no window
+    /// left to wait in, and waiting on a dead grant only delays the failure.
+    public func barrierTimeout(nowMs: UInt64) -> Duration {
+        guard let expiry = UInt64(expiresAtMs), expiry > nowMs else { return .zero }
+        return .milliseconds(expiry - nowMs)
+    }
+}

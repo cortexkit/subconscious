@@ -80,6 +80,11 @@ produced volume, but four of six findings were repeats of two classes. Rounds
 11-16 went at identity, scheduling, dedup, fencing and routing — fewer findings,
 each one invisible from the consumer boundary.
 
+When you commission a red-proof fixture, prefer one drawn from **a failure that
+actually happened**. Synthetic fixtures drift with the imagination of whoever
+wrote them; a fixture anchored to a real incident cannot drift away from what it
+was built to catch.
+
 ## Order to brief them in
 
 1. **Identity, and whatever gates multi-tenancy.** The worst available defect in
@@ -194,6 +199,14 @@ each one invisible from the consumer boundary.
   microseconds into a latency problem. After the brief said so with real
   numbers, the next round measured a hundred runs, reported the aggregate as
   small, and argued from a contiguous stall instead. Same lane, scored 74 then 93.
+- **Publish a counter with its anomaly signature.** Twice in one evening a gauge
+  that already existed, unwatched, turned out to have been naming the defect all
+  along: three blocker counters holding *exactly equal* meant a transition that
+  never fires (a race would have drifted them), and a conservation identity
+  nobody was asserting would have shown an unaccounted bucket. Say what the
+  anomaly looks like when you add the counter — drift means a race, exact
+  equality means a dead transition, imbalance means something unaccounted. **A
+  gauge without its anomaly signature is data; with it, it is a detector.**
 - **Build an enumeration, not a warning.** Documenting a bias does not immunise
   you against it. One seat had written the exact warning — "you will be tempted
   to guard it once and call the class closed" — in their own words, in a file

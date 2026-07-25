@@ -111,6 +111,20 @@ public struct FedRelayCandidate: Sendable, Equatable {
         let id = candidateID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { throw FedFailure.invalidProfile(field: "candidateID") }
         guard !pipeToken.isEmpty else { throw FedFailure.invalidProfile(field: "pipeToken") }
+        // The relay pipe is a WebSocket, so a non-wss URL can never be dialed.
+        // Rejecting it here names the field instead of failing at dial time.
+        guard relayURL.scheme?.lowercased() == "wss" else {
+            throw FedFailure.invalidProfile(field: "relayURL")
+        }
+        // NOTE for callers: `pipeToken` must be the base64url WIRE TEXT as UTF-8
+        // bytes, exactly as the relay_grant carried it — NOT the decoded token. The
+        // Authorization bearer and the PoP's pipe_token_hash are both computed over
+        // these same bytes, so passing base64url-DECODED bytes yields a garbage
+        // bearer and a wrong hash, whose only symptom is
+        // relay_authentication_failed at the barrier after a socket has already
+        // been opened. Validating the token layout here would catch that locally;
+        // it is not enforced yet because the existing tests construct synthetic
+        // tokens, and tightening it belongs with updating those fixtures.
         guard !accountID.isEmpty else { throw FedFailure.invalidProfile(field: "accountID") }
         guard pipeID.utf8.count == 26 else { throw FedFailure.invalidProfile(field: "pipeID") }
         guard accountSigningPublicKey.count == 32 else {

@@ -108,6 +108,13 @@ each one invisible from the consumer boundary.
   Fully compliant: the instruction said tests-only and it wrote a test. Without
   the clause, a sweep hardens exactly what it was sent to find.
 
+  **Worker quality is irrelevant here** — a better model writes a more convincing
+  test asserting the same defect. And **the harm scales with the sweep's
+  thoroughness**: an unswept defect stays discoverable by the next person who
+  reads the code, while a fenced one is discoverable by nobody, because a green
+  test now certifies it. The clause is therefore not a refinement of the
+  instruction. Without it the instrument *inverts* above a certain diligence.
+
 ## A fenced decision is not a fenced enforcement
 
 A policy function returning the right verdict and a call site acting on that
@@ -115,6 +122,13 @@ verdict are **independently mutable**. Tests over the decision function leave th
 enforcement separately deletable — delete it and everything stays green — while
 grepping for the error variant finds the decision test and scores the guard
 covered. Same false positive as auditing by error name.
+
+That does not retire the grep; it demotes it. **Grep the variant to build the
+candidate list, then mutate each production site separately to build the
+coverage map.** The enumeration is cheap and still finds the unasserted
+refusals; only the mutation is evidence. Two distinct shapes score covered under
+the grep alone: a fenced decision whose enforcement is unfenced, and one fenced
+site out of two that return the same variant.
 
 Where the guard's job is to *prevent* something, assert on the thing not
 happening. A rework asserted the consent hook receives **zero calls** on the
@@ -124,6 +138,10 @@ tests fail. **That fences ordering rather than outcome**, which no outcome
 assertion can do — asking a human to approve an action already known unsafe is
 its own defect and is invisible to every test that checks only the returned
 error.
+
+The practical cost is that this needs a **recording double** rather than a
+return-value assertion: a spy that logs its calls, then assert the log is empty.
+Cheap to build, and the only way an ordering invariant becomes visible at all.
 
 ## The cost-asymmetry gate
 

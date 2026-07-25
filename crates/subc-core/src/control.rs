@@ -902,12 +902,28 @@ impl ControlHandler {
     }
 
     fn handle_server_describe(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        // A bare connection count is ambiguous between many clients holding a
+        // route each and one client accumulating hundreds, so publish the
+        // concentration alongside it. Route state is best-effort here: a
+        // diagnostic endpoint must still answer if the forwarding lock is
+        // contended.
+        let mut counters = self.counters.snapshot();
+        if let (Ok((connections_with_routes, max)), Some(obj)) = (
+            self.forwarding.client_route_concentration(),
+            counters.as_object_mut(),
+        ) {
+            obj.insert(
+                "client_connections_with_routes".into(),
+                connections_with_routes.into(),
+            );
+            obj.insert("max_routes_on_one_connection".into(), max.into());
+        }
         let response = ClientControlResponse::ServerDescribe {
             protocol_ver: PROTOCOL_VERSION,
             subc_ops: subc_ops(),
             capabilities: self.subc_capabilities.as_ref().to_vec(),
             connected_clients: self.connected_clients.count(),
-            counters: Some(self.counters.snapshot()),
+            counters: Some(counters),
         };
         Ok(vec![control_response_body_frame(
             &frame,

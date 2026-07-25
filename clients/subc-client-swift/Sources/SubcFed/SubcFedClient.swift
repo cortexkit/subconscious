@@ -594,18 +594,13 @@ public actor SubcFedClient {
             else {
                 continue
             }
-            let kind: String
-            if case .string(let value) = frame.header["kind"] {
-                kind = value
-            } else {
-                kind = "ok"
-            }
-            let code: String?
-            if case .string(let value) = frame.header["code"] {
-                code = value
-            } else {
-                code = nil
-            }
+            // The wire spells the terminal kind `k`; read it through the shared
+            // accessor so this path cannot drift from the effect_status path again.
+            // A missing kind is a malformed frame rather than a success: defaulting
+            // it to a value that classifies as non-terminal is what previously left
+            // every mutation permanently unsettled.
+            let kind = frame.terminalKind ?? "error"
+            let code = frame.terminalCode
             do {
                 let body = try await session.engine.handleInboundTerminal(
                     effect: effect,

@@ -78,6 +78,25 @@ public struct FedFrame: Sendable, Equatable {
         guard let typeName else { return nil }
         return FedFrameType(rawValue: typeName)
     }
+
+    /// The terminal kind of a `call_frame`, read from the wire's `k` field.
+    ///
+    /// This accessor exists so every reader shares one spelling. The wire writes
+    /// `k` and nothing else; a reader that spelled it `kind` silently got its own
+    /// fallback for EVERY terminal frame, which left mutations unsettleable while
+    /// leaving pure queries unaffected — they only branch on the error case. Two
+    /// call sites reading the same field under two names is what allowed that to
+    /// survive, so the field is no longer addressed by literal outside this type.
+    public var terminalKind: String? {
+        guard case .string(let value) = header["k"] else { return nil }
+        return value
+    }
+
+    /// The error code of a terminal `call_frame`, absent on success kinds.
+    public var terminalCode: String? {
+        guard case .string(let value) = header["code"] else { return nil }
+        return value
+    }
 }
 
 /// The byte codec for the fed inner frame. It is independent of Noise and can

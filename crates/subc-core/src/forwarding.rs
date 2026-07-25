@@ -1012,6 +1012,25 @@ impl ForwardingTable {
         Ok(self.read_inner()?.client_to_module.len())
     }
 
+    /// How many distinct client connections hold at least one committed route,
+    /// alongside the largest number of routes any single connection holds.
+    ///
+    /// `connected_clients` alone cannot distinguish many clients with a route
+    /// each from one client accumulating hundreds, and those have opposite
+    /// causes. Reading it required an out-of-band `lsof` during a live
+    /// investigation, and the count of connections was mistaken for a count of
+    /// client processes — which sent two of us after cleanup paths that were
+    /// working correctly.
+    pub fn client_route_concentration(&self) -> Result<(usize, usize), ForwardingError> {
+        let inner = self.read_inner()?;
+        let mut per_connection: HashMap<ConnectionId, usize> = HashMap::new();
+        for key in inner.client_to_module.keys() {
+            *per_connection.entry(key.connection_id).or_insert(0) += 1;
+        }
+        let max = per_connection.values().copied().max().unwrap_or(0);
+        Ok((per_connection.len(), max))
+    }
+
     pub fn has_route_channel(&self, route_channel: u16) -> Result<bool, ForwardingError> {
         let inner = self.read_inner()?;
         Ok(inner
@@ -2356,6 +2375,32 @@ mod tests {
             )
             .unwrap());
         assert!(close.try_recv().is_err());
+    }
+
+    #[test]
+    fn route_concentration_separates_client_count_from_routes_per_client() {
+        // The distinction this asserts is the one a bare connection count cannot
+        // make: two connections holding one route each and one connection
+        // holding two are the same total, and have opposite causes.
+        let (forwarding, module_connection, _, client, sink, _client_rx) =
+            route_fixture("concentration");
+        assert_eq!(forwarding.client_route_concentration().unwrap(), (0, 0));
+
+        for corr in [70_u64, 71] {
+            let pending =
+                begin_test_route(&forwarding, client, sink.clone(), corr, "concentration");
+            forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    pending.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap();
+        }
+
+        // One connection, two routes — not two connections with a route each.
+        assert_eq!(forwarding.active_binding_count().unwrap(), 2);
+        assert_eq!(forwarding.client_route_concentration().unwrap(), (1, 2));
     }
 
     #[test]

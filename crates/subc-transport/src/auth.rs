@@ -546,6 +546,104 @@ mod tests {
 
     const TEST_DAEMON_VER: &str = "subc-auth-test-1";
 
+    /// The Swift client asserts its handshake against a committed vector file, so
+    /// that file is a cross-language contract with two authors and no shared
+    /// compiler between them. Until this test existed it was only a SNAPSHOT: it
+    /// recorded what `compute_proof` produced on the day someone generated it, and
+    /// nothing here would fail if the proof construction later changed. The Swift
+    /// side would keep passing against the stale bytes and the two implementations
+    /// would agree with the file while disagreeing with each other on the wire.
+    ///
+    /// Asserting the vectors from THIS side turns the snapshot into a pin: changing
+    /// the domain separator, the field order, or the MAC breaks the build here,
+    /// where the change is being made, instead of surfacing as a handshake failure
+    /// against a peer that has not been rebuilt.
+    #[test]
+    fn committed_wire_vectors_pin_the_proof_construction() {
+        // Kept in step with clients/subc-client-swift/Tests/SubcClientTests/
+        // Fixtures/wire_vectors.json. Hex is written out rather than read from the
+        // file so that regenerating the fixture cannot silently satisfy this test:
+        // the expected value has to be changed by a person, in a diff a reviewer
+        // sees, in the same commit as the construction change that motivated it.
+        struct ProofVector {
+            name: &'static str,
+            key_hex: String,
+            domain: &'static str,
+            client_nonce_hex: String,
+            server_nonce_hex: String,
+            daemon_id_hex: String,
+            expected_proof_hex: &'static str,
+        }
+
+        fn unhex(hex: &str, what: &str) -> Vec<u8> {
+            assert!(hex.len().is_multiple_of(2), "{what}: odd-length hex");
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&hex[i..i + 2], 16)
+                        .unwrap_or_else(|_| panic!("{what}: non-hex byte at {i}"))
+                })
+                .collect()
+        }
+
+        let key_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let client_nonce_hex = "ab".repeat(NONCE_LEN);
+        let server_nonce_hex = "cd".repeat(NONCE_LEN);
+        let daemon_id_hex = "000102030405060708090a0b0c0d0e0f";
+
+        let vectors = [
+            ProofVector {
+                name: "server_proof_fixed_inputs",
+                key_hex: key_hex.to_owned(),
+                domain: SERVER_PROOF_DOMAIN,
+                client_nonce_hex: client_nonce_hex.clone(),
+                server_nonce_hex: server_nonce_hex.clone(),
+                daemon_id_hex: daemon_id_hex.to_owned(),
+                expected_proof_hex:
+                    "ea06076a980bc7558e45017df86de89f3d2fc09861f8460795dea31eadf40527",
+            },
+            ProofVector {
+                name: "client_auth_fixed_inputs",
+                key_hex: key_hex.to_owned(),
+                domain: CLIENT_AUTH_DOMAIN,
+                client_nonce_hex,
+                server_nonce_hex,
+                daemon_id_hex: daemon_id_hex.to_owned(),
+                expected_proof_hex:
+                    "a3bc64784dbd94c4f52799e0c66f7b2b8183aa4655594630245c5d4a2fa387a9",
+            },
+        ];
+
+        for vector in &vectors {
+            let client_nonce: [u8; NONCE_LEN] = unhex(&vector.client_nonce_hex, vector.name)
+                .try_into()
+                .expect("client nonce length");
+            let server_nonce: [u8; NONCE_LEN] = unhex(&vector.server_nonce_hex, vector.name)
+                .try_into()
+                .expect("server nonce length");
+            let proof = compute_proof(
+                &unhex(&vector.key_hex, vector.name),
+                vector.domain,
+                &client_nonce,
+                &server_nonce,
+                &unhex(&vector.daemon_id_hex, vector.name),
+            );
+            let actual: String = proof.iter().map(|byte| format!("{byte:02x}")).collect();
+            if vector.expected_proof_hex.is_empty() {
+                panic!(
+                    "vector {} needs its expected proof recorded: {actual}",
+                    vector.name
+                );
+            }
+            assert_eq!(
+                actual, vector.expected_proof_hex,
+                "proof construction changed for vector {}: the committed Swift wire \
+                 vectors no longer describe this implementation",
+                vector.name
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn authenticate_server_deadline_is_absolute_across_handshake() {
         let key = vec![0x5a; MIN_KEY_LEN];

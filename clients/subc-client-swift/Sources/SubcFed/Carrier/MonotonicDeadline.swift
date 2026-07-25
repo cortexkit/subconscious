@@ -220,7 +220,58 @@ public func fedCandidateFailure(
         default: return nil
         }
     }
+    if let webSocket = error as? FedWebSocketError {
+        return webSocketFailureReason(webSocket)
+    }
     return .transport(.otherTransport)
+}
+
+/// Map a WebSocket transport failure into the candidate-failure vocabulary. An
+/// upgrade failure carries the URLError code precisely so the cause survives to
+/// the caller: without this arm it collapses into `otherTransport` and the code
+/// is discarded, which is the difference between naming a DNS or refused-
+/// connection fault and reporting an unhelpful catch-all.
+private func webSocketFailureReason(_ error: FedWebSocketError) -> CandidateFailureReason {
+    switch error {
+    case .close(let code):
+        // Auth-class closes must not be reported as ordinary transport faults:
+        // they suppress reconnect until a fresh grant is minted, whereas a
+        // partition-equivalent close is safe to fall through and retry.
+        switch code {
+        case .authFailed, .revoked, .consumed, .violation:
+            return .relayAuthenticationFailed(code: "relay_close_\(code.rawValue)")
+        case .pressure:
+            return .transport(.relayPressure)
+        case .idle, .superseded, .peerClosed, .frameCap:
+            return .transport(.webSocket)
+        }
+    case .unsupportedMessage:
+        return .transport(.webSocket)
+    case .connectionFailed:
+        return .transport(.webSocket)
+    case .upgradeFailed(let urlErrorCode, _):
+        guard let urlErrorCode else { return .transport(.webSocket) }
+        switch urlErrorCode {
+        case URLError.cannotFindHost.rawValue, URLError.dnsLookupFailed.rawValue:
+            return .transport(.dns)
+        case URLError.cannotConnectToHost.rawValue:
+            return .transport(.connectionRefused)
+        case URLError.networkConnectionLost.rawValue:
+            return .transport(.connectionReset)
+        case URLError.notConnectedToInternet.rawValue:
+            return .transport(.networkUnreachable)
+        case URLError.secureConnectionFailed.rawValue,
+             URLError.serverCertificateUntrusted.rawValue,
+             URLError.serverCertificateHasBadDate.rawValue,
+             URLError.serverCertificateNotYetValid.rawValue,
+             URLError.serverCertificateHasUnknownRoot.rawValue:
+            return .transport(.tls)
+        default:
+            // Still better than the catch-all: the failure is known to be the
+            // WebSocket upgrade rather than an unclassified transport fault.
+            return .transport(.webSocket)
+        }
+    }
 }
 
 /// Map a typed relay-pipe close to the candidate-failure vocabulary. Partition-

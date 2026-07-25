@@ -135,6 +135,12 @@ public actor FedRendezvousClient {
     /// client has no org membership, so each is a logged no-op; the array makes
     /// receipt observable to tests and to the notice obligations above.
     private(set) public var epochPushes: [RdvEpochPush] = []
+
+    /// Signature-verified payloads this client could not decode. Non-zero means
+    /// the server is emitting a shape this build does not understand, and the
+    /// client is silently acting on none of it — including, potentially, a
+    /// revocation.
+    private(set) public var undecodablePayloadCount = 0
     private(set) public var lastRefusal: RdvRefusal?
     private(set) public var lastJoinReceipt: RdvDeviceJoinedReceipt?
 
@@ -142,6 +148,7 @@ public actor FedRendezvousClient {
     /// not a member of (every epoch push, for this non-member client). The fixed
     /// `RDV_EPOCH_PUSH_NOOP` token is what operators grep for.
     private let epochPushLog = Logger(subsystem: "io.cortexkit.subcfed", category: "rendezvous")
+    private let payloadLog = Logger(subsystem: "io.cortexkit.subcfed", category: "rendezvous")
 
     // Relay signaling state (docs/rdv-wire.md §6.6). Grants are session-scoped:
     // buffered per peer until the dial ladder claims them, with waiters parked
@@ -524,7 +531,22 @@ public actor FedRendezvousClient {
             return nil
         }
 
-        guard let payload = try? RdvSignedPayload.decode(envelope.payload) else { return nil }
+        // The envelope's signature has already verified, so these bytes genuinely
+        // came from the account key: an undecodable payload here is the server
+        // speaking a shape this client was never taught, not a forgery.
+        //
+        // rdv-wire refuses unknown fields by design, which is right for rows
+        // carrying identity — but on a REVOCATION that strictness inverts into a
+        // liveness hazard: a revocation this client cannot parse is a revocation
+        // it never applies. Dropping it silently would leave no trace of the one
+        // event whose whole purpose is to be acted on, so it is counted and
+        // logged loudly. The drop itself is still correct: acting on a payload
+        // this client cannot fully read would be worse than not acting.
+        guard let payload = try? RdvSignedPayload.decode(envelope.payload) else {
+            undecodablePayloadCount += 1
+            payloadLog.error("RDV_VERIFIED_PAYLOAD_UNDECODABLE: a signature-verified payload could not be decoded; this client is behind the server's wire shape and is acting on nothing")
+            return nil
+        }
 
         // A VERIFIED registry_snapshot is always authoritative: it resets the
         // cursor, applies as truth, and ends any quarantine — even mid-gap, without

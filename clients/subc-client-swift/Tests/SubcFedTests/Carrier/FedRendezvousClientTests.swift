@@ -746,4 +746,46 @@ final class FedRendezvousClientTests: XCTestCase {
         XCTAssertEqual(resyncCount, 0)
         await client.disconnect()
     }
+
+    /// rdv-wire refuses unknown fields by design, which is right for rows that
+    /// carry identity. On a REVOCATION that same strictness inverts into a
+    /// liveness hazard: a payload this client cannot parse is a payload it never
+    /// applies, and for an epoch_push that means a revocation that never lands.
+    ///
+    /// The drop itself is correct — acting on a payload the client cannot fully
+    /// read would be worse. What must not happen is dropping it SILENTLY, so a
+    /// signature-verified payload that fails to decode is counted, leaving
+    /// evidence that this build is behind the server's wire shape.
+    func testAVerifiedButUndecodablePayloadIsCountedRatherThanDroppedSilently() async throws {
+        let (identity, edPub) = try makeIdentity()
+        let (client, registry) = makeClient(identity: identity, pin: try signingPin())
+
+        let server = try await connectWithBarrier(
+            client: client, registry: registry, identity: identity, deviceEd25519Pub: edPub,
+            snapshotPayload: snapshot("1", [rowA(candidateCount: 1)])
+        )
+
+        let before = await client.undecodablePayloadCount
+        XCTAssertEqual(before, 0)
+
+        // Correctly signed, so it passes verification, but carrying a field this
+        // client was never taught — the shape a newer server would emit.
+        var fields = delta("2", rowA(candidateCount: 2), "updated").storage
+        fields["some_future_field"] = .string("value")
+        try await sendSigned(server: server, payload: RdvJSONObject(fields))
+
+        try await waitFor { await client.undecodablePayloadCount == 1 }
+
+        // And it genuinely did not apply: the registry still holds what the
+        // barrier snapshot established, compared against that same row rather
+        // than a hand-counted number.
+        let expected = await { () -> Int in
+            let baseline = self.rowA(candidateCount: 1)
+            guard case .array(let list)? = baseline["candidates"] else { return -1 }
+            return list.count
+        }()
+        let candidates = await client.candidates(forPubkey: pubkeyA)
+        XCTAssertEqual(candidates?.count, expected, "an undecodable payload must not apply")
+    }
+
 }

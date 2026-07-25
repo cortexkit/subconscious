@@ -10,10 +10,34 @@ Authored by the ai-provider-quota seat; kept here because it is fleet-wide
 method, not one module's story. That repo's `docs/provider-invariants.md` is the
 worked example of what a loop leaves behind.
 
+## What this method cannot see
+
+A hunting loop reads **one codebase** carefully, and it is structurally blind to
+defects that live **between two**. A seat that runs sixteen rounds and finds
+nothing more has not exhausted its defect surface — it has exhausted the part one
+reader can see.
+
+The evidence is direct: after the loop below was called closed, a contract
+conversation across three seats found three more live defects in an afternoon.
+None were reachable by the loop's method, because each side was locally correct
+— one seat's poll-time stamping could not be falsified from that seat without
+knowing the other's backoff semantics. Four messages, not sixteen rounds.
+
+So **the next move after a loop is not another loop.** It is writing the contract
+with whoever consumes you, and checking it from both ends.
+
 ## The targeting principle
 
 **The value of a hunting round is inversely proportional to how observable the
 defect class is from production.**
+
+If you want one cheap sweep and nothing else: **list every place your code grants
+something** — a permission, a capacity claim, a freshness assertion, a success
+record — and check each has a test proving it is *withheld* when unearned. Test
+suites have no natural author for the yes-path. Nobody forgets to test that a bad
+credential is refused; everybody forgets to test that a good-looking claim is
+withheld. That grep found the highest-stakes gap in the module this document
+came from, twice.
 
 Parsers, arithmetic and mapping have a second line of defence — eventually a
 human notices a number that looks wrong. A state transition that overwrites its
@@ -197,6 +221,12 @@ deletable as decision and enforcement. So the axis has three positions, not two,
 and the instinctive assertion lands on the wrong one: an authority check whose
 caller's early return was deleted still returned its error, just after
 dispatching.
+
+When a mutation does kill a test, **check that the test that died is the one you
+meant to prove.** One deleted condition reddened three tests all named for
+something else entirely, which reads as "covered" and is actually "defended by
+accident" — the same habit as reading a failure *message* rather than a failure
+*colour*, one level up. Read which test died, not that one did.
 
 ## The cost-asymmetry gate
 

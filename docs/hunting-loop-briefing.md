@@ -357,6 +357,14 @@ The cheap check: if there is a branch for the simple case and a branch for the
 full case, **diff the two branches against each other** rather than reading each
 on its own. Every condition in one wants a counterpart in the other.
 
+**Status: untested outside its author's repo.** Both instances behind this rule
+came from one module, so it may be a description of that codebase wearing a
+rule's clothes. The prediction, stated so it can fail: the next seat with a
+dual-emission or dual-rendering surface who runs this will find a guard tested
+on exactly one branch. **If several seats run it and none find that shape,
+demote it** — and report the null, because a rule nobody contradicts is not the
+same as a rule that holds.
+
 This also predicts how the naming proxy fails, which is not by being absent. If
 every guard exists twice and gets tested once, the named test almost always
 *exists* — attached to the other branch. So the proxy fails by being **present

@@ -84,6 +84,16 @@ each one invisible from the consumer boundary.
    familiarity is what licenses it. It also means this cannot be audited by
    grepping — every hit needs its caller read, which is the work review skips.
 
+   A near neighbour: **an observable that is adjacent to the real property
+   rather than equal to it.** A test polled for a pid file to *exist*, but
+   `echo $! > file` creates the file before the shell writes into it, so a read
+   landing in that window parses an empty string and panics. Existence was never
+   the property it cared about — readable content was. Adjacency is invisible
+   until the window opens, and the fix is to poll for the property you actually
+   need. Not every such poll is wrong: one waiting on a marker whose *presence*
+   is genuinely the signal is correct, so adjudicate each rather than sweeping
+   them into one verdict.
+
    The sub-family worth its own sweep is **an absent input converted into a
    positive assertion**, because unlike the rest of the rung it has literal
    signatures to search: `unwrap_or`, `unwrap_or_default`,
@@ -262,6 +272,19 @@ tests would say if it did that to everything.** If the answer is "they would
 still pass", the suite cannot distinguish the fix from its unbounded version,
 and shipping it is worse than the leak it repairs. The load-bearing test for a
 narrowing change is always the negative one.
+
+The reason this recurs is in how the two get written. The positive test is what
+you write **while thinking about the fix** — it comes free with the work. The
+negative test requires imagining the fix wrong in the direction you were not
+worried about, and only arrives if you deliberately ask: *what would a broken
+version of my own change still pass?*
+
+A related trap on the input side: when an observation authorises destruction,
+**the observation needs as much confidence as the destruction is irreversible**
+— and that asymmetry is invisible at the call site. `if !path.exists() {
+reclaim() }` shows a check and an action and hides that the left side is a cheap
+sample of a racy world while the right side is unrecoverable. Confirm across two
+sweeps before acting on absence.
 
 ## Verification is non-delegable
 

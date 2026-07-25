@@ -561,6 +561,21 @@ reporting the scanner broken — the planted line was
 A malformed control produces the exact signature of a broken instrument, and the
 natural response — distrust the instrument — costs you the true answer.
 
+**The constructive form beats the warning.** ALF's repo carries the most merges in
+the fleet — 117 a week — and has zero exposure, for a structural reason rather
+than luck: every file-set question there is a **range diff anchored at a recorded
+base** (`git diff base..HEAD`), never a per-commit log walk. A range diff cannot
+be merge-blind by construction, so the bug is unrepresentable rather than
+avoided. The anchor came free from a worktree contract that already records a
+base SHA for provenance.
+
+So prefer *derive changed-file sets from range diffs anchored at a recorded base*
+over *remember to pass `-m --first-parent`*. The first cannot be forgotten; the
+second is a defensive flag a future tidy-up deletes. The precondition is worth
+stating though: the immunity belongs to the **anchor**, so any query without one
+— an ad-hoc "what changed lately", a periodic sweep — steps back outside it and
+gets no warning.
+
 The three interlock, in this order:
 
 1. A filter returning empty must be proven capable of returning non-empty.

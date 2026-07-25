@@ -24,3 +24,18 @@ members = [
 # the cortexkit/commons monorepo (https://github.com/cortexkit/commons) and is
 # consumed from crates.io (cortexkit-paths = "0.1"), because AFT uses it without
 # subc. subc-protocol and subc-control stay here precisely because they are subc-defining.
+
+[profile.release]
+# This is cargo's default, stated explicitly because the daemon's failure
+# containment depends on it and nothing else records that.
+#
+# Every connection is served in its own task. Under unwind, a panic while
+# handling one request kills that task alone: the accept loop survives, other
+# connections keep being served, and the supervisor sees a healthy process.
+# Under abort, the same panic takes the whole daemon down and every module
+# loses its route with it.
+#
+# So switching this for binary size or startup time would silently convert
+# every reachable panic in the tree from a single dropped request into a
+# fleet-wide outage, and no test would fail. Change it only deliberately.
+panic = "unwind"

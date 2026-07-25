@@ -549,10 +549,25 @@ files against a 719-insertion `--stat`. alfonso carries 117 merges a week and
 plexus 13, so the blindness covered most real change on every repo that merges
 rather than rebases.
 
-And check that a zero control is *correct* before treating it as a failure: the
-first linear commit tried came back 0 because it was genuinely docs-only. A
-control whose expected answer you have not verified is another unvalidated
-instrument.
+**A control that fails must itself be verified before you blame the instrument.**
+This is the least intuitive of the three, because a failing control has the
+emotional shape of catching something. Two instances in one hour: my first linear
+control returned 0 because the commit was genuinely docs-only; THALAMUS planted a
+control file to prove a scanner worked, still got zero, and was one keystroke from
+reporting the scanner broken — the planted line was
+`subprocess.run(["git","log",...])`, which contains `git","log`, not the literal
+`git log` the pattern matched. **The scanner had been correct the whole time.**
+
+A malformed control produces the exact signature of a broken instrument, and the
+natural response — distrust the instrument — costs you the true answer.
+
+The three interlock, in this order:
+
+1. A filter returning empty must be proven capable of returning non-empty.
+2. The control set must span the **shapes** the filter will meet.
+3. A control that fails must itself be verified before you blame the instrument.
+
+Each caught a different error the night they were written.
 
 **Phrase the check so silence is suspicious.** Better than remembering the
 control, because it removes the need to remember. When confirming someone else's

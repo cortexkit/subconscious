@@ -57,6 +57,35 @@ final class FedURLSessionWebSocketStreamTests: XCTestCase {
         XCTAssertNil(after)
     }
 
+    /// Upgrade validation must NOT depend on a pong. Both surfaces this transport
+    /// serves are server-speaks-first, so a ping-based validator waits for a pong
+    /// while an unread server frame is already queued — and a server whose pong
+    /// never arrives leaves connect() hanging on a socket that is fully open.
+    /// Measured on a real device: a bare upgrade received the server's first frame
+    /// in 0.17s while a ping-validated connect could not finish in 20s.
+    func testConnectSucceedsAgainstServerThatIgnoresPings() async throws {
+        let server = try await ManualWebSocketEchoServer.start(answersPings: false)
+        defer { server.stop() }
+
+        let url = URL(string: "ws://127.0.0.1:\(server.port)/")!
+        // A generous bound that still fails long before the transport's own
+        // deadline: if validation waits on a pong this cannot pass.
+        let stream = try await fedTestWithTimeout(nanoseconds: 8_000_000_000) {
+            try await FedURLSessionWebSocketStream.connect(url: url, bearerToken: "token")
+        }
+
+        // The socket is genuinely usable, not merely constructed.
+        try await stream.send(.text("after-open"))
+        let echoed = try await fedTestWithTimeout(nanoseconds: 5_000_000_000) {
+            try await stream.receive()
+        }
+        guard case .text(let text)? = echoed else {
+            return XCTFail("expected the echo of a message sent after a pong-less upgrade")
+        }
+        XCTAssertEqual(text, "after-open")
+        await stream.close()
+    }
+
     func testConnectToClosedPortFailsFast() async throws {
         // Bind then release an ephemeral port so nothing is listening.
         let server = try await ManualWebSocketEchoServer.start()
@@ -124,16 +153,21 @@ private final class ManualWebSocketEchoServer: @unchecked Sendable {
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "test.ws.manual")
+    /// When false the server completes the upgrade and serves frames normally but
+    /// NEVER answers a client ping, reproducing a server whose pong the client
+    /// cannot rely on. Upgrade validation must not depend on a pong.
+    private let answersPings: Bool
     let port: UInt16
 
-    private init(listener: NWListener, port: UInt16) {
+    private init(listener: NWListener, port: UInt16, answersPings: Bool = true) {
         self.listener = listener
         self.port = port
+        self.answersPings = answersPings
     }
 
-    static func start() async throws -> ManualWebSocketEchoServer {
+    static func start(answersPings: Bool = true) async throws -> ManualWebSocketEchoServer {
         let listener = try NWListener(using: .tcp)
-        let server = ManualWebSocketEchoServer(listener: listener, port: 0)
+        let server = ManualWebSocketEchoServer(listener: listener, port: 0, answersPings: answersPings)
         listener.newConnectionHandler = { connection in
             let state = WebSocketConnectionState()
             connection.start(queue: server.queue)
@@ -158,7 +192,7 @@ private final class ManualWebSocketEchoServer: @unchecked Sendable {
             listener.cancel()
             throw FedCarrierError.carrierClosed
         }
-        return ManualWebSocketEchoServer(listener: listener, port: port)
+        return ManualWebSocketEchoServer(listener: listener, port: port, answersPings: answersPings)
     }
 
     func stop() {
@@ -272,7 +306,9 @@ private final class ManualWebSocketEchoServer: @unchecked Sendable {
                 connection.cancel()
                 return
             case 0x9: // ping → pong with the same payload
-                sendFrame(connection: connection, opcode: 0xA, payload: payload)
+                if answersPings {
+                    sendFrame(connection: connection, opcode: 0xA, payload: payload)
+                }
             case 0xA: // pong → nothing to do
                 break
             default:

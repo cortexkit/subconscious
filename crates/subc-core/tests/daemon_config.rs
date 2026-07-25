@@ -446,6 +446,40 @@ async fn rescan_invalid_config_is_rejected_without_mutating_modules() {
     );
 }
 
+/// A corrupt config is refused loudly and was already covered. An ABSENT one
+/// took the quieter path: `load` reports a missing file as Ok(None), which is
+/// right at boot and wrong here, because rescan reads "not in the config" as
+/// "remove it". An empty module list is therefore an instruction to retire the
+/// entire running fleet, and any editor writing via write-new-then-rename opens
+/// a window where that is what rescan sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_absent_config_is_refused_and_retires_nothing() {
+    let module_id = "rescan-absent-config";
+    let daemon = RunningDaemon::start(
+        "daemon-rescan-absent",
+        Some(config_doc([stub_module(module_id, true, [])])),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+    let mut module_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let module_route = open_route(&mut module_client, module_id, 760).await;
+    let before_pid = call_tool(&mut module_client, module_route, 761, "_test.pid").await;
+
+    fs::remove_file(&daemon.config_path).unwrap();
+    let error = supervisor_rescan_error(&daemon.connection_file_path, 762).await;
+    assert_eq!(error.code, "invalid_daemon_config");
+
+    // The module is not merely still listed: it is the same process, still
+    // serving on the route opened before the rescan.
+    let after = supervisor_modules(&daemon.connection_file_path, 763).await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].module_id, module_id);
+    assert_eq!(
+        call_tool(&mut module_client, module_route, 764, "_test.pid").await,
+        before_pid
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rescan_applies_enabled_flips_without_daemon_restart() {
     let module_id = "rescan-enabled";

@@ -67,12 +67,25 @@ each one invisible from the consumer boundary.
    *nothing* or means *I do not know*. Two found the same evening: a missing
    config read as "no modules configured" when it meant "I could not read the
    file", and an event with no recorded outcome delivered as a successful one.
-   Watch the fixtures too — one that never constructs the absent case makes
-   every test over it vacuous for that branch.
+   **Check the fixtures before reading a single assertion.** A fixture that
+   never constructs the absent case makes every test over it vacuous for that
+   branch — you can write ten sharp assertions over a helper that structurally
+   cannot produce the input, and every one is honest, specific, and blind in the
+   same direction. That is worse than an untested branch, because the coverage
+   is real; it just cannot vary in the dimension that matters. Asking whether
+   any fixture can even construct the input is cheaper than reading the tests
+   and strictly more decisive.
 
    Where the type system allows, prefer removing the ambiguous state to handling
    it. Mapping absence to a safe value is correct and still lets the next caller
    construct the ambiguity; making the field non-optional means nobody can.
+
+   One check before making a field non-optional: **can the value legitimately be
+   unknown at construction time?** If a record is admitted before its outcome
+   exists, non-optional forces every caller to invent one — the fail-open
+   default moved upstream and made mandatory. Where admission and outcome share
+   a call site the answer is no and the change is free; establish which it is
+   rather than assuming.
 3. **The state machine and its fences.** Incarnation/ABA, attempt ordering,
    admission fairness, what a timeout does to a prior observation. Demand the
    exact interleaving — "these two race" is not a finding.

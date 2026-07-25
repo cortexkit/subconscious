@@ -45,6 +45,7 @@ Before believing a green result:
 | 8 | For a guard: does a test assert the prevented effect *did not happen* — not that an error came back? | A mutant that acts and then reports correctly passes |
 | 9 | For a fix that removes, reclaims or refuses: would the tests pass if it did that to *everything*? | The suite cannot tell the fix from its unbounded version |
 | 10 | When a mutation reddens something, which test died? | Three tests named for other things means defended by accident |
+| 10a | When a probe is *expected* to fail, did the failing phase's label appear in the output? | A timeout, a crash and a genuine finding all exit nonzero |
 | 11 | Did the new CI step *execute*, or was the run cancelled before reaching it? | A green list showing passes for runs that never ran the new logic |
 
 Before calling a class closed:
@@ -373,6 +374,17 @@ error.
 The practical cost is that this needs a **recording double** rather than a
 return-value assertion: a spy that logs its calls, then assert the log is empty.
 Cheap to build, and the only way an ordering invariant becomes visible at all.
+
+A verification that never reaches its assertion looks exactly like one that
+passed. A gate run with a deliberately-broken input timed out before reaching
+the phase under test — no failure line, nonzero exit — and reading that as "no
+problem reported" would have recorded a false clear. **When a probe is expected
+to fail, confirm the failing phase's label appears in the output**, not merely
+that the exit code is nonzero: a timeout, a crash and a genuine finding are
+indistinguishable by exit code. This is the third way to get a signal with no
+discriminating power, alongside the unconstructible fixture and the
+always-satisfied condition — and the sneakiest, because the evidence is an
+absence of output rather than a wrong output.
 
 Stated generally: **where a check exists to prevent an effect, the only assertion
 that fences it is that the effect did not happen.** Asserting the returned error

@@ -199,6 +199,15 @@ was built to catch.
   microseconds into a latency problem. After the brief said so with real
   numbers, the next round measured a hundred runs, reported the aggregate as
   small, and argued from a contiguous stall instead. Same lane, scored 74 then 93.
+- **Watch the first run of a changed pipeline to completion.** With
+  `cancel-in-progress`, a green run list does not support a per-commit green
+  claim — only a tip-is-green one. That is harmless when history is cumulative
+  and the tip is what ships, and *not* harmless when the run itself changed: two
+  pushes carrying a new CI step were cancelled here, so the list showed passes
+  for runs that had never executed the new logic. The hazard is proportional to
+  how much of the check is new. Verify the step, not the job. (A reading trap
+  for later: on a bisect, a cancelled entry looks like a failure and an absent
+  one looks like it was never pushed, and neither is true.)
 - **Publish a counter with its anomaly signature.** Twice in one evening a gauge
   that already existed, unwatched, turned out to have been naming the defect all
   along: three blocker counters holding *exactly equal* meant a transition that

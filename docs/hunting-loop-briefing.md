@@ -492,6 +492,31 @@ credited coverage that does not exist and stopped looking. **Green before, red
 after. One without the other is a guard with no negative vector, arriving
 through the instrument instead of the code.**
 
+### A filter that returns empty must be proven capable of returning non-empty
+
+The same defect in a query instead of a test. `git show <sha> --stat -- 'crates/*/src/'`
+returns empty for **every** commit — that pathspec form matches nothing — and an
+empty result reads as a negative finding when it is a null one. Nothing on screen
+distinguishes "no source files in this commit" from "this query matches nothing,
+ever."
+
+It was caught only because the same command was run against a second repo where
+the answer was independently known to be different: four commits reported
+test-only, a differently-shaped query on the same range showed 349 source
+insertions. **The derivation that agreed with expectation was the broken one.**
+
+So before believing an absence, run one **positive control**: the same filter
+against input you know it should match. Five seconds, and it is the entire
+difference between a finding and a blank line. This is the mutation rule wearing
+different clothes — confirm the instrument can produce the other answer.
+
+Related, from the same investigation: **do not read git's hunk-header text to
+decide where a change landed.** That header is a heuristic guess at enclosing
+context, and on a file carrying raw fixture strings it picks the fixture. A hunk
+1200 lines inside `mod tests {` was labelled `data: {"type":"message_stop"}`.
+Compare line positions against the file's own structure instead — the artifact's
+shape, not a label describing it.
+
 ### When the mutant does not kill your new test, the test is the suspect
 
 THALAMUS wrote a test for an authorizer that armed a destructive tee. Three

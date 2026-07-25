@@ -81,7 +81,7 @@ each one invisible from the consumer boundary.
 5. **Transport and resource bounds.** Cheap to check, real when found.
 6. **Parsers last**, justified by being cheap rather than productive.
 
-## Four brief rules that each changed the output measurably
+## Five brief rules that each changed the output measurably
 
 - **State the closed seams explicitly.** Once a class is swept, name it and its
   cleared members. A lane with an open seam keeps returning instances of your
@@ -99,6 +99,31 @@ each one invisible from the consumer boundary.
   catches operator error: a brief said 34 providers and the sweep said 35, and
   listed them. Take the population count from the artifact, never from the brief
   — a sweep that adopts your count cannot find the member you missed.
+- **A tests-only fence needs an explicit stop-and-report clause.** Fencing is the
+  right instrument for an under-tested *correct* mechanism and the wrong one for
+  an *incorrect* one, and the worker cannot tell those apart from the prompt. A
+  sweep sent to find fail-open defaults reached one, wrote a passing test named
+  for it, and thereby converted a latent bug into a defended one — the test now
+  reads as a deliberate specification and its name supplies the justification.
+  Fully compliant: the instruction said tests-only and it wrote a test. Without
+  the clause, a sweep hardens exactly what it was sent to find.
+
+## A fenced decision is not a fenced enforcement
+
+A policy function returning the right verdict and a call site acting on that
+verdict are **independently mutable**. Tests over the decision function leave the
+enforcement separately deletable — delete it and everything stays green — while
+grepping for the error variant finds the decision test and scores the guard
+covered. Same false positive as auditing by error name.
+
+Where the guard's job is to *prevent* something, assert on the thing not
+happening. A rework asserted the consent hook receives **zero calls** on the
+refusing path, which made a pure ordering mutation visible: move the consent
+request ahead of the safety check, leave the refusal itself intact, and both
+tests fail. **That fences ordering rather than outcome**, which no outcome
+assertion can do — asking a human to approve an action already known unsafe is
+its own defect and is invisible to every test that checks only the returned
+error.
 
 ## The cost-asymmetry gate
 

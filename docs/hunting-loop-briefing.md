@@ -46,11 +46,21 @@ defect class is from production.**
 The sharpest form of unobservable is a system that says **nothing** when it has
 the most to say. One quota view printed a bare header when the producing module
 was cold or broken — so the only case where something was genuinely wrong
-rendered as the calmest possible screen. Two independent suppressions composed
-it: the table emitted nothing at zero rows, and the one line that could have
-contradicted the calm was itself keyed on the same zero. Neither branch is wrong
-alone; nobody owns the pair. Pair this with the yes-path rule below — same root,
-opposite sign, and the quiet path has no natural author either way.
+rendered as the calmest possible screen. Pair this with the yes-path rule below
+— same root, opposite sign, and the quiet path has no natural author either way.
+
+The mechanism there is worth its own check, because it is a shape rather than an
+instance: **two independent suppressions keyed on the same condition, where the
+second silences the signal that would have contradicted the first.** A bare
+header at zero rows is reasonable. Suppressing a count line at zero is
+reasonable. The pair removes the alarm and its backstop simultaneously, because
+one condition drives both — and unlike a cross-codebase seam, *both branches
+were in one file* and still nobody owned the pair.
+
+So: **when a condition suppresses output, check whether it also suppresses the
+thing that would have reported the suppression.** Empty-state handling is where
+this lives, because empty is exactly when every "only show if non-zero" branch
+fires at once.
 
 If you want one cheap sweep and nothing else: **list every place your code grants
 something** — a permission, a capacity claim, a freshness assertion, a success

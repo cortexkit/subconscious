@@ -82,6 +82,62 @@ final class FedRelayCarrierTests: XCTestCase {
 
     // MARK: - relay PoP: domain separation from the control-WS hello
 
+    /// `.awaitingPeer` must be EMITTED by a real handshake, not merely declared.
+    /// A state that exists in the enum but is never reported looks correct in
+    /// every unit test of the enum itself while telling an observer nothing —
+    /// and `FedConnectionState.authenticating` and `.negotiating` were in
+    /// exactly that condition, declared and constructed nowhere in Sources.
+    ///
+    /// Ordering matters as much as arrival: reported before the proof is sent,
+    /// it would be claiming a peer wait while this side is still doing its own
+    /// work. The scripted peer records how many phases had arrived at the moment
+    /// it received the proof, which makes that observable rather than assumed.
+    func testThePeerWaitIsReportedOnlyAfterTheProofIsSent() async throws {
+        let (material, _) = try makeMaterial()
+        let pair = LoopbackWebSocketPair()
+        let serverEphPriv = Curve25519.KeyAgreement.PrivateKey()
+        let serverEphPubHex = serverEphPriv.publicKey.rawRepresentation.lowercaseHex
+        let challengeID = "01HZRELAYCHALLENGE"
+        let nonce = "rr112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        let reported = PhaseLog()
+
+        let peer = Task { () throws -> Void in
+            try await pair.server.send(.text(self.relayChallengeText(
+                challengeID: challengeID, nonce: nonce, serverEphPubHex: serverEphPubHex
+            )))
+            guard let message = try await pair.server.receive(), case .text = message else {
+                throw FedCarrierError.carrierClosed
+            }
+            // Recorded BEFORE releasing the barrier, so the count reflects the
+            // moment the proof landed rather than the end of the exchange.
+            await reported.markProofSeen()
+            try await pair.server.send(.text("{\"type\":\"relay_ready\"}"))
+        }
+
+        try await fedTestWithTimeout {
+            try await FedRelayAuthenticator().authenticate(
+                material: material, on: pair.client, clock: SystemFedMonotonicClock(),
+                timeout: .seconds(5), barrierTimeout: .seconds(5),
+                barrierDeadlineEpochMs: 1_800_000_060_000,
+                progress: { phase in Task { await reported.record(phase) } }
+            )
+        }
+        _ = try await fedTestWithTimeout { try await peer.value }
+
+        let waits = await reported.peerWaits
+        XCTAssertEqual(waits.count, 1, "a relay dial reports exactly one peer wait")
+        XCTAssertEqual(waits.first?.pipeID, material.pipeID,
+                       "the wait names the pipe both sides share")
+        XCTAssertEqual(waits.first?.untilEpochMs, 1_800_000_060_000,
+                       "the wait carries the grant's absolute expiry, not a local duration")
+
+        let phasesBeforeProof = await reported.phasesBeforeProof
+        XCTAssertEqual(phasesBeforeProof, 0,
+                       "no peer wait may be reported before the proof is sent")
+        let proofCount = await reported.proofCount
+        XCTAssertEqual(proofCount, 1)
+    }
+
     func testRelayHelloProofVerifiesAgainstRelayContextAndIsDomainSeparatedFromHello() async throws {
         let (material, ed25519Pub) = try makeMaterial()
         let pair = LoopbackWebSocketPair()
@@ -631,6 +687,34 @@ final class FedRelayCandidateTokenValidationTests: XCTestCase {
     func testAnArbitraryStringIsRejected() throws {
         XCTAssertThrowsError(try candidate(pipeToken: Data("token".utf8))) { error in
             XCTAssertEqual(error as? FedFailure, .invalidProfile(field: "pipeToken"))
+        }
+    }
+}
+
+/// Records reported dial phases, plus how many had arrived at the moment the
+/// peer received this side's proof. That count is what makes the ORDERING
+/// observable: a peer wait reported before the proof would show up as a
+/// non-zero value here.
+private actor PhaseLog {
+    private(set) var phases: [FedDialPhase] = []
+    private(set) var phasesBeforeProof = -1
+    private(set) var proofCount = 0
+
+    func record(_ phase: FedDialPhase) { phases.append(phase) }
+
+    func markProofSeen() {
+        proofCount += 1
+        if phasesBeforeProof < 0 { phasesBeforeProof = phases.count }
+    }
+
+    /// Just the peer waits, unpacked so assertions read as facts about the wait
+    /// rather than as pattern matching.
+    var peerWaits: [(pipeID: String, untilEpochMs: UInt64)] {
+        phases.compactMap { phase in
+            if case .awaitingPeer(let pipeID, let until) = phase {
+                return (pipeID: pipeID, untilEpochMs: until)
+            }
+            return nil
         }
     }
 }

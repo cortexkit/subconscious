@@ -111,6 +111,13 @@ public struct FedRelayCandidate: Sendable, Equatable {
     /// Nil falls back to the authenticator's default.
     public let peerBarrierTimeout: Duration?
 
+    /// The same moment as `peerBarrierTimeout`, expressed as absolute
+    /// wall-clock, for REPORTING only — the wait itself is bounded by the
+    /// duration. Carried so an observer can render "waiting until T" without
+    /// re-deriving an instant from a duration, which is what lets two sides
+    /// disagree about when the wait ends.
+    public let peerBarrierDeadlineEpochMs: UInt64?
+
     public init(
         candidateID: String,
         relayURL: URL,
@@ -121,7 +128,8 @@ public struct FedRelayCandidate: Sendable, Equatable {
         tokenVersion: UInt64,
         accountSigningPublicKey: Data,
         accountKeyID: String,
-        peerBarrierTimeout: Duration? = nil
+        peerBarrierTimeout: Duration? = nil,
+        peerBarrierDeadlineEpochMs: UInt64? = nil
     ) throws {
         let id = candidateID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { throw FedFailure.invalidProfile(field: "candidateID") }
@@ -161,6 +169,7 @@ public struct FedRelayCandidate: Sendable, Equatable {
         self.accountSigningPublicKey = accountSigningPublicKey
         self.accountKeyID = accountKeyID
         self.peerBarrierTimeout = peerBarrierTimeout
+        self.peerBarrierDeadlineEpochMs = peerBarrierDeadlineEpochMs
     }
 
     /// Confirms the token is the base64url wire text of a pipe token minted for

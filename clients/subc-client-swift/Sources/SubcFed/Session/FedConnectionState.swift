@@ -5,11 +5,46 @@ public enum FedConnectionState: Sendable, Equatable {
     case idle
     case dialing(attemptID: String, candidateID: String, stage: FedCandidateStage)
     case authenticating(attemptID: String, candidateID: String, kind: FedAuthenticationKind)
+    /// Authenticated on a relay pipe and waiting for the PEER to arrive on it.
+    ///
+    /// Distinct from `authenticating` because it is a different axis: the other
+    /// dial states describe work THIS side is doing, where slowness is
+    /// suspicious. This one describes being finished and waiting on someone
+    /// else, where waiting is expected for the whole window and means nothing is
+    /// wrong. Reporting the two as one term is what lets a healthy meeting read
+    /// as a stall.
+    ///
+    /// `untilEpochMs` is an ABSOLUTE wall-clock instant taken from the grant's
+    /// expiry — the same value the barrier itself is bounded by, and the same
+    /// one the peer holds. A remaining-duration would reintroduce, at the
+    /// observation layer, exactly the drift that anchoring the barrier removed:
+    /// an observer computing `now + remaining` lands on a different instant than
+    /// the peer.
+    ///
+    /// A consumer must NOT retry while in this state. Retrying mints a fresh
+    /// grant and therefore a fresh pipe id, so the peer arrives at a pipe this
+    /// side has already abandoned — it does not merely fail to help, it
+    /// guarantees the miss. `isRetryable` answers this from the state alone.
+    case awaitingPeer(attemptID: String, candidateID: String, pipeID: String, untilEpochMs: UInt64)
     case negotiating(attemptID: String, candidateID: String)
     case ready(sessionID: String)
     case reconnectWaiting(deadlineNanoseconds: UInt64, lastFailure: FedFailure)
     case dormant
     case disconnected(reason: FedFailure)
+
+    /// Whether a consumer may start a new dial attempt from this state.
+    ///
+    /// False during `awaitingPeer` for the reason above: a retry there destroys
+    /// a meeting that was about to succeed. False during states that are already
+    /// making progress, since a second attempt would race the first.
+    public var isRetryable: Bool {
+        switch self {
+        case .idle, .dormant, .disconnected, .reconnectWaiting:
+            return true
+        case .dialing, .authenticating, .awaitingPeer, .negotiating, .ready:
+            return false
+        }
+    }
 }
 
 /// Role of an established Noise+fed session relative to rekey.

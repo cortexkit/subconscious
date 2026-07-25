@@ -123,6 +123,11 @@ each one invisible from the consumer boundary.
   than an incomplete one**. Otherwise the only compliant move is to write the
   test, and compliance is what hardens the defect.
 
+  Make the report the **default for anything the worker cannot positively
+  justify**, not an escape hatch it has to recognise the need for. Recognising
+  the need requires the judgement "is this mechanism correct or merely untested"
+  — which is precisely the judgement a fence instruction removes.
+
 ## A fenced decision is not a fenced enforcement
 
 A policy function returning the right verdict and a call site acting on that
@@ -158,6 +163,15 @@ error.
 The practical cost is that this needs a **recording double** rather than a
 return-value assertion: a spy that logs its calls, then assert the log is empty.
 Cheap to build, and the only way an ordering invariant becomes visible at all.
+
+Stated generally: **where a check exists to prevent an effect, the only assertion
+that fences it is that the effect did not happen.** Asserting the returned error
+fences the *report*, and a mutant that performs the effect and then reports
+correctly passes every such test — report and effect are as independently
+deletable as decision and enforcement. So the axis has three positions, not two,
+and the instinctive assertion lands on the wrong one: an authority check whose
+caller's early return was deleted still returned its error, just after
+dispatching.
 
 ## The cost-asymmetry gate
 

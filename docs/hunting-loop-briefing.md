@@ -10,6 +10,44 @@ Authored by the ai-provider-quota seat; kept here because it is fleet-wide
 method, not one module's story. That repo's `docs/provider-invariants.md` is the
 worked example of what a loop leaves behind.
 
+## The checklist
+
+Everything below this table is the reasoning. This is the part you run down. A
+document that says "check for X" depends on the reader already suspecting X; a
+document that lists the X's does not. **If you have to bring the suspicion, it
+is a warning, not an instrument.**
+
+Before briefing a round:
+
+| # | Check | Where it fails |
+|---|-------|----------------|
+| 1 | Are the closed seams named, with their cleared members listed? | A lane with an open seam returns your own last fix |
+| 2 | Is the target ordered by how *unobservable* the class is, not by where defects are easy to find? | Parsers produce volume and repeat two classes |
+| 3 | Does the brief say an honest null is acceptable? | A lane that must produce will produce speculative hardening |
+| 4 | On a sweep, is the negative half (every member, why cleared) a deliverable? | A null becomes unauditable, and your population count goes unchallenged |
+| 5 | If the prompt asks a worker to *fence* anything, does it grant an explicit refusal path — with reporting a wrong mechanism counted as success? | The sweep hardens the defects it was sent to find |
+
+Before believing a green result:
+
+| # | Check | Where it fails |
+|---|-------|----------------|
+| 6 | Can any fixture in the suite *construct* the defective input? | Ten honest assertions, all blind in one direction |
+| 7 | Is the condition tested **at this site**, not merely tested? | The named test exists, attached to the other branch |
+| 8 | For a guard: does a test assert the prevented effect *did not happen* — not that an error came back? | A mutant that acts and then reports correctly passes |
+| 9 | For a fix that removes, reclaims or refuses: would the tests pass if it did that to *everything*? | The suite cannot tell the fix from its unbounded version |
+| 10 | When a mutation reddens something, which test died? | Three tests named for other things means defended by accident |
+| 11 | Did the new CI step *execute*, or was the run cancelled before reaching it? | A green list showing passes for runs that never ran the new logic |
+
+Before calling a class closed:
+
+| # | Check | Where it fails |
+|---|-------|----------------|
+| 12 | Did you sweep the *property*, or re-check the instance that revealed it? | The second guard of a pair stays undefended |
+| 13 | For each branch pair (simple case / full case): does every condition in one have a counterpart in the other? | The richer path carries the consequences and the thinner test |
+| 14 | Does a condition that suppresses output also suppress the thing that would report the suppression? | Alarm and backstop removed by one condition |
+| 15 | Every consumer of your wire enumerated — not just the ones who asked? | Settling with whoever asked is guard-the-instance again |
+| 16 | Does each counter you publish say what its anomaly *looks like*? | A gauge nobody reads as a detector |
+
 ## What this method cannot see
 
 A hunting loop reads **one codebase** carefully, and it is structurally blind to
@@ -275,6 +313,16 @@ coverage map.** The enumeration is cheap and still finds the unasserted
 refusals; only the mutation is evidence. Two distinct shapes score covered under
 the grep alone: a fenced decision whose enforcement is unfenced, and one fenced
 site out of two that return the same variant.
+
+Once a defect is fixed, **sweep the property, not the instance that revealed
+it.** List every site with the same property — every place the wire asserts
+something a consumer acts on, every call site that applies a grant — rather than
+re-reading the one just repaired. One seat nearly stopped after fixing a
+relaxation gap and found a second, completely undefended guard only because the
+enumeration was mechanical rather than a decision about whether they felt done.
+Adjudicate each candidate separately, though: the sweep finds them, it does not
+settle them, and two fields one line apart in one struct can deserve opposite
+verdicts.
 
 That second shape is not incidental. **Where a module has two emission paths for
 the same data, every guard exists twice and will be tested once** — and the

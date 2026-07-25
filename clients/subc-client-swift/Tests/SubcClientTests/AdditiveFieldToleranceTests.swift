@@ -13,8 +13,18 @@ import XCTest
 /// decode error anyone sees — it is a blank surface on an older client talking
 /// to a healthy daemon.
 ///
-/// This has already happened twice on the rdv registry row, which is why the
-/// tolerance is worth pinning rather than assuming.
+/// SCOPE, and it is the opposite of the rule one layer down: these models
+/// decode an ADDITIVE PROJECTION, where an unrecognised field is a
+/// forward-compatible addition and tolerating it is correct. The rdv-wire types
+/// in SubcFed do the reverse — `RdvFieldDecoder.finish()` REFUSES any key it was
+/// not taught, because those rows carry identity and lineage and a silently
+/// ignored field could be one that changes their meaning. See
+/// `RdvRegistryRowStrictnessTests`, which pins that refusal. Neither rule should
+/// be generalised into the other's layer.
+///
+/// The rdv registry row broke twice on new server fields, but NOT as a tolerance
+/// failure: that was the strict decoder correctly refusing fields the client had
+/// not yet been taught, and the remedy was teaching it, not relaxing it.
 final class AdditiveFieldToleranceTests: XCTestCase {
 
     /// Fields no released client knows about, in every JSON shape — a scalar, an

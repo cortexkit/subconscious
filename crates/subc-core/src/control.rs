@@ -1459,23 +1459,37 @@ impl ControlHandler {
                 )?])
             }
         };
+        // `load` reports a missing file as Ok(None), which is correct at boot
+        // (no config, nothing to supervise) and catastrophic here: rescan treats
+        // "not in the config" as "remove it", so an absent file would read as an
+        // empty module list and retire the entire running fleet. An editor
+        // writing via write-new-then-rename, or a half-finished edit, is enough
+        // to open that window. Refuse instead: a config that cannot be read
+        // carries no instruction to remove anything.
+        let Some(config) = loaded else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_daemon_config",
+                format!(
+                    "daemon config not found at {}; refusing to rescan (an absent config would \
+                     retire every supervised module)",
+                    context.config_path.display()
+                ),
+            )?]);
+        };
         let (
             configured_port,
             storage_config,
             admission_facts_carrier_module_id,
             admission_facts_targets,
             modules,
-        ) = loaded
-            .map(|config| {
-                (
-                    config.port,
-                    config.storage,
-                    config.admission_facts_carrier_module_id,
-                    config.admission_facts_targets,
-                    config.modules,
-                )
-            })
-            .unwrap_or((None, None, None, None, Vec::new()));
+        ) = (
+            config.port,
+            config.storage,
+            config.admission_facts_carrier_module_id,
+            config.admission_facts_targets,
+            config.modules,
+        );
 
         if configured_port != context.configured_port
             || storage_config != context.storage_config

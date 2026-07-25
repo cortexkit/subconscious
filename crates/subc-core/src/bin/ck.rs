@@ -912,6 +912,18 @@ fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
 
     println!("{}", bold_text("Usage", color_enabled));
 
+    // An empty provider array is never "nothing configured": a host with no
+    // usable credentials still returns a full array of unavailable entries, so
+    // the only way to reach zero is a cold module or a structural failure
+    // upstream. Saying so beats printing a bare header that reads as "all
+    // quiet".
+    if order.is_empty() {
+        println!();
+        let reason = quota_empty_reason(providers.is_empty(), filter.is_some());
+        println!("{}", dim_text(reason, color_enabled));
+        return;
+    }
+
     for id in order {
         let group = &grouped[&id];
         let connected: Vec<&&Value> = group
@@ -1001,6 +1013,17 @@ fn quota_entry_worst_used(entry: &Value) -> Option<f64> {
         .fold(None, |acc, used| {
             Some(acc.map_or(used, |max: f64| max.max(used)))
         })
+}
+
+/// Why the table came out empty. Separated from rendering so the three cases
+/// stay distinguishable: an empty wire array means the module answered with
+/// nothing at all, which is cold-or-structural rather than a quiet host.
+fn quota_empty_reason(wire_array_empty: bool, filtered: bool) -> &'static str {
+    match (wire_array_empty, filtered) {
+        (true, _) => "no providers reported - the quota module may still be starting",
+        (false, true) => "no accounts matched that provider",
+        (false, false) => "no connected accounts (--verbose to list unavailable providers)",
+    }
 }
 
 fn quota_window_used_percent(window: &Value) -> Option<f64> {
@@ -2609,6 +2632,36 @@ mod tests {
         assert_eq!(
             shorten_uuid_label("not-a-uuid-e29b-41d4-a716-446655440000"),
             "not-a-uuid-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn empty_quota_table_distinguishes_a_silent_module_from_a_quiet_host() {
+        // The producer never returns an empty array for "nothing configured": a
+        // host with no usable credentials still returns a full array of
+        // unavailable entries. So an empty wire array can only be a cold module
+        // or a structural failure, and it must not share a message with the
+        // case where every provider answered and none were connected.
+        let silent_module = quota_empty_reason(true, false);
+        let all_unavailable = quota_empty_reason(false, false);
+        let filtered_miss = quota_empty_reason(false, true);
+
+        assert_ne!(
+            silent_module, all_unavailable,
+            "an empty wire array must not read the same as a host whose providers all answered"
+        );
+        assert_ne!(silent_module, filtered_miss);
+        assert_ne!(all_unavailable, filtered_miss);
+
+        // The silent-module case is the only one where something upstream is
+        // actually broken, so it has to say so rather than describe the host.
+        assert!(
+            silent_module.contains("quota module"),
+            "empty wire array must name the module, got: {silent_module}"
+        );
+        assert!(
+            !all_unavailable.contains("quota module"),
+            "a fully-answered host must not blame the module, got: {all_unavailable}"
         );
     }
 

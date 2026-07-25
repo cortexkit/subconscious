@@ -3113,6 +3113,83 @@ mod tests {
         ));
     }
 
+    /// The spawn-attestation guard is what stops a connected module from claiming
+    /// another module's identity and being stamped `Reserved` for it. Every other
+    /// test that supplies a consumer_identity supplies a CORRECT one, because a
+    /// correct one is what the rest of the flow needs -- so the guard's rejection
+    /// branch was never the subject of an assertion, only its acceptance branch.
+    ///
+    /// Deleting the guard's EFFECT (granting Reserved unconditionally) leaves the
+    /// whole subc-core library suite green; only the forwarding integration tests
+    /// notice, and they notice for unrelated reasons. This test exists so the
+    /// refusal itself is asserted where the guard lives: it fails if the identity
+    /// check stops refusing, which is the direction that matters, since a guard
+    /// that wrongly ACCEPTS is silent while one that wrongly REJECTS is loud.
+    #[tokio::test]
+    async fn route_open_refuses_consumer_identity_that_fails_spawn_attestation() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("fed", "fed-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+
+        let (target_ctx, _target_rx) = route_ctx(ConnectionId::new(90));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+
+        // A real supervised module id presenting the wrong nonce. This is the
+        // impersonation case: the attacker knows a privileged module_id, which is
+        // public, and guesses at the nonce, which is not.
+        let wrong_nonce = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(91)).0,
+                route_open_frame_with_admission_facts(
+                    20,
+                    "target",
+                    Some(subc_control::ConsumerIdentity {
+                        module_id: "fed".to_string(),
+                        launch_nonce: "not-the-real-nonce".to_string(),
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_error(&wrong_nonce[0])["code"],
+            "bad_consumer_identity",
+            "a mismatched launch nonce must be refused, not stamped Reserved"
+        );
+
+        // A module id the supervisor never spawned at all, so no nonce exists to
+        // compare against. An implementation that treats "no record" as "nothing
+        // to check" fails open here while passing the case above.
+        let never_spawned = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(92)).0,
+                route_open_frame_with_admission_facts(
+                    21,
+                    "target",
+                    Some(subc_control::ConsumerIdentity {
+                        module_id: "never-spawned".to_string(),
+                        launch_nonce: "any-nonce".to_string(),
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_error(&never_spawned[0])["code"],
+            "bad_consumer_identity",
+            "an unspawned module_id must be refused rather than accepted for lack of a record"
+        );
+    }
+
     #[tokio::test]
     async fn admission_facts_gate_checks_carrier_target_and_precedence() {
         let registry = Arc::new(Registry::default());

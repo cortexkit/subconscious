@@ -56,8 +56,23 @@ extension RdvRelayGrant {
     ///
     /// A grant already at or past its expiry yields zero: there is no window
     /// left to wait in, and waiting on a dead grant only delays the failure.
+    ///
+    /// The result is clamped, because the expiry is a value this side receives
+    /// rather than one it computes: a server defect or a clock skewed backwards
+    /// yields an expiry far in the future, and an unclamped wait would park the
+    /// dial there for as long as the bad value says. The clamp costs nothing in
+    /// the normal case — grants are minted well inside it — and bounds the
+    /// abnormal one.
+    ///
+    /// The value matches the serving side's own cap deliberately. Anchoring both
+    /// sides to the grant is what makes them stop waiting at the same instant,
+    /// and a clamp only preserves that if both clamp identically; a different
+    /// number here would reintroduce the offset the anchoring exists to remove.
     public func barrierTimeout(nowMs: UInt64) -> Duration {
         guard let expiry = UInt64(expiresAtMs), expiry > nowMs else { return .zero }
-        return .milliseconds(expiry - nowMs)
+        return min(.milliseconds(expiry - nowMs), Self.relayReadyTimeoutCap)
     }
+
+    /// Upper bound on a peer-meeting wait, matching the serving side's cap.
+    static let relayReadyTimeoutCap: Duration = .seconds(60)
 }

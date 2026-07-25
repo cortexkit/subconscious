@@ -531,6 +531,27 @@ final class FedRelayBarrierDeadlineTests: XCTestCase {
         XCTAssertEqual(grant.barrierTimeout(nowMs: 1_700_000_060_000), .zero)
         XCTAssertEqual(grant.barrierTimeout(nowMs: 1_700_000_099_000), .zero)
     }
+
+    /// The expiry is a value this side RECEIVES, so it can be wrong. A server
+    /// defect or a clock skewed backwards yields an expiry far in the future,
+    /// and an unclamped wait would park the dial there for as long as the bad
+    /// value claims — an hour here, from a single malformed field.
+    ///
+    /// Anchoring to the grant is what makes both sides stop at the same instant,
+    /// so the clamp only preserves that if both clamp to the SAME value. This
+    /// asserts the shared 60s bound rather than merely "something finite": a
+    /// clamp that differed from the serving side would pass a weaker assertion
+    /// while reintroducing exactly the offset the anchoring removes.
+    func testAFarFutureExpiryIsClampedToTheSharedCap() {
+        let now: UInt64 = 1_700_000_000_000
+        let anHourOut = grant(expiresAtMs: now + 3_600_000)
+        XCTAssertEqual(anHourOut.barrierTimeout(nowMs: now), .seconds(60))
+
+        // A window inside the cap is returned untouched, so the clamp is a
+        // bound on the abnormal case and not a flat replacement of the anchor.
+        let wellInside = grant(expiresAtMs: now + 12_000)
+        XCTAssertEqual(wellInside.barrierTimeout(nowMs: now), .milliseconds(12_000))
+    }
 }
 
 private extension Duration {

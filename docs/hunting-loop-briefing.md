@@ -17,6 +17,15 @@ document that says "check for X" depends on the reader already suspecting X; a
 document that lists the X's does not. **If you have to bring the suspicion, it
 is a warning, not an instrument.**
 
+Two things about building one of these, learned by getting both wrong here.
+**A list forces you to enumerate the population, and enumerating the population
+is how you discover a missing member** — building this table is what revealed
+that the sweep-the-property rule had no section to point at, which no amount of
+re-reading the sections could have surfaced. And **a table transcribed from
+memory is prose with borders**: it inherits the errors of the recollection that
+produced it while looking more authoritative than the prose did. Two rows here
+pointed at nothing on the first pass. Re-derive every row from the source.
+
 Before briefing a round:
 
 | # | Check | Where it fails |

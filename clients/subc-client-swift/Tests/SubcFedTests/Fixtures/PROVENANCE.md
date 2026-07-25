@@ -107,11 +107,26 @@ criteria, each encoded as `u32 LE header_len || header || u32 LE body_len
 
 ### rdv-wire vectors
 
-The rdv-wire golden vectors are consumed directly from the vendored
-evidence directory at
-`.cortexkit/alfonso/evidence/fed-mobile/test-vectors/rdv-wire/`. They are
-not copied into this directory: the fixture tests load them at test time
-via the package resource path so a contract update is picked up without
-duplicating bytes. The tests verify canonical key ordering, decimal-string
-numerics, NFC enforcement, minimal escaping, duplicate-key rejection,
-and the depth-128 boundary.
+The rdv-wire golden vectors ARE copied into `Fixtures/rdv-wire/`, and the
+fixture tests read that copy from the source tree at test time. An earlier
+version of this note claimed they were read directly from the vendored
+evidence directory and therefore picked up contract updates automatically.
+That was not true, and the claim was worse than saying nothing: it described
+a currency guarantee that nothing enforced.
+
+A copy is a SNAPSHOT. It records what the producer emitted once, so a change
+on the producing side breaks nothing here and the divergence surfaces at a
+live handshake instead of at a build. `RdvVectorCurrencyTests` turns it into a
+PIN by asserting each vector's SHA-256 against a digest written in the test
+(not computed from the file, which would let any regenerated copy satisfy it),
+plus the vector set itself, since a vector added or removed upstream is also a
+contract change.
+
+The same bytes are consumed by the TypeScript rendezvous worker and the Rust
+cloud vocabulary, both of which read them from the producing repository's own
+`test-vectors/rdv-wire/`. Updating a vector here means the contract moved:
+read what changed before touching the digest.
+
+The conformance tests verify canonical key ordering, decimal-string numerics,
+NFC enforcement, minimal escaping, duplicate-key rejection, and the depth-128
+boundary.

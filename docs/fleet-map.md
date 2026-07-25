@@ -5,7 +5,9 @@ the full picture instead of discovering seams by collision. Written for
 WERNI's onboarding; maintained as seats and charters evolve. Corrections
 belong to the SUBC seat (fleet coordination custody).
 
-Last updated: 2026-07-19.
+Last updated: 2026-07-25. The seat roster below is checkable against
+`ck module list` on a personal daemon; if a supervised module is missing
+from section 1, this document has rotted and the module is right.
 
 ## 1. Product map
 
@@ -18,7 +20,7 @@ Shipped and in production (supervised by the personal daemon today):
   and the Swift chat app (`subc-chat`, the observability/testbed UI).
 - **aft** — code perception and editing tools (search, outline, zoom,
   callgraph, edit, bash, worktrees). The `aft_*` tool surface every agent
-  uses. v0.47.x.
+  uses.
 - **magic-context (mc)** — context lifecycle: compaction/folding,
   historian, memory, cache-stability core (`cortexkit-cache-core` in
   commons), tail reduction, todo capture. Serves owned harnesses via
@@ -28,9 +30,13 @@ Shipped and in production (supervised by the personal daemon today):
   verification. The Mode-3 delivery path.
 - **broca** — the durable LLM loop runner: WAL-first exactly-once agentic
   loop, provider framework (5 wire families, catalog-driven), session
-  lineage, subscriptions. v0.3.0 tagging now.
-- **ai-provider-quota (quota)** — provider quota/usage windows, 30+
-  providers, multi-account. Feeds `ck quota` and the router.
+  lineage, subscriptions.
+- **ai-provider-quota (quota)** — provider quota/usage windows across
+  every provider we can source, multi-account. Feeds `ck quota` and the
+  router. Adding or changing a provider adapter means reading that
+  repo's `docs/provider-invariants.md` first: several of its properties
+  exist because a plausible-looking adapter reported healthy while
+  silently discarding an exhausted allowance.
 - **cortexkit-credentials (ckcred)** — two halves: the local credential
   VAULT (encrypted, single-writer, audit-chained, OAuth refresh custody)
   and the cloud **CortexKit Account service** (account.cortexkit.io on
@@ -55,8 +61,23 @@ Shipped and in production (supervised by the personal daemon today):
   encryption, per-device manifest chains, Cloudflare DO cloud plane
   (live), GC (live), cross-module session restore designed. Master key
   in the vault; sync via federation.
+- **plexus (plex)** — third-party service connectors (the reuse ladder:
+  MCP-direct, OpenAPI-shim, vendor-deep-wrapper). Credentials stay in the
+  vault and bearer handles never reach tool arguments; connectors get
+  binding tickets instead. Supervised in prod, read paths first.
 
 Building / chartered:
+
+- **cerebellum (cereb)** — computer and browser control: the actuation
+  plane for surfaces with no API. Structured interfaces first, GUI
+  driving as the fallback. Isolated from aft so browser runtimes and
+  macOS TCC permissions stay out of the code-perception module.
+- **alfonso-ios (ckios)** — the iOS client: reaches a personal daemon
+  over federation (Noise IK, LAN and WAN via rendezvous/relay), and is
+  the first consumer proving the Swift `SubcFed` transport end to end.
+- **ck-projects** — the workspace registry: durable project identity with
+  a journal spine, so every seat resolves the same project to the same id
+  rather than deriving one per module.
 
 - **wernicke (werni)** — the chat gateway (Slack/Teams/Telegram/Discord):
   org-plane bot, linked-owner authority, Room-1 acting-for consumer.

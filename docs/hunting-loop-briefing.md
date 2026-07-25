@@ -482,6 +482,30 @@ something else entirely, which reads as "covered" and is actually "defended by
 accident" — the same habit as reading a failure *message* rather than a failure
 *colour*, one level up. Read which test died, not that one did.
 
+A mutation result has **two baselines, and everyone runs only one.** We check
+that the mutant turns a test red. We forget to check the test was green before
+the mutation. THALAMUS ran a mutant against a fence and two integration tests
+went red; they nearly reported "integration catches it." Those two fail
+identically on clean code — opt-in corpus probes that panic without env vars
+pointing at capture directories. Without the clean-baseline run they would have
+credited coverage that does not exist and stopped looking. **Green before, red
+after. One without the other is a guard with no negative vector, arriving
+through the instrument instead of the code.**
+
+## Assert both directions, not only the one you are hunting
+
+THALAMUS's fix asserts the forwarded bytes **equal** the client's request and
+**do not equal** the transformed one. That kills two mutants: the one they hunted
+(report the fence, forward the untrusted bytes) and its opposite (withhold
+correctly, mislabel the record as a rewrite).
+
+A single-direction assertion fences the effect. A bidirectional one fences the
+**pairing between the label and the effect**, which is the whole job of a
+decision log. The aggravating detail in both this case and the attestation one is
+that the record was not silent — it was confidently wrong. An operator reading
+`raw_only_fence` in the log would conclude the request was withheld when it was
+sent.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

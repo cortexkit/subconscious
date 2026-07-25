@@ -492,6 +492,20 @@ credited coverage that does not exist and stopped looking. **Green before, red
 after. One without the other is a guard with no negative vector, arriving
 through the instrument instead of the code.**
 
+### A fix to the mechanism does not cover the callers of the mechanism
+
+THALAMUS fixed one fence by asserting it replaces bytes correctly. Twenty minutes
+later the next candidate had the identical defect, and **the fresh fix did not
+catch it** — the new mutant left the mechanism correct and broke the *caller*,
+handing it the wrong bytes to fence to. The gate reported its refusal accurately
+and sent the rejected body anyway. All 400 tests passed, including the fence test
+written twenty minutes earlier.
+
+So the decision/enforcement split **recurses**. Fixing an enforcement site proves
+nothing about a second site that uses the same mechanism, and a suite that just
+grew a correct new test is exactly where you feel most covered. **Each call site
+needs its own mutant at its own call site. Adjacent fixes do not generalise.**
+
 ## Assert both directions, not only the one you are hunting
 
 THALAMUS's fix asserts the forwarded bytes **equal** the client's request and

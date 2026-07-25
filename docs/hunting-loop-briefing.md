@@ -40,6 +40,16 @@ each one invisible from the consumer boundary.
    left everything green. Where the claim is a safety claim, an unearned one
    writes a record asserting something the system did not achieve, which is a
    quiet lie rather than a crash.
+
+   Two follow-ups, both learned by nearly missing them. A grant applied at
+   several sites needs a guard at **each**, and a test on one site says nothing
+   about the other — the moment you find one, you will be tempted to guard it
+   once and call the class closed. And check *what* the nearest existing guard
+   asserts: one that checks an eligibility flag is not set never establishes
+   that an unset flag is not honoured, which is the upstream condition rather
+   than the gate. In the measured case, deleting the real gate reddened only
+   three tests named for something else entirely — defended by accident, and one
+   refactor of those unrelated tests away from being undefended.
 3. **The state machine and its fences.** Incarnation/ABA, attempt ordering,
    admission fairness, what a timeout does to a prior observation. Demand the
    exact interleaving — "these two race" is not a finding.

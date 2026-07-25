@@ -492,6 +492,29 @@ credited coverage that does not exist and stopped looking. **Green before, red
 after. One without the other is a guard with no negative vector, arriving
 through the instrument instead of the code.**
 
+### When the mutant does not kill your new test, the test is the suspect
+
+THALAMUS wrote a test for an authorizer that armed a destructive tee. Three
+versions, all green, and **two of them were worthless**:
+
+- v1 failed — but on the observability assertion, not either security one. No
+  transform was installed, so the declaration was never examined.
+- v2 passed, **and passed against the mutant too**. Arming was blocked earlier by
+  inactive surface state and absent guidance, so control never reached the
+  authorizer. The test would have passed whatever the authorizer did.
+- v3 became evidence only after installing an active surface and usable guidance,
+  so the declaration was the only thing between the call and the queue.
+
+The instinct on v2 is that the guard has some other protection making the mutant
+harmless. It did — and that is exactly the problem: **the test was measuring the
+other protection, not the guard it names.** A test that passes for a reason other
+than the one in its name is worse than no test at that site, because it marks the
+site as covered.
+
+This is the hunted class appearing *inside the hunt*, twice, in ten minutes,
+while explicitly looking for it. Mutating your own new test is not a nicety: it
+was the only thing separating three green tests, two of which proved nothing.
+
 ### A fix to the mechanism does not cover the callers of the mechanism
 
 THALAMUS fixed one fence by asserting it replaces bytes correctly. Twenty minutes

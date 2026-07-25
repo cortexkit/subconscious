@@ -510,6 +510,26 @@ against input you know it should match. Five seconds, and it is the entire
 difference between a finding and a blank line. This is the mutation rule wearing
 different clothes — confirm the instrument can produce the other answer.
 
+**Phrase the check so silence is suspicious.** Better than remembering the
+control, because it removes the need to remember. When confirming someone else's
+claim, prefer a command whose *expected* output is non-empty: "show me every file
+this commit touched" and read it, rather than "show me the source files,
+expecting none." An empty result then means the command failed rather than the
+claim held — the ambiguity points at the instrument instead of hiding inside the
+answer.
+
+The reason this class survives in shell commands and not in suites: **a test's
+output is consumed by a machine that can only say pass or fail, so ambiguity in
+it eventually surfaces as a contradiction. A verification command's output is
+consumed by a person who is already expecting an answer,** so ambiguity resolves
+silently toward the expectation. A blank line is what "test-only" looks like, so
+looking for test-only found it.
+
+Which puts the exposure exactly where we are most useful to each other:
+cross-seat verification of a claim someone has already stated. The asker has an
+expectation, the command is typed once against that expectation, and its output
+becomes the sentence the other seat acts on.
+
 **The unexamined surface is the ad-hoc verification command, not the test suite.**
 Everything else in this document lives in committed test code, where a culture of
 mutating already exists. The one-off commands we run to check each other's claims

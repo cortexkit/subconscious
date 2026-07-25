@@ -135,6 +135,8 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
             material: material,
             clock: context.clock,
             barrierTimeout: relay.peerBarrierTimeout,
+            barrierDeadlineEpochMs: relay.peerBarrierDeadlineEpochMs,
+            progress: context.progress,
             upgrade: { try await upgrade(relay) }
         )
 

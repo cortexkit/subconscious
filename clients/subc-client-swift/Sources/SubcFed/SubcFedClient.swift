@@ -17,6 +17,12 @@ public struct FedDialAttemptContext: Sendable {
     /// not initiate, redeems a grant the remote side opened. The factory must not
     /// send connect_request / relay_open when this is `.responder`.
     public let initiationRole: FedDialInitiationRole
+    /// Reports dial phases as they are entered, so the client can publish them.
+    ///
+    /// Declared with a default so the memberwise initializer keeps working for
+    /// callers that do not observe progress — adding a required parameter here
+    /// would be a source break for every existing construction.
+    public var progress: FedDialProgress? = nil
 }
 
 /// Result of a successful candidate dial through Noise and fed negotiation.
@@ -478,7 +484,13 @@ public actor SubcFedClient {
                 entropy: entropy,
                 stateStore: stateStore,
                 observedNetwork: snapshot,
-                initiationRole: role
+                initiationRole: role,
+                // The carrier reports phases as it enters them; publishing is
+                // the client's job, since only it holds the attempt identity.
+                progress: { [weak self] phase in
+                    guard let self else { return }
+                    Task { await self.publish(phase, attemptID: attemptID, candidateID: candidate.candidateID) }
+                }
             )
             do {
                 let dialed = try await dialFactory.dial(candidate: candidate, context: context)
@@ -789,6 +801,26 @@ public actor SubcFedClient {
     private func cancelBackgroundWork() {
         reconnectTask?.cancel()
         reconnectTask = nil
+    }
+
+    /// Maps a carrier-reported dial phase onto published connection state,
+    /// supplying the attempt identity the carrier does not have.
+    ///
+    /// Late reports are dropped: a phase from a superseded attempt must not
+    /// overwrite the current state, and the dial that reported it may already
+    /// have failed or been replaced by a newer attempt before this runs.
+    private func publish(_ phase: FedDialPhase, attemptID: String, candidateID: String) {
+        guard attemptID == lastAttemptID else { return }
+        switch phase {
+        case .authenticating(let kind):
+            publish(.authenticating(attemptID: attemptID, candidateID: candidateID, kind: kind))
+        case .awaitingPeer(let pipeID, let untilEpochMs):
+            publish(.awaitingPeer(
+                attemptID: attemptID,
+                candidateID: candidateID,
+                pipeID: pipeID,
+                untilEpochMs: untilEpochMs))
+        }
     }
 
     private func publish(_ state: FedConnectionState) {

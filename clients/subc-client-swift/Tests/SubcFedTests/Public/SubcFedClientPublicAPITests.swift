@@ -401,6 +401,8 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             .idle,
             .dialing(attemptID: String(repeating: "ab", count: 16), candidateID: "c", stage: .carrierConnect),
             .authenticating(attemptID: String(repeating: "ab", count: 16), candidateID: "c", kind: .noise),
+            .awaitingPeer(attemptID: String(repeating: "ab", count: 16), candidateID: "c",
+                          pipeID: String(repeating: "p", count: 26), untilEpochMs: 1),
             .negotiating(attemptID: String(repeating: "ab", count: 16), candidateID: "c"),
             .ready(sessionID: "s"),
             .reconnectWaiting(deadlineNanoseconds: 1, lastFailure: .disconnected),
@@ -416,6 +418,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             case .idle: seen.insert("idle")
             case .dialing: seen.insert("dialing")
             case .authenticating: seen.insert("authenticating")
+            case .awaitingPeer: seen.insert("awaitingPeer")
             case .negotiating: seen.insert("negotiating")
             case .ready: seen.insert("ready")
             case .reconnectWaiting: seen.insert("reconnectWaiting")

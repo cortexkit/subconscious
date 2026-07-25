@@ -161,6 +161,20 @@ public struct FedRelayProof: Sendable, Equatable {
     }
 }
 
+/// A dial-progress report from the carrier to whoever owns connection state.
+/// The carrier reports; it does not publish. Kept as a callback rather than a
+/// stream because the carrier has no lifecycle to hang a stream on, and the
+/// client is already the state owner.
+public typealias FedDialProgress = @Sendable (FedDialPhase) -> Void
+
+/// A phase within one candidate's establishment, reported as it is entered.
+public enum FedDialPhase: Sendable, Equatable {
+    case authenticating(kind: FedAuthenticationKind)
+    /// Proof sent and accepted; now waiting for the peer to arrive on the pipe.
+    /// `untilEpochMs` is absolute wall-clock, from the grant's expiry.
+    case awaitingPeer(pipeID: String, untilEpochMs: UInt64)
+}
+
 public struct FedRelayAuthenticator: Sendable {
     public init() {}
 
@@ -189,7 +203,9 @@ public struct FedRelayAuthenticator: Sendable {
         on stream: any FedWebSocketStream,
         clock: any FedMonotonicClock,
         timeout: Duration = .seconds(3),
-        barrierTimeout: Duration = .seconds(60)
+        barrierTimeout: Duration = .seconds(60),
+        barrierDeadlineEpochMs: UInt64? = nil,
+        progress: FedDialProgress? = nil
     ) async throws {
         let runner = FedStageDeadlineRunner(clock: clock)
         do {
@@ -205,6 +221,12 @@ public struct FedRelayAuthenticator: Sendable {
                 let proof = try makeProof(material: material, challenge: challenge)
                 try await stream.send(.text(proof.message))
             }
+            // The proof is away and accepted: everything from here is waiting on
+            // the peer, not on this side. Reported so an observer can say so
+            // rather than showing an indistinguishable spinner.
+            progress?(.awaitingPeer(
+                pipeID: material.pipeID,
+                untilEpochMs: barrierDeadlineEpochMs ?? 0))
             // Reported under the same stage on purpose: the stage vocabulary is
             // shared across implementations, so a new case would have to be
             // agreed on every side before it could be emitted here.
@@ -322,6 +344,12 @@ public actor FedRelayRecordCarrier {
         /// authenticator's default. Derive it from the grant's absolute expiry
         /// so both sides stop waiting at the same instant.
         barrierTimeout: Duration? = nil,
+        /// Absolute instant the barrier wait ends, for reporting only. The wait
+        /// itself is bounded by `barrierTimeout`; this is the same moment
+        /// expressed as wall-clock so an observer can render it without
+        /// re-deriving it from a duration.
+        barrierDeadlineEpochMs: UInt64? = nil,
+        progress: FedDialProgress? = nil,
         upgrade: @escaping @Sendable () async throws -> any FedWebSocketStream
     ) async throws -> FedRelayRecordCarrier {
         let runner = FedStageDeadlineRunner(clock: clock)
@@ -338,7 +366,9 @@ public actor FedRelayRecordCarrier {
                 material: material,
                 clock: clock,
                 timeout: deadlines.relayAuthentication,
-                barrierTimeout: barrierTimeout)
+                barrierTimeout: barrierTimeout,
+                barrierDeadlineEpochMs: barrierDeadlineEpochMs,
+                progress: progress)
         } catch {
             await carrier.close()
             throw error
@@ -350,17 +380,21 @@ public actor FedRelayRecordCarrier {
         material: FedRelayMaterial,
         clock: any FedMonotonicClock,
         timeout: Duration = .seconds(3),
-        barrierTimeout: Duration? = nil
+        barrierTimeout: Duration? = nil,
+        barrierDeadlineEpochMs: UInt64? = nil,
+        progress: FedDialProgress? = nil
     ) async throws {
         guard !closed, !readyToUse else { throw FedNoiseError.handshakeState }
         do {
             if let barrierTimeout {
                 try await authenticator.authenticate(
                     material: material, on: stream, clock: clock,
-                    timeout: timeout, barrierTimeout: barrierTimeout)
+                    timeout: timeout, barrierTimeout: barrierTimeout,
+                    barrierDeadlineEpochMs: barrierDeadlineEpochMs, progress: progress)
             } else {
                 try await authenticator.authenticate(
-                    material: material, on: stream, clock: clock, timeout: timeout)
+                    material: material, on: stream, clock: clock, timeout: timeout,
+                    barrierDeadlineEpochMs: barrierDeadlineEpochMs, progress: progress)
             }
             readyToUse = true
         } catch {

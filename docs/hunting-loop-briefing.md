@@ -87,10 +87,21 @@ each one invisible from the consumer boundary.
    The sub-family worth its own sweep is **an absent input converted into a
    positive assertion**, because unlike the rest of the rung it has literal
    signatures to search: `unwrap_or`, `unwrap_or_default`,
-   `map(...).unwrap_or(...)`. At each one ask whether absence here means
-   *nothing* or means *I do not know*. Two found the same evening: a missing
-   config read as "no modules configured" when it meant "I could not read the
-   file", and an event with no recorded outcome delivered as a successful one.
+   `map(...).unwrap_or(...)`. The test is not "is there a default" but **is the
+   substituted value a claim, or the representation of absence?** A default is
+   safe when the type has a value that *means* absent — null, empty set, an
+   `unknown` variant — and the code picks that one. It is a defect when every
+   available value is a positive assertion and the code picks the flattering
+   one.
+
+   Two found the same evening: a missing config read as "no modules configured"
+   when it meant "I could not read the file", and an event with no recorded
+   outcome delivered as a successful one. Two that cleared honestly under the
+   same test: an absent filter defaulting to include-all (the representation of
+   "no filter", not a claim that everything passed one), and an absent detail
+   block defaulting to JSON null (which asserts nothing). The last two sat *one
+   line apart in the same struct* and got opposite verdicts — the
+   correct-one-call-site-away problem at its shortest possible range.
    **Check the fixtures before reading a single assertion.** A fixture that
    never constructs the absent case makes every test over it vacuous for that
    branch — you can write ten sharp assertions over a helper that structurally

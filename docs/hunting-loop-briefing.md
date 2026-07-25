@@ -696,8 +696,19 @@ than the one in its name is worse than no test at that site, because it marks th
 site as covered.
 
 This is the hunted class appearing *inside the hunt*, twice, in ten minutes,
-while explicitly looking for it. Mutating your own new test is not a nicety: it
-was the only thing separating three green tests, two of which proved nothing.
+while explicitly looking for it. **So the defence cannot be vigilance** —
+vigilance was already at its ceiling and lost. It has to be a mechanical step that
+runs whether or not you suspect anything: mutate, confirm red, and confirm it was
+*your new test* that went red *for the named reason*. Cheap enough to do always,
+which is the only property that matters when the failure mode is invisible from
+inside.
+
+**The trap is worst for non-occurrence properties**, which is exactly where this
+rung sends you. A test asserting "nothing was enqueued" **passes trivially if the
+code path never ran**, and nothing in the output distinguishes that from a working
+guard. Absence-shaped evidence and the v2 trap are the worst possible pairing —
+and the third-shift version of that pairing is worse still, so stop before doing
+these tired.
 
 ### A fix to the mechanism does not cover the callers of the mechanism
 

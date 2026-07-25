@@ -164,7 +164,14 @@ final class FedRelayCarrierTests: XCTestCase {
             "domain": "rdv-v1/relay",
             "nonce": nonce,
             "pipe_id": material.pipeID,
-            "pipe_token_hash": Data(SHA256.hash(data: material.pipeToken)).lowercaseHex,
+            // SHA-256 of the token's DECODED bytes, per the wire contract — the
+            // server and the Rust client both hash what the base64url text decodes
+            // to, NOT the text itself. Deriving this from the spec rather than from
+            // the implementation is the point: hashing material.pipeToken here
+            // would mirror the client and could never catch the client being wrong.
+            "pipe_token_hash": Data(SHA256.hash(
+                data: Data(base64URLEncoded: String(decoding: material.pipeToken, as: UTF8.self)) ?? Data()
+            )).lowercaseHex,
             "server_eph_x25519_pubkey": serverEphPubHex,
             "side": material.side.rawValue,
             "x25519_pubkey_hex": material.x25519Key.publicKey.lowercaseHex,

@@ -530,6 +530,10 @@ async fn print_ack_with_state(
         if let Some(object) = output.as_object_mut() {
             object.insert("state".to_string(), Value::String(state.to_string()));
             object.insert(
+                "daemon".to_string(),
+                Value::String(client.path.display().to_string()),
+            );
+            object.insert(
                 "module".to_string(),
                 module.unwrap_or_else(|| Value::Object(Default::default())),
             );
@@ -544,6 +548,12 @@ async fn print_ack_with_state(
                 state.to_string(),
             ]],
         );
+        // Name the daemon that actually served this. A mis-targeted mutation
+        // otherwise reports success against a different daemon than intended and
+        // nothing in the output says so -- the command is loud, correct-looking,
+        // and about the wrong subject, which is the hardest kind of mistake to
+        // notice because there is no error to see.
+        println!("daemon: {}", client.path.display());
     }
     Ok(())
 }
@@ -2249,6 +2259,14 @@ fn connection_file_candidates(override_path: Option<&Path>) -> Vec<PathBuf> {
     }
 
     let mut candidates = Vec::new();
+    // Honour SUBC_CONNECTION_FILE ahead of discovery. Someone who sets it has
+    // named the daemon they mean; silently ignoring it and auto-discovering a
+    // different one turns a stated intent into a mutation against the wrong
+    // target that still reports success. `--subc` still wins, since an explicit
+    // flag beats an inherited environment.
+    if let Some(from_env) = non_empty_os_var("SUBC_CONNECTION_FILE") {
+        push_unique(&mut candidates, PathBuf::from(from_env));
+    }
     if let Some(runtime_dir) = non_empty_os_var("XDG_RUNTIME_DIR") {
         push_unique(
             &mut candidates,

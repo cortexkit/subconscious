@@ -590,6 +590,30 @@ direct. Directness is worth less than durability for anything meant to hold for
 years. And it is worth hunting for these deliberately — they are the protections
 nobody has to maintain.
 
+### A park carrying an unsized recommendation is a trap for its own author
+
+E2E parked an ungated failing typecheck with "either gate it or delete it," as
+though the two were comparable. They were only comparable while the cost was
+unknown — one measurement gave one file and two errors on a single line, and
+gating became obviously right.
+
+The harm is downstream: **a parked item carrying an unsized recommendation will be
+picked up later by someone who trusts the recommendation more than they should,
+including its author.** A park is a message to a reader with less context than
+you had, and a lean reads to them as a considered judgement. So the honest park
+is **the option set plus the unknown**, not a lean. Same defect as publishing a
+number with a caveat: the qualifier evaporates and the confident part travels.
+
+Related pair, from two ungated scripts found the same night: **a failing ungated
+script is a dormant alarm; a passing one is an active false assurance.** The
+failing one turns red the moment anyone runs it by hand. The passing one is
+confirmed by every hand-run while nothing establishes it will stay green.
+
+And for any check at all: **existence and execution are not the question, timing
+relative to the decision is.** A release-time check reports once someone is
+already publishing — attached to the action you least want to abort, with the
+whole merge-to-release window invisible behind it.
+
 The three interlock, in this order:
 
 1. A filter returning empty must be proven capable of returning non-empty.

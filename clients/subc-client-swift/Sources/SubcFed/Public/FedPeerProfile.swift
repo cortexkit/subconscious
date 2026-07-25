@@ -131,15 +131,20 @@ public struct FedRelayCandidate: Sendable, Equatable {
         guard relayURL.scheme?.lowercased() == "wss" else {
             throw FedFailure.invalidProfile(field: "relayURL")
         }
-        // NOTE for callers: `pipeToken` must be the base64url WIRE TEXT as UTF-8
-        // bytes, exactly as the relay_grant carried it — NOT the decoded token. The
-        // Authorization bearer and the PoP's pipe_token_hash are both computed over
-        // these same bytes, so passing base64url-DECODED bytes yields a garbage
-        // bearer and a wrong hash, whose only symptom is
-        // relay_authentication_failed at the barrier after a socket has already
-        // been opened. Validating the token layout here would catch that locally;
-        // it is not enforced yet because the existing tests construct synthetic
-        // tokens, and tightening it belongs with updating those fixtures.
+        // `pipeToken` must be the base64url WIRE TEXT as UTF-8 bytes, exactly as
+        // the relay_grant carried it — NOT the decoded token. Both forms are
+        // load-bearing and they differ: the Authorization bearer sends this text,
+        // while the PoP hashes what it decodes to. Passing decoded bytes yields a
+        // garbage bearer and a wrong hash, and the only symptom is
+        // relay_authentication_failed at the barrier, after a socket has already
+        // been opened and a grant spent.
+        //
+        // So the layout is checked here, where the mistake can still be named:
+        // decoded bytes fail to base64url-decode a second time into a
+        // fixed-width token, and a token minted for another pipe, side or token
+        // version is caught before it is carried anywhere.
+        try Self.validatePipeTokenLayout(
+            pipeToken, pipeID: pipeID, side: side, tokenVersion: tokenVersion)
         guard !accountID.isEmpty else { throw FedFailure.invalidProfile(field: "accountID") }
         guard pipeID.utf8.count == 26 else { throw FedFailure.invalidProfile(field: "pipeID") }
         guard accountSigningPublicKey.count == 32 else {
@@ -156,6 +161,31 @@ public struct FedRelayCandidate: Sendable, Equatable {
         self.accountSigningPublicKey = accountSigningPublicKey
         self.accountKeyID = accountKeyID
         self.peerBarrierTimeout = peerBarrierTimeout
+    }
+
+    /// Confirms the token is the base64url wire text of a pipe token minted for
+    /// exactly this pipe, side and token version.
+    ///
+    /// The device binding is deliberately NOT checked here: the candidate does
+    /// not carry the device key, and that check already happens at redemption
+    /// where the key is in hand. This is the subset knowable at construction.
+    private static func validatePipeTokenLayout(
+        _ pipeToken: Data,
+        pipeID: String,
+        side: FedRelaySide,
+        tokenVersion: UInt64
+    ) throws {
+        let token: FedPipeToken
+        do {
+            token = try FedPipeToken.parse(base64URL: String(decoding: pipeToken, as: UTF8.self))
+        } catch {
+            throw FedFailure.invalidProfile(field: "pipeToken")
+        }
+        guard token.pipeID == pipeID else { throw FedFailure.invalidProfile(field: "pipeToken.pipeID") }
+        guard token.side == side else { throw FedFailure.invalidProfile(field: "pipeToken.side") }
+        guard token.tokenVersion == tokenVersion else {
+            throw FedFailure.invalidProfile(field: "pipeToken.tokenVersion")
+        }
     }
 
     /// Equality is candidate IDENTITY, so `peerBarrierTimeout` is deliberately

@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
+    supervise::HealthConfig,
     ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig,
     ForwardingTable, Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
@@ -410,6 +411,24 @@ async fn serve_bound_daemon(
         match supervisor.supervise_configured_with_health(configured.module_spec(), enabled, health)
         {
             Ok(_) => {
+                // A raised failure threshold is normally a temporary allowance for a
+                // drive that deliberately stops a module, and it widens the window in
+                // which a genuinely wedged module looks fine. It is only ever noticed
+                // when someone thinks to re-read the config, so a relaxation outlives
+                // its reason silently: a rig ran five days at 240s of tolerance against
+                // a 90s default because a comment promising a revert was mistaken for
+                // the revert. Saying so on every boot costs one line and removes the
+                // need for anyone to remember.
+                let default_threshold = HealthConfig::default().failure_threshold;
+                if enabled && health.failure_threshold > default_threshold {
+                    warn!(
+                        module_id = %module_id,
+                        failure_threshold = health.failure_threshold,
+                        default_threshold,
+                        tolerance_secs = health.cadence.as_secs() * u64::from(health.failure_threshold),
+                        "health failure threshold is relaxed above the default; a wedged module stays unflagged for longer"
+                    );
+                }
                 info!(module_id = %module_id, enabled, "configured module supervised");
             }
             Err(err) => {

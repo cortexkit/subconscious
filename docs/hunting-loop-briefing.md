@@ -252,6 +252,14 @@ was built to catch.
 
 ## Five brief rules that each changed the output measurably
 
+- **A negative is conditional on the configuration it was measured under.** When
+  a change reshapes the landscape a lane was searching — a new dispatch
+  geometry, a different data shape, a lifted bound — the *rejected* candidates
+  in the ledger need re-reading, not just the accepted ones. A mechanism ruled
+  out under the old geometry may be live under the new one, and nothing in the
+  ledger says so, because a null is recorded as a fact rather than as a fact
+  about conditions. This is also an argument for re-firing a lane promptly after
+  a shift, before the assumptions built on the old landscape fossilize.
 - **State the closed seams explicitly.** Once a class is swept, name it and its
   cleared members. A lane with an open seam keeps returning instances of your
   own last fix; the first round with nothing left to mine found a real identity

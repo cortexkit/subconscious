@@ -106,7 +106,14 @@ each one invisible from the consumer boundary.
 
    Two found the same evening: a missing config read as "no modules configured"
    when it meant "I could not read the file", and an event with no recorded
-   outcome delivered as a successful one. Two that cleared honestly under the
+   outcome delivered as a successful one. A third that the discriminator flags
+   even though a test already pins it: an unrecognised session kind falling back
+   to the *most privileged* variant. The fence there pins a compatibility shim,
+   not a safety property, and it conflates two inputs that deserve different
+   answers — an **absent** stamp (an old peer, from before the field existed)
+   and a **present-but-unparseable** one (a newer or malformed sender). Only the
+   first is what the compatibility argument justifies. **A fence proves intent,
+   not correctness.** Two that cleared honestly under the
    same test: an absent filter defaulting to include-all (the representation of
    "no filter", not a claim that everything passed one), and an absent detail
    block defaulting to JSON null (which asserts nothing). The last two sat *one
@@ -124,6 +131,13 @@ each one invisible from the consumer boundary.
    Where the type system allows, prefer removing the ambiguous state to handling
    it. Mapping absence to a safe value is correct and still lets the next caller
    construct the ambiguity; making the field non-optional means nobody can.
+
+   The same move works on APIs, not just types. One release-evidence builder
+   split advertisement from exercise into two entry points — the plain one and a
+   `_with_exercised_rows` variant — so **the honest zero is the default and the
+   claim requires an argument**. That is the structural form of this whole rung:
+   rather than defaulting the two together and testing that the default is
+   honest, make the flattering value impossible to obtain by accident.
 
    One check before making a field non-optional: **can the value legitimately be
    unknown at construction time?** If a record is admitted before its outcome

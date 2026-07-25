@@ -576,6 +576,20 @@ stating though: the immunity belongs to the **anchor**, so any query without one
 — an ad-hoc "what changed lately", a periodic sweep — steps back outside it and
 gets no warning.
 
+ALF's generalisation from that is worth more than the bug: **protections that are
+side effects of something the system needs anyway survive refactors that dedicated
+guards do not.** A dedicated guard's cost is visible and its benefit is invisible,
+so it loses every tidy-up argument on its own merits. A protection riding on
+load-bearing machinery cannot be removed without breaking something whose value is
+obvious — load-bearing for a reason unrelated to the hazard it prevents.
+
+Which makes it a design instruction, not just an observation: **when choosing
+between two ways to prevent a hazard, prefer the one that piggybacks on a
+mechanism the system already depends on**, even where the dedicated guard is more
+direct. Directness is worth less than durability for anything meant to hold for
+years. And it is worth hunting for these deliberately — they are the protections
+nobody has to maintain.
+
 The three interlock, in this order:
 
 1. A filter returning empty must be proven capable of returning non-empty.

@@ -136,6 +136,10 @@ public struct RdvRegistryRow: Sendable, Equatable {
     public let lastSeenMs: String
     public let online: Bool
     public let reenrolledAfterTombstone: Bool
+    /// Stable enrollment identity for the row's current live lineage.
+    public let enrollmentID: String?
+    /// `row_generation` combined with `tombstone_generation`, as a decimal string.
+    public let supersessionGeneration: String?
 
     public init(
         x25519PubkeyHex: String,
@@ -145,7 +149,9 @@ public struct RdvRegistryRow: Sendable, Equatable {
         candidates: [RdvCandidate],
         lastSeenMs: String,
         online: Bool,
-        reenrolledAfterTombstone: Bool
+        reenrolledAfterTombstone: Bool,
+        enrollmentID: String? = nil,
+        supersessionGeneration: String? = nil
     ) {
         self.x25519PubkeyHex = x25519PubkeyHex
         self.ed25519PubkeyHex = ed25519PubkeyHex
@@ -155,6 +161,8 @@ public struct RdvRegistryRow: Sendable, Equatable {
         self.lastSeenMs = lastSeenMs
         self.online = online
         self.reenrolledAfterTombstone = reenrolledAfterTombstone
+        self.enrollmentID = enrollmentID
+        self.supersessionGeneration = supersessionGeneration
     }
 
     static func decode(_ object: RdvJSONObject) throws -> RdvRegistryRow {
@@ -175,7 +183,11 @@ public struct RdvRegistryRow: Sendable, Equatable {
             candidates: candidates,
             lastSeenMs: try decoder.decimalString("last_seen_ms"),
             online: try decoder.bool("online"),
-            reenrolledAfterTombstone: try decoder.bool("reenrolled_after_tombstone")
+            reenrolledAfterTombstone: try decoder.bool("reenrolled_after_tombstone"),
+            // Present on rows from a current worker. Optional so a row minted
+            // before these fields existed still decodes.
+            enrollmentID: try decoder.optionalString("enrollment_id"),
+            supersessionGeneration: try decoder.optionalDecimalString("supersession_generation")
         )
         try decoder.finish()
         return row

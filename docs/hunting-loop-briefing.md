@@ -59,6 +59,8 @@ Before believing a green result:
 | 10a | When a probe is *expected* to fail, did the failing phase's label appear in the output? | A timeout, a crash and a genuine finding all exit nonzero |
 | 10b | Before writing off a measurement as contaminated, do its neighbours agree? | An aggregate caveat silently retires a true finding |
 | 10c | For a causal claim: did you run the control arm, with only the one variable differing? | An uncontrolled measurement is an observation, not an attribution |
+| 10d | Does your "independent" check differ in *premise*, or only in whose hands ran it? | Re-running someone's query is a transcription check |
+| 10e | Does the query you ran answer the question you are asking of it? | One relation's answer quietly supporting a claim about another |
 | 11 | Did the new CI step *execute*, or was the run cancelled before reaching it? | A green list showing passes for runs that never ran the new logic |
 
 Before calling a class closed:
@@ -403,6 +405,29 @@ error.
 The practical cost is that this needs a **recording double** rather than a
 return-value assertion: a spy that logs its calls, then assert the log is empty.
 Cheap to build, and the only way an ordering invariant becomes visible at all.
+
+**A query over one relation does not support a claim about another.** Three
+instances in one evening, all confident and all wrong: a normative row count
+("what the design requires") read as a provable-here count ("what this ABI can
+measure"); a vocabulary drawn from the dominant cases in a population and closed
+without checking it was *total* over that population; and a capability treated
+as reachable because its identifier appeared somewhere in a related file rather
+than because it was reachable by the mechanism that matters. Nothing in any of
+the files signals the difference — each query returns a clean number.
+
+So: **before closing a vocabulary, assign every member of the population and
+confirm the remainder is empty.** And beware a decomposition that changes with
+the analyst: three attempts at splitting one set produced three different splits
+while the total never moved, which proves the split was a property of the
+projection rather than of the data. Collapsing a many-to-many join into a
+partition has no canonical answer, so every implementation invents one — and a
+number that lands in a file gets cited.
+
+**Two derivations agreeing is evidence only when they are independent in the
+premise, not merely in the hands.** Re-running someone's query and getting their
+answer is a transcription check wearing a verification's clothes: it catches
+typos and nothing else. Confirming a number by a *different relation* is the
+check; confirming it by the same one is applause.
 
 **An uncontrolled measurement is an observation, not an attribution.** A striking
 spread is not a mechanism. One investigation produced self-overwrite timings of

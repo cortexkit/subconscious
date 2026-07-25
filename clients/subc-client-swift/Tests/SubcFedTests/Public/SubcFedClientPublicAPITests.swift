@@ -386,6 +386,16 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         )
     }
 
+    /// The connection-state vocabulary is a closed public contract: a consumer
+    /// switching over it exhaustively must be forced to consider any new case
+    /// rather than silently falling into a default.
+    ///
+    /// The assertion is the EXHAUSTIVE SWITCH, not the count. Counting a
+    /// hand-written array proves only that the array has as many entries as
+    /// were typed into it — adding a ninth case to the enum leaves such a test
+    /// green, which is exactly the drift it appears to guard. The switch below
+    /// fails to COMPILE when a case is added or removed, so the guard cannot be
+    /// satisfied by an out-of-date fixture.
     func testConnectionStateCasesAreClosed() {
         let states: [FedConnectionState] = [
             .idle,
@@ -397,7 +407,27 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             .dormant,
             .disconnected(reason: .cancelled),
         ]
-        XCTAssertEqual(states.count, 8)
+
+        // Every case is named here. Adding one to FedConnectionState without
+        // adding it to this switch is a compile error, which is the point.
+        var seen = Set<String>()
+        for state in states {
+            switch state {
+            case .idle: seen.insert("idle")
+            case .dialing: seen.insert("dialing")
+            case .authenticating: seen.insert("authenticating")
+            case .negotiating: seen.insert("negotiating")
+            case .ready: seen.insert("ready")
+            case .reconnectWaiting: seen.insert("reconnectWaiting")
+            case .dormant: seen.insert("dormant")
+            case .disconnected: seen.insert("disconnected")
+            }
+        }
+
+        // And the sample above covers every case rather than repeating one:
+        // without this, the switch could be exhaustive while the array exercised
+        // a single state eight times.
+        XCTAssertEqual(seen.count, states.count, "each sampled state must be a distinct case")
     }
 
     private static let candidateStages: [FedCandidateStage] = [

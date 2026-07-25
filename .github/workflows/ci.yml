@@ -72,6 +72,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --workspace --all-targets
 
+      # A generated file edited by hand is invisible to every test: the suite
+      # passes, and the only symptom is that the generator rewrites the file on
+      # the next build. A sibling repo hit this with a Cargo.lock entry written
+      # at a different indent than cargo emits — green gate, and a tree that
+      # dirtied itself on every build, which would have blocked that repo's own
+      # mason dispatch (it refuses a dirty parent checkout). By this point the
+      # steps above have built every target, so anything cargo intended to
+      # rewrite has been rewritten.
+      - name: Tree is clean after building
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "build modified tracked files:" >&2
+            git status --short >&2
+            git diff >&2
+            exit 1
+          fi
+        shell: bash
+
   # The TypeScript client (@cortexkit/subc-client) ships from this repo and is
   # wire-compatible with the Rust crates, so its typecheck + tests gate here too
   # — otherwise a TS-only break (e.g. a private-member test-harness type error)

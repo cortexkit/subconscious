@@ -10,7 +10,9 @@ use serde_json::Value;
 
 use crate::{
     app::{ACCENT, BORDER, CYAN, GREEN, MUTED, ORANGE, PANEL, PANEL_2, RED, SubcChat, Surface},
-    components::{campaign_card, chip, empty_state, metric, state_color, status_dot},
+    components::{
+        campaign_card, chip, empty_state, metric, relative_time, state_color, status_dot,
+    },
     models::{ConsultRow, Snapshot, SpecCampaign},
     wire,
 };
@@ -1285,7 +1287,7 @@ impl SubcChat {
                                             row.child(model.to_string())
                                         })
                                         .when_some(run.started_at_ms, |row, started| {
-                                            row.child(relative_time(started))
+                                            row.child(relative_time(Some(started)))
                                         }),
                                 ),
                         );
@@ -1557,22 +1559,6 @@ fn transcript_message_row(
     card.into_any_element()
 }
 
-fn relative_time(epoch_ms: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(epoch_ms);
-    let seconds = now.saturating_sub(epoch_ms) / 1_000;
-    if seconds < 60 {
-        format!("{seconds}s ago")
-    } else if seconds < 3_600 {
-        format!("{}m ago", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h ago", seconds / 3_600)
-    } else {
-        format!("{}d ago", seconds / 86_400)
-    }
-}
 
 #[cfg(test)]
 mod tests {

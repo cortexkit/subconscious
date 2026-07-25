@@ -530,10 +530,29 @@ the answer was independently known to be different: four commits reported
 test-only, a differently-shaped query on the same range showed 349 source
 insertions. **The derivation that agreed with expectation was the broken one.**
 
-So before believing an absence, run one **positive control**: the same filter
-against input you know it should match. Five seconds, and it is the entire
-difference between a finding and a blank line. This is the mutation rule wearing
+So before believing an absence, run a **positive control**: the same filter
+against input you know it should match. This is the mutation rule wearing
 different clothes — confirm the instrument can produce the other answer.
+
+**One control is not enough. The control set has to span the shapes the filter
+will meet.** THALAMUS wrote a checker, ran a control on a linear commit, got a
+correct non-zero, and the instrument was still broken — `git show` and `git log
+--name-only` **print nothing at all for a merge commit** without `-m
+--first-parent`. A second control on a merge returned 0 against a known 80
+insertions, which then exposed a *second* independent bug (an early return inside
+a per-file loop). Two bugs, both returning 0, both looking exactly like a clean
+answer.
+
+That one is not hypothetical here: this document's own fleet deploy-gap check had
+it. Positive control on plexus `44ab703` — bare `--name-only` listed **zero**
+files against a 719-insertion `--stat`. alfonso carries 117 merges a week and
+plexus 13, so the blindness covered most real change on every repo that merges
+rather than rebases.
+
+And check that a zero control is *correct* before treating it as a failure: the
+first linear commit tried came back 0 because it was genuinely docs-only. A
+control whose expected answer you have not verified is another unvalidated
+instrument.
 
 **Phrase the check so silence is suspicious.** Better than remembering the
 control, because it removes the need to remember. When confirming someone else's

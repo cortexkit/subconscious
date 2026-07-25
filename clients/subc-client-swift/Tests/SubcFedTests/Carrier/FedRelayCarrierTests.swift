@@ -406,3 +406,136 @@ private actor RelayCloseAfterReadyStream: FedWebSocketStream {
 
     func close() async {}
 }
+
+extension FedRelayCarrierTests {
+
+    /// The relay_ready wait is a PEER-MEETING barrier, not a transport step: the
+    /// relay emits it only once BOTH sides have authenticated on the pipe, so its
+    /// duration is governed by when the peer dials in — which on a cold cellular
+    /// path is seconds after this side finished its own crypto.
+    ///
+    /// Bounding it with the same transport-shaped budget as the challenge/proof
+    /// exchange abandons a pipe the peer is still walking toward. Worse, each
+    /// abandonment mints a fresh grant and therefore a fresh pipe id, so the peer
+    /// arrives at a pipe this side has already left: the retry does not recover
+    /// the miss, it guarantees it.
+    func testPeerMeetingBarrierOutlastsTheTransportBudget() async throws {
+        let (material, _) = try makeMaterial()
+        let pair = LoopbackWebSocketPair()
+        let serverEphPubHex = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.lowercaseHex
+
+        // The peer completes the crypto promptly, then takes noticeably longer to
+        // arrive than the transport budget allows — the ordinary cellular case.
+        let peer = Task { () throws -> Void in
+            try await pair.server.send(.text(self.relayChallengeText(serverEphPubHex: serverEphPubHex)))
+            _ = try await pair.server.receive() // relay_hello, answered at once
+            try await Task.sleep(for: .milliseconds(450))
+            try await pair.server.send(.text("{\"type\":\"relay_ready\"}"))
+        }
+
+        try await fedTestWithTimeout {
+            try await FedRelayAuthenticator().authenticate(
+                material: material,
+                on: pair.client,
+                clock: SystemFedMonotonicClock(),
+                // The crypto exchange is transport-shaped and stays tight.
+                timeout: .milliseconds(200),
+                // The barrier is bounded by how long the grant stays redeemable,
+                // so both sides converge on one instant instead of each guessing.
+                barrierTimeout: .seconds(5)
+            )
+        }
+        _ = try? await peer.value
+    }
+
+    /// The barrier is bounded, not unbounded: a peer that never arrives must
+    /// still fail rather than hang the dial forever.
+    func testPeerMeetingBarrierStillFailsWhenThePeerNeverArrives() async throws {
+        let (material, _) = try makeMaterial()
+        let pair = LoopbackWebSocketPair()
+        let serverEphPubHex = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.lowercaseHex
+
+        let peer = Task { () throws -> Void in
+            try await pair.server.send(.text(self.relayChallengeText(serverEphPubHex: serverEphPubHex)))
+            _ = try await pair.server.receive() // relay_hello; relay_ready never follows
+        }
+
+        do {
+            try await fedTestWithTimeout {
+                try await FedRelayAuthenticator().authenticate(
+                    material: material,
+                    on: pair.client,
+                    clock: SystemFedMonotonicClock(),
+                    timeout: .milliseconds(200),
+                    barrierTimeout: .milliseconds(300)
+                )
+            }
+            XCTFail("a peer that never arrives must fail the barrier")
+        } catch let error as FedCarrierError {
+            XCTAssertEqual(error, .timeout(.relayAuthentication))
+        }
+        _ = try? await peer.value
+    }
+}
+
+/// The barrier deadline must be ABSOLUTE, derived from the grant's
+/// `expires_at_ms`, not a local duration. This is a correctness property rather
+/// than a tuning one, and a duration-bounded test cannot tell the two apart:
+/// it passes on both the correct and the incorrect implementation.
+final class FedRelayBarrierDeadlineTests: XCTestCase {
+
+    private func grant(expiresAtMs: UInt64, pipeID: String = "01HZPIPEPIPEPIPEPIPEPIPEPI") -> RdvRelayGrant {
+        RdvRelayGrant(
+            serverSeq: "1",
+            ofSeq: nil,
+            pipeID: pipeID,
+            relayURL: "wss://rdv.test.invalid/v1/pipe/\(pipeID)",
+            pipeToken: "dG9rZW4",
+            side: .a,
+            peer: String(repeating: "ab", count: 32),
+            issuedAtMs: "\(expiresAtMs - 60_000)",
+            expiresAtMs: "\(expiresAtMs)"
+        )
+    }
+
+    /// The decisive property: two sides that learn of the grant at DIFFERENT
+    /// moments must still stop waiting at the SAME instant. A local `now + N`
+    /// gives them offset windows, which is what lets them miss each other.
+    func testBothSidesConvergeOnOneInstantDespiteLearningAtDifferentTimes() {
+        let expiry: UInt64 = 1_700_000_060_000
+        let grant = grant(expiresAtMs: expiry)
+
+        // The opener is told directly; the peer's copy arrives via a strictly
+        // later server fan-out.
+        let openerLearnsAt: UInt64 = 1_700_000_000_000
+        let peerLearnsAt: UInt64 = 1_700_000_012_000
+
+        let openerDeadline = openerLearnsAt + UInt64(grant.barrierTimeout(nowMs: openerLearnsAt).milliseconds)
+        let peerDeadline = peerLearnsAt + UInt64(grant.barrierTimeout(nowMs: peerLearnsAt).milliseconds)
+
+        XCTAssertEqual(openerDeadline, expiry)
+        XCTAssertEqual(peerDeadline, expiry)
+        XCTAssertEqual(openerDeadline, peerDeadline,
+                       "both sides must stop waiting at the same wall-clock instant")
+
+        // And the windows themselves genuinely differ, so the equality above is
+        // the absolute anchor doing the work rather than a coincidence.
+        XCTAssertNotEqual(grant.barrierTimeout(nowMs: openerLearnsAt),
+                          grant.barrierTimeout(nowMs: peerLearnsAt))
+    }
+
+    /// A grant with no window left yields zero rather than a fresh wait:
+    /// waiting on a dead grant only delays the failure.
+    func testAnExpiredGrantLeavesNoWindowToWaitIn() {
+        let grant = grant(expiresAtMs: 1_700_000_060_000)
+        XCTAssertEqual(grant.barrierTimeout(nowMs: 1_700_000_060_000), .zero)
+        XCTAssertEqual(grant.barrierTimeout(nowMs: 1_700_000_099_000), .zero)
+    }
+}
+
+private extension Duration {
+    var milliseconds: Int64 {
+        let c = components
+        return c.seconds * 1_000 + c.attoseconds / 1_000_000_000_000_000
+    }
+}

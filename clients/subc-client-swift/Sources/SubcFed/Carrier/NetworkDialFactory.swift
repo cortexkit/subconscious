@@ -134,6 +134,7 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
         let carrier = try await FedRelayRecordCarrier.establish(
             material: material,
             clock: context.clock,
+            barrierTimeout: relay.peerBarrierTimeout,
             upgrade: { try await upgrade(relay) }
         )
 

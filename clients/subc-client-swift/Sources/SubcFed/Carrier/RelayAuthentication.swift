@@ -227,13 +227,22 @@ public struct FedRelayAuthenticator: Sendable {
     }
 
     private func makeProof(material: FedRelayMaterial, challenge: FedRelayChallenge) throws -> FedRelayProof {
+        // `pipe_token_hash` is SHA-256 of the token's DECODED bytes, not of the
+        // base64url text that carries it. The two forms are both load-bearing and
+        // they differ: the Authorization bearer sends the base64url TEXT, while the
+        // proof hashes what that text decodes to. The server and the Rust client
+        // both hash the decoded bytes, so hashing the text here produced a proof
+        // the relay rejected (close 4003) even though the bearer was accepted.
+        guard let decodedToken = Data(base64URLEncoded: String(decoding: material.pipeToken, as: UTF8.self)) else {
+            throw FedCarrierError.invalidRelayProof
+        }
         let context: [String: String] = [
             "account_id": material.accountID,
             "challenge_id": challenge.challengeID,
             "domain": "rdv-v1/relay",
             "nonce": challenge.nonce,
             "pipe_id": material.pipeID,
-            "pipe_token_hash": sha256(material.pipeToken).lowercaseHex,
+            "pipe_token_hash": sha256(decodedToken).lowercaseHex,
             "server_eph_x25519_pubkey": challenge.serverEphemeralX25519PublicKey.lowercaseHex,
             "side": material.side.rawValue,
             "x25519_pubkey_hex": material.x25519Key.publicKey.lowercaseHex

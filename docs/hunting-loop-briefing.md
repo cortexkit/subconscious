@@ -115,6 +115,14 @@ each one invisible from the consumer boundary.
   test now certifies it. The clause is therefore not a refinement of the
   instruction. Without it the instrument *inverts* above a certain diligence.
 
+  The trigger is not "tests-only" as such but **a fence instruction with no
+  refusal path**. Any "write a test for X" carries an implicit premise that X is
+  correct, and a worker has no standing to reject that premise unless the prompt
+  grants it — so the clause belongs in *any* fencing prompt, sweep or not. Grant
+  it explicitly, and **make reporting a wrong mechanism a success outcome rather
+  than an incomplete one**. Otherwise the only compliant move is to write the
+  test, and compliance is what hardens the defect.
+
 ## A fenced decision is not a fenced enforcement
 
 A policy function returning the right verdict and a call site acting on that
@@ -129,6 +137,14 @@ coverage map.** The enumeration is cheap and still finds the unasserted
 refusals; only the mutation is evidence. Two distinct shapes score covered under
 the grep alone: a fenced decision whose enforcement is unfenced, and one fenced
 site out of two that return the same variant.
+
+Note the ordering this produces on one guard: nobody asserted it → the verdict
+was asserted → **the enforcement was still separately deletable**. Three
+positions on one axis, not a repeat. Constant-function mutation on the unit
+cannot see the third, because the unit is genuinely correct — a predicate can be
+perfectly tested and never invoked, and the missing coverage lives one layer out
+at the call site. The check is one line: neuter the call site (`if false && …`)
+and see whether anything reddens.
 
 Where the guard's job is to *prevent* something, assert on the thing not
 happening. A rework asserted the consent hook receives **zero calls** on the

@@ -57,7 +57,22 @@ each one invisible from the consumer boundary.
    that diffs against running state, where an empty list means retire
    everything. Same expression, three places, two correct. Only the caller's
    semantics separate them, which is worse than an unusual construct: the
-   familiarity is what licenses it.
+   familiarity is what licenses it. It also means this cannot be audited by
+   grepping — every hit needs its caller read, which is the work review skips.
+
+   The sub-family worth its own sweep is **an absent input converted into a
+   positive assertion**, because unlike the rest of the rung it has literal
+   signatures to search: `unwrap_or`, `unwrap_or_default`,
+   `map(...).unwrap_or(...)`. At each one ask whether absence here means
+   *nothing* or means *I do not know*. Two found the same evening: a missing
+   config read as "no modules configured" when it meant "I could not read the
+   file", and an event with no recorded outcome delivered as a successful one.
+   Watch the fixtures too — one that never constructs the absent case makes
+   every test over it vacuous for that branch.
+
+   Where the type system allows, prefer removing the ambiguous state to handling
+   it. Mapping absence to a safe value is correct and still lets the next caller
+   construct the ambiguity; making the field non-optional means nobody can.
 3. **The state machine and its fences.** Incarnation/ABA, attempt ordering,
    admission fairness, what a timeout does to a prior observation. Demand the
    exact interleaving — "these two race" is not a finding.

@@ -143,6 +143,18 @@ refusals; only the mutation is evidence. Two distinct shapes score covered under
 the grep alone: a fenced decision whose enforcement is unfenced, and one fenced
 site out of two that return the same variant.
 
+That second shape is not incidental. **Where a module has two emission paths for
+the same data, every guard exists twice and will be tested once** — and the
+tested one is predictably the *simpler* path, because it is easier to write a
+test for, while the richer path is where the consequences live. Two separate
+guards in one module landed this way on the same evening: one condition named
+and tested on the plain path, the same condition entirely undefended on the path
+that actually carries the extra field. Deleting it left 424 tests green.
+
+The cheap check: if there is a branch for the simple case and a branch for the
+full case, **diff the two branches against each other** rather than reading each
+on its own. Every condition in one wants a counterpart in the other.
+
 Note the ordering this produces on one guard: nobody asserted it → the verdict
 was asserted → **the enforcement was still separately deletable**. Three
 positions on one axis, not a repeat. Constant-function mutation on the unit

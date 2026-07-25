@@ -332,6 +332,31 @@ was built to catch.
   the need requires the judgement "is this mechanism correct or merely untested"
   — which is precisely the judgement a fence instruction removes.
 
+## The classes are a lens, not a partition
+
+Tested against tonight's confirmed defects rather than against the taxonomy's own
+examples, and it does not partition:
+
+- The authorizer that armed a destructive tee on a refusal sits in **two** classes
+  at once. The classifier returned Unauthorized correctly and arming ignored it
+  (fenced decision, unfenced enforcement); every test asserted the Unauthorized
+  label and none asserted nothing was queued (report asserted, effect unasserted).
+- The secret-input guard whose call site was neuterable sits in **one**. There was
+  no report to assert — the unit tests asserted a predicate's return value, not
+  an emitted outcome.
+- The `unwrap_or(Success)` fail-open default sits in **neither**. No decision
+  function exists; the defect *is* the absent decision, and nothing asserted
+  anything.
+
+So do not route a candidate by picking its class. **Run every probe against every
+candidate** — delete the call site, assert the effect did not happen, mutate the
+ordering, vary the input — because a defect answering "no" to one framing can
+still answer "yes" to another, and the third shape answers no to both while being
+live in production.
+
+The classes are useful for *explaining* a defect once found and for generating
+probe ideas. They are not a decision procedure for which probe to skip.
+
 ## A fenced decision is not a fenced enforcement
 
 A policy function returning the right verdict and a call site acting on that

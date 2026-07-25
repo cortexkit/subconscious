@@ -50,6 +50,14 @@ each one invisible from the consumer boundary.
    than the gate. In the measured case, deleting the real gate reddened only
    three tests named for something else entirely — defended by accident, and one
    refactor of those unrelated tests away from being undefended.
+
+   Expect the identical expression to be **correct one call site away**. A
+   daemon read a missing config file as an empty module list, which is right at
+   boot (nothing configured, nothing to supervise) and catastrophic in a rescan
+   that diffs against running state, where an empty list means retire
+   everything. Same expression, three places, two correct. Only the caller's
+   semantics separate them, which is worse than an unusual construct: the
+   familiarity is what licenses it.
 3. **The state machine and its fences.** Incarnation/ABA, attempt ordering,
    admission fairness, what a timeout does to a prior observation. Demand the
    exact interleaving — "these two race" is not a finding.

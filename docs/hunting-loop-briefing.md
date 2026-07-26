@@ -2629,6 +2629,37 @@ refusal is attributable to the clause under test rather than to an incidentally
 malformed input -- plus a paired positive vector, since a validator that refused
 everything would otherwise satisfy the whole rejection set.
 
+## A mutant that hangs is a result, not a failed experiment
+
+Running both constants against subc's reserved-module HELLO gate: the
+constant-ADMIT arm died correctly and immediately, naming three tests. The
+constant-REJECT arm NEVER FINISHED -- it exhausted a 30-minute budget, twice,
+including with the suite narrowed to the relevant module.
+
+That is not an inconclusive run. Refusing every HELLO means no module ever
+registers, so every test that waits for a module to come up waits forever. THE
+SUITE'S RESPONSE TO A TOTAL-REFUSAL MUTANT IS A HANG, and a hang carries the same
+information as a red: the behaviour is load-bearing, reached, and depended upon.
+
+BUT IT IS A DIFFERENT SHAPE OF EVIDENCE AND MUST BE READ AS ONE. A timeout is
+also what an infinite loop, a deadlock, or a broken harness produces -- so a
+hanging mutant is only informative when you can say WHY it hangs. Here the reason
+is structural and predictable in advance: registration is a precondition of
+almost every integration fixture. If you cannot name the mechanism, a timeout is
+an absent measurement, not a passed one.
+
+THE OPERATIONAL HAZARD IS THE TREE, NOT THE RESULT. A timed-out mutation run
+leaves the mutant IN PLACE -- the restore line never executes, because it sat
+after the command that timed out. I checked and found `M supervise.rs` with the
+mutant still present. RESTORE, THEN VERIFY THE RESTORE, THEN VERIFY GREEN. The
+same half-restored-mutation trap as a repinned digest, arriving by a different
+route: the tree looks like work in progress rather than like a live sabotage, and
+nothing about it announces itself.
+
+PRACTICAL: put the restore in a trap/finally, or budget the mutation run
+explicitly and treat exhaustion as an outcome you will have to clean up after,
+not as an error path you can ignore.
+
 ## Checking a table against the prose it summarises
 
 The checklist above is a summary of the body, so it can drift from it in two

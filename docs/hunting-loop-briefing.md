@@ -1581,6 +1581,27 @@ during unwind yields a FAILED OPERATION, not a poisoned system -- even where the
 code reads alarmingly, such as a caller-supplied callback invoked while holding
 the guard. Ask whether any other thread can ever take this lock again.
 
+AND THE ORDER OF THE FILTERS IS ITSELF THE FINDING. That sweep had two
+mechanism-derived scope reductions: lock FLAVOR (only `std::sync` poisons, which
+drops whole layers before reading a line) and lock LIFETIME (stack-local cannot
+poison). Both are free. Applied in the wrong order they cost a hundred
+critical-section reads to discover most could never have mattered.
+
+Generalised: WHEN A SWEEP HAS SEVERAL MECHANISM-DERIVED SCOPE REDUCTIONS, APPLY
+THE ONE THAT REQUIRES THE LEAST READING FIRST. Flavour is a type check, lifetime
+is a declaration-site check, the critical section is prose. Sorting filters by how
+little understanding they demand is the cheap ordering, and it gets skipped
+because the interesting filter feels like the one to start with.
+
+MEASURE AN AUDIT IN CONSTRAINTS LANDED AT SITES, NOT FINDINGS REPORTED. A report
+is a claim about a moment; a comment at the site is a constraint that travels
+with the code. The census, the flags and the negative result are all invalidated
+by the next edit to those functions, and none of them are visible to the person
+making that edit. In the sweep above, three comments stating why particular
+guards cannot poison were the entire durable yield -- they make a future fallible
+addition legible AS a change to an invariant, to someone who never read the
+audit. Eleven flags yielded nothing.
+
 AN ARTIFACT CAN BE FRESH AND STILL BE BROKEN BY ITS ENVIRONMENT. Every identity
 rung -- mtime, inode, symbol presence -- answers "is this the artifact I built",
 and all of them PASS on a binary whose problem is external. Worked case: a shim

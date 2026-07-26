@@ -896,7 +896,42 @@ the right instinct: correct-shaped assertions are precisely the ones that pass
 while unreachable, because nothing about reading them reveals whether control
 arrives.
 
-### Five empty tables, one fault
+### A snapshot gauge needs its own age rendered beside it
+
+A health line read `1 critical unsettled intents`. The store held **zero** at
+that instant, verified three times. The counted items were wakes that legitimately
+live 29-59 seconds in flight, and the snapshot refreshes every 30 seconds -- so
+under normal churn the gauge has a fair chance of freezing a genuinely in-flight
+row on *every* refresh. Not an occasional false positive: a structural one.
+
+The second defect was worse and only surfaced because someone checked. **The
+reading was not merely wrong, it was 35 minutes old.** The refresh shares a tick
+with other work, and slow passes park it. A `computedAt` field existed; nothing
+rendered its *age*, so a stale number and a fresh one looked identical.
+
+That is presence-without-liveness again, aimed at the surface's own timestamp:
+recording when a value was computed does nothing unless a reader is shown how
+long ago that was. **Render the age, not the timestamp** -- and if a gauge is a
+snapshot, its staleness is part of its value.
+
+A rider that follows from the same case: a freshness floor must compute against
+the *item's* creation time, never against snapshot time, or it inherits exactly
+the staleness it was added to filter.
+
+### And chasing why the refresh parked found a four-day-old zombie
+
+A consult terminal since four days earlier still carried two attempts stuck in
+`canceling`, each re-probed every tick, each accumulating **9,600 probe attempts**
+-- harvesting state and then failing to settle against a fence that no longer
+exists. A canceling attempt on a terminal parent has nothing to settle against
+*by construction*, so it must be reaped at terminalization rather than retried
+forever.
+
+Nobody would have looked. It produced no alert, only churn -- and that churn was
+part of why the snapshot above went stale. **A retry loop with no terminal
+condition is invisible until you ask why something unrelated is slow.**
+
+## Five empty tables, one fault
 
 Chasing whether a backup generation was stalled, I sampled five store tables for
 progress. Every one read unchanged. All five had **zero rows** -- they belong to

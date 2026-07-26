@@ -1546,6 +1546,35 @@ UNRUN. Different fix, different urgency. Size it before naming its severity.
 It is also why the layered control stack works at all: each layer is read by
 something that did not produce the layer beneath it.
 
+## Agreement suppresses the audit that disagreement provokes
+
+The familiar rule is that a measurement contradicting your theory is the finding
+until you can explain the instrument's failure mechanism. It has a mirror that is
+harder to act on: WHEN A MEASUREMENT AGREES WITH YOUR THEORY, IT IS OWED THE SAME
+AUDIT.
+
+The asymmetry is structural rather than a matter of discipline. A disagreeing
+measurement ANNOUNCES ITSELF -- it stops you, it demands an explanation, and the
+friction is the prompt. An agreeing one produces no friction, so the audit is not
+skipped after consideration; it is never considered. That is why one person can
+dismiss a correct measurement and accept an incorrect one in the same session
+without any inconsistency: both times the question was whether the number agreed,
+not what the number measured.
+
+Worked case: a memory investigation sampled RSS fifty times and ran a
+first-half/second-half rate comparison to rule out cache warm-up -- the right
+control, and one most people skip. RSS on that platform counts shared framework
+pages, reading 322 MB against an actual physical footprint of 51.6 MB. NO AMOUNT
+OF ANALYTICAL CARE ON TOP OF A MISMEASURED QUANTITY RECOVERS THE ANSWER, and the
+care makes the wrong answer more convincing rather than less.
+
+A PEAK COUNTER READ AS A LIVE ONE IS THE SAME CLASS AND IS WORTH KNOWING BY
+SIGHT. Tools print peak and current on adjacent lines; a careless match takes the
+peak, which never decreases by construction, and manufactures a leak out of a
+process reclaiming perfectly. The monotone series is indistinguishable from a real
+leak, so it cannot be diagnosed from the series alone. The discriminator is A
+FORCED DROP: trigger a reclaim and see whether the number CAN fall.
+
 ## Control the denominator, not only the result
 
 A check reporting zero failures over zero items reads exactly like a clean pass.

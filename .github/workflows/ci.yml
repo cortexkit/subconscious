@@ -9,6 +9,20 @@ on:
   workflow_call:
 
 concurrency:
+  # Deliberate: rapid pushes to the same ref cancel the earlier runs, so only the
+  # tip is verified. That saves runner minutes and is the right trade for a
+  # branch whose intermediate commits are not independently deployed.
+  #
+  # THE ACCEPTED COST, stated because it has misled a reader three times: a run
+  # list showing passes is a claim about the TIP, never about each commit. A
+  # commit that changes CI logic will usually have its OWN run cancelled by the
+  # next push, and the first completed run carrying that change belongs to a
+  # later, often unrelated, commit. When verifying a workflow edit, find the run
+  # whose head actually contains it rather than reading the newest green.
+  #
+  # Anything that needs per-commit evidence (a bisect, a release tag) must not
+  # rely on this workflow's history -- release.yml deliberately puts the SHA in
+  # its own group for exactly that reason.
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 

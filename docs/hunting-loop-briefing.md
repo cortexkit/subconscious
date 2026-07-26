@@ -2533,6 +2533,20 @@ INSTRUMENT INTO IT DELIBERATELY -- a blind gate, a cross-seat census, a
 report-only detector aimed at its artifacts -- rather than reading the quiet as
 health. The quiet lane is not stuck; it is unarmed.
 
+IT PAID ON THE FIRST APPLICATION, AND THE FAILURE IT CORRECTED WAS MINE. Four
+hours before running the instrument, I had checked the same quiet seat by hand
+and concluded idle-and-fine: clean tree, module healthy in `ck health`, recent
+commit. All three TRUE, none of them the question -- A SUPERVISED MODULE'S HEALTH
+SAYS NOTHING ABOUT WHETHER THE CODE THAT PRODUCES IT PASSES CI, because the
+running binary is an older build. The instrument found a red tip on the seat's
+last commit, a windows-only regression five hours unread, with the five preceding
+commits green.
+
+SO THE RULE HAS A SHARPER EDGE THAN "CHECK ON QUIET SEATS": I DID CHECK, WITH THE
+CHECKS I HAPPENED TO HAVE. Reaching for available signals -- health, tree state,
+commit recency -- is the rung-below substitution wearing a diligence costume. The
+instrument matters more than the intent to look.
+
 THIS COMPOSES WITH THE SINGLE-READER RULE. "Check whatever has exactly one
 reader" targets ARTIFACTS; this targets SEATS, by the same logic -- the artifact
 nobody else has read and the seat nobody else has audited are the same exposure

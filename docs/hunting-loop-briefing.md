@@ -1053,6 +1053,30 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## A procedural mitigation inherits the defect of the tool it replaces
+
+I rejected a CLI preview because it would have located a config file itself --
+two rules selecting one subject, the CLI's guess against the daemon's actual path.
+Then I proposed doing the preview BY HAND instead, whose first step is locating
+the same file myself. IDENTICAL DEFECT, one of the two rules now a human, and
+worse for it: a tool's guess is inspectable in source, mine was in my head.
+
+A MANUAL PROCEDURE IS NOT A NEUTRAL FALLBACK. It carries every assumption the
+tool would have carried, minus the review. "I will be careful" restates the
+problem: a prediction read from the wrong file agrees with itself perfectly.
+
+WHAT ACTUALLY CLOSED IT was deriving both halves from the same authority. The
+running set comes from the daemon over the connection the operation will use; the
+config path comes from the DAEMON PROCESS'S OWN ENVIRONMENT rather than from my
+shell's -- launchd for the pid, then the process environment, then the documented
+resolution order. Proven from the executing process instead of guessed from a
+similar one. It matched the guess, which is exactly why the guess had been
+harmless and why the agreement had never been established.
+
+ORDERING RULE from the same exchange: when a preview and a way to VERIFY the
+preview are both on the ledger, the verifier is worth more. A preview alone is
+trusted; a published input makes it checkable.
+
 ## A destructive operation whose premise is unauditable before it fires
 
 A sweep deletes complete, signed snapshots when the chain head they planned

@@ -1337,6 +1337,33 @@ deletion visible. Pair it with loud failure at the load site -- a missing or
 malformed input must abort, never return null -- because embedding the data
 without fixing the swallow just relocates the same silence.
 
+## The instruments are the least-tested layer
+
+One night's measured ratio: FIVE INSTRUMENT DEFECTS AGAINST ROUGHLY ONE CODE
+DEFECT. Not one of the five was found by reading the command; each surfaced only
+when a result contradicted something already known.
+
+Treat that as a measurement rather than an anecdote. It says the checking layer
+is now the least-tested layer in the system -- exactly where application code sat
+before anyone wrote tests for it. And it has a consequence for ordering work: an
+instrument defect is UPSTREAM of every finding the instrument produces. A large
+coverage enumeration run by an untested enumerator yields a large, confident,
+wrong map with nothing to signal which it is.
+
+So when a backlog contains both findings and instruments, THE INSTRUMENTS COME
+FIRST, however small they look next to the findings.
+
+The rule that follows: EVERY CHECK SHIPS WITH A PROOF IT CAN FAIL. For a
+data-driven check, assert the item count. For a digest check, tamper one blob.
+For a coverage enumeration, plant one item known to be uncovered and one known to
+be covered, and require both to come back correctly classified. One extra case per
+instrument, and it converts "the output looks right" into "this demonstrably
+reports the failure it exists to report".
+
+Apply it to throwaway scripts too. A one-off verification script carries the same
+weight as a committed test at the moment someone acts on its output, and it has
+none of the review that a committed test gets.
+
 ## Control the denominator, not only the result
 
 A check reporting zero failures over zero items reads exactly like a clean pass.

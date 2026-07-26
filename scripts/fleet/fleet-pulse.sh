@@ -298,8 +298,18 @@ dim "idle is a proxy for attention, not for progress -- confirm before acting"
 # construction the true measure of completed work.
 #
 # Read it as a RATE, never as a ratio: the file is append-as-you-go, so the
-# denominator is not final until published=1. Healthy is ~19-21/min. Zero across
-# 60s is a real stall, and a restart is safe then -- it costs the in-flight
+# denominator is not final until published=1.
+#
+# The observation window must be sized against the SLOWEST rate that still counts
+# as progress, not the fastest. An earlier version sampled 30s and declared a
+# stall on a zero delta, which was sound at the ~20/min rate it was written
+# against -- and cried wolf the first time a generation ran at ~3/min, where a
+# 30s window expects fewer than two objects and a zero is ordinary. A false stall
+# is expensive twice: it costs an investigation, and it teaches the reader to
+# discount the one signal that would matter during a real one.
+#
+# So a zero window EXTENDS rather than concludes. Only sustained zero across the
+# long window is a stall, and a restart is safe then -- it costs the in-flight
 # object and resumes from the sidecar.
 #
 # Written after five store tables all read "unchanged" and all five turned out to
@@ -312,14 +322,22 @@ engram_upload_rate() {
   [ -z "$pub" ] && { echo "  engram: nothing unpublished"; return 0; }
   sidecar=$(ls ~/.local/share/cortexkit/engram/staging/"$pub"/uploaded-*.hex 2>/dev/null | head -1)
   [ -z "$sidecar" ] && { echo "  engram: gen unpublished, no sidecar yet (sealing)"; return 0; }
+  sealed=$(ls ~/.local/share/cortexkit/engram/staging/"$pub" 2>/dev/null | grep -vc 'uploaded-\|journal')
   n1=$(wc -l < "$sidecar")
   sleep 30
   n2=$(wc -l < "$sidecar")
-  sealed=$(ls ~/.local/share/cortexkit/engram/staging/"$pub" 2>/dev/null | grep -vc 'uploaded-\|journal')
-  local rate=$(( (n2 - n1) * 2 ))
-  if [ "$rate" -eq 0 ]; then
-    echo "  engram: STALLED -- $n2/$sealed objects, 0/min over 30s (restart is safe, resumes from sidecar)"
+  if [ "$n2" -gt "$n1" ]; then
+    echo "  engram: uploading $n2/$sealed objects at $(( (n2 - n1) * 2 ))/min"
+    return 0
+  fi
+  # Zero in 30s: extend to 3 minutes before calling it, and report the rate over
+  # the whole window so a slow generation reads as slow rather than as stopped.
+  sleep 150
+  local n3
+  n3=$(wc -l < "$sidecar")
+  if [ "$n3" -gt "$n1" ]; then
+    echo "  engram: uploading slowly -- $n3/$sealed objects, $(( (n3 - n1) * 60 / 180 ))/min over 3m"
   else
-    echo "  engram: uploading $n2/$sealed objects at ${rate}/min"
+    echo "  engram: STALLED -- $n3/$sealed objects, 0 in 3m (restart is safe, resumes from sidecar)"
   fi
 }

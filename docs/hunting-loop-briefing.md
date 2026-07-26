@@ -2619,6 +2619,34 @@ exists independent of your attention; AFTER means you are relying on the same
 attention that already failed once. A reminder you have to remember to set is the
 defect wearing a solution's costume.
 
+## A cleanup whose trigger dies with the activity it cleans up after
+
+AFT's callgraph temp-file cleanup was PER-ROOT AND RAN ONLY WHEN A BUILD FIRED
+FOR THAT ROOT. The active store kept building, so cleanup kept firing and it
+stayed clean. THE LEGACY STORE STOPPED RECEIVING BUILDS AT A MIGRATION -- and
+every orphan that existed at that instant became permanent. 15.4 GB, frozen at
+the moment the activity moved elsewhere.
+
+THE CONTRACT GAP, IN THEIR WORDS: the migration DID clean what it was told to;
+its contract was per-root-on-build, and NOBODY OWNED "STORE STOPPED BEING
+WRITTEN". Not negligence -- an unowned state transition.
+
+GENERAL FORM: ANY CLEANUP TRIGGERED BY THE ACTIVITY IT CLEANS UP AFTER STOPS
+EXACTLY WHEN ITS BACKLOG BECOMES PERMANENT. Garbage collection on write, cache
+eviction on access, log rotation on emit, orphan reaping on spawn -- each is
+fine while the subsystem is live and each freezes its debris the moment the
+subsystem goes quiet. The failure is silent because the component looks idle
+rather than broken.
+
+THE TELL IS AN ASYMMETRY BETWEEN TWO INSTANCES OF THE SAME MECHANISM. One store
+accumulated and its sibling did not, same code, same operation. THAT DIFFERENCE
+WAS THE DIAGNOSIS -- reading the code it pointed at took minutes. Where two
+deployments of one mechanism diverge, the divergence names the variable.
+
+AND THE FIX'S PREDICATE MATTERS: age, not liveness (see below). A retirement
+sweep keyed on "is the creating process alive" reads false-positive on precisely
+the oldest files, which are the ones worth deleting.
+
 ## Process liveness is not ownership on a long enough timescale
 
 A reaper that spares a resource because "the owning pid is still alive" is

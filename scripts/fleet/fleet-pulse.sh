@@ -100,6 +100,44 @@ unread=$(sqlite3 "$STORE" "
 echo "  $unread unread"
 echo
 
+# ------------------------------------------------------------------ memory pressure
+# Included because machine-wide memory exhaustion presents as unrelated symptoms
+# in every other section: builds that hang, tests that time out, a language
+# server deadlocked on a pipe whose buffer the kernel could not grow. Chasing
+# those individually costs hours; one line here names the common cause.
+#
+# FREE RAM IS THE WRONG NUMBER AND IS DELIBERATELY NOT THE HEADLINE. It oscillates
+# by ~1 GB on a 30-second timescale, so any two samples can show whatever you
+# already believe. The two that answer the question are the COMPRESSOR SIZE and
+# the SWAP FILE TOTAL: the kernel grows the swap file only under sustained
+# pressure and shrinks it when pressure falls, so its direction is a fact about
+# the machine rather than about the instant you sampled.
+#
+# Reported without a verdict on purpose. A threshold here would be calibrated on
+# whatever this box was doing the day it was written, and a large working set on
+# a 128 GB machine is ordinary rather than alarming.
+#
+# Both probes report ABSENCE rather than a number when they fail. An earlier
+# version let awk's uninitialised variables render as "free 0.0 GB", which reads
+# as catastrophic exhaustion rather than as a broken probe -- a false alarm in the
+# one direction that would send the reader hunting a machine-wide emergency that
+# does not exist.
+bold "MEMORY"
+if mem=$(vm_stat 2>/dev/null) && [ -n "$mem" ]; then
+  printf '%s\n' "$mem" | awk '/Pages free/{f=$3}/Pages occupied by compressor/{c=$5}
+    END {if (f == "" || c == "") print "  vm_stat output unrecognised -- memory UNCHECKED";
+         else printf "  free %.1f GB (oscillates -- not the signal)   compressor %.1f GB\n", f*16384/1073741824, c*16384/1073741824}'
+else
+  echo "  vm_stat unavailable -- memory UNCHECKED this cycle"
+fi
+if swap=$(sysctl -n vm.swapusage 2>/dev/null) && [ -n "$swap" ]; then
+  echo "  swap file: $swap"
+  dim "  swap file GROWING = sustained pressure; shrinking = recovering"
+else
+  echo "  swap usage unavailable -- pressure direction UNCHECKED"
+fi
+echo
+
 # ------------------------------------------------------------------ backup health
 # Engram is the one subsystem whose failure is silent and expensive: backups stop
 # and nothing else changes, so it needs an explicit line rather than a health dot.

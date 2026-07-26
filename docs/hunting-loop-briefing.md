@@ -1364,6 +1364,33 @@ Apply it to throwaway scripts too. A one-off verification script carries the sam
 weight as a committed test at the moment someone acts on its output, and it has
 none of the review that a committed test gets.
 
+### A control must be established by a different method than the thing it guards
+
+The planted case only works if its expected answer comes from somewhere the
+instrument cannot also be wrong about.
+
+Picking an item you already believe is uncovered is contaminated WHENEVER THAT
+BELIEF CAME FROM A PRIOR RUN OF THE SAME KIND OF ANALYSIS. If a reachability
+analysis established that item X is unreachable, and the new enumeration is also
+a reachability analysis, then a defect that under-reports marks X uncovered (the
+control passes) and under-reports the rest (the finding is wrong) -- and the
+control cannot separate those, because it shares the defect. That is the parity
+test aligned to the buggy side, one layer up.
+
+So the question is not whether the expected answer is TRUE. It is where the
+answer CAME FROM. A dormancy recorded as a design decision at the time is an
+independent source and makes a fine control; the same fact arrived at as the
+output of an earlier analysis is still true and useless here.
+
+STRONGEST SHAPE: make the control true BY CONSTRUCTION rather than by prior
+finding. Plant a synthetic item with no enforcement site anywhere, verifiable by
+a direct read, require it reported uncovered, then remove it. For the covered
+direction, pick something a test already exercises end to end, so reachability is
+demonstrated by dispatch rather than asserted by analysis.
+
+Same move as tampering a blob rather than picking a blob you believe is already
+wrong.
+
 ## Control the denominator, not only the result
 
 A check reporting zero failures over zero items reads exactly like a clean pass.

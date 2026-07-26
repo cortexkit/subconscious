@@ -2514,6 +2514,27 @@ was about MY specimen, which I could check and they could not. Where two seats
 discuss one artifact, the one holding it owes the check -- an assertion about
 someone else's evidence is the least-defended claim in any exchange.
 
+## A name is a count without a breakdown
+
+Sorting artifacts by their directory name is supplying the plausible attribution
+rather than measuring the composition -- the same error as reporting a bare count
+and letting the reader infer what it contains, one level down.
+
+PROOF CASE: ten unclassified subtrees needed sorting into authored (preserve) and
+generated (discard). I sorted by name and got SEVEN OF TEN. Opening two files per
+directory took ninety seconds and flipped three:
+· `work/` -- sounds generated, contains hand-written analysis sections.
+· `patches/` -- sounds authored, contains generated artifacts whose durable copy
+  lives on the source branch.
+· `harness-rounds/` -- unclassifiable by name, contains generated iteration logs.
+A NAME IS A CLAIM MADE BY WHOEVER CREATED THE DIRECTORY, and it was never
+required to stay true.
+
+THIS ALSO STRENGTHENS THE POLARITY ARGUMENT BELOW more than the original specimen
+did: a denylist author sorting by name would have gotten three entries wrong IN
+THE SILENT DIRECTION -- generated artifacts included forever, with nothing
+failing. Under an allowlist the same three mistakes surface as something missing.
+
 ## A denylist over a growing tree fails silently; an allowlist fails visibly
 
 The same exchange produced a shape worth generalising past its instance. A

@@ -142,7 +142,11 @@ jobs:
         with:
           bun-version: latest
       - name: Install
-        run: bun install --frozen-lockfile || bun install
+        # No fallback. --frozen-lockfile fails only when the committed lock
+        # disagrees with package.json; falling back to a plain install makes CI
+        # resolve fresh versions and report green on dependencies that were
+        # never committed, so the drift it should surface becomes invisible.
+        run: bun install --frozen-lockfile
       # Same reasoning as the Rust lane: Install is setup, so a failure there
       # makes this impossible rather than skipped. But Typecheck is a CHECK, and
       # the Test step below must not lose its answer to a type error.

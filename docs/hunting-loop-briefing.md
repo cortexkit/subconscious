@@ -1225,6 +1225,37 @@ productive is the order that destroys the evidence. Write the coupling down whil
 nothing automates the deletion yet; afterwards it is a bug report rather than a
 constraint.
 
+## Is this commit comment-only? A line-based check cannot answer it
+
+Asked on every deploy, to decide whether a pending commit needs shipping. Ran the
+obvious version -- strip comment lines and blanks, hash the rest, compare parent
+against commit -- and it reported REAL CODE CHANGE on two commits that were purely
+comment edits.
+
+THE TELL WAS THAT THE TWO HASHES SWAPPED. Commit A moved x -> y and commit B moved
+y -> x, net zero across the pair. Behaviour does not usually return exactly to a
+previous state through two unrelated commits; REFORMATTING does, because the
+formatter re-wraps an expression when a comment above it changes its length, and
+then re-wraps it back. A line-oriented normalisation sees re-wrapped lines as
+different content -- it is comparing LAYOUT, not code.
+
+Whitespace-blind normalisation (strip comments, then delete ALL whitespace) gave
+the correct answer: identical either side, and identical across the pair. The
+control -- a commit that genuinely changed behaviour -- still differed under the
+same normalisation, which is what proves the comparison did not simply stop being
+able to see anything.
+
+WHY THE FAILURE DIRECTION MATTERS: it over-reports. A comment-only commit read as
+a code change costs a deploy nobody needed, which is the safe side. But the same
+mechanism under-reports whenever a formatter's re-wrap happens to CANCEL a real
+change in the hash, so the honest statement is that a line-based check measures
+layout and any agreement with behaviour is incidental.
+
+GENERAL FORM: WHEN NORMALISING BEFORE A COMPARISON, ASK WHAT THE NORMALISATION
+STILL LETS THROUGH. Stripping comments removes one confound and leaves another
+standing, and the residual one is invisible precisely because the check now looks
+principled.
+
 ## An optional field is ignored by anything that predates it
 
 Added a `preview` flag to a control operation that retires processes, so an

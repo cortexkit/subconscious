@@ -68,6 +68,37 @@ Leave provenance and gate records alone. A document recording what CAPTURED BYTE
 contain must keep saying what they contain, or it starts lying about the fixture
 beside it.
 
+### The classes to rename, and the two that must not be
+
+After partitioning, only two classes are load-bearing and both must reach zero:
+ROUTE TARGETS, which break the wire, and USER-VISIBLE STRINGS, which after the flip
+name something that exists nowhere in the fleet -- a placeholder telling the user
+to wait for a module that was renamed.
+
+Tests count as a third, weaker class: they break nothing, which is exactly why they
+are worth doing. A test whose id disagrees with production silently stops
+exercising the shape production uses while staying green.
+
+TWO CLASSES MUST KEEP THE OLD NAME, and a blanket comment sweep gets both wrong:
+
+PINNED WIRE FIXTURES. Where a generator's output is compared byte-wise against
+committed captures, renaming the generator breaks parity and renaming both makes
+synthesised bytes claim to be captured. Check for a parity test BEFORE touching a
+generator; the id is usually incidental payload there and nothing is gained.
+
+HISTORICAL REFERENCES TO OLD BUILDS. A comment reading "older alfonso-core builds
+lack this op" is a statement about builds that genuinely carried that name.
+Renaming it makes the comment claim those builds were called something they were
+not -- the same defect as rewriting a provenance record, wearing ordinary prose.
+Distinguish it from a CURRENT-DESCRIPTIVE comment ("the alfonso-core ops are ..."),
+which is merely stale and safe to update.
+
+AND WATCH THE SUBSTITUTION ITSELF. A whole-file regex for "inside a string literal"
+spans line boundaries: a quote early in the file pairs with one much later and
+swallows everything between. Ours changed 13 lines where 8 were intended. The
+extras happened to be correct; read every changed line rather than trusting the
+count, because the mechanism does not know which.
+
 ## Before the window
 
 1. Ufuk present, daylight, box not under heavy build load.

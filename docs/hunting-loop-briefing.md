@@ -2521,6 +2521,44 @@ EXPLAINING it. Explaining a change is a different cognitive act from making one
 and catches things the making does not. Same effect as a checklist auditing the
 prose it was built from.
 
+## A protection that emerges from the order of two unrelated checks
+
+The most dangerous safety property is the one nobody chose.
+
+ENGRAM's gateway refuses a stale control head BEFORE checking roster membership.
+That ordering was chosen to avoid a membership oracle. It ALSO happens to be the
+only thing preventing a replayed envelope from becoming a permanent oracle for
+the account's control head -- because the freshness and nonce checks that would
+catch a replay live in a DIFFERENT function, called by each handler AFTER the
+verifier returns. Swap the two lines and the replay defence disappears. NO TEST
+ANYWHERE WOULD FAIL.
+
+I proposed that swap, twice. First to let the refusal carry the head (killed:
+the caller is not authenticated at that point at all -- the signature is checked
+against the key the request itself carries). Then a membership-first variant to
+fix that (killed harder: membership passing proves the envelope was ONCE signed
+by an enrolled key, not that the caller possesses it, and with freshness sitting
+behind the refusing check the replay window is unbounded).
+
+THE LESSON IS NOT "BE MORE CAREFUL". IT IS THAT A SECURITY ORDERING CANNOT BE
+REASONED ABOUT FROM THE ORDERING ALONE. The checks that made possession mean
+anything were in another file, in another function, invoked by every caller
+rather than by the verifier -- so nothing at the site tells you they exist.
+
+TWO THINGS TO DO WHEN YOU FIND ONE:
+· WRITE THE PROPERTY AT THE ORDERING, naming what breaks if reversed. An
+  ordering that encodes a security decision and does not say so is
+  indistinguishable from an accident, and accidents get tidied for readability.
+· TEST THE EMERGENT PROPERTY DIRECTLY, precisely BECAUSE it is incidental.
+  Deliberate protections attract tests; emergent ones have none by construction.
+
+AND A NAMING TRAP WORTH ITS OWN LINE: a function called `verify_req` that
+verifies SOME of the request. Freshness and replay protection were the CALLER'S
+obligation, so a handler that forgets them has a silently unauthenticated path
+with a reassuring verifier call right above it. When a verifier does not verify
+everything its name implies, say so IN the verifier -- the missing half is
+invisible at every call site.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

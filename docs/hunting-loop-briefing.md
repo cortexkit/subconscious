@@ -1096,6 +1096,36 @@ both halves -- is this file the one I think it is, and are these the bytes I rea
 Files whose names encode an identifier invite treating the name as authoritative;
 it is metadata a writer chose, and nothing revalidates it.
 
+## A failed `cd` runs the rest of your commands somewhere else
+
+Building a deliberately-conflicting branch to prove a merge gate could fail, I
+wrote `git worktree add "$T/w" && cd "$T/w" && git checkout -b probe && <sabotage>
+&& git commit`. The worktree add failed. `cd` failed. AND EVERY SUBSEQUENT COMMAND
+RAN IN THE MAIN REPOSITORY -- so the probe branch was created there, the sabotage
+edit was applied to a live file, and it was committed, all while the transcript
+showed a plausible result.
+
+I then read the run as "the branch was never created" and tried again, which is
+how I learned it HAD been: the second attempt failed with "a branch named
+'conflict-probe' already exists". Recovery needed removing the throwaway worktree
+first, because it held the master checkout and blocked returning to it.
+
+Three separate rules, each of which alone would have prevented it:
+· `set -e` DOES NOT PROTECT A `&&` CHAIN THE WAY PEOPLE EXPECT, and a chain that
+  begins with a directory change is a chain whose every later step is conditional
+  on that change. VERIFY THE DIRECTORY EXISTS AND ABORT if not -- do not rely on
+  `cd` failing loudly enough to stop what follows.
+· DESTRUCTIVE PROBES BELONG IN A WORKTREE WHOSE CREATION YOU CONFIRMED, never in a
+  chain where the fallback location is the real tree. The blast radius of a
+  mistake should not be "the repository I am working in".
+· WHEN A COMMAND REPORTS A STATE THAT CONTRADICTS YOUR MODEL, ASK THE AUTHORITY
+  RATHER THAN RETRYING. Two retries produced two more confusing errors; one `git
+  branch --list` plus `git worktree list` showed the actual state immediately --
+  the main worktree sitting on a sabotage commit.
+
+Nothing was pushed and no work was lost, which is luck rather than design: the
+edit happened to be to a file I could restore from master.
+
 ## A procedural mitigation inherits the defect of the tool it replaces
 
 I rejected a CLI preview because it would have located a config file itself --

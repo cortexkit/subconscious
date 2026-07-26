@@ -857,6 +857,26 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## A scope list predicted in advance goes stale the moment you authorize an exception
+
+A campaign draft enumerated every path each slice was permitted to touch. Months
+of gated decisions later, 77 changed paths sat outside that list -- a frame
+materializer authorized as a prerequisite, five normative amendments each ruled
+on individually, a test-runner consolidation, a coverage generator. **Every one
+was individually approved; nothing updated the enumeration.**
+
+So the verifier whose job was to enforce the scope became unsatisfiable: written
+faithfully it must reject the very tree it was built to certify.
+
+The trap it sets is worse than the staleness. The obvious repair is to write the
+verifier with an allowlist matching what the tree actually contains -- and that
+is a **verifier calibrated to its subject**, in the one artifact whose entire job
+is independence from what it checks. It would exit 0 forever and mean nothing.
+
+Two durable fixes: update the scope list *at authorization time*, not at
+verification time; and mark it as **derived from gate decisions** rather than
+predicted in advance, so the next reader knows which direction the drift runs.
+
 ## When a tool refuses, it may be right and you may be wrong
 
 I ruled a campaign closeable on prose and an incomplete search. The work graph

@@ -2098,6 +2098,41 @@ A false pass gets caught eventually by the thing it failed to prevent. A false
 refusal is self-justifying: it blocks the change, nothing breaks, and the
 refusal looks vindicated. Both directions need the control.
 
+## Any intermediary between a check and its report can substitute its own verdict
+
+The pipeline case below is one instance of a more general shape, and naming only
+the instance leaves the others invisible.
+
+THE WORKFLOW-RUNNER INSTANCE: GitHub skips later steps once one fails. THALAMUS's
+test steps carried `if: !cancelled()` to defeat that; THEIR LINT STEP DID NOT. So
+a formatting slip -- the cheapest and most easily tripped check in the file --
+cancelled the lints AND both test suites, and the job reported one red mark a
+reader cannot distinguish from "style problem, code fine". A run in their own
+history proves it had already fired: format success, clippy failure, then
+`skipped / skipped`.
+
+I HAD THE IDENTICAL GAP and found it only because they described theirs. My test
+steps were guarded and my two clippy steps were not, so a stray blank line would
+have cancelled every lint and test answer beneath it.
+
+THE GUARD IS ONLY MEANINGFUL ON A CHECK THAT FOLLOWS ANOTHER CHECK. Leave setup
+steps unguarded: if dependency install fails, the check after it is IMPOSSIBLE
+rather than skipped-by-policy, and blanket-applying the guard erases that
+distinction. Enumerate every step and classify it as setup or check rather than
+applying the guard by pattern.
+
+THE TWO DIRECTIONS OF THE SAME DEFECT, worth seeing together: swallowing a status
+with `|| true` turns a real failure into a pass; an unguarded step lets a real
+failure SUPPRESS FOUR OTHER ANSWERS. Both are the check no longer being the thing
+that reports.
+
+AND AN INSTRUMENT WHOSE COMPLAINTS YOU HAVE LEARNED TO DISMISS IS
+INDISTINGUISHABLE FROM ONE THAT HAS STOPPED WORKING. THALAMUS validated their
+workflow edit with a linter that emitted two known-stale complaints; rather than
+trust a tool whose only output was noise, they PLANTED A TYPO and confirmed it
+flagged that too. Any tool with standing ignorable output needs that check before
+its silence means anything.
+
 ## A pipeline reports the last command's exit code, not the work's
 
 Twice in one deploy: `cargo build ... | tail -5` returned **exit 0** while cargo

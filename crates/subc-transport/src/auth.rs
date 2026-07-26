@@ -40,6 +40,20 @@ pub struct ClientAuth {
     pub client_auth: [u8; PROOF_LEN],
 }
 
+/// The outcome of a successful handshake.
+///
+/// WHAT THIS PROVES: the peer possesses the connection key, and (client side)
+/// that the daemon does too. Nothing more.
+///
+/// WHAT `role` IS NOT: it is a string the CLIENT SENT, echoed back unverified.
+/// The handshake never checks it against anything, so it carries no authority --
+/// any peer holding the key can claim any role. It exists so a caller can tell
+/// self-issued traffic (the daemon's own watchdog probe) from real clients when
+/// REPORTING, and it must never decide admission, capacity, or privilege.
+///
+/// A type called `Authenticated` invites reading every field as attested. Only
+/// the possession of the key is. Module identity, which IS attested, travels a
+/// different path entirely (spawn nonces validated at route.open).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated {
     pub role: String,

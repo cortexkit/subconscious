@@ -2449,6 +2449,18 @@ THREE CATEGORIES, ONLY ONE OF WHICH IS EXPOSURE:
   (`&self`) and convention in its second (a promise about callers).
 · TRUE BY CONVENTION -- true today, held by nothing. This is the whole exposure.
 
+THE UNIT OF ENFORCEMENT IS THE CLAIM, NOT THE COMMENT. ENGRAM's sharpest
+observation: one sentence can carry two claims in two categories, and the
+structural half LENDS ITS CREDIBILITY TO THE CONVENTIONAL ONE, so the whole
+sentence reads as uniformly reliable. Split a comment into its claims before
+grading any of them.
+
+AND WHEN CONVERTING CONVENTION TO ENFORCEMENT, ORDER BY WHETHER A VIOLATION
+WOULD BE SILENT. "The scheduler retries every tick" going false surfaces as a
+stall someone notices; "called only after auth" going false surfaces as nothing
+at all, until it matters. Same ordering principle as fixing instruments before
+findings.
+
 MEASURE PREVALENCE BEFORE LEGISLATING. Their sweep found 1 defect in 8
 candidates. Endemic would justify a policy (test every behavioural comment); rare
 justifies the cheap habit of checking a comment while you are in the file anyway.

@@ -1454,6 +1454,36 @@ READ. Not the hardest artifact and not the newest -- the one with exactly one
 reader. That is a queryable property rather than a judgement call, which is what
 makes it survive a busy week.
 
+AND IT HAS A PREDICTION, which is what makes it a rule rather than an
+observation: THE THING THAT DEFINES SCOPE IS ALWAYS SINGLE-READER, BECAUSE
+NOBODY REVIEWS A LIST. Two seats applied the rule independently within an hour
+and both landed on the artifact deciding what gets checked -- one a hardcoded
+module set in a fleet monitor, one a checked-in test inventory behind a gate.
+Both reported clean over an incomplete set. Start there.
+
+A count assertion over such a list is not the defence it appears to be. If the
+expected number is transcribed FROM the list, it proves no duplicates and no
+shrinkage and is structurally incapable of proving COMPLETENESS -- completeness
+is a claim about the world, and the number is a claim about the list. Add a
+qualifying item, forget the list, and both stay consistent forever. The
+denominator has to come from the thing being enumerated, not from the enumeration.
+
+### Two constructions over the same ground diff for free
+
+When two mechanisms cover overlapping scope by DIFFERENT construction -- one
+scanning a directory, one reading a checked-in list -- their disagreement is a
+control you did not have to build, and it is independent on both legs: different
+method, different inputs.
+
+This is worth more than re-deriving the list once. Deriving fixes today's drift;
+the diff keeps working after someone reintroduces a list for a good reason. Where
+the pair already exists, diffing it costs almost nothing and is usually the only
+fully independent control available.
+
+Before reporting the disagreement as a hole, establish the blast radius: an item
+missing from one gate but covered by the other is INCOMPLETE BY OMISSION, not
+UNRUN. Different fix, different urgency. Size it before naming its severity.
+
 It is also why the layered control stack works at all: each layer is read by
 something that did not produce the layer beneath it.
 

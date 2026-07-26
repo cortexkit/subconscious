@@ -2487,6 +2487,40 @@ the branch proves the branch runs; a test whose failure output IS the outage
 proves the model is right, and hands the next person the incident instead of a
 puzzle.
 
+THE INVARIANT PAID OUT WITHIN THE HOUR, and this is the argument for writing
+invariants rather than remedies. Phrased as the remedy ("sync after the
+retirement append") the question stops at retirement. Phrased as the invariant,
+the next question is MECHANICAL -- which other paths mutate durable server state
+before a fallible step? Three call sites existed. ALL THREE HAD THE DEFECT.
+
+ONE OF THE THREE WAS THE CRASH-RECOVERY PATH, and that one deserves its own
+note: A RECOVERY PATH WITH THIS DEFECT DOES NOT MERELY FAIL TO RECOVER, IT
+CONVERTS A RECOVERABLE CRASH INTO AN UNRECOVERABLE DEADLOCK. The mechanism that
+exists to reduce blast radius enlarges it, and it fires exactly when the system
+is already degraded and nobody has spare attention. RECOVERY PATHS DESERVE A
+HEAVIER STANDARD THAN THE PATHS THEY RECOVER, and they routinely get a lighter
+one because they are rare and hard to exercise.
+
+THE SUBTLE CALL THERE: reconcile even when the mutating call REPORTS FAILURE. A
+lost response is indistinguishable from a refusal, and the record may be durable
+either way -- the client's knowledge of a remote mutation is strictly weaker than
+the mutation's existence, so any outcome other than proven-not-applied is a
+possible mutation. Treating a reported failure as evidence of non-mutation is the
+same error as treating an absence in a log as evidence of non-arrival: a claim
+about your instrument dressed as a claim about the world.
+
+WHERE TO PUT THE PROTECTION when sibling call sites share a shape: not one test
+per site. Write the invariant AT THE SHARED FUNCTION, as a precondition of using
+it, so the next person adding a fourth call site reads it. That is cheaper than a
+test and it covers sites that do not exist yet.
+
+WRITE THE COMMENT BEFORE YOU ARE SURE THE CHANGE IS FINISHED. ENGRAM found a
+second latent failure -- a cleanup call releasing a lease against the stale head,
+which would have failed the same fence -- not while making the change but while
+EXPLAINING it. Explaining a change is a different cognitive act from making one
+and catches things the making does not. Same effect as a checklist auditing the
+prose it was built from.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

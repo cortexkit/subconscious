@@ -2437,6 +2437,49 @@ SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
 
+## A count without its breakdown invites the reader to supply an attribution
+
+I reported "96 markdown files" from a branch and let the recipient infer which
+subtree they came from. They inferred the one that fit the fix they were already
+designing -- generated task outputs -- and sized the remedy to it.
+
+The breakdown was 54 hand-authored prompt files, 26 generated transcripts, and 18
+task outputs. So the proposed fix would have removed 18 of 99 while reading as
+though it addressed the whole finding, AND it would have kept force-adding the
+category that actually dominated.
+
+MY NUMBER WAS TRUE AND MY REPORT WAS ONE FIELD SHORT OF USEFUL. A bare count is
+an invitation: the reader needs a composition to act on it, and if you do not
+supply one they will construct the most plausible one available to them -- which
+is the one consistent with what they already believe.
+
+SO WHEN REPORTING A COUNT THAT SOMEONE WILL SIZE A FIX TO, REPORT THE
+PARTITION. `sort | uniq -c` over the grouping dimension costs one pipe.
+
+AND VERIFY CLAIMS MADE ABOUT EVIDENCE YOU SUPPLIED. The recipient's attribution
+was about MY specimen, which I could check and they could not. Where two seats
+discuss one artifact, the one holding it owes the check -- an assertion about
+someone else's evidence is the least-defended claim in any exchange.
+
+## A denylist over a growing tree fails silently; an allowlist fails visibly
+
+The same exchange produced a shape worth generalising past its instance. A
+reclaim safety net force-added an entire subtree MINUS a denylist of generated
+directories. That denylist was already one entry short, and nobody noticed until
+a specimen forced the question.
+
+A DENYLIST OVER A TREE THAT GROWS IS A TRANSCRIBED LIST WITH ALL THE USUAL
+PROPERTIES: it agrees with reality on the day it is written, and the first new
+subtree defaults to INCLUDED with nothing failing.
+
+INVERTING IT CHANGES THE FAILURE DIRECTION, WHICH IS THE WHOLE ARGUMENT. Under an
+allowlist a new subtree defaults to EXCLUDED: worst case something is missed, and
+THAT FAILURE IS VISIBLE (the thing you wanted is not there). Under a denylist the
+failure is invisible (twelve thousand lines of noise you will not read).
+
+GENERAL FORM: WHEN A LIST GOVERNS A GROWING POPULATION, CHOOSE THE POLARITY
+WHOSE DEFAULT FAILS TOWARD SOMETHING A HUMAN WILL NOTICE.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

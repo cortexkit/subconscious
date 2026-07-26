@@ -1,27 +1,46 @@
 import Foundation
 import XCTest
+import CryptoKit
 @testable import SubcChatAskSupport
 
 final class BoardModelsTests: XCTestCase {
     func testDecodesEveryFixtureBlockWithTypedKnownPropsAndOpaqueUnknown() throws {
         let blocks = try loadFixtureBlocks()
-        XCTAssertEqual(blocks.count, 8)
+        XCTAssertEqual(blocks.count, 11)
+
+        // Kinds this client types, and kinds it deliberately does not. The second
+        // list is the load-bearing one: a block whose kind arrived after this
+        // client shipped must decode to `.opaque` with its properties intact, so a
+        // newer board renders those blocks by digest instead of failing the whole
+        // reply. Asserting the arm per kind means a kind silently changing arms --
+        // in either direction -- fails here rather than surfacing as a blank row.
+        var seenTyped: Set<String> = []
+        var seenOpaque: Set<String> = []
 
         for block in blocks {
             switch (block.kind, block.props) {
-            case ("text", .text): break
-            case ("status", .status): break
-            case ("ask", .ask): break
-            case ("show", .show): break
-            case ("flamegraph", .opaque(let props)):
+            case ("text", .text), ("status", .status), ("ask", .ask), ("show", .show):
+                seenTyped.insert(block.kind)
+            case ("flamegraph", .opaque(let props)),
+                 ("work", .opaque(let props)),
+                 ("todos", .opaque(let props)):
                 guard case .object = props else {
-                    return XCTFail("unknown props were not retained as an object")
+                    return XCTFail("\(block.kind): unknown props were not retained as an object")
                 }
-                XCTAssertEqual(block.digest.title, "Decode hot path flamegraph")
+                XCTAssertFalse(
+                    block.digest.title.isEmpty,
+                    "\(block.kind): an untyped block still needs a digest title to render"
+                )
+                seenOpaque.insert(block.kind)
             default:
                 XCTFail("unexpected props arm for \(block.kind)")
             }
         }
+
+        // Both groups must be non-empty, or the loop above proves only that the
+        // decoder is constant in one direction.
+        XCTAssertEqual(seenTyped, ["text", "status", "ask", "show"])
+        XCTAssertEqual(seenOpaque, ["flamegraph", "work", "todos"])
     }
 
     func testAbsentDigestFieldsRemainNil() throws {
@@ -58,8 +77,8 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(state.roomId, "rm_board_ses_example")
         XCTAssertEqual(state.sessionId, "ses_example")
         XCTAssertEqual(state.servedSeq, 412)
-        XCTAssertEqual(state.lanes, ["chat", "asks", "status", "artifacts"])
-        XCTAssertEqual(state.blocks.count, 5)
+        XCTAssertEqual(state.lanes, ["chat", "asks", "status", "artifacts", "work"])
+        XCTAssertEqual(state.blocks.count, 6)
         XCTAssertEqual(state.health?.props.teeCounters?.wellFormed, 41)
         XCTAssertEqual(state.health?.props.teeCounters?.malformed, 1)
         XCTAssertEqual(state.health?.props.rung2Counters?.proseQuestionsAtTurnEnd, 0)
@@ -107,6 +126,36 @@ final class BoardModelsTests: XCTestCase {
         }
         let data = try JSONSerialization.data(withJSONObject: state)
         return try JSONDecoder().decode(BoardState.self, from: data)
+    }
+
+    /// The board wire fixture has a source copy in the alfonso repository and a
+    /// vendored copy here. This test hashes the vendored copy and compares it
+    /// against the same digest alfonso's own suite asserts, so editing either copy
+    /// fails a build until the other is updated. Without that, the two drift apart
+    /// silently: each repository's tests agree with its own copy, and nothing
+    /// compares them.
+    ///
+    /// A digest reports that the bytes changed, not what changed, so the
+    /// assertions above cover the content this client depends on -- the block
+    /// count, and which block kinds decode into typed properties versus opaque
+    /// ones. Read them together when this test fails.
+    func testVendoredFixtureMatchesTheProducerDigest() throws {
+        guard let url = Bundle.module.url(forResource: "board-wire-fixtures-v1", withExtension: "json") else {
+            throw FixtureError.missingResource
+        }
+        let digest = SHA256.hash(data: try Data(contentsOf: url))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        XCTAssertEqual(
+            digest,
+            "63bbed6bd4cca3801413fadd035f159583b46f5599609e4e6ad37aef79e3d50d",
+            """
+            The vendored board fixture no longer matches the copy alfonso pins. \
+            Re-sync from alfonso rather than updating this digest: the fixture is \
+            the contract, and editing the expected hash to match local bytes \
+            silently accepts whatever moved.
+            """
+        )
     }
 
     private func loadFixtureObject() throws -> [String: Any] {

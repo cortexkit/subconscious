@@ -317,8 +317,14 @@ print("|".join(f"^{d}/" for d in dirs))
     continue
   fi
   n=$(echo "$runtime" | wc -l | tr -d ' ')
-  printf '  %-16s binary is %sh behind master, %s runtime file(s) unshipped -- ask the owner\n' \
-    "$repo" "$gap_h" "$n"
+  # Name the BINARY, not the repo. They are the same thing in thirteen of the
+  # fourteen fleet repos, which is exactly why the distinction is invisible until
+  # it matters: subconscious ships three binaries, so a line reading "subconscious
+  # is 48h behind" while the daemon was rebuilt an hour ago is not wrong so much
+  # as unanswerable -- the reader cannot tell which artifact is meant, and the
+  # obvious guess is the most important one.
+  printf '  %-20s is %sh behind %s master, %s runtime file(s) unshipped -- ask the owner\n' \
+    "$binname" "$gap_h" "$repo" "$n"
   echo "$runtime" | head -3 | sed 's/^/      /'
   printed=1
 done <<EOF

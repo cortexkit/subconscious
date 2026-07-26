@@ -1005,6 +1005,36 @@ reason to restart: a restart would have cost one in-flight object and resumed,
 but it would also have destroyed the evidence distinguishing waiting from wedged,
 and nobody knew the cost was low until the question was answered.
 
+## A transcribed allowlist agrees with its source only at the moment it was typed
+
+A scope verifier was built to check that a module's public exports match a
+normative ABI file. Its first delivery carried **two hardcoded sets of ten
+names** and never read the file.
+
+The names were correct. That is what makes it worse than an obvious bug: it
+passed, it would keep passing, and it would keep passing after the normative file
+changed. **A transcribed allowlist decays with nothing to detect the drift** --
+one step better than deriving the allowlist from the tree you are checking, and
+failing in the same direction.
+
+So the verifier committed the defect it exists to catch, in the rule immediately
+next to one that got it right: the same file's ownership rule parsed its
+authority correctly.
+
+Two details worth copying from how it was corrected:
+
+**The derivation was proven exact before it was asked for.** Parsing the five
+relevant keys yielded precisely the ten hardcoded names, zero missing and zero
+extra in both directions -- so the request was mechanical rather than
+speculative, which is the difference between a correction and a redesign.
+
+**Two string literals were left in place, and reported rather than hidden.** They
+are call-graph roots, not allowlists, and renaming an entrypoint produces "could
+not resolve all three parity functions" plus further violations. **A literal that
+fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
+the honest answer was to explain why two remain rather than to satisfy the
+letter of it.
+
 ## A substring match produces a confident, specific, wrong answer
 
 A capability scan reported that a parser module performed randomness. The

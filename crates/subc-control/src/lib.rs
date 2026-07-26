@@ -86,7 +86,29 @@ pub enum ClientControlRequest {
     #[serde(rename = "supervisor.reload")]
     SupervisorReload { module_id: String },
     #[serde(rename = "supervisor.rescan")]
-    SupervisorRescan {},
+    SupervisorRescan {
+        /// Compute the reconciliation and return it WITHOUT applying it.
+        ///
+        /// Rescan retires any supervised module absent from the config, which
+        /// stops live processes. Both halves of that decision are inspectable in
+        /// advance -- the config is a file, the running set is `supervisor.list`
+        /// -- but nothing reconstructs the diff for the operator, so it is read
+        /// from the result table AFTER the retires have happened.
+        ///
+        /// A preview must be computed daemon-side rather than by a client, because
+        /// a client would have to locate the daemon's config itself: two rules
+        /// selecting one subject, agreeing until someone runs a daemon with a
+        /// non-default config. A preview that can describe a different file than
+        /// the operation reads is worse than none, because it is believed.
+        ///
+        /// Defaults to false so an existing client sending `{}` still executes,
+        /// and is OMITTED when false so the bytes an existing client sends are
+        /// unchanged. Serialising `preview:false` would have altered the request's
+        /// wire form for every caller that never asked for a preview -- caught by
+        /// the golden fixture, which is the whole reason that pin exists.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preview: bool,
+    },
     #[serde(rename = "supervisor.set_enabled")]
     SupervisorSetEnabled { module_id: String, enabled: bool },
     #[serde(rename = "supervisor.health_probe")]
@@ -174,6 +196,15 @@ pub struct SupervisorRescanResult {
     pub removed: Vec<String>,
     pub changed_pending_reload: Vec<String>,
     pub unchanged: u32,
+    /// True when this reconciliation was computed but NOT applied.
+    ///
+    /// Carried on the result rather than left to the caller's memory of what it
+    /// asked for. A preview and an execution are otherwise byte-identical, so a
+    /// reader who meets this output later -- in a log, a transcript, a pasted
+    /// snippet -- cannot tell which one happened. Absent when false, so existing
+    /// consumers see the shape they already parse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

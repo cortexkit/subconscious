@@ -1621,13 +1621,24 @@ property by removing the copies, which is more machinery for an identical
 guarantee; prefer it for wire types, prefer the pin-pair for test fixtures.
 
 PAIR THE DIGEST WITH ASSERTIONS THAT NAME THE LOAD-BEARING CONTENT, because A
-DIGEST SAYS CHANGED AND NOT WHAT. And make those assertions state a PROPERTY
-rather than a COUNT: re-syncing a fixture that had grown by three entries failed
-three tests that asserted an exact block count and an exact lane list, and
-FAILING ON GROWTH IS INDISTINGUISHABLE FROM FAILING ON CORRUPTION at the moment
-you read the output. Asserting which kinds decode typed and which decode opaque
--- with both sets required non-empty -- survives the next addition and is what
-the client actually depends on.
+DIGEST SAYS CHANGED AND NOT WHAT. Re-syncing a fixture that had grown by three
+entries failed three tests asserting an exact block count and an exact lane list,
+and FAILING ON GROWTH IS INDISTINGUISHABLE FROM FAILING ON CORRUPTION at the
+moment you read the output. Asserting which kinds decode typed and which decode
+opaque -- with both sets required non-empty, so the check cannot pass by being
+constant in one direction -- survives the next addition and is what the client
+actually depends on.
+
+BUT A COUNT IS THE RIGHT ASSERTION WHEN THE COUNT IS THE CONTRACT, and the two
+cases sit side by side in one repo. A data-driven suite over a published corpus
+MUST assert its item count and file set, because silent shrinkage is exactly the
+failure that takes a suite from 102 passing to 100 with nothing red -- there the
+census IS the property, namely that every published vector is exercised.
+
+THE DISCRIMINATOR IS WHETHER GROWTH IS EXPECTED. A fixture the producer extends
+over time must not assert its size; a corpus where every member must be consumed
+must assert exactly that. Same assertion, opposite verdicts, and the separating
+question is whether a new entry here would be ROUTINE or ALARMING.
 
 AND EXPECT THE FIRST PROBE TO BE WRONG. Sweeping eleven vector files for accept
 arms by matching one key returned zero on a file whose schema marks acceptance by

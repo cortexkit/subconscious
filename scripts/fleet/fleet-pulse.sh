@@ -166,13 +166,57 @@ echo
 bold "DEPLOY"
 BIN="$HOME/.local/share/cortexkit/bin"
 printed=0
-for repo_bin in "ai-proxy:ck-thalamus" "magic-context:ck-mc" "broca:ck-broca" \
-                "ai-provider-quota:ck-quota" "cortexkit-credentials:ck-credentials" \
-                "engram:ck-engram" "astrocyte:ck-astrocyte" "plexus:ck-plexus" \
-                "subc-federation:ck-callosum"; do
-  repo="${repo_bin%%:*}"; binname="${repo_bin##*:}"
+
+# The module set is DERIVED from subc.jsonc, never listed here. An earlier
+# version transcribed nine module:binary pairs, which agreed with the fleet only
+# on the day it was typed: five supervised modules had since been added and were
+# silently outside the check, and the section still reported "no binary behind
+# its master" -- a clean result over an incomplete set, which is the failure this
+# whole file exists to catch.
+#
+# Only the module_id -> repo-directory step is residual, because nothing on disk
+# records it (alfonso-core lives in alfonso/, thalamus in ai-proxy/, subc-mcp in
+# subconscious/). A module whose directory this cannot resolve is REPORTED rather
+# than skipped, so the mapping going stale is visible instead of silent.
+module_repo() {
+  case "$1" in
+    alfonso-core) echo alfonso ;;
+    thalamus)     echo ai-proxy ;;
+    subc-mcp)     echo subconscious ;;
+    *)            echo "$1" ;;
+  esac
+}
+
+CFG="$HOME/.config/cortexkit/subc.jsonc"
+modmap=$(python3 - "$CFG" <<'PY' 2>/dev/null
+import json,re,sys,os
+try:
+    s=open(sys.argv[1]).read()
+except OSError:
+    sys.exit(1)
+s=re.sub(r'//.*','',s); s=re.sub(r',(\s*[}\]])',r'\1',s)
+for mid,cfg in sorted(json.loads(s).get('modules',{}).items()):
+    print(f"{mid} {os.path.basename(str(cfg.get('program','')))}")
+PY
+)
+# A config that cannot be read must not read as an empty fleet -- the same
+# absent-means-nothing conversion that would have let a rescan retire every
+# module. Refuse the section instead.
+if [ -z "$modmap" ]; then
+  echo "  cannot read $CFG -- deploy gaps UNCHECKED this cycle"
+  modmap=""
+fi
+
+while read -r modid binname; do
+  [ -n "$modid" ] || continue
+  repo=$(module_repo "$modid")
   dir="$HOME/Work/Projects/CortexKit/$repo"
-  [ -d "$dir" ] && [ -f "$BIN/$binname" ] || continue
+  if [ ! -d "$dir/.git" ]; then
+    echo "  $modid: no repo at $repo/ -- cannot check for unshipped code"
+    printed=1
+    continue
+  fi
+  [ -f "$BIN/$binname" ] || continue
   head_epoch=$(cd "$dir" && git log -1 --format='%ct' 2>/dev/null) || continue
   bin_epoch=$(stat -f '%m' "$BIN/$binname" 2>/dev/null) || continue
   # Only hours-scale gaps are worth a line. A binary minutes older than its head
@@ -205,8 +249,36 @@ for repo_bin in "ai-proxy:ck-thalamus" "magic-context:ck-mc" "broca:ck-broca" \
     "$repo" "$gap_h" "$n"
   echo "$runtime" | head -3 | sed 's/^/      /'
   printed=1
-done
-[ "$printed" -eq 0 ] && echo "  no binary more than 6h behind its master"
+done <<EOF
+$modmap
+EOF
+# The daemon is not a module, so a module-derived list structurally cannot reach
+# it -- and it is the one binary whose staleness affects every other. Checked
+# separately for that reason, against the subc-core crates only: a commit to the
+# mcp shim or a client SDK moves subconscious HEAD without touching the daemon.
+subc_dir="$HOME/Work/Projects/CortexKit/subconscious"
+if [ -d "$subc_dir/.git" ] && [ -f "$BIN/ck-subc" ]; then
+  d_bin=$(stat -f '%m' "$BIN/ck-subc" 2>/dev/null)
+  d_head=$(cd "$subc_dir" && git log -1 --format='%ct' 2>/dev/null)
+  if [ -n "$d_bin" ] && [ -n "$d_head" ]; then
+    d_gap=$(( (d_head - d_bin) / 3600 ))
+    if [ "$d_gap" -ge 6 ]; then
+      d_since=$(date -r "$d_bin" '+%Y-%m-%d %H:%M:%S')
+      d_rt=$(cd "$subc_dir" && git log --since="$d_since" --format='' --name-only 2>/dev/null \
+        | grep -E '^crates/(subc-core|subc-protocol|subc-transport|subc-control)/.*\.rs$' \
+        | grep -v -E '(^|/)tests?/' | sort -u)
+      if [ -n "$d_rt" ]; then
+        printf '  %-16s DAEMON is %sh behind master, %s runtime file(s) unshipped -- needs a bounce\n' \
+          "ck-subc" "$d_gap" "$(printf '%s\n' "$d_rt" | grep -c .)"
+        printf '%s\n' "$d_rt" | head -3 | sed 's/^/      /'
+        printed=1
+      fi
+    fi
+  fi
+fi
+
+[ "$printed" -eq 0 ] && [ -n "$modmap" ] && \
+  echo "  no binary more than 6h behind its master ($(printf '%s\n' "$modmap" | grep -c .) modules + daemon checked)"
 # The boundary belongs in the output, not in someone's memory of how this works.
 # Without it the next reader takes a clean result as fleet-wide, which it is not:
 # a stale Cloudflare Worker has no local mtime and cannot appear here at all --

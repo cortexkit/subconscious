@@ -2747,6 +2747,18 @@ THE MIGRATION-GATE SHAPE, worth reusing whole:
   stores cross-reference each other, moving one and exiting nonzero leaves a
   CONSISTENT-LOOKING TREE WITH BROKEN REFERENCES, and the operator's instinct is
   to re-run. All or none removes the class.
+· RE-MINT THE BASELINE AGAINST THE STOPPED TREE, not the live one. A baseline
+  taken while the service is still writing is stale the moment it is written, so
+  a clean post-move check proves "no loss relative to a point BEFORE the move"
+  rather than "no loss". The blind spot is exactly as wide as the gap between
+  minting and stopping. Costs one command at the top of the window.
+· CHECK THAT YOUR FIXTURE CAN CONSTRUCT THE DEFECT. Reproducing a truncation
+  gate, I picked a WAL by size filter and got a ZERO-BYTE file: baseline recorded
+  frames 0, truncation could not fall short of zero, and the check passed. The
+  gate was correct and my input could not exercise it -- and the failure pointed
+  the dangerous way, saying the gate does not fire. Corollary for count-based
+  gates: an empty file contributes to a FILE count and to nothing else, so
+  dropping the file count as "redundant" makes empty files invisible to the gate.
 · SHIP THE READ-SIDE CHANGE AHEAD OF THE MOVE, with the fallback arm VERBATIM the
   old expression, so the new binary computes the identical path until someone
   sets the variable. Verify that verbatim-ness at source rather than trusting it;

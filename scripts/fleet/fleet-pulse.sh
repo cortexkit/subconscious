@@ -525,11 +525,22 @@ dim "  covers local binaries only -- cloud-deployed code cannot appear here"
 # `#[cfg(test)]` applied to individual items, which is how a filter of that shape
 # reads a file as clean while it ships real code.
 #
-# Over-reporting is the deliberate direction: a missed stale deploy costs far
-# more than a line someone checks and dismisses. But an unstated upper bound
-# erodes the section's credibility the first time someone investigates a phantom,
-# so the bound is printed rather than remembered.
-dim "  count is an upper bound: in-file #[cfg(test)] changes are counted as runtime"
+# The second cause is COMMENT-ONLY EDITS, and the reason this section does not try
+# to filter them is worth stating rather than leaving as an omission. The obvious
+# filter -- strip comment lines, hash the rest, compare -- MEASURES LAYOUT RATHER
+# THAN CODE: a formatter re-wraps an expression when the comment above it changes
+# length, so a purely documentary commit reads as a code change. Measured on this
+# repo: two comment-only commits reported as real, and the tell was that their
+# hashes SWAPPED, x -> y then y -> x, which is the signature of a re-wrap and its
+# reversal rather than of behaviour. A whitespace-blind normalisation answers
+# correctly, but it belongs at the deploy decision where one repo is being
+# examined, not in a fleet sweep that would run it over every pending commit.
+#
+# Over-reporting is the deliberate direction for both causes: a missed stale deploy
+# costs far more than a line someone checks and dismisses. But an unstated upper
+# bound erodes the section's credibility the first time someone investigates a
+# phantom, so the bound is printed rather than remembered.
+dim "  count is an upper bound: in-file #[cfg(test)] and comment-only edits count as runtime"
 echo
 
 dim "idle is a proxy for attention, not for progress -- confirm before acting"

@@ -552,6 +552,112 @@ final class FedRendezvousClientTests: XCTestCase {
         XCTAssertNil(payload.serverSeq, "epoch_push must carry no server_seq cursor")
     }
 
+    func testEpochPushClaimsMatchProducerMintedVectors() throws {
+        // Every other epoch_push test here hand-builds its claims, so they encode
+        // what this repo BELIEVES the producer emits. This one reads the vectors
+        // the producing repo mints, which is the only source that can disagree.
+        //
+        // It disagreed: the credential producer serializes `new_epoch` as a JSON
+        // NUMBER, and the hand-built claims all used a string. Because the claim
+        // rides a REVOCATION, refusing the producer's shape drops the revocation
+        // and the device keeps serving -- strictness on this one field fails OPEN,
+        // which is why fed-core accepts both shapes and normalizes at the parse
+        // boundary.
+        let lines = try RdvWireFixtures.jsonlLines("epoch-push-claims.jsonl")
+        XCTAssertEqual(lines.count, 15, "vendored vector count changed; re-sync from subc-federation")
+
+        var okCount = 0
+        var rejectCount = 0
+        for line in lines {
+            guard let vector = try JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let vectorId = vector["vector_id"] as? String,
+                  let expected = vector["expected"] as? String,
+                  let claimBytes = Self.rawJSONObjectSlice(of: "jws_payload", in: line)
+            else {
+                return XCTFail("malformed vector line")
+            }
+            // The claim bytes are carried through VERBATIM rather than parsed and
+            // re-encoded. Foundation's JSON writer renders an integral double as
+            // `7`, so a round trip through `[String: Any]` erases exactly the
+            // distinction two of these vectors exist to test -- the assertion
+            // would still pass, over an input the decoder can no longer receive.
+            let object = epochPushObject(jws: Self.compactJWS(payload: claimBytes))
+
+            if expected == "ok" {
+                okCount += 1
+                let push = try XCTUnwrap(
+                    try? RdvEpochPush.decode(object),
+                    "\(vectorId): producer-minted claims must decode"
+                )
+                // Both wire shapes normalize to the same canonical text, so
+                // nothing downstream can observe which one arrived.
+                XCTAssertEqual(
+                    push.newEpoch,
+                    vector["expected_new_epoch"] as? String,
+                    "\(vectorId): new_epoch must normalize to the canonical decimal text"
+                )
+            } else {
+                rejectCount += 1
+                XCTAssertThrowsError(
+                    try RdvEpochPush.decode(object),
+                    "\(vectorId): out-of-contract claims must be refused"
+                )
+            }
+        }
+        // Both outcomes must be present, or the loop proves only that the decoder
+        // is constant in one direction.
+        XCTAssertEqual(okCount, 4)
+        XCTAssertEqual(rejectCount, 11)
+    }
+
+    /// The raw bytes of the JSON object stored at `key`, sliced out of `line`
+    /// without parsing, so number literals keep the exact form the producer
+    /// wrote (`7.0` stays a float, not an integer).
+    private static func rawJSONObjectSlice(of key: String, in line: Data) -> Data? {
+        let bytes = [UInt8](line)
+        guard let marker = "\"\(key)\":".data(using: .utf8).map({ [UInt8]($0) }),
+              let start = Self.firstIndex(of: marker, in: bytes)
+        else { return nil }
+        var index = start + marker.count
+        while index < bytes.count, bytes[index] == UInt8(ascii: " ") { index += 1 }
+        guard index < bytes.count, bytes[index] == UInt8(ascii: "{") else { return nil }
+        // Brace matching is safe here only because these fixtures carry no braces
+        // inside string values; the reader below rejects anything unbalanced.
+        var depth = 0
+        var cursor = index
+        while cursor < bytes.count {
+            if bytes[cursor] == UInt8(ascii: "{") { depth += 1 }
+            if bytes[cursor] == UInt8(ascii: "}") {
+                depth -= 1
+                if depth == 0 { return Data(bytes[index...cursor]) }
+            }
+            cursor += 1
+        }
+        return nil
+    }
+
+    private static func firstIndex(of needle: [UInt8], in haystack: [UInt8]) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+        for start in 0...(haystack.count - needle.count)
+        where Array(haystack[start..<(start + needle.count)]) == needle {
+            return start
+        }
+        return nil
+    }
+
+    /// A compact JWS whose payload segment is exactly `payload`. Header and
+    /// signature are opaque filler: the client parses the payload and does not
+    /// verify the signature (the worker does), so their contents cannot matter.
+    private static func compactJWS(payload: Data) -> String {
+        func encode(_ data: Data) -> String {
+            data.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+        }
+        return "\(encode(Data(#"{"alg":"EdDSA"}"#.utf8))).\(encode(payload)).\(encode(Data(repeating: 0xAB, count: 64)))"
+    }
+
     func testEpochPushRejectsExtraServerSeqField() throws {
         // The envelope is exactly type + jws (deny-unknown-fields). A smuggled
         // server_seq — the old, wrong shape — is an unknown field and rejects.

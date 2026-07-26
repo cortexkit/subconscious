@@ -896,7 +896,43 @@ the right instinct: correct-shaped assertions are precisely the ones that pass
 while unreachable, because nothing about reading them reveals whether control
 arrives.
 
-### A substring match produces a confident, specific, wrong answer
+### Five empty tables, one fault
+
+Chasing whether a backup generation was stalled, I sampled five store tables for
+progress. Every one read unchanged. All five had **zero rows** -- they belong to
+a second subsystem that is built, gate-passed, and has never had a live session
+on this machine, so its entire schema is permanently empty here.
+
+I was sampling tables that *structurally cannot change*, and "unchanged" from
+each was a null result wearing a finding's clothes. One `SELECT COUNT(*)` would
+have caught all five at once -- which is the same rule as preferring a probe
+whose expected result is non-empty, so a blank means the instrument failed rather
+than the world being quiet.
+
+The fd count was the same fault in another costume: 1388 for one process against
+1387 for an unrelated one is a system-wide number, not a per-process one.
+
+### The one crude measurement that worked, and why it was only half right
+
+CPU time over a 40-second window moved 20ms. I read that as "waiting, not
+working" -- correct -- and inferred it might be stalled, which was wrong. The
+process was waiting **on the network, per object, three seconds at a time.**
+**CPU is a good liveness signal for CPU-bound work and a useless one for
+round-trip-bound work**, and 20ms in 40s is exactly what a healthy uploader looks
+like.
+
+The real progress record was not in the database at all. It was a file: one
+object id appended and fsynced per confirmed upload, which doubles as the resume
+record. Measured: 21 objects/min, 1220 of 1464 -- textbook.
+
+Two riders from its owner, both worth keeping. **A rate read from an
+append-as-you-go log is sound; a ratio read from it mid-flight is not** -- the
+denominator is not final until the run is. And knowing recovery is cheap is not a
+reason to restart: a restart would have cost one in-flight object and resumed,
+but it would also have destroyed the evidence distinguishing waiting from wedged,
+and nobody knew the cost was low until the question was answered.
+
+## A substring match produces a confident, specific, wrong answer
 
 A capability scan reported that a parser module performed randomness. The
 offending line:

@@ -2270,6 +2270,38 @@ whatever way that system fails -- which is not always loudly. A seat pointed at
 the wrong module id gets `unknown_module`, which the client RETRIES IN PLACE, so
 a typo presents as a hang rather than an error and gets debugged as one.
 
+## A permissive harness route certifies both answers as correct
+
+A test double that never refuses is not merely failing to test refusal. It is
+ACTIVELY CERTIFYING that authenticated and unauthenticated callers are the same
+thing -- so every test written against it passes, forever, in BOTH directions.
+
+ENGRAM's instance: a simulated cloud answered 200 to any caller on five routes,
+including one with no Authorization header at all. Production 401s on all five.
+The real defect it hid was an ordering bug -- a preflight that READ before it
+MINTED, so the read fell back to an expired token and returned before reaching
+the mint that would have fixed it. With a permissive route, read-before-mint and
+mint-before-read are indistinguishable.
+
+THE PART THAT MAKES THIS ITS OWN SECTION: after adding the gate, the mutation
+reddened TWO tests rather than one. The second was an EXISTING test written
+explicitly to prove that the retire path works on a minted token without a valid
+account JWT. It could never have observed that, because with a permissive route
+there is nothing to distinguish a minted bearer from no bearer. It had been
+asserting a property it could not see since the day it was written.
+
+So fixing a permissive double does not only ADD coverage -- it RESTORES coverage
+that was already claimed, and the claim is what stopped anyone looking. A test
+named for the exact property is the strongest possible signal that the property
+is covered, which is why this shape survives review indefinitely.
+
+THE CHECK: for every route or method on a test double, ask what it REFUSES. One
+that refuses nothing cannot support any test whose subject is a precondition --
+authentication, ordering, admission, capability. Sweep the whole double when you
+find one, because the permissive route you found is rarely the only one, and
+patching the single route that exposed the defect leaves the identical hole for
+the next caller.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

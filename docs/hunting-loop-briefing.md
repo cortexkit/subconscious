@@ -1613,6 +1613,22 @@ consumers, satisfies it; a split RUN would not. Had the rule been written at fil
 granularity it would have flagged a sound design, and A RULE THAT CRIES WOLF GETS
 DISABLED BY THE PERSON IT WAS WRITTEN FOR.
 
+TWO COPIES ARE FINE IF NEITHER CAN CHANGE SILENTLY. The problem was never the
+duplication, it was the silence -- so a digest pinned on BOTH sides converts a
+synchronisation problem into a build failure, which is the only kind of
+synchronisation that survives nobody watching. A shared definition buys the same
+property by removing the copies, which is more machinery for an identical
+guarantee; prefer it for wire types, prefer the pin-pair for test fixtures.
+
+PAIR THE DIGEST WITH ASSERTIONS THAT NAME THE LOAD-BEARING CONTENT, because A
+DIGEST SAYS CHANGED AND NOT WHAT. And make those assertions state a PROPERTY
+rather than a COUNT: re-syncing a fixture that had grown by three entries failed
+three tests that asserted an exact block count and an exact lane list, and
+FAILING ON GROWTH IS INDISTINGUISHABLE FROM FAILING ON CORRUPTION at the moment
+you read the output. Asserting which kinds decode typed and which decode opaque
+-- with both sets required non-empty -- survives the next addition and is what
+the client actually depends on.
+
 AND EXPECT THE FIRST PROBE TO BE WRONG. Sweeping eleven vector files for accept
 arms by matching one key returned zero on a file whose schema marks acceptance by
 the ABSENCE of an error key -- a crude probe returning zero is indistinguishable

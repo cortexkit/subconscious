@@ -1053,6 +1053,31 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## Every broken instrument was caught by a contradiction, never by inspection
+
+Six instrument defects in one day, across two seats: a pipeline reporting `tail`'s
+exit status instead of the command's; a parser reporting a whole tree torn; an
+`lsof` on an empty pid listing every process on the machine; a callgraph control
+drawn from build artifacts; a truncation fixture built on a zero-byte file; a
+search anchored so it could never match. Different populations, one shape: THE
+INSTRUMENT ANSWERED A QUESTION ADJACENT TO THE ONE ASKED, plausibly enough to act
+on. Four of the six failed in the direction "the gate does not fire".
+
+NOT ONE WAS FOUND BY READING THE COMMAND. Every one surfaced because a result
+disagreed with something already known -- a count that could not be zero, a
+process that was plainly running, a file that plainly had frames in it.
+
+That is an argument about METHOD, not diligence. Reviewing instruments more
+carefully does not work, because a broken instrument reads as correct; what works
+is KEEPING A KNOWN QUANTITY IN HAND TO CHECK THE ANSWER AGAINST. When there is no
+such quantity, manufacture one before running the real query: a positive control
+scoped to the same population, a planted item you know the answer for, a tampered
+input that must be rejected.
+
+A baseline is this discipline made durable. The migration gate above is not a
+special-purpose tool -- it is the same instrument-check habit, written down so it
+survives the moment when attention is thinnest.
+
 ## A control drawn from the same population as the query proves nothing
 
 Checking whether a Swift method had callers, I ran a text search, got 21 hits

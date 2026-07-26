@@ -1074,6 +1074,14 @@ threshold cannot show one. And the same command means something different at
 09:00 than at 22:00, which makes a relative window unreproducible by anyone
 reading your report later.
 
+THE DISCRIMINATOR, because both shapes look like time arithmetic: a DIFFERENCE
+BETWEEN TWO ABSOLUTE TIMESTAMPS is stable -- a commit date against a file mtime
+gives the same answer whenever you run it, so gating on it is sound. A FILTER
+RELATIVE TO NOW is not, because the window moves under you. Sweeping this repo's
+fleet tooling found only the first form (deploy gap = head commit time minus
+binary mtime; module age reported by the module itself), so the sweep came back
+clean -- but the two are one keystroke apart and read identically in review.
+
 ## Every broken instrument was caught by a contradiction, never by inspection
 
 Six instrument defects in one day, across two seats: a pipeline reporting `tail`'s

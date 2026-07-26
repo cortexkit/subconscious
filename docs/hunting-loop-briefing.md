@@ -1079,6 +1079,23 @@ REAL CHANGE FIRST and confirm it moves. Same shape as the vacuous truncation
 fixture -- the check was fine, the input could not exercise it, and only trying the
 real case showed the difference.
 
+WHY THIS ONE IS WORSE THAN A WRONG ANSWER: it is a wrong answer that AGREES WITH
+THE EXPECTED ONE. On every ordinary run nothing has changed, the detector says
+nothing changed, and confidence is confirmed. It diverges only on the day it
+matters. A detector whose failure mode is indistinguishable from its success mode
+under normal conditions cannot be validated by using it.
+
+AND CONFIRM THE CHANGE ACTUALLY OCCURRED BEFORE CALLING IT A DETECTOR FAILURE.
+"mtime and size identical" is also exactly what a NO-OP WRITE looks like, so
+without watching the hash move there is a plausible benign explanation available,
+and the finding gets filed as "nothing happened". Every negative result about an
+instrument needs positive evidence that there was something to detect.
+
+A NAME IS A CLAIM ABOUT CONTENT, NOT EVIDENCE OF IT. The same question underlies
+both halves -- is this file the one I think it is, and are these the bytes I read?
+Files whose names encode an identifier invite treating the name as authoritative;
+it is metadata a writer chose, and nothing revalidates it.
+
 ## A procedural mitigation inherits the defect of the tool it replaces
 
 I rejected a CLI preview because it would have located a config file itself --

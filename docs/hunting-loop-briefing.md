@@ -371,6 +371,21 @@ observable in existing test scaffolding.** And it names a cheaper structural fix
 than exhortation — make effects observable in fixtures, and the natural assertion
 becomes the right one.
 
+The prediction then held **prospectively** on the sixth site, which is the only
+form of confirmation worth much. Adding a way to read the durable state
+(`mids.pins(key)`) made the effect assertion the obvious thing to write — and the
+accessor already existed, built for observability. So the fix is stronger than
+"make effects observable in fixtures": **an observability accessor is also a
+testability affordance**, and the two are usually built for different reasons by
+different people. Adding a read accessor for a status surface silently upgrades
+the tests someone writes months later.
+
+Final tally over six refusal points: four defective (fence mechanism, outbound
+validity gate, tool authorizer, generation admission), two already covered — and
+**both of the covered ones were covered because their effect was readable in a
+fixture.** All six had tests naming their error variant, which is why all six read
+as covered.
+
 Method rider from the same run: **when the suite does catch your mutant, find
 which test and which assertion.** A hit can be a decision-level test that proves
 nothing about enforcement — which is exactly what three passing tests were at the

@@ -737,7 +737,15 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
     }
 }
 
-fn user_connection_token() -> String {
+/// The per-user component of the connection-file name.
+///
+/// Public because `ck` derives the same token when discovering which daemon to
+/// talk to. The daemon writes the file and the CLI finds it, so the two must
+/// agree by construction: a second copy of this logic that drifted by one
+/// character would send `ck` looking for a file the daemon never wrote, and the
+/// symptom would be "no daemon running" rather than anything pointing at a
+/// naming mismatch.
+pub fn user_connection_token() -> String {
     #[cfg(unix)]
     if let Some(uid) = unix_uid_token() {
         return uid;

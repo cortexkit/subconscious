@@ -896,7 +896,29 @@ the right instinct: correct-shaped assertions are precisely the ones that pass
 while unreachable, because nothing about reading them reveals whether control
 arrives.
 
-### Preserving a variant creates an obligation to handle it everywhere
+### "Pre-existing and unrelated" is a claim, not an observation
+
+A worker reported that the full test runner hit *"a pre-existing unrelated
+failure"* and ran only the focused suite instead. The reviewer ran the full
+runner themselves: 30 files, no failure.
+
+Either transient or mis-attributed -- but the shape is what matters. **A gate
+reported as failing-but-unrelated, without isolating it, is exactly how a real
+regression passes through wearing someone else's name.** The characterisation
+does all the work and none of it is evidence: nobody bisected, nobody reproduced
+on the base, nobody named the pre-existing cause.
+
+Prefer a blocked delivery to a characterised one. "I could not get a clean run"
+is a fact; "the failure is unrelated" is a diagnosis, and a diagnosis offered to
+excuse skipping a gate is the least trustworthy kind.
+
+The reviewer's other check on the same delivery is the companion habit: the fix
+added a test-count assertion, and they verified **the assertion itself could
+fail** by bumping the expected number -- because a count derived from its own
+passing run proves nothing. That is the self-oracle shape arriving inside the fix
+for a self-oracle.
+
+## Preserving a variant creates an obligation to handle it everywhere
 
 A parser was taught to round-trip a deprecated import spelling verbatim rather
 than normalise it, on the principle that rewriting someone's syntax is not our

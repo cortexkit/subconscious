@@ -839,6 +839,24 @@ whether their absence is judged to matter. That is cheap, it stays useful if the
 phase turns out to be legitimately optional, and it is the only thing that keeps
 rounds comparable across a repair.
 
+### But check whether the defect is a constant before calling it contamination
+
+I escalated the case above as contamination -- results banked under a broken
+phase, a mid-campaign fix splitting the dataset. The seat checked the *previous*
+campaign instead of accepting the framing, and found the identical failure
+signature there. The phase had never run, in any campaign. There was no boundary
+to stamp.
+
+**A defect present in every run is not contamination -- it is a constant, and
+constants preserve comparability.** The finding inverts: nothing in the
+historical record needs marking, but the whole record turns out to describe a
+different experiment than anyone thought (here: every promoted winner was
+selected without the deliberation phase). The damage is bounded to the moment
+someone fixes it, which is why **the stamp belongs on the fix, not on the
+breakage.**
+
+Checking one prior run was cheaper than the escalation I sent.
+
 ## When a tool refuses, it may be right and you may be wrong
 
 I ruled a campaign closeable on prose and an incomplete search. The work graph

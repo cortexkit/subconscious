@@ -1440,6 +1440,23 @@ reproducing.
 
 Settled is where nobody looks.
 
+The same property explains why workers catch bad specifications. A worker has no
+memory of writing the spec, so an unsatisfiable instruction reads to it as a
+contradiction rather than as a decision already made. Three of four unsatisfiable
+specs in one campaign died that way. Calling that "workers treat the spec as
+falsifiable" credits a DISPOSITION, which makes it a property of the model and
+therefore not something you can arrange; it is really THE ABSENCE OF AUTHORSHIP,
+which is a property of the READING POSITION and can be arranged deliberately.
+Dispositions you hope for. Positions you construct.
+
+TARGETING RULE THAT FOLLOWS: SPEND THE NEXT CHECK ON WHATEVER NOBODY BUT YOU HAS
+READ. Not the hardest artifact and not the newest -- the one with exactly one
+reader. That is a queryable property rather than a judgement call, which is what
+makes it survive a busy week.
+
+It is also why the layered control stack works at all: each layer is read by
+something that did not produce the layer beneath it.
+
 ## Control the denominator, not only the result
 
 A check reporting zero failures over zero items reads exactly like a clean pass.

@@ -2302,6 +2302,19 @@ find one, because the permissive route you found is rarely the only one, and
 patching the single route that exposed the defect leaves the identical hole for
 the next caller.
 
+A THIRD MECHANISM, AND THE WORST OF THE FAMILY: A REJECTION PRIMITIVE THAT IS
+ALL-OR-NOTHING. ENGRAM's harness could make the next request fail, whatever it
+was -- so no test could place a failure AFTER an earlier operation had already
+mutated server state. That interleaving was structurally unreachable, and it is
+not exotic: IT IS WHAT EVERY PARTIAL FAILURE LOOKS LIKE. The double could express
+total success and total failure and nothing in between, which is exactly where
+the interesting bugs live. The fix is per-operation rejection, so one call can
+fail while the rest succeed.
+
+SO WHEN AUDITING A DOUBLE, ASK NOT ONLY "WHAT DOES IT REFUSE" BUT "CAN IT REFUSE
+SELECTIVELY". A double that fails everything at once tests recovery from a dead
+dependency and nothing about recovery from a HALF-COMPLETED one.
+
 THE CADENCE THIS EARNS: WHEN A DOUBLE IS CAUGHT LYING ONCE, SWEEP EVERY ROUTE IT
 SERVES BEFORE LEAVING. ENGRAM found two in one day by pulling a single thread --
 first five routes answering success without credentials, then a route answering
@@ -2457,6 +2470,22 @@ in.
 
 AND RAISE IT WHILE IT STILL HURTS. Once the outside credential lands the symptom
 vanishes, and a class that stops hurting stops getting fixed.
+
+TWO THINGS THE SHIPPED FIX DID THAT THE INVARIANT DID NOT SAY, both worth
+copying. HOIST THE RECONCILIATION OUT OF THE BRANCH rather than duplicating it
+into the error arm: run it before the match, so a future author adding a third
+outcome arm CANNOT forget it -- there is nothing arm-local to forget. And CHECK
+WHAT ELSE CARRIED THE STALE VALUE: the cleanup call released a lease against the
+pre-failure head, which would have failed the same equality fence and stranded
+the lease on top of the credential deadlock -- a second failure hiding behind the
+first, invisible until a timeout much later. When a stale datum causes one
+failure, grep for every other consumer of that datum on the same path.
+
+AND THE TEST WHOSE FAILURE OUTPUT IS THE INCIDENT: theirs reproduces the
+production error string and interleaving exactly, in 0.35s. A test that covers
+the branch proves the branch runs; a test whose failure output IS the outage
+proves the model is right, and hands the next person the incident instead of a
+puzzle.
 
 ## The cost-asymmetry gate
 

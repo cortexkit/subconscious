@@ -379,6 +379,30 @@ The only instrument that finds this is reading the call site **against the
 contract the name implies**. Same family as a drifted fixture: the artifact
 answers a question it should not be authoritative for.
 
+**The boundary of everything else in this document**, stated precisely by CEREB:
+every probe above tests *whether a mechanism can be removed without detection*,
+and that presupposes a mechanism. This defect had none. The code does exactly
+what it says at the instruction level and lies only about **what a reader will
+believe**. No mutation reaches that, because there is nothing to mutate.
+
+The candidate set *is* automatable even though the judgement is not: enumerate
+every function whose name asserts a safety property
+(`redact|verify|authorize|sanitize|validate|check|assert|ensure|guard`) per
+crate, then take the **intersection across crates** — a name living in two crates
+is where a reader picks up the wrong contract, especially across a boundary where
+one side fails closed by design. On CEREB's workspace: 68 safety-named functions,
+exactly two names duplicated, one liar and nine honest clears. That turns "read
+everything" into "read these."
+
+Its stated limit: it finds **name collisions across crates**. A lying name with no
+honest twin has no contrast to trip the sweep and is still only findable by
+reading the body against the name.
+
+And the instinct to defer a zero-caller finding is backwards. **Zero callers is
+simultaneously the cheapest moment to fix and the most likely to be dismissed** —
+the cost rises with every call site added, and the review that adds the first one
+will read correct.
+
 ## The classes are a lens, not a partition
 
 Tested against tonight's confirmed defects rather than against the taxonomy's own

@@ -2670,6 +2670,58 @@ AND CHECK WHAT THE LIVE PID ACTUALLY IS. Counting it as live is the error;
 resolving it to a name takes one command and turns "2 possibly-active writers"
 into "2 instances of pid reuse".
 
+## Durable state in an ephemeral directory is a near-miss waiting for a cleanup
+
+Sweeping for unbounded growth, I found a 2.9 GB directory I did not recognise
+inside the daemon's RUNTIME dir -- the one holding the connection file, the
+start-lock and the log I was at that moment scoping ROTATION for. It turned out
+to be another module's write-ahead log and durable index: every session
+transcript in the fleet, every unexported metering fact, and THE ONE ARTIFACT
+WITH NO UPSTREAM (the SQLite store rebuilds from the WAL; nothing rebuilds the
+WAL).
+
+THE NATURAL SHAPE OF THE WORK I WAS SCOPING -- "manage the contents of the
+runtime directory" -- WOULD HAVE DESTROYED IT. What stopped me was not care: it
+was that the sweep surfaced a directory I could not identify and I asked its
+owner instead of assuming. THAT IS NOT A REPEATABLE SAFETY PROPERTY.
+
+SOURCE OF THE HAZARD, in the owner's words: a BOOTSTRAP DEFAULT derived from the
+connection file's parent, with a comment saying a managed descriptor was a later
+refinement. Nobody decided it; it was never revisited. AND "COSMETIC
+INCONSISTENCY" AND "ONE COMMAND FROM DESTROYING THE DURABILITY SUBSTRATE" ARE THE
+SAME ITEM AT TWO PRICES -- the placement had been parked as low-priority
+housekeeping for weeks.
+
+TWO RULES:
+· BEFORE WRITING ANY CLEANUP, ENUMERATE WHAT IS ACTUALLY IN THE DIRECTORY AND
+  RESOLVE EVERY ENTRY TO AN OWNER. A directory's NAME is a claim about its
+  contents (see: a name is a count without a breakdown) and "run" claims
+  ephemerality it may not have.
+· AN ACCEPTED HAZARD NEEDS ITS EXCLUSION AND ITS REASON AT THE LINE, not in a
+  commit message. The next person to write a cleanup may not think to ask, and
+  asking was the only thing that worked this time.
+
+AND WHEN THE MIGRATION COMES: verify a moved WAL by REPLAY OR CHECKSUM, never by
+directory size. A partially-copied 2.9 GB directory looks almost exactly like a
+correctly-copied one, and the failure stays silent until someone resumes a
+session.
+
+## An arrival rate is not an accumulation
+
+I reported a directory as growing -- "4,415 files in three days, newest written
+tonight" -- and it was a RING AT EQUILIBRIUM: a 512 MB cap with a 7-day age
+bound, measured at 521 MB with zero files older than 3 days. The eviction rate
+equalled the arrival rate.
+
+I HAD MEASURED ARRIVAL AND INFERRED ACCUMULATION. A newest-file timestamp tells
+you the writer is live; it says NOTHING about whether anything is leaving. The
+missing measurement was one command: the age of the OLDEST file. Where that is
+much younger than the directory's lifetime, retention is working.
+
+SO FOR ANY "THIS IS GROWING" CLAIM, MEASURE BOTH ENDS. Newest tells you it is
+alive; oldest tells you whether it is bounded. Reporting only the first is the
+alarming half of a true picture.
+
 ## Sweep the class, and expect the plausible culprit to be wrong
 
 Having found one unbounded file (an unrotated 1.34 GB daemon log), asking WHAT

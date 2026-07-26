@@ -19,6 +19,22 @@ name: SubcFed
 # a queued-forever lane renders in the checks list as pending rather than
 # failing, and a pending check reads as "still running" indefinitely.
 #
+# WHY IT IS NOT MADE TO FAIL FAST, which would be the better rendering: there is
+# no mechanism that produces one. `timeout-minutes` counts EXECUTION time, and
+# these jobs never execute a step -- measured here, one run survived 423 minutes,
+# past the 360-minute default, without the default firing. A job waiting for an
+# unsatisfiable runner label is not running slowly; it is not running. So the
+# choice is a pending check that is ANNOTATED, or no workflow at all, and the
+# annotation keeps the specification.
+#
+# THE TRIGGER FOR REMOVING THIS BLOCK: if a macOS runner becomes available
+# (org billing change, or a self-hosted macOS runner), the jobs below should run
+# unmodified. Verify by conclusion distribution rather than by the newest run --
+# `gh run list --workflow=subc-fed.yml --limit 50 --json conclusion` grouped by
+# value. A single green among cancellations is the signal; the latest status is
+# not, because a cancellation and a success render alike in a checks list once
+# the next push arrives.
+#
 # WHAT ACTUALLY VERIFIES THE SWIFT CLIENT TODAY: local runs on the dev box
 # (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`,
 # 311 tests at the time of writing). That is discipline, not enforcement --

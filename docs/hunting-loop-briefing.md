@@ -2619,6 +2619,46 @@ exists independent of your attention; AFTER means you are relying on the same
 attention that already failed once. A reminder you have to remember to set is the
 defect wearing a solution's costume.
 
+## Process liveness is not ownership on a long enough timescale
+
+A reaper that spares a resource because "the owning pid is still alive" is
+trusting a number the OS recycles. Sweeping 88 orphaned temporary files whose
+owning pid is embedded in the filename: 85 pids dead, 2 ALIVE -- and the live
+ones were `PasswordBreachAgent` and a similar system daemon, on files last
+written TWO WEEKS EARLIER.
+
+SO A PID-LIVENESS REAPER WOULD HAVE SPARED THOSE TWO FOREVER, for a reason
+unrelated to the code that created them. The predicate is not merely weak; it is
+WRONG IN A DIRECTION THAT LOOKS LIKE CAUTION, so nobody investigates the
+survivors.
+
+CROSS PID-LIVENESS WITH MTIME, ALWAYS. A two-week-old file whose pid is alive is
+telling you about the pid table, not about the file. Same family as a
+self-matching process selector (`pgrep -f <name>` matching the probe's own
+command line) -- both are identity checks on a namespace that is not stable
+across time.
+
+AND CHECK WHAT THE LIVE PID ACTUALLY IS. Counting it as live is the error;
+resolving it to a name takes one command and turns "2 possibly-active writers"
+into "2 instances of pid reuse".
+
+## Sweep the class, and expect the plausible culprit to be wrong
+
+Having found one unbounded file (an unrotated 1.34 GB daemon log), asking WHAT
+ELSE HAS NO BOUND found a 187 GB tree where that log was 0.7% of the problem --
+56 GB of build output in agent worktrees, 15.4 GB of orphaned database
+temporaries, both invisible because NO SINGLE COMPONENT OWNS THE TOTAL.
+
+AND THE FIRST HYPOTHESIS WAS WRONG BY TWO ORDERS OF MAGNITUDE. I attributed 24 GB
+to my own tooling's exhaust -- the plausible culprit, and the one I was primed to
+find because it was mine. Measured: 117 MB. The real consumer was a neighbouring
+directory I had not considered.
+
+THE HABIT: when a sweep turns up a big number, MEASURE THE ATTRIBUTION SEPARATELY
+FROM THE TOTAL. A plausible owner adjacent to the real one is the easiest wrong
+answer to publish, because both the number and the story are true -- they are
+just about different objects.
+
 ## Retention outlives evidence: the oldest item is the one you can least adjudicate
 
 A cleanup predicate that consults a record to decide safety has an expiry the

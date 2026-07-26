@@ -1611,6 +1611,29 @@ other read as two free wins when written separately, and the reader who finds on
 has no reason to look for the other. They are one comment even when they live in
 two places.
 
+The rule is not about comments. It has three instances, worsening: a TEST that
+asserts half a tradeoff fails visibly the moment someone changes the other half.
+A COMMENT split across two files leaves the reader who finds one with no reason
+to seek the other. A DASHBOARD showing one side of a coupled pair is read
+continuously, by people making decisions, with nothing indicating the other half
+exists -- so it does not merely fail to warn, IT ACTIVELY RECOMMENDS optimising
+the visible half. Worked case: a backup metric reported bytes and not round
+trips, and every reading argued for smaller chunks while the real cost was
+per-object. Same defect, longest feedback loop.
+
+THE SWEEP BUYS THE RIGHT TO MAKE THE CLAIM, AND THE CLAIM IS WHAT SURVIVES. You
+cannot write "these guards cannot poison, and here is why" until you have read
+all of them -- so the reading is not overhead on the way to a finding, it IS the
+purchase. That inverts the intuition that a clean sweep is wasted effort.
+
+Which changes when to run one: NOT "I SUSPECT A DEFECT HERE" BUT "I WANT TO BE
+ABLE TO STATE THIS INVARIANT AT THE SITES THAT DEPEND ON IT". Those pick
+different sweeps, and only the second pays regardless of outcome. It also
+predicts its own scope -- the invariant you want to state names the population you
+must read, where "find the bug" gives no stopping rule at all. And it is why the
+first framing produces speculative hardening: A SWEEP CHARTERED TO FIND SOMETHING
+MUST PRODUCE SOMETHING.
+
 MEASURE AN AUDIT IN CONSTRAINTS LANDED AT SITES, NOT FINDINGS REPORTED. A report
 is a claim about a moment; a comment at the site is a constraint that travels
 with the code. The census, the flags and the negative result are all invalidated

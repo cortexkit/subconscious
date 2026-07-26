@@ -896,6 +896,31 @@ the right instinct: correct-shaped assertions are precisely the ones that pass
 while unreachable, because nothing about reading them reveals whether control
 arrives.
 
+### Presence is not liveness: the config is testimony, the probe is evidence
+
+My survey for unprotected repos read `git remote -v` and classified anything with
+a remote as safe. It found five repos with none.
+
+It missed the largest. **1,465 commits, in a repo whose remote is configured and
+does not exist** -- `ls-remote` returns "Repository not found." Every push someone
+believed was happening had been failing, and the folder held every line of that
+night's work.
+
+`git remote -v` renders identically for a working remote and a tombstone. The
+config records an *intention*; only the probe establishes the *fact*. Re-running
+the survey with a liveness probe against all 30 folders found it immediately, and
+the probe costs about twenty seconds for the whole tree.
+
+It also corrected a misreading from earlier the same night: I had hit that same
+"Repository not found" while checking a peer's push state and attributed it to my
+own SSH access. **An error blamed on your own environment stops being
+investigated** -- and it was the actual finding, sitting in plain sight for hours.
+
+General form: a survey for *unprotected* things must probe the protection, not
+read its declaration. Backups configured to a dead endpoint, replicas pointing at
+a decommissioned host, alerts routed to a closed channel -- all present, all
+inert, all indistinguishable from working until something asks them to perform.
+
 ### A line that is always there stops being read
 
 My fleet pulse printed `CKTUI MISSING` on every 30-minute wake for eight days. I

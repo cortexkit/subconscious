@@ -208,7 +208,20 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
     # The upload sidecar is appended as objects land, so its line count is real
     # progress. Sampling it twice is the only thing here that distinguishes
     # moving from stuck, and it costs the seconds between the two reads.
-    sidecar=$(ls -t "$HOME/.local/share/cortexkit/engram/staging"/*/uploaded-*.hex 2>/dev/null | head -1)
+    # THE SIDECAR MUST BELONG TO THE GENERATION BEING REPORTED. An earlier version
+    # took the most recently modified sidecar anywhere under staging, which is a
+    # different selection rule from the line above (newest by device_seq) and can
+    # therefore pick a different generation. Observed live: the header said gen 99
+    # while this sampled gen 96's sidecar -- a PUBLISHED generation whose staging
+    # directory had not yet been swept -- and reported NOT MOVING, which was true
+    # of that file and said nothing about gen 99. A finished upload looks exactly
+    # like a stalled one once you are watching the wrong file.
+    newest_pub=$(sqlite3 "$ENGRAM_STORE" \
+      "SELECT lower(hex(pub_id)) FROM generations WHERE device_seq = $newest;" 2>/dev/null)
+    sidecar=""
+    if [ -n "$newest_pub" ]; then
+      sidecar=$(ls -t "$HOME/.local/share/cortexkit/engram/staging/$newest_pub"/uploaded-*.hex 2>/dev/null | head -1)
+    fi
     if [ -n "$sidecar" ]; then
       before=$(wc -l < "$sidecar" 2>/dev/null | tr -d ' ')
       sleep 20
@@ -216,8 +229,12 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
       if [ "${after:-0}" -gt "${before:-0}" ] 2>/dev/null; then
         echo "  uploading: $after objects, +$((after - before)) in 20s"
       else
-        echo "  NOT MOVING: $after objects, unchanged over 20s -- check before assuming slow"
+        echo "  NOT MOVING: gen $newest at $after objects, unchanged over 20s -- check before assuming slow"
       fi
+    else
+      # No sidecar for the reported generation means uploading has not begun --
+      # distinct from begun-and-stalled, and the remedies differ.
+      echo "  gen $newest has no upload sidecar yet (sealing, or not started)"
     fi
   else
     echo "  gen $maxpub published ($pub/$total)"

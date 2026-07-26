@@ -5,6 +5,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process,
+    time::{Duration, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
@@ -144,12 +145,61 @@ pub fn write_atomic(
         .ok_or_else(|| ConnectionFileError::MissingFileName {
             path: path.to_path_buf(),
         })?;
+    // Sweep temps stranded by an earlier writer before creating our own. The
+    // error path below removes this call's temp, but nothing removes one left by
+    // a process that died BETWEEN create and rename -- and a connection file
+    // carries the daemon's auth key, so a stranded temp is a stale credential
+    // sitting in the runtime directory indefinitely. Owner-only mode means no
+    // other user can read it and the key dies with the daemon that minted it;
+    // the objection is to key material with no owner and no expiry, not to an
+    // active leak.
+    //
+    // Best-effort and non-fatal: publishing must not fail because cleanup could
+    // not remove somebody else's file.
+    sweep_stale_temps(parent, file_name);
+
     let temp_path = temp_path(parent, file_name)?;
     let result = write_atomic_inner(path, &temp_path, info);
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+/// Remove `.<file_name>.<pid>.<hex>.tmp` siblings older than ten minutes.
+///
+/// AGE IS THE SOLE PREDICATE. Testing whether the embedded pid is alive reads
+/// false-positive on exactly the oldest files, because pid numbers are recycled:
+/// an unrelated long-lived process inherits the number and the stalest temp
+/// looks owned. That failure direction resembles caution, which is why nobody
+/// investigates the survivors. Ten minutes is far longer than the window this
+/// guards, which spans two syscalls.
+fn sweep_stale_temps(parent: &Path, file_name: &std::ffi::OsStr) {
+    const STALE_AFTER: Duration = Duration::from_secs(600);
+
+    let prefix = format!(".{}.", file_name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|modified| {
+                SystemTime::now()
+                    .duration_since(modified)
+                    .is_ok_and(|age| age >= STALE_AFTER)
+            })
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub fn read(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
@@ -397,6 +447,54 @@ mod tests {
         }
         name.push_str(".json");
         std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn write_atomic_sweeps_stale_temps_and_spares_recent_and_unrelated_files() {
+        let dir = std::env::temp_dir().join(format!("subc-sweep-{}", process::id()));
+        fs::create_dir_all(&dir).expect("create dir");
+        let target = dir.join("subc-connection.json");
+
+        // A temp stranded by a dead writer: correct shape, old enough to sweep.
+        let stale = dir.join(".subc-connection.json.99999.deadbeef.tmp");
+        fs::write(&stale, b"stranded").expect("write stale");
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open stale")
+            .set_modified(old)
+            .expect("backdate stale");
+
+        // A temp from a writer that may still be mid-rename: same shape, fresh.
+        // Sweeping this would race a concurrent publish.
+        let recent = dir.join(".subc-connection.json.99998.feedface.tmp");
+        fs::write(&recent, b"in flight").expect("write recent");
+
+        // An old file that is not one of our temps. Age alone must not condemn it.
+        let unrelated = dir.join("unrelated.txt");
+        fs::write(&unrelated, b"not ours").expect("write unrelated");
+        File::options()
+            .write(true)
+            .open(&unrelated)
+            .expect("open unrelated")
+            .set_modified(old)
+            .expect("backdate unrelated");
+
+        write_atomic(&target, &sample_info()).expect("publish");
+
+        assert!(!stale.exists(), "a stale temp must be swept");
+        assert!(
+            recent.exists(),
+            "a recent temp may belong to an in-flight publish and must be spared"
+        );
+        assert!(
+            unrelated.exists(),
+            "age alone must not condemn a file that is not one of our temps"
+        );
+        assert!(target.exists(), "the publish itself must still land");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

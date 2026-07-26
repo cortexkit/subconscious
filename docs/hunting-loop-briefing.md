@@ -812,6 +812,33 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## A status field whose healthy value and never-happened value render identically
+
+The gauge version of this is well known: a counter at 0 is indistinguishable from
+a counter never wired. The same property shows up in workflow state, where it is
+harder to see and more expensive.
+
+Two instances in one night:
+
+- A work-graph leaf marked **done with zero files changed**, its delivery note
+  saying the prerequisite was unavailable. On the board, *"blocked, did nothing"*
+  and *"delivered"* render the same.
+- An **optional phase that fails without failing the run**: every discuss-phase
+  seat reporting failure across two campaign rounds while fanout and measurement
+  proceeded and both rounds settled. Failure, skip, and success-with-nothing-to-say
+  all render as a completed round.
+
+The second is worse than a missing phase. Results were banked under the
+assumption the phase ran, so they came from a different experiment than the one
+designed -- contamination, not absence. And if a fix lands mid-campaign you get a
+silent methodology change between rounds, with the leaderboard comparing across a
+boundary nobody recorded.
+
+So: **stamp the run with which phases actually executed**, independently of
+whether their absence is judged to matter. That is cheap, it stays useful if the
+phase turns out to be legitimately optional, and it is the only thing that keeps
+rounds comparable across a repair.
+
 ## When a tool refuses, it may be right and you may be wrong
 
 I ruled a campaign closeable on prose and an incomplete search. The work graph

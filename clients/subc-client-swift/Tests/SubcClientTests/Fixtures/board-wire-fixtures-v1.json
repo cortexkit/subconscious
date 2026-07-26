@@ -1,5 +1,5 @@
 {
-  "$comment": "Board wire contract v1 fixtures — canonical shapes SUBC's tab builds against. Casing: camelCase everywhere. Wire law: absent means unknown/not-applicable, present-empty means empty; renderers must distinguish. Unknown `kind` renders as a digest card. `digest` is MODULE-DERIVED from props at post time; agents never author it. Kind vocabulary v1: text, status, ask, show (+ reserved: todos). Version: board-wire-v1.",
+  "$comment": "Board wire contract v1 fixtures — canonical shapes SUBC's tab builds against. Casing: camelCase everywhere. Wire law: absent means unknown/not-applicable, present-empty means empty; renderers must distinguish. Unknown `kind` renders as a digest card. `digest` is MODULE-DERIVED from props at post time; agents never author it. Kind vocabulary v1: text, status, ask, show, work (+ reserved: todos). `rooms.list` with `kind: board` includes the optional durable agent-seat `displayName`. Version: board-wire-v1.",
   "blocks": [
     {
       "$case": "status block, all digest fields present",
@@ -114,6 +114,67 @@
       "rev": 1,
       "props": { "$comment": "opaque to a v1 renderer", "columns": [1, 2, 3] },
       "digest": { "title": "Decode hot path flamegraph", "line2": "unknown block kind (flamegraph)", "badge": "opaque" }
+    },
+    {
+      "$case": "work block, read-time projection of a claimed graph row",
+      "blockId": "wi-build-board",
+      "lane": "work",
+      "kind": "work",
+      "rev": 1784412000000,
+      "props": {
+        "title": "Build the board work lane",
+        "itemType": "task",
+        "status": "in_progress",
+        "ready": false,
+        "blockedBy": ["wi-prepare-wire"],
+        "acceptanceCriteria": "Projection is read-time only."
+      },
+      "digest": {
+        "title": "Build the board work lane",
+        "line2": "in_progress · 1 blocker",
+        "badge": "in_progress"
+      }
+    },
+    {
+      "$case": "todos block, reserved vocabulary with explicit item state",
+      "blockId": "todos-ses-example",
+      "lane": "work",
+      "kind": "todos",
+      "rev": 1,
+      "props": {
+        "items": [
+          { "content": "Read the board plan", "status": "in_progress", "priority": "high" },
+          { "content": "Run the fixture tests", "status": "pending", "priority": "medium" }
+        ]
+      },
+      "digest": {
+        "title": "Session todos",
+        "line2": "2 items",
+        "badge": "todos"
+      }
+    },
+    {
+      "$case": "projected user ask, status and age are read-time fields",
+      "blockId": "ask-projected-open",
+      "lane": "asks",
+      "kind": "ask",
+      "rev": 1,
+      "props": {
+        "requestId": "ask_projected",
+        "question": "Continue the benchmark?",
+        "options": [],
+        "allowFreeText": true,
+        "status": "pending",
+        "askedAt": 1000,
+        "ageMs": 500,
+        "silencePolicy": { "waitUntil": 2000, "defaultDecision": "Continue" }
+      },
+      "digest": {
+        "title": "Continue the benchmark?",
+        "line2": "0 options · default: Continue",
+        "badge": "ask",
+        "urgency": "normal"
+      }
     }
   ],
   "boardState": {
@@ -122,13 +183,14 @@
     "sessionId": "ses_example",
     "vocabulary": "board-wire-v1",
     "servedSeq": 412,
-    "lanes": ["chat", "asks", "status", "artifacts"],
+    "lanes": ["chat", "asks", "status", "artifacts", "work"],
     "blocks": [
       { "$ref": "blk-status-build (rev 3 — newest-wins fold already applied)" },
       { "$ref": "blk-ask-9f2c (rev 2)" },
       { "$ref": "blk-show-diff (rev 1)" },
       { "$ref": "blk-chat-000041 (rev 1)" },
-      { "$ref": "blk-chat-000042 (rev 1)" }
+      { "$ref": "blk-chat-000042 (rev 1)" },
+      { "$ref": "ask-projected-open (read-time projection)" }
     ],
     "health": {
       "kind": "health",
@@ -138,5 +200,88 @@
         "teeCounters": { "wellFormed": 41, "malformed": 1, "leakedOtherHarness": 0, "syntaxMimicry": 0 }
       }
     }
-  }
+  },
+  "boardListRows": [
+    {
+      "room": {
+        "roomId": "rm_board_ses_example",
+        "mode": "board",
+        "joinPolicy": "invite_only",
+        "title": "Board for ses_example",
+        "createdBy": { "harness": "opencode", "sessionId": "ses_example" },
+        "state": "active",
+        "agendaJson": null,
+        "minQuorum": 1,
+        "startDeadlineAt": 0,
+        "entryGraceMs": 0,
+        "stageTimeoutMs": 0,
+        "adjournDeadlineMs": 0,
+        "maxMeetingLifetimeMs": 0,
+        "startPolicy": "start_without",
+        "createdAt": 1784412000000,
+        "updatedAt": 1784412000000,
+        "stateChangedAt": 1784412000000,
+        "startingAt": null,
+        "meetingStartedAt": null,
+        "adjournDeadlineAnchorAt": null
+      },
+      "member": {
+        "roomId": "rm_board_ses_example",
+        "identity": { "harness": "ck-app", "sessionId": "ses_example" },
+        "displayName": "User",
+        "role": "human",
+        "rsvp": "accepted",
+        "ackCursor": 0,
+        "signalWatermark": 0,
+        "servedSeq": 0,
+        "lastRoute": null,
+        "createdAt": 1784412000000,
+        "updatedAt": 1784412000000
+      },
+      "headSeq": 412,
+      "unreadCount": 0,
+      "pendingInvite": false,
+      "displayName": "ALF"
+    },
+    {
+      "room": {
+        "roomId": "rm_board_ses_unnamed",
+        "mode": "board",
+        "joinPolicy": "invite_only",
+        "title": "Board for ses_unnamed",
+        "createdBy": { "harness": "opencode", "sessionId": "ses_unnamed" },
+        "state": "active",
+        "agendaJson": null,
+        "minQuorum": 1,
+        "startDeadlineAt": 0,
+        "entryGraceMs": 0,
+        "stageTimeoutMs": 0,
+        "adjournDeadlineMs": 0,
+        "maxMeetingLifetimeMs": 0,
+        "startPolicy": "start_without",
+        "createdAt": 1784412000000,
+        "updatedAt": 1784412000000,
+        "stateChangedAt": 1784412000000,
+        "startingAt": null,
+        "meetingStartedAt": null,
+        "adjournDeadlineAnchorAt": null
+      },
+      "member": {
+        "roomId": "rm_board_ses_unnamed",
+        "identity": { "harness": "ck-app", "sessionId": "ses_unnamed" },
+        "displayName": "User",
+        "role": "human",
+        "rsvp": "accepted",
+        "ackCursor": 0,
+        "signalWatermark": 0,
+        "servedSeq": 0,
+        "lastRoute": null,
+        "createdAt": 1784412000000,
+        "updatedAt": 1784412000000
+      },
+      "headSeq": 0,
+      "unreadCount": 0,
+      "pendingInvite": false
+    }
+  ]
 }

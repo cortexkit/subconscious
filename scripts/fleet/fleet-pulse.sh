@@ -177,6 +177,17 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
   else
     echo "  gen $maxpub published ($pub/$total)"
   fi
+  # A backlog at the cap is not "a bit behind", it is STOPPED: engram's scheduler
+  # refuses to start a new capture once three generations await publish
+  # (engram-module/src/main.rs, backpressure gate), so at 3 the module has
+  # stopped protecting new work and will not resume without an operator. Report
+  # that in words -- the bare count reads the same at 2 (progressing) and at 3
+  # (halted), and the difference is the whole point.
+  unpub=$((total - pub))
+  if [ "$unpub" -ge 3 ] 2>/dev/null; then
+    last=$(sqlite3 "$ENGRAM_STORE" "SELECT datetime(MAX(created_at),'unixepoch','localtime') FROM generations;" 2>/dev/null)
+    echo "  CAPTURE HALTED: $unpub staged await publish (cap 3); newest snapshot $last"
+  fi
   # Liveness is still health's job: a module that stopped answering matters even
   # when the store looks fine.
   ck health engram 2>/dev/null | head -1 | sed 's/^/  /'

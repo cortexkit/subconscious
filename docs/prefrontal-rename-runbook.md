@@ -31,6 +31,43 @@ INSTALLED app on every device that runs one. A phone on the old build cannot be
 repointed without reinstalling. That sets the window, and it is the reason the
 apps gate rather than follow.
 
+## A clean merge is not a complete rename
+
+`git merge-tree` proves there is no textual conflict between the branch and master.
+It CANNOT prove the rename is complete, and on a long-lived branch it usually is
+not: master keeps acquiring new occurrences of the old id after the branch point,
+and those survive the merge UNRENAMED with nothing to report. The green tick is
+about conflicts, and completeness is a different question that looks answered.
+
+GREP THE MERGED TREE, NOT EITHER SIDE. Grepping the branch understates (it cannot
+see what master added); grepping master overstates (it counts what the branch
+already fixed). Only the merge result is the thing that ships:
+
+    T=$(git merge-tree --write-tree master <branch>)
+    git grep -l '<old-id>' "$T" -- '*.rs' '*.ts' '*.swift'
+
+THEN PARTITION BY MEANING BEFORE ACTING. The raw count mixes route targets, doc
+comments, prose and historical records, and only the first kind breaks anything.
+Measured here: 94 occurrences, 58 of them quoted bare ids, and ALL 58 in tests
+with zero in sources -- which is simultaneously the proof that every production
+call site was covered and the sizing of the remaining work.
+
+RENAME THE TEST OCCURRENCES ANYWAY. They construct an id value rather than dialling
+a route, so nothing breaks either way. That is precisely the reason to do it: a
+test whose id disagrees with production stops exercising the shape production uses,
+and the suite stays green while covering a string that exists nowhere in the fleet.
+
+AND EXPECT A BLIND SWEEP TO HALF-RENAME A PAIR. Ours hit an assertion's EXPECTED
+value but not the INPUT literal it was escaped inside, leaving a test demanding
+that decoding the old id yield the new one. Wherever a value is transformed, the
+two sides can be written differently enough that one pattern reaches only one of
+them -- so run the suite after the sweep and read what fails, rather than widening
+the pattern until nothing matches.
+
+Leave provenance and gate records alone. A document recording what CAPTURED BYTES
+contain must keep saying what they contain, or it starts lying about the fixture
+beside it.
+
 ## Before the window
 
 1. Ufuk present, daylight, box not under heavy build load.

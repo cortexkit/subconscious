@@ -1544,6 +1544,24 @@ the author had the category fully in mind and did not point it at themselves.
 So: NAME THE CLASS, THEN IMMEDIATELY RE-RUN IT ON EVERYTHING YOU EXCLUDED FROM
 THE SUBJECT. It is mechanical and takes minutes.
 
+A CONFLATION IS INVISIBLE WHILE THE TWO THINGS HAPPEN TO COINCIDE. A deploy check
+asked "which changed files reach this binary" and answered it repo-wide. Thirteen
+of fourteen fleet repos ship exactly one binary, so repo-wide and binary-wide
+agreed everywhere and the distinction could not be seen -- until a repo carried
+code outside its deployed dependency graph, and unrelated commits were attributed
+to the artifact.
+
+The general shape: WHERE A CHECK USES ONE SCOPE AS A PROXY FOR ANOTHER, IT IS
+CORRECT EXACTLY UNTIL THE FIRST CASE WHERE THEY DIFFER, AND THAT CASE ARRIVES
+WITHOUT ANNOUNCEMENT. Ask what the check is really scoped to (repo vs artifact,
+file vs run, process vs machine) and whether anything guarantees the two stay
+aligned. Usually nothing does; they were merely equal when it was written.
+
+Derive the narrower scope from a source that cannot drift -- here cargo's own
+path-dependency closure rather than a maintained list -- and choose the error
+direction deliberately: crate granularity over-reports where target granularity
+would under-report, and for a deploy gap over-reporting is the safe side.
+
 SIZE AN OBSERVATION WINDOW AGAINST THE SLOWEST RATE THAT STILL COUNTS AS
 PROGRESS, NOT THE RATE YOU HAPPENED TO MEASURE. A stall detector sampling 30
 seconds was correct against the ~20/min rate it was written for; the first

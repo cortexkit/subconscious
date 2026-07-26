@@ -812,6 +812,29 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## Your own cleanup can manufacture the evidence you are chasing
+
+The two most expensive investigations of the night were aimed at symptoms the
+harness produced itself. A test's `rmSync` teardown deleted a directory, and the
+resulting error read as "downloaded binary identity changed" -- a plausible
+supply-chain signal. A `SIGTERM` in cleanup produced "settled right after the
+deadline" -- a plausible race. Both hypotheses were aimed at exactly what the
+error said, and in both cases the error was written by the cleanup path.
+
+This is worse than a broken instrument, because a broken instrument gives you a
+wrong *answer* while this gives you a wrong *question* -- and every subsequent
+measurement, however careful, is aimed at a phantom.
+
+When an error appears near the end of a test, check what teardown does before
+theorising about what the code does. Specifically: does cleanup delete, signal,
+unmount, or revoke anything the error mentions? If so, that is the first
+hypothesis, not the last.
+
+Same family, quieter: **a command that runs, prints something, and exits 0
+without doing the work.** `sample` without privileges emits no data and succeeds.
+`bash` on a `.ts` file resolves to ImageMagick's `import`, prints usage, exits 0.
+The shadowing set worth knowing: `import`, `test`, `time`, `sample`, `link`.
+
 ## A check that cannot pass is worse than one that cannot fail
 
 We spend most of our attention on checks that can't fail -- the guard with no

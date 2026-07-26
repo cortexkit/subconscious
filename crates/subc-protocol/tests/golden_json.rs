@@ -101,6 +101,49 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     );
 }
 
+/// The wire constants are transcribed into all three client languages, and only
+/// three of the four are protected by anything.
+///
+/// PROTOCOL_VERSION, HEADER_LEN and FROZEN_PREFIX_LEN all APPEAR IN ENCODED
+/// BYTES, so a value drifting in one language changes that language's output and
+/// the committed frame vectors catch it. MAX_FRAME_BODY_LEN is a THRESHOLD: it
+/// appears in no byte of any frame, so no byte-parity fixture can observe it.
+///
+/// What each language had instead was a test importing its OWN constant and
+/// asserting against itself -- true by construction in every language
+/// independently, and therefore silent if one of them changed. Rust referenced
+/// the constant in no test at all. A cap that drifted low would refuse frames a
+/// peer considers legal; one that drifted high would accept an allocation the
+/// daemon refuses, and both surface as a live wire failure rather than a build
+/// one.
+///
+/// Publishing the values as a fixture gives the other languages something to
+/// compare against that is not themselves.
+#[test]
+fn protocol_constants_are_published_for_cross_language_comparison() {
+    let actual = serde_json::json!({
+        "protocol_version": subc_protocol::PROTOCOL_VERSION,
+        "min_supported_version": subc_protocol::MIN_SUPPORTED_VERSION,
+        "header_len": subc_protocol::HEADER_LEN,
+        "frozen_prefix_len": subc_protocol::FROZEN_PREFIX_LEN,
+        "max_frame_body_len": subc_protocol::MAX_FRAME_BODY_LEN,
+    });
+    let path = golden_path("protocol_constants");
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&actual).unwrap()),
+        )
+        .unwrap();
+    }
+    let expected: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "protocol constant drift; every client transcribes these, so changing one \
+         here means changing it in the TypeScript and Swift clients in the same commit"
+    );
+}
+
 fn assert_golden<T>(name: &str, value: &T)
 where
     T: Serialize + DeserializeOwned + PartialEq + Debug,

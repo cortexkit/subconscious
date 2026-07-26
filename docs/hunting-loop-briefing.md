@@ -942,6 +942,17 @@ formatting its output. The failure is silent by construction: the error text is
 right there on screen while the exit code says fine, and automation reads the
 exit code.
 
+**A fix can rebuild the very class it closes, one level up.** Twice in one night:
+a reclaim marker introduced to end signal-dependence was specified as
+deletable-by-consumers, which made it shared mutable state between two daemons --
+and the unlink race's loser sees the signal vanish mid-read, silently, which is
+the original missing-signal leak wearing a new hat. Both instances were caught by
+someone tracing the *composed* behaviour rather than reviewing the change.
+
+A corollary worth keeping: **the module that writes a fact owns its lifecycle.**
+A consumer deleting inside another module's tree converts one unlink today into
+whose-prune-ran-last archaeology in six months.
+
 **A fix does not inherit the confidence of what it repaired.** The path anchor in
 that check genuinely fixed the multi-row problem *and* genuinely created a false
 all-clear — and neither was findable by reasoning about the other. It took running

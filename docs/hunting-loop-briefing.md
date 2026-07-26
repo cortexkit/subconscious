@@ -56,12 +56,16 @@ Before believing a green result:
 | 8 | For a guard: does a test assert the prevented effect *did not happen* — not that an error came back? | A mutant that acts and then reports correctly passes |
 | 9 | For a fix that removes, reclaims or refuses: would the tests pass if it did that to *everything*? | The suite cannot tell the fix from its unbounded version |
 | 10 | When a mutation reddens something, which test died? | Three tests named for other things means defended by accident |
+| 10f | Is anything in the suite keyed on the *file* rather than the *behaviour* — a self-digest, a source-text assertion, a snapshot over source? | It reddens on any edit, so a failure count reads as a clean catch while the clause stays unfenced |
+| 10g | Did the mutation actually *apply*? | A substitution that matched nothing looks exactly like a guard that was never reached |
 | 10a | When a probe is *expected* to fail, did the failing phase's label appear in the output? | A timeout, a crash and a genuine finding all exit nonzero |
 | 10b | Before writing off a measurement as contaminated, do its neighbours agree? | An aggregate caveat silently retires a true finding |
 | 10c | For a causal claim: did you run the control arm, with only the one variable differing? | An uncontrolled measurement is an observation, not an attribution |
 | 10d | Does your "independent" check differ in *premise*, or only in whose hands ran it? | Re-running someone's query is a transcription check |
 | 10e | Does the query you ran answer the question you are asking of it? | One relation's answer quietly supporting a claim about another |
 | 11 | Did the new CI step *execute*, or was the run cancelled before reaching it? | A green list showing passes for runs that never ran the new logic |
+| 11a | Would this check have failed *before* the fix? | If it was already green on the broken box it is measuring something else — the easy check sits one rung below the one that matters |
+| 11b | For a deploy marker: what candidate did you *reject*? | A topical, specific, new-sounding string that reads identically in both binaries certifies a swap that never happened |
 
 Before calling a class closed:
 
@@ -73,6 +77,9 @@ Before calling a class closed:
 | 15 | Every consumer of your wire enumerated — not just the ones who asked? | Settling with whoever asked is guard-the-instance again |
 | 16 | Does each counter you publish say what its anomaly *looks like*? | A gauge nobody reads as a detector |
 | 17 | Would a *new entry* in the thing you are asserting over be routine or alarming? | Routine and you asserted a count: healthy growth reads as breakage. Alarming and you asserted a property: silent shrinkage reads as green |
+| 18 | What does this test double *refuse* — and can it refuse *selectively*? | A route that never refuses certifies both answers; a rejection that is all-or-nothing makes every partial-failure interleaving unreachable |
+| 19 | For a capability grant: what can the granted set do *in combination*? | Rows enter a table one at a time and are read back one at a time, so a composition has no moment at which anyone looks at it |
+| 20 | Did you write down the *invariant* or the *remedy*? | A remedy answers the site that broke; an invariant makes the next question mechanical and finds the siblings |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -2592,6 +2599,18 @@ artifact, so the restore must return BOTH the source and the artifact. A
 half-restored mutation is worse than none: the tree looks clean while carrying a
 stale claim.
 
+AND CONFIRM THE MUTATION ACTUALLY APPLIED, which is the cheapest check in the
+whole family and the one I skipped. Probing my own tree for this class, my first
+substitution MATCHED NOTHING -- the file was unchanged, every test passed, and I
+nearly recorded "no hazard here". A MUTATION THAT DID NOT APPLY IS INDISTINGUISHABLE
+FROM A GUARD THAT WAS NEVER REACHED: both leave a green suite and an unedited
+intuition. Count the occurrences before and after, or diff the file, before
+reading anything into the result.
+
+The proof, once the mutation did apply, is worth stating because it is the class
+at its purest: inserting a COMMENT containing the watched string -- compiled
+away, zero semantic content -- took the guard from green to red.
+
 A CONTRACT QUESTION HAS THREE ANSWERS, NOT TWO. "No contradiction", "we have a
 problem", and TRUE IN THE CODE BUT UNFENCED IN THE SUITE. The third is invisible
 to memory -- REMEMBERING THE DESIGN CORRECTLY IS EXACTLY WHAT PRODUCES THE
@@ -2609,6 +2628,42 @@ field of a shared valid fixture and asserting the EXACT error variant -- so a
 refusal is attributable to the clause under test rather than to an incidentally
 malformed input -- plus a paired positive vector, since a validator that refused
 everything would otherwise satisfy the whole rejection set.
+
+## Checking a table against the prose it summarises
+
+The checklist above is a summary of the body, so it can drift from it in two
+directions: a row naming a check the body never states, and a body section with
+no row. I have hit both.
+
+WHAT DOES NOT WORK, and I tried it: phrase-matching a row's wording against the
+body. A body section states its idea IN ITS OWN WORDS -- that is what makes it
+prose rather than a restatement -- so the row's phrasing appears exactly once, in
+the row. My probe reported zero matches for four rows and I was one step from
+"four phantom rows" when the POSITIVE CONTROL came back 1 instead of the >1 I had
+predicted. THE CONTROL DID NOT VALIDATE THE INSTRUMENT, IT REFUTED THE METHOD.
+
+Two instrument defects on the way there, both of the kind that return a confident
+number: markdown emphasis (`*file*`) breaking a literal phrase match, and mixing
+`grep -c` with alternation syntax that needs `-E`. Each produced a zero that
+looked exactly like a real absence.
+
+WHAT WORKS: read the section HEADINGS and match SUBJECTS by hand. There are tens
+of them, not hundreds, and a heading is written to name its subject. The check is
+cheap in the only currency that matters here -- attention on the right thing --
+and it cannot be automated by matching text, because the relationship between a
+row and its section is semantic rather than lexical.
+
+GENERAL FORM: WHEN A SUMMARY AND ITS SOURCE ARE WRITTEN IN DIFFERENT WORDS BY
+DESIGN, NO TEXTUAL COMPARISON CAN RELATE THEM. Reaching for one produces a
+number, and the number is about the wording rather than the coverage.
+
+AND NOT EVERY SECTION EARNS A ROW. Two here deliberately have none -- the one on
+label scope and the one on emergent protections -- because they are review
+postures rather than steps you can take at a moment of work, and A CHECKLIST THAT
+GROWS TO COVER EVERY SECTION STOPS BEING A CHECKLIST. The omission is recorded
+here so a later reader does not read the gap as drift and 'fix' it: an
+unexplained absence and a deliberate one look identical, which is the same reason
+a deliberate refusal in code needs its justification written at the refusal.
 
 ## The cost-asymmetry gate
 

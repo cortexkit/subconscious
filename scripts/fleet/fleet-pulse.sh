@@ -215,10 +215,23 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
   # stopped protecting new work and will not resume without an operator. Report
   # that in words -- the bare count reads the same at 2 (progressing) and at 3
   # (halted), and the difference is the whole point.
+  #
+  # The line carries BOTH the absolute timestamp and the elapsed age. The absolute
+  # one makes the report reproducible by whoever reads it later; the age is what
+  # decides urgency, and asking a reader to subtract two datetimes at a glance is
+  # how a four-hour gap and a four-day gap get read the same way. Neither
+  # substitutes for the other, and both are already in hand -- the timestamp is
+  # rendered from the same epoch the arithmetic uses.
   unpub=$((total - pub))
   if [ "$unpub" -ge 3 ] 2>/dev/null; then
-    last=$(sqlite3 "$ENGRAM_STORE" "SELECT datetime(MAX(created_at),'unixepoch','localtime') FROM generations;" 2>/dev/null)
-    echo "  CAPTURE HALTED: $unpub staged await publish (cap 3); newest snapshot $last"
+    last_epoch=$(sqlite3 "$ENGRAM_STORE" "SELECT MAX(created_at) FROM generations;" 2>/dev/null)
+    if [ -n "$last_epoch" ] 2>/dev/null; then
+      last=$(date -r "$last_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+      age_s=$(( $(date +%s) - last_epoch ))
+      echo "  CAPTURE HALTED: $unpub staged await publish (cap 3); nothing new for $((age_s / 3600))h$(( (age_s % 3600) / 60 ))m (newest $last)"
+    else
+      echo "  CAPTURE HALTED: $unpub staged await publish (cap 3); newest snapshot time UNREADABLE"
+    fi
   fi
   # Liveness is still health's job: a module that stopped answering matters even
   # when the store looks fine.

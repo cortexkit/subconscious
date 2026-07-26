@@ -217,3 +217,37 @@ dim "  covers local binaries only -- cloud-deployed code cannot appear here"
 echo
 
 dim "idle is a proxy for attention, not for progress -- confirm before acting"
+
+# --- engram backup progress -------------------------------------------------
+# No durable ROW advances while a generation uploads: `generations` is written
+# twice (insert at capture, flip at publish) and nothing in between. The
+# per-object counter is the upload sidecar, one object id appended and fsynced
+# per confirmed upload -- which is also the resume record, so it is by
+# construction the true measure of completed work.
+#
+# Read it as a RATE, never as a ratio: the file is append-as-you-go, so the
+# denominator is not final until published=1. Healthy is ~19-21/min. Zero across
+# 60s is a real stall, and a restart is safe then -- it costs the in-flight
+# object and resumes from the sidecar.
+#
+# Written after five store tables all read "unchanged" and all five turned out to
+# have zero rows: they belong to a subsystem with no live session on this box.
+engram_upload_rate() {
+  local db=~/.local/share/cortexkit/engram/store.db
+  [ -f "$db" ] || return 0
+  local pub sidecar n1 n2 sealed
+  pub=$(sqlite3 "$db" "SELECT lower(hex(pub_id)) FROM generations WHERE published=0 ORDER BY device_seq DESC LIMIT 1;" 2>/dev/null)
+  [ -z "$pub" ] && { echo "  engram: nothing unpublished"; return 0; }
+  sidecar=$(ls ~/.local/share/cortexkit/engram/staging/"$pub"/uploaded-*.hex 2>/dev/null | head -1)
+  [ -z "$sidecar" ] && { echo "  engram: gen unpublished, no sidecar yet (sealing)"; return 0; }
+  n1=$(wc -l < "$sidecar")
+  sleep 30
+  n2=$(wc -l < "$sidecar")
+  sealed=$(ls ~/.local/share/cortexkit/engram/staging/"$pub" 2>/dev/null | grep -vc 'uploaded-\|journal')
+  local rate=$(( (n2 - n1) * 2 ))
+  if [ "$rate" -eq 0 ]; then
+    echo "  engram: STALLED -- $n2/$sealed objects, 0/min over 30s (restart is safe, resumes from sidecar)"
+  else
+    echo "  engram: uploading $n2/$sealed objects at ${rate}/min"
+  fi
+}

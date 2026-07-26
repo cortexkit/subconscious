@@ -524,6 +524,23 @@ The exception proves the rule: one fix in the set (a `unwrap_or(Success)`
 fail-open default) **did** ship enforcement code, because that one was genuinely
 wrong rather than merely untested.
 
+**Where the inflation enters, and it is not carelessness.** THALAMUS traced it in
+their own reports: every commit message was accurate, each describing the mutant
+("making the gate fence to...", "passed all 400 tests"). The inflation lived
+entirely in the prose summaries — "four guards reported their refusal correctly
+while preventing nothing" **describes the mutant and reads as a description of the
+shipped code.** Compressing "the mutant does X and nothing catches it" into "the
+guard does X" silently changes the tense and the subject.
+
+So, a standing rule for reporting mutation results: **the finding is always about
+a hypothetical artifact, and every natural short phrasing describes it as if it
+were the real one.** Name the mutant as the subject, or say "no test would catch
+this" rather than "the guard does not do this."
+
+And the reason nobody caught it from inside: **the person who wrote the change is
+the worst-placed to notice what it does not contain.** They knew what they wrote;
+the question of whether it touched shipped code never arose.
+
 ## A fenced decision is not a fenced enforcement
 
 A policy function returning the right verdict and a call site acting on that

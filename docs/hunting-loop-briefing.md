@@ -1194,6 +1194,14 @@ evidence can vanish INDEPENDENTLY of its subject. If it can, the predicate has a
 blind spot that grows with age, and it will be blindest on the oldest cases --
 which are usually the ones anyone bothers to run it on.
 
+AND THE ORDERING RULE IS WORTH STATING WHILE IT IS STILL OBVIOUS: in any cleanup,
+ADJUDICATE BEFORE DELETING, never after. It reads as too obvious to write down,
+which is exactly why cleanup scripts get it backwards -- THE DELETION IS THE
+SATISFYING STEP AND THE CLASSIFICATION IS THE CHORE, so the order that feels
+productive is the order that destroys the evidence. Write the coupling down while
+nothing automates the deletion yet; afterwards it is a bug report rather than a
+constraint.
+
 ## A destructive operation whose premise is unauditable before it fires
 
 A sweep deletes complete, signed snapshots when the chain head they planned

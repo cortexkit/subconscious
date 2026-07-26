@@ -2360,6 +2360,36 @@ sounds new -- and it reads 3 in BOTH binaries, because the fix REUSES an existin
 string. A probe built on it reports the marker present on the OLD binary, and the
 reader concludes the swap succeeded without anything having swapped.
 
+FIRST, THOUGH: VERIFY THE MARKER ON THE ARTIFACT YOU JUST BUILT, BEFORE COMPARING
+AGAINST ANYTHING. If a string does not appear in a binary compiled from source
+containing it, the marker is unusable -- stop there. One command, and it converts
+an unfalsifiable comparison into a falsifiable one before it can mislead anyone.
+
+THE REASON THAT PRE-CHECK IS NOT OPTIONAL: "use a string the change introduces,
+because those survive into the binary" IS TRUE FOR FORMAT STRINGS AND ERROR
+MESSAGES AND FALSE FOR MATCH-ARM LITERALS. rustc compares `&str` match arms by
+length-and-bytes without emitting a contiguous constant, so no `strings`-based
+check can ever see one. BOTH ARE STRING LITERALS IN THE SAME FILE and the
+difference is invisible in the source -- only the compiler knows one becomes data
+and the other becomes a comparison.
+
+AND THE FAILURE DIRECTION IS THE DANGEROUS ONE. A marker reading zero in BOTH
+images looks exactly like "the deploy did not take", so it produces ACTION rather
+than complacency: a redeploy of an artifact that was already correct, which also
+appears to fail, which invites escalation.
+
+WHAT TO USE INSTEAD WHEN THE CHANGE IS STRUCTURAL: A MONOMORPHIZATION IS CODE, SO
+IT NECESSARILY EMITS A SYMBOL. A change that alters a data structure or
+introduces a generic instantiation leaves a symbol that cannot be optimized into
+a comparison -- check it with `nm`, not `strings`. Pair it with a reach-control: a
+different instantiation of the SAME type present in both images, proving the grep
+reaches that corner of the symbol table, so a zero on the marker means absence.
+
+ONE TRAP THERE: mangled names embed a per-build crate disambiguator, so raw
+symbol names DIFFER BETWEEN BUILDS EVEN FOR IDENTICAL CODE. Write the pattern to
+skip it; a tightened literal match reads zero for a reason unrelated to the
+change.
+
 So a differential needs THREE strings, not two:
   - one present in both (proves the probe can read),
   - one absent-then-present (the marker),

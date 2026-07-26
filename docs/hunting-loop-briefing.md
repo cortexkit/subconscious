@@ -1593,6 +1593,24 @@ is a declaration-site check, the critical section is prose. Sorting filters by h
 little understanding they demand is the cheap ordering, and it gets skipped
 because the interesting filter feels like the one to start with.
 
+AND A DECISION NOT TO FIX BELONGS AT THE SITE TOO. An accepted cost with no
+comment DOES NOT READ AS NEUTRAL -- it reads as an oversight, so the next reader
+either undoes a deliberate decision or re-derives the whole analysis. Same class
+as a deliberate refusal decaying into an apparent bug, arriving through a
+different door. Notes serve the auditor; comments serve the maintainer, and only
+one of them is present when the code changes.
+
+What makes such a comment sufficient rather than merely present: THE COST, ITS
+MEASURED BOUND, AND WHAT A FIX WOULD HAVE TO PRESERVE. The first two explain; the
+third CONSTRAINS. "This is deliberate" is a claim, and the next change cannot be
+tested against it.
+
+AND THE DOCUMENT UNIT MUST MATCH THE DECISION UNIT: A TRADEOFF DOCUMENTED IN
+HALVES IS AN INVITATION TO OPTIMISE ONE HALF. Two costs that trade against each
+other read as two free wins when written separately, and the reader who finds one
+has no reason to look for the other. They are one comment even when they live in
+two places.
+
 MEASURE AN AUDIT IN CONSTRAINTS LANDED AT SITES, NOT FINDINGS REPORTED. A report
 is a claim about a moment; a comment at the site is a constraint that travels
 with the code. The census, the flags and the negative result are all invalidated

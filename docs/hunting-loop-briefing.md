@@ -2581,6 +2581,25 @@ This is the strongest reason to check WHICH test reddened rather than THAT
 something did. A count of failures is satisfied by any mechanism sensitive to the
 edit; only the name tells you the mutation reached the behaviour.
 
+AND THE FAILURE IS ASYMMETRIC IN THE WORST DIRECTION. The false POSITIVE -- the
+digest fires, the mutation proved nothing -- leaves you believing a guard is
+fenced when it is not, which is exactly the state the mutation gate exists to
+detect. Worse, it LOOKS RIGHT: eight tests red on a security-fence deletion is
+the shape of a clean catch, so nothing prompts a second look.
+
+NEUTRALISING IS NOT FREE, EITHER. Repinning a digest is itself an edit to the
+artifact, so the restore must return BOTH the source and the artifact. A
+half-restored mutation is worse than none: the tree looks clean while carrying a
+stale claim.
+
+A CONTRACT QUESTION HAS THREE ANSWERS, NOT TWO. "No contradiction", "we have a
+problem", and TRUE IN THE CODE BUT UNFENCED IN THE SUITE. The third is invisible
+to memory -- REMEMBERING THE DESIGN CORRECTLY IS EXACTLY WHAT PRODUCES THE
+CONFIDENT WRONG ANSWER -- and is only reachable by reading the source AND
+breaking it. So when you send a contract clarification, ask for the check rather
+than the answer; a seat answering honestly from memory returns a clean "no
+contradiction" over an unfenced clause.
+
 AND THE DEFECT UNDERNEATH IT was the outcome-homogeneity class in its purest
 form: a validator with SEVEN typed refusals whose entire suite built well-formed
 input and asserted success. Every refusing branch was unreachable from the tests,

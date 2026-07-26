@@ -812,6 +812,21 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## Four ways to get a trustworthy-looking empty result
+
+All four were hit in a single night across the fleet, and they share one defence:
+**a positive control at the same scope as the query.**
+
+1. A query over one **relation** answers only that relation.
+2. A lookup in one **store** answers only that store.
+3. A query resolving by the wrong **key** returns a clean, confident zero.
+4. A **control scoped more narrowly than the query it guards** proves nothing.
+
+The fourth is the subtlest, because the control existed and was run. The first
+three fail loudly the moment you look at them; a mis-scoped control *passes* and
+reports success. In the live case it was rescued by an inconsistency noticed by
+accident -- which is luck, not method.
+
 ## A control scoped more narrowly than the query it guards proves nothing
 
 A control is supposed to prove the instrument can return the other answer. But if

@@ -577,6 +577,23 @@ async fn delivered_cancel_is_request_ordered_and_discriminates_a_second_writer()
     );
 }
 
+/// Structural guard: module-bound writes stay centralized in one send site.
+///
+/// MUTATION-TESTING HAZARD, READ BEFORE MUTATING `mod.rs`. This assertion reads
+/// the SOURCE TEXT of its sibling module, so it reacts to the FILE CHANGING
+/// rather than to any BEHAVIOUR changing. Two consequences, each producing a
+/// confident wrong answer in opposite directions:
+///
+/// - A mutation that touches that call site reddens THIS test, and a failure
+///   COUNT alone then reads as "the mutation was caught" when nothing about the
+///   behaviour was proved.
+/// - A mutation that leaves the text intact leaves this test green regardless of
+///   what it did to the semantics.
+///
+/// So when mutating `mod.rs`, READ WHICH TEST DIED rather than counting
+/// failures: if this one is in the set, discount it and confirm a
+/// behaviour-named test also reddened. The general class -- any mechanism keyed
+/// on the file rather than the behaviour -- is in docs/hunting-loop-briefing.md.
 #[test]
 fn route_drain_has_the_only_module_sink_send_site() {
     let source = include_str!("mod.rs");

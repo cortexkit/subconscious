@@ -10,8 +10,22 @@ set -euo pipefail
 
 TAG="${1:?usage: $0 subc-core-v<version>}"
 TARGET_NAME="darwin-arm64"
-BINS=(ck-subc subc-probe ck fake-aft-stub ck-subc-mcp)
 REPO="cortexkit/subconscious"
+
+# The binary list is DERIVED from release.yml rather than transcribed here.
+# Both halves of a release must ship the same set: CI produces linux-x64, this
+# script produces darwin-arm64, and a consumer pinning the tag fetches whichever
+# its platform needs. A hand-copied list in this file would agree with the
+# workflow on the day it was written and drift the first time a binary is added
+# to one and not the other -- and the drift is silent, because each half
+# succeeds. The symptom lands on a consumer as a 404 for one platform only.
+WORKFLOW=".github/workflows/release.yml"
+[[ -f "$WORKFLOW" ]] || { echo "cannot derive binary list: ${WORKFLOW} not found" >&2; exit 1; }
+# grep -o rather than sed: every --bin flag sits on ONE line in the workflow, and
+# a line-oriented substitution yields only the last match on that line.
+read -r -a BINS <<<"$(grep -oE -- '--bin [a-z0-9-]+' "$WORKFLOW" | awk '{print $2}' | sort -u | tr '\n' ' ')"
+(( ${#BINS[@]} > 0 )) || { echo "derived an empty binary list from ${WORKFLOW}" >&2; exit 1; }
+echo "binaries derived from ${WORKFLOW}: ${BINS[*]}"
 
 [[ "$TAG" =~ ^subc-core-v([0-9].*)$ ]] || { echo "tag must be subc-core-v<version>" >&2; exit 1; }
 VERSION="${BASH_REMATCH[1]}"

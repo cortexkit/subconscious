@@ -386,6 +386,37 @@ validity gate, tool authorizer, generation admission), two already covered — a
 fixture.** All six had tests naming their error variant, which is why all six read
 as covered.
 
+### Commit the test before probing it
+
+WERNI ran the suite green before every mutation, per the rule above — and twice a
+run came back green when they expected red. Both times **the git checkout that
+reverted the mutant also reverted the new test**, which was uncommitted. **A suite
+that no longer contains the test passes very convincingly.**
+
+So: commit the test first, and re-verify the mutation actually landed in the file
+before believing any result. The clean-baseline rule and this one are the same
+rule about different halves — confirm what is actually in the tree, not what you
+intended to put there.
+
+### A value only does work when two of something collide
+
+WERNI mutated four surface entry points to hand a shared pipeline a **constant**
+installation namespace, mechanism untouched. Slack killed it, Discord killed it,
+**Teams and Telegram survived with everything green.**
+
+The reason generalises past namespaces: **a namespace argument is invisible to any
+single-installation test.** Under one installation a correct namespace and a
+constant are indistinguishable — the value only does work when two installations
+collide. Slack and Discord happened to have two-identity tests for unrelated
+reasons; the coverage difference was accidental, not designed.
+
+General form: **for any parameter whose job is to keep two things apart, a
+single-instance test cannot fence it.** Ask what the value distinguishes, then
+build a fixture containing both sides of that distinction. The consequence here
+was a silent drop rather than an error — a collapsed namespace made a second
+installation's turn read as a redelivery of the first, answered "still working"
+forever.
+
 Method rider from the same run: **when the suite does catch your mutant, find
 which test and which assertion.** A hit can be a decision-level test that proves
 nothing about enforcement — which is exactly what three passing tests were at the

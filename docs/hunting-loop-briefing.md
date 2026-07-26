@@ -1491,6 +1491,18 @@ does not fail when the encoder stops preserving floats; a test asserting that
 `7.0` survives re-encoding as `7.0` fails on exactly that day, with a message
 naming why. A dependency that is recorded is not guarded.
 
+A test that pins a library's behaviour is a DIFFERENT SPECIES from the rest of a
+suite, and worth recognising as a category. Everything else tests your code; this
+tests a DEPENDENCY'S PROMISE your code silently relies on. It therefore fails on a
+dependency bump rather than on a change of yours, and whoever sees it red will not
+have touched anything near it -- so its failure message must name the REMEDY, not
+the symptom.
+
+The pattern generalises past JSON. Anywhere behaviour depends on a library
+preserving something it never promised -- ordering, precision, encoding form,
+iteration stability -- there are two options: REMOVE THE DEPENDENCE, or PIN IT
+WITH A TEST. Commenting it is the third option that looks like the second.
+
 RELATED, from the same exchange: A LIMITATION ASSERTED AS A DIVERGENCE IS SAFE;
 THE SAME LIMITATION ALLOWED TO PASS AS AGREEMENT IS THE DANGEROUS ONE. Where one
 implementation genuinely cannot enforce a rule, a parity suite should require the

@@ -812,6 +812,23 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## A control scoped more narrowly than the query it guards proves nothing
+
+A control is supposed to prove the instrument can return the other answer. But if
+the control searches a *smaller region* than the real query, it can fail for a
+reason that has nothing to do with the instrument -- and a failed control reads
+as "the search is broken" when it actually means "you looked in the wrong place."
+
+The case: checking whether a slice identifier existed, with a control grepping a
+known term in `docs/`. The control came back empty, which by the rule nulls
+everything after it. It was rescued only because a later grep in the same
+directory hit a real line -- the *contradiction* proved the control wrong rather
+than the finding absent. The known term lived in `prompts/`, not `docs/`.
+
+So the control must cover at least the region the query covers. And note what
+saved it: not the control, but an inconsistency noticed by accident. **A control
+can fail silently in exactly the way it exists to prevent.**
+
 ## A control cannot catch an error in what counts as the boundary
 
 The controls in this document check that a search can return both answers. They

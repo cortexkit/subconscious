@@ -231,14 +231,48 @@ while read -r modid binname; do
   # there is nothing to deploy and the line would be a false alarm that costs the
   # owner an interruption and costs this section its credibility.
   #
-  # Deliberately generous about what counts as reaching the binary: a path this
-  # does not recognise is reported rather than dismissed, because a missed stale
-  # deploy is far more expensive than an extra line to check.
+  # "Reaches the binary" is asked of THIS binary, not of the repo. Repo-wide
+  # attribution counts every tracked crate, including ones nothing deployed links:
+  # standalone spikes, evaluation prototypes, and benches outside the workspace.
+  # Those inflate the count on a line whose whole value is being believed.
+  #
+  # The crate set is cargo's own path-dependency closure rather than a list, so a
+  # crate added later cannot silently fall outside it. Note this is CRATE
+  # granularity, not target: a sibling binary's source inside a linked crate still
+  # counts, which over-reports rather than under-reports and is the safe direction
+  # for a deploy gap. A repo cargo cannot describe falls back to repo-wide.
   since=$(date -r "$bin_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || continue
+  crate_filter=$(cd "$dir" && cargo metadata --no-deps --offline --format-version 1 2>/dev/null \
+    | BINNAME="$binname" python3 -c '
+import sys, json, os
+try:
+    meta = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+root = meta["workspace_root"]
+pkgs = {p["name"]: p for p in meta["packages"]}
+owner = next((p["name"] for p in meta["packages"]
+              for t in p["targets"] if "bin" in t["kind"] and t["name"] == os.environ["BINNAME"]), None)
+if owner is None:
+    sys.exit(1)
+# Walk path dependencies only: a workspace-local crate is the only kind whose
+# source lives in this repo and therefore the only kind a git path can name.
+seen = set()
+stack = [owner]
+while stack:
+    name = stack.pop()
+    if name in seen or name not in pkgs:
+        continue
+    seen.add(name)
+    stack.extend(d["name"] for d in pkgs[name]["dependencies"] if d.get("path"))
+dirs = sorted(os.path.relpath(os.path.dirname(pkgs[n]["manifest_path"]), root) for n in seen)
+print("|".join(f"^{d}/" for d in dirs))
+' 2>/dev/null)
   runtime=$(cd "$dir" && git log --since="$since" --format='' --name-only 2>/dev/null \
     | grep -E '\.(rs|toml)$' \
     | grep -v -E '(^|/)(tests?|benches|examples)/' \
     | grep -v -E '(^|/)bin/.*_cli\.rs$' \
+    | { if [ -n "$crate_filter" ]; then grep -E "$crate_filter|^Cargo\.(toml|lock)$"; else cat; fi; } \
     | sort -u)
   if [ -z "$runtime" ]; then
     dim "  $repo: ${gap_h}h gap, but nothing in it reaches the binary (ci/docs/tests only)"

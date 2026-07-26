@@ -879,6 +879,28 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## Check coverage in both directions, or neither check is tight
+
+An authority document listing which paths a campaign was permitted to touch needs
+two independent checks, and each catches what the other cannot:
+
+- **Forward**: every path in the range is authorized by some row. Catches
+  *omissions* -- work nobody accounted for.
+- **Reverse**: every row corresponds to a path actually in the range. Catches
+  *inventions* -- rows added to make the check pass.
+
+Forward-only accepts a document full of phantom rows. Reverse-only accepts one
+missing real work. Neither direction is slack.
+
+Running the reverse check found exactly one phantom: **the amendment's own path.**
+It authorized every file in the campaign except itself. Only the direction that
+looks for unmatched rows could see it -- and an authority document that cannot
+account for itself is the same self-exclusion problem the normative index solves,
+arriving one layer up.
+
+The general form: any artifact asserting completeness over a set should be
+checked in both directions, and should account for itself.
+
 ## A number that reconciles is not a set that matches
 
 I recomputed a peer's count of 77 unauthorized paths, got 84, and resolved the

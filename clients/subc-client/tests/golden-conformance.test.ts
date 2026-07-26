@@ -2,7 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { buildFrame, decodeHeader, encodeFrame, FrameType } from "../src/envelope";
+import {
+  buildFrame,
+  decodeHeader,
+  encodeFrame,
+  FrameType,
+  FROZEN_PREFIX_LEN,
+  HEADER_LEN,
+  MAX_FRAME_BODY_LEN,
+  PROTOCOL_VERSION,
+} from "../src/envelope";
 
 // The Rust golden fixtures are canonical serializations of the wire shapes both
 // languages speak. Their README has always said the TypeScript client consumes
@@ -69,6 +78,25 @@ describe("Rust golden fixtures", () => {
     expect(typeof identity.project_root).toBe("string");
     expect(typeof identity.harness).toBe("string");
     expect(typeof identity.session).toBe("string");
+  });
+
+  test("the transcribed protocol constants match the Rust originals", () => {
+    // Every client transcribes these four values, and only three of them are
+    // protected by anything. PROTOCOL_VERSION, HEADER_LEN and FROZEN_PREFIX_LEN
+    // appear IN encoded bytes, so a drift changes this client's output and the
+    // committed frame vectors catch it. MAX_FRAME_BODY_LEN is a THRESHOLD -- it
+    // appears in no byte of any frame, so no byte-parity fixture can observe it.
+    //
+    // What stood here instead was this package's own test importing this
+    // package's own constant: true by construction, and silent if Rust changed.
+    // A cap drifting low refuses frames the daemon considers legal; drifting
+    // high accepts an allocation the daemon refuses. Both surface on a live wire
+    // rather than in a build.
+    const constants = loadGolden("protocol_constants");
+    expect(constants.protocol_version).toBe(PROTOCOL_VERSION);
+    expect(constants.header_len).toBe(HEADER_LEN);
+    expect(constants.frozen_prefix_len).toBe(FROZEN_PREFIX_LEN);
+    expect(constants.max_frame_body_len).toBe(MAX_FRAME_BODY_LEN);
   });
 
   test("a route bind command survives a real frame round trip", () => {

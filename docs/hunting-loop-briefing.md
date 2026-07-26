@@ -1080,6 +1080,19 @@ AND NAME THE RESOURCE. "0.1 GB free" with no unit of what reads as whichever
 resource the reader has most recently been worrying about -- disk pressure wants
 deletion, memory pressure wants processes to exit, and the two share no remedy.
 
+A PERCENTAGE WITHOUT ITS DENOMINATOR IS THE SAME DEFECT WEARING A NUMBER. I put
+"the disk is 95% full" into two decisions asking a busy person to act. True, and
+it overstated the case badly: the disk is a 4 TB container with 215 GB free. 95%
+of 4 TB and 95% of 256 GB are not the same situation, and the percentage is the
+form that travels. Give both, or give the absolute -- a ratio is a claim about
+proportion that readers convert into a claim about urgency.
+
+SAME UNIT TRAP ONE STEP OVER: the daemon log read "1.34 GB" once and "1.25 GB"
+later, which for an append-only file should be impossible and briefly looked like
+something had rotated it. Same file, same bytes, GB against GiB. WHEN A QUANTITY
+MOVES IN A DIRECTION ITS MECHANISM FORBIDS, SUSPECT THE UNITS BEFORE THE
+MECHANISM.
+
 ## A relative-time window is anchored on the moment you run it
 
 Asked whether a population of files was still growing, I ran a "created in the

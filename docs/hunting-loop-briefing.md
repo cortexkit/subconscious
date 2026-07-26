@@ -2706,6 +2706,30 @@ directory size. A partially-copied 2.9 GB directory looks almost exactly like a
 correctly-copied one, and the failure stays silent until someone resumes a
 session.
 
+THE MIGRATION-GATE SHAPE, worth reusing whole:
+· RUN THE VERIFIER AGAINST THE SOURCE FIRST. A replay script that silently
+  exercises nothing -- wrong path, zero sessions enumerated, a swallowed
+  exception -- returns the same "all good" as a correct one. The baseline turns a
+  clean post-move result from an assumption into a COMPARISON.
+· RECORD COUNTS FROM THE BASELINE, NOT JUST PASS/FAIL. A post-move replay passing
+  over FEWER sessions is exactly what a truncated copy produces, and a boolean
+  gate cannot see it. Same as a data-driven suite that silently shrinks: the
+  count is the check.
+· MOVE, DO NOT COPY-THEN-SWITCH, AND NEVER SYMLINK. A single-writer guard that
+  compares file size against its own last-write mark can trip MID-RUN through
+  symlink indirection -- and a failure arriving at an arbitrary later moment is
+  worse than one at boot, because it detaches the symptom from the change.
+· PUT THE ALL-OR-NOTHING CONSTRAINT IN THE SCRIPT, NOT THE PLAN. Where several
+  stores cross-reference each other, moving one and exiting nonzero leaves a
+  CONSISTENT-LOOKING TREE WITH BROKEN REFERENCES, and the operator's instinct is
+  to re-run. All or none removes the class.
+· SHIP THE READ-SIDE CHANGE AHEAD OF THE MOVE, with the fallback arm VERBATIM the
+  old expression, so the new binary computes the identical path until someone
+  sets the variable. Verify that verbatim-ness at source rather than trusting it;
+  it is the whole reason the change is safe to land early. Guard the empty string
+  explicitly -- an empty env var is the classic way to relocate durable state to a
+  relative path.
+
 ## An arrival rate is not an accumulation
 
 I reported a directory as growing -- "4,415 files in three days, newest written

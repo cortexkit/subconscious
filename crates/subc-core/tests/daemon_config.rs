@@ -481,6 +481,59 @@ async fn rescan_absent_config_is_refused_and_retires_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_preview_reports_the_removal_it_would_make_and_makes_none() {
+    // The preview exists so an operator can see that a rescan is about to stop a
+    // live process BEFORE it stops one. So the assertion that matters is not that
+    // the diff is right -- it is that the process named in the diff is still
+    // serving afterwards. Asserting only the returned lists would pass on an
+    // implementation that reported correctly and retired anyway.
+    let module_id = "rescan-preview";
+    let daemon = RunningDaemon::start(
+        "daemon-rescan-preview",
+        Some(config_doc([stub_module(module_id, true, [])])),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+    let mut module_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let module_route = open_route(&mut module_client, module_id, 900).await;
+    let before_pid = call_tool(&mut module_client, module_route, 901, "_test.pid").await;
+
+    // Remove the module from the config, then preview.
+    fs::write(&daemon.config_path, config_doc([])).unwrap();
+    let preview = supervisor_rescan_with(&daemon.connection_file_path, 902, true).await;
+
+    assert_eq!(preview.removed, vec![module_id.to_string()]);
+    assert!(preview.added.is_empty());
+    assert!(
+        preview.preview,
+        "the result must carry the preview flag, or a reader meeting this output \
+         later cannot tell a preview from an execution"
+    );
+
+    // The effect assertion: same process, same route, still answering.
+    let after = supervisor_modules(&daemon.connection_file_path, 903).await;
+    assert_eq!(after.len(), 1, "preview must not retire the module");
+    assert_eq!(after[0].module_id, module_id);
+    assert_eq!(
+        call_tool(&mut module_client, module_route, 904, "_test.pid").await,
+        before_pid,
+        "the route opened before the preview must still be served by the same process"
+    );
+
+    // And the same call without preview DOES apply it, so the test cannot pass on
+    // an implementation that simply never retires anything.
+    let applied = supervisor_rescan_with(&daemon.connection_file_path, 905, false).await;
+    assert_eq!(applied.removed, vec![module_id.to_string()]);
+    assert!(!applied.preview);
+    assert!(
+        supervisor_modules(&daemon.connection_file_path, 906)
+            .await
+            .is_empty(),
+        "a non-preview rescan must retire the module the preview only reported"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rescan_applies_enabled_flips_without_daemon_restart() {
     let module_id = "rescan-enabled";
     let daemon = RunningDaemon::start(
@@ -763,8 +816,17 @@ async fn catalog_modules(
 }
 
 async fn supervisor_rescan(path: &Path, corr: u64) -> SupervisorRescanResult {
+    supervisor_rescan_with(path, corr, false).await
+}
+
+async fn supervisor_rescan_with(path: &Path, corr: u64, preview: bool) -> SupervisorRescanResult {
     let mut client = wait_for_client(path, START_TIMEOUT).await;
-    match control_rpc_on_stream(&mut client, corr, ClientControlRequest::SupervisorRescan {}).await
+    match control_rpc_on_stream(
+        &mut client,
+        corr,
+        ClientControlRequest::SupervisorRescan { preview },
+    )
+    .await
     {
         ClientControlResponse::SupervisorRescan { result } => result,
         other => panic!("unexpected supervisor.rescan response: {other:?}"),
@@ -773,9 +835,13 @@ async fn supervisor_rescan(path: &Path, corr: u64) -> SupervisorRescanResult {
 
 async fn supervisor_rescan_error(path: &Path, corr: u64) -> ErrorBody {
     let mut client = wait_for_client(path, START_TIMEOUT).await;
-    control_rpc_result_on_stream(&mut client, corr, ClientControlRequest::SupervisorRescan {})
-        .await
-        .expect_err("supervisor.rescan should return a typed error")
+    control_rpc_result_on_stream(
+        &mut client,
+        corr,
+        ClientControlRequest::SupervisorRescan { preview: false },
+    )
+    .await
+    .expect_err("supervisor.rescan should return a typed error")
 }
 
 async fn wait_for_supervisor_absent(path: &Path, module_id: &str, wait: Duration) {

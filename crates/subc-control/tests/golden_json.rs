@@ -136,8 +136,15 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             },
         ),
         (
+            // preview:false is the default and is skipped on the wire, so this
+            // vector's bytes are unchanged by the field's addition -- which is the
+            // property that lets an existing client keep sending `{}`.
             "client_control_request_supervisor_rescan",
-            ClientControlRequest::SupervisorRescan {},
+            ClientControlRequest::SupervisorRescan { preview: false },
+        ),
+        (
+            "client_control_request_supervisor_rescan_preview",
+            ClientControlRequest::SupervisorRescan { preview: true },
         ),
         (
             "client_control_request_supervisor_set_enabled",
@@ -235,6 +242,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     removed: vec!["old-tools".to_string()],
                     changed_pending_reload: vec!["aft-tools".to_string()],
                     unchanged: 3,
+                    preview: false,
                 },
             },
         ),

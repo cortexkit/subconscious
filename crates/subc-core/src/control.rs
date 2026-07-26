@@ -827,7 +827,9 @@ impl ControlHandler {
             ClientControlRequest::SupervisorReload { module_id } => {
                 self.handle_supervisor_reload(frame, module_id).await
             }
-            ClientControlRequest::SupervisorRescan {} => self.handle_supervisor_rescan(frame).await,
+            ClientControlRequest::SupervisorRescan { preview } => {
+                self.handle_supervisor_rescan(frame, preview).await
+            }
             ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
                 self.handle_supervisor_set_enabled(frame, module_id, enabled)
                     .await
@@ -1438,7 +1440,11 @@ impl ControlHandler {
         )?])
     }
 
-    async fn handle_supervisor_rescan(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+    async fn handle_supervisor_rescan(
+        &self,
+        frame: Frame,
+        preview: bool,
+    ) -> Result<Vec<Frame>, RouterError> {
         let Some(context) = self.rescan.clone() else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -1513,7 +1519,7 @@ impl ControlHandler {
         }
 
         let result = match self
-            .reconcile_supervised_modules(&context.supervisor, modules)
+            .reconcile_supervised_modules(&context.supervisor, modules, preview)
             .await
         {
             Ok(result) => result,
@@ -1529,10 +1535,19 @@ impl ControlHandler {
         )?])
     }
 
+    /// Reconcile the running module set against the configured one.
+    ///
+    /// With `preview` set, the diff is computed and returned WITHOUT applying any
+    /// of it: nothing is retired, reconfigured, enabled or spawned. The preview
+    /// deliberately shares this function with the executing path rather than
+    /// computing the same diff somewhere else -- two implementations of one
+    /// decision agree until they do not, and the whole value of a preview is that
+    /// it describes the operation that will actually run.
     async fn reconcile_supervised_modules(
         &self,
         supervisor: &Supervisor,
         configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
+        preview: bool,
     ) -> Result<SupervisorRescanResult, String> {
         let mut current = BTreeMap::new();
         for module in self.supervisor.list() {
@@ -1594,6 +1609,21 @@ impl ControlHandler {
             if !configuration_changed && !enabled_changed {
                 unchanged = unchanged.saturating_add(1);
             }
+        }
+
+        // Everything above this point is pure computation over two snapshots.
+        // Everything below MUTATES. The preview returns here so the boundary is a
+        // single early return rather than a condition repeated at each mutation
+        // site, where one missed guard would apply part of a change the caller was
+        // told would not happen.
+        if preview {
+            return Ok(SupervisorRescanResult {
+                added,
+                removed,
+                changed_pending_reload,
+                unchanged,
+                preview: true,
+            });
         }
 
         for module_id in &removed {
@@ -1660,6 +1690,7 @@ impl ControlHandler {
             removed,
             changed_pending_reload,
             unchanged,
+            preview: false,
         })
     }
 

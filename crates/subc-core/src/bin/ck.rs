@@ -107,7 +107,7 @@ fn discover_external_domains() -> Vec<String> {
     domains
 }
 
-const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set";
+const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
 
 const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
@@ -151,7 +151,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Module(ModuleCommand::Restart { module_id }) => {
             module_restart(&mut client, &module_id, args.json).await
         }
-        Command::Module(ModuleCommand::Rescan) => module_rescan(&mut client, args.json).await,
+        Command::Module(ModuleCommand::Rescan { preview }) => {
+            module_rescan(&mut client, args.json, preview).await
+        }
         Command::Module(ModuleCommand::Stop { module_id }) => {
             module_set_enabled(&mut client, &module_id, false, args.json).await
         }
@@ -219,7 +221,7 @@ enum ModuleCommand {
     List,
     Status { module_id: String },
     Restart { module_id: String },
-    Rescan,
+    Rescan { preview: bool },
     Stop { module_id: String },
     Start { module_id: String },
 }
@@ -480,10 +482,39 @@ async fn module_restart(
     print_ack_with_state(client, module_id, ack, "restart", json_output).await
 }
 
-async fn module_rescan(client: &mut CkClient, json_output: bool) -> Result<(), CkError> {
+async fn module_rescan(
+    client: &mut CkClient,
+    json_output: bool,
+    preview: bool,
+) -> Result<(), CkError> {
     let result = client
-        .rpc_value(ClientControlRequest::SupervisorRescan {})
+        .rpc_value(ClientControlRequest::SupervisorRescan { preview })
         .await?;
+
+    // A daemon predating the preview field IGNORES it -- serde drops unknown
+    // fields -- and runs a REAL rescan, retiring modules the operator was told
+    // would only be reported. Measured rather than theorised: the first live
+    // --dry-run against the running daemon executed a full reconciliation.
+    //
+    // So the response must PROVE the daemon honoured the request. It echoes
+    // preview:true only from the path that returns before mutating; an older
+    // daemon cannot produce that field at all. Absence therefore means the
+    // operation may already have applied, and the only honest report is a loud
+    // one -- a silent success here is the exact failure the flag exists to
+    // prevent.
+    let honoured = result
+        .get("preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if preview && !honoured {
+        return Err(CkError::Usage(
+            "this daemon does not support `rescan --dry-run` and IGNORED the flag: it may \
+             have applied a real reconciliation just now. Compare `ck module list` against \
+             your config, and upgrade the daemon before relying on --dry-run."
+                .to_string(),
+        ));
+    }
+
     if json_output {
         print_json(&result)?;
     } else {
@@ -1747,6 +1778,18 @@ fn print_rescan_table(result: &Value) {
         ],
     ];
     print_table(&["change", "modules / count"], rows);
+
+    // Say which operation this was. Without it the CLI reproduces the defect the
+    // preview exists to fix: a table of changes that cannot tell the reader
+    // whether they HAPPENED. The line goes after the table so it is the last thing
+    // read, and it names the applying command so the next step is not a guess.
+    if result
+        .get("preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!("\npreview only — nothing was changed. Run `ck module rescan` to apply.");
+    }
 }
 
 fn print_status_table(module: &Value, health: Option<&Value>) {
@@ -2200,7 +2243,13 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             };
             let command = match verb.as_str() {
                 "list" => ModuleCommand::List,
-                "rescan" => ModuleCommand::Rescan,
+                // --dry-run computes the reconciliation daemon-side and returns
+                // it without applying it. The flag is read from the verb's own
+                // tail rather than the global argument set, so it cannot silently
+                // apply to a different verb.
+                "rescan" => ModuleCommand::Rescan {
+                    preview: tail.iter().any(|t| t == "--dry-run"),
+                },
                 "status" => ModuleCommand::Status { module_id: id(1)? },
                 "restart" => ModuleCommand::Restart { module_id: id(1)? },
                 "stop" => ModuleCommand::Stop { module_id: id(1)? },

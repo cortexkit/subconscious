@@ -100,7 +100,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
     eprintln!("[probe] authenticated");
 
     if args.supervisor_rescan {
-        let body = serde_json::to_vec(&ClientControlRequest::SupervisorRescan {})?;
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorRescan { preview: false })?;
         let response = control_rpc(&mut stream, body).await?;
         match response.header.ty {
             FrameType::Response => {

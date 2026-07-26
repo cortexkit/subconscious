@@ -879,6 +879,35 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## Phrase a status report so that silence would be suspicious
+
+The best deploy summary anyone sent me tonight had this property: every claim in
+it was one command from being falsified. An **unfiltered** `--stat` over the
+commit range, the two source commits named and characterised, the running
+process verified by pid and inode number.
+
+Compare *"nothing important changed"* -- unfalsifiable by construction, and it
+reads exactly the same whether it is true, whether the author checked, or whether
+the author's filter was broken.
+
+The same author flagged an assertion of theirs as structurally correct but **not
+yet mutation-proved**, and volunteered it above their passing results. That is
+the right instinct: correct-shaped assertions are precisely the ones that pass
+while unreachable, because nothing about reading them reveals whether control
+arrives.
+
+### And check your own ledger before asking
+
+I asked a seat about two blockers. Both were closed -- one of them by *me*, hours
+earlier. I had carried a resolved item forward as an open one and offered to
+solve a problem that no longer existed, holding a deploy for a defect already
+fixed in production.
+
+**A stale entry and a live one render identically on a list.** Nothing about
+"open item, waiting seat" distinguishes still-blocked from resolved-and-never-
+struck-off -- the same-glyph problem, in my own tracking. A hold that rests on a
+stale entry is not caution; it is staleness wearing caution's clothes.
+
 ## Is the substituted answer a claim, or the representation of not knowing?
 
 When a fallible step is made infallible, ask what the substitute *asserts*. The

@@ -896,7 +896,35 @@ the right instinct: correct-shaped assertions are precisely the ones that pass
 while unreachable, because nothing about reading them reveals whether control
 arrives.
 
-### "Pre-existing and unrelated" is a claim, not an observation
+### A substring match produces a confident, specific, wrong answer
+
+A capability scan reported that a parser module performed randomness. The
+offending line:
+
+```ts
+readonly #brand = PARSED_ARTIFACT_TOKEN;
+```
+
+`rand` matched inside `#brand`. The scan found a randomness import in a private
+class field name.
+
+What makes substring matching worse than a vague instrument is that **it fails
+with specificity**. It does not return "maybe"; it returns a file, a line number,
+and a match -- and a wrong answer carrying a line number is far more persuasive
+than a wrong answer carrying none. The reviewer was seconds from reporting a rule
+violation attached to nothing.
+
+Redone with word boundaries and a positive control -- the same pattern against a
+script known to do filesystem I/O, which detected correctly -- both modules came
+back clean. The zero became a measured zero rather than an untested one.
+
+The rule being verified said checks must be AST and call-graph based rather than
+name grep. The verification of that rule was done by name grep. **Your own
+tooling is not exempt from the rules you write for workers**, and a check run in
+the act of enforcing a standard is exactly where that exemption feels most
+natural.
+
+## "Pre-existing and unrelated" is a claim, not an observation
 
 A worker reported that the full test runner hit *"a pre-existing unrelated
 failure"* and ran only the focused suite instead. The reviewer ran the full

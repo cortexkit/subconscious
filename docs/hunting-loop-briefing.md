@@ -812,6 +812,24 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## When a tool refuses, it may be right and you may be wrong
+
+I ruled a campaign closeable on prose and an incomplete search. The work graph
+was refusing to close it -- three verify leaves still open -- and I never opened
+the system that tracks completion before ruling on completion. The refusing tool
+was correct and the adjudicator was not.
+
+A tool that blocks you is easy to route around precisely when you are confident,
+and confidence is what a careful-looking search produces. Before overriding a
+refusal, find out what it knows that you don't.
+
+The same investigation surfaced the work-graph version of the designed-zero
+problem: a leaf marked **done with zero files changed**, its delivery note saying
+the prerequisite was unavailable. The prerequisite landed later by another route
+and nothing revisited it. On the board, *"blocked, did nothing"* and *"delivered"*
+render identically -- so a done leaf with an empty delivery and a stated blocker
+should not read as complete.
+
 ## Four ways to get a trustworthy-looking empty result
 
 All four were hit in a single night across the fleet, and they share one defence:

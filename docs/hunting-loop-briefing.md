@@ -2581,6 +2581,19 @@ without redoing the whole investigation. After, a red means the failure survived
 N attempts. Same shape as logging a static refusal once instead of every sweep:
 THE VALUE IS NOT REMOVING THE NOISE, IT IS RESTORING THE SIGNAL'S MEANING.
 
+RECORD THE EVIDENCE, NOT A CHARACTERISATION. The comment that lands with the pin
+should say "red on <sha>, green on same-sha rerun" rather than "rare, transient".
+EVIDENCE STAYS TRUE; A RATE CLAIM ROTS THE FIRST TIME SOMEONE MEASURES IT, and
+nobody measured this one.
+
+THE LIMIT THE STORY WILL FORGET: A RETRY PIN BUYS ROBUSTNESS, NOT DIAGNOSIS. If
+the underlying failures are a flake, N attempts is plenty. If they are a RISING
+TREND -- an image change, a package deprecation, a tightening rate limit -- the
+pin CONVERTS A VISIBLE RED INTO AN INVISIBLE SLOW-DOWN, and the first signal is
+the day N attempts stop being enough. The pin's own success rate is a measurement
+nobody is taking; if the step starts needing all N, that is data rather than
+noise.
+
 ## "Pushed" is not a terminal state
 
 Two seats made the same substitution within one evening, in different objects. I
@@ -2598,6 +2611,13 @@ SO THE DURABLE FIX IS A TRIGGER, NOT MORE DISCIPLINE: the terminal state of a
 change is A CONCLUSION ON THAT SHA, not the push. Anything that ends a session at
 "pushed" leaves a claim unverified -- and the claim is the one everyone downstream
 will assume was checked.
+
+AND THE TRIGGER MUST BE ARMED BY THE SAME ACT AS THE PUSH, NOT AFTERWARDS. The
+seat that had just been bitten wired their next push's watch BEFORE sending the
+message reporting it. That ordering is the entire rule: BEFORE means the trigger
+exists independent of your attention; AFTER means you are relying on the same
+attention that already failed once. A reminder you have to remember to set is the
+defect wearing a solution's costume.
 
 ## Retention outlives evidence: the oldest item is the one you can least adjudicate
 

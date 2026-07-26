@@ -14,6 +14,19 @@ import { SubcClient } from "@cortexkit/subc-client"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+// This script usually runs from a shell spawned BY a supervised module, so it
+// inherits that module's SUBC_MODULE_ID and SUBC_LAUNCH_NONCE. The client
+// auto-attaches those as consumer_identity, which makes this probe claim to be a
+// module it is not -- and the claim is checked: the daemon validates the nonce
+// against the one it minted at spawn, so the probe fails with
+// bad_consumer_identity the moment that module restarts and the inherited nonce
+// goes stale. It worked before the restart, which is what makes it a trap.
+//
+// A monitoring probe has no business asserting a module identity. Dropping these
+// connects as an ordinary user-owned client, which is what it actually is.
+delete process.env.SUBC_MODULE_ID
+delete process.env.SUBC_LAUNCH_NONCE
+
 const client = await SubcClient.connect({
   connectionFile: join(homedir(), ".local/share/cortexkit/run/subc-connection.json"),
   identity: { project_root: "/", harness: "ck-app", session: "fleet-idle" },

@@ -20,11 +20,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
 use serde_json::{json, Value};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
+// The connection-file name embeds a per-user token. `ck` must derive it the same
+// way the daemon does, so it imports the daemon's function rather than carrying
+// a copy -- these two used to be byte-identical duplicates in different files,
+// with nothing asserting they agreed.
+use subc_core::bootstrap::user_connection_token;
 use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file, ConnectionFileError, ConnectionInfo};
@@ -2317,66 +2319,12 @@ fn temp_fallback_connection_file_path() -> PathBuf {
     env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
 }
 
-fn user_connection_token() -> String {
-    #[cfg(unix)]
-    if let Some(uid) = unix_uid_token() {
-        return uid;
-    }
-
-    for key in ["USER", "USERNAME", "HOME", "USERPROFILE"] {
-        if let Some(value) = non_empty_os_var(key) {
-            return sanitize_token(&value.to_string_lossy());
-        }
-    }
-
-    "unknown".to_string()
-}
-
-#[cfg(unix)]
-fn unix_uid_token() -> Option<String> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let probe_path = env::temp_dir().join(format!(".subc-uid-probe-{}-{nonce}", process::id()));
-
-    let uid = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe_path)
-        .ok()
-        .and_then(|file| {
-            let uid = file.metadata().ok().map(|metadata| metadata.uid());
-            drop(file);
-            let _ = fs::remove_file(&probe_path);
-            uid
-        });
-
-    uid.map(|uid| uid.to_string())
-}
-
 fn non_empty_os_var(key: &str) -> Option<OsString> {
     let value = env::var_os(key)?;
     if value.is_empty() {
         None
     } else {
         Some(value)
-    }
-}
-
-fn sanitize_token(raw: &str) -> String {
-    let mut token = String::new();
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-            token.push(ch);
-        } else {
-            token.push('_');
-        }
-    }
-    if token.is_empty() {
-        "unknown".to_string()
-    } else {
-        token
     }
 }
 

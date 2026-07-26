@@ -1053,6 +1053,27 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## A relative-time window is anchored on the moment you run it
+
+Asked whether a population of files was still growing, I ran a "created in the
+last 24 hours" filter at 22:12, got zero, and reported that creation had stopped.
+The filter was correct and its window was not what I read it to be: a rolling 24
+hours anchored on the current clock reaches back to 22:12 YESTERDAY, so it
+excluded almost all of the previous calendar day -- which was the busiest recent
+day. Grouped by absolute date, the population was ongoing and bursty.
+
+THE COMPOUNDING IS THE PART THAT MATTERS. I combined two true measurements --
+zero in the last day, most older than a week -- into a STORY about a population
+that accumulated under some earlier condition and then stopped, and sent the story
+rather than the numbers. A false conclusion drawn from correct measurements is
+harder to catch than a wrong number, because nothing in it looks wrong.
+
+RULE: when the question is "is this still happening", GROUP BY ABSOLUTE DATE
+rather than filtering by relative age. A distribution cannot hide a trough; a
+threshold cannot show one. And the same command means something different at
+09:00 than at 22:00, which makes a relative window unreproducible by anyone
+reading your report later.
+
 ## Every broken instrument was caught by a contradiction, never by inspection
 
 Six instrument defects in one day, across two seats: a pipeline reporting `tail`'s

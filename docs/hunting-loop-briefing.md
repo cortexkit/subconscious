@@ -2275,6 +2275,52 @@ referencing a credential has it. Recording the asymmetry is the cheap half;
 unifying four working workflows to remove a failure mode that is not firing is
 churn with a live-credential blast radius.
 
+## The field that would show the problem is often the field the problem freezes
+
+A cached gauge refreshed by the operation that is stuck reports the state from
+just before the stall, forever. It is not lying -- it answers a narrower question
+than an operator reads it as -- and it fails in the direction of reassurance.
+
+PROOF CASE: a backup module's health cache refreshes on publish. Publishing was
+blocked, so `snapshotAgeMs` froze at the moment of the block and `ck health`
+reported `ok` while the module had taken no new snapshot for 6.6 hours. Reading
+the module's SQLite store directly is what surfaced it -- durable state moves
+when the cached projection cannot.
+
+THE SAME INCIDENT CARRIED A SECOND REPORTING DEFECT WORTH SEEING SEPARATELY.
+The honest field WAS present and correct: `stagedUnpublished: 3`. But 3 is also
+the hardcoded cap at which the scheduler stops capturing, so THE NUMBER THAT
+MEANS "STOPPED" LOOKS EXACTLY LIKE THE NUMBER THAT MEANS "SLIGHTLY BEHIND". A
+reader has to know the threshold to read the value as terminal. Where a gauge
+crossing a threshold changes the system's BEHAVIOUR, the status must say so IN
+WORDS -- "capture halted: backpressure cap reached" -- because a bare number
+cannot distinguish running, behind-but-progressing, and stopped-pending-operator.
+
+AND THE AUDIBLE SIGNAL WAS INAUDIBLE. The gate did log its refusal, to stderr,
+from a supervised child whose stderr is inherited rather than captured to a file.
+A correct log line that lands nowhere durable is the same as no log line. Check
+where a component's stderr actually goes BEFORE relying on "it logs that".
+
+THE GENERAL CHECK: for any cached health field, ask WHAT REFRESHES IT, and
+whether that thing is inside the failure it is supposed to reveal. If it is, the
+field is structurally incapable of reporting its own stall.
+
+## Two stalls can wear one explanation
+
+When a known outage is in progress, a second unrelated stall gets absorbed into
+it -- the first explanation is available, plausible, and already believed.
+
+In the case above, publishing was blocked on a credential deadlock that was
+understood and being waited on. Captures stopping LOOKED like part of the same
+story. It was not: captures are entirely local and need no credential, so the
+deadlock could not explain them. Two stalls, one explanation, and the explanation
+fitted the loud one well enough that nobody examined the quiet one.
+
+THE DISCRIMINATOR IS DEPENDENCY, NOT TIMING: does the stalled thing actually
+require the resource the known outage removed? If not, it is a second incident
+wearing the first one's clothes, and the fact that it started at the same time is
+not evidence -- a shared trigger and a shared cause are different claims.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

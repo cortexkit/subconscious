@@ -812,6 +812,20 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+**A fix does not inherit the confidence of what it repaired.** The path anchor in
+that check genuinely fixed the multi-row problem *and* genuinely created a false
+all-clear — and neither was findable by reasoning about the other. It took running
+a control that had no reason to fail. The anchor is still right; it moved the
+failure from a direction that wastes a redeploy to a direction that blesses a dead
+module. So **every fix deserves its own negative controls**, derived from what the
+fixed check now asks rather than from what the old one got wrong.
+
+And a test worth applying to any banked procedure: **could someone copy this out
+of the note and have it work?** That is a different question from whether the
+entry is accurate — a doctrine entry listing four guards in prose passes a casual
+read and still produces a broken command. Only the first question matters for
+something whose whole purpose is to travel.
+
 The three interlock, in this order:
 
 1. A filter returning empty must be proven capable of returning non-empty.

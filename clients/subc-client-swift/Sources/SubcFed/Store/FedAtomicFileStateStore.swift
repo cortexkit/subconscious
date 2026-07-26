@@ -390,6 +390,23 @@ public actor FedAtomicFileStateStore: FedStateStore {
         }
     }
 
+    /// Sweeps every `fed-state.*.tmp` sibling unconditionally, with no age test.
+    ///
+    /// THAT IS SAFE HERE ONLY BECAUSE OF THE LOCK, and the reason is not visible
+    /// at this method. Every temp is created by `commitDocumentUnlocked`, which
+    /// runs under `withExclusiveLock`, and the sole caller of this sweep --
+    /// `open` -- holds that same lock. A second writer blocks at `flock` before
+    /// it can create anything, so a temp belonging to an in-flight commit cannot
+    /// exist while this runs. Every temp visible from here is therefore the
+    /// residue of a writer that died, and deleting it destroys nothing.
+    ///
+    /// CONTRAST WITH `sweep_stale_temps` in subc-transport's connection_file.rs,
+    /// which does the same job for the daemon's connection file and DOES require
+    /// an age threshold: there is no lock serialising those writers, so an
+    /// unconditional sweep would race a concurrent publish and delete a temp
+    /// between its create and its rename. Same idea, different predicate,
+    /// because the surrounding guarantee differs. If this sweep is ever called
+    /// from outside the lock, it needs that age threshold too.
     private func removeStaleTemporaryFiles() {
         guard let entries = try? fileManager.contentsOfDirectory(
             at: directoryURL,

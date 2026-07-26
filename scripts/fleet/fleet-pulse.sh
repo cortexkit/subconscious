@@ -349,8 +349,56 @@ if [ -d "$subc_dir/.git" ] && [ -f "$BIN/ck-subc" ]; then
   fi
 fi
 
+# The deploy surface is WIDER THAN THE MODULE SET, and that gap is invisible from
+# subc.jsonc alone. Operator CLIs, helper binaries, and worker executables spawned
+# BY a module all live in the same bin/ directory and drift independently -- one
+# such worker was stale for days while its parent module read current, because
+# nothing counted it. So the live contents of bin/ are enumerated and anything the
+# loops above did not examine is named.
+#
+# Ownership is derived by asking each repo which binaries it declares, rather than
+# from a mapping here: a repo that adds a binary is covered without anyone
+# remembering to update this. A binary no repo claims is still REPORTED, because
+# an unattributable deployed artifact is a worse finding than an unchecked one.
+checked=$(printf '%s\n' "$modmap" | awk '{print $2}'; echo ck-subc)
+bin_owner=$(for d in "$HOME/Work/Projects/CortexKit"/*/; do
+  [ -f "$d/Cargo.toml" ] || continue
+  (cd "$d" && cargo metadata --no-deps --offline --format-version 1 2>/dev/null \
+    | REPO="$(basename "$d")" python3 -c '
+import sys, json, os
+try:
+    m = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for p in m["packages"]:
+    for t in p["targets"]:
+        if "bin" in t["kind"]:
+            print(t["name"], os.environ["REPO"])
+' 2>/dev/null)
+done)
+uncovered=0
+for f in "$BIN"/*; do
+  b=$(basename "$f")
+  # Skip the backup copies the deploy ritual leaves behind: dated snapshots and
+  # pre-/staged- prefixes are deliberate history, not deployed surface.
+  case "$b" in *.bak|*pre-*|*staged-*|*rollback*|*reclamation*|*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T*) continue ;; esac
+  printf '%s\n' "$checked" | grep -qx "$b" && continue
+  owner=$(printf '%s\n' "$bin_owner" | awk -v b="$b" '$1==b {print $2; exit}')
+  if [ -z "$owner" ]; then
+    echo "  $b: deployed but NO REPO DECLARES IT -- cannot check for unshipped code"
+    uncovered=1; printed=1; continue
+  fi
+  d="$HOME/Work/Projects/CortexKit/$owner"
+  h=$(cd "$d" && git log -1 --format='%ct' 2>/dev/null) || continue
+  m=$(stat -f '%m' "$f" 2>/dev/null) || continue
+  g=$(( (h - m) / 3600 ))
+  [ "$g" -ge 24 ] || continue
+  printf '  %-24s %sh behind %s master (not a supervised module -- check if still wanted)\n' "$b" "$g" "$owner"
+  uncovered=1; printed=1
+done
+
 [ "$printed" -eq 0 ] && [ -n "$modmap" ] && \
-  echo "  no binary more than 6h behind its master ($(printf '%s\n' "$modmap" | grep -c .) modules + daemon checked)"
+  echo "  no binary more than 6h behind its master ($(printf '%s\n' "$modmap" | grep -c .) modules + daemon + $(ls "$BIN" | wc -l | tr -d ' ') bin/ entries checked)"
 # The boundary belongs in the output, not in someone's memory of how this works.
 # Without it the next reader takes a clean result as fleet-wide, which it is not:
 # a stale Cloudflare Worker has no local mtime and cannot appear here at all --

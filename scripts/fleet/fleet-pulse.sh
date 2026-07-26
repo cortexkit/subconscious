@@ -130,12 +130,35 @@ if mem=$(vm_stat 2>/dev/null) && [ -n "$mem" ]; then
 else
   echo "  vm_stat unavailable -- memory UNCHECKED this cycle"
 fi
-if swap=$(sysctl -n vm.swapusage 2>/dev/null) && [ -n "$swap" ]; then
-  echo "  swap file: $swap"
-  dim "  swap file GROWING = sustained pressure; shrinking = recovering"
-else
-  echo "  swap usage unavailable -- pressure direction UNCHECKED"
-fi
+  # The swap FILE TOTAL is the quantity that separates a loaded box from a
+  # degrading one, and it only says anything ACROSS TIME -- the kernel extends the
+  # file under sustained pressure and shrinks it as pressure falls. An earlier
+  # version printed one sample and told the reader that growing meant pressure,
+  # which asks for a comparison the output does not contain: the same defect as
+  # reading a level and calling it a trend. So the total is remembered between
+  # cycles and the DELTA is what gets printed.
+  #
+  # The remembered value lives in the runtime dir beside the connection file, and
+  # a first run (or an unreadable one) says so rather than implying stability.
+  if swap=$(sysctl -n vm.swapusage 2>/dev/null) && [ -n "$swap" ]; then
+    echo "  swap file: $swap"
+    now_total=$(printf '%s' "$swap" | sed -n 's/.*total = \([0-9.]*\)M.*/\1/p')
+    prev_file="$HOME/.local/share/cortexkit/run/.fleet-pulse-swap-total"
+    prev_total=$(cat "$prev_file" 2>/dev/null)
+    if [ -n "$now_total" ] && [ -n "$prev_total" ]; then
+      delta=$(awk -v a="$now_total" -v b="$prev_total" 'BEGIN{printf "%.0f", a-b}')
+      case "$delta" in
+        -*) dim "  swap file SHRANK ${delta#-}M since last cycle -- pressure falling" ;;
+        0)  dim "  swap file unchanged since last cycle -- loaded, not degrading" ;;
+        *)  echo "  swap file GREW ${delta}M since last cycle -- sustained pressure" ;;
+      esac
+    else
+      dim "  no previous sample -- direction UNCHECKED this cycle (a level alone is not a trend)"
+    fi
+    [ -n "$now_total" ] && printf '%s\n' "$now_total" > "$prev_file" 2>/dev/null
+  else
+    echo "  swap usage unavailable -- pressure direction UNCHECKED"
+  fi
 echo
 
 # ------------------------------------------------------------------ backup health

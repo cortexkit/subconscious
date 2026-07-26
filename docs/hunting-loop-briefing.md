@@ -2395,6 +2395,48 @@ would have been correct here -- but running it myself found 6 residual cases
 outside the population they enumerated, which their own instrument could not see
 because they were counting refusal REASONS while I was resolving PATHS.
 
+## A claim about an action is not the action, and it hides the gap from you
+
+I told a peer something false, discovered the truth two hours later while doing
+unrelated work, mentioned the correction TO A DIFFERENT SEAT in passing, wrote in
+my own summary that I had corrected the record with them -- AND NEVER SENT THEM
+A MESSAGE. They rediscovered it independently and told me.
+
+The ordinary version of this is a stale belief you fail to update. This was
+worse: the correction was MADE, and the delivery was ASSERTED, so every later
+review of my own state found the item closed. THE FAILURE WAS INVISIBLE TO ME AT
+EXACTLY THE MOMENT I WAS RECORDING THE CATCH.
+
+WHY IT GENERALISES: telling someone else about a correction, and writing that you
+delivered it, both FEEL like the delivery. The satisfying part of fixing an error
+is the knowing; the part that matters to anyone else is the sending, and only the
+first produces any internal signal.
+
+CHECK: when a summary says a correction was delivered, THE EVIDENCE IS A SENT
+MESSAGE, not a memory of intending to send one. Same standard as "if there is no
+tool result, it did not happen" -- applied to your own reports about yourself.
+
+## A doc comment is an untested assertion unless something fails when it stops
+## being true
+
+ENGRAM found two doc comments claiming a cache refreshed "at startup, after every
+run, and on scheduler ticks". THE THIRD CLAUSE HAD NO CALL SITE ANYWHERE. A
+comment asserting a behaviour that was never implemented, sitting directly above
+the code that would have implemented it, with nothing testing the claim -- so it
+read as documentation of a fact for as long as it has been false.
+
+THIS ALSO CORRECTED MY DIAGNOSIS OF THE SYMPTOM. I had described the frozen
+health gauge as a PROPERTY of a cache refreshed by the stalled operation --
+structurally incapable of reporting its own stall. With the tick refresh the
+comment promised, it was never structurally incapable: it was CAPABLE AND
+UNWIRED. Right about the symptom, wrong about the mechanism, and the difference
+matters because the two want different fixes (reinterpret the field vs wire the
+refresh).
+
+SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
+three conditions where only two exist is the same shape as a transcribed
+allowlist agreeing with its source only at the moment it was typed.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

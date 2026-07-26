@@ -1544,6 +1544,16 @@ the author had the category fully in mind and did not point it at themselves.
 So: NAME THE CLASS, THEN IMMEDIATELY RE-RUN IT ON EVERYTHING YOU EXCLUDED FROM
 THE SUBJECT. It is mechanical and takes minutes.
 
+SIZE AN OBSERVATION WINDOW AGAINST THE SLOWEST RATE THAT STILL COUNTS AS
+PROGRESS, NOT THE RATE YOU HAPPENED TO MEASURE. A stall detector sampling 30
+seconds was correct against the ~20/min rate it was written for; the first
+generation that ran at ~3/min expects fewer than two events in that window, so a
+zero is ordinary and the detector reported a stall on a system working fine. The
+fix is that A ZERO WINDOW EXTENDS RATHER THAN CONCLUDES, and a slow subject
+reports as slow rather than as stopped. Same failure as a poll-count deadline
+that shrinks under the load which makes the operation slower: THE THRESHOLD WAS
+CALIBRATED ON ONE OPERATING POINT AND TREATED AS ABSOLUTE.
+
 STATE THE RULE AT THE GRANULARITY THAT MAKES IT TRUE. A corpus of refusals needs
 an accept arm in THE SAME HARNESS AND THE SAME RUN -- not in the same file. A
 refusal-only file paired with an accept-only sibling, both loaded by both

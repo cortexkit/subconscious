@@ -2364,6 +2364,37 @@ returned for paths that DO NOT EXIST, where the reclaim goal is already
 satisfied. Absence read as corruption -- the same absent-vs-unknown discriminator
 as a missing config file read as an empty module list.
 
+## A window sized in lines is a window sized in time at whatever rate the log runs
+
+Verifying a fix that CHANGES A LOG'S RATE, using a line-bounded window, measures
+mostly the period before the fix -- and attributes it to after.
+
+PROOF CASE: a peer deployed a fix that cut a repeated error by 98%. I checked
+`tail -20000`, counted 9093 instances, and nearly reported that the fix had
+barely moved anything. Those 20,000 lines spanned 15:01 to 18:26; the deploy was
+minutes old. Bounding to the recent tail gave 24.
+
+THE MECHANISM IS SELF-REFERENTIAL, WHICH IS WHY IT IS EASY TO MISS: the line rate
+is the quantity the fix changed, so a line-bounded window is sized by the very
+variable under test. The higher the pre-fix volume, the further back the same
+line count reaches, so THE MORE EFFECTIVE THE FIX, THE MORE PRE-FIX DATA THE
+WINDOW SWALLOWS.
+
+BOUND VERIFICATION WINDOWS IN TIME, or by a marker you can see (the deploy's own
+first log line), never in lines -- and print the window's actual start timestamp
+beside the count, so a wrong window announces itself instead of reading as a
+result.
+
+PAIRED WITH ITS MIRROR, from the same evening: checking ONE path out of 422 put
+me on the wrong side of a 98/2 split. Too little data landed on the wrong side;
+too much data landed in the wrong era. BOTH READ AS DECISIVE, and neither
+announces its scope.
+
+AND VERIFY A PEER'S FIX FROM YOUR OWN VANTAGE ANYWAY. Accepting the headline
+would have been correct here -- but running it myself found 6 residual cases
+outside the population they enumerated, which their own instrument could not see
+because they were counting refusal REASONS while I was resolving PATHS.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

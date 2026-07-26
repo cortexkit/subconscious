@@ -1555,6 +1555,32 @@ the author had the category fully in mind and did not point it at themselves.
 So: NAME THE CLASS, THEN IMMEDIATELY RE-RUN IT ON EVERYTHING YOU EXCLUDED FROM
 THE SUBJECT. It is mechanical and takes minutes.
 
+A NEGATIVE RESULT FROM AN AUDIT THAT HIDES ITS BOUNDARIES IS INDISTINGUISHABLE
+FROM ONE THAT NEVER LOOKED. "No hazards found" is unfalsifiable unless the sweep
+states its population, its coverage, and WHERE IT STOPPED. A clean result reading
+"133 of 133 shipped sites, stopped at this dependency's API boundary" can be
+checked; the same conclusion without those numbers cannot be distinguished from a
+sweep that quietly ended early.
+
+Two practices that make a null trustworthy, both from the same audit: GIVE THE
+SWEEP ITS CENSUS AS FACTS rather than having it re-derive them, which removes the
+failure mode where the sweep's own counting error silently narrows the
+population; and VALIDATE THE COUNTING INSTRUMENT AT BOTH ENDS before trusting it
+-- confirm it returns the known count on a file you have already counted, and
+zero on a file you know has none.
+
+AND SCOPE A SEVERITY TO A CONFIGURATION. Eight flagged sites were real for a
+deployment we do not build, labelled "unusual but real" -- not wrong, UNSCOPED,
+which is what makes a reader act on someone else's system. Check linkage before
+accepting reachability.
+
+A related discriminator, because the obvious version of the rule over-reports:
+for lock poisoning THE QUESTION IS LIFETIME, NOT SHARING. Poisoning requires the
+lock to OUTLIVE the panic, so a mutex owned by one call frame and destroyed
+during unwind yields a FAILED OPERATION, not a poisoned system -- even where the
+code reads alarmingly, such as a caller-supplied callback invoked while holding
+the guard. Ask whether any other thread can ever take this lock again.
+
 AN ARTIFACT CAN BE FRESH AND STILL BE BROKEN BY ITS ENVIRONMENT. Every identity
 rung -- mtime, inode, symbol presence -- answers "is this the artifact I built",
 and all of them PASS on a binary whose problem is external. Worked case: a shim

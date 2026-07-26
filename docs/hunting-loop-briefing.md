@@ -1416,6 +1416,30 @@ THE THING IS ABSENT. Pair it with a positive control at the same scope: search
 the same way for an item you know HAS an enforcement site, and confirm you find
 it. Otherwise the control rests on an unchecked empty result.
 
+That is three layers of one rule stacked: the enumeration needs a control, the
+control needs a source read, the source read needs its own positive control. Each
+layer is cheap. The stack is what makes the output mean anything.
+
+### Show someone what you have already concluded
+
+The corrections that matter cluster on settled items, and the person who settled
+one is structurally worst placed to re-open it. Not through carelessness: an
+answer you produced yourself does not PRESENT as an open question, so "how do we
+know that" never surfaces as a thing to ask. Someone who never ran the analysis
+has that question available for free, because it is the only one they have.
+
+So the habit is not "get a second opinion on hard problems". Hard problems
+already attract scrutiny. It is DELIBERATELY SHOW A SECOND READER THE THINGS YOU
+HAVE MARKED DONE -- the closed gate, the settled list, the control you already
+chose -- precisely because you have no motivation to look there again.
+
+Worked case: a control choice recorded as settled was contaminated, and the catch
+came from the seat that had never performed the analysis establishing it. Read
+that as structural rather than as a fact about either reader, or the habit stops
+reproducing.
+
+Settled is where nobody looks.
+
 ## Control the denominator, not only the result
 
 A check reporting zero failures over zero items reads exactly like a clean pass.

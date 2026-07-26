@@ -1611,15 +1611,26 @@ other read as two free wins when written separately, and the reader who finds on
 has no reason to look for the other. They are one comment even when they live in
 two places.
 
-The rule is not about comments. It has three instances, worsening: a TEST that
-asserts half a tradeoff fails visibly the moment someone changes the other half.
-A COMMENT split across two files leaves the reader who finds one with no reason
-to seek the other. A DASHBOARD showing one side of a coupled pair is read
-continuously, by people making decisions, with nothing indicating the other half
-exists -- so it does not merely fail to warn, IT ACTIVELY RECOMMENDS optimising
-the visible half. Worked case: a backup metric reported bytes and not round
-trips, and every reading argued for smaller chunks while the real cost was
-per-object. Same defect, longest feedback loop.
+The rule is not about comments. It has three instances, ordered by FEEDBACK-LOOP
+LENGTH, which is what decides how much damage each does:
+
+- A TEST asserting half a tradeoff fails visibly the moment someone touches the
+  other half. Self-correcting, fastest loop.
+- A COMMENT split across two files misleads one reader at a time, and only the
+  reader who happens to arrive.
+- A METRIC showing one side of a coupled pair is read CONTINUOUSLY, by people
+  making decisions, with nothing indicating the other half exists. It does not
+  fail to warn -- IT ACTIVELY RECOMMENDS optimising the visible half, and keeps
+  recommending it. Worked case: a backup metric reported bytes and not round
+  trips, so every reading argued for smaller chunks while the real cost was
+  per-object.
+
+The dashboard was not wrong about bytes. IT WAS WRONG ABOUT WHAT QUESTION IT
+APPEARED TO ANSWER -- which makes it the same defect as an unscoped severity
+label, arriving through the widest possible door: AN ARTIFACT THAT IS LOCALLY
+ACCURATE AND SILENTLY ANSWERS A BROADER QUESTION THAN THE ONE IT MEASURED. The
+reader cannot detect it from the artifact alone, because nothing in a correct
+bytes-number hints that round trips exist.
 
 THE SWEEP BUYS THE RIGHT TO MAKE THE CLAIM, AND THE CLAIM IS WHAT SURVIVES. You
 cannot write "these guards cannot poison, and here is why" until you have read

@@ -2148,6 +2148,36 @@ trust a tool whose only output was noise, they PLANTED A TYPO and confirmed it
 flagged that too. Any tool with standing ignorable output needs that check before
 its silence means anything.
 
+## Distinguish the benign failure by state, not by its wording
+
+When a command's failure is sometimes benign, the tempting test is a substring
+match on the error text. That reads as precise and is not: ERROR WORDING IS NOT
+A CONTRACT. It changes across tool versions, across API versions, and between a
+human-readable renderer and a machine one.
+
+I wrote exactly this while FIXING a swallowed-status defect in a release
+workflow, and my own case sweep caught it before it landed: I matched
+"already exists" where the tool now emits "already_exists". The consequence is
+the bad direction -- a legitimate retag routes to the failure branch and the
+release stops, and it stops for a reason the log describes wrongly.
+
+ASK THE STATE QUESTION INSTEAD. Not "did the error say the release exists" but
+"does the release exist now". A state query cannot drift with wording, it is
+true for the right reason, and it stays correct if the tool starts failing for a
+new benign reason nobody enumerated.
+
+THE SAME REASONING RETIRES THE OTHER HALF OF THE PATTERN. `... 2>/dev/null ||
+true` on a create-if-absent step is right for the one benign case and wrong for
+every other failure -- permissions, network, a malformed argument. Worse than
+silence: the next step then fails with a MISLEADING SYMPTOM ("release not
+found"), so the reader is sent after a missing artifact rather than the cause
+that actually stopped the run.
+
+AND PROVE THE BRANCHES WITHOUT SPENDING THE REAL OPERATION. A release workflow
+cannot be exercised by pushing tags. Simulating the command's outcomes -- each
+exit status crossed with each state -- costs one shell function and is what
+caught the wording defect above.
+
 ## A pipeline reports the last command's exit code, not the work's
 
 Twice in one deploy: `cargo build ... | tail -5` returned **exit 0** while cargo

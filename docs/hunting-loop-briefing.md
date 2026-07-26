@@ -1258,6 +1258,28 @@ AND IT WAS ONLY FOUND BY RUNNING IT AGAINST A LIVE OLD PEER. Every test passed:
 the tests build both halves from the same source tree, so version skew is exactly
 the condition a same-repo suite structurally cannot construct.
 
+THREE STRENGTHS, AND THE STRONGEST IS NOT THE ONE I SHIPPED. A second seat swept
+their own wire against this class and found their mutating plane STRUCTURALLY
+IMMUNE -- every field rides inside a body whose digest is bound into the request
+signature, recomputed by the receiver and compared. Dropping a field CHANGES THE
+DIGEST, so an older receiver does not ignore it, it FAILS VERIFICATION. There is
+no ignored state available to the field at all.
+
+So the ladder is: BIND the field into something the receiver must verify, which
+makes absence unrepresentable; failing that, ECHO PLUS REFUSAL, where the receiver
+proves it understood and the caller treats missing proof as failure; failing that,
+nothing, and the inversion is silent. Binding is the fix for a plane that CAN
+bind. Echo-plus-refusal is the retrofit for a plane that cannot -- a plain JSON
+control plane, a query string, anything where the receiver cannot tell the field
+was ever there.
+
+THEIR SENTENCE IS THE ONE TO KEEP: the signed plane cannot have the defect and the
+unsigned plane cannot avoid it by care. The difference is not diligence. It is
+whether the receiver can tell the field was ever there. Note also WHY their plane
+has the property -- it was designed against a hostile server, not for versioning,
+and version-skew immunity fell out of it. Integrity mechanisms buy skew safety for
+free; versioning discipline does not buy integrity.
+
 SWEEP RESULT ON THE SAME WIRE, recorded because a null is worth as much as a hit
 and is the only thing that sizes the class. Five optional fields on the control
 plane, each read for what its absence means to a peer that never learned it.

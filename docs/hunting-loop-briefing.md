@@ -1053,6 +1053,30 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## A control drawn from the same population as the query proves nothing
+
+Checking whether a Swift method had callers, I ran a text search, got 21 hits
+against a callgraph reporting zero, and ran a positive control -- a method I knew
+was called -- which returned 23. Control passed, so I believed the 21.
+
+Both numbers were build artifacts. The package's `.build` directory carries index
+databases and serialised modules that mention every symbol in the package, so
+BOTH the query and its control were dominated by the same non-source population.
+The control could not have failed: it was measuring the same thing the query was
+measuring wrongly. Restricted to tracked files, the real answer was ONE caller,
+and the callgraph's zero was also wrong.
+
+This is the independence rule landing on a control I built myself minutes
+earlier, which is what makes it worth writing down. The check for it is
+mechanical: NAME THE POPULATION THE CONTROL IS DRAWN FROM AND ASK WHETHER IT IS
+THE SAME ONE THE QUERY SEARCHES. If it is, the control tests reachability of a
+set, not correctness of a filter.
+
+PRACTICAL FORM FOR REPOSITORY SEARCHES: scope to tracked files (`git ls-files`)
+rather than walking the working tree. Generated output, build caches, and vendored
+copies all answer searches and all look like source. The same discipline that
+keeps stale audit evidence out of a repo applies to the search itself.
+
 ## Recomputed is not reproduced
 
 An artifact that records command output can be checked two ways, and only one of

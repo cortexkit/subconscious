@@ -2514,6 +2514,31 @@ was about MY specimen, which I could check and they could not. Where two seats
 discuss one artifact, the one holding it owes the check -- an assertion about
 someone else's evidence is the least-defended claim in any exchange.
 
+## A quiet lane is unarmed, not stuck
+
+Every defect corrected across one evening's cross-seat arc had been WRITTEN by a
+seat working alone, and each was found only once another seat's finding put a new
+instrument in the author's hands. Nobody in the chain was being more careful than
+usual; each was holding a tool sharpened somewhere else an hour earlier.
+
+SO THE SEATS ARE NOT CORRECTING EACH OTHER -- THE INSTRUMENTS ARE CIRCULATING AND
+THE SEATS ARE THEIR CARRIERS. That is a more precise account of what a review
+partnership does than "a second pair of eyes", and it predicts where the method
+fails: A SEAT WORKING ALONE ON A NOVEL PROBLEM HAS NO CIRCULATING INSTRUMENT TO
+HOLD AGAINST IT. It is exactly the condition under which the original defects
+were written.
+
+OPERATIONAL FORM: when a lane has been quiet for a long stretch, ROUTE AN
+INSTRUMENT INTO IT DELIBERATELY -- a blind gate, a cross-seat census, a
+report-only detector aimed at its artifacts -- rather than reading the quiet as
+health. The quiet lane is not stuck; it is unarmed.
+
+THIS COMPOSES WITH THE SINGLE-READER RULE. "Check whatever has exactly one
+reader" targets ARTIFACTS; this targets SEATS, by the same logic -- the artifact
+nobody else has read and the seat nobody else has audited are the same exposure
+at two scales. Recency of cross-seat contact is a selection signal alongside the
+usual suspects.
+
 ## Retention outlives evidence: the oldest item is the one you can least adjudicate
 
 A cleanup predicate that consults a record to decide safety has an expiry the

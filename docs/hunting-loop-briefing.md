@@ -1380,7 +1380,25 @@ test aligned to the buggy side, one layer up.
 So the question is not whether the expected answer is TRUE. It is where the
 answer CAME FROM. A dormancy recorded as a design decision at the time is an
 independent source and makes a fine control; the same fact arrived at as the
-output of an earlier analysis is still true and useless here.
+output of an earlier analysis is still true and useless here. Put plainly: A TRUE
+FACT ESTABLISHED BY THE METHOD UNDER TEST IS NOT EVIDENCE ABOUT THAT METHOD. A
+control's job is not to be right -- it is to be ABLE TO BE WRONG in the specific
+way the instrument might be.
+
+INDEPENDENCE HAS TWO LEGS, AND THE SECOND IS THE ONE THAT BITES. Independent
+METHOD is visible in how the check is written, so it gets checked. Independent
+INPUTS is invisible at the check and has to be traced upstream. Worked case: a
+mutation over a materialized corpus looks fully independent of a route analysis --
+different method entirely, execution rather than static tracing -- but if THE
+CORPUS WAS DERIVED FROM THE ROUTES, an analysis that misses a route yields a
+corpus missing the same frames, and the mutation inherits the gap. Different
+method, shared input provenance, contaminated anyway.
+
+The same case is worth reading a second way, as a claim rather than a control:
+"no materialized frame reaches it" is not "no route can reach it". That is the
+narrow-but-true class landing on a piece of EVIDENCE instead of on a check -- the
+fact is correct and the proposition it supports is smaller than the use it was
+put to.
 
 STRONGEST SHAPE: make the control true BY CONSTRUCTION rather than by prior
 finding. Plant a synthetic item with no enforcement site anywhere, verifiable by
@@ -1390,6 +1408,13 @@ demonstrated by dispatch rather than asserted by analysis.
 
 Same move as tampering a blob rather than picking a blob you believe is already
 wrong.
+
+When the synthetic plant becomes load-bearing, control its own premise too. You
+establish "no enforcement site anywhere" by searching, and A SEARCH RETURNING
+ZERO BECAUSE THE PATTERN IS WRONG LOOKS IDENTICAL TO ONE RETURNING ZERO BECAUSE
+THE THING IS ABSENT. Pair it with a positive control at the same scope: search
+the same way for an item you know HAS an enforcement site, and confirm you find
+it. Otherwise the control rests on an unchecked empty result.
 
 ## Control the denominator, not only the result
 

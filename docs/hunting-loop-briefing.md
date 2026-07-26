@@ -2321,6 +2321,49 @@ require the resource the known outage removed? If not, it is a second incident
 wearing the first one's clothes, and the fact that it started at the same time is
 not evidence -- a shared trigger and a shared cause are different claims.
 
+## A single sample lands on one side of a split and reads as decisive either way
+
+Checking ONE instance of a repeated condition tells you which side of the
+distribution that instance is on, and nothing about the distribution.
+
+PROOF CASE: a reclaim loop logged the same refusal for 422 distinct paths. I
+checked one, found the directory present, and was about to report "the loop is
+retrying live worktrees." Resolving all 422 gave 413 ABSENT and 9 present -- a
+98/2 split, and my sample had landed in the 2%. The one-sample version was not
+merely weaker; IT SUPPORTED THE OPPOSITE CONCLUSION, with the same confidence.
+
+WHAT MAKES THIS WORSE THAN AN ORDINARY SMALL-SAMPLE PROBLEM: a repeated log line
+INVITES the single check, because every instance looks like every other one. The
+repetition that makes the sample feel representative is a property of the
+MESSAGE, not of the underlying state.
+
+CHEAP FIX: when the population is enumerable from the evidence you already have
+(all the paths are IN the log), resolve ALL of it. 422 filesystem checks cost
+under a second. Sample only when enumerating is genuinely expensive, and say so.
+
+## A log line repeated per-item per-sweep broadcasts a static backlog
+
+A loop that retries a permanently-failing item and logs each failure converts a
+fixed backlog into unbounded output. Measured here: 8547 of 20000 lines (43%) in
+a 3.5-hour window, one message, 422 items, ~84 retries each -- roughly 40 MB/day
+into an unrotated 1.34 GB file.
+
+THE SECOND-ORDER COST IS THE REAL ONE. Underneath those 8547 lines sat 828 and
+776 instances of two DIFFERENT warnings that may be real. A dominant repeated
+line does not merely waste bytes, it buries the signal you would need on the day
+something else breaks -- and it does so in the single durable record of module
+stderr, which is the thing you reach for during an incident.
+
+IF A REFUSAL IS PERMANENT PENDING AN OPERATOR, SAY IT ONCE. Re-announcing a
+static state on every sweep is the logging equivalent of a health gauge that
+cannot distinguish stopped from slow: the reader cannot tell a new failure from
+the eighty-fourth repeat of an old one.
+
+AND CHECK WHETHER THE REFUSAL IS EVEN CORRECT. Here "cannot inspect" was being
+returned for paths that DO NOT EXIST, where the reclaim goal is already
+satisfied. Absence read as corruption -- the same absent-vs-unknown discriminator
+as a missing config file read as an empty module list.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

@@ -2417,7 +2417,37 @@ MESSAGE, not a memory of intending to send one. Same standard as "if there is no
 tool result, it did not happen" -- applied to your own reports about yourself.
 
 ## A doc comment is an untested assertion unless something fails when it stops
-## being true
+## being true -- and the question is ENFORCEMENT, not truth
+
+MY FIRST FORM OF THIS RULE ASKED THE WRONG QUESTION. "Is the comment true" is a
+snapshot: you can only answer it for today, and when the answer is yes there is
+no follow-up. ENGRAM's refinement transfers instead: THE EXPOSURE IS NOT THAT A
+COMMENT IS WRONG, IT IS THAT IT IS UNENFORCED. Truth is a property of the moment;
+enforcement is a property of the code.
+
+AND THE TELL IS FREE. Sweeping eight behavioural comments, the two they did NOT
+have to verify by hand were the two with tests behind them. THE COMMENTS THAT
+COST EFFORT TO CHECK ARE PRECISELY THE ONES NOTHING WILL CHECK LATER -- the
+difficulty of verifying is itself the signal.
+
+THREE CATEGORIES, ONLY ONE OF WHICH IS EXPOSURE:
+· TESTED -- something fails when the claim goes false.
+· STRUCTURALLY ENFORCED -- control flow or a schema holds it (a call sitting in
+  the Ok arm of a transaction; a function reachable only through an authenticated
+  path; SQLite AUTOINCREMENT). STRONGEST OF THE THREE, because an edit cannot
+  break it while leaving tests green.
+· TRUE BY CONVENTION -- true today, held by nothing. This is the whole exposure.
+
+MEASURE PREVALENCE BEFORE LEGISLATING. Their sweep found 1 defect in 8
+candidates. Endemic would justify a policy (test every behavioural comment); rare
+justifies the cheap habit of checking a comment while you are in the file anyway.
+A POLICY SIZED TO A RATE NOBODY MEASURED IS HOW A CODEBASE ACQUIRES CEREMONY THAT
+CATCHES NOTHING.
+
+AND REPORTING THE NEAR-NULL IS THE HARDER HALF: a sweep chartered to find
+something produces something. Promoting a borderline case to a finding, to
+justify the sweep, is the failure mode -- the round's result has to bind in the
+direction where it says the thing is not here.
 
 ENGRAM found two doc comments claiming a cache refreshed "at startup, after every
 run, and on scheduler ticks". THE THIRD CLAUSE HAD NO CALL SITE ANYWHERE. A

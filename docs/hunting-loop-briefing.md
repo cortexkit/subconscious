@@ -951,6 +951,20 @@ It also corrected a misreading from earlier the same night: I had hit that same
 own SSH access. **An error blamed on your own environment stops being
 investigated** -- and it was the actual finding, sitting in plain sight for hours.
 
+The three states get progressively quieter, and the quietest one is invisible to
+both checks above it:
+
+| state | presence check | liveness check | ahead-count |
+| --- | --- | --- | --- |
+| no remote | catches | catches | catches |
+| dead remote | **misses** | catches | catches |
+| unpushed | **misses** | **misses** | catches |
+
+A repo with a working remote and 83 unpushed commits passes both checks, because
+they answer *"is there a remote and does it respond"* and never *"does it have
+the work."* **Only the ahead-count measures the property anyone actually cares
+about, which is durability rather than configuration.**
+
 General form: a survey for *unprotected* things must probe the protection, not
 read its declaration. Backups configured to a dead endpoint, replicas pointing at
 a decommissioned host, alerts routed to a closed channel -- all present, all

@@ -4,6 +4,22 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# Deliberately its OWN workspace rather than a member of the root one, and this
+# is a decision rather than an oversight: gpui pulls a very large dependency
+# tree, and joining the root workspace would put that build cost on every
+# `cargo test` in the daemon crates.
+#
+# THE COST THIS ACCEPTS, stated so nobody has to rediscover it: standing outside
+# the workspace means CI never builds this crate, so a change that breaks it
+# lands green. That was harmless while this was an evaluation spike. It is less
+# harmless now -- this crate holds live wire strings (module ids, op names) that
+# move when the fleet renames a module, and a stale one here fails at runtime on
+# a real daemon rather than at compile time in CI.
+#
+# A FIX WOULD HAVE TO PRESERVE the root workspace's build time. A separate CI job
+# that builds only this crate on changes under spikes/ does that; adding it to
+# the workspace members does not. Until then, changes here need a local build --
+# which is why the fleet rename work built it by hand rather than trusting green.
 [workspace]
 
 [dependencies]

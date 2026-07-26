@@ -2553,6 +2553,52 @@ nobody else has read and the seat nobody else has audited are the same exposure
 at two scales. Recency of cross-seat contact is a selection signal alongside the
 usual suspects.
 
+## Re-running a red: experiment or retry, and the difference is a prediction
+
+Re-running a failed job usually converts an unexplained failure into an
+UNEXAMINED PASS. It is the rigorous move only under a specific condition: YOU CAN
+STATE, BEFORE RUNNING IT, WHAT EACH OUTCOME WILL MEAN.
+
+LEGITIMATE CASE (SYNAPSE, 2026-07-26): a windows job failed at a `choco install
+llvm` setup step, BEFORE any code from the commit was touched, and the diff was
+structurally incapable of causing it (python + Swift + markdown under a bench
+directory no Rust target builds). With a named suspect and an a-priori argument,
+the re-run is a controlled experiment on one variable -- same sha, different CDN
+draw. Green means environment; red means the structural argument is wrong and the
+diff is back in scope. THE PREDICTION REGISTERED IN ADVANCE IS WHAT MAKES IT AN
+EXPERIMENT RATHER THAN A HOPE.
+
+THE WEAK BRANCH IS THE ONE THAT FEELS CONCLUSIVE: A SINGLE GREEN RE-RUN IS
+CONSISTENT WITH A FLAKE AT ANY RATE ABOVE ZERO, INCLUDING 50%. It does not
+establish "environmental", it fails to refute it. So the comment that follows must
+name the flake CLASS and not assert a RATE nobody measured -- "this step has
+failed on a CDN draw before" is defensible; "rare, transient" is a number nobody
+took.
+
+AND THE FIX RESTORES MEANING RATHER THAN REMOVING NOISE. Before a retry pin, a
+red on that step is uninformative -- real break or bad draw, indistinguishable
+without redoing the whole investigation. After, a red means the failure survived
+N attempts. Same shape as logging a static refusal once instead of every sweep:
+THE VALUE IS NOT REMOVING THE NOISE, IT IS RESTORING THE SIGNAL'S MEANING.
+
+## "Pushed" is not a terminal state
+
+Two seats made the same substitution within one evening, in different objects. I
+read a module's HEALTH as evidence about its CODE. They read a LOCAL gate
+(fmt/clippy/tests) as evidence about the REMOTE head, pushed, and stopped. Both
+signals were true, adjacent, and about a different object -- and in both cases
+THE CHECK WE RAN COULD NOT HAVE FAILED FOR THE REASON WE NEEDED IT TO.
+
+They had banked the tip-was-queued-vs-tip-is-green rule TWO DAYS EARLIER and
+forgotten it at exactly the moment it applied. That is not a memory failure: A
+RULE WITH NO MECHANICAL TRIGGER DECAYS TO ZERO PRECISELY WHEN IT IS RELEVANT,
+because relevance arrives at the end of a work session when attention is lowest.
+
+SO THE DURABLE FIX IS A TRIGGER, NOT MORE DISCIPLINE: the terminal state of a
+change is A CONCLUSION ON THAT SHA, not the push. Anything that ends a session at
+"pushed" leaves a claim unverified -- and the claim is the one everyone downstream
+will assume was checked.
+
 ## Retention outlives evidence: the oldest item is the one you can least adjudicate
 
 A cleanup predicate that consults a record to decide safety has an expiry the

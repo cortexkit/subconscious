@@ -2148,6 +2148,31 @@ trust a tool whose only output was noise, they PLANTED A TYPO and confirmed it
 flagged that too. Any tool with standing ignorable output needs that check before
 its silence means anything.
 
+## An impossible number is a gift; a merely wrong one is not
+
+`git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not
+the grand total: xargs splits its input across multiple invocations and each one
+emits its own "total" line. On a repo small enough for a single batch it is
+correct, which is how the idiom survives.
+
+I caught mine only because it printed 0 LINES ACROSS 63 FILES -- impossible on
+its face, so it could not be believed. Had the split landed differently it would
+have under-reported by some plausible fraction, and I would have published a
+confident wrong ratio in a comparison I was using to size a risk. THE VERSION
+THAT IS EASY TO CATCH AND THE VERSION THAT IS DANGEROUS ARE THE SAME BUG; which
+one you get is set by the input size.
+
+SO DO NOT TREAT "THE NUMBER LOOKED SANE" AS A CHECK. It only rules out the
+self-evidently broken instance. Where a count feeds a decision, prefer an
+accumulator you can read (`while read; do ...; done | awk '{s+=$1} END'`) over a
+pipeline whose batching is invisible, or cross-check one value against a second
+method.
+
+SAME SHAPE, DIFFERENT TOOL: a pipeline reporting the last command's exit code,
+and `tail -1` reporting the last batch's total. In both, an intermediary quietly
+narrows what you are measuring, and the output still looks like the answer to
+the question you asked.
+
 ## A fallback can substitute a weaker operation, not just a weaker verdict
 
 The swallowed-status family has a member that is harder to see, because nothing

@@ -896,6 +896,22 @@ the right instinct: correct-shaped assertions are precisely the ones that pass
 while unreachable, because nothing about reading them reveals whether control
 arrives.
 
+### A line that is always there stops being read
+
+My fleet pulse printed `CKTUI MISSING` on every 30-minute wake for eight days. I
+read past it every time, because a line that never changes reads as furniture.
+
+Investigating it once found a repo with 34 commits and **no git remote at all**.
+That repo led to a survey: five CortexKit repos have no remote, 447 commits
+living on exactly one disk, including the only copy of a module currently serving
+production traffic.
+
+This is the corollary to the designed-zero rule, aimed at the reader instead of
+the gauge: **a signal that is permanently present conveys nothing, whatever it
+says.** If a condition is expected to persist, it needs either a resolution path
+or a different presentation -- because an alert nobody can act on becomes an
+alert nobody reads, and it takes the surrounding lines down with it.
+
 ### And check your own ledger before asking
 
 I asked a seat about two blockers. Both were closed -- one of them by *me*, hours

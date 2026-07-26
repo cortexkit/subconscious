@@ -2356,6 +2356,27 @@ the deploy fix the thing" -- for that you need a functional probe that exercises
 the repaired path end to end. On a box where the fix is needed, only the second
 fails before the deploy, which is what makes it the real gate.
 
+THE PATTERN UNDERNEATH, and it recurred three times in two days: THE AVAILABLE
+AND EASY CHECK SITS ONE RUNG BELOW THE ONE THAT MATTERS. A health route returning
+200 (the service is up) below whether the mutation path works. A `--version`
+probe (the binary runs) below whether it contains the fix. An inode match (the
+image swapped) below whether the swap repaired anything. Each lower rung is
+cheap, scriptable, and produces a green line, which is exactly why it gets
+substituted for the rung above without anyone deciding to substitute it.
+
+The question that separates them: WOULD THIS CHECK HAVE FAILED BEFORE THE FIX? If
+the answer is no -- if it was already green on the broken box -- it is measuring
+something other than what you are trying to establish.
+
+PREDICT THE CONFUSING SIGNAL BEFORE THE WINDOW. If a known-benign anomaly is
+expected (a stale error on the first tick, a warning from an unrelated path), say
+so IN ADVANCE and say what would distinguish it from a real failure. Named
+beforehand, it is a prediction that either holds or does not; discovered live, it
+gets rationalised in whichever direction the operator already expects. And the
+standing instruction should be to report the confusing signal rather than the
+tidy one -- a smoothed-over anomaly is a defect that has been given a reason to
+stay.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

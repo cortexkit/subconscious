@@ -72,6 +72,17 @@ Before calling a class closed:
 | 14 | Does a condition that suppresses output also suppress the thing that would report the suppression? | Alarm and backstop removed by one condition |
 | 15 | Every consumer of your wire enumerated — not just the ones who asked? | Settling with whoever asked is guard-the-instance again |
 | 16 | Does each counter you publish say what its anomaly *looks like*? | A gauge nobody reads as a detector |
+| 17 | Would a *new entry* in the thing you are asserting over be routine or alarming? | Routine and you asserted a count: healthy growth reads as breakage. Alarming and you asserted a property: silent shrinkage reads as green |
+
+Row 17 is the shape of every entry here worth trusting: **a rule recorded without
+its discriminator is half-guidance**, and the half that travels is whichever
+sounded cleaner. "Assert the property, not the census" and "a data-driven suite
+must assert its item count" are both correct, in the same repository, on the same
+afternoon — and neither is derivable from a rule about assertions. What separates
+them is a question about the *subject*, not about the check.
+
+So when a rule goes in a document, the thing to write beside it is not more
+justification. It is the case where it is wrong.
 
 ## What this method cannot see
 

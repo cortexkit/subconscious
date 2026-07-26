@@ -812,6 +812,24 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## A check that cannot pass is worse than one that cannot fail
+
+We spend most of our attention on checks that can't fail -- the guard with no
+negative vector, the assertion that would hold on any input. But a check that
+cannot *pass* is the more dangerous defect, because it produces **confident
+refusals**.
+
+The live case: verifying a candidate binary contained a fix by grepping its
+strings anchored as `^literal$`. Rust packs string literals contiguously, so no
+literal sits alone on a line and the check returned 0 for *every* binary --
+including the control string the running module was printing at that moment. Left
+unchecked it would have concluded the candidate lacked the fix, and refusing to
+deploy would have looked like diligence.
+
+A false pass gets caught eventually by the thing it failed to prevent. A false
+refusal is self-justifying: it blocks the change, nothing breaks, and the
+refusal looks vindicated. Both directions need the control.
+
 ## A pipeline reports the last command's exit code, not the work's
 
 Twice in one deploy: `cargo build ... | tail -5` returned **exit 0** while cargo

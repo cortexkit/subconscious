@@ -1053,6 +1053,32 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## A destructive operation whose premise is unauditable before it fires
+
+A sweep deletes complete, signed snapshots when the chain head they planned
+against no longer matches the current one. Correct behaviour. But the planned head
+lives only inside a sealed blob, so THE INPUT TO THE DESTRUCTIVE DECISION CANNOT
+BE INSPECTED FROM OUTSIDE -- and if the implementation's read of it were wrong,
+the evidence would be gone by the time anyone looked.
+
+That is a distinct hazard from an ordinary unverifiable claim. Most such claims
+leave their subject in place to be checked later; this one consumes it. The
+asymmetry is what makes it worth naming: a WRONG PRESERVE is recoverable, a WRONG
+DELETE is not, so the two directions do not deserve the same standard of evidence.
+
+THE CHEAP FIX IS ALWAYS THE SAME SHAPE: expose the predicate's inputs next to its
+current comparison value, read-only, so the decision is checkable BEFORE it
+executes rather than reconstructible afterwards. No behaviour change, no new
+failure mode.
+
+AND THE DECISION NOT TO FIX IT NOW IS LEGITIMATE, provided it is recorded as a
+decision. Here: the sweep has run in production for months, so the gap predates
+the incident and is not urgent; a fix would only pay off if deployed ahead of the
+very recovery it would audit; and adding a commit to a payload someone must verify
+under time pressure has its own cost. AN UNRECORDED DEFERRAL DECAYS INTO AN
+APPARENT OVERSIGHT -- the same reason a deliberate refusal in code needs its
+justification written at the refusal.
+
 ## Two lines naming the same subject must select it by the same rule
 
 A report section printed a header naming the generation being uploaded, then

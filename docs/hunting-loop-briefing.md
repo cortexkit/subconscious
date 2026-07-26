@@ -1053,6 +1053,33 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## A single sample cannot distinguish a state from a trajectory
+
+Three times in one night, on three unrelated resources, the same shape: a level
+read as a trend, with the alarming interpretation available for free.
+
+· A debug capture directory: newest file written minutes ago, so the directory
+  was "growing". It was a ring at equilibrium. NEWEST TELLS YOU THE WRITER IS
+  LIVE; ONLY OLDEST TELLS YOU WHETHER IT IS BOUNDED.
+· A population of empty files: zero created in the last 24 hours, so creation had
+  "stopped". Grouped by absolute date it was ongoing and bursty.
+· Free RAM at 0.5 GB: the box was "degrading". It was loaded and stable.
+
+THE DISCRIMINATOR IS NEVER THE LEVEL. For memory specifically it is whether the
+kernel is EXTENDING THE SWAP FILE: a degrading box grows the file and free RAM
+oscillates by a gigabyte on a 30-second timescale; a merely loaded one shows a
+fixed file with steady occupancy. Same "0.5 GB free" headline, opposite
+conditions, and the remedy differs completely -- one needs processes to exit, the
+other needs nothing.
+
+GENERAL FORM: before reporting a resource as a problem, TAKE A SECOND SAMPLE AND
+NAME WHICH QUANTITY YOU EXPECT TO HAVE MOVED. If you cannot name one, you are
+reporting a level and calling it a trend.
+
+AND NAME THE RESOURCE. "0.1 GB free" with no unit of what reads as whichever
+resource the reader has most recently been worrying about -- disk pressure wants
+deletion, memory pressure wants processes to exit, and the two share no remedy.
+
 ## A relative-time window is anchored on the moment you run it
 
 Asked whether a population of files was still growing, I ran a "created in the

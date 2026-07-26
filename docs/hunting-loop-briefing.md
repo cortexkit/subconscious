@@ -1165,6 +1165,35 @@ ORDERING RULE from the same exchange: when a preview and a way to VERIFY the
 preview are both on the ledger, the verifier is worth more. A preview alone is
 trusted; a published input makes it checkable.
 
+## Prefer evidence that shares a lifetime with its subject
+
+A prune predicate needed to tell a deliberate deletion from a snapshot of a
+worktree being torn down. The first design looked the branch up in a task ledger
+-- and the ledger's rows expire, so the OLDEST branches, the ones most worth
+pruning, had outlived their evidence. The predicate was strongest where it was
+least needed.
+
+The replacement reads only the two commits: are the deleted paths still present on
+the base branch? If they are, nothing was removed from the project and the commit
+records an absence that existed only inside a dying worktree. Same question,
+answered from the artifact rather than from a side table.
+
+THE PROPERTY IS NOT "NO EXPIRY", AND SAYING SO WOULD BE THE OVERSTATEMENT THAT
+GETS LEANED ON LATER. The check still depends on the branch commit being
+reachable, so it survives a branch outliving its ledger row and does NOT survive
+the ref being deleted. What it buys is that THE EVIDENCE AND THE SUBJECT NOW SHARE
+A LIFETIME -- the evidence cannot expire while the thing being judged still exists.
+That is strictly better than a side table and materially different from immortal.
+
+Two consequences that follow only once it is stated that way: adjudicate BEFORE
+deleting a ref, never after; and RECORD THE VERDICT DURABLY, because it outlives
+the ability to re-derive it.
+
+GENERAL FORM: when a predicate needs supporting evidence, ask whether that
+evidence can vanish INDEPENDENTLY of its subject. If it can, the predicate has a
+blind spot that grows with age, and it will be blindest on the oldest cases --
+which are usually the ones anyone bothers to run it on.
+
 ## A destructive operation whose premise is unauditable before it fires
 
 A sweep deletes complete, signed snapshots when the chain head they planned

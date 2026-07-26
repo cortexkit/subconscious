@@ -1053,6 +1053,30 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## Two lines naming the same subject must select it by the same rule
+
+A report section printed a header naming the generation being uploaded, then
+sampled a progress file to say whether it was moving. The header selected by
+sequence number; the probe selected by "most recently modified file anywhere in
+the staging area". Both rules are reasonable and they agree almost always.
+
+They diverged the moment a FINISHED generation's residue outlived an UNSTARTED
+one: the header said generation 99 while the probe watched generation 96's file
+and reported NOT MOVING. True of that file, silent about the subject. And the
+failure lands exactly on the distinction the section exists to make -- A FINISHED
+UPLOAD IS INDISTINGUISHABLE FROM A STALLED ONE ONCE YOU ARE WATCHING THE WRONG
+FILE.
+
+What makes this worse than an ordinary bug is that the output stayed fluent. Two
+adjacent lines, consistent grammar, no error anywhere -- the reader has nothing to
+notice.
+
+RULES: resolve the subject ONCE and pass its identity down, rather than letting
+each line re-derive it. Where that is impractical, MAKE EACH LINE NAME THE SUBJECT
+IT MEASURED, so a divergence appears in the output instead of only in the code.
+And distinguish NOT STARTED from STARTED-THEN-STOPPED: the absence of a progress
+artifact is a different state from a stalled one, with a different remedy.
+
 ## A single sample cannot distinguish a state from a trajectory
 
 Three times in one night, on three unrelated resources, the same shape: a level

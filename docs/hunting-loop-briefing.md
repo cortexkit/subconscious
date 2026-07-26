@@ -896,7 +896,42 @@ the right instinct: correct-shaped assertions are precisely the ones that pass
 while unreachable, because nothing about reading them reveals whether control
 arrives.
 
-### Presence is not liveness: the config is testimony, the probe is evidence
+### Preserving a variant creates an obligation to handle it everywhere
+
+A parser was taught to round-trip a deprecated import spelling verbatim rather
+than normalise it, on the principle that rewriting someone's syntax is not our
+call. That was right. But once **two spellings are both legitimate, every
+predicate that classifies one must classify the other** -- and a guard added a
+day later, by a different author, covered only the modern spelling. The exact
+corruption the guard existed to prevent still shipped through the other door.
+
+Nothing in the type system or the tests connects the preservation change to the
+validation change. The obligation is created at one site and comes due at every
+other, with no mechanism carrying it across.
+
+The fix that matters is structural: make the classification **spelling-agnostic
+at one site**, rather than adding a parallel path -- a second path is exactly
+where the third divergence lands.
+
+Note the sequence, because it is the fence class twice over: the first fix
+fenced a defect as correct, and the second fix fenced *half* a defect as fixed.
+Both were caught by an oracle from outside the layer -- the runtime, not the
+syntax tree.
+
+### An instrument can also produce a false positive
+
+Every instrument failure above returned a false all-clear. This one went the
+other way: a probe reported a case as *refused*, which would have read as an
+over-broad guard and sent someone chasing a bug that did not exist. The refusal
+was real; the reason was `file_not_found`, because the fixture had been written
+to the wrong directory.
+
+A false positive is cheaper than a false all-clear -- it wastes work rather than
+hiding a defect -- but it costs the same investigative reflex: **when a result
+surprises you in either direction, check the instrument before theorising about
+the subject.**
+
+## Presence is not liveness: the config is testimony, the probe is evidence
 
 My survey for unprotected repos read `git remote -v` and classified anything with
 a remote as safe. It found five repos with none.

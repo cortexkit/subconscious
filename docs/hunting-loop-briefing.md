@@ -2366,12 +2366,21 @@ containing it, the marker is unusable -- stop there. One command, and it convert
 an unfalsifiable comparison into a falsifiable one before it can mislead anyone.
 
 THE REASON THAT PRE-CHECK IS NOT OPTIONAL: "use a string the change introduces,
-because those survive into the binary" IS TRUE FOR FORMAT STRINGS AND ERROR
-MESSAGES AND FALSE FOR MATCH-ARM LITERALS. rustc compares `&str` match arms by
-length-and-bytes without emitting a contiguous constant, so no `strings`-based
-check can ever see one. BOTH ARE STRING LITERALS IN THE SAME FILE and the
-difference is invisible in the source -- only the compiler knows one becomes data
-and the other becomes a comparison.
+because those survive into the binary" is simply FALSE FOR SOME LITERALS. rustc
+can compare `&str` match arms by length-and-bytes without emitting a contiguous
+constant, and then no `strings`-based check can ever see one.
+
+BUT DO NOT LEARN THAT AS "MATCH ARMS DO NOT SURVIVE" -- THALAMUS checked their own
+artifact and found one shipped match arm absent and ANOTHER, TWO FILES AWAY IN
+THE SAME SYNTACTIC POSITION, PRESENT. Same construct, opposite outcome, and
+neither of us can say which optimisation decides it.
+
+SO THE PREDICATE IS NOT ABOUT SYNTAX AT ALL: SURVIVAL IS NOT DECIDABLE FROM THE
+SOURCE. That distinction is load-bearing rather than pedantic -- a reader who
+learns the match-arm version will CLASSIFY A LITERAL BY LOOKING AT IT, conclude
+"this one is a format string, it is fine", and be wrong in the other direction
+for reasons nobody has enumerated. THE ONLY AUTHORITY IS A BUILD KNOWN TO CONTAIN
+THE STRING.
 
 AND THE FAILURE DIRECTION IS THE DANGEROUS ONE. A marker reading zero in BOTH
 images looks exactly like "the deploy did not take", so it produces ACTION rather
@@ -2389,6 +2398,21 @@ ONE TRAP THERE: mangled names embed a per-build crate disambiguator, so raw
 symbol names DIFFER BETWEEN BUILDS EVEN FOR IDENTICAL CODE. Write the pattern to
 skip it; a tightened literal match reads zero for a reason unrelated to the
 change.
+
+AND A REACH-CONTROL HAS ITS OWN BLIND SPOT, found by THALAMUS inside the very
+script they wrote to implement this check. Their control was a string present in
+every build, so a broken extractor could not report a false absence. Sound --
+until they pointed the script at a Cargo.toml as a negative case and THE CONTROL
+PASSED, because the manifest declares the binary's name and the control string
+was in the text file too. The script then declared the marker unusable: a false
+verdict, in the action-causing direction, produced by the guard added to prevent
+exactly that.
+
+A REACH-CONTROL PROVES THE EXTRACTOR CAN FIND THINGS. IT DOES NOT PROVE YOU ARE
+LOOKING AT THE RIGHT KIND OF THING. If the input's TYPE matters -- an executable
+rather than any file that happens to contain text -- verify the type first;
+content-based controls cannot distinguish a binary from a manifest that mentions
+it.
 
 So a differential needs THREE strings, not two:
   - one present in both (proves the probe can read),

@@ -812,6 +812,32 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## A control cannot catch an error in what counts as the boundary
+
+The controls in this document check that a search can return both answers. They
+do not check that the search is looking at the right *region* -- and when the
+defect is in the boundary definition, a known-present instance and a known-absent
+region both sit inside the blind spot.
+
+The case: censusing production `.lock().unwrap()` sites required excluding test
+code. One pass excluded whole files whose lock sites sat inside `#[cfg(test)]
+mod` blocks. But `#[cfg(test)]` also attaches to *individual functions at module
+scope*, outside any test module -- invisible to a span-based filter, because the
+attribute is on the item rather than an enclosing block. A file reported clean
+while shipping three real locks. Two seats got this wrong in opposite directions:
+one counted shipped code as tests, the other excluded test code as shipped.
+
+So when a filter defines a region, enumerate the ways membership in that region
+can be expressed before trusting either direction of the result. Both-ends
+controls will pass regardless.
+
+**And prefer the claim that is load-bearing to the claim that is true.** "Zero
+lock sites" was a fact about a grep. "These three critical sections cannot panic
+while holding the guard" is a fact about the code. The severity assessment should
+have rested on the second all along -- when the count turned out wrong, the
+conclusion survived only because someone went and read the sections. Prefer
+evidence about the mechanism over evidence about its absence.
+
 ## Your own cleanup can manufacture the evidence you are chasing
 
 The two most expensive investigations of the night were aimed at symptoms the

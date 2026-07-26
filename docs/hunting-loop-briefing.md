@@ -2425,17 +2425,28 @@ no follow-up. ENGRAM's refinement transfers instead: THE EXPOSURE IS NOT THAT A
 COMMENT IS WRONG, IT IS THAT IT IS UNENFORCED. Truth is a property of the moment;
 enforcement is a property of the code.
 
-AND THE TELL IS FREE. Sweeping eight behavioural comments, the two they did NOT
-have to verify by hand were the two with tests behind them. THE COMMENTS THAT
-COST EFFORT TO CHECK ARE PRECISELY THE ONES NOTHING WILL CHECK LATER -- the
-difficulty of verifying is itself the signal.
+THE DISCRIMINATOR IS WHETHER A FUTURE EDIT VIOLATING THE CLAIM WOULD FAIL
+SOMETHING -- compile, test, or nothing. Not whether the claim is true, and NOT
+whether it was hard to verify.
+
+I FIRST WROTE THAT DIFFICULTY-OF-VERIFICATION WAS THE TELL, AND IT IS ONLY A
+CORRELATION. ENGRAM broke it on an example I had graded myself: a function whose
+comment said "called only by the Worker after auth", which I called structurally
+enforced because the call graph had exactly one production caller. WALKING A CALL
+GRAPH TELLS YOU WHAT IS; ENFORCEMENT IS ABOUT WHAT CANNOT BE. Nothing refuses a
+second caller, and adding one breaks no compile and no test -- so it is
+convention, not structure. A claim that is hand-checked can turn out structural
+(a call in the Ok arm of a transaction), and a claim that reads structural can be
+mere fact.
 
 THREE CATEGORIES, ONLY ONE OF WHICH IS EXPOSURE:
 · TESTED -- something fails when the claim goes false.
-· STRUCTURALLY ENFORCED -- control flow or a schema holds it (a call sitting in
-  the Ok arm of a transaction; a function reachable only through an authenticated
-  path; SQLite AUTOINCREMENT). STRONGEST OF THE THREE, because an edit cannot
-  break it while leaving tests green.
+· STRUCTURALLY ENFORCED -- control flow, a type, or a schema holds it: a call
+  sitting in the Ok arm of a transaction; `&self` making a "read-only" claim a
+  compile error to violate; SQLite AUTOINCREMENT. STRONGEST OF THE THREE, because
+  an edit cannot break it while leaving tests green. NOTE THAT ONE COMMENT CAN
+  SPLIT: "read-only projection called after auth" is structural in its first half
+  (`&self`) and convention in its second (a promise about callers).
 · TRUE BY CONVENTION -- true today, held by nothing. This is the whole exposure.
 
 MEASURE PREVALENCE BEFORE LEGISLATING. Their sweep found 1 defect in 8

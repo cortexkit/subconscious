@@ -1,5 +1,28 @@
 name: SubcFed
 
+# STATUS: THIS LANE HAS NEVER VERIFIED ANYTHING. Of its first 31 runs, 30 were
+# cancelled and one was in flight -- zero successes, zero failures, and ZERO
+# STEPS EXECUTED in any of them. The jobs are created and given a start time,
+# then wait for a `macos-13` runner that never arrives, until the next push
+# cancels them. Observed lifetimes ranged from 8 minutes to 7 hours.
+#
+# CAUSE: `macos-13` is a GitHub-hosted runner, and GitHub blocks private-repo
+# Actions jobs for this free-plan org at the zero spending limit -- the same
+# constraint ci.yml documents, which is why every other lane runs on Blacksmith.
+# Blacksmith has no macOS runners, so there is no drop-in substitution: this
+# workflow cannot run until the org's billing changes or a self-hosted macOS
+# runner exists.
+#
+# WHY IT IS LEFT IN PLACE RATHER THAN DELETED: the job definitions below are
+# correct and are the specification of what Swift CI should do once a runner
+# exists. Deleting them loses that; leaving them un-annotated is worse, because
+# a queued-forever lane renders in the checks list as pending rather than
+# failing, and a pending check reads as "still running" indefinitely.
+#
+# WHAT ACTUALLY VERIFIES THE SWIFT CLIENT TODAY: local runs on the dev box
+# (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`,
+# 311 tests at the time of writing). That is discipline, not enforcement --
+# nothing refuses an unverified push to clients/subc-client-swift/.
 on:
   push:
     branches: [master]

@@ -1126,6 +1126,21 @@ Three separate rules, each of which alone would have prevented it:
 Nothing was pushed and no work was lost, which is luck rather than design: the
 edit happened to be to a file I could restore from master.
 
+SWEEPING THE COMMITTED SCRIPTS AFTERWARDS FOUND NOTHING, and the reason is worth
+recording because it explains where this class actually lives. Every directory
+change in the checked-in tooling is either inside `$( ... )` or `( ... )` -- a
+SUBSHELL, whose failure cannot affect the parent's working directory -- or a bare
+`cd` with an explicit `|| exit`. Confirmed empirically rather than assumed: a
+subshell whose `cd` fails produces empty output and leaves the caller's directory
+untouched.
+
+SO THE EXPOSURE IS IN AD-HOC COMMANDS, NOT IN COMMITTED CODE. Scripts get written
+deliberately, reviewed once, and reused; ad-hoc chains are composed under time
+pressure, run once, and never read again -- which is precisely when a fallback
+location of "wherever I happen to be" is most dangerous. The habit that
+generalises: WRITE THROWAWAY CHAINS THE WAY YOU WOULD WRITE A COMMITTED SCRIPT,
+subshell-scoped, because the throwaway one has no reviewer.
+
 ## A procedural mitigation inherits the defect of the tool it replaces
 
 I rejected a CLI preview because it would have located a config file itself --

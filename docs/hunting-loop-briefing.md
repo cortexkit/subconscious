@@ -2180,6 +2180,20 @@ TWO RULES:
   does not. File layout and dependency-path form are proxies, and a proxy is
   where a plausible mechanism gets to substitute itself for an answer.
 
+A SECOND INSTANCE, from PLEX the same night, which is what makes this a class
+rather than one person's lapse: their post-merge gate failed, they had a
+MECHANISM (new transport, new blocking calls, plausible boot hang), and it
+outranked TWO measurements they already held -- the same failure signature on
+main, and a pre-merge flake rate they had measured themselves at 10/12. They
+bisected the diff before checking the environment. The cause was the machine.
+Same shape, and it cost a detour rather than a false claim only because they
+were arguing with a test rather than with another seat.
+
+AND THE UNCOMFORTABLE COROLLARY, theirs: THE TIDIER THE OUTPUT FORMAT, THE MORE
+PROVENANCE IT DESTROYS -- and we reach for tables precisely when reporting to
+someone else, which is the moment the loss matters most. A table sent to a peer
+is the highest-stakes place to erase how you know each cell.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

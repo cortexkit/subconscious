@@ -1527,6 +1527,36 @@ difference and say why, rather than letting the two sides quietly agree. Most
 parity suites default the other way, because agreement is what they are built to
 find.
 
+### Re-run a new class on whatever you did not consider the subject
+
+A newly named class gets aimed at whatever you already think of as the code.
+Tests, tooling, fixtures, and scripts are reflexively filed as INSTRUMENTS rather
+than as subjects, which is exactly where the class hides best -- nobody reviews
+them with the same eye.
+
+Three instances in one night, two repos: a rule about transcribed lists was
+written, and the transcribed list turned up in the monitoring tool whose job was
+catching that class. A rule about unstated library promises was applied across
+production and stopped at the test directory, where an assertion indexing
+position `[0]` relied on the engine scanning in insertion order. In both cases
+the author had the category fully in mind and did not point it at themselves.
+
+So: NAME THE CLASS, THEN IMMEDIATELY RE-RUN IT ON EVERYTHING YOU EXCLUDED FROM
+THE SUBJECT. It is mechanical and takes minutes.
+
+A TELL WORTH KNOWING, from the same case: WHEN TWO CALL SITES DISAGREE WITH A
+THIRD, THE ODD ONE OUT IS USUALLY THE ONE THAT DRIFTED. It is cheap because it
+needs no judgement about which form is correct -- only that a majority exists.
+The trap is that DRIFT PRODUCES LOCAL AGREEMENT: two wrong call sites look
+consistent with each other and read as a convention, while the correct one reads
+as the outlier.
+
+AND KEEP THE TWO ARGUMENTS SEPARATE: rejecting a bad remedy is not a reason to
+leave a case alone. "Adding an ORDER BY to a genuinely unordered query would be
+cargo-culting" was correct, and it got used to justify recording the case rather
+than fixing the assertion, which was the actual remedy. A GOOD REASON TO REJECT
+ONE FIX IS NOT A REASON TO REJECT ALL OF THEM.
+
 ### Two constructions over the same ground diff for free
 
 When two mechanisms cover overlapping scope by DIFFERENT construction -- one

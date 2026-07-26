@@ -90,11 +90,16 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
     public var rev: Int
     public var props: BoardBlockProps
     public var digest: BoardDigest
+    /// When this block last changed, in epoch milliseconds.
+    ///
+    /// Additive projection field: absent on alfonso-core builds that predate
+    /// it, so a consumer must treat nil as "unknown" rather than as a time.
+    public var updatedAtMs: Int64?
 
     public var id: String { blockId }
 
     private enum CodingKeys: String, CodingKey {
-        case blockId, lane, kind, rev, props, digest
+        case blockId, lane, kind, rev, props, digest, updatedAtMs
     }
 
     public init(
@@ -103,7 +108,8 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
         kind: String,
         rev: Int,
         props: BoardBlockProps,
-        digest: BoardDigest
+        digest: BoardDigest,
+        updatedAtMs: Int64? = nil
     ) {
         self.blockId = blockId
         self.lane = lane
@@ -111,6 +117,7 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
         self.rev = rev
         self.props = props
         self.digest = digest
+        self.updatedAtMs = updatedAtMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -120,6 +127,7 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
         kind = try container.decode(String.self, forKey: .kind)
         rev = try container.decode(Int.self, forKey: .rev)
         digest = try container.decode(BoardDigest.self, forKey: .digest)
+        updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs)
 
         switch kind {
         case "text": props = .text(try container.decode(BoardTextProps.self, forKey: .props))
@@ -138,6 +146,7 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
         try container.encode(rev, forKey: .rev)
         try container.encode(props, forKey: .props)
         try container.encode(digest, forKey: .digest)
+        try container.encodeIfPresent(updatedAtMs, forKey: .updatedAtMs)
     }
 
     /// Applies the server's newest-wins rule without doing any local revision

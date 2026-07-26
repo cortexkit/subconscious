@@ -496,6 +496,34 @@ live in production.
 The classes are useful for *explaining* a defect once found and for generating
 probe ideas. They are not a decision procedure for which probe to skip.
 
+## What this rung actually finds: unfenced guards, not broken ones
+
+A correction to the whole document, measured rather than assumed. Across four
+seats and eleven fix commits, **almost every fix shipped zero lines outside
+`mod tests`.** Verified by hunk position against each file's test-module
+boundary, with positive controls on commits known to ship code (a feature commit
+showed 2 shipped hunks; a manifest-guard commit showed 2).
+
+So the guards were **present and working in the served binaries the whole time.**
+What was missing was any test that would catch their removal. The mutations that
+found them — delete the call site, watch the suite stay green — were probes, not
+discoveries of live faults.
+
+That distinction matters and is easy to lose in the retelling:
+
+- **Live bug:** "an older projection reaches the provider after a newer one."
+- **Latent bug:** "an older projection *would* reach the provider if anyone ever
+  deleted that line, and nothing would notice."
+
+The second is what was found. It is still worth the night — an unfenced guard is
+one refactor from an unenforced one, and the refactor will pass review because
+the tests are green — but it is not an outage narrowly avoided, and describing it
+as one inflates every future report from the same method.
+
+The exception proves the rule: one fix in the set (a `unwrap_or(Success)`
+fail-open default) **did** ship enforcement code, because that one was genuinely
+wrong rather than merely untested.
+
 ## A fenced decision is not a fenced enforcement
 
 A policy function returning the right verdict and a call site acting on that

@@ -2239,6 +2239,37 @@ that the record was not silent — it was confidently wrong. An operator reading
 `raw_only_fence` in the log would conclude the request was withheld when it was
 sent.
 
+## A label is scoped too, and its scope is the one nobody checks
+
+We treat scope carefully in queries, filters and controls. A LABEL has a scope
+too -- what the name refers to -- and it is checked less than any of them,
+because a name is not obviously a claim.
+
+My deploy screen read "subconscious is 48h behind master" while the daemon had
+been rebuilt an hour earlier. The gap and the changed-file set were computed
+correctly PER BINARY; only the label was per repo. So the number was true of the
+MCP shim and the name invited reading it as the daemon -- and the reader who
+acts on it investigates the artifact that is fine.
+
+WHY IT SURVIVED: thirteen of the fourteen fleet repos ship exactly one binary.
+Repo and artifact are the same thing almost everywhere, so the ambiguity is
+invisible until the one repo where they differ -- and there, the wrong reading is
+the alarming one. This is the sampling trap operating on VOCABULARY rather than
+on data: naming habits get trained on a population where the ambiguity cannot
+bite, and then carry into the case where it can.
+
+The check: for any name in an output an operator acts on, ask what population
+trained it, and whether every member of that population maps one-to-one onto
+what the name denotes. Where it does not, name the narrower thing. A label that
+is unambiguous only because the general case has not arrived yet is a defect
+waiting on a second binary, a second cluster, or a second account.
+
+The operational corollary is worse than the reporting one. An instruction
+carrying an ambiguous name gets RESOLVED BY GUESSING, and the guess fails in
+whatever way that system fails -- which is not always loudly. A seat pointed at
+the wrong module id gets `unknown_module`, which the client RETRIES IN PLACE, so
+a typo presents as a hang rather than an error and gets debugged as one.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

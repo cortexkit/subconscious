@@ -1544,6 +1544,23 @@ the author had the category fully in mind and did not point it at themselves.
 So: NAME THE CLASS, THEN IMMEDIATELY RE-RUN IT ON EVERYTHING YOU EXCLUDED FROM
 THE SUBJECT. It is mechanical and takes minutes.
 
+STATE THE RULE AT THE GRANULARITY THAT MAKES IT TRUE. A corpus of refusals needs
+an accept arm in THE SAME HARNESS AND THE SAME RUN -- not in the same file. A
+refusal-only file paired with an accept-only sibling, both loaded by both
+consumers, satisfies it; a split RUN would not. Had the rule been written at file
+granularity it would have flagged a sound design, and A RULE THAT CRIES WOLF GETS
+DISABLED BY THE PERSON IT WAS WRITTEN FOR.
+
+AND EXPECT THE FIRST PROBE TO BE WRONG. Sweeping eleven vector files for accept
+arms by matching one key returned zero on a file whose schema marks acceptance by
+the ABSENCE of an error key -- a crude probe returning zero is indistinguishable
+from a real zero, and here it would have produced a CONFIDENT FALSE FINDING
+rather than a null. A CORPUS-WIDE PROBE ASSUMES A UNIFORM SCHEMA THAT MULTI-FILE
+CORPORA RARELY HAVE; read each schema before trusting any count. Note also that
+the clean result was only worth something because the probe was wrong once and
+someone noticed: A SWEEP THAT NEVER PRODUCED A SUSPICIOUS INTERMEDIATE IS USUALLY
+A SWEEP THAT WAS NOT MEASURING.
+
 A TELL WORTH KNOWING, from the same case: WHEN TWO CALL SITES DISAGREE WITH A
 THIRD, THE ODD ONE OUT IS USUALLY THE ONE THAT DRIFTED. It is cheap because it
 needs no judgement about which form is correct -- only that a majority exists.

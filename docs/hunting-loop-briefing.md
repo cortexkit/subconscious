@@ -1664,6 +1664,25 @@ guards cannot poison were the entire durable yield -- they make a future fallibl
 addition legible AS a change to an invariant, to someone who never read the
 audit. Eleven flags yielded nothing.
 
+A TOOL THAT INHERITS AN IDENTITY IT DID NOT EARN WORKS UNTIL THE MOMENT IT
+MATTERS. A monitoring probe run from a shell spawned by a supervised process
+inherits that process's identity environment, and a client library that
+auto-attaches those variables will assert the identity on every call. It is
+validated: the daemon checks the spawn nonce it minted, so the probe fails the
+instant that process restarts and the inherited value goes stale.
+
+The timing is the whole defect. IT WORKS RIGHT UP UNTIL A RESTART, which is
+precisely when monitoring is worth having -- so the probe is reliable in every
+condition except the one it exists for. Strip inherited credentials in any tool
+that has no business claiming them.
+
+REPRODUCING IT NEEDED THE FAILURE CONSTRUCTED, NOT RE-RUN. Reverting the fix and
+re-running passed, because each new shell inherits a FRESH nonce from the
+respawned process -- the failure window had already closed. A transient condition
+cannot be reproduced by repeating the action that hit it; it has to be rebuilt
+deliberately (here, by supplying a deliberately stale value). A negative control
+that passes because the world moved on is not evidence the fix was unnecessary.
+
 AN ARTIFACT CAN BE FRESH AND STILL BE BROKEN BY ITS ENVIRONMENT. Every identity
 rung -- mtime, inode, symbol presence -- answers "is this the artifact I built",
 and all of them PASS on a binary whose problem is external. Worked case: a shim

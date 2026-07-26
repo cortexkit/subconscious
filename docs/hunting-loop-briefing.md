@@ -938,6 +938,24 @@ case. Summing them produces a number with no meaningful threshold at all.
 So: if a headline aggregates counters, either threshold the aggregate or display
 the addends separately -- but never threshold one addend and display the sum.
 
+**And my semantic split, while correct in general, was operationally wrong.**
+I argued the two addends needed different treatment because in-flight is
+transient by nature and outcome-unknown is not. Checking the rows showed
+outcome-unknown is *also* a routine transit state on that surface: four intents
+passed through it after one ambiguous attempt and settled completed on the
+reconcile probe, all within 59 seconds.
+
+So the discriminator is not the class, it is **per-item age**. A 59-second
+outcome-unknown is healthy reconcile machinery; a ten-minute one is an incident.
+A distinction that is real in the type system can be absent in the operational
+data, and only the rows tell you which.
+
+**Persistence beats magnitude.** The strongest of the corrected triggers is not a
+threshold at all: re-read ten minutes later and check whether the *same* items
+are still elevated. Churn freezes a different item on every snapshot; a real
+backlog freezes the same ones. That costs one extra read and is far harder to
+fool than any number.
+
 ### And chasing why the refresh parked found a four-day-old zombie
 
 A consult terminal since four days earlier still carried two attempts stuck in

@@ -1544,6 +1544,18 @@ the author had the category fully in mind and did not point it at themselves.
 So: NAME THE CLASS, THEN IMMEDIATELY RE-RUN IT ON EVERYTHING YOU EXCLUDED FROM
 THE SUBJECT. It is mechanical and takes minutes.
 
+DEPLOY IS A WIRING GAP, NOT AN OPERATIONAL CHORE. Merge is a producer and deploy
+is its consumer, so a merged-but-never-shipped change is the producer-no-consumer
+case one layer out from the codebase. It hides for the same reason the in-process
+version does: EVERY PARTICIPANT IS INDIVIDUALLY ALIVE AND CORRECT. The branch
+merged, CI passed, the binary runs, the module reports healthy -- nothing is at
+fault at any single point, so nothing errors, and the only detector is something
+that looks at the whole path and asks whether the END moved.
+
+The four verdicts apply unchanged, including the fourth: a binary deliberately not
+deployed is a real deliberate-refusal case, which is why the finding is a question
+to the owner rather than a defect report.
+
 A CONFLATION IS INVISIBLE WHILE THE TWO THINGS HAPPEN TO COINCIDE. A deploy check
 asked "which changed files reach this binary" and answered it repo-wide. Thirteen
 of fourteen fleet repos ship exactly one binary, so repo-wide and binary-wide

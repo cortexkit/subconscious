@@ -1632,6 +1632,16 @@ ACCURATE AND SILENTLY ANSWERS A BROADER QUESTION THAN THE ONE IT MEASURED. The
 reader cannot detect it from the artifact alone, because nothing in a correct
 bytes-number hints that round trips exist.
 
+AND THE SAME STRUCTURE HOLDS ONE LEVEL UP: THE FINDINGS BUY THE RIGHT TO HAVE THE
+ARGUMENT. When a night's method corrections outlast every defect it found, the
+tempting conclusion is that method is what matters, therefore hold method
+discussions. That is the rule degrading into its own failure mode. Every
+correction worth keeping was forced by a concrete case neither party could
+hand-wave past -- a stack-local mutex that looked like a hazard, flags in a crate
+the binary does not link, a panel reporting bytes without round trips. Strip the
+cases and you get agreeable generalities, several of them wrong, with nothing
+present to catch which.
+
 THE SWEEP BUYS THE RIGHT TO MAKE THE CLAIM, AND THE CLAIM IS WHAT SURVIVES. You
 cannot write "these guards cannot poison, and here is why" until you have read
 all of them -- so the reading is not overhead on the way to a finding, it IS the

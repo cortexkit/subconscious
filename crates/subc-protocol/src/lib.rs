@@ -41,6 +41,25 @@ pub mod session;
 pub use frame::{Frame, FrameBuildError};
 
 /// Per-route bind identity shared by client-facing and module-facing control.
+///
+/// EVERY FIELD HERE IS CLIENT-SUPPLIED AND UNATTESTED. The daemon canonicalizes
+/// `project_root` as a path but does not verify that the caller has any relation
+/// to it, and `harness` and `session` are strings the caller chose. A client
+/// holding the connection key can present any values it likes.
+///
+/// This sits directly above `Principal`, which is the opposite: stamped BY the
+/// daemon from a launch nonce it minted. The two travel together on every
+/// `route.bind`, so a module reading them side by side is reading one fact it can
+/// trust and three it cannot. THE DISTINCTION IS INVISIBLE FROM THE TYPES, which
+/// is why it is written here.
+///
+/// So these fields are for SCOPING AND ATTRIBUTION -- which project's state to
+/// open, which session to thread, what to log -- and never for authorization. A
+/// module that grants capability on `harness` or trusts `project_root` to bound
+/// what a caller may reach has built an authorization check on a value the caller
+/// controls. Gate on `Principal` instead, and where a module needs a caller fact
+/// subc does not stamp, it must establish that fact itself rather than believe
+/// this struct.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BindIdentity {
     pub project_root: PathBuf,

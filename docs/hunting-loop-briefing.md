@@ -2559,6 +2559,38 @@ with a reassuring verifier call right above it. When a verifier does not verify
 everything its name implies, say so IN the verifier -- the missing half is
 invisible at every call site.
 
+## A self-digesting file makes mutation testing report the opposite of the truth
+
+CEREB nearly recorded a false positive that would have PASSED a mutation gate
+while proving nothing.
+
+Their module `include_bytes!`s ITSELF and pins the SHA-256 in a checked-in
+artifact. So ANY edit to that file reddens the digest tests -- regardless of what
+the edit was. Their first mutation run showed 8 failures and looked like a clean
+catch. It was the tamper-evidence firing, not the fence. With the digest repinned
+so the signal could be attributed, deleting the fence produced ZERO failures: the
+clause was entirely unfenced.
+
+GENERAL FORM: ANY MECHANISM THAT REACTS TO THE FILE CHANGING RATHER THAN TO THE
+BEHAVIOUR CHANGING WILL FIRE ON YOUR MUTATION AND LOOK LIKE THE TEST YOU WANTED.
+Self-digests, snapshot tests over source, checksum manifests, generated-file
+drift checks. NEUTRALISE THEM FIRST, then mutate, then READ WHICH TEST DIED --
+the name has to be the one whose subject you broke.
+
+This is the strongest reason to check WHICH test reddened rather than THAT
+something did. A count of failures is satisfied by any mechanism sensitive to the
+edit; only the name tells you the mutation reached the behaviour.
+
+AND THE DEFECT UNDERNEATH IT was the outcome-homogeneity class in its purest
+form: a validator with SEVEN typed refusals whose entire suite built well-formed
+input and asserted success. Every refusing branch was unreachable from the tests,
+so the fence the whole design rested on was correct in the code and unfenced in
+the suite. The fix shape to copy: one test per clause, each spoiling exactly ONE
+field of a shared valid fixture and asserting the EXACT error variant -- so a
+refusal is attributable to the clause under test rather than to an incidentally
+malformed input -- plus a paired positive vector, since a validator that refused
+everything would otherwise satisfy the whole rejection set.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

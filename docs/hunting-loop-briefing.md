@@ -1296,13 +1296,40 @@ signature, recomputed by the receiver and compared. Dropping a field CHANGES THE
 DIGEST, so an older receiver does not ignore it, it FAILS VERIFICATION. There is
 no ignored state available to the field at all.
 
-So the ladder is: BIND the field into something the receiver must verify, which
-makes absence unrepresentable; failing that, ECHO PLUS REFUSAL, where the receiver
-proves it understood and the caller treats missing proof as failure; failing that,
-nothing, and the inversion is silent. Binding is the fix for a plane that CAN
-bind. Echo-plus-refusal is the retrofit for a plane that cannot -- a plain JSON
-control plane, a query string, anything where the receiver cannot tell the field
-was ever there.
+So the ladder is, strongest first:
+
+NEGOTIATE. The sender emits the field ONLY to a peer that proved it understands,
+during capability negotiation, and REFUSES the operation outright when the peer did
+not -- rather than sending the degraded form. The receiver then REQUIRES the field
+on any negotiated session and treats its absence as a protocol violation. Absence
+never occurs rather than being detected, and the proof of understanding is the
+negotiation, which an old peer cannot fabricate. A third seat found their one
+inverting field closed exactly this way: a `mutating` flag whose absence would have
+routed a call around the exactly-once ledger entirely, emitted only to peers that
+negotiated the capability.
+
+THE LOAD-BEARING HALF IS THE REFUSAL, and it is the half most implementations get
+wrong: the tempting behaviour when a peer lacks the capability is to send the
+request in its degraded form and hope. That reintroduces the exact inversion the
+negotiation exists to prevent, with a green handshake in front of it.
+
+BIND. Put the field inside something the receiver must verify -- a digest folded
+into the signature -- so dropping it changes the digest and the request FAILS
+VERIFICATION rather than degrading. Absence is unrepresentable.
+
+ECHO PLUS REFUSAL. The receiver proves it understood in the response, and the
+caller treats missing proof as failure. Detection after the fact, and it depends on
+the caller actually checking. This is the retrofit for a plane that can neither
+negotiate nor bind -- a plain JSON control plane, a query string, anything where
+the receiver cannot tell the field was ever there.
+
+NOTHING, and the inversion is silent.
+
+A RELATED STRUCTURAL FIX WORTH PREFERRING TO ALL THREE: make the field REQUIRED
+rather than optional. The same seat's idempotency key rides a required struct, so a
+peer that drops it produces a schema violation rather than a duplicate execution.
+Where the dedup identity is inseparable from the request, the hazard cannot be
+constructed.
 
 THEIR SENTENCE IS THE ONE TO KEEP: the signed plane cannot have the defect and the
 unsigned plane cannot avoid it by care. The difference is not diligence. It is

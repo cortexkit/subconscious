@@ -918,6 +918,26 @@ A rider that follows from the same case: a freshness floor must compute against
 the *item's* creation time, never against snapshot time, or it inherits exactly
 the staleness it was added to filter.
 
+### A headline number that is a sum cannot be thresholded on one addend
+
+The agreed escalation rule was: treat the degraded line as the known case unless
+one named counter exceeds ten. Applied to a live reading, the surface said **11**
+and the named counter said **7**.
+
+Enumerating resolved it: the displayed number is a sum of two counters with
+different semantics -- seven in-flight, four whose outcome nobody established --
+and the threshold covered only the first. So the second could climb without
+limit, the surface would show a large growing number, and the rule would
+correctly instruct a reader to ignore it. **The trigger would be doing exactly
+what it was designed to prevent.**
+
+The two addends also have different healthy ranges. In-flight is transient by
+nature; outcome-unknown is not, and a growing count there is the genuinely bad
+case. Summing them produces a number with no meaningful threshold at all.
+
+So: if a headline aggregates counters, either threshold the aggregate or display
+the addends separately -- but never threshold one addend and display the sum.
+
 ### And chasing why the refresh parked found a four-day-old zombie
 
 A consult terminal since four days earlier still carried two attempts stuck in

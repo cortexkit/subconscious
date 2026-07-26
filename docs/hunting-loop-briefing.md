@@ -2229,6 +2229,52 @@ annotate rather than delete. The job definitions are the specification of what
 should run once a runner exists -- but leaving them UNANNOTATED is worse than
 deleting them, because the pending check keeps reading as progress.
 
+## A green run on a platform that lacks the expensive step is not evidence about
+## the platform that has it
+
+CEREB measured their conformance suite's `live_daemon` test at 0.19s on Linux CI
+against 5-22s for a first run on macOS -- because the macOS first-exec
+code-signature validation does not exist on Linux. THEIR CI IS THEREFORE
+SYSTEMATICALLY BLIND TO THE ONE TIMING FAULT THAT REPO HAS ALREADY HAD.
+
+The trap is in how the result reads. A green conformance run naturally reads as
+"registration works"; what it establishes is "registration works WHERE THE
+EXPENSIVE STEP DOES NOT HAPPEN". Narrow-but-true again, this time with the
+narrowing supplied by the runner rather than by the check.
+
+IT HAS A SIBLING WORTH SEEING TOGETHER. My own Swift lane asks for a macOS
+runner this org's billing cannot provide: 31 runs, zero steps executed ever. So
+across one fleet, one repo cannot test on macOS AT ALL and another tests on Linux
+and inherits a blind spot for a macOS-only fault. Nobody chose either; both are
+downstream of the same runner constraint. AND NEITHER IS VISIBLE IN A CHECKS
+LIST -- one renders as pending, the other as green.
+
+SO: when a fault class is platform-specific, ask whether the platform that
+EXHIBITS it is the platform that RUNS the tests. If not, say so in the workflow.
+The next reader will otherwise take the green at face value, and they will be
+right to -- nothing in the output says which platform's answer they are holding.
+
+## Two provisioning shapes, one with strictly more ways to be half-done
+
+Same credential, two spellings, different failure surfaces. The fleet's CI token
+minting exists in both: one form needs a single SECRET, the other needs a secret
+AND a repository VARIABLE. Secrets and variables are set by different commands,
+listed by different commands, and are easily provisioned in separate passes
+months apart -- so the two-artifact form has strictly more ways to be
+half-configured, and a missing variable surfaces as a TOKEN-MINTING FAILURE that
+reads as a permissions problem.
+
+CEREB caught theirs pre-flight by checking credentials BEFORE the first run
+rather than debugging the failure after. That ordering is the transferable part:
+for any new lane, enumerate what it reads from repo configuration and confirm
+each one EXISTS, before spending a run to discover it.
+
+THE FINDING IS NOT "ONE REPO WAS MISSING A VARIABLE" but "half the fleet is on
+the shape where that is possible". I swept and found no live gap -- every repo
+referencing a credential has it. Recording the asymmetry is the cheap half;
+unifying four working workflows to remove a failure mode that is not firing is
+churn with a live-credential blast radius.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

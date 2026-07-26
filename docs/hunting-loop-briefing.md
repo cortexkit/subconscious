@@ -879,6 +879,40 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## Is the substituted answer a claim, or the representation of not knowing?
+
+When a fallible step is made infallible, ask what the substitute *asserts*. The
+dangerous substitutions are the ones that read as a positive finding.
+
+```rust
+pub fn is_equal_to(&self, other: &Self) -> bool {
+    self.try_fingerprint().ok() == other.try_fingerprint().ok()
+}
+```
+
+Fingerprinting fails when a record exceeds a size bound. `.ok()` maps that to
+`None` **on both sides**, and `None == None` is `true` -- so two records that both
+failed to fingerprint compare *equal*. A revalidation asking "is this still the
+same target" is answered **yes** at precisely the moment neither side could be
+verified.
+
+That is the swallowed-error class one level up. `catch { return null }` converts
+an error into an absent *value*; this converts it into an absent *comparison*,
+and comparison of two absences manufactures a claim of sameness out of two
+failures. Same family as `unwrap_or(Success)`: both pick the flattering reading
+of "I could not tell."
+
+The discriminator generalises past defaults. A substitution that represents *not
+knowing* (`None`, a typed error, a refusal) is safe to propagate. A substitution
+that represents *an answer* -- success, equality, authorized, unchanged -- is a
+fabricated finding, and every caller downstream will treat it as evidence.
+
+Worth noting how this one was resolved: **zero callers, so it was deleted rather
+than fixed.** Teaching it to refuse would have left two ways to compare the same
+records, one of which someone must remember to prefer -- and the correct version
+already existed one file over. A helper with legitimate uses gets fixed; a helper
+with none gets deleted, and zero callers is the moment deletion is free.
+
 ## An expiry check is only as live as the clock it reads
 
 A pairing ceremony's window check consulted a cached `now`, advanced by a

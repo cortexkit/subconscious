@@ -857,6 +857,44 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## A number that reconciles is not a set that matches
+
+I recomputed a peer's count of 77 unauthorized paths, got 84, and resolved the
+gap cleanly: 84 minus the 7 baseline rows my filter had omitted. The arithmetic
+closed exactly, so I stopped -- and described the group as "the 7 baseline files
+plus the README." The README **is** one of the seven. The eighth file was a
+normative appendix added mid-campaign, and it was the most load-bearing file in
+the whole effort: the one authorized specifically to stop a generator inferring
+schemas from field names and validating against itself.
+
+So the file that exists to prevent the self-oracle defect was the one missing
+from the authority list, and a clean reconciliation is what stopped me looking.
+
+**When a count resolves neatly, that is the moment to enumerate the members, not
+the moment to stop.** A plausible grouping that fixes the arithmetic sounds like
+knowledge and can be entirely invented.
+
+## Mechanism-real is not cost-real
+
+A hunter reported redundant work on a hot path: a manifest fingerprint computed
+before the fast path that would skip it, and a warm-key call made twice per
+configure. Both true, both verified at source, and the report was scrupulous
+about claiming no timing number.
+
+Measured: one directory enumeration plus n+1 metadata probes, 0.03-0.07ms warm,
+0.66ms cold -- against a **twelve second** deadline. Every syscall it counted is
+genuinely there and the total is noise.
+
+The alternative was a targeted fix carrying an invalidation contract whose
+failure mode is a stale fingerprint preserving cross-package edges after a
+manifest change: **unmeasurable latency traded for a correctness hazard.**
+Declining was both the cheaper and the safer call, which is not the usual shape
+of that tradeoff.
+
+One command settled it. Require a cost number before accepting a performance
+finding, and treat "the redundant work is real" as the beginning of the argument
+rather than the end of it.
+
 ## A scope list predicted in advance goes stale the moment you authorize an exception
 
 A campaign draft enumerated every path each slice was permitted to touch. Months

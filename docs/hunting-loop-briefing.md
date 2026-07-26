@@ -936,6 +936,34 @@ knowing* (`None`, a typed error, a refusal) is safe to propagate. A substitution
 that represents *an answer* -- success, equality, authorized, unchanged -- is a
 fabricated finding, and every caller downstream will treat it as evidence.
 
+**But the signature is not the defect, so you cannot grep this class.** A sweep
+of every `is_none_or` / `map_or(true, ..)` / `unwrap_or_default()` site across
+three crates found nine candidates, and *seven were the same idiom doing the
+opposite work*:
+
+```rust
+measured.is_none_or(|value| value > maximum)   // absent measurement => bound exceeded
+```
+
+Here "I could not measure the interval" forfeits the containment claim exactly as
+"the interval was too long" does. Identical expression shape to the defect,
+inverted meaning, and correct -- because the substituted answer is the
+conservative one. Whether `is_none_or` fails open or closed depends entirely on
+which side of the comparison the guard sits.
+
+So **the sweep produces candidates and the reading produces verdicts.** Two of
+the nine meant absence-passes; one of those was clear by construction (the field
+is always populated where it matters, and absence means *not applicable* rather
+than *unknown*, with a fail-closed sibling one line away), and one was genuinely
+ambiguous and got flagged rather than changed.
+
+That last distinction is worth copying: an *unambiguously* wrong helper can be
+deleted without a contract decision, because no reading justifies it. One where
+"nothing configured, nothing to enforce" is a legitimate reading is a **contract
+call, not a cleanup** -- and the tell there was that the status it produces is
+named `Accepted`, which reads downstream as *verified*. File it with its trigger:
+settle the contract before the first caller, since after that it is a migration.
+
 Worth noting how this one was resolved: **zero callers, so it was deleted rather
 than fixed.** Teaching it to refuse would have left two ways to compare the same
 records, one of which someone must remember to prefer -- and the correct version

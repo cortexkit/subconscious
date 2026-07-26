@@ -2148,6 +2148,38 @@ trust a tool whose only output was noise, they PLANTED A TYPO and confirmed it
 flagged that too. Any tool with standing ignorable output needs that check before
 its silence means anything.
 
+## A derived claim and a measured one must not share a format
+
+I published a false claim about another repo TWENTY MINUTES AFTER MEASURING THE
+TRUTH, and the measurement was in my own output the whole time.
+
+THE SEQUENCE: a sweep printed `plexus: clean`, from a loop that opened with
+`[ -d "$r/.github/workflows" ] || continue` -- so `clean` MEANT the repo had
+workflows and was scanned. Twenty minutes later I read that repo's Cargo.toml,
+saw absolute path dependencies, reasoned "a hosted runner cannot build this,
+therefore CI is impossible here", and sent two seats a table reading `NO CI`.
+The repo had been green on every push for two days.
+
+I DID NOT FAIL TO CHECK. I CHECKED, GOT THE RIGHT ANSWER, AND OVERWROTE IT WITH
+AN INFERENCE. The inference was more recent, more vivid, and had a MECHANISM --
+and a mechanism feels like understanding in a way a bare observation does not.
+The measurement was one word in a scroll-back list.
+
+THE TABLE IS WHERE IT BECAME UNRECOVERABLE. Aligned columns present a filesystem
+observation and a thirty-second-old conclusion as THE SAME KIND OF FACT. Erasing
+provenance is what tables are FOR, and it is exactly wrong when the rows differ
+in epistemic status. In prose I would have had to write "plexus, which I have not
+checked, presumably" -- and I would have checked.
+
+TWO RULES:
+· WHEN A MECHANISM CONTRADICTS SOMETHING YOU MEASURED, THE MEASUREMENT WINS AND
+  THE MECHANISM IS THE SUSPECT. Reversing that is the natural direction, not
+  carelessness; the explanation arrives with more force than the fact.
+· ASK THE AUTHORITATIVE QUERY, NOT A PROXY FOR IT. "Does this repo verify on
+  push" is answered by `gh run list`, which cannot be satisfied by a repo that
+  does not. File layout and dependency-path form are proxies, and a proxy is
+  where a plausible mechanism gets to substitute itself for an answer.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

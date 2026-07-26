@@ -556,14 +556,25 @@ public struct RdvEpochPush: Sendable, Equatable {
         guard let typ = raw["typ"] as? String, typ == "epoch_push" else {
             throw RdvJSONError.wrongType(field: "typ")
         }
-        // An empty required identifier is treated as absent (fail closed).
-        guard let org = raw["org"] as? String, !org.isEmpty else {
+        // An empty required identifier is treated as absent (fail closed), and
+        // surrounding whitespace is REFUSED rather than trimmed -- the bytes on
+        // the wire are the canon, and an implementation that silently repairs a
+        // claim accepts inputs the spec forbids while looking correct. The worker
+        // that verifies these claims checks a TRIMMED COPY and then forwards the
+        // JWS verbatim, so its emptiness check constrains a string that never
+        // travels; refusing padding here makes both implementations accept the
+        // same set (fed-core `parse_epoch_push_jws`).
+        guard let org = raw["org"] as? String, !org.isEmpty,
+              org.trimmingCharacters(in: .whitespacesAndNewlines) == org
+        else {
             throw RdvJSONError.missingField("org")
         }
-        guard let account = raw["account"] as? String, !account.isEmpty else {
+        guard let account = raw["account"] as? String, !account.isEmpty,
+              account.trimmingCharacters(in: .whitespacesAndNewlines) == account
+        else {
             throw RdvJSONError.missingField("account")
         }
-        guard let newEpoch = raw["new_epoch"] as? String, RdvDecimalString.isValid(newEpoch) else {
+        guard let newEpoch = Self.normalizeNewEpoch(raw["new_epoch"]) else {
             throw RdvJSONError.invalidDecimalString("\(raw["new_epoch"] ?? "<absent>")")
         }
         // Unknown or malformed reason → refuse, fail closed; never ignore.
@@ -574,7 +585,49 @@ public struct RdvEpochPush: Sendable, Equatable {
         }
         return Claims(org: org, account: account, newEpoch: newEpoch, reason: reason)
     }
+
+    /// Normalize the `new_epoch` claim to canonical decimal text, accepting the
+    /// two shapes the wire carries. Returns nil for anything out of contract.
+    ///
+    /// The credential producer serializes this claim as a JSON NUMBER, so the
+    /// number is the canonical shape and must parse. A canonical decimal string
+    /// is also accepted, matching the rest of this vocabulary and older emitters.
+    ///
+    /// Accepting two shapes here is deliberate and is scoped to this one claim.
+    /// It rides a REVOCATION: refusing the shape the producer actually emits
+    /// drops the revocation, and a dropped revocation leaves the device serving.
+    /// Strictness on this field fails OPEN, which is the opposite of what
+    /// strictness is for. Every other claim keeps its exact shape.
+    ///
+    /// Mirrors fed-core's `deserialize_epoch_push_new_epoch`: a number is
+    /// accepted only when it is a non-negative integer within 2^53-1, and any
+    /// float-typed value is out of contract even when integral-valued, so the
+    /// float-free discipline holds everywhere past this boundary.
+    private static func normalizeNewEpoch(_ value: Any?) -> String? {
+        if let text = value as? String {
+            return RdvDecimalString.isValid(text) ? text : nil
+        }
+        guard let number = value as? NSNumber else { return nil }
+        // CFNumber preserves whether the literal was written as a float, which is
+        // what separates 7 from 7.0 -- the two are equal in value and only one is
+        // in contract. A JSON bool also bridges to NSNumber and is not a number.
+        let type = CFNumberGetType(number)
+        switch type {
+        case .float32Type, .float64Type, .floatType, .doubleType, .cgFloatType:
+            return nil
+        default:
+            break
+        }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+        let integer = number.int64Value
+        guard integer >= 0, integer <= rdvMaxSafeInteger else { return nil }
+        return String(integer)
+    }
 }
+
+/// The largest integer a JSON number can carry without precision loss
+/// (2^53 - 1), matching fed-core's `MAX_SAFE_INTEGER`.
+private let rdvMaxSafeInteger: Int64 = 9_007_199_254_740_991
 
 /// Decode a base64url (RFC 4648 §5, no padding) string, as used by compact JWS
 /// segments. Returns nil on any malformed input. Mirrors fed-core's

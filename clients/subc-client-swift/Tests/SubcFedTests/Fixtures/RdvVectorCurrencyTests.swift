@@ -27,6 +27,7 @@ final class RdvVectorCurrencyTests: XCTestCase {
         "canonical-valid.jsonl": "dc63a68a2ffd500651ba37946d743abb2f069c1f90ab5379857d52fad739fddc",
         "decimal-string.jsonl": "61e658691267c7f3b528fdc6b1c87c4fc16ab803a203dfbb2d5c10fae4b8b2c1",
         "device-record.jsonl": "78680f32dec61fd98b504ce5a38f6db7fd5ea4ea499a0c36b0d2479c25f04dad",
+        "epoch-push-claims.jsonl": "3a04398e882d4dec44e7c1f65f56976342ec3c4cf3d6734aae2b74088d21883a",
         "nesting-depth.jsonl": "deefbb3e6efdc7cc6d677f862711e2d00483c1acbcd3da3724cb548e8b5969a6",
         "parse-reject.jsonl": "c7fcc91cd4c39319331bdd69e00dcdfd3294216eb2be65d84c50e1edde9e0cb2",
         "pipe-token.jsonl": "c9c061a52f3dcb9896b13a1827b7e07c4b2db4330123d99611fb635920415996",

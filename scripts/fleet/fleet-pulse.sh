@@ -406,6 +406,21 @@ done
 # fails. mtime is also only a screen: proving WHICH build runs needs the artifact
 # itself (inode for no-replace-in-place, symbol presence for which build).
 dim "  covers local binaries only -- cloud-deployed code cannot appear here"
+# The runtime-file count is an UPPER BOUND, and saying so here is cheaper than
+# the alternative. The filter excludes tests/ and benches/ DIRECTORIES, but a
+# Rust file commonly carries its tests inline under `#[cfg(test)] mod tests`, and
+# a path-based filter structurally cannot see a region defined by an attribute.
+# So a commit that only adds an in-file test still counts as an unshipped runtime
+# file. Detecting that properly means deciding whether each changed hunk falls
+# inside a conditionally-compiled module -- brace matching gets this wrong on
+# `#[cfg(test)]` applied to individual items, which is how a filter of that shape
+# reads a file as clean while it ships real code.
+#
+# Over-reporting is the deliberate direction: a missed stale deploy costs far
+# more than a line someone checks and dismisses. But an unstated upper bound
+# erodes the section's credibility the first time someone investigates a phantom,
+# so the bound is printed rather than remembered.
+dim "  count is an upper bound: in-file #[cfg(test)] changes are counted as runtime"
 echo
 
 dim "idle is a proxy for attention, not for progress -- confirm before acting"

@@ -111,5 +111,20 @@ const missing = EXPECTED_SEATS.filter((seat) => !reported.has(seat))
 for (const seat of missing) {
   console.log(`  ${seat.padEnd(22)} ${"MISSING".padStart(8)}  not in roster -- absent, not idle`)
 }
+// A MISSING line that only states a fact becomes furniture: it prints unchanged
+// on every run, and a line that never changes stops being read. CKTUI printed
+// here for eight days before anyone looked, and looking found a repo with no
+// remote at all.
+//
+// So the line carries its resolution. Both branches are one action, and taking
+// either one silences it honestly.
+if (missing.length > 0) {
+  console.log(
+    `\n  ${missing.length} seat(s) absent. Each is one decision: re-register the session,\n` +
+      `  or delete the name from EXPECTED_SEATS to record it as retired.\n` +
+      `  Before retiring one, run check-repo-protection.sh -- an absent seat is the\n` +
+      `  most likely owner of work nobody is pushing.`,
+  )
+}
 
 client.close()

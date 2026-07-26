@@ -2377,6 +2377,45 @@ standing instruction should be to report the confusing signal rather than the
 tidy one -- a smoothed-over anomaly is a defect that has been given a reason to
 stay.
 
+## A capability table is reviewed one row at a time and defeated by a pair
+
+A deny table lists operations individually, so it gets reviewed individually --
+and a privilege boundary can be crossed by a COMPOSITION that no single row
+contains.
+
+ENGRAM's case: a slice widened a worker-token deny range from one operation to
+seven in a single keystroke, sweeping in every newly added retention op. Fixing
+it meant deciding each op, and two of them looked alike: a retention SWEEP and a
+retention POLICY SET. Both arrived in the same slice, both are retention, neither
+is destructive alone.
+
+But policy is the INPUT that decides what the sweep destroys. Admit both and one
+credential can set the bound and then run the operation that honours it. The
+sweep's safety argument -- signed plan, lease, grace window, gateway
+revalidation -- holds only while the policy those mechanisms evaluate AGAINST is
+not writable by the same credential. Admitting the pair makes every one of those
+checks evaluate a bound the caller just chose.
+
+THE DISCRIMINATOR: admit an operation the unattended path MUST call to do its
+job; deny an operation that SETS THE BOUNDS that path operates within. A sweep is
+not a configuration act, even when both live in the same feature and were written
+in the same week.
+
+THE REVIEW HABIT: for any capability grant, ask what the granted set can do IN
+COMBINATION, not one row at a time. Rows enter a table one at a time and are read
+back one at a time, so a composition has no natural moment at which anyone looks
+at it.
+
+AND THE TEST SHAPE THAT HID IT: the guard test computed its expected value with a
+CHARACTER-FOR-CHARACTER COPY of the implementation's match expression -- the same
+expression evaluated twice. It iterated every operation byte, so it LOOKED
+exhaustive; the enumeration was real and the oracle was empty. A capability table
+must be tested by an explicit enumeration written from the POLICY, each entry
+named with its reason, and mutation-proved in BOTH directions -- admitting a
+denied op must redden it, and denying an admitted op must too. A one-directional
+proof leaves the fail-open half unmeasured, and on a capability table fail-open is
+the half that matters.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

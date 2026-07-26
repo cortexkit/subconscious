@@ -879,6 +879,40 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## An expiry check is only as live as the clock it reads
+
+A pairing ceremony's window check consulted a cached `now`, advanced by a
+once-per-second countdown task. iOS suspends that task while the app is
+backgrounded. So: open the ceremony, background the app, let the window lapse in
+real time, foreground -- the countdown never ran, the cached time is stale, **the
+window reads live**, and the trust-establishing confirm proceeds.
+
+A fail-open on the step that establishes mutual trust, in a guard whose own doc
+comment read *"authoritative (fail-closed)."*
+
+Any deadline judged against a cached clock inherits the liveness of whatever
+advances it -- a timer task, a poll loop, an event tick -- and every one of those
+can be suspended, starved, or descheduled. Judge against `max(cachedClock,
+realClock)`, or read the real clock at the decision point.
+
+## Guards that shadow each other are each individually unfenced
+
+The same probe found two guards that could each be deleted with the full suite
+green -- not because they were untested, but because **each was standing behind
+the other.** Delete the window check and the state guard refuses; delete the
+state guard and the window check refuses. The single test that covered both drove
+the clock through a tick that also moved the state, so the two were never
+exercised apart.
+
+Coverage of a *conjunction* is not coverage of its terms. To fence N guards on
+one path you need N tests, each of which reaches the guard under test with every
+other guard satisfied -- and the mutation is what proves you got there.
+
+A corollary that caught a bad test on this same path: the first isolation tests
+passed *and* passed against their own mutants, because a third guard refused
+before control ever reached the one under test. **If the mutant does not kill
+your new test, the test is the suspect.**
+
 ## A suite that shrinks and stays green
 
 The sharpest instance of the whole family, and I reproduced it myself rather than

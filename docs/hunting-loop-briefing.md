@@ -2302,6 +2302,28 @@ find one, because the permissive route you found is rarely the only one, and
 patching the single route that exposed the defect leaves the identical hole for
 the next caller.
 
+THE CADENCE THIS EARNS: WHEN A DOUBLE IS CAUGHT LYING ONCE, SWEEP EVERY ROUTE IT
+SERVES BEFORE LEAVING. ENGRAM found two in one day by pulling a single thread --
+first five routes answering success without credentials, then a route answering
+`200 {}` to every object read, which meant a cloud-primary manifest path had zero
+coverage while looking covered. A double is authored once, by one person, under
+one set of assumptions; a permissive route is evidence about the AUTHORING, not
+about that route.
+
+AND A SECOND BLIND THAT STACKS ON THE FIRST: a test flag that suppresses
+construction of the very subsystem under test. Their cloud arm passed a
+capture-only flag that skips building the cloud target entirely, so the arm was
+not exercising a degraded cloud -- IT HAD NO CLOUD AT ALL. Two independent blinds
+on one arm, either sufficient. When a test configures the system differently from
+production, the difference is a claim that the difference does not matter, and
+that claim is rarely checked.
+
+THE ASSERTION SHAPE THAT KEEPS SUCH AN ARM HONEST: assert the SPECIFIC failure
+that must not occur, not a blanket success. Their cloud arm legitimately ends in
+an unrelated downstream error, so `is_ok()` would have been a lie and `is_err()`
+would pass even if the subject never ran. "Not THIS error" is the honest
+assertion when the run has legitimate failures downstream of what is under test.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

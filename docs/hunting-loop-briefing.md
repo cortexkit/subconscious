@@ -2148,6 +2148,34 @@ trust a tool whose only output was noise, they PLANTED A TYPO and confirmed it
 flagged that too. Any tool with standing ignorable output needs that check before
 its silence means anything.
 
+## A fallback can substitute a weaker operation, not just a weaker verdict
+
+The swallowed-status family has a member that is harder to see, because nothing
+visibly discards a status. `strict-thing || loose-thing` does not suppress a
+verdict -- it RUNS SOMETHING ELSE and reports that instead.
+
+PROOF CASE: `bun install --frozen-lockfile || bun install`, in both a CI lane
+and a RELEASE lane. The strict form fails in exactly one situation -- the
+committed lockfile disagrees with package.json -- and that is precisely the
+situation both lanes must refuse. The fallback resolved fresh versions, rewrote
+the lock inside the runner, ran typecheck and tests against those unreviewed
+versions, and in the release lane PUBLISHED the result. Every step green.
+
+WHAT MAKES IT HARD TO SPOT: read as ordinary robustness ("try the strict thing,
+fall back if it does not work"), it looks careful. The question that exposes it
+is not "what does the fallback do" but WHEN DOES THE FIRST COMMAND FAIL -- and
+if the answer is "exactly in the situation this gate exists to catch", the
+fallback is not resilience, it is the bypass.
+
+MEASURE BEFORE REMOVING. Run the strict form yourself: if it succeeds today the
+fallback is dead weight and deleting it costs nothing, and if it fails you have
+found a real drift that the fallback has been hiding. Either way you learn
+something; guessing gets you a red pipeline and no explanation.
+
+AND PROVE THE STRICT FORM ACTUALLY FENCES. Add a dependency to package.json
+without touching the lock, confirm the strict form refuses it, restore. Without
+that, "strict" is an assumption about a flag's name.
+
 ## Distinguish the benign failure by state, not by its wording
 
 When a command's failure is sometimes benign, the tempting test is a substring

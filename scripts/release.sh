@@ -8,8 +8,16 @@ set -euo pipefail
 #   e.g. ./scripts/release.sh subc-transport 0.1.0
 #
 # Publishable crates: subc-protocol, subc-transport (subc-core is publish=false).
-# On the pushed tag, CI (release.yml) takes over: verify (3-OS fmt/clippy/test)
-# → cargo publish to crates.io.
+# On the pushed tag, CI (release.yml) takes over: verify (fmt/clippy/test on
+# ubuntu + windows) → cargo publish to crates.io.
+#
+# NOT three platforms, despite what this said until 2026-07-26: ci.yml's matrix
+# is ubuntu and windows only. macOS is absent because Blacksmith has no macOS
+# runners and GitHub-hosted macOS is billing-blocked for this private free-plan
+# org -- the same constraint that leaves .github/workflows/subc-fed.yml queued
+# forever. So a release is verified on two platforms and SHIPS a darwin-arm64
+# asset built by scripts/release-darwin-binaries.sh on the dev box, which is the
+# one platform combination CI cannot check.
 
 CRATE="${1:-}"
 VERSION="${2:-}"
@@ -92,4 +100,4 @@ fi
 git tag -a "$TAG" -m "Release $TAG"
 git push origin HEAD
 git push origin "$TAG"
-echo "  ✓ Pushed $TAG — CI will verify (3-OS) then publish $CRATE v$VERSION to crates.io"
+echo "  ✓ Pushed $TAG — CI will verify (ubuntu + windows) then publish $CRATE v$VERSION to crates.io"

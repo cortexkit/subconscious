@@ -60,7 +60,8 @@ mason does its own investigation and fix directly, never delegating).
    before merge. Wrong fix on a right diagnosis gets bounced.
 7. **Merge + gate.** Merge to master. Gate = full workspace tests green + clippy
    native + clippy `x86_64-pc-windows-gnu` + `cargo fmt --check` + `check_comments`
-   on the diff, then push (CI confirms 3-OS). For TS/Swift touched: their suites +
+   on the diff, then push (CI confirms ubuntu + windows; there is no macOS runner,
+   so a macOS-only fault is not covered). For TS/Swift touched: their suites +
    typecheck too.
 8. **Update ledger.** Append found/fixed/rejected/escalated entries with SHAs.
 9. **Finalize** both mason tasks (accept with scores, or reject with reasons).

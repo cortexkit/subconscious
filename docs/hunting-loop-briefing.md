@@ -1035,6 +1035,29 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## Recomputed is not reproduced
+
+An artifact that records command output can be checked two ways, and only one of
+them proves anything about the commands.
+
+RECOMPUTING checks the document against itself: embedded bytes hash to recorded
+digests, the file list matches the range, vocabularies are closed. All necessary,
+and all satisfiable by a document nobody ever ran a command to produce. Internal
+consistency is a property of the author's arithmetic.
+
+REPRODUCING checks the document against the world: check out the candidate
+commit, run one of the recorded commands, compare the bytes. That is the only
+check separating CAPTURED evidence from TRANSCRIBED evidence.
+
+The distinction generalises past evidence documents. Every field is either a
+claim about something recomputable -- recompute it -- or a claim that AN ACTION
+OCCURRED, which only re-performing the action can test. Ask which fields are of
+the second kind. There are usually few, and they carry all the weight.
+
+This is the transcribed-allowlist rule one layer up: an allowlist agrees with its
+source only at the moment it was typed, and a recorded output agrees with the
+command only at the moment it was run.
+
 ## A substring match produces a confident, specific, wrong answer
 
 A capability scan reported that a parser module performed randomness. The
@@ -1313,6 +1336,19 @@ whose coverage is unfalsifiable, and the count is the only thing that makes
 deletion visible. Pair it with loud failure at the load site -- a missing or
 malformed input must abort, never return null -- because embedding the data
 without fixing the swallow just relocates the same silence.
+
+## Control the denominator, not only the result
+
+A check reporting zero failures over zero items reads exactly like a clean pass.
+
+My first digest pass over an evidence document found zero JSON blocks and
+reported zero mismatches, because the document was raw JSON and the pattern
+looked for markdown code fences that did not exist. The result line was true and
+the check was empty.
+
+Any check that iterates must assert its ITEM COUNT before its failure count means
+anything. Same shape as a data-driven suite that silently shrinks when its input
+files move: the pass count drops, nothing fails, CI stays green.
 
 ## Before specifying a check, run each of its rules by hand against its subject
 

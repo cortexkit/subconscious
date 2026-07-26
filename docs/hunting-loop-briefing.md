@@ -879,6 +879,37 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## Before specifying a check, run each of its rules by hand against its subject
+
+Two unsatisfiable specifications in one night, from the same author, from the
+same gap. The first: a scope list that had gone stale. The second: a purity rule
+forbidding filesystem access in code that performs it at two known call sites.
+Both rules were written into a task prompt and **never once evaluated against the
+module they govern.**
+
+The existing habit -- checking that the artifacts a task references actually
+exist -- catches missing subjects. It does not catch *a rule the existing code
+already violates*. That is a different check and it costs about five minutes per
+rule.
+
+### And when the exception looks cheap, read the code it excuses
+
+The proposed narrow exception was justified on the grounds that the reads were
+hash-pinned and therefore not arbitrary capability. Reading the call sites
+killed that: **both swallow their errors** (`catch { return null }`,
+`read_to_string(...).ok()?`), so a missing or moved file does not fail -- the
+parser proceeds as though the schema did not exist. The hash is verified in the
+repository at gate time; the runtime path verifies nothing.
+
+So the pinning that made the exception sound was not enforced where the exception
+needed it. The real choice was never strict-versus-pragmatic; it was between
+removing the dependency and keeping a **silent-degradation path inside the
+artifact whose entire purpose is independence from its environment.**
+
+Approval of a gate is not a promise the file is frozen. A gate that passed on
+code containing a rule violation did not prove the violation absent -- it proved
+the gate did not look.
+
 ## Check coverage in both directions, or neither check is tight
 
 An authority document listing which paths a campaign was permitted to touch needs

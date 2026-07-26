@@ -2514,6 +2514,30 @@ was about MY specimen, which I could check and they could not. Where two seats
 discuss one artifact, the one holding it owes the check -- an assertion about
 someone else's evidence is the least-defended claim in any exchange.
 
+## Retention outlives evidence: the oldest item is the one you can least adjudicate
+
+A cleanup predicate that consults a record to decide safety has an expiry the
+designer rarely models: THE RECORD IS ALSO SUBJECT TO RETENTION, and it usually
+ages out faster than the thing it describes.
+
+PROOF CASE: a prune predicate needed a task's record to distinguish "this commit
+deletes files because the task was to delete them" from "this commit photographed
+a worktree mid-teardown". Searching all 3,734 store rows for the oldest candidate
+returned ZERO -- the branch outlived its own ledger row. So THE BRANCHES MOST
+WORTH PRUNING, being oldest, ARE EXACTLY THE ONES WHOSE ADJUDICATING EVIDENCE NO
+LONGER EXISTS.
+
+THE ANTI-PATTERN THIS FORBIDS: treating a missing record as the benign case. An
+absent row is not evidence of teardown-photography, nor of anything else -- it is
+the same absent-vs-unknown discriminator that has appeared all week, arriving
+through a retention policy. Add a REPORTED-BUT-NEVER-AUTO-ACTED class rather than
+letting absence fall into either branch.
+
+DESIGN CONSEQUENCE: when a predicate's safety depends on a lookup, compare the
+retention horizon of the LOOKUP TABLE against the lifetime of the thing being
+judged. If the table is shorter-lived, the predicate is strongest exactly where
+it is least needed and weakest exactly where it is.
+
 ## A name is a count without a breakdown
 
 Sorting artifacts by their directory name is supplying the plausible attribution

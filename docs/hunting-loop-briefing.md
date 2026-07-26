@@ -1468,6 +1468,36 @@ is a claim about the world, and the number is a claim about the list. Add a
 qualifying item, forget the list, and both stay consistent forever. The
 denominator has to come from the thing being enumerated, not from the enumeration.
 
+### A fixture whose point is the literal form must carry its bytes verbatim
+
+Parsing a golden vector and re-encoding it before feeding the subject erases the
+distinction the vector exists to test, and the assertion then passes forever over
+an input the subject cannot receive.
+
+Worked case: a reject-vector carrying `7.0` was fed through a parse-and-re-encode
+step whose JSON writer renders an integral double as `7`. The decoder received an
+integer, the "this must be refused" assertion passed, and nothing ever presented
+a float. The fix is to slice the raw bytes out of the fixture line and use them
+unchanged.
+
+The hazard is library-specific and that is what makes it dangerous. One JSON
+library preserved the float discriminant through the same round trip; two others
+collapsed it. So the same test shape is sound in one language and vacuous in
+another, and reading the code cannot tell you which.
+
+WHERE A ROUND TRIP IS KEPT DELIBERATELY, ENFORCE THE LIBRARY PROPERTY RATHER THAN
+RECORDING IT. A comment saying "this works because the encoder preserves floats"
+does not fail when the encoder stops preserving floats; a test asserting that
+`7.0` survives re-encoding as `7.0` fails on exactly that day, with a message
+naming why. A dependency that is recorded is not guarded.
+
+RELATED, from the same exchange: A LIMITATION ASSERTED AS A DIVERGENCE IS SAFE;
+THE SAME LIMITATION ALLOWED TO PASS AS AGREEMENT IS THE DANGEROUS ONE. Where one
+implementation genuinely cannot enforce a rule, a parity suite should require the
+difference and say why, rather than letting the two sides quietly agree. Most
+parity suites default the other way, because agreement is what they are built to
+find.
+
 ### Two constructions over the same ground diff for free
 
 When two mechanisms cover overlapping scope by DIFFERENT construction -- one

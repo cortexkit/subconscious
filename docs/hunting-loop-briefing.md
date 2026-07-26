@@ -1501,7 +1501,24 @@ the symptom.
 The pattern generalises past JSON. Anywhere behaviour depends on a library
 preserving something it never promised -- ordering, precision, encoding form,
 iteration stability -- there are two options: REMOVE THE DEPENDENCE, or PIN IT
-WITH A TEST. Commenting it is the third option that looks like the second.
+WITH A TEST. Commenting it is the third option that looks like the second. The
+argument for pinning over commenting, in one line: THE COMMENT IS READ BY SOMEONE
+WHO ALREADY SUSPECTS, THE ASSERTION IS READ BY SOMEONE WHO DOES NOT.
+
+Prefer removal wherever it is cheap; pinning is for where you WANT the dependence
+and need it to fail loudly if it dies. A sweep that comes back "mostly removed,
+the unavoidable one pinned" is the healthy shape.
+
+The same hazard appears TEST-SIDE, where it is easy to wave off. A test that
+indexes position `[0]` on a query with no ORDER BY passes because the engine
+happens to scan in insertion order -- an unstated promise, relied on by an
+assertion. The fix is NOT to add an ORDER BY to a genuinely unordered query,
+which changes production to satisfy a test; it is to assert over the SET rather
+than by position, so the assertion matches the contract that actually exists.
+Worth doing even when the risk looks small, because the failure mode is the
+expensive kind: AN INTERMITTENT FAILURE GETS RE-RUN AND DISMISSED, burning
+attention repeatedly and teaching the reader to distrust the suite, where a test
+that fails always gets fixed once.
 
 RELATED, from the same exchange: A LIMITATION ASSERTED AS A DIVERGENCE IS SAFE;
 THE SAME LIMITATION ALLOWED TO PASS AS AGREEMENT IS THE DANGEROUS ONE. Where one

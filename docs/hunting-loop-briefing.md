@@ -2660,6 +2660,27 @@ PRACTICAL: put the restore in a trap/finally, or budget the mutation run
 explicitly and treat exhaustion as an outcome you will have to clean up after,
 not as an error path you can ignore.
 
+## A clean apply proves the patch applied, not that it was the patch you reviewed
+
+BROCA cherry-picked a fix using the sha from the delivery record. It was the sha
+of the FIRST delivery, not the revision they had reviewed and asked for. THE PICK
+APPLIED CLEANLY, because both versions apply to the same base -- so nothing
+failed, nothing warned, and the operation reported exactly what they hoped.
+
+What caught it: comparing the picked `--stat` against the diff they had just
+read. 27 insertions where the revision had 50 insertions and 16 deletions.
+
+THE PRESCRIPTION: after any revision round, pick from the WORKTREE HEAD rather
+than a recorded sha, and verify with an IDENTIFIER THAT EXISTS ONLY IN THE
+REVISED VERSION. The identifier check is the stronger half -- it is a positive
+fact rather than an arithmetic coincidence.
+
+GENERALISES PAST CHERRY-PICKS to anything addressed by a recorded reference: a
+sha, a tag, a build id, an artifact URL. Success proves the reference resolved,
+never that it resolved to what you meant. And the danger is specific to the case
+where BOTH candidates are valid: if the wrong sha did not apply you would learn
+immediately, so THE FAILURE IS ONLY POSSIBLE WHERE IT IS ALSO SILENT.
+
 ## Checking a table against the prose it summarises
 
 The checklist above is a summary of the body, so it can drift from it in two

@@ -1971,12 +1971,37 @@ impl ControlHandler {
                 status: None,
                 live: None,
             },
-            (PollKind::Liveness, RoutePollSnapshot::Bound { module_id, .. }) => {
-                let live = self
-                    .process_liveness
-                    .as_ref()
-                    .and_then(|source| source.process_live(&module_id))
-                    .unwrap_or(true);
+                (PollKind::Liveness, RoutePollSnapshot::Bound { module_id, .. }) => {
+                    // ABSENCE HERE MEANS "NOT SUPERVISED", NOT "UNKNOWN", and that
+                    // is what makes reporting `true` correct rather than a
+                    // confident guess. `process_live` returns None only when the
+                    // module id has no supervisor snapshot at all -- an
+                    // externally-started module the daemon did not spawn -- and
+                    // for those the supervisor has no opinion to offer, ever. It
+                    // is never None for a supervised module in an unknown state:
+                    // a supervised module always has a snapshot, and the answer
+                    // comes from `state == Running && process_alive`.
+                    //
+                    // The route is Bound, so the module completed a HELLO on a
+                    // live connection; "the process this route points at is
+                    // running" is therefore attested by the binding rather than
+                    // assumed. Reporting `false` for an unsupervised module would
+                    // be the actual lie -- it would tell a client its healthy
+                    // route is dead because the daemon does not manage the
+                    // process.
+                    //
+                    // IF `process_live` EVER GAINS A THIRD CASE -- a supervised
+                    // module whose liveness is genuinely unknown, e.g. a snapshot
+                    // that has not been populated yet -- THIS DEFAULT BECOMES
+                    // WRONG and must split: unsupervised stays true, unknown
+                    // becomes null so the client can tell the two apart. The
+                    // response field is already `Option<bool>`, so the wire can
+                    // carry that distinction today.
+                    let live = self
+                        .process_liveness
+                        .as_ref()
+                        .and_then(|source| source.process_live(&module_id))
+                        .unwrap_or(true);
                 ClientControlResponse::RoutePoll {
                     route_channel,
                     route_epoch,

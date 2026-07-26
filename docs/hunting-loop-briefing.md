@@ -2324,6 +2324,38 @@ an unrelated downstream error, so `is_ok()` would have been a lie and `is_err()`
 would pass even if the subject never ran. "Not THIS error" is the honest
 assertion when the run has legitimate failures downstream of what is under test.
 
+## A marker that looks like a marker but predates the change
+
+A deploy differential -- prove the new binary is really running by finding a
+string the old one lacks -- has a well-known failure and a less-known one.
+
+The known one: the probe cannot read at all, so every string reads absent and the
+result looks like a clean "old binary". A POSITIVE CONTROL fixes it: a string
+present in BOTH binaries, which must be found in both.
+
+The less-known one is the inverse and it fails in the dangerous direction. THE
+MARKER ITSELF DOES NOT DISCRIMINATE. ENGRAM's case: the obvious marker for a
+credential-ordering fix was `"worker token minting failed"` -- topical, specific,
+sounds new -- and it reads 3 in BOTH binaries, because the fix REUSES an existing
+string. A probe built on it reports the marker present on the OLD binary, and the
+reader concludes the swap succeeded without anything having swapped.
+
+So a differential needs THREE strings, not two:
+  - one present in both (proves the probe can read),
+  - one absent-then-present (the marker),
+  - and a REJECTED marker candidate, stated alongside, showing the marker was
+    CHOSEN rather than assumed.
+
+The third is the discipline worth adopting. Recording what you rejected is the
+only evidence that you checked; a single accepted marker is indistinguishable
+from the first string that came to mind.
+
+AND THE PROPOSITION A DIFFERENTIAL PROVES IS NARROWER THAN THE ONE YOU WANT.
+Inode and symbol checks answer "did the deploy happen". They cannot answer "did
+the deploy fix the thing" -- for that you need a functional probe that exercises
+the repaired path end to end. On a box where the fix is needed, only the second
+fails before the deploy, which is what makes it the real gate.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

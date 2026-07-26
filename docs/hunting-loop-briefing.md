@@ -812,6 +812,19 @@ relative to the decision is.** A release-time check reports once someone is
 already publishing — attached to the action you least want to abort, with the
 whole merge-to-release window invisible behind it.
 
+## A pipeline reports the last command's exit code, not the work's
+
+Twice in one deploy: `cargo build ... | tail -5` returned **exit 0** while cargo
+had failed on a wrong package name, and `bash script.ts || bun script.ts` ran
+ImageMagick's `import` binary, exited 0, and never reached the fallback. Both
+printed an error and both reported success.
+
+Any build, test, or check piped into a formatter reports the *formatter's*
+success. Use `set -o pipefail`, or check the real command's status before
+formatting its output. The failure is silent by construction: the error text is
+right there on screen while the exit code says fine, and automation reads the
+exit code.
+
 **A fix does not inherit the confidence of what it repaired.** The path anchor in
 that check genuinely fixed the multi-row problem *and* genuinely created a false
 all-clear — and neither was findable by reasoning about the other. It took running

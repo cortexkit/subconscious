@@ -2194,6 +2194,41 @@ PROVENANCE IT DESTROYS -- and we reach for tables precisely when reporting to
 someone else, which is the moment the loss matters most. A table sent to a peer
 is the highest-stakes place to erase how you know each cell.
 
+## A pending check is the one status nobody reads as broken
+
+A workflow that CANNOT ACQUIRE A RUNNER does not fail. It queues, renders as
+pending, and gets cancelled by the next push -- so it produces neither a red
+mark nor a green one, and a reader scanning a checks list sees "still running"
+for as long as the repo exists.
+
+MEASURED IN MY OWN REPO, minutes after landing the authoritative-query rule and
+applying it here rather than reading the workflow file: 31 runs, 30 cancelled,
+one in flight. Zero successes, zero failures, and ZERO STEPS EXECUTED in any of
+them. Run lifetimes from 8 minutes to 7 hours, which is not a build -- it is a
+queue wait terminated by the next push. The lane had never verified anything and
+nothing anywhere said so.
+
+WHY IT SURVIVES: every other absence has a signal. A deleted workflow disappears
+from the checks list; a failing one is red; a skipped one says skipped. QUEUED
+IS THE ONLY STATE THAT LOOKS LIKE WORK IN PROGRESS, and it looks like that
+permanently.
+
+THE CHECK: for each workflow, ask for its CONCLUSION DISTRIBUTION, not its most
+recent status. `gh run list --workflow=X --limit 60 --json conclusion` grouped by
+value answers "has this ever completed" in one command. A tail of cancellations
+is normal on a busy branch; ZERO SUCCESSES ACROSS THE WHOLE HISTORY is a lane
+that has never run.
+
+AND CHECK WHETHER ANYTHING CALLS IT before touching it. A workflow declaring
+`workflow_call` may be a dependency of a release lane, in which case a
+never-acquirable runner is not a dead lane but a HANG in something that matters.
+
+WHEN THE CAUSE IS UNFIXABLE FROM THE FILE (here: GitHub-hosted runners blocked
+for a free-plan private org, and the substitute runner class has no macOS),
+annotate rather than delete. The job definitions are the specification of what
+should run once a runner exists -- but leaving them UNANNOTATED is worse than
+deleting them, because the pending check keeps reading as progress.
+
 ## An impossible number is a gift; a merely wrong one is not
 
 `git ls-files '*.rs' | xargs wc -l | tail -1` reports the LAST BATCH's total, not

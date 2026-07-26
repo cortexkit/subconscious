@@ -91,6 +91,20 @@ first, because it is DIALLED. Both collapse into one sentence worth carrying:
   EVERY PLACE THAT NAMES THE MODULE BY STRING MUST ACCEPT THE NEW NAME BEFORE THE
   MODULE STARTS USING IT.
 
+AND THE GATE IS A RUNNING ARTIFACT, NEVER A MERGED COMMIT. A trust allowlist on
+main grants nothing; the supervised process is still executing the binary it was
+started with. AFT made this correction against their own earlier framing after
+landing the fix, and it is the same condition as the apps gate one paragraph up --
+there it is an INSTALLED build on a device, here it is a STAGED AND BOUNCED binary
+on this box. Both collapse into: THE PRECONDITION IS SATISFIED BY WHAT IS RUNNING,
+NOT BY WHAT IS ON MAIN.
+
+So the pre-window checklist has a deploy list, not a merge list: the three
+allowlist holders bounced onto binaries carrying their fix, and every app rebuilt
+and installed. Verify each by the running image rather than by a commit -- inode
+against the deploy path, or a symbol differential -- because "merged" and "green"
+are both true of a binary nobody is executing.
+
 So three more repos join the pre-window list, one line each -- add the new name
 beside the old, keep both across the window, drop the old one afterwards.
 

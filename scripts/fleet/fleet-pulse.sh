@@ -265,9 +265,26 @@ while read -r modid binname; do
     printed=1
     continue
   fi
-  [ -f "$BIN/$binname" ] || continue
-  head_epoch=$(cd "$dir" && git log -1 --format='%ct' 2>/dev/null) || continue
-  bin_epoch=$(stat -f '%m' "$BIN/$binname" 2>/dev/null) || continue
+  # Three ways a module can drop out of this check. All of them USED TO BE SILENT,
+  # which meant a clean section could cover any subset of the fleet and read
+  # exactly like a clean section covering all of it. Zero modules hit these today,
+  # but that is a property of today's state rather than of the check -- and the
+  # first time one does, the reader must not be told the fleet is current.
+  if [ ! -f "$BIN/$binname" ]; then
+    echo "  $modid: $binname is not in the deploy dir -- UNCHECKED, not current"
+    printed=1
+    continue
+  fi
+  if ! head_epoch=$(cd "$dir" && git log -1 --format='%ct' 2>/dev/null) || [ -z "$head_epoch" ]; then
+    echo "  $modid: cannot read $repo HEAD -- UNCHECKED, not current"
+    printed=1
+    continue
+  fi
+  if ! bin_epoch=$(stat -f '%m' "$BIN/$binname" 2>/dev/null) || [ -z "$bin_epoch" ]; then
+    echo "  $modid: cannot stat $binname -- UNCHECKED, not current"
+    printed=1
+    continue
+  fi
   # Only hours-scale gaps are worth a line. A binary minutes older than its head
   # is the normal state right after a deploy, and flagging it trains the reader
   # to ignore this section.

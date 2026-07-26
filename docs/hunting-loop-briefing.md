@@ -1544,6 +1544,28 @@ the author had the category fully in mind and did not point it at themselves.
 So: NAME THE CLASS, THEN IMMEDIATELY RE-RUN IT ON EVERYTHING YOU EXCLUDED FROM
 THE SUBJECT. It is mechanical and takes minutes.
 
+AN ARTIFACT CAN BE FRESH AND STILL BE BROKEN BY ITS ENVIRONMENT. Every identity
+rung -- mtime, inode, symbol presence -- answers "is this the artifact I built",
+and all of them PASS on a binary whose problem is external. Worked case: a shim
+execs a helper through a path baked in at compile time; the build directory it
+pointed at was reclaimed, so the shim was current, correctly signed, correctly
+placed, and could not run. Identity checks cannot see this because identity is
+exactly what is intact.
+
+For any binary that execs another, verify THE TARGET, and verify it as EXECUTABLE
+rather than merely present, since executability is the actual requirement.
+
+THE MISREPORTED SYMPTOM IS THE EXPENSIVE HALF: the failure surfaced as "handshake
+timed out", sending the reader after concurrency and startup ordering. A fast
+exec failure and a real timeout are separated by ONE MEASUREMENT -- how long did
+it take to fail -- and that question is worth asking before any theory.
+
+AND THE PROBE FOR IT NEEDS ITS OWN GUARD. Extracting a baked path from a Rust
+binary with `strings` will MANUFACTURE PLAUSIBLE PATHS, because literals are
+packed contiguously and a greedy match glues adjacent ones together. The
+fabricated path does not exist, which is exactly the finding you were hoping to
+make. Test the prefixes of a GONE result before believing it.
+
 DEPLOY IS A WIRING GAP, NOT AN OPERATIONAL CHORE. Merge is a producer and deploy
 is its consumer, so a merged-but-never-shipped change is the producer-no-consumer
 case one layer out from the codebase. It hides for the same reason the in-process

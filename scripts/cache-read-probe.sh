@@ -52,8 +52,15 @@ echo
 echo "step | input | cache_read | cache_write | output | read_ratio"
 echo "-----+-------+------------+-------------+--------+-----------"
 found=""
-for f in "$STATE_ROOT"/wal/*.wal; do
-  strings "$f" | grep -q "\"session\":\"$SESSION\"" || continue
+  # `strings` here reads a WAL, which is length-prefixed frames wrapping JSON --
+  # a DATA file, so the text it looks for is genuinely present as bytes. That is
+  # the safe use. The unsafe one is `strings` over a compiled BINARY looking for a
+  # source literal: match-arm literals are compared by length-and-bytes and never
+  # emitted as a contiguous constant, so they read zero however present they are.
+  # Noted here because the two invocations look identical at a glance and only one
+  # of them can be trusted.
+  for f in "$STATE_ROOT"/wal/*.wal; do
+    strings "$f" | grep -q "\"session\":\"$SESSION\"" || continue
   found=1
   strings "$f" | python3 -c '
 import sys, json

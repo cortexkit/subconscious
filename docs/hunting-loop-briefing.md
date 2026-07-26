@@ -1225,6 +1225,39 @@ productive is the order that destroys the evidence. Write the coupling down whil
 nothing automates the deletion yet; afterwards it is a bug report rather than a
 constraint.
 
+## An optional field is ignored by anything that predates it
+
+Added a `preview` flag to a control operation that retires processes, so an
+operator could see the decision before it executed. Ran the new client against the
+RUNNING daemon as a live check. It performed a REAL reconciliation: the daemon
+predates the field, unknown fields are dropped during deserialisation, and nothing
+anywhere errored. The fleet survived because the config happened to match the
+running set.
+
+THE FAILURE DIRECTION IS THE WHOLE POINT. For most added fields, being ignored
+degrades a feature. For a field whose meaning is DO NOT DO THE THING, being
+ignored means DOING THE THING -- while the caller is told, by a normal-looking
+success, that nothing happened. A safety flag that can be silently dropped is not
+a weaker safety flag; it is an unsafety flag with a reassuring name.
+
+THE FIX IS AN ECHO PLUS A REFUSAL. The response carries the flag back, produced
+only by the path that honours it, so an older peer CANNOT fabricate it. The client
+then refuses -- loudly, nonzero, naming what may already have happened -- when the
+echo is absent, rather than printing the result it was given. Silence on the echo
+is the one case where reporting success is a lie.
+
+GENERAL RULE: WHEN ADDING AN OPTIONAL FIELD, ASK WHAT ITS ABSENCE MEANS TO A PEER
+THAT NEVER LEARNED IT. If absence is benign, defaulting is fine. If absence
+inverts the meaning -- suppression flags, dry-run flags, confirmation tokens,
+idempotency keys -- the receiver must PROVE it understood, and the sender must
+treat missing proof as failure. This is the deploy-order rule (a narrowing shipped
+ahead of its producer silently drops what it narrows) arriving through the field
+rather than through the schema.
+
+AND IT WAS ONLY FOUND BY RUNNING IT AGAINST A LIVE OLD PEER. Every test passed:
+the tests build both halves from the same source tree, so version skew is exactly
+the condition a same-repo suite structurally cannot construct.
+
 ## A destructive operation whose premise is unauditable before it fires
 
 A sweep deletes complete, signed snapshots when the chain head they planned

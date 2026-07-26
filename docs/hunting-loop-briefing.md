@@ -1258,6 +1258,19 @@ AND IT WAS ONLY FOUND BY RUNNING IT AGAINST A LIVE OLD PEER. Every test passed:
 the tests build both halves from the same source tree, so version skew is exactly
 the condition a same-repo suite structurally cannot construct.
 
+SWEEP RESULT ON THE SAME WIRE, recorded because a null is worth as much as a hit
+and is the only thing that sizes the class. Five optional fields on the control
+plane, each read for what its absence means to a peer that never learned it.
+CONSUMER IDENTITY: dropped, the caller is attested as the WEAKER principal, so a
+provider gating on the stronger one REFUSES -- fail-closed. CONSUMER CAPABILITIES:
+dropped, the provider concludes the client cannot accept reverse requests and does
+not send any -- a lost feature, not an unsafe act. ADMISSION FACTS: dropped, a
+gate expecting them denies. Only PREVIEW inverted, and the reason is visible in
+the list: THE OTHER FOUR DESCRIBE WHAT THE CALLER IS OR CAN DO, WHILE PREVIEW
+DESCRIBES WHAT THE RECEIVER MUST NOT DO. Capability-shaped fields degrade toward
+refusal when lost; instruction-shaped fields degrade toward action. That is the
+cheap discriminator to apply before tracing anything.
+
 ## A destructive operation whose premise is unauditable before it fires
 
 A sweep deletes complete, signed snapshots when the chain head they planned

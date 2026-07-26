@@ -2416,6 +2416,48 @@ denied op must redden it, and denying an admitted op must too. A one-directional
 proof leaves the fail-open half unmeasured, and on a capability table fail-open is
 the half that matters.
 
+## A fence whose recovery path is gated by the fence
+
+Two defects in one day, same repo, same shape at two depths -- worth separating,
+because the second is much worse and the fix for the first does not touch it.
+
+SHALLOW: an ORDERING error inside one function. A preflight read authenticated
+with a stale credential and returned BEFORE the mint that would have refreshed
+it, so the fix for the failure was minted on the line the failure skipped. It ran
+269 consecutive times with zero successes. Unrecoverable, but only until someone
+swaps two statements.
+
+DEEP: a DURABLE STATE DIVERGENCE between two machines. An operation advanced the
+server's chain, failed at a later step, and returned without reconciling -- so
+the local head went stale. Every subsequent credential mint is fenced on head
+equality, and the recovery read that would learn the true head is itself
+credential-gated. THE SIDE THAT IS BEHIND CANNOT LEARN IT IS BEHIND WITHOUT A
+CREDENTIAL IT CAN ONLY OBTAIN BY PROVING IT IS NOT BEHIND. No code change
+resolves the CURRENT instance; only an outside credential does.
+
+THE INVARIANT, which is what to write down rather than the remedy: ANY OPERATION
+THAT MUTATES DURABLE SERVER STATE MUST RECONCILE LOCAL STATE BEFORE RETURNING, ON
+EVERY PATH INCLUDING ERROR PATHS. Stated as a remedy ("sync after the append"),
+the next person who adds a server-mutating step ahead of a fallible one
+reintroduces it; stated as an invariant, they have something to check new code
+against. And the test must assert the RECONCILIATION -- force the later step to
+fail, assert local state advanced -- not the absence of the symptom, which can be
+satisfied by making the later step stop failing.
+
+BUT RECONCILIATION CLOSES ONE PRODUCER, NOT THE CLASS. A crash between the two
+steps, a network drop mid-reconcile, or a killed process re-enters the identical
+deadlock. THE CLASS-KILLING MOVE IS TO MAKE THE REFUSAL CARRY WHAT RECOVERY
+NEEDS: at the moment the fence refuses, the server is HOLDING the value the
+client lacks, and throwing it away is what makes the deadlock reachable. A
+refusal that returns the current head lets the client reconcile from the refusal
+itself -- no second credential, no human. Check the security question honestly
+(does echoing it enable a replay against the fence it protects?), but ask it,
+because a fence that hoards the recovery datum is a fence with a deadlock built
+in.
+
+AND RAISE IT WHILE IT STILL HURTS. Once the outside credential lands the symptom
+vanishes, and a class that stops hurting stops getting fixed.
+
 ## The cost-asymmetry gate
 
 This killed two proposed guards and justified one. Wrongly rejecting a good

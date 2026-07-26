@@ -71,7 +71,13 @@ jobs:
       - name: Install dev deps + verify
         working-directory: ${{ steps.pkg.outputs.dir }}
         run: |
-          bun install --frozen-lockfile || bun install
+          # No fallback: --frozen-lockfile fails exactly when the committed lock
+          # disagrees with package.json, and that is the one condition a RELEASE
+          # must refuse. Falling back to a plain install would resolve fresh
+          # versions, rewrite the lock inside the runner, verify against those
+          # unreviewed versions and publish the result -- so the artifact ships
+          # dependencies nobody approved while every step reports success.
+          bun install --frozen-lockfile
           bun run typecheck
           bun test
 

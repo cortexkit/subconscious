@@ -83,10 +83,23 @@ terminal=$(sqlite3 "$STORE" "
     AND caller_session IS NOT NULL AND caller_session <> ''
     AND updated_at > (strftime('%s','now') - 43200) * 1000
   ORDER BY updated_at DESC LIMIT 6;" 2>/dev/null)
+# The LIMIT above keeps a busy day from burying the rest of the report, but a
+# truncated list that does not say it was truncated is a clean-looking result over
+# a partial set -- the same shape as a scanner that will not print what it
+# skipped. So count the window separately and say when rows were withheld.
+terminal_total=$(sqlite3 "$STORE" "
+  SELECT COUNT(*) FROM consult
+  WHERE phase IN ('failed','done')
+    AND consult_kind IN ('spec','campaign')
+    AND caller_session IS NOT NULL AND caller_session <> ''
+    AND updated_at > (strftime('%s','now') - 43200) * 1000;" 2>/dev/null)
 if [ -n "$terminal" ]; then
   printf '%s\n' "$terminal" | while IFS='|' read -r id kind phase reason who age; do
     printf '  %-14s %-8s %-7s %-26s %s  (%sm ago)\n' "$id" "$kind" "$phase" "$reason" "$who" "$age"
   done
+  if [ -n "$terminal_total" ] && [ "$terminal_total" -gt 6 ] 2>/dev/null; then
+    echo "  ... and $((terminal_total - 6)) more in the window, not shown"
+  fi
   dim "  quiet since BEFORE one of these terminals = produced nothing after it; check the transcript for why"
 else
   echo "  none terminal in the last 12h"

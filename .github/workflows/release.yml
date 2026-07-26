@@ -87,10 +87,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "subc daemon binaries for sibling-repo CI (ck-subc, subc-probe, ck, fake-aft-stub, ck-subc-mcp)." \
-            2>/dev/null || true
+          # Create the release if it does not exist yet. A retag or recovery
+          # re-run finds it already present, which is success. Anything else --
+          # a permissions problem, a network failure, a malformed tag -- is a
+          # real failure and must reach the log. Discarding it makes the upload
+          # below fail with "release not found", which sends the reader after a
+          # missing release instead of the cause that actually stopped it.
+          #
+          # The benign case is distinguished by asking whether the release now
+          # EXISTS, not by matching text in the failure. Error wording is not a
+          # contract -- gh has rendered this as both "already exists" and
+          # "already_exists" -- and a pattern that stops matching sends a
+          # successful retag down the failure path. The state query cannot drift.
+          if ! out=$(gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                --title "${GITHUB_REF_NAME}" \
+                --notes "subc daemon binaries for sibling-repo CI (ck-subc, subc-probe, ck, fake-aft-stub, ck-subc-mcp)." 2>&1); then
+            if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "release ${GITHUB_REF_NAME} already exists; uploading into it"
+            else
+              echo "::error::gh release create failed and no such release exists: ${out}"
+              exit 1
+            fi
+          fi
           gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
 
   publish:

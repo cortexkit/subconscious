@@ -952,8 +952,23 @@ function encodeJson(value: unknown): Uint8Array {
   return new Uint8Array(Buffer.from(JSON.stringify(value), "utf8"));
 }
 
+// Decode the way the SHIPPED client does. This helper existed in two forms
+// across the test files: `Buffer.from(...).toString("utf8")` here and in the
+// other suites, and `new TextDecoder().decode(...)` in this one. They agree on
+// every ordinary body -- including subarray views into a larger read buffer,
+// which is what a frame body is -- so the drift was invisible.
+//
+// They diverge on exactly one input: a UTF-8 BOM. TextDecoder STRIPS it and
+// parses; Buffer keeps it and JSON.parse throws. So the same wire bytes were
+// accepted by this suite and rejected by the other two, and a test asserting
+// how the client handles a BOM-prefixed body would have proved opposite things
+// depending on which file it lived in.
+//
+// src/client.ts and src/provider.ts both use the Buffer form, so THAT is what a
+// test helper must mirror: a helper that is more permissive than the code under
+// test cannot observe the code being too strict.
 function parseJson(bytes: Uint8Array): unknown {
-  return JSON.parse(new TextDecoder().decode(bytes));
+  return JSON.parse(Buffer.from(bytes).toString("utf8"));
 }
 
 function createPermitGate(capacity: number): { acquire(): Promise<() => void> } {

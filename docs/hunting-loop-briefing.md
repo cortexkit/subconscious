@@ -2126,6 +2126,21 @@ with `|| true` turns a real failure into a pass; an unguarded step lets a real
 failure SUPPRESS FOUR OTHER ANSWERS. Both are the check no longer being the thing
 that reports.
 
+A GREEN RUN CANNOT DEMONSTRATE THIS GUARD, which is worth knowing before you go
+looking for reassurance in one. The guard only does anything when an earlier step
+FAILS, so every passing run exercises the same path as before the fix and proves
+nothing about it. Two checks are available without spending a deliberately-red
+run: confirm the guarded steps EXECUTED (not merely that the job was green), and
+parse the workflow to confirm the guard sits on exactly the check steps and not
+on the setup steps. Neither is the real proof; both are honest about being
+weaker, which the green run is not.
+
+AND WATCH WHICH COMMIT THE GREEN BELONGS TO. My workflow edit's own run was
+CANCELLED by the concurrency group, so the first completed run carrying it was
+the NEXT commit -- a docs-only change whose green would ordinarily say nothing.
+A run list showing passes is a claim about the tip, never about the commit that
+changed the logic.
+
 AND AN INSTRUMENT WHOSE COMPLAINTS YOU HAVE LEARNED TO DISMISS IS
 INDISTINGUISHABLE FROM ONE THAT HAS STOPPED WORKING. THALAMUS validated their
 workflow edit with a linter that emitted two known-stale complaints; rather than

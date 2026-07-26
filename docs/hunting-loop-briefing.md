@@ -1053,6 +1053,32 @@ fails loudly cannot hide drift**; the instruction was "no hardcoded names" and
 the honest answer was to explain why two remain rather than to satisfy the
 letter of it.
 
+## A fingerprint must be tested against the change it is meant to detect
+
+Offered mtime+size as the cheap way to notice a config file changing between
+reading it and acting on it. Before adopting it I tested it against the specific
+edit the operation makes -- a module-id rename -- on a copy:
+
+  before: mtime 1785101683  size 3301
+  after:  mtime 1785101683  size 3301   IDENTICAL
+  sha256: 3bf069e2a666aef1 -> b33ffebc33497405   CHANGED
+
+TWO INDEPENDENT REASONS IT MISSES, both properties of this exact change. A rename
+is a SUBSTITUTION, so size is preserved when the replacement is the same length.
+And mtime granularity is ONE SECOND, so an edit landing in the same second as the
+read is invisible -- not exotic when the edit is scripted.
+
+So the conventional fingerprint reports "nothing changed" across a change that
+definitely occurred, in the one situation the procedure exists for. mtime+size is
+blind to substitutions and to same-second writes -- which is to say, blind to
+renames and scripted edits, between them most of what an operator does to a config
+during a migration.
+
+RULE: a fingerprint is not adopted because it is conventional. RUN IT AGAINST THE
+REAL CHANGE FIRST and confirm it moves. Same shape as the vacuous truncation
+fixture -- the check was fine, the input could not exercise it, and only trying the
+real case showed the difference.
+
 ## A procedural mitigation inherits the defect of the tool it replaces
 
 I rejected a CLI preview because it would have located a config file itself --

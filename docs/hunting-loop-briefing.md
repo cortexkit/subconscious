@@ -839,6 +839,28 @@ whether their absence is judged to matter. That is cheap, it stays useful if the
 phase turns out to be legitimately optional, and it is the only thing that keeps
 rounds comparable across a repair.
 
+### A status field can lie in both directions at once
+
+The campaign phase above turned out to be neither dead nor optional. Its grammar
+parser demanded `LANE: class - scope` on an **ASCII hyphen**, while models emit
+the em-dash: 74 of 93 posts ever recorded failed on that separator. Of the 19
+that parsed, most carry truncated classes, because splitting on the first hyphen
+cuts inside hyphenated names (`kv-cache-bandwidth` becomes class `kv`). And a
+third defect renders success as failure -- the overlap check does not exclude a
+seat's own lane, so a redrive self-collides and a valid recorded post still
+reports `lane-taken`.
+
+So one `failed` covered three different states: *parser rejected the input*,
+*genuinely produced nothing*, and *succeeded then collided with itself*. The
+same-glyph problem is usually about a healthy value indistinguishable from a
+never-happened one; here the field was also reporting failure for work that
+succeeded.
+
+Worth keeping for its own sake: **the grammar fought the models' strongest prior
+and lost 74 times out of 93.** When a parser and a generator disagree about
+punctuation, the parser loses -- so build the tolerance in rather than
+discovering the preference in a corpus of failures.
+
 ### But check whether the defect is a constant before calling it contamination
 
 I escalated the case above as contamination -- results banked under a broken

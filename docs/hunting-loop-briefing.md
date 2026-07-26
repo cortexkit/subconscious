@@ -332,6 +332,28 @@ was built to catch.
   the need requires the judgement "is this mechanism correct or merely untested"
   — which is precisely the judgement a fence instruction removes.
 
+## `--version` is not an identity check unless the deploy crosses a version bump
+
+A deploy the same evening made this concrete without anything going wrong. Nine
+commits ahead of the last tag, no version bumped, so both the old and new
+binaries reported `0.3.17`. The warm-exec probe was **true and useless**: it
+cannot distinguish the new build from the release it replaced, which is exactly
+the case an untagged batch deploy always is.
+
+The three layers answer three different questions and none substitutes for
+another:
+
+- **inode** — the process is running the file at the deploy path
+- **a live turn** — the process is serving
+- **a symbol differential** — *which code* is inside
+
+The differential needs controls on both ends, or it proves nothing: a string the
+change introduces (present in new, absent in old) **plus** strings present in
+both, which establish that the tool genuinely read the old binary rather than
+failing silently against it. Without the controls, "absent from old" and "never
+looked at old" are the same output — the null-versus-negative confusion again,
+this time in a deploy check.
+
 ## Two functions, one name, opposite safety semantics
 
 A shape none of the probes above can reach, because **there is no mechanism to

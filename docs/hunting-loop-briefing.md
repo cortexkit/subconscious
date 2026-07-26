@@ -10,6 +10,29 @@ Authored by the ai-provider-quota seat; kept here because it is fleet-wide
 method, not one module's story. That repo's `docs/provider-invariants.md` is the
 worked example of what a loop leaves behind.
 
+## How to read this, and what it has become
+
+This file is now ~4,000 lines across ~90 sections, and it is honest to say that
+only the first part is an INSTRUMENT. The checklist below is meant to be run:
+numbered questions, grouped by when they apply, each naming where it fails. If you
+read nothing else, read that.
+
+Everything after it is a CASE BOOK. Each section is one defect that actually
+happened, with the reasoning that found it and, where it applies, the correction
+that followed. It is not organised for lookup and it will not surface the relevant
+rule to someone who does not already suspect it -- which is the standing test this
+document fails by design, because a case book's job is to be read once and change
+what you notice, not to be consulted.
+
+SO THE TWO HALVES HAVE DIFFERENT FAILURE MODES. The checklist rots if a rule lands
+in the prose without a row (checked periodically; the row must trace to a
+section). The case book rots if it grows past reading -- and it is already past it.
+A future pass should cut the cases that only restate a rule the checklist already
+carries, and keep the ones whose VALUE IS THE CONCRETE FAILURE: the measurement
+that refuted an assumption, the instrument that returned a plausible wrong answer,
+the fix that rebuilt the class one level up. Those cannot be compressed into a
+rule without losing the thing that makes the rule believable.
+
 ## The checklist
 
 Everything below this table is the reasoning. This is the part you run down. A

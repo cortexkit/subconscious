@@ -68,6 +68,43 @@ Leave provenance and gate records alone. A document recording what CAPTURED BYTE
 contain must keep saying what they contain, or it starts lying about the fixture
 beside it.
 
+### The class that lives in other people's repos
+
+The two branches for this rename each grep THEIR OWN tree, and there is a class
+that cannot appear in either: A TRUST ALLOWLIST KEYED ON MODULE ID. A module that
+names yours in a security decision has no reason to appear in your repo, and you
+have no reason to look in theirs.
+
+Found by grepping all fourteen repos rather than the two we own. Three modules gate
+first-party capability on a hardcoded list of caller ids, and the new name is on
+none of them: aft (bash), cerebellum (browser and computer use), plexus (connector
+invocation). Each else-branch was READ rather than inferred: all three fail CLOSED,
+so this is capability loss and not a security hole. That is also what makes it
+expensive -- the executive quietly stops being permitted to do things, and "the
+agent cannot run bash any more" gets debugged in the wrong repo.
+
+THE ORDERING IS THE MIRROR OF THE ROUTE-TARGET RULE, and getting it backwards
+leaves a window with no capability at all. Route targets: CONSUMERS ship the new
+string first, because they DIAL. Trust allowlists: THE ALLOWLIST HOLDER ships
+first, because it is DIALLED. Both collapse into one sentence worth carrying:
+
+  EVERY PLACE THAT NAMES THE MODULE BY STRING MUST ACCEPT THE NEW NAME BEFORE THE
+  MODULE STARTS USING IT.
+
+So three more repos join the pre-window list, one line each -- add the new name
+beside the old, keep both across the window, drop the old one afterwards.
+
+THE PROOF THIS IS NOT THEORETICAL sits in aft's list, which carries BOTH the old
+AND new names from the PREVIOUS rename. Someone hit this exact class before and
+handled it by keeping both. It is the only place in the fleet where a prior
+rename's transitional state is still visible, and it is inside a trust decision --
+which means it also needs a comment saying why both are there, or the next person
+tidying duplicates removes the wrong one.
+
+RUN THE FLEET-WIDE GREP BEFORE WRITING THE RUNBOOK, not after. It is one command
+over every repo and it finds the classes that a per-repo sweep cannot see by
+construction.
+
 ### The classes to rename, and the two that must not be
 
 After partitioning, only two classes are load-bearing and both must reach zero:

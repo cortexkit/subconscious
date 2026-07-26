@@ -879,6 +879,37 @@ breakage.**
 
 Checking one prior run was cheaper than the escalation I sent.
 
+## A suite that shrinks and stays green
+
+The sharpest instance of the whole family, and I reproduced it myself rather than
+taking it on report:
+
+```
+baseline            102 pass, 0 fail
+move one schema     100 pass, 0 fail    <- two tests ceased to exist
+restored            102 pass, 0 fail
+```
+
+Moving a single hash-pinned normative schema out of the tree did not fail two
+tests. **It deleted them.** The run still reported zero failures, so a reader
+watching CI sees green both times. Only the count moved, and nothing asserts the
+count.
+
+So the gate that exists to catch a missing pinned schema reports success when one
+goes missing -- and it is reachable by an ordinary mistake: a rename, a vendored
+crate, a moved manifest.
+
+This is the designed-zero problem in its purest form: **a check whose absence is
+indistinguishable from a check that passed.** Nothing in a normal test framework
+prevents it, because a data-driven suite generating cases from files on disk
+generates zero cases from a file that isn't there.
+
+**Assert the expected test count.** A suite that can silently shrink is a suite
+whose coverage is unfalsifiable, and the count is the only thing that makes
+deletion visible. Pair it with loud failure at the load site -- a missing or
+malformed input must abort, never return null -- because embedding the data
+without fixing the swallow just relocates the same silence.
+
 ## Before specifying a check, run each of its rules by hand against its subject
 
 Two unsatisfiable specifications in one night, from the same author, from the

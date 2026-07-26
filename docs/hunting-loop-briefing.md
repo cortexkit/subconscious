@@ -332,6 +332,31 @@ was built to catch.
   the need requires the judgement "is this mechanism correct or merely untested"
   — which is precisely the judgement a fence instruction removes.
 
+## Two functions, one name, opposite safety semantics
+
+A shape none of the probes above can reach, because **there is no mechanism to
+mutate.** No branch to delete, no verdict to ignore, no effect to suppress — just
+correct code under a lying name.
+
+CEREB found `redact_then_truncate(value, max_bytes)` in the browser crate whose
+entire body was `utf8_safe_truncate(value, max_bytes)`. No redaction. Meanwhile
+`cerebellum-core::journal::redaction` exports a function of **the same name**
+that redacts through a bound policy and returns `Err(RedactionUnavailable)` when
+none is bound — its own doc explaining that copying or truncating input would
+"make sensitive material durable." The core module explicitly refuses the exact
+behaviour its same-named neighbour performs. **A prefix of a secret is still a
+secret.**
+
+Zero callers today, so not a live leak — and still worth fixing, for the reason
+that generalises: **a function that looks like redaction and is not will answer a
+future search.** Someone wiring an adapter greps for redaction, finds it, uses
+it, and the review reads correct because the call site says `redact_then_truncate`.
+**The name is the claim, and it is the only thing most readers will check.**
+
+The only instrument that finds this is reading the call site **against the
+contract the name implies**. Same family as a drifted fixture: the artifact
+answers a question it should not be authoritative for.
+
 ## The classes are a lens, not a partition
 
 Tested against tonight's confirmed defects rather than against the taxonomy's own

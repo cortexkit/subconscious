@@ -138,8 +138,17 @@ fi
   # reading a level and calling it a trend. So the total is remembered between
   # cycles and the DELTA is what gets printed.
   #
-  # The remembered value lives in the runtime dir beside the connection file, and
-  # a first run (or an unreadable one) says so rather than implying stability.
+  # The remembered value lives in the runtime dir beside the connection file. That
+  # directory is the WRONG place for durable state -- broca's write-ahead log sits
+  # there today and a reasonable cleanup would destroy it -- so the placement is
+  # deliberate rather than incidental: this file is a CACHE OF ONE NUMBER,
+  # regenerated on the next cycle, and losing it costs exactly one UNCHECKED line.
+  # Disposable-by-construction is what the runtime dir is for. The distinction is
+  # invisible from a directory listing, which is the whole hazard, so it is stated
+  # here rather than left for a reader to infer.
+  #
+  # A first run, or an unreadable value, says UNCHECKED rather than implying
+  # stability -- a fresh install must not get a reassuring answer it has not earned.
   if swap=$(sysctl -n vm.swapusage 2>/dev/null) && [ -n "$swap" ]; then
     echo "  swap file: $swap"
     now_total=$(printf '%s' "$swap" | sed -n 's/.*total = \([0-9.]*\)M.*/\1/p')

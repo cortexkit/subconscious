@@ -227,6 +227,20 @@ where
 
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
+    // `authenticated.role` is CLIENT-SUPPLIED and unverified -- the handshake
+    // proves possession of the connection key, nothing about who is calling. So
+    // this exclusion is safe ONLY while the role decides a reporting question and
+    // never an authorization one: the watchdog's own loopback probe would
+    // otherwise inflate the very count it exists to sanity-check.
+    //
+    // The consequence of it being unverified, stated so nobody has to rediscover
+    // it: ANY client holding the key can claim this role and omit itself from
+    // `connected_clients`. That is a gauge a caller can lie to, and it is
+    // acceptable because the gauge informs an operator rather than gating
+    // anything. IF A ROLE IS EVER USED TO DECIDE ADMISSION, CAPACITY, OR PRIVILEGE,
+    // this stops being safe and the role must be attested rather than declared --
+    // the daemon already has the mechanism for that in the spawn-nonce path used
+    // for module identity.
     let _connected_client = (authenticated.role != WATCHDOG_CLIENT_ROLE)
         .then(|| auth.connected_clients.open(connection_id));
     let close_receiver = connection.take_close_receiver();

@@ -354,6 +354,28 @@ failing silently against it. Without the controls, "absent from old" and "never
 looked at old" are the same output — the null-versus-negative confusion again,
 this time in a deploy check.
 
+### The fixture shape decides which property gets asserted
+
+THALAMUS predicted their suite was uniformly report-asserting. Five sites in, the
+prediction was **falsified** — and the exception explains the rule better than the
+rule did.
+
+The one covered site had a **recording sink in its fixture**, so asserting the
+effect (`sink.is_empty()`) was the natural thing to write. The four defective
+sites express their outcome through a **return value**, so asserting the return
+value was the natural thing to write. **Nobody chose the weaker property. The
+fixture shape decided it.**
+
+That predicts where to look in any codebase: **guards whose effect is not
+observable in existing test scaffolding.** And it names a cheaper structural fix
+than exhortation — make effects observable in fixtures, and the natural assertion
+becomes the right one.
+
+Method rider from the same run: **when the suite does catch your mutant, find
+which test and which assertion.** A hit can be a decision-level test that proves
+nothing about enforcement — which is exactly what three passing tests were at the
+site that turned out to be defective.
+
 ## Two functions, one name, opposite safety semantics
 
 A shape none of the probes above can reach, because **there is no mechanism to

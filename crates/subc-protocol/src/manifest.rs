@@ -221,6 +221,19 @@ pub struct ModelPolicy {
     pub fallback_chain: Vec<String>,
 }
 
+/// Declared trip threshold for a scheduled task's circuit breaker: stop after this
+/// many IDENTICAL consecutive failures.
+///
+/// SCOPE, because the name invites a wider reading than the field supports. The
+/// alarm condition here is "this failure looks like the last one", so it detects a
+/// task stuck failing the SAME way and is silent on a task failing MANY DIFFERENT
+/// ways -- and it goes quieter the more varied the failures become, which is often
+/// the more alarming case. A module treating this as its only stop condition will
+/// find it mutest during the messiest outage. Pair it with a signal that counts
+/// failures regardless of their kind.
+///
+/// The daemon carries this field and does not act on it: enforcement belongs to the
+/// module running the task, since only it can compare two failures for identity.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct CircuitBreaker {
     pub identical_failures: u32,

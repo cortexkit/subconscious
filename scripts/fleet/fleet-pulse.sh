@@ -14,7 +14,20 @@
 
 set -uo pipefail
 
-STORE="$HOME/.local/share/cortexkit/alfonso-core/store.db"
+# RESOLVE THE EXECUTIVE'S STORE, DO NOT NAME IT. The module id changes at the
+# prefrontal rename, and a hardcoded name goes blind EXACTLY AT THE FLIP -- the one
+# moment this report is being read closely. A name search inherits every renaming
+# anyone has ever done; the first path that exists is a question about the resource.
+# Ordered new-name-first so the window needs no edit here, with the old name as the
+# fallback until it is gone.
+STORE=""
+for candidate in prefrontal alfonso-core; do
+  if [ -f "$HOME/.local/share/cortexkit/$candidate/store.db" ]; then
+    STORE="$HOME/.local/share/cortexkit/$candidate/store.db"
+    break
+  fi
+done
+[ -n "$STORE" ] || STORE="$HOME/.local/share/cortexkit/alfonso-core/store.db"
 # Peers that have gone quiet for longer than this are surfaced for a decision.
 # Roughly two of my wake cycles: long enough that a normal work stretch does not
 # trip it, short enough that a stalled seat is caught within an hour.
@@ -380,7 +393,7 @@ printed=0
 # than skipped, so the mapping going stale is visible instead of silent.
 module_repo() {
   case "$1" in
-    alfonso-core) echo alfonso ;;
+    alfonso-core | prefrontal) echo alfonso ;;
     thalamus)     echo ai-proxy ;;
     subc-mcp)     echo subconscious ;;
     *)            echo "$1" ;;

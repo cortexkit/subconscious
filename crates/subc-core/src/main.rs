@@ -25,6 +25,26 @@ async fn main() {
         println!("ck-subc {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // PARSE-THEN-ACT: EVERY argument is settled before the first side effect, not
+    // just the two recognised ones. Handling --help and --version early while
+    // letting anything else fall through leaves the original defect for every OTHER
+    // argument -- a typo, a flag copied from another tool, a stale invocation -- all
+    // of which would silently START A DAEMON. The daemon takes no arguments, so the
+    // complete rule is: recognise the two probes, refuse everything else, and only
+    // then bootstrap.
+    if let Some(unknown) = args
+        .iter()
+        .find(|arg| *arg != "--help" && *arg != "-h" && *arg != "help" && *arg != "--version")
+    {
+        eprintln!(
+            "ck-subc: unexpected argument '{}'\n\nck-subc takes no arguments; \
+             it is started by launchd and reads subc.jsonc from the XDG config \
+             directory. Use `ck` to inspect or control a running daemon, or \
+             `ck-subc --help`.",
+            unknown.to_string_lossy()
+        );
+        process::exit(2);
+    }
     if args
         .iter()
         .any(|arg| arg == "--help" || arg == "-h" || arg == "help")

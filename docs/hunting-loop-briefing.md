@@ -4332,8 +4332,8 @@ found: a delta check whose baseline was optional, so without it the comparison
 measured from zero and the "movement" attributed to a run was the process's LIFETIME
 TOTAL -- asserting "this process has ever done X" while reading as "this run did X",
 with identical output either way. THE LONGER THE PROCESS HAS BEEN UP, THE MORE
-CERTAINLY IT PASSES. Anti-correlation against uptime rather than against the
-property.
+CERTAINLY IT PASSES. The check goes quieter as UPTIME grows rather than as the
+property worsens -- a second way for a check to be silent exactly where it matters.
 
 THE WORST VARIANT NEEDS NO SECOND CONDITION, ONLY TIME. A search that scans
 newest-first for anything matching, with the target optional, is correct on a fresh
@@ -4363,9 +4363,9 @@ through into the side effect: a typo, a flag copied from another tool, an option
 no longer exists, each silently starting a daemon or a gateway. The boundary that
 felt complete was the FLAG boundary; the real one was the ARGUMENT SPACE.
 
-AND THE CIRCUMSTANCE TRAP GUARDS THE ENTRANCE TO THIS ONE. An unrecognised flag ALONE
-often errors -- for a reason unrelated to the flag, such as a required argument being
-absent -- so a careless check reads clean. The case that matters is AN UNRECOGNISED
+AND A DEFENCE THAT HOLDS FOR THE WRONG REASON GUARDS THE ENTRANCE TO THIS ONE. An
+unrecognised flag ALONE often errors -- for a reason unrelated to the flag, such as a
+required argument being absent -- so a careless check reads clean. The case that matters is AN UNRECOGNISED
 FLAG ALONGSIDE A VALID INVOCATION, which nobody constructs without having seen the
 shape before.
 
@@ -4381,12 +4381,12 @@ authorize it too. For an authorizer the correct answer is EXACT MATCH PLUS A
 COORDINATED CHANGE, documented where the constant lives so the coordination is
 discoverable at the moment someone renames -- not tolerance.
 
-THIS IS THE FAILURE MODE OF RECEIVING A SHAPE WITHOUT ITS COST MODEL. A seat that
+THIS IS THE FAILURE MODE OF RECEIVING A SHAPE WITHOUT KNOWING WHAT A WRONG ANSWER
+COSTS HERE. A seat that
 ported the monitor fix directly onto an authorizer would have written a real security
-regression while believing they were applying a lesson. So a shape must travel with
-BOTH its circumstance trap (what invocation exposes it) AND its cost model (what
-reading it wrongly costs HERE), or it arrives as a rule with no idea which way to
-point.
+regression while believing they were applying a lesson. So a shape must travel with BOTH the
+invocation that exposes it AND what reading it wrongly costs in the recipient's code,
+or it arrives as a rule with no idea which way to point.
 
 CHECKED IN MY OWN AUTHORITY PATH: subc's principal grant compares the module id by
 exact map lookup and the nonce in constant time, with an empty presented nonce
@@ -4395,7 +4395,7 @@ rename must add the new id deliberately, which is the coordinated change rather 
 a fallback. Right by construction, and now stated so nobody "improves" it into
 symmetry with the monitors.
 
-A SHAPE ONLY TRANSFERS IF IT CARRIES ITS CIRCUMSTANCE TRAP WITH IT. "Help must not
+A SHAPE ONLY TRANSFERS IF IT CARRIES THE INVOCATION THAT EXPOSES IT. "Help must not
 run the command" alone would have had the recipient test an unknown flag IN ISOLATION,
 watch it error for an unrelated reason, and file the binary clean. What made it
 transferable was the accompanying detail that the bad flag must sit ALONGSIDE a valid
@@ -4405,7 +4405,20 @@ because you now believe you checked, and the area is closed rather than merely
 unexamined.
 
 So when sending a shape, send the invocation that exposes it, not only the property.
-The property is what makes it interesting; the trap is what makes it findable.
+The property is what makes it interesting; the invocation is what makes it findable.
+
+A CITATION IS A CLAIM ABOUT ANOTHER FILE AND AGES LIKE ONE. A comment saying "covered
+by X" is worse than no comment when X does not cover it, because it tells the next
+reader the coverage exists and they stop looking. Check the citation before writing
+it, and check it again when the test moves -- nothing makes a stale citation fail.
+
+A NOTE ON THE WORDS IN THIS DOCUMENT. Two seats working a class together invent
+shorthand fast, and the shorthand feels like understanding. It is not portable: a
+reader who was not in the exchange meets a coined phrase and stops, or worse, guesses.
+The same hazard applies to CODE COMMENTS written during a sweep -- a comment saying
+"the positive half is covered" is meaningless to the next maintainer. Prefer the plain
+statement of the mechanism over the name we gave it, and if a name is worth keeping,
+define it where it first appears rather than assuming the reader has the conversation.
 
 A DESCRIPTION OF A SHAPE TRAVELS FURTHER THAN A REVIEW. Across four consecutive finds
 in two codebases, NOT ONE WAS FOUND BY THE AUTHOR OF THE CODE, and none came from
@@ -4424,18 +4437,18 @@ other is never opened. So the mechanical enumeration is LEAST optional exactly w
 you are most confident you understand the pattern -- confidence is what replaces the
 second look.
 
-THE THIRD ANTI-CORRELATION AXIS IS SEVERITY, AND IT IS THE WORST. The first two were
-against the PROPERTY (a weak drive silences the check a weak drive would fail) and
-against ELAPSED TIME (a lifetime counter passes more certainly the longer a process
-runs). This one is against HOW BAD THE FAULT IS. A persistence detector comparing
+A CHECK CAN GO QUIET AS THE FAULT GETS WORSE, AND THERE ARE THREE WAYS IT HAPPENS.
+By the PROPERTY: a weak drive silences the very check a weak drive would fail. By
+ELAPSED TIME: a lifetime counter passes more certainly the longer a process runs.
+And by SEVERITY, which is the worst. A persistence detector comparing
 rendered lines calls a fault PERSISTENT when its detail is stable and NEW when the
 detail changes -- so a stuck condition whose detail carries a RISING count reads as
 new every cycle and never once as persistent. The detector is quietest exactly where
 the signal is strongest. Ask of any change-detector: what does WORSENING look like
 to it, and does worsening alter the thing it compares?
 
-SAMENESS-SHAPED IS NECESSARY BUT NOT SUFFICIENT: THE DEFECT IS SAMENESS-SHAPED PLUS
-A DOC THAT PROMISES DETECTION. Compare two fields with the identical blind spot. A
+A DETECTOR KEYED ON THINGS BEING THE SAME IS NOT YET A DEFECT -- IT BECOMES ONE WHEN
+ITS DOCUMENTATION PROMISES DETECTION. Compare two fields with the identical blind spot. A
 degrade streak documented as "the substrate for a persistent-degrade alarm" makes a
 CAPABILITY claim and says nothing about scope -- a reader builds the alarm on it and
 finds it silent during the widest outage. A field named `last_error`, documented as

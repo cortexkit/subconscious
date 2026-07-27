@@ -4369,6 +4369,18 @@ absent -- so a careless check reads clean. The case that matters is AN UNRECOGNI
 FLAG ALONGSIDE A VALID INVOCATION, which nobody constructs without having seen the
 shape before.
 
+A SHAPE ONLY TRANSFERS IF IT CARRIES ITS CIRCUMSTANCE TRAP WITH IT. "Help must not
+run the command" alone would have had the recipient test an unknown flag IN ISOLATION,
+watch it error for an unrelated reason, and file the binary clean. What made it
+transferable was the accompanying detail that the bad flag must sit ALONGSIDE a valid
+invocation. A SHAPE WITHOUT ITS TRAP IS AN INVITATION TO A FALSE NEGATIVE, and a false
+negative from a shape you were told about is WORSE than never having heard it --
+because you now believe you checked, and the area is closed rather than merely
+unexamined.
+
+So when sending a shape, send the invocation that exposes it, not only the property.
+The property is what makes it interesting; the trap is what makes it findable.
+
 A DESCRIPTION OF A SHAPE TRAVELS FURTHER THAN A REVIEW. Across four consecutive finds
 in two codebases, NOT ONE WAS FOUND BY THE AUTHOR OF THE CODE, and none came from
 reading the other's diff. Each came from someone describing a shape they had just hit

@@ -4285,6 +4285,27 @@ cannot launder a real violation -- a genuine failure must still fail rather than
 reporting as skipped -- because that is the control everyone omits and the only one
 separating an honest skip from a silent pass.
 
+THE THIRD SHAPE IS NOT A SKIP AT ALL, AND IT IS THE WORST: A FALSE PASS FROM
+SELF-COMPARISON. A check picked the last qualifying item as its comparison subject;
+when nothing qualified, the fallback was THE BASELINE ITSELF, so it compared one
+thing with itself and AFFIRMED the property. Full green run, no SKIP, no missing
+count, exit 0 -- on a drive where the condition never recovered. The anti-
+correlation at its most extreme: the run where recovery FAILED is the run that
+produces the confident recovery pass.
+
+So the family has three members, increasingly bad: a check that says it skipped; a
+check that vanishes and shrinks the denominator with it; and a check that AFFIRMS
+BY MEASURING NOTHING. Only the first is visible in output.
+
+WHERE TO LOOK FOR SELF-COMPARISON: any selection with a fallback, and any
+before/after comparison against stored state. For a selection, ask what the
+fallback resolves to when nothing qualifies -- if it can resolve to the baseline,
+the comparison is trivially true. For stored state, CHECK THE ORDER OF READ AND
+WRITE: writing the current value before reading the previous one makes every cycle
+compare a value with itself and report "unchanged" forever, which is the reassuring
+direction. Both of mine read before writing, verified at source rather than
+assumed.
+
 RELATED, AND THE REASON TO ENUMERATE RATHER THAN TRUST: fixing one call site says
 nothing about its siblings. A correct new mechanism used in one place leaves the
 other place untouched and still wrong. The remedy is not more care at the moment of

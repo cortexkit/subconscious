@@ -4355,6 +4355,28 @@ THE ANSWER IS ALREADY DETERMINED, NOT AT THE POINT WHERE THE MISSING INPUT IS US
 Those are the same place only when nothing happens in between, and something always
 happens in between.
 
+ENUMERATE THE SPACE, NOT THE NEIGHBOURS. Having just applied a rule to one neighbour
+is its own certainty, one notch smaller than having just understood the rule -- and
+it stops you at the same place. Two seats independently fixed a help-fallthrough by
+handling the sibling flag and stopping there, leaving every OTHER argument falling
+through into the side effect: a typo, a flag copied from another tool, an option that
+no longer exists, each silently starting a daemon or a gateway. The boundary that
+felt complete was the FLAG boundary; the real one was the ARGUMENT SPACE.
+
+AND THE CIRCUMSTANCE TRAP GUARDS THE ENTRANCE TO THIS ONE. An unrecognised flag ALONE
+often errors -- for a reason unrelated to the flag, such as a required argument being
+absent -- so a careless check reads clean. The case that matters is AN UNRECOGNISED
+FLAG ALONGSIDE A VALID INVOCATION, which nobody constructs without having seen the
+shape before.
+
+A DESCRIPTION OF A SHAPE TRAVELS FURTHER THAN A REVIEW. Across four consecutive finds
+in two codebases, NOT ONE WAS FOUND BY THE AUTHOR OF THE CODE, and none came from
+reading the other's diff. Each came from someone describing a shape they had just hit
+and the recipient applying it to different code. Review requires reading what someone
+wrote; this requires only knowing what to ask -- which is why it crosses repository
+boundaries that review cannot, and why the finding worth sending is the SHAPE rather
+than the patch.
+
 KNOWING THE PATTERN IS WHAT MAKES YOU SKIP THE SIBLING. My seats section already
 printed MISSING against an expected roster; the modules section one screen away
 counted only what answered, and I read its first line every thirty minutes for a

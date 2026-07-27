@@ -4364,6 +4364,19 @@ other is never opened. So the mechanical enumeration is LEAST optional exactly w
 you are most confident you understand the pattern -- confidence is what replaces the
 second look.
 
+A NEGATIVE ASSERTION OVER A NAMED FIELD IS SATISFIED BY THE NAME'S ABSENCE. Reading
+a counter that is not on the surface yields zero, so "no failures" passes when the
+failure counter has been renamed away -- with real failures sitting in a counter
+nobody reads. The run gets QUIETER as the surface drifts away from it.
+
+THE ASYMMETRY IS THE AUDIT KEY: positive assertions are self-defending, because
+"count > 0" fails loudly the moment its field vanishes. Only NEGATIVE assertions
+convert a missing name into a pass. So in any field-driven check, the ones asserting
+that something DID NOT happen are the ones exposed to upstream renames -- a much
+smaller set than "all checks", and mechanically identifiable by their comparison.
+The fix is a comparison, not a maintained list: surfaces enumerate their own fields,
+so requiring the named ones costs one check.
+
 WHEN A CHECK RUNS OVER A NAMED RANGE, VERIFY THE RANGE WAS COVERED. Assertions over
 rows a store happens to hold are silent about rows it does not: a range half covered
 reports the same clean success as one covered completely, and THE FEWER ROWS SURVIVE

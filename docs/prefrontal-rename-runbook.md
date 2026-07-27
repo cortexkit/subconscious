@@ -150,6 +150,38 @@ swallows everything between. Ours changed 13 lines where 8 were intended. The
 extras happened to be correct; read every changed line rather than trusting the
 count, because the mechanism does not know which.
 
+## The daemon artifact for this window
+
+The window needs a daemon bounce regardless (module ids change, so the config
+changes and a rescan follows), which makes it the natural moment to close the
+daemon's own deploy gap. Build the release binary BEFORE the window so the step is
+copy, sign, warm-exec, restart -- not a build.
+
+WHAT THE PENDING DAEMON BINARY CARRIES that matters here: `supervisor.rescan
+--dry-run`, which shows the reconciliation without applying it. The running daemon
+predates the flag and IGNORES it, executing a real rescan -- the CLI refuses loudly
+rather than reporting success, but the preview is unavailable until the bounce. So
+the order is BOUNCE FIRST, THEN USE THE PREVIEW during the rename, not the reverse.
+
+MARKER FOR VERIFYING THE SWAP, measured rather than assumed:
+
+    strings <binary> | grep -c preview      new: 3    old: 0
+
+CONTROL, proving the probe reads the binary at all -- a marker that reads zero on
+both is indistinguishable from a failed deploy and invites redeploying correct
+bytes:
+
+    strings <binary> | grep -c changed_pending_reload    new: 3    old: 3
+
+TWO TRAPS I HIT PICKING THAT MARKER, both worth avoiding under window pressure.
+First, my initial choice was a CLI string and read ZERO on the daemon -- the marker
+must come from the artifact being swapped, so VERIFY IT ON THE NEW BINARY BEFORE
+comparing against the old one. Second, match-arm string literals never reach the
+binary at all: the compiler compares them by length and bytes without emitting a
+contiguous constant, so a perfectly reasonable-looking marker can be structurally
+unfindable. If a string is not in a binary built from source containing it, the
+marker is unusable -- stop there rather than concluding the deploy failed.
+
 ## Before the window
 
 1. Ufuk present, daylight, box not under heavy build load.

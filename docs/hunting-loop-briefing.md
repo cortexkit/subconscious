@@ -4306,6 +4306,19 @@ compare a value with itself and report "unchanged" forever, which is the reassur
 direction. Both of mine read before writing, verified at source rather than
 assumed.
 
+A VACUITY GUARD PROTECTS AGAINST ONE VACUITY AND CAN HIDE ANOTHER. The second
+self-comparison found by this rule sat behind a minimum-length guard, written by
+someone who had already worried about trivial passes. It fired correctly -- the
+prefix genuinely was long -- and its PASS line made the tautological run look MORE
+carefully verified than a bare comparison would have. So the guard did not merely
+fail to help; its success was part of the disguise. Ask of any check carrying a
+vacuity guard: WHICH vacuity, and does its passing imply anything about the others?
+Usually nothing.
+
+AND WHEN THE INPUTS MAKE THE QUESTION UNANSWERABLE, REFUSE RATHER THAN ANSWER. Two
+identical arguments where two distinct ones were meant has no correct comparison
+available, so producing one is the error. Exit distinctly and say why.
+
 RELATED, AND THE REASON TO ENUMERATE RATHER THAN TRUST: fixing one call site says
 nothing about its siblings. A correct new mechanism used in one place leaves the
 other place untouched and still wrong. The remedy is not more care at the moment of

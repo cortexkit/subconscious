@@ -1270,10 +1270,27 @@ correct bytes are wrong.
 
 AUDIT THE CLASS, NOT THE INSTANCE: a verification step whose validity depends on a
 step the procedure itself performs. Pointing that at the rest of the same ritual
-found a second immediately -- BYTE SIZE also changes across signing (9,409,008
-before, 9,372,416 after), and it shrinks, which is also what a truncated copy does.
+found a second immediately -- BYTE SIZE -- and the second one is worse than it first
+appeared, for a reason that only came out on a retest.
+
+The first reading was "size changes across signing, 9,409,008 to 9,372,416". WRONG,
+and verified wrong independently: re-signing an already-signed binary leaves the
+size UNCHANGED. The observed change was cargo's output to the first re-sign, and the
+cause is that THE LINKER ALREADY SIGNS ITS OUTPUT (`flags=0x20002(adhoc,
+linker-signed)`). So the first codesign REPLACES a linker signature and resizes;
+every signing after that does not.
+
+WHICH MAKES SIZE MORE DANGEROUS THAN AN ALWAYS-WRONG CHECK, NOT LESS. It does not
+always disagree -- it disagrees ON THE FIRST SIGNING ONLY. A CHECK THAT USUALLY
+PASSES IS TRUSTED FAR MORE THAN ONE THAT NEVER DOES, and the single case where size
+legitimately disagrees is exactly the case an operator learns to wave through as
+"that's just the signing". Since a truncated copy also reads smaller, the fault size
+exists to catch arrives wearing the one excuse that has been trained into the reader.
+
 A marker-string check SURVIVES, because signing rewrites the signature blob rather
-than the string table, but that was measured rather than assumed.
+than the string table. That was measured rather than assumed, and then tested AS A
+PREDICTION on a case not yet examined -- 22,164 strings before and after, identical
+-- which is what separates a mechanism from a story fitted to what you already saw.
 
 WHAT TO USE INSTEAD, ranked by the question each answers:
 · INODE -- "is this pid executing this file". Unaffected by signing. Rung 1.
@@ -1286,9 +1303,20 @@ WHAT TO USE INSTEAD, ranked by the question each answers:
 AND BOTH REPLACEMENTS CARRY THE EMPTY-RESULT TRAP. `otool` on a non-Mach-O yields
 nothing, so TWO UNREADABLE PATHS COMPARE EQUAL and report SAME BUILD -- the
 strongest possible agreement, from two measurements that did not happen. Same shape
-as an lsof invoked with an empty pid. Guard with an explicit non-empty check on
-BOTH sides and mutation-prove the guard, because this is the third time in one
-weekend that this failure shape has appeared INSIDE a fix for that failure shape.
+as an lsof invoked with an empty pid.
+
+PUT THE GUARD IN THE EXTRACTION, NOT THE COMPARISON. This shape appeared THREE TIMES
+IN ONE WEEKEND INSIDE FIXES FOR ITSELF, and the reason is structural: THE FIX IS
+ALWAYS A NEW COMPARISON, AND EVERY NEW COMPARISON IS A FRESH CHANCE FOR BOTH SIDES
+TO BE EMPTY AND AGREE. The class reproduces through its own remedy. A guarded
+comparison protects only callers who remember; AN EXTRACTOR THAT RAISES RATHER THAN
+RETURNING A SENTINEL CANNOT FEED A FALSE MATCH DOWNSTREAM AT ALL.
+
+The test that shows the difference is the CARELESS CALLER: write the naive
+`identity(a) == identity(b)` over two unreadable paths. With a raising extractor it
+cannot run. With a sentinel it returns True. Mutation-prove it by reverting the
+extractor to a sentinel and watching the false match come back -- a guard verified
+only through its careful caller has not been tested where it matters.
 
 ## Reach for the authoritative check before the clever one
 

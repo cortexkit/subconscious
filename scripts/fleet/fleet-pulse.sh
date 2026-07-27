@@ -125,6 +125,13 @@ if [ -n "$terminal" ]; then
     echo "  ... and $((terminal_total - 6)) more in the window, not shown"
   fi
   dim "  quiet since BEFORE one of these terminals = produced nothing after it; check the transcript for why"
+elif [ ! -r "$STORE" ]; then
+  # AN EMPTY QUERY RESULT AND AN UNREADABLE STORE ARE DIFFERENT FACTS, and the
+  # section reported both as "none terminal in the last 12h" -- an emptiness claim
+  # about a source it could not read. Every other section here already announces a
+  # missing input; this one asserted a clean answer instead, which is the worse
+  # direction because it is reassuring.
+  echo "  store unreadable ($STORE) -- campaign terminals UNCHECKED this cycle"
 else
   echo "  none terminal in the last 12h"
 fi

@@ -1256,6 +1256,35 @@ STILL LETS THROUGH. Stripping comments removes one confound and leaves another
 standing, and the residual one is invisible precisely because the check now looks
 principled.
 
+## Reach for the authoritative check before the clever one
+
+After running about ten mutations in one session, I swept for sabotage left behind.
+Built a positional detector -- a `return false;` immediately after a function
+signature -- reasoning that the count alone cannot separate a mutant from ordinary
+Rust. Proved it could fire by planting one in a throwaway tree. Clean.
+
+Then ran `git diff origin/master` and it was ZERO. A tree with no diff against the
+remote cannot contain a mutation, so the positional check was redundant before I
+wrote it. The cheap authoritative check SUBSUMES the clever one entirely.
+
+WHY THE CLEVER ONE CAME FIRST, since the ordering is the finding rather than the
+waste: I was thinking about the PROPERTY (what does a leftover mutation look like)
+rather than the QUESTION (is anything left). The property invites a detector; the
+question has a one-command answer. The same inversion produced a false report about
+another repo's CI earlier the same night -- I reasoned from a mechanism instead of
+asking the authoritative query, and published the inference over a measurement I
+had already made.
+
+BEFORE BUILDING A DETECTOR, ASK WHETHER SOMETHING ALREADY KNOWS THE ANSWER. Version
+control, the process supervisor, the package manager, the API -- these hold
+authoritative state and answer in one command. A detector reconstructs that state
+from evidence, and every reconstruction is a chance to be wrong in a way that reads
+as a result.
+
+THE CLEVER CHECK IS NOT WASTED WHEN THE AUTHORITY IS UNAVAILABLE -- a dirty tree,
+an unpushed branch, a machine with no remote. Keep it for that case, and reach for
+it second.
+
 ## Fenced, unfenced, and fenced-by-accident
 
 Running the constant-function mutation across a module's guards produces three

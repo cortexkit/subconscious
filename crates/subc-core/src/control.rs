@@ -3276,6 +3276,103 @@ mod tests {
         );
     }
 
+    /// The refusal test above proves the guard says NO. Nothing proved it can say
+    /// YES, and the difference is not academic: replacing the whole authorization
+    /// with `false` -- admitting no consumer identity at all, revoking Reserved
+    /// standing for every supervised module in the fleet -- leaves 110 of the 111
+    /// library tests GREEN. The one that notices does so by HANGING, because it
+    /// waits for a bind that can no longer happen.
+    ///
+    /// A hang is the weakest signal a suite can produce. In CI it reads as a slow
+    /// or flaky test, invites a RETRY rather than an investigation, and the retry
+    /// hangs too and gets blamed on the runner. So a total revocation of the
+    /// daemon's trust grant would have shipped behind a symptom nobody attributes
+    /// to code.
+    ///
+    /// The bias is structural rather than accidental. A REFUSAL looks like a
+    /// failure someone writes a test for; a GRANT looks like the happy path. Every
+    /// binary-outcome guard whose STRICTNESS is the point acquires a refusal-heavy
+    /// suite for that reason, and this one is the purest case in the daemon.
+    ///
+    /// This test asserts the EFFECT rather than the absence of an error: the module
+    /// receives a RouteBind and it carries `Reserved` naming the attested module.
+    /// A guard that admitted nobody would produce no bind at all; one that admitted
+    /// everybody would stamp the wrong principal, which the refusal test catches.
+    #[tokio::test]
+    async fn route_open_stamps_reserved_for_a_correctly_attested_consumer() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("fed", "fed-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(95));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(96));
+        let route_handler = handler.clone();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(
+                    &client_ctx,
+                    route_open_frame_with_admission_facts(
+                        30,
+                        "target",
+                        Some(subc_control::ConsumerIdentity {
+                            module_id: "fed".to_string(),
+                            launch_nonce: "fed-nonce".to_string(),
+                        }),
+                        None,
+                    ),
+                )
+                .await
+                .unwrap()
+        });
+
+        // BOUND THE WAIT. The first version of this test recv'd unbounded, and under
+        // the very mutation it exists to catch -- a guard that admits nobody -- no
+        // bind is ever sent, so it HUNG rather than failing. That reproduces the
+        // exact defect being fixed: a total revocation detected only as a stalled
+        // suite, which reads as flakiness and invites a retry. An acceptance test
+        // that waits for an effect must bound the wait, or a red becomes a hang.
+        let bind_frame = tokio::time::timeout(Duration::from_secs(5), target_rx.recv())
+            .await
+            .expect("no route.bind within 5s: the consumer-identity guard refused a correctly attested consumer")
+            .expect("module control channel closed before route.bind");
+        let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
+        let ModuleControlRequest::RouteBind { principal, .. } = bind else {
+            panic!("expected route.bind")
+        };
+        assert_eq!(
+            principal,
+            Some(Principal::Reserved {
+                module_id: "fed".to_string()
+            }),
+            "a correctly attested consumer must be stamped Reserved for its own id"
+        );
+
+        handler
+            .handle_control_frame(&target_ctx, route_bind_ack(bind_frame.header.corr))
+            .await
+            .unwrap();
+        assert!(route_task.await.unwrap().is_empty());
+        assert!(
+            matches!(
+                serde_json::from_slice::<ClientControlResponse>(
+                    &client_rx.recv().await.unwrap().body
+                )
+                .unwrap(),
+                ClientControlResponse::RouteOpen { .. }
+            ),
+            "the route must actually open, not merely avoid an error"
+        );
+    }
+
     #[tokio::test]
     async fn admission_facts_gate_checks_carrier_target_and_precedence() {
         let registry = Arc::new(Registry::default());

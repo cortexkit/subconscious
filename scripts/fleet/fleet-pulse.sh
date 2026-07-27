@@ -223,7 +223,13 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
   "SELECT COUNT(*), SUM(published), MAX(CASE WHEN published=1 THEN device_seq END), MAX(device_seq) FROM generations;" 2>/dev/null) && [ -n "$gens" ]; then
   IFS='|' read -r total pub maxpub newest <<<"$gens"
   if [ "$newest" != "$maxpub" ]; then
-    echo "  gen $newest uploading (last published $maxpub, $pub/$total published)"
+    # SAY "UNPUBLISHED", NOT "UPLOADING". The counter proves only that a generation
+    # is not published yet; whether anything is being sent is a separate fact,
+    # established two lines below by the sidecar. Calling it "uploading" asserts an
+    # activity this query cannot observe -- and when uploads are stopped entirely,
+    # as during a credential outage, this line and the sidecar line contradict each
+    # other two lines apart. The reader anchors on the first one.
+    echo "  gen $newest unpublished (last published $maxpub, $pub/$total published)"
     # The generation counter above cannot see WITHIN a generation: one that is
     # 60% uploaded and one that has not started read identically. That gap is
     # how a stalled publish hides -- it looks exactly like a slow one, and the

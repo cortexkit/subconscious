@@ -4258,7 +4258,7 @@ After three rounds where fix authorization could not reach a dying worker, the
 lane became report-only by design and the operator wrote every fix. That removed
 a failure mode and cost nothing, because verification was already theirs.
 
-## A skip is worst when its trigger is anti-correlated with the property
+## A check that goes quiet exactly when it matters
 
 A silently skipped check is bad because a clean result covers an arbitrary subset.
 It is far worse when the condition that silences the check is CORRELATED WITH THE
@@ -4285,6 +4285,8 @@ cannot launder a real violation -- a genuine failure must still fail rather than
 reporting as skipped -- because that is the control everyone omits and the only one
 separating an honest skip from a silent pass.
 
+## A check that affirms by measuring nothing
+
 THE THIRD SHAPE IS NOT A SKIP AT ALL, AND IT IS THE WORST: A FALSE PASS FROM
 SELF-COMPARISON. A check picked the last qualifying item as its comparison subject;
 when nothing qualified, the fallback was THE BASELINE ITSELF, so it compared one
@@ -4306,6 +4308,8 @@ compare a value with itself and report "unchanged" forever, which is the reassur
 direction. Both of mine read before writing, verified at source rather than
 assumed.
 
+## A guard against one empty case can hide another
+
 A VACUITY GUARD PROTECTS AGAINST ONE VACUITY AND CAN HIDE ANOTHER. The second
 self-comparison found by this rule sat behind a minimum-length guard, written by
 someone who had already worried about trivial passes. It fired correctly -- the
@@ -4324,6 +4328,8 @@ A guard placed at the point of use sits AFTER whatever setup precedes it -- a st
 query, a network call -- so it cannot fire when that setup fails, and the run dies
 in a traceback instead of refusing. IF THE ARGUMENTS ALONE SETTLE IT, THE REFUSAL
 OWES NOTHING TO ANY MEASUREMENT and belongs before the first one.
+
+## Rank the empty paths by how easy they are to reach
 
 RANK VACUOUS PATHS BY HOW MUCH EFFORT THEY TAKE TO REACH. A tautology needing a
 wrong invocation is a hazard; one needing an OMITTED OPTIONAL ARGUMENT is the
@@ -4355,6 +4361,8 @@ THE ANSWER IS ALREADY DETERMINED, NOT AT THE POINT WHERE THE MISSING INPUT IS US
 Those are the same place only when nothing happens in between, and something always
 happens in between.
 
+## Enumerate the space, not the neighbours
+
 ENUMERATE THE SPACE, NOT THE NEIGHBOURS. Having just applied a rule to one neighbour
 is its own certainty, one notch smaller than having just understood the rule -- and
 it stops you at the same place. Two seats independently fixed a help-fallthrough by
@@ -4368,6 +4376,8 @@ unrecognised flag ALONE often errors -- for a reason unrelated to the flag, such
 required argument being absent -- so a careless check reads clean. The case that matters is AN UNRECOGNISED
 FLAG ALONGSIDE A VALID INVOCATION, which nobody constructs without having seen the
 shape before.
+
+## Reading a name loosely: harmless for a monitor, dangerous for an authorizer
 
 A NAME-KEYED READ IS A LIABILITY WHEN IT GATES OBSERVATION AND A FEATURE WHEN IT
 GATES AUTHORITY. Same mechanism, opposite correct response, and the discriminator is
@@ -4427,6 +4437,8 @@ and the recipient applying it to different code. Review requires reading what so
 wrote; this requires only knowing what to ask -- which is why it crosses repository
 boundaries that review cannot, and why the finding worth sending is the SHAPE rather
 than the patch.
+
+## Knowing the pattern is what makes you skip the sibling
 
 KNOWING THE PATTERN IS WHAT MAKES YOU SKIP THE SIBLING. My seats section already
 printed MISSING against an expected roster; the modules section one screen away
@@ -4512,6 +4524,8 @@ the survivor was reachable by doing LESS than the closed path required. After wr
 a fix, ask what OTHER inputs reach the same wrong output, not merely whether the
 observed one is now blocked.
 
+## Classify your own fixes: comparison or case
+
 CLASSIFY YOUR OWN FIXES BY THE SHAPE OF THE CONDITION THEY ADD. A fix stated as a
 COMPARISON covers causes its author never enumerated; a fix stated as a CASE handles
 the case. THE TELL IS WHETHER THE PREDICATE NAMES THE PROPERTY OR NAMES A
@@ -4530,6 +4544,8 @@ can be asked of the clock directly.
 USUALLY IS WHERE THESE LIVE. When a predicate is true because of a circumstance that
 ordinarily accompanies the property, write down which circumstance -- and then ask
 what makes it stop accompanying.
+
+## A negative assertion passes when the field it names disappears
 
 A NEGATIVE ASSERTION OVER A NAMED FIELD IS SATISFIED BY THE NAME'S ABSENCE. Reading
 a counter that is not on the surface yields zero, so "no failures" passes when the
@@ -4557,6 +4573,8 @@ HONEST. The 0 reads as "none configured" and the '?' as "unknown"; both are
 reportable as findings. A probe that fails loudly is cheaper than one that fails
 plausibly, and tolerance added early is what makes a broken instrument look like a
 result.
+
+## Ask where a tool decides WHICH thing it is talking about
 
 ENUMERATE WHERE THE SUBJECT IS CHOSEN, NOT WHERE CHECKS MIGHT NOT RUN. The five
 earlier finds came from asking which checks can be silenced; that key was exhausted.

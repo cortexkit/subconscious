@@ -1283,13 +1283,35 @@ test. A new test adds coverage while leaving the next person just as unaware of
 what the existing ones quietly do -- and they are the ones at risk of being
 refactored.
 
-A CHEAP PREDICTOR, since the full sweep is not free. A test named for a RULE
-("requires a matching nonce") tends to cover the whole truth table; a test named
-for a REFUSAL ("refuses an unattested consumer") tends to cover refusals only. In
-one module the rule-named guard was covered both directions with the accept case
-asserting a real effect, and the refusal-named one admitted nobody with the suite
-green. GREP FOR refuses/rejects/denies IN TEST NAMES AND CHECK EACH FOR AN ACCEPT
-COUNTERPART -- it is not proof, but it ranks where to spend the mutation.
+A CHEAP PREDICTOR, since the full sweep is not free. Test names rank where to spend
+the mutation, in three shapes of increasing danger:
+
+RULE-NAMED ("requires a matching nonce") tends to cover the whole truth table.
+Measured: covered both directions, accept case asserting a real effect.
+
+REFUSAL-NAMED ("refuses an unattested consumer") tends to cover refusals only.
+Measured: the guard admitted nobody with the suite green.
+
+ABSENCE-NAMED ("never contains the input", "does not leak", "is not reachable") is
+the worst, and it inverts the usual intuition: THE DEGENERATE IMPLEMENTATION IS
+MORE ABSENT THAN THE CORRECT ONE. A second seat found a fingerprint function whose
+three assertions all checked output SHAPE -- prefix, length, and does-not-contain
+the input -- and A HARDCODED CONSTANT SATISFIED ALL THREE PERFECTLY. The
+strictest-looking assertion in the file is the one a constant passes most easily,
+because a constant contains the input LESS than a real digest does.
+
+The consequence there was not cosmetic: the fingerprint was used as IDENTITY, so a
+constant collapses every distinct handle onto one -- one credential's response
+served for another's lookup, one audit trail for all of them -- while reading as
+correct in every log line. Same total collapse of a primitive as an all-green trust
+guard, reached through a different door.
+
+SO GREP TEST NAMES FOR refuses/rejects/denies AND FOR never/not/without, and for
+each ask what the corresponding PRESENCE assertion would be. For an absence-named
+test the missing counterpart is usually "distinct inputs produce distinct outputs",
+and it needs proving against TWO mutants: a constant, and a function that reads
+only part of its input -- the second produces different outputs for different
+inputs, so a naive assertion over two very different values passes it.
 
 ## An optional field is ignored by anything that predates it
 

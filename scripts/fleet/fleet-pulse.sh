@@ -46,7 +46,30 @@ echo
 bold "MODULES"
 if health=$(ck health 2>/dev/null); then
   ok_count=$(printf '%s\n' "$health" | grep -c '● ok')
-  printf '  %s ok\n' "$ok_count"
+  # COUNT WHAT SHOULD EXIST, NOT ONLY WHAT ANSWERED. This line reported what the
+  # daemon RETURNED, with nothing to compare it against -- so a module removed from
+  # the config, or never spawned, read as a smaller count and NO not-ok line. That
+  # is QUIETER than a degraded module, which is the wrong direction: the more
+  # completely a module is gone, the less this section says about it. The seats
+  # section already learned this and prints MISSING against an expected roster; the
+  # config is the equivalent authority here, and it is the same file the daemon
+  # spawns from rather than a list maintained beside it.
+  cfg_count=$(python3 -c "import json,re,os,sys
+p=os.path.expanduser('~/.config/cortexkit/subc.jsonc')
+try:
+    s=re.sub(r'//.*','',open(p).read())
+    print(len(json.loads(s).get('modules',[])))
+except Exception:
+    pass" 2>/dev/null)
+  reported=$(printf '%s\n' "$health" | grep -c '●')
+  if [ -n "$cfg_count" ] && [ "$reported" -lt "$cfg_count" ] 2>/dev/null; then
+    printf '  %s ok  (%s of %s configured modules reporting -- %s ABSENT from health)\n' \
+      "$ok_count" "$reported" "$cfg_count" "$((cfg_count - reported))"
+  elif [ -z "$cfg_count" ]; then
+    printf '  %s ok  (config unreadable -- cannot say whether any module is ABSENT)\n' "$ok_count"
+  else
+    printf '  %s ok\n' "$ok_count"
+  fi
   notok=$(printf '%s\n' "$health" | grep '●' | grep -v '● ok' || true)
   prev_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/ck-fleet-pulse-health.prev"
   prev=$(cat "$prev_file" 2>/dev/null || true)

@@ -4355,6 +4355,26 @@ THE ANSWER IS ALREADY DETERMINED, NOT AT THE POINT WHERE THE MISSING INPUT IS US
 Those are the same place only when nothing happens in between, and something always
 happens in between.
 
+ENUMERATE WHERE THE SUBJECT IS CHOSEN, NOT WHERE CHECKS MIGHT NOT RUN. The five
+earlier finds came from asking which checks can be silenced; that key was exhausted.
+Asking instead "where does this decide WHICH EVENT it is talking about" found the
+purest instance in one pass: a command that scans with NO SUBJECT ARGUMENT AT ALL,
+so there is nothing to omit and nothing to get wrong -- the vacuous path is the ONLY
+path, correct on a fresh instance and wrong from the moment a second run lands in the
+same directory.
+
+THE THIRD REMEDY IS TO QUALIFY THE CLAIM, when the operation is legitimate but its
+scope is wider than a reader will assume. A survey that reports "a placeholder
+exists" is doing its job; the defect is that an unqualified finding is read as a
+finding about the run just performed. "...in any capture on disk" is still true,
+still unscoped, and now unmistakable. THE LABEL IS THE BINDING, as far as anyone
+reading the output is concerned -- which is why a lifetime ratio marked all-time is
+fixed while the same number unmarked is not.
+
+AND NOTE WHAT NOT TO DO: requiring a scope bound on a genuinely unscoped survey is
+as wrong as leaving it unlabelled. Refusal and qualification are not interchangeable
+-- refusal denies an answer that exists.
+
 AND CHOOSE REFUSAL OR SKIP BY WHETHER A LEGITIMATE READING EXISTS. Two identical
 arguments where two distinct ones were meant has no correct answer, so refuse.
 A newest-first match that lands on an older event has one -- the run may genuinely

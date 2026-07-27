@@ -4374,6 +4374,21 @@ new every cycle and never once as persistent. The detector is quietest exactly w
 the signal is strongest. Ask of any change-detector: what does WORSENING look like
 to it, and does worsening alter the thing it compares?
 
+THE EXPOSURE IS STRUCTURAL AND PREDICTABLE WITHOUT REDOING THE REASONING. A check
+that ITERATES EVENTS gets LOUDER as a fault worsens -- more bad events means more
+assertions, so severity cannot suppress it. A check that COMPARES A STATE TO ITS OWN
+PREVIOUS RENDERING can be suppressed, because worsening alters the compared value
+itself.
+
+NARROW IT ONE STEP FURTHER, WHICH THE PAIR IN MY OWN SCRIPT SETTLES: the exposed set
+is cross-cycle comparisons WHERE SAMENESS IS THE SIGNAL. My persistence detector
+treats unchanged-as-meaningful, so a rising count destroys the signal. My swap-delta
+treats changed-as-meaningful, so a rising number IS the report. Same structure,
+opposite exposure, decided entirely by which side of the comparison carries the
+meaning. So: ANY DETECTOR WHOSE ALARM CONDITION IS "THIS LOOKS LIKE LAST TIME" IS
+EXPOSED TO SEVERITY; one whose alarm condition is "this differs from last time" is
+not.
+
 DISTINGUISH BEING COVERED FROM BEING DESIGNED. Auditing four text comparisons, three
 were safe -- one shadowed by an equality check directly above it, two sitting under
 POSITIVE assertions that fail loudly when their literal is renamed. None of that was
@@ -4382,6 +4397,19 @@ which is worth more than luck and less than design: the mechanism predicts where
 next one will be safe, but nothing stops someone deleting the shadowing check while
 tidying. Record which safety is load-bearing and which is incidental, or the next
 reader cannot tell them apart.
+
+THE FINDS GENERATE THE CRITERIA, NOT THE REVERSE. Across thirteen defects in one
+sweep, NOT ONE was found by the criterion that opened it. Each new criterion arrived
+because a defect's SHAPE did not fit the question that had found its predecessor --
+silenced checks, then effort ranking, then subject binding, then set size, then
+negative assertions, then predicate shape. None came from thinking harder about the
+previous question.
+
+So the method is not "have better criteria", it is LET A FIND THAT DOES NOT FIT
+REWRITE THE QUESTION. That only works if you examine the SHAPE of what you caught
+rather than filing it under the category you were hunting -- filing it is what ends
+the sequence, because a defect recorded as another instance of a known class teaches
+nothing and the next criterion never arrives.
 
 FIXING THE SAMPLE IS NOT FIXING THE POPULATION. A remedy aimed at the observed
 failure narrows the entrance it watched and can leave a wider one open -- in one case

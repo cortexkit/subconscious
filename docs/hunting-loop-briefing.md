@@ -4374,6 +4374,28 @@ new every cycle and never once as persistent. The detector is quietest exactly w
 the signal is strongest. Ask of any change-detector: what does WORSENING look like
 to it, and does worsening alter the thing it compares?
 
+SAMENESS-SHAPED IS NECESSARY BUT NOT SUFFICIENT: THE DEFECT IS SAMENESS-SHAPED PLUS
+A DOC THAT PROMISES DETECTION. Compare two fields with the identical blind spot. A
+degrade streak documented as "the substrate for a persistent-degrade alarm" makes a
+CAPABILITY claim and says nothing about scope -- a reader builds the alarm on it and
+finds it silent during the widest outage. A field named `last_error`, documented as
+"reason for the MOST RECENT failure", has the same one-slot shape and cannot be
+misread, because the NAME STATES THE SCOPE and the doc repeats it. Only the first is
+a defect.
+
+SO THE CHEAPEST PROPHYLACTIC IS A NAME THAT STATES ITS OWN SCOPE: a doc then cannot
+overclaim without contradicting the name, and a contradiction is something a reader
+notices where a silence is not.
+
+BUT CHECK WHICH LEVEL CARRIES THE CLAIM, because they can differ within one
+declaration. `CircuitBreaker { identical_failures }` states its scope at the FIELD
+and overclaims at the TYPE: the type name promises general protection against
+runaway failure, and the type name is what travels -- into design docs, into prose,
+into conversation -- while the field name stays at the construction site. A reader
+asking "does this task have a circuit breaker?" never sees the qualifier. When the
+name cannot be changed without a wire break, the doc has to carry the whole scope,
+which is the more expensive form of the same fix.
+
 THE EXPOSURE IS STRUCTURAL AND PREDICTABLE WITHOUT REDOING THE REASONING. A check
 that ITERATES EVENTS gets LOUDER as a fault worsens -- more bad events means more
 assertions, so severity cannot suppress it. A check that COMPARES A STATE TO ITS OWN

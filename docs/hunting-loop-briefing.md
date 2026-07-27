@@ -4258,6 +4258,39 @@ After three rounds where fix authorization could not reach a dying worker, the
 lane became report-only by design and the operator wrote every fix. That removed
 a failure mode and cost nothing, because verification was already theirs.
 
+## A skip is worst when its trigger is anti-correlated with the property
+
+A silently skipped check is bad because a clean result covers an arbitrary subset.
+It is far worse when the condition that silences the check is CORRELATED WITH THE
+CHECK FAILING -- because then the runs least likely to have demonstrated the
+property are the runs most likely to report success.
+
+Two instances from one harness, both found by asking the question rather than
+waiting for a failure. A protection check ran only when the wire carried enough
+items for any to be eligible; too few items means the drive barely exercised the
+mechanism, so a WEAK DRIVE silenced the check AND produced a pass. And a reply-form
+check needed a decision log, which is exactly the artefact absent when the feature
+is misconfigured -- so a misconfigured run announced success over the checks that
+survived.
+
+So the question at each skip is not only "can this be skipped" but "WHAT MAKES IT
+SKIP, and does that condition make the property MORE likely to be violated?" If it
+does, the skip is not a gap in coverage, it is a filter that removes the failing
+cases.
+
+A check that could not be attempted neither holds nor fails, so it must not be
+absorbed into either. Count it separately, print it with its reason, and report the
+run as INCOMPLETE rather than as a pass. And write the control that proves the skip
+cannot launder a real violation -- a genuine failure must still fail rather than
+reporting as skipped -- because that is the control everyone omits and the only one
+separating an honest skip from a silent pass.
+
+RELATED, AND THE REASON TO ENUMERATE RATHER THAN TRUST: fixing one call site says
+nothing about its siblings. A correct new mechanism used in one place leaves the
+other place untouched and still wrong. The remedy is not more care at the moment of
+fixing; it is listing every site mechanically afterwards and reading what follows
+each one. Nineteen sites, two of them checks that had quietly stopped being checks.
+
 ## Pre-commit the stop condition
 
 Write it down before the round runs. A stop rule authored after the result is a

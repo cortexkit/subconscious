@@ -4319,6 +4319,27 @@ AND WHEN THE INPUTS MAKE THE QUESTION UNANSWERABLE, REFUSE RATHER THAN ANSWER. T
 identical arguments where two distinct ones were meant has no correct comparison
 available, so producing one is the error. Exit distinctly and say why.
 
+PUT THAT REFUSAL WHERE THE ARGUMENTS ARE READ, NOT WHERE THE MISSING INPUT IS USED.
+A guard placed at the point of use sits AFTER whatever setup precedes it -- a store
+query, a network call -- so it cannot fire when that setup fails, and the run dies
+in a traceback instead of refusing. IF THE ARGUMENTS ALONE SETTLE IT, THE REFUSAL
+OWES NOTHING TO ANY MEASUREMENT and belongs before the first one.
+
+RANK VACUOUS PATHS BY HOW MUCH EFFORT THEY TAKE TO REACH. A tautology needing a
+wrong invocation is a hazard; one needing an OMITTED OPTIONAL ARGUMENT is the
+default behaviour for anyone running the command for the first time. Worst instance
+found: a delta check whose baseline was optional, so without it the comparison
+measured from zero and the "movement" attributed to a run was the process's LIFETIME
+TOTAL -- asserting "this process has ever done X" while reading as "this run did X",
+with identical output either way. THE LONGER THE PROCESS HAS BEEN UP, THE MORE
+CERTAINLY IT PASSES. Anti-correlation against uptime rather than against the
+property.
+
+WHEN COUNTING INSTANCES, SEPARATE THE SHAPE FROM THE COUNT. Five instances of one
+pattern in one file is a fact about that file -- five subcommands sharing one
+counter-and-compare idiom -- not a competence difference between the people who
+wrote it and the people who did not. The shape generalises; the count does not.
+
 RELATED, AND THE REASON TO ENUMERATE RATHER THAN TRUST: fixing one call site says
 nothing about its siblings. A correct new mechanism used in one place leaves the
 other place untouched and still wrong. The remedy is not more care at the moment of

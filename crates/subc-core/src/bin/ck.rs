@@ -2232,6 +2232,18 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             if verb == "-h" || verb == "--help" || verb == "help" {
                 return Ok(Command::Help(MODULE_HELP.into()));
             }
+            // A HELP REQUEST ANYWHERE IN THE TAIL IS STILL A HELP REQUEST. Checking
+            // only the verb position meant `ck module rescan --help` fell through to
+            // the verb match and RAN THE RECONCILIATION -- an operator asking a
+            // destructive command to explain itself got the command. Placed before
+            // the verb match so it cannot be reached by any verb.
+            if tail
+                .iter()
+                .skip(1)
+                .any(|t| t == "-h" || t == "--help" || t == "help")
+            {
+                return Ok(Command::Help(MODULE_HELP.into()));
+            }
             let id = |n: usize| -> Result<String, CkError> {
                 tail.get(n)
                     .map(|t| t.to_string_lossy().into_owned())

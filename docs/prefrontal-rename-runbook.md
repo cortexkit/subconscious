@@ -157,15 +157,33 @@ changes and a rescan follows), which makes it the natural moment to close the
 daemon's own deploy gap. Build the release binary BEFORE the window so the step is
 copy, sign, warm-exec, restart -- not a build.
 
+STAGED ARTIFACT, ad-hoc signed and version-probed:
+
+    ~/.local/share/cortexkit/staging/ck-subc.rename-window-019ba45f
+    sha256 a4232d6edd980cce...
+
+RE-STAGE IF MASTER HAS MOVED. An earlier version of this document said a binary was
+staged when only `target/release` had been built -- the record ran ahead of the
+artifact, and a staged binary that no longer matches master is the same defect one
+step along. Check the suffix against `git rev-parse --short HEAD` before the window
+and rebuild if they differ; the suffix exists so the mismatch is visible in a
+directory listing rather than needing a hash.
+
 WHAT THE PENDING DAEMON BINARY CARRIES that matters here: `supervisor.rescan
 --dry-run`, which shows the reconciliation without applying it. The running daemon
 predates the flag and IGNORES it, executing a real rescan -- the CLI refuses loudly
 rather than reporting success, but the preview is unavailable until the bounce. So
 the order is BOUNCE FIRST, THEN USE THE PREVIEW during the rename, not the reverse.
 
-MARKER FOR VERIFYING THE SWAP, measured rather than assumed:
+MARKER FOR VERIFYING THE SWAP, measured on BOTH artifacts rather than assumed:
 
-    strings <binary> | grep -c preview      new: 3    old: 0
+    strings <binary> | grep -c 'the CortexKit subc daemon'    staged: 3    running: 0
+
+A CANDIDATE THAT FAILED THE SAME CHECK, recorded so nobody reaches for it: `rescan
+--dry-run` reads ZERO IN BOTH, because match-arm and format-adjacent literals do not
+always survive into the binary. A marker reading zero on both is indistinguishable
+from a failed deploy and invites redeploying correct bytes. ALWAYS VERIFY THE MARKER
+ON THE ARTIFACT YOU JUST BUILT BEFORE COMPARING AGAINST ANYTHING.
 
 CONTROL, proving the probe reads the binary at all -- a marker that reads zero on
 both is indistinguishable from a failed deploy and invites redeploying correct

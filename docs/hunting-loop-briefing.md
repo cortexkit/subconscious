@@ -1256,6 +1256,40 @@ STILL LETS THROUGH. Stripping comments removes one confound and leaves another
 standing, and the residual one is invisible precisely because the check now looks
 principled.
 
+## A verification step invalidated by the procedure it verifies
+
+Our deploy ritual signs the binary AT THE DESTINATION, because an unsigned copy is
+killed by the kernel on first exec. Our deploy CHECK compared the staged artifact's
+sha256 against the deployed file's. Signing rewrites bytes inside the binary, so
+THOSE TWO CAN NEVER MATCH -- the check reports a false mismatch on every correct
+deploy, and its natural remedy is redeploying a binary that was already right.
+
+The check and the ritual were quietly incompatible. Nothing surfaces that until the
+day it fires, on a real deploy, under time pressure, telling an operator that
+correct bytes are wrong.
+
+AUDIT THE CLASS, NOT THE INSTANCE: a verification step whose validity depends on a
+step the procedure itself performs. Pointing that at the rest of the same ritual
+found a second immediately -- BYTE SIZE also changes across signing (9,409,008
+before, 9,372,416 after), and it shrinks, which is also what a truncated copy does.
+A marker-string check SURVIVES, because signing rewrites the signature blob rather
+than the string table, but that was measured rather than assumed.
+
+WHAT TO USE INSTEAD, ranked by the question each answers:
+· INODE -- "is this pid executing this file". Unaffected by signing. Rung 1.
+· LC_UUID (`otool -l`, one line) or the __TEXT segment bytes -- "is this file the
+  build I meant". Both survive re-signing; verified agreeing in both directions,
+  identical across a re-sign and differing across builds.
+· WHOLE-FILE SHA AND FILE SIZE -- valid only when nothing re-signs after staging,
+  which our ritual violates by design.
+
+AND BOTH REPLACEMENTS CARRY THE EMPTY-RESULT TRAP. `otool` on a non-Mach-O yields
+nothing, so TWO UNREADABLE PATHS COMPARE EQUAL and report SAME BUILD -- the
+strongest possible agreement, from two measurements that did not happen. Same shape
+as an lsof invoked with an empty pid. Guard with an explicit non-empty check on
+BOTH sides and mutation-prove the guard, because this is the third time in one
+weekend that this failure shape has appeared INSIDE a fix for that failure shape.
+
 ## Reach for the authoritative check before the clever one
 
 After running about ten mutations in one session, I swept for sabotage left behind.

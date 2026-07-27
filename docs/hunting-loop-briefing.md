@@ -1256,6 +1256,41 @@ STILL LETS THROUGH. Stripping comments removes one confound and leaves another
 standing, and the residual one is invisible precisely because the check now looks
 principled.
 
+## Fenced, unfenced, and fenced-by-accident
+
+Running the constant-function mutation across a module's guards produces three
+outcomes, not two, and the third needs a different response from either.
+
+FENCED. Breaking the guard reddens a test NAMED FOR IT. Nothing to do.
+
+UNFENCED. Breaking it changes nothing, or -- worse -- produces a HANG. Write the
+missing test.
+
+FENCED BY ACCIDENT. Breaking it reddens several tests and EVERY ONE IS NAMED FOR
+SOMETHING ELSE. Measured instance: a health-advertisement check whose accept
+direction is held up by five tests about capability relay, probe demultiplexing and
+supervision-only probing. Each exercises a successful advertisement check on the
+way to its own subject.
+
+THE THIRD IS REAL PROTECTION WITH A SPECIFIC FRAGILITY: narrowing any of those
+tests to focus on its stated subject silently removes coverage nobody knows they
+are carrying. It is also INVISIBLE TO AN AUDIT BY NAME -- reading the test list
+suggests the guard is uncovered, and reading the mutation result suggests it is
+fine. Only the two together locate it.
+
+THE RESPONSE IS A COMMENT AT THE GUARD NAMING WHICH TESTS HOLD IT UP, not a new
+test. A new test adds coverage while leaving the next person just as unaware of
+what the existing ones quietly do -- and they are the ones at risk of being
+refactored.
+
+A CHEAP PREDICTOR, since the full sweep is not free. A test named for a RULE
+("requires a matching nonce") tends to cover the whole truth table; a test named
+for a REFUSAL ("refuses an unattested consumer") tends to cover refusals only. In
+one module the rule-named guard was covered both directions with the accept case
+asserting a real effect, and the refusal-named one admitted nobody with the suite
+green. GREP FOR refuses/rejects/denies IN TEST NAMES AND CHECK EACH FOR AN ACCEPT
+COUNTERPART -- it is not proof, but it ranks where to spend the mutation.
+
 ## An optional field is ignored by anything that predates it
 
 Added a `preview` flag to a control operation that retires processes, so an

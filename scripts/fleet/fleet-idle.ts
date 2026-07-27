@@ -43,10 +43,26 @@ type Project = {
   attention?: Record<string, number>
 }
 
-const reply = (await client.call("alfonso-core", "projects.overview", {})) as {
-  result?: { projects?: Project[] }
-  projects?: Project[]
+type Overview = { result?: { projects?: Project[] }; projects?: Project[] }
+
+// TRY THE NEW MODULE ID FIRST, FALL BACK TO THE OLD. The executive is renamed to
+// prefrontal in a flag-day cutover -- the registry refuses duplicate ids, so there
+// is no window where both resolve. A HARDCODED ID GOES BLIND EXACTLY AT THE FLIP,
+// which is the moment this probe is watched most closely. Ordered new-first so the
+// window needs no edit here; drop the fallback once the old id is gone fleet-wide.
+async function overview(): Promise<Overview> {
+  let lastError: unknown
+  for (const moduleId of ["prefrontal", "alfonso-core"]) {
+    try {
+      return (await client.call(moduleId, "projects.overview", {})) as Overview
+    } catch (err) {
+      lastError = err
+    }
+  }
+  throw lastError
 }
+
+const reply = await overview()
 const projects = reply.result?.projects ?? reply.projects ?? []
 const now = Date.now()
 

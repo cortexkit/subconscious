@@ -30,12 +30,36 @@ echo
 # ---------------------------------------------------------------- module health
 # First because a degraded module can be the CAUSE of peer silence, and reading
 # the peer table first would send you chasing a symptom.
+# NOT-OK LINES ARE REPORTED BY PERSISTENCE, NOT BY MAGNITUDE. Some gauges are
+# structurally noisy: alfonso-core's delivery counter samples on a 30s cadence
+# while intents legitimately live 29-59s in flight, so nearly every refresh
+# freezes one to three mid-flight rows and renders "degraded". Reporting that each
+# cycle trains the reader to wave through the one gauge that will eventually mean
+# something -- an instrument whose complaints you have learned to dismiss is
+# indistinguishable from one that has stopped working.
+#
+# So the detail line is remembered between cycles and surfaced only when it is
+# UNCHANGED, which is the module owner's own triage trigger: the same condition
+# frozen across two readings is a stall, a different one is traffic. A first
+# sighting says so explicitly rather than staying silent, because silence on a
+# genuine new failure is the expensive direction.
 bold "MODULES"
 if health=$(ck health 2>/dev/null); then
   ok_count=$(printf '%s\n' "$health" | grep -c '● ok')
   printf '  %s ok\n' "$ok_count"
-  # Anything not ok is printed in full: these are the lines worth stopping for.
-  printf '%s\n' "$health" | grep '●' | grep -v '● ok' | sed 's/^/  /'
+  notok=$(printf '%s\n' "$health" | grep '●' | grep -v '● ok' || true)
+  prev_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/ck-fleet-pulse-health.prev"
+  prev=$(cat "$prev_file" 2>/dev/null || true)
+  printf '%s' "$notok" > "$prev_file" 2>/dev/null || true
+  if [ -n "$notok" ]; then
+    if [ "$notok" = "$prev" ]; then
+      printf '%s\n' "$notok" | sed 's/^/  PERSISTS /'
+      echo "  ^ unchanged since the previous cycle -- this is the shape worth acting on"
+    else
+      printf '%s\n' "$notok" | sed 's/^/  (new or changed) /'
+      echo "  ^ first sighting; noisy gauges clear by the next cycle, a real one persists"
+    fi
+  fi
 else
   echo "  daemon unreachable -- this is the first thing to fix"
 fi

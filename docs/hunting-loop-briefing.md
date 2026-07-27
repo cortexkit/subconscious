@@ -4355,6 +4355,29 @@ THE ANSWER IS ALREADY DETERMINED, NOT AT THE POINT WHERE THE MISSING INPUT IS US
 Those are the same place only when nothing happens in between, and something always
 happens in between.
 
+KNOWING THE PATTERN IS WHAT MAKES YOU SKIP THE SIBLING. My seats section already
+printed MISSING against an expected roster; the modules section one screen away
+counted only what answered, and I read its first line every thirty minutes for a
+weekend without seeing it. The lesson existed in the same file and did not transfer.
+Same shape as two sibling subcommands sharing an idiom where one gets fixed and the
+other is never opened. So the mechanical enumeration is LEAST optional exactly when
+you are most confident you understand the pattern -- confidence is what replaces the
+second look.
+
+WHEN A CHECK RUNS OVER A NAMED RANGE, VERIFY THE RANGE WAS COVERED. Assertions over
+rows a store happens to hold are silent about rows it does not: a range half covered
+reports the same clean success as one covered completely, and THE FEWER ROWS SURVIVE
+THE FEWER CHECKS RUN AND THE QUIETER THE RESULT. The authority is usually already in
+hand -- an independent record of what was served, a config the daemon spawns from --
+so this needs a comparison rather than a maintained roster.
+
+MAKE PROBES BRITTLE WHILE YOU ARE STILL ESTABLISHING WHAT THEY SAY. Chasing one
+count I got 0, then '?', then a crash -- three wrong answers, and ONLY THE CRASH WAS
+HONEST. The 0 reads as "none configured" and the '?' as "unknown"; both are
+reportable as findings. A probe that fails loudly is cheaper than one that fails
+plausibly, and tolerance added early is what makes a broken instrument look like a
+result.
+
 ENUMERATE WHERE THE SUBJECT IS CHOSEN, NOT WHERE CHECKS MIGHT NOT RUN. The five
 earlier finds came from asking which checks can be silenced; that key was exhausted.
 Asking instead "where does this decide WHICH EVENT it is talking about" found the

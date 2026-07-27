@@ -1746,6 +1746,18 @@ impl ControlHandler {
             )?]);
         };
 
+        // This guard's ACCEPT direction is fenced, but only INCIDENTALLY: no test is
+        // named for it. Making `module_registration_grants_op` return false
+        // unconditionally reddens five tests, and every one is named for something
+        // else -- capability relay, probe/bind demultiplexing, supervision-only
+        // probing. They exercise a successful advertisement check on the way to their
+        // own subject.
+        //
+        // Real protection, fragile in a specific way: narrowing any of those tests to
+        // focus on its stated subject would silently remove coverage nobody knows
+        // they are carrying. Recorded here rather than as a sixth test, because the
+        // useful fact is WHICH tests hold the guard up -- a new test would add
+        // coverage without telling the next person what the existing ones quietly do.
         if !module_registration_grants_op(&registration.control_ops, MODULE_CONTROL_OP_HEALTH_CHECK)
         {
             return Ok(vec![control_error_frame(

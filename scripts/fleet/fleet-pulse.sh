@@ -70,12 +70,21 @@ except Exception:
   else
     printf '  %s ok\n' "$ok_count"
   fi
-  notok=$(printf '%s\n' "$health" | grep '●' | grep -v '● ok' || true)
+    # COMPARE THE MODULE AND ITS STATUS, NOT THE WHOLE LINE. Byte-identity of the
+    # rendered text is a PROXY for "the same condition is still present", and it
+    # stops accompanying the property the moment any volatile substring appears --
+    # an age, a queue depth, a count. A module stuck degraded for hours whose
+    # detail carries a rising number would read as (new or changed) EVERY cycle and
+    # never once as PERSISTS, so the one signal worth acting on is the one a
+    # counting detail suppresses. Detail still prints; only the comparison key is
+    # narrowed.
+    notok=$(printf '%s\n' "$health" | grep '●' | grep -v '● ok' || true)
+    notok_key=$(printf '%s\n' "$notok" | awk '{print $1, $2, $3}')
   prev_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/ck-fleet-pulse-health.prev"
-  prev=$(cat "$prev_file" 2>/dev/null || true)
-  printf '%s' "$notok" > "$prev_file" 2>/dev/null || true
-  if [ -n "$notok" ]; then
-    if [ "$notok" = "$prev" ]; then
+    prev=$(cat "$prev_file" 2>/dev/null || true)
+    printf '%s' "$notok_key" > "$prev_file" 2>/dev/null || true
+    if [ -n "$notok" ]; then
+      if [ "$notok_key" = "$prev" ]; then
       printf '%s\n' "$notok" | sed 's/^/  PERSISTS /'
       echo "  ^ unchanged since the previous cycle -- this is the shape worth acting on"
     else

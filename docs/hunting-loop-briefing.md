@@ -4364,6 +4364,25 @@ other is never opened. So the mechanical enumeration is LEAST optional exactly w
 you are most confident you understand the pattern -- confidence is what replaces the
 second look.
 
+CLASSIFY YOUR OWN FIXES BY THE SHAPE OF THE CONDITION THEY ADD. A fix stated as a
+COMPARISON covers causes its author never enumerated; a fix stated as a CASE handles
+the case. THE TELL IS WHETHER THE PREDICATE NAMES THE PROPERTY OR NAMES A
+CIRCUMSTANCE THAT USUALLY IMPLIES IT.
+
+Worked pair from one sequence. "Compare the count against what SHOULD exist" is
+indifferent to whether a module died or an upstream glyph was renamed -- it covered
+a second cause with no second edit. "Is this match the NEWEST one" is a proxy for
+recency that holds only while the directory keeps growing; the same sequence's own
+remedy carried it, and a run producing NO captures made a day-old event trivially
+newest, so the original defect survived its own fix by an even lower-effort path
+than the one that had been closed. The comparison form was available the whole time
+-- the records carry a timestamp, so "does this belong to the run being asserted"
+can be asked of the clock directly.
+
+USUALLY IS WHERE THESE LIVE. When a predicate is true because of a circumstance that
+ordinarily accompanies the property, write down which circumstance -- and then ask
+what makes it stop accompanying.
+
 A NEGATIVE ASSERTION OVER A NAMED FIELD IS SATISFIED BY THE NAME'S ABSENCE. Reading
 a counter that is not on the surface yields zero, so "no failures" passes when the
 failure counter has been renamed away -- with real failures sitting in a counter

@@ -236,7 +236,14 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
     # activity this query cannot observe -- and when uploads are stopped entirely,
     # as during a credential outage, this line and the sidecar line contradict each
     # other two lines apart. The reader anchors on the first one.
-    echo "  gen $newest unpublished (last published $maxpub, $pub/$total published)"
+    # "$pub/$total" IS A LIFETIME RATIO AND IMPROVES WITH AGE WHILE A FAULT PERSISTS:
+    # three stuck generations read as 4% of 74 today and would read as 1.5% of 200
+    # later, with the stuck count unchanged. Anti-correlation against uptime -- the
+    # longer this has run, the healthier the ratio looks for the same defect. It is
+    # labelled rather than dropped because the absolute counts on the HALTED line
+    # below carry the real signal; an unlabelled ratio beside them invites reading
+    # the reassuring one.
+    echo "  gen $newest unpublished (last published $maxpub; $pub/$total published all-time)"
     # The generation counter above cannot see WITHIN a generation: one that is
     # 60% uploaded and one that has not started read identically. That gap is
     # how a stalled publish hides -- it looks exactly like a slow one, and the

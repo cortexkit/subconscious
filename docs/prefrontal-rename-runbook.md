@@ -217,10 +217,35 @@ unfiltered listing that returns a plausible unrelated file.
 ## Registering the prediction
 
 Rescan retires any supervised module absent from the config, which stops live
-processes. Its premise is inspectable in advance (unlike a sealed one), but
-nothing reconstructs the diff for the operator — the result table is read AFTER
-the retires. Until `supervisor.rescan` gains a preview mode, register the
-prediction by hand:
+processes. Its premise is inspectable in advance (unlike a sealed one), and the
+daemon now reconstructs the diff on request.
+
+RUN `ck module rescan --dry-run` FIRST. It reports the added / removed / unchanged
+sets WITHOUT applying them, computed daemon-side by the same function as the
+executing path with a single early return before any mutation — so the preview
+cannot describe a different config than the operation reads.
+
+AND THE OPERATOR'S `ck` MUST CARRY IT TOO. The flag was committed to master before
+the binary on PATH was refreshed, so for a while this document prescribed a flag the
+operator's own binary did not have. Check with `ck module --help`: if `rescan
+--dry-run` is absent from the listing, install the current build first. A runbook
+line is a claim about the INSTALLED tool, not about master.
+
+TWO FURTHER CONDITIONS, BOTH LOAD-BEARING:
+
+· THE DAEMON MUST CARRY THE PREVIEW BUILD. A daemon predating it DROPS THE UNKNOWN
+  FIELD AND EXECUTES A REAL RECONCILIATION. The CLI refuses loudly rather than
+  reporting success — exit 2, with an explicit warning that a reconciliation may
+  have applied — but the ordering still matters: BOUNCE FIRST, THEN PREVIEW, never
+  the reverse. This is the whole reason the pending daemon binary is staged.
+· THE PREVIEW IS NOT A SUBSTITUTE FOR THE HASH. It answers what rescan WOULD do
+  against the config as it stands now; it says nothing about the config changing
+  between the preview and the run. Keep step 5.
+
+With the preview available the hand prediction is a cross-check rather than the
+only instrument, and it is still worth writing down — a prediction registered in
+advance turns a surprise into a finding instead of something rationalised after the
+fact:
 
 1. Edit the config.
 2. Record `shasum -a 256` of the config. NOT mtime+size: a rename is a

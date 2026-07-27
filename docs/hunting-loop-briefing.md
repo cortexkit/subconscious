@@ -4369,6 +4369,32 @@ absent -- so a careless check reads clean. The case that matters is AN UNRECOGNI
 FLAG ALONGSIDE A VALID INVOCATION, which nobody constructs without having seen the
 shape before.
 
+A NAME-KEYED READ IS A LIABILITY WHEN IT GATES OBSERVATION AND A FEATURE WHEN IT
+GATES AUTHORITY. Same mechanism, opposite correct response, and the discriminator is
+THE COST OF READING THE NAME TOO LOOSELY.
+
+A MONITOR reading a name loosely costs nothing -- try the new id, fall back to the
+old, and a rename needs no edit. An AUTHORIZER reading a name loosely WIDENS WHAT CAN
+ARM THE THING IT PROTECTS, which is the opposite of its purpose: a suffix or prefix
+match on a tool name that authorizes a destructive path lets a neighbouring name
+authorize it too. For an authorizer the correct answer is EXACT MATCH PLUS A
+COORDINATED CHANGE, documented where the constant lives so the coordination is
+discoverable at the moment someone renames -- not tolerance.
+
+THIS IS THE FAILURE MODE OF RECEIVING A SHAPE WITHOUT ITS COST MODEL. A seat that
+ported the monitor fix directly onto an authorizer would have written a real security
+regression while believing they were applying a lesson. So a shape must travel with
+BOTH its circumstance trap (what invocation exposes it) AND its cost model (what
+reading it wrongly costs HERE), or it arrives as a rule with no idea which way to
+point.
+
+CHECKED IN MY OWN AUTHORITY PATH: subc's principal grant compares the module id by
+exact map lookup and the nonce in constant time, with an empty presented nonce
+refused outright. No prefix, suffix or contains anywhere on that path -- so the
+rename must add the new id deliberately, which is the coordinated change rather than
+a fallback. Right by construction, and now stated so nobody "improves" it into
+symmetry with the monitors.
+
 A SHAPE ONLY TRANSFERS IF IT CARRIES ITS CIRCUMSTANCE TRAP WITH IT. "Help must not
 run the command" alone would have had the recipient test an unknown flag IN ISOLATION,
 watch it error for an unrelated reason, and file the binary clean. What made it

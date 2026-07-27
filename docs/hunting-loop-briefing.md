@@ -4364,6 +4364,31 @@ other is never opened. So the mechanical enumeration is LEAST optional exactly w
 you are most confident you understand the pattern -- confidence is what replaces the
 second look.
 
+THE THIRD ANTI-CORRELATION AXIS IS SEVERITY, AND IT IS THE WORST. The first two were
+against the PROPERTY (a weak drive silences the check a weak drive would fail) and
+against ELAPSED TIME (a lifetime counter passes more certainly the longer a process
+runs). This one is against HOW BAD THE FAULT IS. A persistence detector comparing
+rendered lines calls a fault PERSISTENT when its detail is stable and NEW when the
+detail changes -- so a stuck condition whose detail carries a RISING count reads as
+new every cycle and never once as persistent. The detector is quietest exactly where
+the signal is strongest. Ask of any change-detector: what does WORSENING look like
+to it, and does worsening alter the thing it compares?
+
+DISTINGUISH BEING COVERED FROM BEING DESIGNED. Auditing four text comparisons, three
+were safe -- one shadowed by an equality check directly above it, two sitting under
+POSITIVE assertions that fail loudly when their literal is renamed. None of that was
+intentional; the asymmetry did the work. That is luck WITH A MECHANISM BEHIND IT,
+which is worth more than luck and less than design: the mechanism predicts where the
+next one will be safe, but nothing stops someone deleting the shadowing check while
+tidying. Record which safety is load-bearing and which is incidental, or the next
+reader cannot tell them apart.
+
+FIXING THE SAMPLE IS NOT FIXING THE POPULATION. A remedy aimed at the observed
+failure narrows the entrance it watched and can leave a wider one open -- in one case
+the survivor was reachable by doing LESS than the closed path required. After writing
+a fix, ask what OTHER inputs reach the same wrong output, not merely whether the
+observed one is now blocked.
+
 CLASSIFY YOUR OWN FIXES BY THE SHAPE OF THE CONDITION THEY ADD. A fix stated as a
 COMPARISON covers causes its author never enumerated; a fix stated as a CASE handles
 the case. THE TELL IS WHETHER THE PREDICATE NAMES THE PROPERTY OR NAMES A

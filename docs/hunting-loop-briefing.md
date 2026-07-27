@@ -4335,6 +4335,31 @@ with identical output either way. THE LONGER THE PROCESS HAS BEEN UP, THE MORE
 CERTAINLY IT PASSES. Anti-correlation against uptime rather than against the
 property.
 
+THE WORST VARIANT NEEDS NO SECOND CONDITION, ONLY TIME. A search that scans
+newest-first for anything matching, with the target optional, is correct on a fresh
+instance and becomes wrong as history accumulates -- and capture directories,
+ledgers and logs only grow. So it passes every test run while the tool is being
+built and starts lying once the tool is trusted. Worst instance found: a compaction
+assertion with no exchange given matched YESTERDAY's correctly-handled event and
+reported six of six checks passed for a run that produced no compaction at all. Not
+one check was wrong; every one was true of a different event. THE RUN DESCRIBED
+SOMETHING OTHER THAN THE THING BEING ASSERTED, fluently.
+
+A LIFETIME RATIO IS THE NUMERICAL FORM OF THE SAME DEFECT. It is not incorrect, it
+answers a question nobody asked while sitting where a window would go -- and it
+improves while the fault is unchanged, so it makes the problem look smaller more
+convincingly every day the problem persists.
+
+GENERAL FORM OF THE PLACEMENT RULE: A REFUSAL BELONGS AT THE EARLIEST POINT WHERE
+THE ANSWER IS ALREADY DETERMINED, NOT AT THE POINT WHERE THE MISSING INPUT IS USED.
+Those are the same place only when nothing happens in between, and something always
+happens in between.
+
+AND CHOOSE REFUSAL OR SKIP BY WHETHER A LEGITIMATE READING EXISTS. Two identical
+arguments where two distinct ones were meant has no correct answer, so refuse.
+A newest-first match that lands on an older event has one -- the run may genuinely
+be describing something else -- so record it as a skip that names what it found.
+
 WHEN COUNTING INSTANCES, SEPARATE THE SHAPE FROM THE COUNT. Five instances of one
 pattern in one file is a fact about that file -- five subcommands sharing one
 counter-and-compare idiom -- not a competence difference between the people who

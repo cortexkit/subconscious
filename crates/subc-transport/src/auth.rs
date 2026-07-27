@@ -327,6 +327,25 @@ fn random_nonce() -> Result<[u8; NONCE_LEN], AuthError> {
     Ok(nonce)
 }
 
+/// Both directions of this comparison are fenced, verified by mutation rather than
+/// assumed, because a proof check has the failure mode where a suite proves only
+/// that it can say NO.
+///
+/// ALWAYS-FALSE (no proof ever verifies, every connection in the fleet refused) is
+/// caught by the handshake integration tests and by two bootstrap tests -- named
+/// for key rotation and singleton probing, so this is coverage carried by tests
+/// about something else. Narrowing either would remove it silently.
+///
+/// ALWAYS-TRUE is caught by `foreign_server_reused_port_never_receives_client_auth`
+/// -- the case where a client must refuse a server that cannot produce the proof.
+/// Named for the refusal, and it holds that direction directly.
+///
+/// The construction feeding it is pinned separately by
+/// `committed_wire_vectors_pin_the_proof_construction`, which reddens for a constant
+/// proof AND for one that folds only part of its input -- the second matters because
+/// a partial-input proof still produces different outputs for different inputs, so
+/// any distinctness assertion passes it while a proof minted against one daemon
+/// verifies against another.
 fn constant_time_eq(expected: &[u8; PROOF_LEN], actual: &[u8; PROOF_LEN]) -> bool {
     expected.as_slice().ct_eq(actual.as_slice()).into()
 }

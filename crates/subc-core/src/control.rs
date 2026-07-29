@@ -2575,15 +2575,18 @@ fn control_response_body_frame<T: Serialize>(
 /// two codes on the same side of the boundary passes it. Measured rather than
 /// assumed — `NoModuleConnection` re-pointed at `module_reloading` is caught only
 /// by `supervision_only_module_health_probe_does_not_enable_route_open_and_cleans_up`,
-/// a test named for something else that happens to assert the string. Narrowing
-/// that test to its stated subject would silently remove the only coverage of
-/// which code this variant produces.
+/// a test named for something else that happens to assert the string.
 ///
-/// No identity fence is added, deliberately. Retryability is the property clients
-/// branch on; beyond it the code reaches humans in logs and `ck`, where a
-/// misleading-but-same-class code costs a confusing line rather than wrong
-/// control flow. Pin identity here if a consumer ever branches on a specific code
-/// within a class.
+/// That accidental coverage is deliberately left alone rather than promoted to a
+/// named test, because it guards a property this function does not promise.
+/// Checked at source: every consumer branches on the RETRYABLE SET and none on a
+/// specific code within a class, so identity is free to change and only the
+/// partition is a contract. Splitting it out would assert a guarantee nothing
+/// depends on — and a suite that promises more than the code does is the harder
+/// thing to correct later, because the next reader cannot tell which assertions
+/// are load-bearing.
+///
+/// Pin identity here the moment a consumer branches on a specific code.
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
         ForwardingError::NoModuleConnection => "target_unavailable",
@@ -2737,11 +2740,13 @@ mod tests {
     /// first-party capability to something that never proved it; a supervised one
     /// stamped `Direct` silently strips a module of capability it is entitled to.
     ///
-    /// Neither shows up in a test that only checks the bind succeeded. Pinned here
-    /// because the existing coverage is accidental: the mutation is caught by
-    /// `route_open_round_trip_via_tagged_shape_forwards_through_stub`, a wire-shape
-    /// test that happens to assert the stamped principal, so narrowing it to its
-    /// stated subject would delete the only assertion on this value.
+    /// Neither shows up in a test that only checks the bind succeeded. Before this
+    /// test the only coverage was accidental —
+    /// `route_open_round_trip_via_tagged_shape_forwards_through_stub` asserts the
+    /// stamped principal on its way past, so narrowing that wire-shape test to its
+    /// stated subject would have deleted the last assertion on this value. It
+    /// still asserts the stamp, which is now redundancy rather than the only
+    /// guard: both fail under the same mutation, and this one names the reason.
     #[tokio::test]
     async fn an_unattested_caller_is_never_stamped_as_a_supervised_module() {
         let handler = ControlHandler::default();

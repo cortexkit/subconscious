@@ -2729,6 +2729,52 @@ mod tests {
         }
     }
 
+    /// The principal is the daemon's answer to "who is calling", and modules
+    /// branch on it: aft gates bash on it, cerebellum gates browser control,
+    /// plexus gates connector invocation. So a stamp is an authorization input in
+    /// another process, not a label — and both possible answers SUCCEED, which is
+    /// what makes a wrong one quiet. An unattested caller stamped `Reserved` hands
+    /// first-party capability to something that never proved it; a supervised one
+    /// stamped `Direct` silently strips a module of capability it is entitled to.
+    ///
+    /// Neither shows up in a test that only checks the bind succeeded. Pinned here
+    /// because the existing coverage is accidental: the mutation is caught by
+    /// `route_open_round_trip_via_tagged_shape_forwards_through_stub`, a wire-shape
+    /// test that happens to assert the stamped principal, so narrowing it to its
+    /// stated subject would delete the only assertion on this value.
+    #[tokio::test]
+    async fn an_unattested_caller_is_never_stamped_as_a_supervised_module() {
+        let handler = ControlHandler::default();
+        let frame =
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 900, Vec::new()).unwrap();
+
+        // Absent consumer_identity is the ordinary case: a human at a terminal, or
+        // any process holding the connection file. Nothing was proved, so nothing
+        // may be granted beyond the unattested floor.
+        let stamped = handler.route_open_principal(&frame, None).unwrap().unwrap();
+        assert_eq!(
+            stamped,
+            Principal::Direct,
+            "a caller that proved nothing must not be stamped as a supervised module"
+        );
+
+        // A claimed module_id with a nonce no supervised child was given is a
+        // forgery attempt, not a weaker caller: it must be REFUSED rather than
+        // quietly demoted to Direct, or an impersonation attempt looks identical
+        // to an ordinary unattested connection.
+        let forged = handler
+            .route_open_principal(
+                &frame,
+                Some(ConsumerIdentity {
+                    module_id: "aft".to_string(),
+                    launch_nonce: "not-a-real-nonce".to_string(),
+                }),
+            )
+            .unwrap();
+        let refusal = forged.expect_err("an unmatched launch nonce must not yield a principal");
+        assert_eq!(parse_error(&refusal)["code"], "bad_consumer_identity");
+    }
+
     fn manifest(module_id: &str, protocol_ver: u8) -> ModuleManifest {
         ModuleManifest {
             module_id: module_id.to_string(),

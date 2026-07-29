@@ -909,6 +909,38 @@ fn quota_entry_is_connected(entry: &Value) -> bool {
     entry.get("usage").is_some_and(Value::is_object)
 }
 
+/// Whether a disconnected entry is worth anyone's attention.
+///
+/// Not-connected covers two unrelated situations that used to render as one
+/// number. A provider nobody ever configured is a permanent, correct state with
+/// nothing to do about it; a provider whose credential broke this morning is a
+/// login away from working. Counting them together means a provider that stopped
+/// working moves the total by one and produces no other signal — which is how a
+/// quota exhaustion went unnoticed here before.
+///
+/// `errorClass` is the producer's machine-readable reason (see the field's docs
+/// in `cortexkit-provider-usage`). Two of its values are NOT actionable:
+/// `credential_absent` is the never-configured case, and `no_quota_reported`
+/// means the credential works and the account simply has no quota to report.
+/// Everything else names something a person could fix.
+///
+/// An UNRECOGNISED class counts as actionable on purpose. The class list is open
+/// and grows on the producer's side, so the choice is between surfacing a class
+/// we have not heard of and silently filing it under "nothing to do". On an
+/// observability surface the first is a line someone reads once; the second is
+/// the exact blindness this split exists to remove.
+///
+/// An entry with NO class at all — any producer predating the field — counts as
+/// not-actionable, so an older producer renders exactly as it did before rather
+/// than turning every disconnected provider into an alarm.
+fn quota_entry_is_actionable(entry: &Value) -> bool {
+    match entry.get("errorClass").and_then(Value::as_str) {
+        None => false,
+        Some("credential_absent" | "no_quota_reported") => false,
+        Some(_) => true,
+    }
+}
+
 fn quota_entries_for_table<'a>(
     providers: &'a [Value],
     filter: Option<&str>,
@@ -1020,8 +1052,23 @@ fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
             .filter(|entry| !quota_entry_is_connected(entry))
             .count();
         if disconnected > 0 {
+            // Split the count only when the producer gives us the reason. A
+            // producer predating `errorClass` yields zero actionable entries and
+            // renders the single line it always did.
+            let failing = providers
+                .iter()
+                .filter(|entry| !quota_entry_is_connected(entry))
+                .filter(|entry| quota_entry_is_actionable(entry))
+                .count();
             println!();
-            let summary = format!("{disconnected} providers not connected (--verbose to list)");
+            let summary = if failing > 0 {
+                format!(
+                    "{} not connected · {failing} configured but failing (--verbose to list)",
+                    disconnected - failing
+                )
+            } else {
+                format!("{disconnected} providers not connected (--verbose to list)")
+            };
             println!("{}", dim_text(&summary, color_enabled));
         }
     }
@@ -1096,13 +1143,21 @@ fn print_quota_account(
 
     if !quota_entry_is_connected(entry) {
         let reason = entry_error_detail(entry).unwrap_or_else(|| "no usage data".to_string());
+        // "Which ones" is the first question after seeing the failing count, so
+        // the class is named here rather than left to the prose. The prose is the
+        // producer's human message and carries no stability promise; the class is
+        // the stable name, and printing both means an unrecognised class still
+        // arrives with a readable explanation beside it.
+        let detail = match entry.get("errorClass").and_then(Value::as_str) {
+            Some(class) if quota_entry_is_actionable(entry) => {
+                format!("{label} [{class}] — {}", truncate_cell(&reason))
+            }
+            _ => format!("{label} — {}", truncate_cell(&reason)),
+        };
         println!(
             "  {} {}",
             dim_text("○", color_enabled),
-            dim_text(
-                &format!("{label} — {}", truncate_cell(&reason)),
-                color_enabled
-            )
+            dim_text(&detail, color_enabled)
         );
         return;
     }
@@ -2726,6 +2781,68 @@ mod tests {
         let expected =
             "{\n  \"result\": [\n    {\n      \"provider\": \"codex\",\n      \"usage\": {}\n    }\n  ]\n}";
         assert_eq!(format_json_output(&reply).unwrap(), expected);
+    }
+
+    /// The whole point of the split is that the second number is trustworthy, so
+    /// it must be zero when every degraded provider is degraded for a reason
+    /// nobody can act on. A count that is permanently non-zero while nothing is
+    /// wrong stops being read within a week.
+    #[test]
+    fn a_never_configured_provider_is_not_counted_as_failing() {
+        for class in ["credential_absent", "no_quota_reported"] {
+            let entry = serde_json::json!({
+                "provider": "p", "error": "x", "errorClass": class
+            });
+            assert!(
+                !quota_entry_is_actionable(&entry),
+                "{class} must not land in the actionable bucket"
+            );
+        }
+    }
+
+    /// A credential that broke this morning is the case the split exists to
+    /// surface. Exercised across every actionable class the producer ships today
+    /// rather than one representative, so a class going quiet is a failure here
+    /// rather than a silent drop in the count.
+    #[test]
+    fn a_broken_credential_is_counted_as_failing() {
+        for class in [
+            "credential_unusable",
+            "credential_rejected",
+            "upstream_failed",
+            "decode_failed",
+        ] {
+            let entry = serde_json::json!({
+                "provider": "p", "error": "x", "errorClass": class
+            });
+            assert!(
+                quota_entry_is_actionable(&entry),
+                "{class} names something a person can fix"
+            );
+        }
+    }
+
+    /// The class list is open and grows on the producer's side. A class this
+    /// build has never seen must surface rather than be filed under "nothing to
+    /// do" — the direction matters, because the quiet failure is the one that
+    /// reproduces the blindness the field was added to remove.
+    #[test]
+    fn a_class_this_build_has_never_seen_still_surfaces() {
+        let entry = serde_json::json!({
+            "provider": "p", "error": "something new", "errorClass": "a_class_from_the_future"
+        });
+        assert!(quota_entry_is_actionable(&entry));
+    }
+
+    /// A producer predating the field must render exactly as it did before, or
+    /// shipping this turns every disconnected provider on an older fleet into an
+    /// alarm. Not vacuous: the entry really is disconnected, so it cannot pass by
+    /// being mistaken for a healthy one.
+    #[test]
+    fn an_entry_with_no_class_is_not_counted_as_failing() {
+        let entry = serde_json::json!({ "provider": "p", "error": "no session: x" });
+        assert!(!quota_entry_is_connected(&entry));
+        assert!(!quota_entry_is_actionable(&entry));
     }
 
     #[test]

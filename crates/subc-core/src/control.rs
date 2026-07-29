@@ -2775,6 +2775,42 @@ mod tests {
         assert_eq!(parse_error(&refusal)["code"], "bad_consumer_identity");
     }
 
+    /// The test above hands `route_open_principal` an identity it built itself,
+    /// which proves the stamping rule and nothing about where the identity comes
+    /// from. The real producer is a wire body, and the two are joined by a serde
+    /// field name that nothing else asserts.
+    ///
+    /// That join fails quietly in one specific way: an unrecognised key is simply
+    /// absent after parsing, so a renamed or misspelled `consumer_identity`
+    /// yields `None` and every supervised module silently drops to `Direct`.
+    /// Capability-wise that is the safe direction, but it surfaces far from its
+    /// cause — as a module mysteriously refused bash — and it would pass every
+    /// test that builds its own input.
+    ///
+    /// Deliberately NOT closed with `deny_unknown_fields`: refusing unknown keys
+    /// would break every client the moment the daemon gains a field, trading a
+    /// quiet demotion for a hard refusal on additive change. Asserting the join
+    /// instead means a rename breaks a test here rather than the fleet.
+    #[test]
+    fn a_wire_body_actually_yields_the_consumer_identity_the_daemon_stamps_from() {
+        let body = br#"{"op":"route.open","target":{"kind":"tool_provider","module_id":"m"},"identity":{"session":"s","project_root":"/p","harness":"h"},"consumer_identity":{"module_id":"aft","launch_nonce":"n"}}"#;
+        let parsed: ClientControlRequest = serde_json::from_slice(body).unwrap();
+        let ClientControlRequest::RouteOpen {
+            consumer_identity, ..
+        } = parsed
+        else {
+            panic!("route.open body must parse as RouteOpen");
+        };
+        assert_eq!(
+            consumer_identity,
+            Some(ConsumerIdentity {
+                module_id: "aft".to_string(),
+                launch_nonce: "n".to_string(),
+            }),
+            "the wire field name must reach the value route_open_principal reads"
+        );
+    }
+
     fn manifest(module_id: &str, protocol_ver: u8) -> ModuleManifest {
         ModuleManifest {
             module_id: module_id.to_string(),

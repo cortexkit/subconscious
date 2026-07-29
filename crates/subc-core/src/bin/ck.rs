@@ -1987,6 +1987,22 @@ fn print_health_table(modules: &[Value]) {
         if last_action != "-" {
             annotations.push(format!("last action: {last_action}"));
         }
+        // This whole table is the supervisor's STORED record, not a probe issued
+        // for the question -- so every status here describes some moment in the
+        // past. Age is what tells a reader whether that moment was before or
+        // after the restart they just performed: a pre-restart record reports the
+        // old process, reads as a failed deploy, and invites redeploying
+        // something already correct. Shown only past a minute, since a fresh
+        // record is the ordinary case and annotating it would train the reader to
+        // skip the line. `ck health <id>` needs none of this -- it probes.
+        if let Some(age_s) = health_record_age_secs(module) {
+            if age_s >= 60 {
+                annotations.push(format!(
+                    "record {} old",
+                    format_duration(Duration::from_secs(age_s))
+                ));
+            }
+        }
         let detail = display_field(module, "detail");
         let mut detail_text = if detail == "-" { String::new() } else { detail };
         if !annotations.is_empty() {
@@ -2198,6 +2214,21 @@ fn display_json_value(value: &Value) -> String {
 fn connection_file_age(path: &Path) -> Option<Duration> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     SystemTime::now().duration_since(modified).ok()
+}
+
+/// How long ago the daemon collected a health entry, in seconds.
+///
+/// `None` when the module has never been probed or the stamp is unreadable — both
+/// mean "cannot say how old this is", which must not render as "fresh". A clock
+/// that moved backwards between collection and now also yields `None` rather than
+/// a wrapped enormous age.
+fn health_record_age_secs(entry: &Value) -> Option<u64> {
+    let probed_ms = entry.get("last_probe_ms").and_then(Value::as_u64)?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    now_ms.checked_sub(probed_ms).map(|delta| delta / 1000)
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -2858,6 +2889,48 @@ mod tests {
                 "{class} names something a person can fix"
             );
         }
+    }
+
+    /// A stored health record must disclose its age, because the surface is read
+    /// right after a restart to confirm a deploy. A record collected BEFORE the
+    /// restart describes the old process; without an age the reader cannot tell
+    /// it from a current one, concludes the deploy failed, and redeploys
+    /// something that was already correct.
+    ///
+    /// Never-probed must NOT render as fresh: "no stamp" and "stamped just now"
+    /// are opposite facts, and defaulting the absent case to zero would make the
+    /// staler of the two look like the newer.
+    #[test]
+    fn a_health_record_without_a_probe_stamp_cannot_claim_to_be_fresh() {
+        let stamped = serde_json::json!({
+            "module_id": "m",
+            "last_probe_ms": (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+                as u64)
+                - 7_200_000
+        });
+        let age = health_record_age_secs(&stamped).expect("a stamped record has an age");
+        assert!(
+            (7150..=7250).contains(&age),
+            "a two-hour-old record must report about two hours, got {age}s"
+        );
+
+        let unstamped = serde_json::json!({ "module_id": "m" });
+        assert_eq!(
+            health_record_age_secs(&unstamped),
+            None,
+            "never-probed must be unknown, never zero -- zero renders as fresh"
+        );
+
+        // A clock that moved backwards between collection and now yields no age
+        // rather than a wrapped enormous one, which would read as a decades-old
+        // record and send someone looking for a fault that is not there.
+        let future = serde_json::json!({
+            "module_id": "m",
+            "last_probe_ms": (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+                as u64)
+                + 60_000
+        });
+        assert_eq!(health_record_age_secs(&future), None);
     }
 
     /// A failure inside the quota module is real and NOT the reader's to fix.

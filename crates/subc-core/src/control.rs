@@ -1348,6 +1348,7 @@ impl ControlHandler {
                     consecutive_failures: status.health.consecutive_failures,
                     last_action: status.health.last_action,
                     last_action_ms: status.health.last_action_ms,
+                    last_probe_ms: status.health.last_probe_ms,
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;

@@ -319,6 +319,7 @@ fn supervisor_health_entry() -> SupervisorHealthEntry {
         consecutive_failures: 0,
         last_action: Some("report".to_string()),
         last_action_ms: Some(1_700_000_000_100),
+        last_probe_ms: Some(1_700_000_000_050),
     }
 }
 

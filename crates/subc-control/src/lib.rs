@@ -251,6 +251,20 @@ pub struct SupervisorHealthEntry {
     pub last_action: Option<String>,
     #[serde(default)]
     pub last_action_ms: Option<u64>,
+    /// When the daemon last collected this entry, as unix milliseconds.
+    ///
+    /// `supervisor.health` answers from the supervisor's STORED record rather
+    /// than probing, so every field above describes some moment in the past and
+    /// nothing here said which. That matters most right after a restart, where
+    /// the surface is used to confirm a deploy: a record collected before the
+    /// restart reports the OLD process, reads as a failed deploy, and invites a
+    /// redeploy of something that was already correct.
+    ///
+    /// `None` means never probed — distinct from probed-long-ago, and the reader
+    /// must not collapse them. Absent on modules that advertise no health
+    /// capability, which is why it is optional rather than defaulted to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_ms: Option<u64>,
 }
 
 #[cfg(test)]

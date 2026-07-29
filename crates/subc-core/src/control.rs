@@ -2748,6 +2748,18 @@ mod tests {
     /// stated subject would have deleted the last assertion on this value. It
     /// still asserts the stamp, which is now redundancy rather than the only
     /// guard: both fail under the same mutation, and this one names the reason.
+    /// SCOPE: this handler's supervisor has spawned nothing, so
+    /// `spawned_consumer_authorized` can only ever return false and the GRANT arm
+    /// is unreachable here. Both assertions below are refusals, and a mutant that
+    /// refuses everything would satisfy them.
+    ///
+    /// The grant side is covered where a real nonce exists: `tests/forwarding.rs`
+    /// spawns a supervised consumer, reads its live nonce, and asserts the module
+    /// observed `principal.kind == "reserved"` carrying that module_id — verified
+    /// at source rather than assumed, since a citation is a claim about another
+    /// file and ages like one. Recorded because a harness that structurally
+    /// cannot reach an arm reports "none" for that arm identically to one that
+    /// covers it and found nothing.
     #[tokio::test]
     async fn an_unattested_caller_is_never_stamped_as_a_supervised_module() {
         let handler = ControlHandler::default();

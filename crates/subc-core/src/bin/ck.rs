@@ -909,35 +909,52 @@ fn quota_entry_is_connected(entry: &Value) -> bool {
     entry.get("usage").is_some_and(Value::is_object)
 }
 
-/// Whether a disconnected entry is worth anyone's attention.
+/// What, if anything, a reader should do about a disconnected provider.
 ///
-/// Not-connected covers two unrelated situations that used to render as one
-/// number. A provider nobody ever configured is a permanent, correct state with
-/// nothing to do about it; a provider whose credential broke this morning is a
-/// login away from working. Counting them together means a provider that stopped
-/// working moves the total by one and produces no other signal — which is how a
-/// quota exhaustion went unnoticed here before.
+/// Not-connected used to be one number covering unrelated situations. A provider
+/// nobody ever configured is a permanent, correct state; a provider whose
+/// credential broke this morning is a login away from working. Counted together,
+/// a provider that STOPPED working moves the total by one and produces no other
+/// signal — which is how a quota exhaustion went unnoticed here before.
 ///
-/// `errorClass` is the producer's machine-readable reason (see the field's docs
-/// in `cortexkit-provider-usage`). Two of its values are NOT actionable:
-/// `credential_absent` is the never-configured case, and `no_quota_reported`
-/// means the credential works and the account simply has no quota to report.
-/// Everything else names something a person could fix.
+/// The split is three ways rather than two because the middle bucket carries an
+/// implied instruction. "Configured but failing" means go fix your credential,
+/// and that is the wrong thing to tell someone when the fault is in the quota
+/// module itself: nothing they can log into or reconfigure changes the outcome.
+/// A bucket whose implied action cannot work is a worse place to be than an
+/// unlabelled one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaDisconnectKind {
+    /// Permanent and correct. Never configured, or the account genuinely has no
+    /// quota to report. Nothing to do, and it must never inflate a count that is
+    /// supposed to mean "something needs attention".
+    Inert,
+    /// A person can fix this — usually by logging in again.
+    UserFixable,
+    /// The quota module itself failed. Real, worth surfacing, and NOT the
+    /// reader's to fix.
+    ModuleDefect,
+}
+
+/// Classify a disconnected entry from the producer's `errorClass` (see the
+/// field's docs in `cortexkit-provider-usage`).
 ///
-/// An UNRECOGNISED class counts as actionable on purpose. The class list is open
-/// and grows on the producer's side, so the choice is between surfacing a class
-/// we have not heard of and silently filing it under "nothing to do". On an
-/// observability surface the first is a line someone reads once; the second is
-/// the exact blindness this split exists to remove.
+/// An UNRECOGNISED class is [`UserFixable`](QuotaDisconnectKind::UserFixable) on
+/// purpose. The class list is open and grows on the producer's side, so the
+/// choice is between surfacing something we have not heard of and silently
+/// filing it under "nothing to do". On an observability surface the first is a
+/// line someone reads once; the second is the exact blindness this split exists
+/// to remove.
 ///
-/// An entry with NO class at all — any producer predating the field — counts as
-/// not-actionable, so an older producer renders exactly as it did before rather
-/// than turning every disconnected provider into an alarm.
-fn quota_entry_is_actionable(entry: &Value) -> bool {
+/// An entry with NO class — any producer predating the field — is `Inert`, so an
+/// older producer renders exactly as it did before rather than turning every
+/// disconnected provider into an alarm.
+fn quota_disconnect_kind(entry: &Value) -> QuotaDisconnectKind {
     match entry.get("errorClass").and_then(Value::as_str) {
-        None => false,
-        Some("credential_absent" | "no_quota_reported") => false,
-        Some(_) => true,
+        None => QuotaDisconnectKind::Inert,
+        Some("credential_absent" | "no_quota_reported") => QuotaDisconnectKind::Inert,
+        Some("internal_error") => QuotaDisconnectKind::ModuleDefect,
+        Some(_) => QuotaDisconnectKind::UserFixable,
     }
 }
 
@@ -1052,22 +1069,35 @@ fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
             .filter(|entry| !quota_entry_is_connected(entry))
             .count();
         if disconnected > 0 {
-            // Split the count only when the producer gives us the reason. A
-            // producer predating `errorClass` yields zero actionable entries and
+            // Split the count only where the producer gives us the reason. A
+            // producer predating `errorClass` classifies everything as inert and
             // renders the single line it always did.
-            let failing = providers
+            let kinds: Vec<_> = providers
                 .iter()
                 .filter(|entry| !quota_entry_is_connected(entry))
-                .filter(|entry| quota_entry_is_actionable(entry))
-                .count();
+                .map(quota_disconnect_kind)
+                .collect();
+            let count = |kind| kinds.iter().filter(|k| **k == kind).count();
+            let failing = count(QuotaDisconnectKind::UserFixable);
+            let broken = count(QuotaDisconnectKind::ModuleDefect);
+
             println!();
-            let summary = if failing > 0 {
-                format!(
-                    "{} not connected · {failing} configured but failing (--verbose to list)",
-                    disconnected - failing
-                )
-            } else {
+            let mut parts = vec![format!(
+                "{} not connected",
+                count(QuotaDisconnectKind::Inert)
+            )];
+            if failing > 0 {
+                parts.push(format!("{failing} configured but failing"));
+            }
+            // Named for the culprit rather than the symptom: a reader who tries
+            // to fix their own credential here is being sent to the wrong place.
+            if broken > 0 {
+                parts.push(format!("{broken} quota-module defect"));
+            }
+            let summary = if failing == 0 && broken == 0 {
                 format!("{disconnected} providers not connected (--verbose to list)")
+            } else {
+                format!("{} (--verbose to list)", parts.join(" · "))
             };
             println!("{}", dim_text(&summary, color_enabled));
         }
@@ -1148,8 +1178,14 @@ fn print_quota_account(
         // producer's human message and carries no stability promise; the class is
         // the stable name, and printing both means an unrecognised class still
         // arrives with a readable explanation beside it.
-        let detail = match entry.get("errorClass").and_then(Value::as_str) {
-            Some(class) if quota_entry_is_actionable(entry) => {
+        let detail = match (
+            entry.get("errorClass").and_then(Value::as_str),
+            quota_disconnect_kind(entry),
+        ) {
+            (_, QuotaDisconnectKind::ModuleDefect) => {
+                format!("{label} [quota-module defect] — {}", truncate_cell(&reason))
+            }
+            (Some(class), QuotaDisconnectKind::UserFixable) => {
                 format!("{label} [{class}] — {}", truncate_cell(&reason))
             }
             _ => format!("{label} — {}", truncate_cell(&reason)),
@@ -2793,9 +2829,10 @@ mod tests {
             let entry = serde_json::json!({
                 "provider": "p", "error": "x", "errorClass": class
             });
-            assert!(
-                !quota_entry_is_actionable(&entry),
-                "{class} must not land in the actionable bucket"
+            assert_eq!(
+                quota_disconnect_kind(&entry),
+                QuotaDisconnectKind::Inert,
+                "{class} must not land in a bucket that implies work"
             );
         }
     }
@@ -2815,11 +2852,28 @@ mod tests {
             let entry = serde_json::json!({
                 "provider": "p", "error": "x", "errorClass": class
             });
-            assert!(
-                quota_entry_is_actionable(&entry),
+            assert_eq!(
+                quota_disconnect_kind(&entry),
+                QuotaDisconnectKind::UserFixable,
                 "{class} names something a person can fix"
             );
         }
+    }
+
+    /// A failure inside the quota module is real and NOT the reader's to fix.
+    /// Putting it beside a broken credential would tell them to go re-authorise
+    /// something that is working — a bucket whose implied action cannot succeed
+    /// is worse than an unlabelled one, because it directs the work confidently.
+    #[test]
+    fn a_failure_inside_the_quota_module_is_not_blamed_on_the_user() {
+        let entry = serde_json::json!({
+            "provider": "p", "error": "internal error: provider fetch panicked",
+            "errorClass": "internal_error"
+        });
+        assert_eq!(
+            quota_disconnect_kind(&entry),
+            QuotaDisconnectKind::ModuleDefect
+        );
     }
 
     /// The class list is open and grows on the producer's side. A class this
@@ -2831,7 +2885,10 @@ mod tests {
         let entry = serde_json::json!({
             "provider": "p", "error": "something new", "errorClass": "a_class_from_the_future"
         });
-        assert!(quota_entry_is_actionable(&entry));
+        assert_eq!(
+            quota_disconnect_kind(&entry),
+            QuotaDisconnectKind::UserFixable
+        );
     }
 
     /// A producer predating the field must render exactly as it did before, or
@@ -2842,7 +2899,7 @@ mod tests {
     fn an_entry_with_no_class_is_not_counted_as_failing() {
         let entry = serde_json::json!({ "provider": "p", "error": "no session: x" });
         assert!(!quota_entry_is_connected(&entry));
-        assert!(!quota_entry_is_actionable(&entry));
+        assert_eq!(quota_disconnect_kind(&entry), QuotaDisconnectKind::Inert);
     }
 
     #[test]

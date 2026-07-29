@@ -575,12 +575,15 @@ for p in m["packages"]:
 ' 2>/dev/null)
 done)
 uncovered=0
+skipped=0
+extra=0
 for f in "$BIN"/*; do
   b=$(basename "$f")
   # Skip the backup copies the deploy ritual leaves behind: dated snapshots and
   # pre-/staged- prefixes are deliberate history, not deployed surface.
-  case "$b" in *.bak|*pre-*|*staged-*|*rollback*|*reclamation*|*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T*) continue ;; esac
+  case "$b" in *.bak|*pre-*|*staged-*|*rollback*|*reclamation*|*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T*) skipped=$((skipped + 1)); continue ;; esac
   printf '%s\n' "$checked" | grep -qx "$b" && continue
+  extra=$((extra + 1))
   owner=$(printf '%s\n' "$bin_owner" | awk -v b="$b" '$1==b {print $2; exit}')
   if [ -z "$owner" ]; then
     echo "  $b: deployed but NO REPO DECLARES IT -- cannot check for unshipped code"
@@ -595,8 +598,17 @@ for f in "$BIN"/*; do
   uncovered=1; printed=1
 done
 
+# A SWEEP REPORTS TWO NUMBERS: what it found, and what it LOOKED AT. The first is
+# useless without the second, because a clean result over a silently truncated set
+# is indistinguishable from a clean result over the whole one. The denominator
+# here is built from what the loops actually examined -- modules from the config,
+# the daemon, and the bin/ entries neither covered -- rather than from a count of
+# the directory, so a future skip that nobody remembered to disclose shrinks this
+# number instead of hiding inside it. Backup copies are counted separately: they
+# are DELIBERATELY excluded, and folding a deliberate exclusion into the same
+# number as an examined artifact is how a denominator stops meaning anything.
 [ "$printed" -eq 0 ] && [ -n "$modmap" ] && \
-  echo "  no binary more than 6h behind its master ($(printf '%s\n' "$modmap" | grep -c .) modules + daemon + $(ls "$BIN" | wc -l | tr -d ' ') bin/ entries checked)"
+  echo "  no binary more than 6h behind its master ($(printf '%s\n' "$modmap" | grep -c .) modules + daemon + ${extra:-0} other bin/ entries checked; ${skipped:-0} backup copies skipped)"
 # The boundary belongs in the output, not in someone's memory of how this works.
 # Without it the next reader takes a clean result as fleet-wide, which it is not:
 # a stale Cloudflare Worker has no local mtime and cannot appear here at all --

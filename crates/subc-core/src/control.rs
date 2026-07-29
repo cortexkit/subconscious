@@ -2570,6 +2570,20 @@ fn control_response_body_frame<T: Serialize>(
 /// permanent gives up on work that would have succeeded. Both look correct in a
 /// log, which is why `retryability_of_forwarding_codes_matches_the_failure` pins
 /// the mapping per variant rather than merely asserting that some code exists.
+///
+/// That fence partitions by RETRYABILITY, which is coarser than identity: swapping
+/// two codes on the same side of the boundary passes it. Measured rather than
+/// assumed — `NoModuleConnection` re-pointed at `module_reloading` is caught only
+/// by `supervision_only_module_health_probe_does_not_enable_route_open_and_cleans_up`,
+/// a test named for something else that happens to assert the string. Narrowing
+/// that test to its stated subject would silently remove the only coverage of
+/// which code this variant produces.
+///
+/// No identity fence is added, deliberately. Retryability is the property clients
+/// branch on; beyond it the code reaches humans in logs and `ck`, where a
+/// misleading-but-same-class code costs a confusing line rather than wrong
+/// control flow. Pin identity here if a consumer ever branches on a specific code
+/// within a class.
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
         ForwardingError::NoModuleConnection => "target_unavailable",

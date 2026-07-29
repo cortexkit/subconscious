@@ -2557,6 +2557,19 @@ fn control_response_body_frame<T: Serialize>(
     .map_err(RouterError::FrameBuild)
 }
 
+/// Map a forwarding failure to the wire code a client sees.
+///
+/// The code is not a label: clients BRANCH on it. `is_retryable_route_open_code`
+/// in both SDKs treats `target_unavailable`, `module_reloading`, `unknown_module`
+/// and `module_timeout` as "retry in place", so a code chosen here decides
+/// whether a caller retries or gives up.
+///
+/// That makes attribution the load-bearing property, not merely having a code. A
+/// permanent fault published as a retryable one produces a fleet-wide retry storm
+/// against something that can never recover; a transient fault published as
+/// permanent gives up on work that would have succeeded. Both look correct in a
+/// log, which is why `retryability_of_forwarding_codes_matches_the_failure` pins
+/// the mapping per variant rather than merely asserting that some code exists.
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
         ForwardingError::NoModuleConnection => "target_unavailable",
@@ -2626,6 +2639,81 @@ mod tests {
     use super::*;
     use crate::{registry::ChannelState, router::FrameSink, RouteCtx, Router};
     use tokio::sync::mpsc;
+
+    /// The retryable set both SDKs branch on, kept byte-identical to
+    /// `is_retryable_route_open_code` in subc-client-rs and subc-client.
+    const CLIENT_RETRYABLE: &[&str] = &[
+        "unknown_module",
+        "module_reloading",
+        "target_unavailable",
+        "module_timeout",
+    ];
+
+    /// A code is not a label — clients branch on it, so publishing the wrong KIND
+    /// of failure is worse than publishing none. A permanent fault dressed as
+    /// retryable makes every client in the fleet retry forever against something
+    /// that cannot recover; a transient fault dressed as permanent abandons work
+    /// that would have succeeded.
+    ///
+    /// Asserting "a code exists" cannot catch either, because the string is free
+    /// to say anything. This enumerates every variant and pins which side of the
+    /// retry boundary it lands on, so a new variant must be classified here
+    /// deliberately rather than inheriting whichever arm it was appended to.
+    #[test]
+    fn retryability_of_forwarding_codes_matches_the_failure() {
+        // Transient by nature: the target is booting, reloading, or its endpoint
+        // was swapped mid-flight. Retrying is how these resolve.
+        let transient = [
+            ForwardingError::NoModuleConnection,
+            ForwardingError::ModuleReloading {
+                module_id: "m".into(),
+            },
+            ForwardingError::StaleModuleEndpoint,
+            ForwardingError::UnknownReservation {
+                client_channel: 1,
+                module_channel: 1,
+            },
+            ForwardingError::ConnectionClosing {
+                connection_id: ConnectionId::new(1),
+            },
+            ForwardingError::ClientEgressClosed {
+                connection_id: ConnectionId::new(1),
+            },
+        ];
+        for err in transient {
+            let code = forwarding_error_code(&err);
+            assert!(
+                CLIENT_RETRYABLE.contains(&code),
+                "{err:?} is transient but publishes {code:?}, which clients treat as permanent"
+            );
+        }
+
+        // Not fixed by retrying. Channel and correlation exhaustion need the
+        // caller to close routes, and a poisoned lock is a daemon that cannot
+        // recover at all — the worst thing to advertise as retryable, since every
+        // client would storm a daemon that will never answer.
+        let permanent = [
+            ForwardingError::ClientRouteChannelExhausted {
+                connection_id: ConnectionId::new(1),
+            },
+            ForwardingError::ModuleRouteChannelExhausted {
+                endpoint: ModuleEndpointId {
+                    connection_id: ConnectionId::new(1),
+                    generation: 1,
+                },
+            },
+            ForwardingError::RelayCorrelationExhausted,
+            ForwardingError::RouteOpenBuild("x".into()),
+            ForwardingError::Poisoned,
+        ];
+        for err in permanent {
+            let code = forwarding_error_code(&err);
+            assert!(
+                !CLIENT_RETRYABLE.contains(&code),
+                "{err:?} cannot be fixed by retrying but publishes {code:?}, which clients retry"
+            );
+        }
+    }
 
     fn manifest(module_id: &str, protocol_ver: u8) -> ModuleManifest {
         ModuleManifest {

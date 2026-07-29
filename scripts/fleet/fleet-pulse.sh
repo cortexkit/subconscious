@@ -559,8 +559,26 @@ fi
 # remembering to update this. A binary no repo claims is still REPORTED, because
 # an unattributable deployed artifact is a worse finding than an unchecked one.
 checked=$(printf '%s\n' "$modmap" | awk '{print $2}'; echo ck-subc)
+# WORKTREES DECLARE THE SAME BINARIES AS THE REPO THEY BRANCH FROM, and they sit
+# in this same parent directory. Ownership resolves to whichever match comes
+# first, and a worktree name sorts before its parent (`alfonso-wire-v2/` before
+# `alfonso/`, because `-` precedes `/`), so the worktree WINS every collision.
+#
+# The consequence is not a wrong label, it is a check that cannot fail, and both
+# observed cases fail SILENTLY in different ways. A worktree pinned to an old
+# branch has a HEAD behind the deploy, so the gap computes NEGATIVE and the binary
+# reads as current forever (ck-alfonso-core: -335h against a real gap of 0h). A
+# worktree whose parent repository has since been RENAMED cannot resolve its git
+# dir at all, so the gap is EMPTY and the arithmetic is skipped entirely
+# (broca-deploy still points at llm-runner/, renamed to broca/ months ago).
+# Neither prints anything. This is the silent half of the section -- the noisy
+# half announces itself, this one never does.
+#
+# Identified structurally rather than by name: a worktree's `.git` is a FILE, a
+# real repository's is a DIRECTORY.
 bin_owner=$(for d in "$HOME/Work/Projects/CortexKit"/*/; do
   [ -f "$d/Cargo.toml" ] || continue
+  [ -d "$d/.git" ] || continue
   (cd "$d" && cargo metadata --no-deps --offline --format-version 1 2>/dev/null \
     | REPO="$(basename "$d")" python3 -c '
 import sys, json, os

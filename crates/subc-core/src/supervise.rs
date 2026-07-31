@@ -1723,6 +1723,11 @@ fn truncate_health_metrics(metrics: Option<Value>) -> Option<Value> {
     }
 }
 
+/// Spread health probes so a fleet-wide restart does not converge them.
+///
+/// The delay is derived from the module id and probe index rather than a random
+/// source, so it is deterministic per module: a module keeps its own offset
+/// across daemon restarts instead of re-rolling into a collision.
 fn jittered_health_delay(module_id: &str, probe_index: u64, cadence: Duration) -> Duration {
     if cadence.is_zero() {
         return Duration::ZERO;
@@ -2969,4 +2974,100 @@ fn lock_snapshot(
     snapshot
         .lock()
         .map_err(|_| SuperviseError::StatePoisoned { module_id: None })
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::jittered_health_delay;
+    use std::{collections::HashSet, time::Duration};
+
+    /// The module ids supervised in production, so the dispersal claim is about
+    /// the fleet that actually runs rather than about invented names.
+    const FLEET: [&str; 14] = [
+        "aft",
+        "alfonso-core",
+        "magic-context",
+        "broca",
+        "thalamus",
+        "quota",
+        "engram",
+        "plexus",
+        "cerebellum",
+        "astrocyte",
+        "synapse",
+        "subc-mcp",
+        "cortexkit-credentials",
+        "subc-federation",
+    ];
+
+    /// Probes must not converge after a fleet-wide restart.
+    ///
+    /// This is the property the jitter exists for: every module reconnects at
+    /// once, and without dispersal all fourteen would then probe on the same
+    /// tick forever. Nothing failed visibly when this went untested -- a
+    /// convergent fleet still probes correctly, just in a burst, so the symptom
+    /// is a periodic load spike that looks like whatever else is running.
+    #[test]
+    fn probe_delays_disperse_across_the_fleet() {
+        let cadence = Duration::from_secs(30);
+        let delays: HashSet<Duration> = FLEET
+            .iter()
+            .map(|id| jittered_health_delay(id, 0, cadence))
+            .collect();
+        assert_eq!(
+            delays.len(),
+            FLEET.len(),
+            "every supervised module must land on its own probe offset"
+        );
+    }
+
+    /// The offset may only ever DELAY a probe, never bring it forward.
+    ///
+    /// A delay below the cadence would probe a module more often than
+    /// configured, which is the opposite of what an operator asked for and
+    /// would tighten the failure budget without anyone changing it.
+    #[test]
+    fn jitter_only_delays_and_stays_within_one_tenth_of_cadence() {
+        let cadence = Duration::from_secs(30);
+        let span = cadence / 10;
+        for id in FLEET {
+            for probe_index in 0..8 {
+                let delay = jittered_health_delay(id, probe_index, cadence);
+                assert!(
+                    delay >= cadence,
+                    "{id}#{probe_index}: jitter must not shorten the cadence"
+                );
+                assert!(
+                    delay < cadence + span,
+                    "{id}#{probe_index}: jitter must stay inside one tenth of the cadence"
+                );
+            }
+        }
+    }
+
+    /// A module keeps its offset across daemon restarts.
+    ///
+    /// The delay is derived rather than randomised precisely so a restart does
+    /// not re-roll every module into a fresh chance of collision. A random
+    /// source would satisfy the dispersal test above and quietly lose this.
+    #[test]
+    fn a_module_offset_is_stable_across_restarts() {
+        let cadence = Duration::from_secs(30);
+        for id in FLEET {
+            assert_eq!(
+                jittered_health_delay(id, 0, cadence),
+                jittered_health_delay(id, 0, cadence),
+                "{id}: the same module and probe index must produce the same offset"
+            );
+        }
+    }
+
+    /// A zero cadence disables probing rather than producing a busy loop.
+    #[test]
+    fn zero_cadence_yields_zero_delay() {
+        assert_eq!(
+            jittered_health_delay("aft", 0, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
 }

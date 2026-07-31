@@ -3618,6 +3618,39 @@ mod tests {
             3,
             "vendored fed corpus changed size; re-sync from subc-federation"
         );
+
+        // Pin what makes the corpus DISCRIMINATING, not just present.
+        //
+        // The relay test below takes its expected value from the corpus, so the
+        // corpus supplies the test's power to detect a lossy relay rather than
+        // its correctness. A relay that dropped unrecognised fields would still
+        // be caught -- but only by a package carrying fields it does not know.
+        // Shrink every package to the handful of keys any implementation would
+        // recognise and the test keeps passing over an input that can no longer
+        // fail, which is the same clean green as a corpus that shrank away.
+        //
+        // So assert the precondition rather than duplicating the packages here:
+        // at least one vector must carry a field beyond the small common set.
+        // That is one claim to maintain instead of nine, and it fails loudly if
+        // a re-sync ever flattens the corpus.
+        const COMMONLY_MODELLED: [&str; 3] = ["schema", "verified_class", "org"];
+        let richest = vectors
+            .iter()
+            .filter_map(|(_, package)| package.as_object())
+            .map(|object| {
+                object
+                    .keys()
+                    .filter(|key| !COMMONLY_MODELLED.contains(&key.as_str()))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            richest >= 2,
+            "vendored corpus no longer carries a package with unmodelled fields, \
+             so the relay test can no longer distinguish a verbatim relay from a lossy one"
+        );
+
         vectors
     }
 

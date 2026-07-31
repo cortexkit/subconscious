@@ -141,6 +141,40 @@ async fn bootstrap_watchdog_logs_connection_file_divergence() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn watchdog_rejects_a_daemon_that_answers_the_wrong_control_response() {
+    let port = reserve_free_port().await;
+    let live_info = test_connection_info(port);
+    let temp_dir = unique_temp_dir("watchdog-wrong-reply");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let connection_file_path = temp_dir.join("subc-conn.json");
+    write_atomic(&connection_file_path, &live_info).unwrap();
+
+    let server_task = start_wrong_reply_server(port, &live_info).await;
+    let watchdog = DaemonSelfWatchdog::new(live_info, &connection_file_path);
+
+    let err = watchdog
+        .run_once()
+        .await
+        .expect_err("a reply that is not server.describe must not count as a healthy tick");
+
+    // Assert the STAGE, not just that something failed: connect and authenticate
+    // both succeeded here, and attributing this to either of them would send an
+    // operator to the wrong layer.
+    assert_eq!(
+        err.stage(),
+        subc_core::WatchdogStage::Describe,
+        "a wrong control response is a describe-stage fault, not a transport one"
+    );
+    assert!(
+        err.to_string().contains("unexpected server.describe reply"),
+        "the message must name what arrived so the fault is diagnosable: {err}"
+    );
+
+    server_task.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn watchdog_failed_tick_logs_stage_and_recovery_streak() {
     let capture = LogCapture::default();
     let _guard = tracing::subscriber::set_default(capture.subscriber());
@@ -330,6 +364,74 @@ async fn wait_for_log(capture: &LogCapture, timeout: Duration, predicate: impl F
         );
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A listener that completes the auth handshake and then answers channel-0 with
+/// a well-formed reply to the WRONG request.
+///
+/// The watchdog's `describe` stage exists for a daemon that is reachable and
+/// authenticates but whose control plane is not answering correctly -- the state
+/// where every cheaper signal (port open, key valid) says healthy. No fixture
+/// could reach that stage, because a fixture built from the real router answers
+/// `server.describe` correctly by construction, so the branches that classify a
+/// wrong reply were unreachable from the suite that covers this file.
+async fn start_wrong_reply_server(port: u16, live_info: &ConnectionInfo) -> JoinHandle<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    // Drive the handshake directly rather than through ServerAuth: its fields are
+    // private, and this fixture needs the auth to succeed while what follows it
+    // does not.
+    let key = live_info.key.clone();
+    let daemon_id = live_info.daemon_id;
+    let daemon_ver = live_info.daemon_ver.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let key = key.clone();
+            let daemon_ver = daemon_ver.clone();
+            tokio::spawn(async move {
+                if subc_transport::authenticate_server(
+                    &mut stream,
+                    key.as_ref(),
+                    &daemon_id,
+                    daemon_ver.as_ref(),
+                    Duration::from_secs(2),
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                // Read whatever channel-0 request arrives, then reply with a
+                // DIFFERENT well-formed control response. The frame decodes, the
+                // correlation matches, and only the variant is wrong -- so this
+                // isolates the variant check from the transport checks around it.
+                let Ok(Some(request)) = read_frame(&mut stream).await else {
+                    return;
+                };
+                let body =
+                    serde_json::to_vec(&subc_control::ClientControlResponse::SupervisorAck {
+                        module_id: "not-a-describe".to_string(),
+                        applied: true,
+                    })
+                    .unwrap();
+                let reply = Frame::build(
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, false),
+                    0,
+                    0,
+                    request.header.corr,
+                    body,
+                )
+                .unwrap();
+                let _ = write_frame(&mut stream, &reply).await;
+                let _ = stream.flush().await;
+            });
+        }
+    })
 }
 
 async fn start_fixed_port_server(port: u16, live_info: &ConnectionInfo) -> JoinHandle<()> {

@@ -1733,6 +1733,21 @@ fn jittered_health_delay(module_id: &str, probe_index: u64, cadence: Duration) -
         return Duration::ZERO;
     }
     let cadence_ms = cadence.as_millis() as u64;
+    // This early return is REDUNDANT, deliberately, and a mutation run will show
+    // it surviving removal. Recording why here so the next person to notice does
+    // not have to re-derive it:
+    //
+    // - It is unreachable in practice. `positive_millis` in daemon_config rejects
+    //   a zero cadence and builds the Duration from whole milliseconds, so a
+    //   sub-millisecond cadence cannot come from config.
+    // - Even if reached it changes no answer. The `.max(1)` below makes the span
+    //   1, and `hash % 1` is 0, so the fall-through returns `cadence` unchanged
+    //   -- exactly what this returns.
+    //
+    // Kept as a guard against a future widening of the config parser (accepting
+    // microseconds, say), which would make the sub-millisecond case reachable.
+    // The `.max(1)` is the load-bearing half TODAY: remove it and the modulo
+    // divides by zero. Remove this and nothing changes.
     if cadence_ms == 0 {
         return cadence;
     }

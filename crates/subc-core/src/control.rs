@@ -3587,6 +3587,111 @@ mod tests {
         );
     }
 
+    /// Read the vendored fed corpus rather than hand-building a package.
+    ///
+    /// A hand-built object encodes what the test author believed the carrier
+    /// emits. These vectors are what it actually emits, and one of them exists
+    /// specifically to pin OUR side of the seam: its note reads "SUBC relay
+    /// ignores additive unknown fields at the traversal emit terminus."
+    fn fed_admission_facts_vectors() -> Vec<(String, Value)> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/team-mode/conformance/vectors/fed/admission-facts-emit.jsonl");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("vendored fed corpus unreadable at {path:?}: {err}"));
+        let vectors: Vec<(String, Value)> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let entry: Value = serde_json::from_str(line).expect("corpus line must be JSON");
+                let id = entry["corpus_id"]
+                    .as_str()
+                    .expect("every vector carries a corpus_id")
+                    .to_string();
+                (id, entry["package"].clone())
+            })
+            .collect();
+        // Pin the count: a corpus that silently shrinks would take its coverage
+        // with it, and a suite reading N-1 vectors reports the same clean pass
+        // as one reading N.
+        assert_eq!(
+            vectors.len(),
+            3,
+            "vendored fed corpus changed size; re-sync from subc-federation"
+        );
+        vectors
+    }
+
+    /// The relay must carry the carrier's package through BYTE-FOR-BYTE.
+    ///
+    /// The gate test below proves the ACCESS RULE (who may send facts, to whom).
+    /// This proves the PAYLOAD RULE, which the gate cannot: it hand-builds a
+    /// three-key object, so a relay that quietly dropped fields it did not
+    /// recognise would satisfy it. These vectors carry nine keys including ones
+    /// this crate has no type for, so a typed relay fails here and only here.
+    #[tokio::test]
+    async fn admission_facts_relay_carries_vendored_packages_verbatim() {
+        for (corpus_id, package) in fed_admission_facts_vectors() {
+            let registry = Arc::new(Registry::default());
+            let forwarding = Arc::new(ForwardingTable::default());
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce("fed", "fed-nonce".to_string());
+            let handler =
+                ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                    .with_supervisor(supervisor)
+                    .with_admission_facts_config(
+                        Some("fed".to_string()),
+                        Some(vec!["target".to_string()]),
+                    );
+
+            let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(90));
+            handler
+                .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+                .await
+                .unwrap();
+
+            let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(91));
+            let route_handler = handler.clone();
+            let expected = package.clone();
+            let route_task = tokio::spawn(async move {
+                route_handler
+                    .handle_control_frame(
+                        &client_ctx,
+                        route_open_frame_with_admission_facts(
+                            20,
+                            "target",
+                            Some(subc_control::ConsumerIdentity {
+                                module_id: "fed".to_string(),
+                                launch_nonce: "fed-nonce".to_string(),
+                            }),
+                            Some(package),
+                        ),
+                    )
+                    .await
+                    .unwrap()
+            });
+
+            let bind_frame = target_rx.recv().await.unwrap();
+            let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
+            let ModuleControlRequest::RouteBind {
+                admission_facts, ..
+            } = bind
+            else {
+                panic!("{corpus_id}: expected route.bind")
+            };
+            assert_eq!(
+                admission_facts,
+                Some(expected),
+                "{corpus_id}: relay must not add, drop or reshape any field"
+            );
+
+            handler
+                .handle_control_frame(&target_ctx, route_bind_ack(bind_frame.header.corr))
+                .await
+                .unwrap();
+            route_task.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn admission_facts_gate_checks_carrier_target_and_precedence() {
         let registry = Arc::new(Registry::default());

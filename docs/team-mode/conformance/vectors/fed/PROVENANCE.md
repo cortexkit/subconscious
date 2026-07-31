@@ -19,11 +19,30 @@ never CKCRED's account JWKS — test keys never cross trust boundaries.
 Refresh rule: re-vendor by commit hash + diff + a Room-1 channel
 notice. subc-federation is the authority; never edit here.
 
-The §5 emit-side slot (r1-fed-emit-*) remains a named placeholder in
-PLACEHOLDER.md until FED §8 step 5 (emission against SUBC's shipped
-relay) lands.
+(Superseded: the §5 emit-side slot was a named placeholder in
+PLACEHOLDER.md until FED §8 step 5 landed. It has landed — see the
+admission-facts-emit.jsonl section below — and PLACEHOLDER.md is gone.
+This paragraph is kept because the sentence it replaces was still being
+read as current: it sits above the section that contradicts it, and a
+reader who stops at the first mention of the emit slot learns the wrong
+thing.)
 
 ## admission-facts-emit.jsonl (§5 emit trio — corpus COMPLETE with this set)
+
+SECOND COPY: these exact bytes are also vendored at
+`clients/subc-client-swift/Tests/SubcFedTests/Fixtures/rdv-wire/admission-facts.jsonl`,
+where `RdvVectorCurrencyTests` pins their digest. This copy has no digest
+pin, so on a re-vendor the Swift copy fails loudly and this one changes
+quietly — which makes the unpinned copy the one that silently becomes the
+stale truth for whoever reads it. Re-vendor BOTH, or neither.
+
+This copy is read by `admission_facts_relay_carries_vendored_packages_verbatim`
+in `crates/subc-core/src/control.rs`, which drives the daemon's relay with
+each package and asserts it arrives byte-identical. That test also guards
+the property that makes these vectors useful as INPUT rather than as a
+subject: at least one package must carry fields the daemon has no type for,
+since a corpus flattened to commonly-modelled keys would leave the test
+green while no longer able to distinguish a verbatim relay from a lossy one.
 
 Vendored from subc-federation @ dad90c7 (`test-vectors/rdv-wire/admission-facts.jsonl`),
 FED §8 step 5. Verified at vendor time: all three corpus_ids present

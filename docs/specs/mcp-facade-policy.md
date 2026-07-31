@@ -260,6 +260,24 @@ Rationale for the two entries: `magic-context`'s `ctx_reduce` requires the
 shim-ephemeral → durable-session mapping that does not exist yet (the Mode-4
 convergence design); `llm-runner`'s session ops are consumer APIs, not tools.
 
+> STATE CLAIM, STALE AS OF 2026-07-31. The mapping SHIPPED: the shim carries a
+> wrapper-minted conversation token (`CK_INSTANCE_TOKEN`) and binds the session
+> verbatim, and `ctx_reduce` runs in production under `mode: "ack_only"` with
+> the reduction applied downstream from the completed provider response.
+> `magic-context` is enabled at the global tier in the live config, which is
+> exactly the escape hatch the paragraph above describes.
+>
+> The DECISION is unchanged and still correct: these module IDs are
+> baseline-denied, and only the global tier may enable them. What rotted is the
+> OBSERVATION the decision was written around — a spec is frozen to preserve
+> reasoning, and reasoning does not rot the way state claims do. Marked here,
+> where a reader meets the stale sentence, rather than in a note at the end
+> that the misled reader never reaches.
+>
+> `llm-runner` was also renamed to `broca` and no longer appears in the daemon
+> config under that name. The entry is kept as written because it is a
+> historical record of a gated decision; the current module ID is `broca`.
+
 ## 10. Tests (gate)
 
 - Composition: global-only; global harness-section override; project narrows;

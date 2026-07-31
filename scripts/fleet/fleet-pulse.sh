@@ -453,6 +453,27 @@ while read -r modid binname; do
   # is the normal state right after a deploy, and flagging it trains the reader
   # to ignore this section.
   gap_h=$(( (head_epoch - bin_epoch) / 3600 ))
+
+  # The shared-crate check runs BEFORE the small-gap floor below, not after.
+  # A binary rebuilt an hour ago against a five-day-old commons has an own-repo
+  # gap of zero and a shared-crate gap of five days -- and a fresh rebuild is the
+  # normal state right after any deploy, so the floor would swallow the check
+  # exactly when someone has just deployed and is most likely to be reading this.
+  # A guard placed after a skip inherits that skip's blind spot, and here the
+  # skip's condition is not incidental to the fault but a common companion of it.
+  commons_head_ms=""
+  if grep -Eq 'cortexkit-(store|lease|paths|provider-usage|model-catalog)' "$dir/Cargo.toml" 2>/dev/null \
+     || grep -Eq 'cortexkit-(store|lease)' "$dir"/crates/*/Cargo.toml 2>/dev/null; then
+    commons_head_ms=$(cd "$HOME/Work/Projects/CortexKit/commons" 2>/dev/null \
+      && git log -1 --format='%ct' 2>/dev/null)
+  fi
+  if [ -n "$commons_head_ms" ] && [ "$commons_head_ms" -gt "$bin_epoch" ] 2>/dev/null; then
+    commons_gap_h=$(( (commons_head_ms - bin_epoch) / 3600 ))
+    printf '  %-20s predates commons master by %sh -- shared-crate changes are not in this binary\n' \
+      "$binname" "$commons_gap_h"
+    printed=1
+  fi
+
   [ "$gap_h" -ge 6 ] || continue
 
   # A time gap alone cannot tell a stale deploy from a busy repo: a CI-workflow
@@ -504,29 +525,6 @@ print("|".join(f"^{d}/" for d in dirs))
     | grep -v -E '(^|/)bin/.*_cli\.rs$' \
     | { if [ -n "$crate_filter" ]; then grep -E "$crate_filter|^Cargo\.(toml|lock)$"; else cat; fi; } \
     | sort -u)
-  # A binary can also be stale against a SHARED crate with no commit in this repo
-  # at all. Modules depend on commons by absolute or ../ path, so those sources
-  # never appear in this repo's git log and the comparison above cannot see them
-  # -- a fleet-wide fix lands in commons and every module reads as current.
-  # Proven by the case that prompted this: an owner-only store-permissions fix
-  # merged to commons while all fourteen binaries still carried the old crate.
-  commons_head_ms=""
-  if grep -q 'cortexkit-\(store\|lease\|paths\|provider-usage\|model-catalog\)' "$dir/Cargo.toml" 2>/dev/null \
-     || grep -rq 'cortexkit-\(store\|lease\)' "$dir"/crates/*/Cargo.toml 2>/dev/null; then
-    commons_head_ms=$(cd "$HOME/Work/Projects/CortexKit/commons" 2>/dev/null \
-      && git log -1 --format='%ct' 2>/dev/null)
-  fi
-  if [ -n "$commons_head_ms" ] && [ "$commons_head_ms" -gt "$bin_epoch" ] 2>/dev/null; then
-    commons_gap_h=$(( (commons_head_ms - bin_epoch) / 3600 ))
-    printf '  %-20s predates commons master by %sh -- shared-crate changes are not in this binary\n' \
-      "$binname" "$commons_gap_h"
-  fi
-
-  # Reported AFTER the shared-crate check, deliberately. A module can have no
-  # runtime change of its own while still carrying a stale shared crate, and that
-  # is the most important case rather than an edge one: a fleet-wide fix lands in
-  # commons and touches no module repo at all. Skipping here first would have
-  # silenced exactly the modules a shared fix is waiting on.
   if [ -z "$runtime" ]; then
     dim "  $repo: ${gap_h}h gap, but nothing in it reaches the binary (ci/docs/tests only)"
     continue

@@ -78,6 +78,8 @@ Before believing a green result:
 | 7 | Is the condition tested **at this site**, not merely tested? | The named test exists, attached to the other branch |
 | 8 | For a guard: does a test assert the prevented effect *did not happen* — not that an error came back? | A mutant that acts and then reports correctly passes |
 | 9 | For a fix that removes, reclaims or refuses: would the tests pass if it did that to *everything*? | The suite cannot tell the fix from its unbounded version |
+| 9a | Asserting an *upper* bound on work done — at most one call, no more than N writes? Assert a lower bound too | The cheapest way to satisfy "at most one" is to do none, and doing nothing is what a broken path looks like |
+| 9b | Reading a status surface: does its failure path emit the same field names as its success path? | Zero-because-healthy and zero-because-the-read-failed are indistinguishable by value; only key presence separates them |
 | 10 | When a mutation reddens something, which test died? | Three tests named for other things means defended by accident |
 | 10f | Is anything in the suite keyed on the *file* rather than the *behaviour* — a self-digest, a source-text assertion, a snapshot over source? | It reddens on any edit, so a failure count reads as a clean catch while the clause stays unfenced |
 | 10g | Did the mutation actually *apply*? | A substitution that matched nothing looks exactly like a guard that was never reached |
@@ -901,6 +903,47 @@ Worth keeping for its own sake: **the grammar fought the models' strongest prior
 and lost 74 times out of 93.** When a parser and a generator disagree about
 punctuation, the parser loses -- so build the tolerance in rather than
 discovering the preference in a corpus of failures.
+
+### The cheapest way to satisfy an upper bound is to do nothing
+
+ENGRAM fixed a status call that minted six cloud credentials where one would do,
+and the natural test asserts the fix: exactly one mint. That assertion also
+passes on a status that never reaches the cloud at all -- and a parameter shape
+that suppresses cloud construction produces precisely that. The test would then
+certify a dead code path as an optimised one.
+
+They wrote both arms: **at least one** mint, proving the call reached the cloud,
+and **exactly one**, proving the reads share it. The lower bound is the
+load-bearing half, because the failure it catches looks like success.
+
+The general form is worth applying without waiting to be bitten. Whenever a test
+asserts an upper bound on work done -- at most one call, no more than N writes,
+fewer than K allocations -- the cheapest way to satisfy it is to do none, and
+doing none is indistinguishable from the path being broken. Pair every ceiling
+with a floor.
+
+This is the same family as a suite that generates zero cases from a file that
+moved, and as a progress probe watching the one generation guaranteed to be idle:
+**a zero-valued success is indistinguishable from a zero-filled failure.**
+
+### A surface whose failure path emits the same fields as its success path
+
+The same status call answers with `retentionN`, `eligibleCount`,
+`pendingR2Deletes` and friends. Its **error branch emits those same field names
+with zeros**. So `retentionN: 0` is indistinguishable between *healthy account,
+no policy configured* and *the read failed*, and nothing in the values separates
+them.
+
+ENGRAM verified which branch produced their numbers before quoting them, using
+**key presence rather than values**: `error`/`account` present means the failure
+branch, `alert`/`pendingR2Deletes`/`quarantines` present means the success one.
+Without that check a reader learns nothing and believes they learned something --
+which is worse than an error, because an error gets investigated.
+
+When reading any status surface, establish which branch you are on before
+quoting a value from it. And when *writing* one, make the branches
+distinguishable by shape: a failure that renders as a well-formed zero is a
+failure that will be quoted as a fact.
 
 ### But check whether the defect is a constant before calling it contamination
 

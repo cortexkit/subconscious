@@ -872,6 +872,9 @@ public actor SubcFedClient {
         case .relayAuthenticationFailed: return .relayAuthentication
         case .responderKeyMismatch, .noiseAuthenticationFailed: return .noiseHandshake
         case .rejected, .transport: return .carrierConnect
+        // Eviction happens on the control WebSocket, whose upgrade is the stage
+        // this maps to; it is not a fault of the candidate being dialled.
+        case .supersededBySecondConnection: return .webSocketUpgrade
         }
     }
 

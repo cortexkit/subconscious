@@ -242,7 +242,13 @@ private func webSocketFailureReason(_ error: FedWebSocketError) -> CandidateFail
             return .relayAuthenticationFailed(code: "relay_close_\(code.rawValue)")
         case .pressure:
             return .transport(.relayPressure)
-        case .idle, .superseded, .peerClosed, .frameCap:
+        case .superseded:
+            // 4002 is NOT a transport fault, and classifying it as one is a loop:
+            // the server evicts when a SECOND socket completes hello, so a
+            // reconnect opens a socket that evicts the next one, reporting 4002
+            // again. Its own reason keeps it out of permitsAutomaticReconnect.
+            return .supersededBySecondConnection
+        case .idle, .peerClosed, .frameCap:
             return .transport(.webSocket)
         }
     case .unsupportedMessage:
@@ -355,6 +361,9 @@ public struct FedCandidateFallbackRunner: Sendable {
         case .relayAuthenticationFailed: return .relayAuthentication
         case .responderKeyMismatch, .noiseAuthenticationFailed: return .noiseHandshake
         case .rejected, .transport: return .carrierConnect
+        // Eviction happens on the control WebSocket, whose upgrade is the stage
+        // this maps to; it is not a fault of the candidate being dialled.
+        case .supersededBySecondConnection: return .webSocketUpgrade
         }
     }
 }

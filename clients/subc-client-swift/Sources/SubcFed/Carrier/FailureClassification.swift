@@ -39,6 +39,21 @@ public enum CandidateFailureReason: Codable, Sendable, Equatable {
     case relayAuthenticationFailed(code: String)
     case responderKeyMismatch
     case noiseAuthenticationFailed
+    /// Close 4002: another connection completed hello with the SAME device key
+    /// and the server evicted this one.
+    ///
+    /// This is deliberately its own case rather than a transport kind, because a
+    /// transport kind would inherit `permitsAutomaticReconnect` and reconnecting
+    /// is precisely what must not happen here. The server evicts on the new
+    /// socket's hello, so reconnecting opens a socket that evicts the next one,
+    /// which reports 4002, which reconnects: a self-sustaining loop with no
+    /// network fault anywhere in it.
+    ///
+    /// The cause is always a second holder of the device key -- the same process
+    /// racing itself across a background/foreground cycle, or two processes
+    /// pointed at one key file. None of those are fixed by retrying, and all of
+    /// them are made worse by it.
+    case supersededBySecondConnection
 
     private enum CodingKeys: String, CodingKey {
         case kind
@@ -52,6 +67,7 @@ public enum CandidateFailureReason: Codable, Sendable, Equatable {
         case relayAuthenticationFailed
         case responderKeyMismatch
         case noiseAuthenticationFailed
+        case supersededBySecondConnection
     }
 
     public init(from decoder: Decoder) throws {
@@ -70,6 +86,8 @@ public enum CandidateFailureReason: Codable, Sendable, Equatable {
             self = .responderKeyMismatch
         case .noiseAuthenticationFailed:
             self = .noiseAuthenticationFailed
+        case .supersededBySecondConnection:
+            self = .supersededBySecondConnection
         }
     }
 
@@ -92,6 +110,8 @@ public enum CandidateFailureReason: Codable, Sendable, Equatable {
             try container.encode(Kind.responderKeyMismatch, forKey: .kind)
         case .noiseAuthenticationFailed:
             try container.encode(Kind.noiseAuthenticationFailed, forKey: .kind)
+        case .supersededBySecondConnection:
+            try container.encode(Kind.supersededBySecondConnection, forKey: .kind)
         }
     }
 
@@ -103,11 +123,20 @@ public enum CandidateFailureReason: Codable, Sendable, Equatable {
         case .rejected, .timedOut, .transport, .relayAuthenticationFailed,
              .responderKeyMismatch, .noiseAuthenticationFailed:
             return true
+        case .supersededBySecondConnection:
+            // Eviction is scoped to the DEVICE KEY, not to the candidate, so no
+            // other endpoint can succeed while the second holder is live.
+            // Falling through the remaining candidates only opens more sockets
+            // for the server to evict.
+            return false
         }
     }
 
     /// Only ordinary transport partitions authorize automatic reconnect. A key
-    /// or proof failure needs changed profile material before it is retried.
+    /// or proof failure needs changed profile material before it is retried, and
+    /// an eviction needs the second key holder resolved -- see
+    /// `supersededBySecondConnection`, where retrying is the failure rather than
+    /// the recovery.
     public var permitsAutomaticReconnect: Bool {
         if case .transport = self { return true }
         return false

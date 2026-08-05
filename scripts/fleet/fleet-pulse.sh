@@ -297,33 +297,43 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
     # The upload sidecar is appended as objects land, so its line count is real
     # progress. Sampling it twice is the only thing here that distinguishes
     # moving from stuck, and it costs the seconds between the two reads.
-    # THE SIDECAR MUST BELONG TO THE GENERATION BEING REPORTED. An earlier version
-    # took the most recently modified sidecar anywhere under staging, which is a
-    # different selection rule from the line above (newest by device_seq) and can
-    # therefore pick a different generation. Observed live: the header said gen 99
-    # while this sampled gen 96's sidecar -- a PUBLISHED generation whose staging
-    # directory had not yet been swept -- and reported NOT MOVING, which was true
-    # of that file and said nothing about gen 99. A finished upload looks exactly
-    # like a stalled one once you are watching the wrong file.
-    newest_pub=$(sqlite3 "$ENGRAM_STORE" \
-      "SELECT lower(hex(pub_id)) FROM generations WHERE device_seq = $newest;" 2>/dev/null)
+    # WATCH THE GENERATION THE DRAIN IS WORKING, WHICH IS THE OLDEST UNPUBLISHED --
+    # NOT THE NEWEST. engram publishes oldest-first, so the newest staged generation
+    # is the LAST one that will move and normally has no sidecar at all.
+    #
+    # This line has now been wrong twice, in opposite directions, and the second
+    # error was introduced by the fix for the first. Originally it took the most
+    # recently modified sidecar anywhere under staging, which could land on a
+    # different generation than the header named. The fix bound the sidecar to the
+    # reported generation so the two selections agreed -- and they agreed on the
+    # newest, which is the one generation guaranteed not to be uploading. Observed
+    # live: "gen 99 has no upload sidecar yet" printed for ten minutes while gen 97
+    # was uploading at ~10 objects/min, so a recovering backup read as a dead one.
+    # MAKING TWO SELECTION RULES CONSISTENT IS NOT THE SAME AS MAKING EITHER CORRECT.
+    drain_seq=$(sqlite3 "$ENGRAM_STORE" \
+      "SELECT MIN(device_seq) FROM generations WHERE published = 0;" 2>/dev/null)
+    drain_pub=$(sqlite3 "$ENGRAM_STORE" \
+      "SELECT lower(hex(pub_id)) FROM generations WHERE device_seq = ${drain_seq:-0};" 2>/dev/null)
     sidecar=""
-    if [ -n "$newest_pub" ]; then
-      sidecar=$(ls -t "$HOME/.local/share/cortexkit/engram/staging/$newest_pub"/uploaded-*.hex 2>/dev/null | head -1)
+    if [ -n "$drain_pub" ]; then
+      sidecar=$(ls -t "$HOME/.local/share/cortexkit/engram/staging/$drain_pub"/uploaded-*.hex 2>/dev/null | head -1)
     fi
     if [ -n "$sidecar" ]; then
       before=$(wc -l < "$sidecar" 2>/dev/null | tr -d ' ')
       sleep 20
       after=$(wc -l < "$sidecar" 2>/dev/null | tr -d ' ')
       if [ "${after:-0}" -gt "${before:-0}" ] 2>/dev/null; then
-        echo "  uploading: $after objects, +$((after - before)) in 20s"
+        echo "  uploading gen $drain_seq: $after objects, +$((after - before)) in 20s"
       else
-        echo "  NOT MOVING: gen $newest at $after objects, unchanged over 20s -- check before assuming slow"
+        # Twenty seconds at the observed ~10 objects/min is only ~3 objects, so a
+        # zero delta here is weak evidence. Say what was measured rather than
+        # declaring a stall.
+        echo "  gen $drain_seq at $after objects, no change in 20s -- weak signal at this rate, re-read before calling it stalled"
       fi
     else
-      # No sidecar for the reported generation means uploading has not begun --
-      # distinct from begun-and-stalled, and the remedies differ.
-      echo "  gen $newest has no upload sidecar yet (sealing, or not started)"
+      # No sidecar on the DRAIN TARGET means uploading has not begun -- distinct
+      # from begun-and-stalled, and the remedies differ.
+      echo "  gen ${drain_seq:-?} (oldest unpublished) has no upload sidecar yet -- publish not started"
     fi
   else
     echo "  gen $maxpub published ($pub/$total)"

@@ -118,6 +118,14 @@ name is correct. One ending in a long hex string was derived by the signing tool
 because no identifier was given. One carrying an *underscore* and a short hash is
 the build tool's own linker-applied identity — never signed by anyone.
 
+Watch for one combination in particular: **a test binary carrying production's
+name in the derived form.** It is not colliding today only because it is
+unsigned — the derived suffix keeps it distinct by accident. The moment someone
+pins it, correctly following the stability rule, using the name it already
+carries, it becomes production's principal. A latent defect waiting for someone
+to do the right thing by halves, and invisible until the rule is stated as
+*match the deployed name* rather than *be stable*.
+
 **Apply that rule at stage time, never at placement.** If a test artifact arrives
 carrying the production identifier and others have already verified its hash,
 re-signing it changes the bytes they accepted. Substituting a different artifact

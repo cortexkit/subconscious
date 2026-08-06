@@ -125,6 +125,7 @@ Before calling a class closed:
 | 38 | Is the uncalled component the most detailed description of intended behaviour? | Then it is read as documentation, and every capability it describes but the wired path lacks is a wrong conclusion waiting to be drawn |
 | 39 | Is an address or capability the peer *asserted* being treated as one you verified? | An assertion is a usable hint and nothing more; name it a hint in the type, or the first reader treats a claim as a fact |
 | 40 | Is the check's passing state also its null state? | Then it cannot detect the null — doing nothing satisfies it, so it reports success across a no-op |
+| 41 | Does an error return skip the readback that decides whether the mutation landed? | Propagating the error abandons the only step that can tell "failed" from "succeeded, reply lost" — and every retry then fails correctly, forever |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3166,6 +3167,41 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## An error return that skips the readback
+
+A publish appeared stuck for thirteen hours. It had **already succeeded** on its
+first attempt.
+
+The server applied the change and finalised it in one transaction, then the
+response was lost to a transport error. The client propagated that error
+immediately — which skipped the very next line, a readback whose entire job is
+deciding whether the change landed. Every attempt afterwards re-reserved the same
+operation, was correctly told the reservation was already finalised, and failed.
+**Each refusal was right. The recovery they demanded was unreachable.**
+
+The general shape: **between a mutation and the check that determines its
+outcome, an early return is not a safe default.** A failed send and a successful
+send whose reply was lost are indistinguishable at the call site, and the
+readback is the only thing that separates them. Returning the error throws away
+the distinction and converts a transient into a permanent one.
+
+Two diagnostic notes worth as much as the mechanism:
+
+**The error text changed, and that was the signal.** Before a fix went in, the
+failure said one thing; after, it said another. That transition proved the first
+defect was genuinely repaired and had been *concealing* a second on the same
+path. A fix that changes the symptom without removing it is evidence, not
+disappointment.
+
+**The stall was called on "neither expected outcome, and nothing in the log"** —
+defined in advance as its own result rather than as slowness. Waiting longer
+would have produced more of nothing. The state that looked like a dead loop was
+actually a completed operation nobody could observe.
+
+And the belief everyone held all day — that the last good backup was the previous
+generation — was wrong in the reassuring direction. The data had been safe since
+morning.
 
 ## A check whose passing state is also its null state
 

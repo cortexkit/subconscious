@@ -352,3 +352,80 @@ public func fedFailurePermitsCandidateFallback(_ reason: CandidateFailureReason)
 public func fedFailurePermitsAutomaticReconnect(_ reason: CandidateFailureReason) -> Bool {
     reason.permitsAutomaticReconnect
 }
+
+/// Human-readable text for every failure, written for someone who will read it
+/// on a screen rather than in a debugger.
+///
+/// Without this, Swift renders a failure by dumping the enum's structure, so a
+/// correct explanation reaches a person as `moduleError(code: "unknown_member",
+/// message: Optional("..."))` — the wrapper is an artifact of how the value was
+/// printed, not part of what went wrong, and it makes an accurate sentence read
+/// like a crash. Each consumer that cares then writes its own unwrapping, which
+/// only helps the consumers that think to write one.
+///
+/// Where a failure carries the remote module's own prose, that prose is used
+/// verbatim: it is the only part of the failure that says what to do about it.
+extension FedFailure: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .notDialOwner:
+            return "This device is not the one responsible for opening the connection."
+        case .unsupportedEnrollmentClass:
+            return "This device's enrollment is not a kind this connection accepts."
+        case let .invalidProfile(field):
+            return "The connection profile is not usable: '\(field)' is missing or malformed."
+        case let .candidateRejected(reason):
+            return "No usable network path: \(reason)."
+        case let .candidateTimedOut(stage):
+            return "Timed out while connecting, during \(stage)."
+        case let .relayAuthenticationFailed(code):
+            return "The relay refused this connection (\(code))."
+        case .responderKeyMismatch:
+            return "The remote device presented a different key than expected, so the connection was refused."
+        case .accountKeyMismatch:
+            return "The remote device belongs to a different account than expected."
+        case .noiseAuthenticationFailed:
+            return "The encrypted handshake failed to authenticate."
+        case .framingViolation:
+            return "The remote device sent data this version cannot read."
+        case let .protocolViolation(byeCode):
+            return "The connection was closed for a protocol error (\(byeCode))."
+        case .catalogTargetUnavailable:
+            return "That service is not currently offered by the remote device."
+        case .fedBodyTooLarge:
+            return "The message is too large to send over this connection."
+        case .fedEffectsUnsupported:
+            return "The remote device does not support this kind of request."
+        case .storeCorrupt:
+            return "Local stored data is damaged and could not be read."
+        case .storeUnavailable:
+            return "Local storage could not be opened."
+        case .storeMigrationFailed:
+            return "Local stored data could not be upgraded to the current format."
+        case .reservationFailed:
+            return "Could not reserve capacity to send this request."
+        case .persistenceFailed:
+            return "Could not record this request locally before sending it."
+        case .cancelled:
+            return "Cancelled."
+        case .suspended:
+            return "The connection is suspended."
+        case .disconnected:
+            return "Disconnected before a reply arrived."
+        case let .moduleError(code, message):
+            // The module's own prose says what to do about it, so prefer it and
+            // fall back to the code only when no message was sent.
+            return message ?? "The remote service refused this request (\(code))."
+        case .indeterminateMutation:
+            return "It is not known whether this change was applied."
+        case .admissionQueueFull:
+            return "Too many requests are already waiting."
+        case .admissionQueueTimedOut:
+            return "Timed out waiting for an earlier request to finish."
+        case let .noEligibleCandidates(failures):
+            return "No network path to the remote device was usable (\(failures.count) tried)."
+        case let .allCandidatesFailed(failures):
+            return "Every network path to the remote device failed (\(failures.count) tried)."
+        }
+    }
+}

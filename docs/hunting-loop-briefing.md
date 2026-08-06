@@ -121,6 +121,7 @@ Before calling a class closed:
 | 34 | Does your detector distinguish the *causes* of the state it detects, or only the state? | A correct detector fires correctly on an event it cannot tell apart from another — absence cannot separate deleted from moved, and the consequence lands on the benign cause |
 | 35 | Does an await inside a select arm stop the other arms being polled? | The loop has left the select, so a cheaper outcome arriving on another arm waits out the expensive one's full timeout |
 | 36 | Before reporting evidence missing, did you check the tools you already run? | An absence found by searching the wrong kind of store is a fact about the search; your own monitoring may already read the thing you are about to escalate |
+| 37 | Does the column name describe what the column counts? | A narrower-than-it-sounds name reads as a defect to anyone who did not define it, and the suspicion outlives the question |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3162,6 +3163,32 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A name narrower than it sounds reads as a defect
+
+A backup store showed `entry_count = 2` on every generation, including ones that
+demonstrably moved 2219 objects and 1.3 GB. Alongside it, `staged_bytes = 0`
+everywhere. Read cold, that is a store recording nothing.
+
+Both are honest. `entry_count` counts **catalog entries** — this account captures
+exactly two databases — and the thousands of objects are the chunks those two
+decompose into. `staged_bytes` stopped being written when staging changed to hold
+only what deduplication missed.
+
+Neither name is wrong to the person who chose it, and both are actively
+misleading to everyone else. The cost is not confusion in the moment — that gets
+resolved with one question. **The cost is the suspicion it leaves**: a reader who
+moves on without asking now believes the store is unreliable, and carries that
+into the next incident, where it competes with real evidence.
+
+So: when someone reads a column as broken, the useful reply is not just the
+correct interpretation but **why the name misleads**, which is what stops it
+being rediscovered. Better still, put it in the schema comment — the reader who
+needs it may never ask.
+
+A counter is worth extra suspicion once it **stops being written**. `staged_bytes
+= 0` is indistinguishable from "nothing staged", and a column nobody maintains is
+better dropped than left reading zero.
 
 ## An await inside a select arm stops the other arms
 

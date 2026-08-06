@@ -122,6 +122,7 @@ Before calling a class closed:
 | 35 | Does an await inside a select arm stop the other arms being polled? | The loop has left the select, so a cheaper outcome arriving on another arm waits out the expensive one's full timeout |
 | 36 | Before reporting evidence missing, did you check the tools you already run? | An absence found by searching the wrong kind of store is a fact about the search; your own monitoring may already read the thing you are about to escalate |
 | 37 | Does the column name describe what the column counts? | A narrower-than-it-sounds name reads as a defect to anyone who did not define it, and the suspicion outlives the question |
+| 38 | Is the uncalled component the most detailed description of intended behaviour? | Then it is read as documentation, and every capability it describes but the wired path lacks is a wrong conclusion waiting to be drawn |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3163,6 +3164,29 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## Uncalled code read as documentation
+
+A transport carries a dial orchestrator with no production callers — fully
+tested, never wired. Easy to file as a loose end. It is worse than that, because
+the orchestrator is **ahead of the path that actually runs**: it orders three
+kinds of route, while the type at the live boundary can only represent two.
+
+So reading it tells you what the transport was *designed* to do, and the wired
+type tells you what it *can* do, and those had silently diverged. I read the
+orchestrator, saw a route it supports, and told another team to use something
+the boundary type has no case for — a comment in that very file says so plainly.
+The uncalled code was more specific than any document, so it was read as the
+authority.
+
+A second artifact in the same file has the same property: a per-rung timeout that
+looks like a guarantee and bounds nothing, because nothing runs the rungs. Two in
+one file is not coincidence — **it is what uncalled code decays into**, since
+nothing forces it to track the path that ships.
+
+The rule: **dead code is not inert when it is also the most detailed description
+of intended behaviour.** Wire it or delete it. Leaving it is a standing source of
+wrong conclusions, and the conclusion drawn here was mine.
 
 ## A name narrower than it sounds reads as a defect
 

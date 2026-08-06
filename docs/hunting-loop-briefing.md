@@ -3235,6 +3235,13 @@ separately from where it is a routing reference.** Grant lists, allowlists,
 policy files, capability manifests. A routing reference fails loudly on the next
 call; an authority reference fails as absence.
 
+The same rename produced a second casualty of the same family: a peer registry
+keyed by **owner directory** emptied itself when the directory moved. Directory-
+keyed and identifier-keyed state are both invisible to a sweep that asks "what
+calls this", because nothing calls them — they are looked up *by* the thing that
+changed. Worth enumerating explicitly before any rename: what is keyed on this
+name, and what is keyed on this path.
+
 **A grant naming an unknown subject should say so.** Fail-loud is arguable —
 silence is not, because the failure surfaces as a working connection with no
 content, which reads as "nothing to show" rather than "you were denied".

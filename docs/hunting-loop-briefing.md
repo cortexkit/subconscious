@@ -161,6 +161,7 @@ Before calling a class closed:
 | 74 | Two rules collide — which one protects the validity of what you are about to measure? | That one wins; the other is routed to its source rather than applied late |
 | 75 | Your rule requires a value to be *stable* — does it say which value? | Stability and correctness are different properties; whoever applies it fills the gap with the only name in front of them |
 | 76 | Writing a rule — which of its terms would a careful reader have to guess? | That term will be filled in wrong, with the nearest available value, by someone following the rule correctly |
+| 77 | Who does this fix arm? | Applying a rule to something already carrying a wrong value converts a dormant defect into a live one; the trigger is the remediation |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3498,6 +3499,25 @@ consumer's configuration.** That turns it into one line per binary.
 
 My own wording had the same hole from the other side. The runbook said *use a
 distinct identifier per environment* — true, and silent on where to get the name.
+
+### A defect whose trigger is the remediation
+
+The sweep's sharpest residual was a test binary carrying **production's name in
+the unstable form.** It is not colliding today only because it was never signed
+with an explicit identity — the changing suffix keeps it distinct by accident.
+
+Apply the stability rule to it, correctly, using the name it already carries, and
+it becomes production's principal. **The fix arms the defect.**
+
+That is worth holding as its own class rather than as an instance: a dormant
+problem that the remediation converts into a live one. It is invisible to the
+partial rule, because "make this stable" is satisfied by pinning whatever value is
+already there — and the person doing it will have followed the instruction
+exactly.
+
+The question to carry into any cleanup pass: **what does this fix arm?** Applying
+a rule to something already holding a wrong value is not the same as applying it
+to something holding none.
 
 ### The term a careful reader has to guess
 

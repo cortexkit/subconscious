@@ -132,6 +132,8 @@ Before calling a class closed:
 | 45 | If one side of a comparison is missing, does the check say "cannot compare" — or return a verdict? | An absent input rendered as a verdict is wrong in both directions: silently passing, or raising a false alarm that invites undoing correct work |
 | 46 | Did anything verify the *destination*, or only the artifact? | Identity checks answer "is this the right file" and say nothing about "does the consumer read from here" — two directories, one filename, and every check passes |
 | 47 | When two careful people disagree on a fact, are they describing the same object? | Both measurements can be correct about different things; the ambiguity hides in the definite article, not in the reading |
+| 48 | Does the assertion bound a duration, or prove the mechanism by contrast? | A wall-clock bound is a property of the run, not the code — it fails once, under load, when a false alarm is most expensive |
+| 49 | Once the live symptom is fixed, is a test the only remaining witness to the defect? | Then that test must be proven red against the pre-fix code, or it is indistinguishable from coverage and quietly retires the finding |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3208,6 +3210,49 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## When a test is the last witness
+
+A connection defect produced a sixty-second delay, and the client change that
+removed the *trigger* shipped before the server fix. So the loud symptom is gone:
+nobody will ever observe that delay again on a healthy setup.
+
+Which means **the tests are the only evidence of that defect that will ever
+exist.** A test passing against both the broken and the fixed implementation
+would be indistinguishable from real coverage, and would quietly retire a finding
+that took three people and an external observation to establish.
+
+So the author required the tests written and shown **red against the pre-fix
+code** before the fix was written, then re-ran that themselves rather than
+accepting the report. The tests measure the bug, not the fix.
+
+The paired control matters as much: a positive case driving the expensive path to
+completion with no competitor, asserting it is genuinely used. Without it, an
+implementation that always prefers the cheap path satisfies every new test while
+breaking the feature entirely.
+
+General form: **when a fix removes the conditions that made a defect observable,
+the test becomes the last witness — and a witness that cannot fail is not a
+witness.**
+
+## A wall-clock bound is a property of the run
+
+A test asserted an expired deadline returned within a second. It failed exactly
+once — during a restart window, on a loaded machine — which is precisely when a
+false alarm is most expensive and most likely to be attributed to the change
+under way.
+
+A duration bound measures the machine, not the code. The rewrite proves the same
+property **by contrast**: a call that ignored its deadline would return the same
+result as a generous call, so an error from one and a result from the other can
+only mean the deadline was applied. No timing anywhere in the assertion.
+
+It also **stops rather than passing** on a machine where no contrast exists — the
+difference between a test that reports "cannot evaluate" and one that reports
+success because nothing happened.
+
+The general shape: **prove a mechanism by what it makes impossible, not by how
+long it took.**
 
 ## Verifying the artifact, never the destination
 

@@ -17,9 +17,13 @@ Shipped and in production (supervised by the personal daemon today):
   (single-principal router + process supervisor, wire v2, 21-byte
   envelope, loopback TCP + HMAC), the `ck` operator CLI, `ck-subc-mcp`
   (MCP gateway for unowned hosts), client SDKs (TypeScript, Rust, Swift),
-  and `gpui-chat`, the desktop observability/testbed UI. The Swift package
-  is an SDK only: the iOS app consumes it, and the SwiftUI desktop app it
-  once carried was deleted when the GPUI port reached parity.
+  and the client SDKs the apps build on. The Swift package is an SDK only:
+  the iOS app consumes it, and the SwiftUI desktop app it once carried was
+  deleted when the GPUI port reached parity.
+- **alfonso-desktop** — the desktop app: Rust and GPUI, linking the Rust
+  client directly. Chat, Rooms, Asks, Boards, Observe. Began as a spike
+  inside subconscious and moved out with its history once it was the
+  answer rather than the experiment.
 - **aft** — code perception and editing tools (search, outline, zoom,
   callgraph, edit, bash, worktrees). The `aft_*` tool surface every agent
   uses.

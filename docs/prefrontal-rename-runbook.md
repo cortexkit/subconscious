@@ -21,15 +21,21 @@ module changes identity. A consumer on the new string during the transition
 retries `unknown_module` in place and recovers; a consumer left on the old string
 fails permanently the moment the flip lands.
 
-## The apps are the gate, not the slowest consumer
+## The desktop app stopped being the gate
 
-Four of this repo's live call sites are in the Swift and gpui apps, where the
-module id is a literal compiled into the binary. There is no config path for it.
+This section used to say the apps set the window, because the module id is a
+literal compiled into a binary with no config path, so "consumers first" meant a
+rebuilt and *installed* app on every device rather than a merged commit.
 
-So "consumers first" does not mean a merged commit — it means a REBUILT AND
-INSTALLED app on every device that runs one. A phone on the old build cannot be
-repointed without reinstalling. That sets the window, and it is the reason the
-apps gate rather than follow.
+Two changes removed most of that. The SwiftUI desktop app was deleted once the
+GPUI port reached parity, and the GPUI app moved to its own repository — where it
+is a locally rebuilt binary rather than something anyone installs. Its call sites
+are already renamed.
+
+What remains of the original argument applies only to the phone: it runs an
+installed build, and a phone on the old string cannot be repointed without
+reinstalling. That is the real gate, and it is one device rather than a fleet of
+surfaces.
 
 ## A clean merge is not a complete rename
 

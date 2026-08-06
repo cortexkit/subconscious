@@ -70,13 +70,32 @@ inode the live process is executing differs from the inode now on disk.
 daemon, MCP gateway, backups, context, connectors (two binaries), and the two
 executive binaries staged by their owner.
 
-One asymmetry worth recording, because it nearly produced a wrong note: after
-signing, two of three hashes were **unchanged** from what their owners quoted,
-and one changed. The two were already signed at their source, so re-signing was a
-no-op; the third was not. So a hash mismatch after signing does not imply the
-wrong file, and a match does not imply signing was skipped — which is why the
-changed one was confirmed by marker instead, reading 1 in the staged file and 0
-in its own backup.
+### Verifying a signed artifact
+
+Signing rewrites the binary, so **a staged file can never match the source hash
+its owner quoted**. That makes "verify by sha" unusable at the deploy path, and
+an owner instructing it in good faith sends you to a check that cannot pass.
+
+The substitute: **sign a reference copy of the verified source under the same
+filename and compare.** Signing is deterministic — two signings of identical
+bytes under the same name produce byte-identical output — so the comparison is
+exact.
+
+The filename is load-bearing and not obvious. macOS derives the signing
+identifier from the file's name, so signing a copy called `ref` yields a
+different result than signing the same bytes called `ck-engram`. A reference
+signed under the wrong name reports a mismatch for a file that is correct, which
+is how a good artifact gets rejected.
+
+That mismatch also produced a wrong conclusion before it was chased down: signing
+looked non-deterministic, when the variable was the name introduced by the check
+itself. Two signings under a controlled name settled it.
+
+A related asymmetry, since it nearly produced a wrong note: after signing, two of
+three hashes were **unchanged** from what their owners quoted and one changed.
+The two were already signed at source, so re-signing was a no-op. **A hash
+mismatch after signing does not imply the wrong file, and a match does not imply
+signing was skipped.**
 
 ## A moving branch tip is not a stale artifact
 

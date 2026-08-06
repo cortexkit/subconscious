@@ -143,6 +143,7 @@ Before calling a class closed:
 | 56 | Is the resource being *consumed*, or *retained*? | A falling number looks identical either way, and every search for a writer is wasted when nothing is writing |
 | 57 | Does your existence check discriminate, or does it pass the worst case? | "The path exists" admits a live-but-wrong target; the shape of the path is the test that separates them |
 | 58 | Is the state keyed on the thing you are renaming a *cache* or a *fence*? | A lost cache announces itself as slowness; a lost fence reports a clean start, and by the time it is visible the irreversible act has happened |
+| 59 | Could your "it survived" check pass by luck? | A count that may legitimately be zero proves nothing; verify an identity only the original could carry |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3248,6 +3249,36 @@ flip, and verified with a check that distinguishes *legitimately empty* from
 The owner's own sentence is the one to keep: *"renamed and healthy will look
 identical whether or not I got this right."* Health is not evidence for a
 property health does not measure.
+
+### The survival check that passes by luck
+
+I wrote that rule as: *verify the pending set, not the file's existence.* A second
+owner found the hole. Their pending table was **legitimately empty that day**, so
+"empty" was consistent with both a correctly migrated store and a freshly created
+one. The check passes by coincidence in exactly the case it exists to catch — the
+same defect as an existence check passing a stale path, one level in.
+
+What they proposed instead: their store carries an **incarnation identifier minted
+once at creation and never recomputed.** A recreated store produces a *different*
+one rather than a missing one, so the check cannot be satisfied by an empty
+state.
+
+The general form: **verify an identity only the original could carry.** Not an
+absence, and not a count that might legitimately be zero. Counts are
+corroboration; the minted identifier is the proof.
+
+Two further details from the same review, both of which I would have got right for
+the wrong reason:
+
+**Move, never copy.** I would have moved out of tidiness. The actual reason is
+that the single-writer lock is per-location, so a copy leaves a second openable
+store and two live writers become possible.
+
+**Move while stopped, before restart.** The storage location is handed to the
+module when it connects, so a module that restarts before the move **creates a
+fresh empty store at the new location** — leaving two to reconcile. That is a
+narrow ordering window, and it belongs in the procedure as a hard sequence rather
+than as a note.
 
 The same owner sharpened a check I had been broadcasting. I had said: after
 re-registering, confirm the bound directory exists. **During a rename both the

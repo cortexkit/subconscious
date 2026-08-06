@@ -139,6 +139,7 @@ Before calling a class closed:
 | 52 | Does one error value carry two meanings — "the remote refused" and "the connection went away"? | The caller retries a call that will refuse identically, and the remote's reason, the only thing saying what to do, is discarded at the conversion |
 | 53 | Do two sources describe the same event in incompatible terms? | Something between them is rewriting it — the disagreement is the finding, and a single source alone would read as an ordinary failure |
 | 54 | Does an accessor read a field name that is real on a *different* member of the same family? | It returns a plausible absence rather than failing, so it reads as "not set" instead of "looked in the wrong place" |
+| 55 | Did the search you are quoting actually finish? | An absence asserted from an unfinished search is a fact about nothing, and it is published with the confidence of a completed one |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3215,6 +3216,30 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## An absence asserted from an unfinished search
+
+Asked whether any consumer of a wire format had been missed, I ran a fleet-wide
+search, then answered **"nothing else reads this"** and named the count. The
+search had not returned when I said it. When it did, there was another consumer.
+
+It was harmless — display-only, unaffected by the change — but the answer was
+wrong, and it was wrong in the direction that ends an inquiry rather than
+extending one. The person who asked had specifically requested to hear about any
+additional consumer *now* rather than later.
+
+The mechanism is worth separating from carelessness: a long-running search that
+has not finished looks exactly like one that finished empty. Nothing distinguishes
+"still working" from "found nothing" at a glance, and the conclusion arrives with
+the confidence of a completed run.
+
+This was committed an hour after writing down the rule it violates. Knowing the
+class does not protect against it; only checking that the instrument returned
+does.
+
+**Before quoting a search as evidence of absence, confirm it completed.** And
+prefer reporting the search's own output over your summary of it — the summary is
+where "still running" quietly becomes "none".
 
 ## A field name that is real somewhere else
 

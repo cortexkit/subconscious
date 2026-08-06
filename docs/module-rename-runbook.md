@@ -64,6 +64,41 @@ never examined, because nobody re-derives a number that agrees with them.
 Steps 6 and 7 are the ones that get dropped. A resident left running through a
 rename works today and breaks whenever someone tidies up.
 
+## Placing a signed binary
+
+Sign at **stage** time with an explicit identifier, then place with a plain copy.
+
+An ad-hoc signature with no identifier given derives one from the build, so it
+changes on every rebuild of any source change. The operating system binds privacy
+grants to that identifier and attributes them to the supervising process, which
+means replacing a supervisor binary can silently revoke a permission for
+everything it supervises: no prompt, no error, and no self-healing, because a new
+process carries the new identifier while the grant still names the old one.
+
+So the dangerous command must be **absent** from the placement procedure rather
+than present with the right flag. A pin is not sticky: any later signature without
+an explicit identifier silently reverts it.
+
+Use a distinct identifier per environment — a development build must never share
+a principal with production, or it can inherit that grant invisibly.
+
+Two consequences worth having:
+
+- **Whole-file hashing works again as a placement check**, because staged and
+  placed are byte-identical. That check is unusable when signing happens after
+  copying.
+- **Re-signing invalidates every published hash.** The build identifier does not
+  change, so it remains the way to prove two artifacts are the same build across
+  a re-sign. A hash is only a valid acceptance value when paired with the exact
+  signing command that produced it.
+
+Copy to a temporary name and rename over the destination — writing in place
+rewrites the pages of a process currently executing from that file.
+
+Afterwards, compare the **running process's** file identity against the
+destination's. They correctly disagree between placement and restart, so reading
+the destination alone reports a restart as done when it has not happened.
+
 ## Verification
 
 **Sub-checkouts must resolve to the new root**, not merely appear in a listing.

@@ -99,6 +99,36 @@ from content:
 
     codesign --force --sign - --identifier ck-subc /path/to/ck-subc
 
+### Better: pin at stage time, place with a plain copy
+
+Signing at placement is the wrong step, and the reason generalises: **a pinned
+identifier is not sticky.** Any later `codesign --force --sign -` silently
+re-derives it, so a procedure that says "sign correctly when you place" is one
+forgotten flag away from the failure it prevents.
+
+Copying does not invalidate a signature — measured: a plain copy of a pinned
+binary keeps its identifier, is byte-identical, and executes. What is required is
+that the file be signed *before* it is executed, not that it be signed *after* it
+is copied.
+
+So: **sign once at stage time with the pinned identifier, verify the identifier
+there, and place with a plain copy.** The dangerous command is then absent from
+the placement procedure rather than present with the right flag — the same reason
+a guard belongs at the reader rather than in the comparison.
+
+This also recovers whole-file hashing as a placement check, since staged and
+placed are byte-identical. The "the digest will not match, that is signing"
+caveat existed only because signing happened after copying.
+
+One caveat measured separately: an *unsigned* binary is killed on exec, so
+signing genuinely is required at some point. Compiler output is already
+linker-signed, which is why a plain copy of a fresh build runs at all.
+
+Use a **distinct identifier per principal** — a test daemon gets its own rather
+than sharing production's. Sharing would work, which is the problem: the test
+binary would inherit production's grant, and the settings pane shows one row per
+identifier, so nothing reveals that two principals sit behind it.
+
 **Sign every copy, not just the one being deployed.** A first pass here pinned
 only the artifacts staged that day and missed six already in place, plus every
 file in the staging directory — so the class read as closed while two thirds of

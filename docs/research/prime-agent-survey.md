@@ -58,7 +58,12 @@ real gap and this is a clean shape for it: the boundary is still a valid cut
 point, the summary is scoped to the discarded half, and the kept half is
 untouched bytes rather than a re-rendering.
 
-Worth raising with the context-management module rather than implementing here.
+Confirmed by the context module against their own source: cuts snap to user-turn
+boundaries with tool-arc fencing, so an oversized *live* turn is a currently-open
+residual whose only answer today is warn-and-refuse. Aged giant turns compact
+whole and are fine. Banked there with the constraints any implementation must
+clear, including a boundary vocabulary for a mid-turn cut that is not a
+compartment boundary.
 
 ## Borrowable 2: the compaction note that names what the summary cannot see
 
@@ -81,6 +86,11 @@ transcript has this property. Ours: module-side stores, open background tasks,
 staged files on disk. A summary that silently omits them invites the reader to
 treat them as absent — the same shape as a status field that cannot distinguish
 zero from unread.
+
+Also confirmed a gap: the historian prompt records what *happened* and says
+nothing about what *survives*. Queued for the next epoch cycle rather than
+immediately, because the prompt bytes are load-bearing for cache stability and
+any change revalidates first.
 
 ## Durability: at-most-once at the supervisor boundary
 

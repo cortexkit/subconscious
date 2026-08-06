@@ -126,7 +126,15 @@ only — the worker half needs its own reviewed gate.
    clean sweep afterwards is the proof the restarts took effect, and this is one
    of the few checks whose failing state exists only during a window.
 9. **Sweep every store, its `-wal`/`-shm` siblings, and the module's `.lease`
-   for `0600`.** Nine must flip; the three already correct are the control
+   for `0600`.** The acceptance set is **13 live files**, each of which flips
+   when its module reopens it.
+
+   Two others were removed from that set beforehand rather than counted as
+   failures: a zero-byte placeholder and an orphaned lock file, neither held by
+   any process. **An open-time fix only reaches files something opens**, so
+   those would have stayed world-readable through the restart and read as two
+   failures in an otherwise clean sweep — the kind of standing residue that
+   teaches a reader to ignore the check. Nine must flip; the three already correct are the control
    proving the check can read a correct state.
 
    The lease is the other half of the same fix and carries a *different* risk.

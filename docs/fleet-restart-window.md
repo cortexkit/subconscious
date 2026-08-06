@@ -210,6 +210,30 @@ The partial state is boring by construction.
 - **The rename spawns nothing.** Old ids gone, new ids absent, stores already
   moved. Fix config, rescan again.
 
+## Outcome
+
+Every step landed, verified after a full machine restart rather than from what
+was done during the window: 14 modules healthy, **zero running-image
+mismatches**, all binaries holding pinned signing identifiers, the state move
+complete with the old path gone, the working-directory rename clean with all 26
+worktree backpointers repaired, and the 1.5 GB combined log rotated.
+
+One leg closed as **brought up clean, write path unproven** rather than as
+passed. Its owner had every check available to them green, and declined to call
+it acceptance because the available checks did not include a mutating call — the
+module's peers are phones and none were connected. That is the honest status and
+it is recorded as such.
+
+They also declined to force a reconnect to clear it, for a better reason than
+patience: a fix to that exact connection path was already dispatched, so a green
+would have been measured against code about to change and a red would have been
+ambiguous between the old defect and the new work. **Clearing a caveat by
+manufacturing the event produces a result that describes nothing.**
+
+The check that earned its place was comparing each running process against the
+file at its deploy path. It caught a restart that had changed nothing, and it is
+the only step in the list whose failing state exists solely during a window.
+
 ## Not in this window
 
 The worker half of engram (needs a separate reviewed gate with the credentials

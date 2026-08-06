@@ -76,7 +76,16 @@ never examined, because nobody re-derives a number that agrees with them.
    **Open verification copies read-only, and treat that as load-bearing rather
    than good manners.** A write-ahead database missing its sidecar *refuses to
    open* read-only, because a read-only connection cannot create the shared-memory
-   file it needs. Opened read-write it opens happily and answers every query —
+   file it needs.
+
+   **That refusal is ambiguous, and the two readings are opposites.** It means
+   either *this copy is missing its most recent writes* or *this store was shut
+   down cleanly* — a clean shutdown folds the sidecar into the main file and
+   removes it, leaving nothing for a read-only connection to attach to. The
+   discriminator is whether the service was stopped first, which is knowledge the
+   operator has and the check does not. Expect it after a deliberate stop; treat
+   it as a finding only on a copy taken from a running service. Resolve it on a
+   throwaway copy rather than on the original or the backup. Opened read-write it opens happily and answers every query —
    silently short. The flag converts a silent wrong answer into a hard error.
 
    So **the error is the finding.** `unable to open database file` on a copy you

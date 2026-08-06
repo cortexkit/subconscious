@@ -60,6 +60,24 @@ conclusive, since a difference can be a comment shifting a panic line.
 **backups, context**: artifacts pending; both owners are fixing defects found
 during preparation.
 
+## Staged
+
+All of the below are in place at the deploy paths with the previous binary backed
+up beside each. Staging is not a restart: the copy removes the destination first,
+so every running process keeps executing its old file. Verified — for each, the
+inode the live process is executing differs from the inode now on disk.
+
+daemon, MCP gateway, backups, context, connectors (two binaries), and the two
+executive binaries staged by their owner.
+
+One asymmetry worth recording, because it nearly produced a wrong note: after
+signing, two of three hashes were **unchanged** from what their owners quoted,
+and one changed. The two were already signed at their source, so re-signing was a
+no-op; the third was not. So a hash mismatch after signing does not imply the
+wrong file, and a match does not imply signing was skipped — which is why the
+changed one was confirmed by marker instead, reading 1 in the staged file and 0
+in its own backup.
+
 ## Acceptance
 
 Per module, by its owner, and **every one includes a mutating call**. A

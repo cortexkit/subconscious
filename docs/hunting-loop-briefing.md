@@ -192,6 +192,8 @@ Before calling a class closed:
 | 105 | You recovered the record — is it a document or a patch? | Applying a patch as a document silently drops everything the patch did not touch, and the result is internally consistent either way |
 | 106 | Does your producer and your consumer agree what a submission *means*? | Delta-versus-replacement disagreement destroys content while both sides behave reasonably and nothing errors |
 | 107 | Would this detector fire on healthy cases? | A signal that flags normal convergence gets switched off within a week, so partition by what the value means before thresholding it |
+| 108 | Does your detector print its exempt population? | An exemption nobody can see cannot be audited, so a wrongly-exempt case is invisible for as long as the rule stands |
+| 109 | Two checks with complementary blind spots — did you ship the better one, or both? | When each check covers the other's gap, choosing between them halves the coverage while feeling like a simplification |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4338,6 +4340,42 @@ The census also corrected my own escalation. I had reported this as silently
 corrupting every campaign; 10 of 82 show any hit, and only 6 involve a normative
 section. **I had generalised from the worst instance rather than the typical one**
 — which is what finding a severe case does to your estimate of its frequency.
+
+**Print the exempt population as a control.** The census lists the converging
+sections it deliberately ignores, because an exemption nobody can see cannot be
+audited — if the rule is ever wrong about a section, that case is invisible for as
+long as the rule stands. This generalises to every detector that treats one class
+differently from another.
+
+### Two checks whose blind spots are each other's coverage
+
+The guard that came out of this uses two independent tests: a size drop, and
+phrases like *"as accepted in round 5"* treated as suspect at any size.
+
+Either alone looks sufficient and neither is. A short section replaced by a
+reference may not trip any size threshold; a reviewer inventing new retention
+wording dodges the phrase list while still losing content. **The size test catches
+the damage, the phrase test catches the intent, and each one's blind spot is
+exactly the other's coverage.**
+
+Worth stating as a general question because the pull is always toward picking the
+better check: **when two checks have complementary blind spots, choosing between
+them halves the coverage while feeling like a simplification.**
+
+### A guard with no path forward
+
+My version of the fix would have shipped a deadlock. Refusing the destructive
+submission is correct, but the reviewer then keeps submitting the same shape, the
+guard keeps refusing, and the work never advances.
+
+The owner's version tells the next round to restate refused sections in full — a
+recovery path attached to the refusal. **A fail-closed guard with no way forward
+converts silent data loss into a loud stall**, which is an improvement and not a
+fix.
+
+One detail from the same design worth copying: the diagnostic field is **present
+and empty when clean**, rather than absent. A field that only appears on failure
+cannot distinguish *nothing was suppressed* from *the guard never ran*.
 
 ### A live surface inside a frozen set
 

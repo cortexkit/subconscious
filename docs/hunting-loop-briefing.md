@@ -174,6 +174,7 @@ Before calling a class closed:
 | 87 | Checking a citation in someone else's document — whose ruling is it? | Finding your own words landed there reads as independent corroboration, and the check that was supposed to catch that is what delivers it |
 | 88 | Does this identifier stay fixed while the content it names can change? | A correct replay guard then reads a content change as a replay attempt, and refuses the delivery forever |
 | 89 | Adding or changing a rendering — who is reading the old one? | A broken parse fails; a broken match just stops matching, so the quality loss is silent and only the author could have known a better answer existed |
+| 90 | Does the attribution still name the same party after being passed back? | Attribution survives one hop and degrades on the second; verify against the original message, not the most recent restatement |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3655,6 +3656,30 @@ citation over from where I looked. And the mechanism is nastier than ordinary
 circular reasoning: **the act of verifying is what delivers it.** A ruling that has
 travelled into someone else's document looks exactly like an independent source,
 because by then it *is* in an independent document.
+
+### The restatement is where it inverts
+
+One exchange after we both banked the fix above, it failed again — in the opposite
+direction, **in the message implementing it.**
+
+Describing where they had filed my argument, they wrote "your structural argument
+is listed second and marked as load-bearing." I read *your* as a transfer and was
+about to commit a record crediting them with an argument I had introduced. They
+caught it by quoting my original message back.
+
+Neither of us misremembered the origin at the moment of the ruling. **The
+restatement inverted it** — and it was headed for the copy we had just designated
+as authoritative, which is the copy nobody would think to doubt.
+
+So the rule needs a sharper operational form than "attribute borrowed rulings":
+**attribution survives one hop and degrades on the second.** The check is not *did
+I attribute this* but **does the attribution still name the same party after being
+passed back** — verified against the original message, not against the most recent
+restatement of it. That is what caught it.
+
+My share was the larger one: I took a restatement of my own words at face value
+when going back to the original was a single step. **The description of a record
+is not the record**, and that is precisely the hop where this fails.
 
 Two practices follow, both theirs:
 

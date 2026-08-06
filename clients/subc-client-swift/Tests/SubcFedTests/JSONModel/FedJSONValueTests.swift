@@ -73,6 +73,51 @@ final class FedJSONValueTests: XCTestCase {
         XCTAssertEqual(decoded["params"], .object(FedJSONObject(["value": .integer(3)])))
     }
 
+    /// 0 and 1 must stay integers for every width, and real booleans must stay
+    /// booleans.
+    ///
+    /// Foundation bridges numbers and booleans to a common NSNumber, and
+    /// `NSNumber(0) as? Bool` succeeds — so a Bool-first cast sent every 0 and 1 as
+    /// `false` and `true`. A first page request carrying `sinceSeq: 0` reached the
+    /// far side as a boolean and was rejected for the wrong type; 2 and above were
+    /// unaffected, so it read as one broken call rather than a broken encoder.
+    ///
+    /// The boolean half is what makes the fix safe: deleting the Bool branch would
+    /// pass this test's integer half while sending real flags as 1 and 0.
+    func testNumericZeroAndOneSurviveAsIntegersAndBooleansStayBooleans() throws {
+        let zeroes: [Any] = [Int(0), Int8(0), Int16(0), Int32(0), Int64(0),
+                             UInt(0), UInt8(0), UInt16(0), UInt32(0), UInt64(0)]
+        for value in zeroes {
+            XCTAssertEqual(
+                try FedJSONValue(any: value), .integer(0),
+                "\(type(of: value)) 0 must stay an integer"
+            )
+        }
+        let ones: [Any] = [Int(1), Int8(1), Int16(1), Int32(1), Int64(1),
+                           UInt(1), UInt8(1), UInt16(1), UInt32(1), UInt64(1)]
+        for value in ones {
+            XCTAssertEqual(
+                try FedJSONValue(any: value), .integer(1),
+                "\(type(of: value)) 1 must stay an integer"
+            )
+        }
+        XCTAssertEqual(try FedJSONValue(any: Double(0)), .integer(0))
+        XCTAssertEqual(try FedJSONValue(any: Double(1)), .integer(1))
+
+        XCTAssertEqual(try FedJSONValue(any: true), .boolean(true))
+        XCTAssertEqual(try FedJSONValue(any: false), .boolean(false))
+        XCTAssertEqual(try FedJSONValue(any: NSNumber(value: true)), .boolean(true))
+        XCTAssertEqual(try FedJSONValue(any: NSNumber(value: false)), .boolean(false))
+    }
+
+    /// The same guarantee through the path outbound calls actually use.
+    func testSnapshotKeepsZeroAndOneAsIntegers() throws {
+        let snapshot = try FedJSONObject.snapshot(["sinceSeq": 0, "limit": 1, "live": true])
+        XCTAssertEqual(snapshot["sinceSeq"], .integer(0))
+        XCTAssertEqual(snapshot["limit"], .integer(1))
+        XCTAssertEqual(snapshot["live"], .boolean(true))
+    }
+
     private func nestedObjectJSON(containerCount: Int) -> Data {
         var text = ""
         for _ in 0..<containerCount { text += "{\"x\":" }

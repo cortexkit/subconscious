@@ -166,6 +166,7 @@ Before calling a class closed:
 | 79 | Handing something over — are you publishing values that *discriminate* it, or values that *describe* it? | A hash describes; an identity discriminates. Publishing the discriminating value is what lets the author find their own error first |
 | 80 | Two people report the same metric and disagree — are they measuring the same column? | Two correct measurements of different quantities wearing one name look exactly like a defect |
 | 81 | Widening a reply shape — how long until every consumer can parse it? | A service redeploys in minutes and its consumers on restart, so a widened reply is a narrowing at the far end; make it opt-in |
+| 82 | How much of each file did your scan actually read? | A scan reporting on a third of a file is not a sweep with a caveat, it is a different question wearing the same name |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3560,6 +3561,39 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## A scan that reads a fraction of the file
+
+A colleague's sweep excluded test code by cutting each file at the first
+test-only attribute. Some crates put that attribute on **production** items — a
+test-only constructor beside the real one, an injection point — so the cut landed
+near the top. Their scan read **32% of one file** and reported a property missing
+that was present twenty-four lines past where it stopped looking.
+
+I ran the same measurement against my own crates and it is worse here:
+
+- the module registry: cut at line 17 of 202 — **reads 8%**
+- the routing table, where most of the interesting invariants live: line 407 of
+  2562 — **reads 15%**
+
+Any sweep of mine using that anchor would have reported on a twelfth of the most
+important file and produced clean, plausible output.
+
+**The direction is what makes it expensive.** Truncation reports things *absent*
+that are present, never the reverse. So every artefact is a false "missing", which
+reads as a finding — you investigate, discover it is fine, and file it as a false
+positive. **A real gap in the same run is indistinguishable from that noise.** The
+instrument does not fail loudly; it fails by producing exactly the kind of output
+a sweep is supposed to produce.
+
+Two fixes, and the second is the one that generalises: anchor on the attribute
+*immediately followed by* a test module, and **print how much of each file the scan
+read** before believing any result. The anchor fix alone is correct and silent;
+the coverage line is what makes the next wrong anchor visible. It is the same move
+as everywhere else — emit the distinction rather than document it.
+
+Their framing is worth keeping exactly: *a scan reporting on a third of a file is
+not a sweep with a caveat, it is a different question wearing the same name.*
 
 ## Two correct measurements wearing one name
 

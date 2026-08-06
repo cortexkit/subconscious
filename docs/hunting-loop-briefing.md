@@ -154,6 +154,7 @@ Before calling a class closed:
 | 67 | Will anything else change your observable during this operation? | A confound that *decorates* a success is never investigated, because nobody re-derives a number that agrees with them |
 | 68 | Comparing two instruments — do they answer the same question? | A pair where one is *defined* to normalise cannot detect whether the other normalised; the difference you see is the definition, not a finding |
 | 69 | Can the check read correct while wrong *and* wrong while correct? | Ambiguous in both directions is not weak evidence, it is none — replace it with a behavioural test |
+| 71 | When does this check become valid, relative to the decision it gates? | A sound check whose validity window opens after the gate is no check at all |
 | 70 | Did the tool answer *your* question, or a well-formed one you did not ask? | "Nothing to review" is a sentence shaped like an answer; a review of an unstaged file is indistinguishable from a clean one |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
@@ -3514,6 +3515,38 @@ logical path and hands it back.
 defined to normalise, so the difference between them is the definition — not
 evidence about the other member's behaviour. A comparison where one side is
 specified to do the thing you are testing for tells you nothing.
+
+The method that resolved it, in their words: **when two instruments disagree,
+establish what each one measures before interpreting the difference.** They had a
+disagreement and reached straight for a story about the subject; the disagreement
+was a property of the instruments.
+
+Operationally: **add instruments until the disagreements are explained, rather
+than explaining the first one you see.** The four-way comparison worked not
+because four is a useful number but because the additions were of *different
+kinds* — a shell builtin, a separate program, the raw system call. Three tools
+that all consult the same remembered value would have agreed with each other and
+taught nothing.
+
+### A check whose validity window opens after the gate
+
+They tested my correction rather than accepting it, and found the sharper version.
+
+The shell validates its remembered path against the directory's identity and
+discards it silently when they disagree. Measured: a stale logical path survives
+only while it still names the same directory. So the string is ambiguous
+**precisely and only while the compatibility link exists.**
+
+I had called the check unreliable in general. It is narrower and worse than that:
+**uninformative exactly during the interval it would be used, and informative only
+after the thing it was meant to authorise has already happened.**
+
+Their statement of it is the general shape: *a check that becomes valid only after
+the decision it gates is not a weak check, it is no check.* Worth separating from
+the usual question. Most checks are classified by whether they *can* be wrong;
+this one classifies by **when** they are wrong relative to the decision. A check
+can be perfectly sound and still worthless if its validity window opens after the
+gate.
 
 ### Ambiguous in both directions is not weak evidence
 

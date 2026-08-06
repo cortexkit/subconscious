@@ -107,10 +107,25 @@ only — the worker half needs its own reviewed gate.
 4. **Stop broca, move its state, leave it stopped.**
 5. **Stop the executive modules, move their stores, edit the daemon config.**
 6. **One daemon bounce.** Everything comes up on new binaries with new config.
+
+   Worth being explicit, because it inverts the natural reading of this list:
+   the daemon is not one more module at the end. Every supervised module is its
+   child, so **the bounce is the single event that picks up every staged module
+   binary at once**. The individual restarts above exist only for the ones that
+   must come up in a controlled order and be verified alone.
+
+   The daemon itself runs under the system launcher, whose configuration names
+   the deploy path directly, so restarting it re-executes whatever is staged
+   there. Nothing has to restart itself into a new binary.
 7. **Verify by inode, per module.** Then each owner runs their own acceptance,
    including at least one mutating call — a read-only health route proves the
    service is serving and nothing about the write path.
-8. **Sweep every store, its `-wal`/`-shm` siblings, and the module's `.lease`
+8. **Run `scripts/fleet/verify-running-image.sh`.** Every module must report
+   `ok`: same file identifier for the running process and the deploy path. Six
+   report `MISMATCH` right now by design — staged and not yet restarted — so a
+   clean sweep afterwards is the proof the restarts took effect, and this is one
+   of the few checks whose failing state exists only during a window.
+9. **Sweep every store, its `-wal`/`-shm` siblings, and the module's `.lease`
    for `0600`.** Nine must flip; the three already correct are the control
    proving the check can read a correct state.
 

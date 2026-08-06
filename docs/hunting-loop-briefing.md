@@ -172,6 +172,7 @@ Before calling a class closed:
 | 85 | A fix landed upstream — which local workarounds did it just make unreachable? | Nothing fails when a workaround is superseded, so it survives as dead code wearing a safety costume |
 | 86 | Is this gate expensive enough that someone will route around it? | A gate that gets avoided is replaced by something worse and unmonitored; cost is a security property, not an ergonomic one |
 | 87 | Checking a citation in someone else's document — whose ruling is it? | Finding your own words landed there reads as independent corroboration, and the check that was supposed to catch that is what delivers it |
+| 88 | Does this identifier stay fixed while the content it names can change? | A correct replay guard then reads a content change as a replay attempt, and refuses the delivery forever |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3566,6 +3567,39 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## An identifier that outlives the content it names
+
+A notification sat undelivered for twenty minutes, and the module reporting it
+degraded. My first reading was that it had been addressed to something that could
+no longer receive it — a failure mode we had hit hours earlier, and the wrong
+answer here.
+
+The real cause was an unrelated fix from earlier the same evening. The
+notification's *text* changed. Its delivery guard keys on an identifier plus a
+hash of the payload, and refuses a replay whose hash has moved — a correct guard
+against a real hazard. But the identifier stayed fixed across the text change, so
+**the guard read "same identifier, different bytes" as a replay attempt** and
+refused delivery permanently.
+
+The structural statement: **an identifier that survives a change to the content it
+names is a versioning bug.** When the content is not derived from the identifier's
+own inputs, the identifier has to carry a revision of that content, or every
+content change collides with its own delivery history.
+
+Two things worth keeping about how it was found.
+
+**Neither party could have diagnosed it alone.** One side saw a stuck delivery, the
+other had shipped a text change; only reading both records together produced the
+collision. A guard refusing correctly and a change being correct do not add up to
+a correct system.
+
+**The count-shaped gauge was almost useless and was rescued by one field.** "One
+pending" cannot distinguish a single stuck item from a succession of brief ones.
+What settled it in two samples was that the gauge also emitted the identifier and
+an age — a count that carries its own distinguishing fact. The remaining gap is
+the familiar one: *sent and not yet acknowledged* and *sent to something that can
+never acknowledge* still render identically.
 
 ## Your own ruling, cited back at you
 

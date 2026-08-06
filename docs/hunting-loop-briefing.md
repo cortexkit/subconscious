@@ -140,6 +140,8 @@ Before calling a class closed:
 | 53 | Do two sources describe the same event in incompatible terms? | Something between them is rewriting it — the disagreement is the finding, and a single source alone would read as an ordinary failure |
 | 54 | Does an accessor read a field name that is real on a *different* member of the same family? | It returns a plausible absence rather than failing, so it reads as "not set" instead of "looked in the wrong place" |
 | 55 | Did the search you are quoting actually finish? | An absence asserted from an unfinished search is a fact about nothing, and it is published with the confidence of a completed one |
+| 56 | Is the resource being *consumed*, or *retained*? | A falling number looks identical either way, and every search for a writer is wasted when nothing is writing |
+| 57 | Does your existence check discriminate, or does it pass the worst case? | "The path exists" admits a live-but-wrong target; the shape of the path is the test that separates them |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3216,6 +3218,71 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## An existence check that passes the worst case
+
+After a rename broke message routing between agents, I told several teams the
+remedy: re-register the moved peer, then confirm the recorded directory
+**exists**.
+
+That check passes the worst case. The recorded directory is derived from wherever
+the named session happens to run, and a session id can belong to a short-lived
+background worker rather than to the agent itself. **A worker whose working
+directory is still live yields an existing path and an undeliverable inbox** —
+clean by my rule. Existence only catches the workers whose directories have
+already been cleaned up.
+
+The discriminating check is **the shape of the path**: a real project root means a
+real session; anything under a worktree directory means the id belongs to a
+worker. Same output, different question — it turns the recorded directory from a
+property you inspect into a **test of the identifier**.
+
+Two details worth carrying:
+
+One team had the worktree path in their own output, reported it verbatim, and
+read it as a symptom rather than as the diagnosis — then re-ran the registration
+twice to confirm the path was stable. **A test of the wrong hypothesis, executed
+carefully**, which is the expensive kind: the rigour makes the conclusion feel
+earned.
+
+And the failure mode is why a structural check is required rather than an
+attentive one: **the only signal is a reply that never arrives, and silence is
+indistinguishable from a busy recipient.** Someone did ask for confirmation
+through a bad entry and got none — which was the evidence, visible only in
+hindsight.
+
+## Consumed, or merely retained
+
+Free disk space fell steadily for an hour — measured at 737 MB/min over a full
+minute — while **every directory sampled read flat.** I spent that hour hunting a
+writer: databases, staging directories, container images, log stores,
+deleted-but-open files, backup processes. All flat. One candidate looked live
+only because a modified-time search matched a *touch* rather than growth, which I
+reported and withdrew.
+
+The owner ended it in one move: he deleted about 150 GB and **free space did not
+change.**
+
+That is not consumption. A filesystem snapshot taken that morning was retaining
+every file deleted since — unlinked, but still referenced, so nothing was ever
+released. Removing the snapshot returned the space immediately, and it kept
+climbing for minutes as blocks were released.
+
+**A falling free-space number looks identical under consumption and under
+retention, and the whole search strategy differs.** Under consumption you hunt a
+writer; under retention there is no writer to find, which is exactly why every
+directory read flat. That flatness was the answer, and I read it as a failure to
+locate the cause.
+
+The discriminating test costs one command: **delete something large and see
+whether the free number moves.** If it does not, stop looking for a writer. That
+is a far sharper instrument than watching a number fall, and it was available the
+whole time.
+
+Generalises past disk: any exhausted resource whose usage only rises — memory
+held by a cache that never evicts, connections held by a pool that never reaps,
+file descriptors retained after close. **Ask whether release works before asking
+who is allocating.**
 
 ## An absence asserted from an unfinished search
 

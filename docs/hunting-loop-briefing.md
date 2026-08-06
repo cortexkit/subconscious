@@ -123,6 +123,7 @@ Before calling a class closed:
 | 36 | Before reporting evidence missing, did you check the tools you already run? | An absence found by searching the wrong kind of store is a fact about the search; your own monitoring may already read the thing you are about to escalate |
 | 37 | Does the column name describe what the column counts? | A narrower-than-it-sounds name reads as a defect to anyone who did not define it, and the suspicion outlives the question |
 | 38 | Is the uncalled component the most detailed description of intended behaviour? | Then it is read as documentation, and every capability it describes but the wired path lacks is a wrong conclusion waiting to be drawn |
+| 39 | Is an address or capability the peer *asserted* being treated as one you verified? | An assertion is a usable hint and nothing more; name it a hint in the type, or the first reader treats a claim as a fact |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -130,6 +130,7 @@ Before calling a class closed:
 | 43 | Is a broken state available right now that you have been unable to test against? | The failing direction of a check is only testable while something is genuinely broken — spend an outage on the measurement, not only the recovery |
 | 44 | When renaming an identifier, did you sweep where it is an *authority* reference and not only a *routing* one? | Nothing that resolves routes ever touches a grant list, so it survives every sweep driven by "what breaks if this name is wrong" |
 | 45 | If one side of a comparison is missing, does the check say "cannot compare" — or return a verdict? | An absent input rendered as a verdict is wrong in both directions: silently passing, or raising a false alarm that invites undoing correct work |
+| 46 | Did anything verify the *destination*, or only the artifact? | Identity checks answer "is this the right file" and say nothing about "does the consumer read from here" — two directories, one filename, and every check passes |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3206,6 +3207,37 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## Verifying the artifact, never the destination
+
+A binary was placed for a test rig. Every check passed: the digest matched the
+value its author published, the signing identifier was correctly pinned, the
+build identifier matched, staged and placed were byte-identical, and the copy
+used the safe rename. **It went to the wrong directory.**
+
+Two directories, one filename — the production binary directory and the rig's own
+— and a rig-named file in the production directory looks entirely reasonable at a
+glance. Nothing loads it.
+
+Every instrument that day had been built to make an artifact's *identity*
+unforgeable, and **not one of them asks whether the consumer reads from that
+path.** An artifact property cannot answer a question about a location.
+
+The author caught it by verifying against the path **the consumer's configuration
+names**, rather than the path in the message reporting the placement. When the
+values disagreed they searched **by digest** rather than by name — a name search
+returns seven plausible candidates across the tree, while a content search finds
+the one file that actually moved.
+
+Underneath it was a second floor: **two rigs existed**, with different
+configurations and different module sets, and the only launcher entry pointed at
+the older one. Both parties had read "the rig config" and read different files,
+each truthfully. So the destination question has two parts — *which path*, and
+*which consumer reads it* — and answering the first does not touch the second.
+
+The generalisation: after confirming an artifact is right, confirm that the thing
+meant to load it **names the place you put it**. Read that from the consumer's
+configuration, not from your own record of where you wrote.
 
 ## A missing input rendered as a verdict
 

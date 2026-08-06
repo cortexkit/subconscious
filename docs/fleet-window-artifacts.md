@@ -89,10 +89,31 @@ Measured today: replacing the daemon at 12:01 changed its identifier from
 window successfully at 11:00 was refused at 14:14 — with the daemon process never
 having restarted.
 
+The derived identifier is **the link-time build identifier with its dashes
+stripped** — `ck-thalamus-55554944bec92f6d…` against LC_UUID
+`BEC92F6D-0472-3229…`. So it is a pure function of the build and changes on
+**every** rebuild of any source change, not occasionally.
+
 **The fix is to pin the identifier at signing time** rather than letting it derive
 from content:
 
     codesign --force --sign - --identifier ck-subc /path/to/ck-subc
+
+**Sign every copy, not just the one being deployed.** A first pass here pinned
+only the artifacts staged that day and missed six already in place, plus every
+file in the staging directory — so the class read as closed while two thirds of
+it remained. Staging copies matter because they are placed later, which is
+exactly when the derived identifier comes back.
+
+**For a binary a process is already running, do not sign in place.** That rewrites
+the live process's text pages, the same hazard that makes remove-first copying
+load-bearing. Copy to a temporary name, sign the copy, and rename over the path:
+the running process keeps its inode and the path gets a new one.
+
+And note which question each instrument answers, because during a window they
+disagree correctly: the build identifier answers *is this file the artifact I
+staged*, and only the inode answers *is that what is running*. Reading the path
+alone reports a restart as done when it has not happened.
 
 Verified invariant: the same identifier results from entirely different bytes, so
 it survives every future rebuild. All staged binaries now carry their own name as

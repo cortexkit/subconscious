@@ -154,6 +154,7 @@ Before calling a class closed:
 | 67 | Will anything else change your observable during this operation? | A confound that *decorates* a success is never investigated, because nobody re-derives a number that agrees with them |
 | 68 | Comparing two instruments — do they answer the same question? | A pair where one is *defined* to normalise cannot detect whether the other normalised; the difference you see is the definition, not a finding |
 | 69 | Can the check read correct while wrong *and* wrong while correct? | Ambiguous in both directions is not weak evidence, it is none — replace it with a behavioural test |
+| 70 | Did the tool answer *your* question, or a well-formed one you did not ask? | "Nothing to review" is a sentence shaped like an answer; a review of an unstaged file is indistinguishable from a clean one |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3467,6 +3468,31 @@ Generalises past disk: any exhausted resource whose usage only rises — memory
 held by a cache that never evicts, connections held by a pool that never reaps,
 file descriptors retained after close. **Ask whether release works before asking
 who is allocating.**
+
+## An answer to a question you did not ask
+
+I ran a comment review over a document I had just written and got "no changes to
+review." I ran it again more explicitly and got the same. Both replies were
+correct: the file was **untracked**, so it was absent from the diff the tool
+reads. I nearly took the second reply as a pass.
+
+This belongs with the other absence failures but is worse in one specific way.
+An empty result set, a missing run, an unfinished search — each is an *absence*,
+and an absence can at least be interrogated. **This one arrives as a
+positive-sounding verdict.** "Nothing to review" is a sentence in the shape of an
+answer, and it is well-formed whether or not it addresses what you meant.
+
+The tell, once named, is general: **when a tool answers a question you did not
+ask, the answer is still well-formed.** Nothing about its phrasing reveals the
+substitution.
+
+The fix is structural rather than attentional: **stage first, review second.** That
+removes the state in which the two outcomes look alike, instead of requiring
+anyone to notice the difference between them.
+
+A colleague ran the same check against their own work after I reported the miss.
+Theirs was clean — and they made the point that the check only existed because a
+process slip was reported rather than quietly fixed.
 
 ## An instrument pair that cannot answer the question
 

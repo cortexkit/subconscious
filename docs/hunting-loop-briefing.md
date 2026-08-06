@@ -185,6 +185,7 @@ Before calling a class closed:
 | 98 | Does a functional test of this registry prove its rows are sound? | A stale row with a live duplicate resolves correctly, so the system passes every send test while carrying the defect |
 | 99 | Measuring a store — does anything still write it? | A dead store and a live one with stale rows are identical by their contents; the discriminator is never in the rows |
 | 100 | The other party retracted — does that make your number wrong? | A retraction from one side makes the other's figure feel like the error, and over-correcting toward it discards a correct measurement |
+| 101 | Feeling the pull to concede — which measurement would you have to disbelieve? | If you cannot name one, you are conceding to the other party's confidence rather than to evidence |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4271,6 +4272,18 @@ retraction, I sent my own — attributing my larger number to a counting mistake
 that had not happened. **A retraction from one side makes the other side's figure
 feel like the error.** The pull is toward the smaller number and the more recently
 confident party, and neither is evidence.
+
+They pointed out this was the second time that evening, and the first was theirs:
+they had withdrawn a correct warning immediately after I produced a plausible
+alternative. **So the pattern is bidirectional and has a trigger** — the other
+party conceding makes your own position feel like the error, when the concession
+carries no new evidence, only more willingness to be wrong. Twice in one evening a
+correct position was abandoned for a worse one out of deference.
+
+Their guard is the usable part: **when you feel the pull to concede, name the
+measurement you would have to disbelieve in order to do it.** Neither of us could,
+in either instance. If you cannot name one, you are not conceding to evidence —
+you are conceding to the other party's confidence.
 
 ### A skipped step presents as a broken one
 

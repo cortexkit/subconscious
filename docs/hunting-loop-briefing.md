@@ -186,6 +186,8 @@ Before calling a class closed:
 | 99 | Measuring a store — does anything still write it? | A dead store and a live one with stale rows are identical by their contents; the discriminator is never in the rows |
 | 100 | The other party retracted — does that make your number wrong? | A retraction from one side makes the other's figure feel like the error, and over-correcting toward it discards a correct measurement |
 | 101 | Feeling the pull to concede — which measurement would you have to disbelieve? | If you cannot name one, you are conceding to the other party's confidence rather than to evidence |
+| 102 | Does this frozen set contain anything whose correctness depends on the outside world? | A tracking surface inside an immutable set is a contradiction that surfaces the first time the tracked thing moves |
+| 103 | Your blast-radius map was wrong once — what is the chance it is complete now? | Being wrong about a map is evidence about the mapping process, not only about that map |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4236,6 +4238,49 @@ than **unreachable** — and quiet requires no action. The minimum fix is not to
 re-key the registry but to **make a send to a row whose directory has vanished
 fail loudly**; re-keying is the better design, failing loudly is what stops the
 silence and can land first.
+
+### A live surface inside a frozen set
+
+A routine update to a set of upstream version pins turned out to be impossible.
+The pins live inside a file set that another piece of work froze — asserted
+byte-identical to a historical commit — to guarantee an authority chain.
+
+The options were all bad in instructive ways. **Move the freeze point:** that
+re-baselines an entire immutable set to update one pin, which means the
+immutability was never the property it claimed — a frozen set you can unfreeze
+whenever a member is inconvenient is a set with a slow edit path. **Exempt the one
+file:** an exception carved for exactly the file someone needed to edit, where a
+later reader cannot tell *exempt because the design requires it* from *exempt
+because someone needed it once*. **Do nothing**, and accept stale pins.
+
+Do nothing was correct, because it is the only option that changes nothing already
+approved.
+
+But the finding is bigger than the decision: **freezing a live surface inside an
+immutable set makes the two mutually exclusive, and neither design mentions the
+other.** Version pins exist to track upstream — tracking is their entire function
+— and the frozen set exists to guarantee nothing moves. That contradiction only
+surfaces when the tracked thing moves, which is to say eventually and always.
+
+The structural repair is a partition rather than an exemption: **an immutable set
+should contain only artifacts whose correctness is fixed at freeze time.** Anything
+whose correctness depends on the outside world belongs outside it, referenced by
+identity rather than by content.
+
+### A map that was wrong once
+
+Worth recording how the wall was found. They applied the change and **ran the
+verifier rather than assuming their chain was complete** — and it failed *above*
+both layers they had mapped, on hashes hardcoded in the verifier's own source.
+
+Their own reading of that: having missed a third pin an hour after mapping two,
+the chance of a fourth is higher than they would like. **A blast-radius map that
+was wrong once is evidence about the mapping process, not only about that map** —
+and most people update only the map.
+
+They also reverted to green rather than pressing on with a partial chain. **An
+internally inconsistent tree that passes some checks is more dangerous than a red
+one.**
 
 ### Measuring a store nothing writes
 

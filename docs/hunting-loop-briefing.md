@@ -157,6 +157,8 @@ Before calling a class closed:
 | 71 | When does this check become valid, relative to the decision it gates? | A sound check whose validity window opens after the gate is no check at all |
 | 70 | Did the tool answer *your* question, or a well-formed one you did not ask? | "Nothing to review" is a sentence shaped like an answer; a review of an unstaged file is indistinguishable from a clean one |
 | 72 | Can this check still *fail*? | A check whose mismatch is expected noise gives no signal in either direction — restoring its ability to fail is what makes it an instrument |
+| 73 | Did the instrument touch its target before you read its verdict? | A comment review over an unstaged file, a mutation patch that failed to apply, a query matching nothing on a formatting mismatch — all report well-formed success |
+| 74 | Two rules collide — which one protects the validity of what you are about to measure? | That one wins; the other is routed to its source rather than applied late |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3470,6 +3472,50 @@ Generalises past disk: any exhausted resource whose usage only rises — memory
 held by a cache that never evicts, connections held by a pool that never reaps,
 file descriptors retained after close. **Ask whether release works before asking
 who is allocating.**
+
+## A success report from an instrument that never touched its target
+
+Three instrument failures in one evening, across three tools and three people,
+all the same shape:
+
+- A comment review over a file that was not yet staged: *"no changes to review."*
+- **A mutation patch that failed to apply**, so the suite ran against the unmodified
+  code and its pass was read as *the mutant surviving*.
+- A query matching nothing because it compared an eight-character abbreviation
+  against a seven-character slice, reporting zero results for something that
+  existed.
+
+The middle one is the worst, and inverts its verdict: a passing suite is the
+strongest possible evidence that a test is vacuous, and here it was manufactured
+by the test being fine. Mutation testing is also the instrument we reach for to
+check *other* instruments, so a silent failure there corrupts the layer used to
+detect corruption.
+
+What unites them: **a success report from an instrument that never touched its
+target.** Every one answered well-formedly. That is what makes the family
+dangerous — an absence invites interrogation, while a well-formed positive verdict
+closes the question.
+
+The defence is identical in all three: **prove the instrument touched its target
+before reading its verdict.** Stage before reviewing. Compare the file before
+believing a mutation ran. Run a positive control before trusting an empty result.
+
+### When two rules collide
+
+A test artifact arrived carrying the production signing identity, violating a rule
+about keeping those separate. Re-signing it would have violated a different rule:
+do not change an artifact after others have verified its bytes.
+
+I decided on consequences and a colleague named the principle: **the rule
+protecting the validity of what you are about to measure wins.** The artifact under
+test must be the artifact everyone verified — that is a correctness property of
+the experiment. Keeping identities separate is hygiene: a real risk, but about a
+different failure.
+
+The half that stops this becoming an excuse: **the residual goes to the source.**
+Declining to fix something late is only correct if it gets fixed where it belongs.
+They recorded it against the artifact itself — *accepted for this round, fix at
+next build* — so "not my step" cannot quietly become "nobody's step".
 
 ## Recovering an instrument's ability to fail
 

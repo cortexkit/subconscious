@@ -122,6 +122,14 @@ is the same shape as the absent-config hazard the refusal guards against.
 5. **Stop the executive modules, move their stores, edit the daemon config.**
 6. **One daemon bounce.** Everything comes up on new binaries with new config.
 
+   **While the daemon is down, move the combined log aside.** It is 1.5 GB and
+   nothing rotates it. This is the only moment it can be done safely: fifteen
+   processes hold that descriptor while the fleet is up, each with its own write
+   offset, so truncating it live produces a sparse file that resumes at its old
+   size. With every writer stopped there are no open descriptors, and the
+   launcher recreates the file on start. Costs nothing extra here; see
+   `docs/fleet-log-rotation.md` for the durable fix.
+
    Worth being explicit, because it inverts the natural reading of this list:
    the daemon is not one more module at the end. Every supervised module is its
    child, so **the bounce is the single event that picks up every staged module

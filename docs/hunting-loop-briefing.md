@@ -112,6 +112,7 @@ Before calling a class closed:
 | 25 | When a mutant survives: did the suite miss the behaviour, or did the mutation never happen? | Both read as "unproven". The second is a working bug that just demonstrated itself and got recorded as absence of evidence |
 | 26 | For each guard: is it checking the thing it protects, or something that merely correlates with it? | The correlation holds until the surrounding procedure changes shape, then the guard refuses the safe case and permits the dangerous one without a line of it changing |
 | 27 | Did an unverified premise *close* a direction rather than open one? | A wrong premise that opens gets tested by whoever builds it; one that closes is never tested, because nothing downstream exists to fail |
+| 28 | Did repairing the instrument invalidate the safety readings taken with the broken one? | A broken tool reports "nothing here" and a fixed one reports what is there; a check carried across the repair was answered by the broken version |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3153,6 +3154,37 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A safety check answered by the tool you then repaired
+
+I removed two abandoned working directories after checking they held no
+uncommitted work. The check said zero. It said zero *because the tool could not
+read them* — their internal pointer referenced a parent directory renamed a
+month earlier, so every query returned nothing.
+
+I then fixed the pointer, precisely so the tool could manage them. And I carried
+the earlier reading across that repair. Re-running the same query after the fix
+reported two modified files in one and one in the other. I had already passed
+them to a forced delete.
+
+What was lost was small — uncommitted edits in a directory nothing had touched in
+a month, with all committed history intact on a branch that still exists. That is
+luck, not diligence.
+
+The shape is general and it is not about git. **A broken instrument reports
+"nothing here"; a working one reports what is there.** Those are the same output.
+So any safety reading taken before a repair was answered by the broken version,
+and the repair is exactly the event that should invalidate it.
+
+Worse, the repair *feels* like progress toward safety — the tool now works, so
+surely things are better understood than before. That is what makes the stale
+reading easy to keep.
+
+The rule: **after fixing an instrument, re-run every check you made with it.**
+And when a check returns an all-clear that would also be returned by a failure to
+look, treat the all-clear as unmeasured until something proves the instrument
+could have said otherwise — the positive control, applied to a destructive step
+rather than to a search.
 
 ## An unverified premise that closes a direction
 

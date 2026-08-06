@@ -471,18 +471,40 @@ while read -r modid binname; do
   # exactly when someone has just deployed and is most likely to be reading this.
   # A guard placed after a skip inherits that skip's blind spot, and here the
   # skip's condition is not incidental to the fault but a common companion of it.
-  commons_head_ms=""
-  if grep -Eq 'cortexkit-(store|lease|paths|provider-usage|model-catalog)' "$dir/Cargo.toml" 2>/dev/null \
-     || grep -Eq 'cortexkit-(store|lease)' "$dir"/crates/*/Cargo.toml 2>/dev/null; then
-    commons_head_ms=$(cd "$HOME/Work/Projects/CortexKit/commons" 2>/dev/null \
-      && git log -1 --format='%ct' 2>/dev/null)
-  fi
-  if [ -n "$commons_head_ms" ] && [ "$commons_head_ms" -gt "$bin_epoch" ] 2>/dev/null; then
-    commons_gap_h=$(( (commons_head_ms - bin_epoch) / 3600 ))
-    printf '  %-20s predates commons master by %sh -- shared-crate changes are not in this binary\n' \
-      "$binname" "$commons_gap_h"
-    printed=1
-  fi
+  # A PATH DEPENDENCY CROSSING A REPOSITORY BOUNDARY IS INVISIBLE TO AN
+  # OWN-REPO COMPARISON, AND IT FAILS TOWARD A FALSE ALL-CLEAR. A commit in
+  # subconscious changes a module's binary with no commit in that module's
+  # repo, so mtime-versus-its-own-history reports clean while the binary is
+  # stale. Nine of the fourteen modules link subconscious crates this way and
+  # only the commons half of the problem was checked here; the subconscious
+  # half was found by a module owner auditing a clean verdict I had given them,
+  # which is the only reason it was found at all.
+  #
+  # Both sources are checked against the same binary mtime and reported
+  # separately, because they are different repositories with different owners
+  # and "which upstream moved" is the first thing a reader needs.
+  #
+  # Only PUBLISHED consumption is safe from this: a crates.io dependency needs
+  # a publish and a lock bump to reach a consumer, so a working-tree change
+  # cannot. This check keys on the path-dependency spelling for that reason.
+  for up in commons subconscious; do
+    up_dir="$HOME/Work/Projects/CortexKit/$up"
+    grep -rqs "path *= *\"[^\"]*$up/" "$dir/Cargo.toml" "$dir"/crates/*/Cargo.toml 2>/dev/null || continue
+    # Measure the upstream's last RUNTIME commit, not its HEAD. HEAD moves on
+    # docs and CI edits, and this file's own doc commits promptly produced
+    # "predates subconscious master by 0h" against three binaries -- a check
+    # that cries wolf on its author's own prose gets ignored within a day.
+    # Restricted to crate sources, excluding tests and benches, mirroring what
+    # the own-repo leg below already does with the binary's crate closure.
+    up_head=$(cd "$up_dir" 2>/dev/null && git log -1 --format='%ct' \
+      -- 'crates/*/src/*' 'crates/*/Cargo.toml' 2>/dev/null) || continue
+    [ -n "$up_head" ] || continue
+    if [ "$up_head" -gt "$bin_epoch" ] 2>/dev/null; then
+      printf '  %-20s predates %s master by %sh -- shared-crate changes are not in this binary\n' \
+        "$binname" "$up" "$(( (up_head - bin_epoch) / 3600 ))"
+      printed=1
+    fi
+  done
 
   [ "$gap_h" -ge 6 ] || continue
 

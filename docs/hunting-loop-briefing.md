@@ -170,6 +170,7 @@ Before calling a class closed:
 | 83 | A tool refuses to open something — is the refusal the obstacle or the finding? | Retrying with a laxer flag converts a correct alarm into a silent wrong answer |
 | 84 | Right conclusion — is the mechanism behind it right too? | A wrong mechanism sends the next reader hunting for a state that never existed, even when the advice it produced was correct |
 | 85 | A fix landed upstream — which local workarounds did it just make unreachable? | Nothing fails when a workaround is superseded, so it survives as dead code wearing a safety costume |
+| 86 | Is this gate expensive enough that someone will route around it? | A gate that gets avoided is replaced by something worse and unmonitored; cost is a security property, not an ergonomic one |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3564,6 +3565,43 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## A gate expensive enough to route around
+
+Adjudicating where a permission check belongs for a new capability, the strongest
+argument turned out to be one that reads like convenience: **an agent that cannot
+cheaply glance at its own work will reach for the disruptive path instead.**
+
+That is a security argument wearing ergonomic clothes. A gate expensive enough to
+avoid **gets avoided**, and what replaces it is worse and unmonitored. Prompting
+before every read does not buy safety; it buys a workaround.
+
+It needs writing down explicitly wherever it applies, precisely because a future
+reviewer will read the cheap path as laxity and tighten it — correctly by local
+reasoning, and wrongly overall.
+
+### Put the seam on a property, not on a classification
+
+The same decision asked whether the gate should key on which subsystem a
+capability lives in, or on what the capability *does*.
+
+A subsystem boundary is a classification **someone maintains**, so every new
+capability inherits its gate from where it happened to land — which is how a
+write ends up behind a read's gate one reorganisation later. Keying on the
+action's own declared kind makes the gate follow the property, and lets anything
+that declares nothing default to the strict side.
+
+### A grant nobody could say they issued
+
+One rejected option derived the permission from ambient state — whichever
+application happened to be in front. The obvious objection is the race between
+deciding and acting. The disqualifying objection is different: **the permission
+would come from state the user does not experience as a decision.** Clicking a
+window is not consenting to it being driven.
+
+Every other option had somebody making a choice. That one produced a permission
+**nobody could later say they issued**, which rules it out independently of any
+race.
 
 ## A workaround that survives its own obsolescence
 

@@ -21,7 +21,7 @@ set -uo pipefail
 # Ordered new-name-first so the window needs no edit here, with the old name as the
 # fallback until it is gone.
 STORE=""
-for candidate in prefrontal alfonso-core; do
+for candidate in prefrontal-core prefrontal alfonso-core; do
   if [ -f "$HOME/.local/share/cortexkit/$candidate/store.db" ]; then
     STORE="$HOME/.local/share/cortexkit/$candidate/store.db"
     break
@@ -412,12 +412,13 @@ printed=0
 # whole file exists to catch.
 #
 # Only the module_id -> repo-directory step is residual, because nothing on disk
-# records it (alfonso-core lives in alfonso/, thalamus in ai-proxy/, subc-mcp in
-# subconscious/). A module whose directory this cannot resolve is REPORTED rather
-# than skipped, so the mapping going stale is visible instead of silent.
+# records it (prefrontal-core lives in prefrontal/, thalamus in ai-proxy/,
+# subc-mcp in subconscious/). A module whose directory this cannot resolve is
+# REPORTED rather than skipped, so the mapping going stale is visible instead of
+# silent -- which is how the two entries below were caught after a rename.
 module_repo() {
   case "$1" in
-    alfonso-core | prefrontal) echo alfonso ;;
+    prefrontal-core | prefrontal-routing) echo prefrontal ;;
     thalamus)     echo ai-proxy ;;
     subc-mcp)     echo subconscious ;;
     *)            echo "$1" ;;

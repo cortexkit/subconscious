@@ -148,6 +148,7 @@ Before calling a class closed:
 | 61 | Does the value you are about to publish depend on a temporary shim? | It will look verified, pass every test, and break when the shim is removed — worse than publishing nothing, which fails loudly on first use |
 | 62 | Do both ends spell the same location the same way? | A symlink makes one side report the resolved path and the other the logical one; both are correct, neither can see the other's spelling |
 | 63 | Is the survivor a survivor, or does it match everything? | A row with a NULL scope key matches every scope, and reads as evidence of a partial failure when the truth is a scope change |
+| 64 | Before calling shared infrastructure "down", did anyone succeed on it during the failure window? | One success inside the window converts an outage into contention, and the two call for opposite actions |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3461,6 +3462,50 @@ Generalises past disk: any exhausted resource whose usage only rises — memory
 held by a cache that never evicts, connections held by a pool that never reaps,
 file descriptors retained after close. **Ask whether release works before asking
 who is allocating.**
+
+## Shared infrastructure: down, or contended
+
+Three teams reported the same shared build pool as unavailable — repeated
+zero-progress failures, an annotation naming the pool, and one team's clean
+before/after boundary across an unchanged configuration. I relayed the outage
+framing myself.
+
+Then I checked my own runs: **a fully green build on the same pool, four minutes
+after another team's third consecutive failure on it.** Real work, not a vacuous
+pass — four jobs, thirteen executed steps each.
+
+One success inside the failure window is enough to refute an outage, and the
+distinction is not academic: **an outage means wait, contention means retry, and a
+per-repository limit means look at quotas.** Every team was about to take the
+first action.
+
+### Two failures that render identically
+
+My own run list looked like a matching outage — five cancelled, one failed, one
+green. It was not. The step count separates them:
+
+- **zero steps** — the job never acquired a runner. The real symptom.
+- **many steps** — the job ran and was killed when a newer commit superseded it.
+  Self-inflicted, and invisible in the interface.
+
+Both display as "cancelled". I had been pushing commits in quick succession all
+afternoon, which is exactly what triggers the second, and I nearly read my own
+normal behaviour as corroboration of someone else's outage.
+
+So the check before concluding infrastructure failure is: **does the failing job
+show zero executed steps?** If yes, it never started. If no, the annotation is
+describing something other than what stopped it.
+
+### A control from before the event
+
+The strongest self-correction came from the team that reported it. Their evidence
+included "the repository on the other runner type is green" — and they flagged it
+themselves as **not a control, because its last run predated the event by a week.**
+
+A result from before an event cannot testify about the event. Had they leaned on
+it, they would have had a false control supporting a conclusion that was itself
+unproven — two errors pointing the same way, which is the configuration hardest to
+notice.
 
 ## An absence asserted from an unfinished search
 

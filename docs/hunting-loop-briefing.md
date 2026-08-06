@@ -171,6 +171,7 @@ Before calling a class closed:
 | 84 | Right conclusion — is the mechanism behind it right too? | A wrong mechanism sends the next reader hunting for a state that never existed, even when the advice it produced was correct |
 | 85 | A fix landed upstream — which local workarounds did it just make unreachable? | Nothing fails when a workaround is superseded, so it survives as dead code wearing a safety costume |
 | 86 | Is this gate expensive enough that someone will route around it? | A gate that gets avoided is replaced by something worse and unmonitored; cost is a security property, not an ergonomic one |
+| 87 | Checking a citation in someone else's document — whose ruling is it? | Finding your own words landed there reads as independent corroboration, and the check that was supposed to catch that is what delivers it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3565,6 +3566,36 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## Your own ruling, cited back at you
+
+Adjudicating a design question from someone else's quotations of their own
+document, I disclosed that I could not read their source and asked them to correct
+me rather than take my agreement as confirmation.
+
+They checked, and their quotations were verbatim. **But one of the rulings they
+cited was mine** — sent to them earlier that day, not yet written into their
+document. So when I went looking for it in their repo to check the citation, I was
+looking for my own words. **Had I found them, I would have read them back as
+independent corroboration.**
+
+The circularity the disclosure guards against was present; it simply sat one
+citation over from where I looked. And the mechanism is nastier than ordinary
+circular reasoning: **the act of verifying is what delivers it.** A ruling that has
+travelled into someone else's document looks exactly like an independent source,
+because by then it *is* in an independent document.
+
+Two practices follow, both theirs:
+
+**Attribute a borrowed ruling where it lands.** One ruling cited once, with its
+origin recorded, rather than two mentions of the same thing that a later reader
+counts as two.
+
+**Prefer the argument that does not depend on the borrowed judgement.** The seam
+question had two supports: one resting on my judgement about a specific category,
+the other on a structural property. They adopted it on the structural one — which
+is the right move whenever support turns out to be self-referential, because it
+leaves the conclusion resting on something neither party supplied.
 
 ## A gate expensive enough to route around
 

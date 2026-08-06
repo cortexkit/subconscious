@@ -74,6 +74,20 @@ only — the worker half needs its own reviewed gate.
 
 ## Ordering, and why
 
+**Before anything: the dry-run preview is not available until the daemon
+bounces.** Tested live — the CLI carries the preview field, the running daemon
+does not, and the CLI refuses with exit 2 rather than letting an old daemon
+ignore the flag and perform a real reconciliation while the operator believes
+they previewed. That refusal is the whole reason the field exists, and this is
+the first time it has fired outside a test.
+
+So any step that opens with a preview must either move after the bounce or be
+replaced by comparing `ck module list` against the module ids in the config —
+which establishes the same thing without depending on a capability we are in the
+middle of deploying. **Compare the id sets, not counts:** a count of zero from a
+wrong pattern and a count of zero from an empty config are the same output, which
+is the same shape as the absent-config hazard the refusal guards against.
+
 0. **The credentials vault restarts first, alone, and is then excluded from the
    bounce.** Its owner ruled this rather than me: the vault is a dependency of
    several modules, so it gets its own verification and its own rollback

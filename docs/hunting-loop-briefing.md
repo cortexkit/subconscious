@@ -190,6 +190,8 @@ Before calling a class closed:
 | 103 | Your blast-radius map was wrong once — what is the chance it is complete now? | Being wrong about a map is evidence about the mapping process, not only about that map |
 | 104 | Concluding something was not retained — where would it be retained if it were? | An absence found by searching one medium is scoped to that medium; a filesystem search says nothing about a database |
 | 105 | You recovered the record — is it a document or a patch? | Applying a patch as a document silently drops everything the patch did not touch, and the result is internally consistent either way |
+| 106 | Does your producer and your consumer agree what a submission *means*? | Delta-versus-replacement disagreement destroys content while both sides behave reasonably and nothing errors |
+| 107 | Would this detector fire on healthy cases? | A signal that flags normal convergence gets switched off within a week, so partition by what the value means before thresholding it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4291,6 +4293,51 @@ And one check remains before any such reconstruction is trusted: **verify the
 patch semantics rather than assuming them.** Whole-section replacement and
 within-section deltas require different application, and getting it wrong loses
 content invisibly, because the result is internally consistent either way.
+
+## The sentence that deletes what it describes
+
+The missing-material case above had a deeper cause, found at source by the seat
+that hit it. The engine assembling these documents performs **whole-section
+replacement**. A reviewer writing *"retained verbatim except for X"* is describing
+a patch in prose — and the engine inserts that prose **as the entire section**.
+
+**The sentence announcing that content is retained is the thing that deletes it.**
+
+Measured across one round: 23,989 bytes to 5,067; 10,856 to 1,673; 8,526 to 2,643;
+4,877 to 2,896. Four sections, one round, nothing errored. Every section present,
+document internally consistent, round reported success.
+
+It is invisible by construction because **the producer and the consumer disagree
+about what a submission means, and neither can detect the disagreement.** The
+reviewer writes a delta, since restating an unchanged 24KB section every round is
+absurd. The engine treats every submission as complete. Both behaviours are
+reasonable alone. The output is always a valid-looking document, so there is
+nothing to notice — only a specification that thins each round while appearing to
+converge.
+
+The structural fix is that **a submission must declare whether it is a replacement
+or a delta**, rather than one side assuming and the other intending.
+
+### A detector that fires on healthy cases
+
+My first suggestion was a size-drop assertion on every section. Running the census
+showed why that is wrong.
+
+Across 82 campaigns and 339 rounds, 18 sections lost more than half their content
+in one round — and **the hits split into two populations.** Sections named for open
+questions and unresolved assumptions collapsing toward zero is what **success**
+looks like: a specification converging. Normative sections — acceptance criteria,
+interfaces, schemas, plans — shrinking is the defect, because a specification does
+not converge by having fewer requirements.
+
+A blanket threshold fires on every healthy campaign and **gets switched off within
+a week.** The rule has to be *a normative section must not shrink without an
+explicit cut*, not *no section may shrink*.
+
+The census also corrected my own escalation. I had reported this as silently
+corrupting every campaign; 10 of 82 show any hit, and only 6 involve a normative
+section. **I had generalised from the worst instance rather than the typical one**
+— which is what finding a severe case does to your estimate of its frequency.
 
 ### A live surface inside a frozen set
 

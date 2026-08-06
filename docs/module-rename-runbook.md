@@ -118,6 +118,21 @@ name is correct. One ending in a long hex string was derived by the signing tool
 because no identifier was given. One carrying an *underscore* and a short hash is
 the build tool's own linker-applied identity — never signed by anyone.
 
+The middle form is decidable by inspection, which makes the sweep cheap. Strip the
+fixed prefix and the remainder is the binary's own build identifier with its
+separators removed — verified across every instance on this machine. So a one-line
+read proves the identity moves with every build, without rebuilding anything.
+
+The third form needs a real experiment, because a hash suffix is not always
+build-derived: one such identity on this fleet proved **stable** across two
+genuinely different builds. Build twice at different commits and compare.
+
+**Which identity-bound resources matter is per-module.** Screen capture and
+accessibility are the visible ones, but keychain access is identity-bound too, so
+a module that reads stored credentials is exposed by a moving identity even
+though it touches neither. Ask which of these the module actually uses rather than
+checking a fixed list.
+
 Watch for one combination in particular: **a test binary carrying production's
 name in the derived form.** It is not colliding today only because it is
 unsigned — the derived suffix keeps it distinct by accident. The moment someone

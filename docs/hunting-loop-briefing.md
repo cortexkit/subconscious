@@ -127,6 +127,7 @@ Before calling a class closed:
 | 40 | Is the check's passing state also its null state? | Then it cannot detect the null — doing nothing satisfies it, so it reports success across a no-op |
 | 41 | Does an error return skip the readback that decides whether the mutation landed? | Propagating the error abandons the only step that can tell "failed" from "succeeded, reply lost" — and every retry then fails correctly, forever |
 | 42 | Did you change an artifact after someone verified it, and republish the new value? | A fix applied after verification invalidates the verification, and the more thorough the original check the more expensive the silent invalidation |
+| 43 | Is a broken state available right now that you have been unable to test against? | The failing direction of a check is only testable while something is genuinely broken — spend an outage on the measurement, not only the recovery |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

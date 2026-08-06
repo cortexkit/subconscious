@@ -168,9 +168,13 @@ Rust-native GPUI shell that links the client SDK directly with no webview
 boundary; an iOS companion reaches the home daemon over the federation
 transport.
 
-**subc-chat** — the Swift proving ground for Cortex: live sessions, rooms,
-asks with notifications, the Board tab, observability into agent lanes
-(consults, background tasks, token metrics).
+**gpui-chat** — the desktop surface: live sessions, rooms, asks with
+notifications, the Board tab, observability into agent lanes (consults,
+background tasks, token metrics). Rust and GPUI, linking the Rust client
+directly with no wire or FFI boundary. It replaced a SwiftUI app of the same
+shape, which was deleted once the port reached parity — the Swift package
+remains as the SDK the iOS app builds on (`SubcClient`, `SubcFed`, and the
+shared surface models), which is why that directory still exists.
 
 **brocatui** (building) — the terminal harness: full-transcript virtualized
 scrollback, driving broca sessions over the wire.

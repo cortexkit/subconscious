@@ -117,6 +117,7 @@ Before calling a class closed:
 | 30 | Having tightened one rule of a test double, did you enumerate its others? | A double is a set of independent permissions; fixing one teaches nothing about the rest, and each remaining one certifies a different broken client |
 | 31 | Did you verify the target, or only properties of the target you assumed? | Every property can be true of the wrong endpoint; a check whose output omits what it was pointed at cannot expose a wrong target |
 | 32 | Does your change break an invariant that nothing currently reads? | No test fails and no alarm fires, because the only thing that would object does not exist yet — the cost lands on whoever writes the first reader |
+| 33 | When a filter matches nothing, does the unmatched input flow through as data? | A filter that fails open does not merely lose rows — it turns headers and framing into records, and whether that reads as loud or silent is an accident of content |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3158,6 +3159,38 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A filter that matches nothing, and what happens to the rest
+
+Two people wrote the same check within an hour — compare the configured module
+set against the running one — and both filters failed to match. The outcomes were
+opposite, and the difference was luck.
+
+The first counted configured modules with a pattern that matched none of them and
+reported **zero**, against fourteen actually running. The second filtered
+command output for a header token that did not exist, so the header row itself
+survived into the data and the check reported **a module named `id`** that does
+not exist.
+
+So a filter that fails open does not merely lose rows: **the input's own
+furniture — headers, separators, framing — becomes records.** Losing rows tends
+toward a false clean; inventing them tends toward a false alarm. Which one you
+get is decided by what the framing happens to say, not by anything you control.
+
+The second case was safe by accident. A phantom named `id` is loud enough to
+investigate. Had the header token been one the filter *did* match, the identical
+defect would have silently dropped a real module and reported agreement.
+
+The fix is to stop hoping the filter still matches: **assert the shape before
+parsing it.** Requiring the header to be a specific literal converts a format
+change from "produces wrong data" into "fails at the assertion". That is the
+difference between a parser and a guess.
+
+A companion worth copying from the same exchange: the procedure runs that check
+twice — once expecting agreement, and again after the config edit **expecting a
+specific disagreement**. One instrument, two invocations, opposite expected
+verdicts. A check that can only ever return agreement is caught by construction,
+because the second run demands it say something else.
 
 ## Breaking an invariant nothing reads yet
 

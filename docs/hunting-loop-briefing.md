@@ -118,6 +118,7 @@ Before calling a class closed:
 | 31 | Did you verify the target, or only properties of the target you assumed? | Every property can be true of the wrong endpoint; a check whose output omits what it was pointed at cannot expose a wrong target |
 | 32 | Does your change break an invariant that nothing currently reads? | No test fails and no alarm fires, because the only thing that would object does not exist yet — the cost lands on whoever writes the first reader |
 | 33 | When a filter matches nothing, does the unmatched input flow through as data? | A filter that fails open does not merely lose rows — it turns headers and framing into records, and whether that reads as loud or silent is an accident of content |
+| 34 | Does your detector distinguish the *causes* of the state it detects, or only the state? | A correct detector fires correctly on an event it cannot tell apart from another — absence cannot separate deleted from moved, and the consequence lands on the benign cause |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3159,6 +3160,33 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A correct detector firing on an ambiguous event
+
+A reaper kills background work once its project root is confirmed absent, after a
+two-sweep check. The mechanism is right and the check is careful. But **a rename
+makes the old path absent while the work keeps running fine** through its open
+directory handle at the new location — so the reaper correctly detects absence and
+kills healthy work.
+
+This is a third category alongside the two usually considered. Not a **stale**
+read, where old data is served as current. Not a **missing** read, which is
+visible and self-correcting. This is a **correct detection of a state whose
+causes it cannot distinguish**: deleted and moved look identical to anything that
+only checks presence.
+
+The question to ask of any detector: does it distinguish the *causes* of the
+state it detects, or only the state? If only the state, then every cause sharing
+that state inherits the consequence — and the consequence was designed for the
+worst cause.
+
+The options are to disambiguate (watch for the move rather than the absence),
+soften the consequence, or **accept it and record the constraint beside the
+mechanism**. The third is legitimate when disambiguation is expensive, but only
+if written where the next reader arrives: at the detection site, saying which
+benign cause is being sacrificed and what to avoid doing as a result. Otherwise
+it is indistinguishable from an oversight, and the next person to hit it
+reasonably files it as a bug.
 
 ## A filter that matches nothing, and what happens to the rest
 

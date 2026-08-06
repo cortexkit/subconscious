@@ -169,6 +169,7 @@ Before calling a class closed:
 | 82 | How much of each file did your scan actually read? | A scan reporting on a third of a file is not a sweep with a caveat, it is a different question wearing the same name |
 | 83 | A tool refuses to open something — is the refusal the obstacle or the finding? | Retrying with a laxer flag converts a correct alarm into a silent wrong answer |
 | 84 | Right conclusion — is the mechanism behind it right too? | A wrong mechanism sends the next reader hunting for a state that never existed, even when the advice it produced was correct |
+| 85 | A fix landed upstream — which local workarounds did it just make unreachable? | Nothing fails when a workaround is superseded, so it survives as dead code wearing a safety costume |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3563,6 +3564,38 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## A workaround that survives its own obsolescence
+
+A missing conformance meant errors reached one client as a dump of internal
+structure rather than a sentence. That client wrote a local repair, and reported
+the gap rather than keeping the fix to itself — correctly, since a client-side
+workaround only helps the clients that write one.
+
+When the fix landed at the source, they found **two** local repairs superseded, not
+one. The second was a mapping from bare status words to friendly sentences. It
+matched those words *whole*, deliberately, so richer messages kept their detail —
+and the new descriptions render those same cases as full sentences, so **the match
+can never succeed again.**
+
+Nothing failed. Nothing warned. A rule that no input can reach still reads to the
+next person as an active safeguard, which is worse than absent code because it is
+trusted.
+
+**Its test would have passed forever**, and the reason is the shape this family
+keeps producing: the test *constructed* the bare status word itself rather than
+obtaining one from the system. So it proved the function worked and never that
+anything could reach it. It took an unrelated upstream fix to expose it.
+
+The generalisation is the part worth keeping: **a workaround for a missing
+upstream capability does not merely fail to help others — it survives its own
+obsolescence silently**, because nothing breaks when the real fix arrives. That is
+a second, independent reason to report a gap rather than patch around it.
+
+Worth copying too: they verified the upstream fix **before** deleting their
+workaround, by bypassing it and exercising the real path. Deleting first and
+checking after would have proven nothing about which of the two was doing the
+work.
 
 ## A wrong mechanism behind a right conclusion
 

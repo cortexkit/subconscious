@@ -81,11 +81,22 @@ never examined, because nobody re-derives a number that agrees with them.
    **That refusal is ambiguous, and the two readings are opposites.** It means
    either *this copy is missing its most recent writes* or *this store was shut
    down cleanly* — a clean shutdown folds the sidecar into the main file and
-   removes it, leaving nothing for a read-only connection to attach to. The
-   discriminator is whether the service was stopped first, which is knowledge the
-   operator has and the check does not. Expect it after a deliberate stop; treat
-   it as a finding only on a copy taken from a running service. Resolve it on a
-   throwaway copy rather than on the original or the backup. Opened read-write it opens happily and answers every query —
+   removes it, leaving nothing for a read-only connection to attach to. Measured
+   during one migration: the directory went from four files to two and the main
+   file grew by almost exactly the sidecar's size.
+
+   So **the flag is the right default for reading a live store, and proves nothing
+   about a stopped one.** At the verification step, the counts do the work: the
+   minted identifier proves it is the same store, and a continuously growing table
+   at or above its recorded floor proves it kept its tail — because a partial copy
+   comes back *short* while every other check passes.
+
+   The flaw in the earlier wording is worth keeping as a caution: it was derived
+   against a running store, where the sidecar always exists, and applied at a step
+   that only ever runs against a stopped one. **A rule validated in one state and
+   applied in another was never true where it was written to be used.** Followed
+   literally it would have called a successful migration a data loss, at exactly
+   the moment when the natural response is to undo correct work. Opened read-write it opens happily and answers every query —
    silently short. The flag converts a silent wrong answer into a hard error.
 
    So **the error is the finding.** `unable to open database file` on a copy you

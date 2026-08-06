@@ -164,6 +164,8 @@ Before calling a class closed:
 | 77 | Who does this fix arm? | Applying a rule to something already carrying a wrong value converts a dormant defect into a live one; the trigger is the remediation |
 | 78 | "Fixed" — in the place it was *made* true, or the place it must *be* true? | Merged is not deployed, published is not consumed, written is not read; two parties reading the same correct-but-wrong-scoped source will agree |
 | 79 | Handing something over — are you publishing values that *discriminate* it, or values that *describe* it? | A hash describes; an identity discriminates. Publishing the discriminating value is what lets the author find their own error first |
+| 80 | Two people report the same metric and disagree — are they measuring the same column? | Two correct measurements of different quantities wearing one name look exactly like a defect |
+| 81 | Widening a reply shape — how long until every consumer can parse it? | A service redeploys in minutes and its consumers on restart, so a widened reply is a narrowing at the far end; make it opt-in |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3558,6 +3560,40 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## Two correct measurements wearing one name
+
+Verifying someone else's migration, I compared their reported counts against a
+baseline I had recorded beforehand. Two numbers disagreed.
+
+Neither was wrong. They had counted one column; I had counted a different one, and
+**both are reasonably described as "distinct scopes."** One is the target's
+location, the other the owner's — and only the second is what a lookup keys on.
+Confirming their column reproduced their number exactly.
+
+A disagreement between two careful parties is worth one question before it becomes
+a defect report: **are we measuring the same quantity?** Two correct measurements
+of different things wearing one name look exactly like an error.
+
+What kept it cheap was having written the baseline down rather than recalling it,
+which let me enumerate **which** scopes had gone and confirm each was slated for
+removal. A decrease is acceptable only if you can name every member of it.
+
+A third number I could not confirm at all — they reported a row count four lower
+than mine, almost certainly messages delivered in between, including the exchange
+itself. I reported what I measured rather than reconciling to theirs, on the rule
+that a count taken from a live system is a floor and not an equality.
+
+### Widening a reply is narrowing at the far end
+
+The same deployment broke every running consumer by adding a field to a reply.
+The service redeploys in minutes; its consumers reload only when their host
+restarts. **So a widened reply arrives at consumers that cannot parse it**, and the
+change that looks additive at the source is a breaking change at the destination.
+
+The correct default is opt-in: new callers request the richer shape, existing ones
+keep what they had. It fits the general ordering rule — the side that refuses
+earlier deploys first, and a consumer that cannot parse is refusing.
 
 ## Publish the value that discriminates, not the one that describes
 

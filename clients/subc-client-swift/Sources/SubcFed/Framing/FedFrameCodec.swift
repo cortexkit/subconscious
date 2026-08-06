@@ -93,8 +93,40 @@ public struct FedFrame: Sendable, Equatable {
     }
 
     /// The error code of a terminal `call_frame`, absent on success kinds.
+    ///
+    /// A `call_frame` error carries its code in the BODY (`{"code":..,"message":..}`),
+    /// not the header. `bye` and `goodbye` frames put a `code` in the header, and
+    /// reading that spelling here returned nil for every module error — which
+    /// silently classified them as unsettleable rather than as refusals. The two
+    /// frame families genuinely differ, so each is addressed by its own accessor
+    /// and neither field is read by literal outside this type.
     public var terminalCode: String? {
+        errorBodyField("code")
+    }
+
+    /// The human-readable reason from a terminal `call_frame` error body.
+    ///
+    /// The code says which refusal; the message says what to do about it. A caller
+    /// showing this to a person wants the message.
+    public var terminalMessage: String? {
+        errorBodyField("message")
+    }
+
+    /// The code of a `bye`/`goodbye` frame, which genuinely lives in the header.
+    public var byeCode: String? {
         guard case .string(let value) = header["code"] else { return nil }
+        return value
+    }
+
+    private func errorBodyField(_ name: String) -> String? {
+        guard !body.isEmpty,
+              let parsed = try? JSONSerialization.jsonObject(with: body),
+              let object = parsed as? [String: Any],
+              let value = object[name] as? String,
+              !value.isEmpty
+        else {
+            return nil
+        }
         return value
     }
 }

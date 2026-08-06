@@ -313,6 +313,25 @@ final class FedAuditHardeningTests: XCTestCase {
     /// module's reason never surfaces anywhere. The defect was live for weeks on
     /// a phone client, where every remote refusal displayed as "lost the
     /// connection" regardless of what the module had actually said.
+    /// The wire puts a call_frame error's code and message in the BODY. Reading
+    /// them from the header — where `bye` frames genuinely carry a code — yields
+    /// nil for every module error, so the caller learns only that something
+    /// refused. This asserts the accessors read the body.
+    func testTerminalErrorCodeAndMessageComeFromTheBody() throws {
+        let frame = FedFrame(
+            type: "call_frame",
+            fields: ["k": .string("error"), "last": .bool(true)],
+            body: Data(#"{"code":"fed_not_exposed","message":"tool not exposed"}"#.utf8)
+        )
+        XCTAssertEqual(frame.terminalCode, "fed_not_exposed")
+        XCTAssertEqual(frame.terminalMessage, "tool not exposed")
+        // A bye frame's code lives in the header and must not be read as a
+        // terminal code, or the two frame families collapse into one spelling.
+        let bye = FedFrame(type: "bye", fields: ["code": .string("fed_goodbye")])
+        XCTAssertEqual(bye.byeCode, "fed_goodbye")
+        XCTAssertNil(bye.terminalCode)
+    }
+
     func testModuleErrorOnPureQueryCarriesTheModuleCode() async throws {
         let store = FedMemoryStateStore()
         _ = try await store.open(localPublicKey: localKey)
@@ -350,12 +369,16 @@ final class FedAuditHardeningTests: XCTestCase {
                 body: Data(),
                 bodyOmitted: false,
                 errorCode: "not_a_member",
+                errorMessage: "you are not a member of this room",
                 isMutation: false,
                 permit: admitted.permit
             )
             XCTFail("a module error must reach the caller")
         } catch let error as FedFailure {
-            XCTAssertEqual(error, .moduleError(code: "not_a_member"))
+            XCTAssertEqual(
+                error,
+                .moduleError(code: "not_a_member", message: "you are not a member of this room")
+            )
             XCTAssertNotEqual(error, .disconnected)
         }
     }

@@ -613,6 +613,7 @@ public actor SubcFedClient {
             // every mutation permanently unsettled.
             let kind = frame.terminalKind ?? "error"
             let code = frame.terminalCode
+            let message = frame.terminalMessage
             do {
                 let body = try await session.engine.handleInboundTerminal(
                     effect: effect,
@@ -620,6 +621,7 @@ public actor SubcFedClient {
                     body: frame.body,
                     bodyOmitted: frame.body.isEmpty,
                     errorCode: code,
+                    errorMessage: message,
                     isMutation: pending.isMutation,
                     permit: pending.permit
                 )

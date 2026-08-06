@@ -146,6 +146,8 @@ Before calling a class closed:
 | 59 | Could your "it survived" check pass by luck? | A count that may legitimately be zero proves nothing; verify an identity only the original could carry |
 | 60 | Did you audit the component, or also whoever *lives in* it? | A service and the agent operating it are different subjects; asking an owner "is your state safe" reliably gets the component answer |
 | 61 | Does the value you are about to publish depend on a temporary shim? | It will look verified, pass every test, and break when the shim is removed — worse than publishing nothing, which fails loudly on first use |
+| 62 | Do both ends spell the same location the same way? | A symlink makes one side report the resolved path and the other the logical one; both are correct, neither can see the other's spelling |
+| 63 | Is the survivor a survivor, or does it match everything? | A row with a NULL scope key matches every scope, and reads as evidence of a partial failure when the truth is a scope change |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3281,6 +3283,53 @@ unable to run the very commands needed to diagnose it.
 
 **Ask the resident to verify their own footing as a separate question.** Same
 rename, different subject, different answer.
+
+### The shim repairs one faculty and breaks another
+
+The compatibility link that restored the resident's tools then broke their
+**incoming messages**, and the mechanism is worth reading carefully because every
+value involved was correct.
+
+Their session resolves the link and reports its location as the *new* path. Every
+peer that writes to them still records the *old* one. Both strings name the same
+directory. Neither side can detect the other's spelling. So messages were stored
+under one key and queried under the other: the wake arrived, the notification
+preview arrived, and the body was unreachable. **Their inbox reported empty.**
+
+The same schema property hid four of their five contacts — rows scoped by
+location, written under the old spelling, invisible to a query under the new one.
+**Not deleted. Invisible.**
+
+Three things generalise:
+
+**A resolved-versus-logical path disagreement is undetectable from either end.**
+Storing a canonical form at write time — fully resolved, links followed — removes
+the class rather than mitigating it.
+
+**Two surfaces keyed on the same value independently break separately.** The
+resident repaired their contact list and their inbox stayed blind, which correctly
+proved the two were not one lookup. Repairing one tells you nothing about the
+other.
+
+**Reporting "empty" for a scope with no rows cannot distinguish no-mail from
+wrong-scope.** A count of items addressed to this recipient *regardless of scope*
+makes the difference legible immediately: 699 waiting under a key you are not
+reading is a diagnosis; "empty" is not.
+
+### The survivor that matches everything
+
+One contact survived while four vanished, stamped from weeks earlier. That
+asymmetry drove the diagnosis toward "some state moved and some did not" — a
+partial failure, which is a much harder thing to reason about than a scope change.
+
+The survivor had been written before the scoping column was populated, so its key
+was **NULL, and a NULL scope matches every scope.** It had not survived anything;
+it was never scoped in the first place.
+
+The resident's own reasoning was sound and the conclusion was one step too far:
+*"a fresh store would not hold a 34-day-old entry"* is correct, and does not imply
+a partition. **A legacy row with an empty key is indistinguishable from a row that
+survived a migration**, and it will always point at the more alarming explanation.
 
 ### The shim that quietly becomes load-bearing
 

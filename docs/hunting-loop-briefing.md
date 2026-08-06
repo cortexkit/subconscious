@@ -178,6 +178,8 @@ Before calling a class closed:
 | 91 | Which credits in this record favour *you*? | Nobody re-reads a line that flatters them, so those are the ones no reader is motivated to challenge — including you |
 | 92 | Blocked on a decision — half-build it with a default, or record the gap? | A provisional default becomes the contract by accident: it ships, something depends on it, and the decision nobody made is inherited by everybody |
 | 93 | Several candidates match — does your code pick one? | Any tiebreak rule is a choice derived from ambient state that nobody made; refuse and say how many matched |
+| 94 | Two people asked one decision — is there exactly one open request? | Answering one and not the other leaves each side proceeding on a different half-answer, both believing it settled |
+| 95 | Does every option in this choice behave differently? | An option with no distinct behaviour pads a decision without informing it, and makes a binary read as carefully considered |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3750,6 +3752,27 @@ matched and enough to tell them apart.
 
 A refusal here is honest and rare. A silent pick is a wrong target nobody can
 audit afterwards.
+
+### One decision, two requests
+
+We both escalated the same question independently, minutes apart. They spotted it
+and collapsed the pair.
+
+Worse than redundant: **the answerer could reply to one and not the other, and
+each side would proceed on a different half-answer, both believing it settled.** A
+split that looks like agreement from both ends.
+
+Their rule for which survives is the one to keep generally: **the request sits
+with whoever implements the answer.** That removes a relay hop between the
+decision and the code embodying it — and a decision that has to travel from
+answerer to implementer through a third party is one restatement away from
+drifting.
+
+One more thing fell out of merging them. Their version had offered three options
+where one had **no distinct behaviour** from another. **An option that changes
+nothing pads a decision without informing it**, and is worse than absent: a
+three-way choice reads as more carefully considered than a binary, so the answerer
+does work that cannot affect the outcome.
 
 ### Splitting a decision by who it belongs to
 

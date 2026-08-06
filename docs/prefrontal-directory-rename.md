@@ -29,21 +29,51 @@ only displayed.
 That leaves **1066 rows of genuinely live state**, which is a small, bounded
 update rather than the migration the raw count suggests.
 
-## What is still unknown
+## The code-search caches survive the rename
 
-The code-search module keeps 1957 per-root cache directories under 16-character
-hashed names. **Whether that name derives from the absolute path is unresolved** —
-md5 and truncated sha256 of the path both fail to match, so the mapping is
-something else. Its owner has the question.
+Resolved by their owner and verified here. The 16-character directory names are
+keyed on **repository identity — the set of root commits — not the path**, which
+is why hashing the path never matched. That repository has three root commits
+(it was assembled from several histories), and both `index/be627d40119a995e` and
+the matching callgraph files exist on disk.
 
-Two outcomes: if the key is path-derived, the rename orphans that root's index
-and callgraph and the next attach pays a cold rebuild — acceptable if expected.
-If it derives from a repo identity, the rename costs nothing there.
+So the search index, callgraph, and semantic embeddings **carry over untouched**:
+renaming a directory does not change root commits. The path-to-key memo simply
+misses under the new name, re-derives from git once, and lands on the same key.
 
-The answer that would matter most is a third one: **anything that goes stale
-rather than simply missing.** A cold miss is visible and self-correcting; a stale
-hit is the shape that had a module serving an eleven-day-old build while every
-path-derived check reported it current.
+This falls out of a property built for something else — repo-identity keying is
+what lets temporary worktrees at different paths share one set of artifacts.
+Rename-survival is a free consequence, which is better than a feature, because
+nothing has to remember it applies.
+
+Only the per-checkout code-health caches are path-keyed by design. They orphan
+and rebuild in the background in minutes.
+
+**Nothing goes stale** — path-keyed state misses cold rather than serving old
+data under the new name.
+
+### Two sequencing constraints, both from the same owner
+
+**Rename with the module down.** Its artifact lease records the checkout path and
+a process id. Rename under a live daemon and the renamed checkout looks like
+another live process owning the artifact, so it comes up borrow-only until
+reclaim. With the daemon stopped the recorded process is dead and reclaim is
+clean.
+
+**Rename with no background tasks running against that root.** A newly landed
+behaviour kills surviving tasks once a root is confirmed absent — and a rename
+makes the old path absent while running tasks keep working through their open
+directory handles.
+
+That second one is a category worth naming: not stale, not missing, but **a
+correct absence detection firing on a path that moved rather than vanished.** The
+mechanism is right; the event is ambiguous between two causes, and a rename is
+indistinguishable from a deletion to anything that only checks presence.
+
+Both constraints are satisfied by doing the move while the fleet is down — which
+**changes the recommendation**: the filesystem move wants a window rather than
+wanting to avoid one. Just not the same window as the module-id flip, whose
+rollback story should not be entangled with a directory move.
 
 ## Sequence, once that is answered
 

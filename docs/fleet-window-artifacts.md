@@ -70,6 +70,38 @@ inode the live process is executing differs from the inode now on disk.
 daemon, MCP gateway, backups, context, connectors (two binaries), and the two
 executive binaries staged by their owner.
 
+### Sign with a stable identifier
+
+Ad-hoc signing derives the signature identifier from a **content hash**, so every
+rebuild produces a different one. The operating system binds privacy grants
+(screen capture, accessibility) to that identifier — and it attributes a grant to
+the **responsible process**, which for every supervised module is the daemon.
+
+So replacing the daemon binary silently revokes screen capture **for the whole
+fleet at once**: no restart required, no prompt, no error, and the capture
+service does not allow prompting, so nothing tells the user. It cannot self-heal
+by restarting, because a fresh process from the new binary carries the new
+identifier and the grant names the old one. The only symptom is a capability that
+quietly stops working.
+
+Measured today: replacing the daemon at 12:01 changed its identifier from
+`ck-subc-55554944d4d6…` to `ck-subc-55554944fe92…`, and a module that captured a
+window successfully at 11:00 was refused at 14:14 — with the daemon process never
+having restarted.
+
+**The fix is to pin the identifier at signing time** rather than letting it derive
+from content:
+
+    codesign --force --sign - --identifier ck-subc /path/to/ck-subc
+
+Verified invariant: the same identifier results from entirely different bytes, so
+it survives every future rebuild. All staged binaries now carry their own name as
+identifier, and each still executes after re-signing.
+
+This costs **one** re-grant — the current grant is already invalid from the 12:01
+replacement — and removes the class permanently. Without it, every release
+revokes the fleet's capture permission again.
+
 ### Verifying a signed artifact
 
 Signing rewrites the binary, so **a staged file can never match the source hash

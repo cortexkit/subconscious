@@ -175,6 +175,7 @@ Before calling a class closed:
 | 88 | Does this identifier stay fixed while the content it names can change? | A correct replay guard then reads a content change as a replay attempt, and refuses the delivery forever |
 | 89 | Adding or changing a rendering — who is reading the old one? | A broken parse fails; a broken match just stops matching, so the quality loss is silent and only the author could have known a better answer existed |
 | 90 | Does the attribution still name the same party after being passed back? | Attribution survives one hop and degrades on the second; verify against the original message, not the most recent restatement |
+| 91 | Which credits in this record favour *you*? | Nobody re-reads a line that flatters them, so those are the ones no reader is motivated to challenge — including you |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3680,6 +3681,29 @@ restatement of it. That is what caught it.
 My share was the larger one: I took a restatement of my own words at face value
 when going back to the original was a single step. **The description of a record
 is not the record**, and that is precisely the hop where this fails.
+
+### Check the credits that favour you first
+
+A third round narrowed it again, and was raised by the party the error favoured.
+My written record credited them with rejecting an option — half right. They had
+raised it and rejected it, but on a *mechanism* objection they themselves had
+conceded was contingent; the argument that disqualified it was mine.
+
+Their observation is the most useful of the three: **over-attribution to yourself
+is the hardest kind to catch, because the incentive to check runs the wrong way.**
+The earlier inversions were found because being credited with something you know
+is not yours is uncomfortable, and discomfort prompts a check. **Nobody re-reads a
+line that flatters them.**
+
+So the instruction is narrower than "verify attributions": **verify the ones in
+your own favour first.** Those are the ones no reader is motivated to challenge,
+including the beneficiary.
+
+The asymmetry showed up across every instance that evening: each error was caught
+by **the party it favoured**, never by the party it cost. The beneficiary is
+simultaneously the only one with the information to spot it and the only one with
+no reason to look, which makes catching it a deliberate act rather than a
+byproduct of care.
 
 Two practices follow, both theirs:
 

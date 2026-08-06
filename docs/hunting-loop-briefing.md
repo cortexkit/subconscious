@@ -120,6 +120,7 @@ Before calling a class closed:
 | 33 | When a filter matches nothing, does the unmatched input flow through as data? | A filter that fails open does not merely lose rows — it turns headers and framing into records, and whether that reads as loud or silent is an accident of content |
 | 34 | Does your detector distinguish the *causes* of the state it detects, or only the state? | A correct detector fires correctly on an event it cannot tell apart from another — absence cannot separate deleted from moved, and the consequence lands on the benign cause |
 | 35 | Does an await inside a select arm stop the other arms being polled? | The loop has left the select, so a cheaper outcome arriving on another arm waits out the expensive one's full timeout |
+| 36 | Before reporting evidence missing, did you check the tools you already run? | An absence found by searching the wrong kind of store is a fact about the search; your own monitoring may already read the thing you are about to escalate |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

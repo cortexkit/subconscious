@@ -145,6 +145,7 @@ Before calling a class closed:
 | 58 | Is the state keyed on the thing you are renaming a *cache* or a *fence*? | A lost cache announces itself as slowness; a lost fence reports a clean start, and by the time it is visible the irreversible act has happened |
 | 59 | Could your "it survived" check pass by luck? | A count that may legitimately be zero proves nothing; verify an identity only the original could carry |
 | 60 | Did you audit the component, or also whoever *lives in* it? | A service and the agent operating it are different subjects; asking an owner "is your state safe" reliably gets the component answer |
+| 61 | Does the value you are about to publish depend on a temporary shim? | It will look verified, pass every test, and break when the shim is removed — worse than publishing nothing, which fails loudly on first use |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3280,6 +3281,29 @@ unable to run the very commands needed to diagnose it.
 
 **Ask the resident to verify their own footing as a separate question.** Same
 rename, different subject, different answer.
+
+### The shim that quietly becomes load-bearing
+
+The same person then corrected their own advice, having lived through it: the
+compatibility link is right and **insufficient**. A link created ahead of the move
+keeps the resident alive, but leaves it bound to a path that is now a shim —
+functional, and quietly wrong in a way that surfaces only when someone tidies up.
+
+So the procedure is three steps, not two: rename, link, **restart the resident so
+it re-binds to the real path**, and only then remove the link.
+
+They also declined to hand over their identifier for broadcast, which was the
+sharper call. Their session was still bound to the old path — the link was what
+made it resolve — so publishing that identifier would have put a value into every
+registry in the fleet **that works only while the shim exists.** It would have
+looked verified, passed every test, and broken silently the moment the shim came
+out. Strictly worse than publishing nothing: a missing entry fails loudly on first
+use, while a shim-dependent one fails weeks later with no proximate cause and
+nobody remembering the link was load-bearing.
+
+That reordering matters generally: **the restart is not cleanup, it is a
+dependency.** Everything downstream — the identifier, the broadcast, the link's
+removal — gates on it.
 
 One thing went right and is worth copying: **the failure was loud.** The refusal
 named the path, the condition, and the likely cause, so it cost minutes. Every

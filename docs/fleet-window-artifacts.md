@@ -78,6 +78,24 @@ wrong file, and a match does not imply signing was skipped — which is why the
 changed one was confirmed by marker instead, reading 1 in the staged file and 0
 in its own backup.
 
+## A moving branch tip is not a stale artifact
+
+Three times during preparation an owner reported their tip had moved after giving
+me a hash — a shell script, a test module, a comment. Each time the right action
+was **do not rebuild**, and it is worth stating why, because the instinct runs the
+other way.
+
+A rebuild from effectively identical source produces **different bytes**: build
+paths and timestamps land in the binary. So refreshing an artifact to match a
+moved tip trades a delta you can reason about (a comment cannot reach a binary)
+for a hash you must re-verify from nothing, and discards the provenance you
+already established.
+
+So the ledger records two commits per module where they differ: the one the
+binary was **built from**, and the one that **merges**. Without that, a later
+reader diffs the tip against the deployed binary, finds commits that never
+shipped, and either re-verifies everything or concludes the deploy is stale.
+
 ## Acceptance
 
 Per module, by its owner, and **every one includes a mutating call**. A

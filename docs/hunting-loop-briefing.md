@@ -133,9 +133,9 @@ Before calling a class closed:
 | 46 | Did anything verify the *destination*, or only the artifact? | Identity checks answer "is this the right file" and say nothing about "does the consumer read from here" — two directories, one filename, and every check passes |
 | 47 | When two careful people disagree on a fact, are they describing the same object? | Both measurements can be correct about different things; the ambiguity hides in the definite article, not in the reading |
 | 48 | Does the assertion bound a duration, or prove the mechanism by contrast? | A wall-clock bound is a property of the run, not the code — it fails once, under load, when a false alarm is most expensive |
+| 49 | Once the live symptom is fixed, is a test the only remaining witness to the defect? | Then that test must be proven red against the pre-fix code, or it is indistinguishable from coverage and quietly retires the finding |
 | 50 | Do sibling arms of the same dispatch agree on how they match? | Each arm is defensible read alone and wrong beside its neighbours — a diff shows one arm, so review structurally cannot see it |
 | 51 | Did you mutate toward the mistake a future fixer would make, not only toward the original bug? | The plausible wrong fix is the one a green suite blesses |
-| 49 | Once the live symptom is fixed, is a test the only remaining witness to the defect? | Then that test must be proven red against the pre-fix code, or it is indistinguishable from coverage and quietly retires the finding |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

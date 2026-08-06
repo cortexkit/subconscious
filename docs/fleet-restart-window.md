@@ -1,0 +1,102 @@
+# Fleet restart window — plan
+
+Written 2026-08-06. Everything below was measured from the running fleet and the
+repositories on this machine, not recalled.
+
+## Why one window
+
+Thirteen of fourteen supervised binaries are behind their masters, most by
+250-300 hours. That is not neglect: every restart of a supervised module has been
+held for the owner's approval, so the backlog is the boundary working as
+intended. It does mean the cheapest way to clear it is one coordinated window
+rather than fourteen individual ones.
+
+Two data migrations and one module rename also need doing, and both migrations
+want the same quiescent state a restart already produces.
+
+## Measured state
+
+Supervised binaries behind their own master:
+
+| binary | behind | unshipped runtime files |
+|---|---|---|
+| `ck-subc-mcp` | 313h | 17 |
+| `ck-mc` | 287h | 3 |
+| `ck-callosum` | 281h | 13 |
+| `ck-plexus` | 272h | 15 |
+| `ck-aft` | 270h | 32 |
+| `ck-engram` | 263h | 8 |
+| `ck-credentials` | 436h | 5 |
+| `ck-thalamus` | 54h | 18 |
+| `ck-subc` (daemon) | 264h | 12 |
+
+Additionally behind the shared `commons` crates, which carry the store-permission
+fix that creates database files `0600` rather than world-readable: `ck-astrocyte`,
+`ck-credentials`, `ck-engram`, `ck-mc`, `ck-plexus`, `ck-callosum`,
+`ck-subc-mcp`, `ck-thalamus`. **Those get the fix for free from any rebuild** —
+no separate step, which is why store permissions is not its own line item below.
+
+Non-supervised binaries also stale and worth deciding on rather than rebuilding
+by reflex: `broca-session`, `ck`, `ck-account`, `ck-plexus-admin`, `subc-probe`
+(553h — likely dead, check before rebuilding).
+
+`ck-broca` is current: v0.3.20 deployed and verified by inode earlier today.
+
+## The three pieces of real work
+
+**1. Broca state-directory move.** Its runbook is settled and reviewed. Requires
+the module stopped, an atomic same-filesystem rename, and its own verify legs
+(the WAL comparison against a baseline taken from the stopped tree). Independent
+of everything else — confirmed by checking that no other module carries a
+descriptor at the path the backup discovery reads.
+
+**2. The executive module rename.** Old ids retire, new ids spawn. `rescan` can
+now do this in one call without a daemon restart, but the store move cannot ride
+inside it, so the sequence is: stop the old modules, move the stores, edit the
+daemon config, dry-run, execute. The gating consumer is the desktop app, whose
+module ids are compiled literals.
+
+**3. Engram restage.** Fifteen commits, three load-bearing: the fix for the path
+that stranded the account twice, the fix that reports the real refusal instead of
+a fallback's symptom, and the self-heal that recovers without a human. Module
+only — the worker half needs its own reviewed gate.
+
+## Ordering, and why
+
+1. **Engram's drain finishes first.** Three generations are staged and uploading.
+   Restarting mid-drain is recoverable but pointless.
+2. **Stage every new binary while modules keep running.** A remove-first copy
+   leaves the running process on its old inode, so staging is not a restart. This
+   front-loads all the risky building outside the outage.
+3. **Each owner verifies their own staged artifact** before the window: version
+   probe, warm exec, whatever symbol check they specify. An owner is the only one
+   who knows what discriminates their build.
+4. **Stop broca, move its state, leave it stopped.**
+5. **Stop the executive modules, move their stores, edit the daemon config.**
+6. **One daemon bounce.** Everything comes up on new binaries with new config.
+7. **Verify by inode, per module.** Then each owner runs their own acceptance,
+   including at least one mutating call — a read-only health route proves the
+   service is serving and nothing about the write path.
+
+Steps 4 and 5 are the only ones with data motion, and both are separated from
+the id change deliberately: if a spawn fails afterwards, the stores are already
+moved and consistent, so recovery is fix-config-and-rescan with no data motion.
+The partial state is boring by construction.
+
+## What could go wrong, and the answer
+
+- **A new binary is broken.** Every previous binary is backed up beside its
+  replacement, and step 3 is where this should surface rather than in the window.
+- **The daemon comes up and a module does not.** Its previous binary is one copy
+  away, and the daemon keeps supervising the rest.
+- **A store move fails.** Both migrations verify the destination before the
+  source is removed; neither deletes anything in the window.
+- **The rename spawns nothing.** Old ids gone, new ids absent, stores already
+  moved. Fix config, rescan again.
+
+## Not in this window
+
+The worker half of engram (needs a separate reviewed gate with the credentials
+owner), and the protocol change that would close the multi-device case of the
+credential deadlock. That one is not "later" — it is **before a second device is
+enrolled**, which is a date rather than a priority, and the phone work sets it.

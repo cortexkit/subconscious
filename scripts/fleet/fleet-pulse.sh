@@ -693,6 +693,16 @@ done
 # fails. mtime is also only a screen: proving WHICH build runs needs the artifact
 # itself (inode for no-replace-in-place, symbol presence for which build).
 dim "  covers local binaries only -- cloud-deployed code cannot appear here"
+# THE UPPER BOUND HAS A MIRROR THAT FAILS THE OTHER WAY, and a module owner found
+# it by auditing a clean verdict rather than a noisy one. The path filter excludes
+# tests/ and benches/, which is right for a repo that keeps only tests there and
+# WRONG for one that keeps runtime code under those paths -- and in the second
+# case this section reports clean while real code is unshipped. It cannot be
+# fixed from here: whether a file under tests/ ships is a fact about that repo's
+# layout, not about its path. The owner who raised it was clean anyway, but only
+# because they had deployed that morning -- correct by circumstance rather than
+# by coverage, which is precisely what a clean line cannot distinguish.
+dim "  a clean line means nothing under tests/ or benches/ was checked -- ask the owner whether runtime code lives there"
 # The runtime-file count is an UPPER BOUND, and saying so here is cheaper than
 # the alternative. The filter excludes tests/ and benches/ DIRECTORIES, but a
 # Rust file commonly carries its tests inline under `#[cfg(test)] mod tests`, and

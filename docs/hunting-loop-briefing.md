@@ -173,6 +173,7 @@ Before calling a class closed:
 | 86 | Is this gate expensive enough that someone will route around it? | A gate that gets avoided is replaced by something worse and unmonitored; cost is a security property, not an ergonomic one |
 | 87 | Checking a citation in someone else's document — whose ruling is it? | Finding your own words landed there reads as independent corroboration, and the check that was supposed to catch that is what delivers it |
 | 88 | Does this identifier stay fixed while the content it names can change? | A correct replay guard then reads a content change as a replay attempt, and refuses the delivery forever |
+| 89 | Adding or changing a rendering — who is reading the old one? | A broken parse fails; a broken match just stops matching, so the quality loss is silent and only the author could have known a better answer existed |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3567,6 +3568,42 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## A rendering is an interface nobody agreed to
+
+I added human-readable descriptions to a set of error values, closing a gap where
+failures reached users as dumps of internal structure. Correct change, asked for,
+and it **shipped a user-facing regression**.
+
+A client had a function turning failed connections into actionable advice, and it
+matched on the *rendered text* of the failure. After my change, two of its five
+remedies no longer matched anything. The costly one: "could not reach your Mac
+through the relay, it may be asleep or offline" — the single most useful sentence
+that surface produces when the user is away from home — silently degraded to
+"could not reach your Mac."
+
+The coupling was theirs and latent. But latent things stay harmless until someone
+moves what they depend on, and the commit that moved it was mine.
+
+**This is the reply-shape asymmetry one layer over.** Widening a reply breaks
+consumers that cannot parse it; changing a rendering breaks consumers that were
+matching it. Both are additive at the source and breaking at the far end, and in
+both the author cannot see the consumer.
+
+**But the rendering case is harder to detect, and the difference is the point: a
+broken parse fails. A broken match just stops matching.** The parse case throws;
+the match case falls quietly through to a generic branch. So there is no failure
+at all — only a loss of quality that nobody is positioned to notice, because the
+person reading the vaguer message does not know a better one existed.
+
+The fix that holds is structural rather than a re-spelling: **match the value, not
+its rendering**, and switch over cases so the compiler enforces coverage. A new
+case then becomes a build error instead of a remedy that quietly never fires.
+Re-spelling the matches fixes today and re-arms tomorrow.
+
+And where prose must cross a boundary, carry a machine-readable code **alongside**
+it rather than expecting anyone to parse the prose — so the text stays free to
+improve.
 
 ## An identifier that outlives the content it names
 

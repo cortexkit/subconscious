@@ -24,9 +24,20 @@ for path in "$BIN"/ck-*; do
   case "$path" in *.pre-*|*.bak-*|*.[0-9]*Z*) continue ;; esac   # backups
   name=$(basename "$path")
 
-  # Resolve the pid by EXACT executable path. `pgrep -f <name>` matches this
-  # script's own command line and any editor or shell mentioning the name --
-  # in a verifier that is a wrong answer, and in a reaper it is a self-kill.
+  # Resolve the pid by EXACT executable path, through ps. Two distinct reasons,
+  # both of which make pgrep unusable here:
+  #
+  # Matching a command-line substring (`pgrep -f`) returns this script's own
+  # process and any editor or shell that mentions the name. In a verifier that
+  # is a wrong answer; in a reaper it is a self-kill.
+  #
+  # And pgrep on this platform SILENTLY EXCLUDES ITS OWN ANCESTORS. Run from an
+  # agent shell, the ancestry is bash -> ck-aft -> ck-subc, so `pgrep -x ck-aft`
+  # and `pgrep -x ck-subc` both return EMPTY while both processes are live --
+  # reported as "not running" rather than "cannot tell". The blindness lands on
+  # exactly the processes most likely to be hosting whatever runs this, which
+  # are also the two whose staleness matters most. Measured on this host: ps
+  # finds both, pgrep finds neither.
   pid=$(ps -Ao pid=,comm= | awk -v p="$path" '$2==p{print $1; exit}')
 
   if [ -z "$pid" ]; then

@@ -116,6 +116,7 @@ Before calling a class closed:
 | 29 | Was the control run in a state where the failure it guards against *could* occur? | A control run where the fault is impossible proves the check runs, not that it can detect — and it passes for the right reason, so nothing looks wrong |
 | 30 | Having tightened one rule of a test double, did you enumerate its others? | A double is a set of independent permissions; fixing one teaches nothing about the rest, and each remaining one certifies a different broken client |
 | 31 | Did you verify the target, or only properties of the target you assumed? | Every property can be true of the wrong endpoint; a check whose output omits what it was pointed at cannot expose a wrong target |
+| 32 | Does your change break an invariant that nothing currently reads? | No test fails and no alarm fires, because the only thing that would object does not exist yet — the cost lands on whoever writes the first reader |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3157,6 +3158,40 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## Breaking an invariant nothing reads yet
+
+A recovery branch had to skip a sequence number it could not identify — that
+unknowability was the whole reason it existed. A side effect: each record links
+to its predecessor, and skipping leaves that link chain with a hole.
+
+Nothing reads the link. It is written, signed over, and decoded, and no verifier
+walks it, so the hole is unobservable today by construction. No test fails, no
+alarm fires, nothing anywhere objects.
+
+That is a distinct hazard from the more familiar one. The usual version is **a
+field asserting a property nothing checks** — a writer can record something false
+and no reader catches it. This is the mirror: **a writer maintains an invariant
+no reader uses**, so a change can silently stop maintaining it and the cost lands
+entirely on whoever writes the first reader. They will reasonably assume the
+chain is intact, because every line of code that maintains it says so.
+
+Both shapes come from the same root — a promise in the data with no consumer to
+keep it honest — and neither is detectable by running anything.
+
+So when a change breaks an unread invariant, the choice is: restore it, delete
+the field, or **record the constraint at the site** so a future reader inherits
+it rather than rediscovering it. A note in a plan does not travel; a comment
+beside the field does. Here the constraint was that a future walk must either
+tolerate the hole or be built only after the upstream gap that forces the skip is
+closed.
+
+Worth noticing what the accumulation was telling us. This was the third
+independent symptom of one missing capability — a refusal that withheld a value
+the server had already computed, an object orphaned by guessing forward, and now
+a chain that only stays intact if clients never have to guess. **Three symptoms
+with one cause is a much stronger argument for the fix than any of them alone**,
+and none of the three was individually large enough to justify it.
 
 ## Verifying properties of the wrong target
 

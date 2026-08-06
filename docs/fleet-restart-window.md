@@ -126,6 +126,25 @@ The partial state is boring by construction.
 
 - **A new binary is broken.** Every previous binary is backed up beside its
   replacement, and step 3 is where this should surface rather than in the window.
+
+  **Rollback is not uniform, and the general case is wrong for one module.** For
+  most, the previous binary reopens a migrated store cleanly — verified at the
+  migration runner, which skips anything at or below the applied maximum and
+  never refuses a store newer than the binary knows. So rolling back means
+  replacing the binary and nothing else.
+
+  The context module is the exception: its migration is **one-way**, and the
+  previous binary will refuse the migrated store afterwards. That refusal is
+  correct and loud, but it means the rollback unit there is **binary plus
+  store**, restored from the pre-migration backup rather than the binary alone.
+  A plan that is right for thirteen modules and wrong for one is worse than no
+  plan, because the operator applies the general case under pressure.
+
+  Every pre-migration backup is created `0600` at the moment it is taken. A copy
+  inherits the mode of its source, nothing ever opens a backup, and so the
+  open-time permission fix can never reach it — a backup taken minutes before
+  the fix goes live would otherwise stay world-readable forever, beside a fleet
+  measured as clean.
 - **The daemon comes up and a module does not.** Its previous binary is one copy
   away, and the daemon keeps supervising the rest.
 - **A store move fails.** Both migrations verify the destination before the

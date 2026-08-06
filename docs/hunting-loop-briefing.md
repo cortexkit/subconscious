@@ -188,6 +188,7 @@ Before calling a class closed:
 | 101 | Feeling the pull to concede — which measurement would you have to disbelieve? | If you cannot name one, you are conceding to the other party's confidence rather than to evidence |
 | 102 | Does this frozen set contain anything whose correctness depends on the outside world? | A tracking surface inside an immutable set is a contradiction that surfaces the first time the tracked thing moves |
 | 103 | Your blast-radius map was wrong once — what is the chance it is complete now? | Being wrong about a map is evidence about the mapping process, not only about that map |
+| 104 | Concluding something was not retained — where would it be retained if it were? | An absence found by searching one medium is scoped to that medium; a filesystem search says nothing about a database |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4238,6 +4239,31 @@ than **unreachable** — and quiet requires no action. The minimum fix is not to
 re-key the registry but to **make a send to a row whose directory has vanished
 fail loudly**; re-keying is the better design, failing loudly is what stops the
 silence and can land first.
+
+### An absence scoped to one medium
+
+A seat reported an evidence-loss defect: a failed process left them a document
+that instructed them to work from it, and the document referred to earlier
+material it did not contain. They checked whether that material still existed,
+found nothing on disk, and concluded it was unrecoverable.
+
+It was in a database table, complete, every round retained.
+
+Their search was correct and correctly scoped — no such files existed. **But an
+answer about the filesystem reads as an answer about retention**, and the two
+differ whenever a system keeps state in a database, which this one does. The check
+is one question earlier than the search: **before concluding something was not
+retained, establish where it would be retained if it were.**
+
+Worth separating the two defects, because they have different fixes. The retention
+was fine; **the discoverability was not.** The failure report never said the
+per-round record was stored, so a reader who searches the obvious place finds
+nothing and stops. One sentence naming the table and key would have turned a dead
+end into a two-minute lookup.
+
+They were also right to stop rather than reconstruct the missing material.
+**Fabricated normative content is indistinguishable from the real thing on
+review**, and would have shipped as a decision nobody made.
 
 ### A live surface inside a frozen set
 

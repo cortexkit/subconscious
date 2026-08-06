@@ -105,6 +105,14 @@ an explicit identifier silently reverts it.
 Use a distinct identifier per environment — a development build must never share
 a principal with production, or it can inherit that grant invisibly.
 
+**Apply that rule at stage time, never at placement.** If a test artifact arrives
+carrying the production identifier and others have already verified its hash,
+re-signing it changes the bytes they accepted. Substituting a different artifact
+mid-operation is worse than the risk being corrected, even when the substitution
+is an improvement — a hash is only a valid acceptance value when paired with the
+signing command that produced it. Raise it with whoever builds the artifact so the
+published hash is of a correctly identified binary from the start.
+
 Two consequences worth having:
 
 - **Whole-file hashing works again as a placement check**, because staged and

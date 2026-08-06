@@ -129,6 +129,7 @@ Before calling a class closed:
 | 42 | Did you change an artifact after someone verified it, and republish the new value? | A fix applied after verification invalidates the verification, and the more thorough the original check the more expensive the silent invalidation |
 | 43 | Is a broken state available right now that you have been unable to test against? | The failing direction of a check is only testable while something is genuinely broken — spend an outage on the measurement, not only the recovery |
 | 44 | When renaming an identifier, did you sweep where it is an *authority* reference and not only a *routing* one? | Nothing that resolves routes ever touches a grant list, so it survives every sweep driven by "what breaks if this name is wrong" |
+| 45 | If one side of a comparison is missing, does the check say "cannot compare" — or return a verdict? | An absent input rendered as a verdict is wrong in both directions: silently passing, or raising a false alarm that invites undoing correct work |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3205,6 +3206,31 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## A missing input rendered as a verdict
+
+During a data migration, a verification tool read a baseline file that no longer
+existed, got empty strings for the expected counts, and printed **shortfall on
+all three fields** — reporting that the migration had lost data. It had not; the
+file had been written to a temporary directory that a reboot cleared.
+
+Every other instance of this family renders absence as **success**: a restart
+that changed nothing passing its check, grants for a missing subject dropped
+without a word, a registry emptied by a rename. This one inverts it, and in an
+operational window it is arguably worse: **a false alarm during a migration
+invites a rollback.** The correct outcome would have been undone on the strength
+of a file that was merely absent.
+
+The rule runs in both directions: **if one side of a comparison is missing, the
+result is "cannot compare" — never a verdict.** Not passed, not failed. A
+comparison with one side absent has no verdict to give, and inventing either one
+is a claim about data nobody has.
+
+The secondary lesson is where the artifact lived. The baseline's entire purpose
+is to survive the operation, and it was stored somewhere the operation could
+destroy. **Evidence about a change must be kept somewhere the change cannot
+reach** — the same reasoning that makes a build-time hash better than one taken
+after signing.
 
 ## An identifier used as an authority, not a route
 

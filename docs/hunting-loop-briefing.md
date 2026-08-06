@@ -152,6 +152,8 @@ Before calling a class closed:
 | 65 | You wrote a caveat — would the conclusion change if the caveated item were deleted? | If not, the caveat was decoration: it discharges the obligation to be rigorous without doing any of the work |
 | 66 | Reading a trend — are the points measurements of the same subject? | Real numbers in a real order across different subjects produce a convincing curve that describes nothing |
 | 67 | Will anything else change your observable during this operation? | A confound that *decorates* a success is never investigated, because nobody re-derives a number that agrees with them |
+| 68 | Comparing two instruments — do they answer the same question? | A pair where one is *defined* to normalise cannot detect whether the other normalised; the difference you see is the definition, not a finding |
+| 69 | Can the check read correct while wrong *and* wrong while correct? | Ambiguous in both directions is not weak evidence, it is none — replace it with a behavioural test |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3465,6 +3467,47 @@ Generalises past disk: any exhausted resource whose usage only rises — memory
 held by a cache that never evicts, connections held by a pool that never reaps,
 file descriptors retained after close. **Ask whether release works before asking
 who is allocating.**
+
+## An instrument pair that cannot answer the question
+
+A colleague tested whether a compatibility link is preserved or resolved when a
+process works through it. They compared the shell's `pwd` against `pwd -P`, saw
+the resolved form, and concluded the link is resolved at use.
+
+I reproduced it and got the opposite answer. Both results were real:
+
+- shell builtin `pwd` → keeps the link
+- `pwd -P` → resolves, **by definition**
+- `getcwd(2)` → always resolves
+
+The kernel never stored the link. `chdir` records an inode, so the system call can
+only ever reconstruct the physical path; the shell separately remembers the
+logical path and hands it back.
+
+**Their instrument pair could not have answered their question.** One member is
+defined to normalise, so the difference between them is the definition — not
+evidence about the other member's behaviour. A comparison where one side is
+specified to do the thing you are testing for tells you nothing.
+
+### Ambiguous in both directions is not weak evidence
+
+The consequence was worse than either of us first thought, and it strengthened
+their proposal rather than weakening it.
+
+Which path a process reports depends on **how** it obtained it, and that is not
+visible from inside. So a verification comparing path strings could read *new*
+while still running through the link, or *old* while correctly rebound. Wrong in
+both directions is not a weak check; it is not a check.
+
+Their replacement is behavioural and cannot be fooled by which representation
+someone captured: **remove the link first, then have the process act.** Correctly
+rebound, it works. Still on the link, it fails immediately and unmistakably — the
+same failure an unprepared move would cause, but triggered deliberately while
+someone is watching and can restore it in one command, rather than surfacing days
+later when someone clears out stale links.
+
+The general form: when a state check can be satisfied for the wrong reason,
+**replace it with an action whose success requires the state to be right.**
 
 ## The confound that decorates a success
 

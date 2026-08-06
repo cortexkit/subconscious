@@ -119,6 +119,7 @@ Before calling a class closed:
 | 32 | Does your change break an invariant that nothing currently reads? | No test fails and no alarm fires, because the only thing that would object does not exist yet — the cost lands on whoever writes the first reader |
 | 33 | When a filter matches nothing, does the unmatched input flow through as data? | A filter that fails open does not merely lose rows — it turns headers and framing into records, and whether that reads as loud or silent is an accident of content |
 | 34 | Does your detector distinguish the *causes* of the state it detects, or only the state? | A correct detector fires correctly on an event it cannot tell apart from another — absence cannot separate deleted from moved, and the consequence lands on the benign cause |
+| 35 | Does an await inside a select arm stop the other arms being polled? | The loop has left the select, so a cheaper outcome arriving on another arm waits out the expensive one's full timeout |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3160,6 +3161,41 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## An await inside a select arm stops the other arms
+
+A connection took exactly sixty seconds, three times, and the local network path
+it eventually used had been **established one second in**.
+
+The peer loop waits on several things at once: an outbound dial, an inbound
+connection, control commands. A control command asked it to open a relayed
+connection, and the handler awaited that dial **inside the arm** — so the loop had
+left the multi-way wait, and the inbound-connection arm was no longer being
+polled. The local connection completed its handshake, queued, and sat there. The
+relay wait was bounded by a grant deadline rather than a short timeout, so the
+loop returned sixty seconds later, drained the queued connection, and proceeded.
+
+The result reads as "the local path won, slowly", which is why it survived: the
+fast path *did* win. It simply could not be served while nothing was looking at
+it.
+
+Two generalisations worth more than the bug:
+
+**An already-established cheap outcome should pre-empt a speculative expensive
+one.** Here the cheapest possible case — the peer is already connected — was
+served last. Any loop that races alternatives has to keep racing them for the
+whole attempt, not just until one of them starts.
+
+**Setting up an expensive path is not free for the other side.** The client
+assembled its full candidate list up front, which minted a grant, which told the
+peer to go and wait somewhere. It then connected locally in 180ms and never used
+the grant. Preparing an option had a side effect on someone else — so the option
+should be prepared only once the cheaper ones have failed.
+
+The diagnosis came from correlating two independent vantage points: the client's
+own timings, and a watcher on the *listener* showing when the connection actually
+established. Neither alone distinguishes "slow to connect" from "connected and
+unattended".
 
 ## A correct detector firing on an ambiguous event
 

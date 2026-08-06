@@ -184,14 +184,18 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
     /// reply. Collapsing the two makes every module-level refusal read as a
     /// network problem, and the module's own reason — the only thing that says
     /// what to do about it — is discarded on the way back to the caller.
-    case moduleError(code: String)
+    ///
+    /// The code identifies which refusal; the message is the module's own prose
+    /// and is what a caller should show a person. The message is optional because
+    /// a module may send a code alone.
+    case moduleError(code: String, message: String? = nil)
     case indeterminateMutation
     case admissionQueueFull
     case admissionQueueTimedOut
     case noEligibleCandidates([CandidateFailure])
     case allCandidatesFailed([CandidateFailure])
 
-    private enum CodingKeys: String, CodingKey { case kind, field, code, stage, failures }
+    private enum CodingKeys: String, CodingKey { case kind, field, code, message, stage, failures }
     private enum Kind: String, Codable {
         case notDialOwner, unsupportedEnrollmentClass, invalidProfile, candidateRejected,
              candidateTimedOut, relayAuthenticationFailed, responderKeyMismatch,
@@ -228,7 +232,11 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         case .cancelled: self = .cancelled
         case .suspended: self = .suspended
         case .disconnected: self = .disconnected
-        case .moduleError: self = .moduleError(code: try c.decode(String.self, forKey: .code))
+        case .moduleError:
+            self = .moduleError(
+                code: try c.decode(String.self, forKey: .code),
+                message: try c.decodeIfPresent(String.self, forKey: .message)
+            )
         case .indeterminateMutation: self = .indeterminateMutation
         case .admissionQueueFull: self = .admissionQueueFull
         case .admissionQueueTimedOut: self = .admissionQueueTimedOut
@@ -267,8 +275,10 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         case .cancelled: try c.encode(Kind.cancelled, forKey: .kind)
         case .suspended: try c.encode(Kind.suspended, forKey: .kind)
         case .disconnected: try c.encode(Kind.disconnected, forKey: .kind)
-        case .moduleError(let code):
-            try c.encode(Kind.moduleError, forKey: .kind); try c.encode(code, forKey: .code)
+        case .moduleError(let code, let message):
+            try c.encode(Kind.moduleError, forKey: .kind)
+            try c.encode(code, forKey: .code)
+            try c.encodeIfPresent(message, forKey: .message)
         case .indeterminateMutation: try c.encode(Kind.indeterminateMutation, forKey: .kind)
         case .admissionQueueFull: try c.encode(Kind.admissionQueueFull, forKey: .kind)
         case .admissionQueueTimedOut: try c.encode(Kind.admissionQueueTimedOut, forKey: .kind)

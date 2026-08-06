@@ -475,6 +475,7 @@ public actor FedSessionEngine {
         body: Data,
         bodyOmitted: Bool,
         errorCode: String?,
+        errorMessage: String? = nil,
         isMutation: Bool,
         permit: FedAdmissionPermit,
         provenance: FedDispatchProvenance = .afterDispatchOrUnknown
@@ -508,7 +509,7 @@ public actor FedSessionEngine {
             // Reporting it as one converts every remote refusal into a network
             // fault, so the caller retries a call that will refuse identically and
             // never learns the reason. Carry the module's own code through.
-            throw FedFailure.moduleError(code: errorCode ?? "unspecified")
+            throw FedFailure.moduleError(code: errorCode ?? "unspecified", message: errorMessage)
         }
         return body
     }
@@ -745,12 +746,12 @@ public actor FedSessionEngine {
             )
             _ = catalogTracker.apply(catalog)
         case .bye:
-            if case .string(let code) = frame.header["code"], code == "fed_rekey_needed" {
+            if frame.byeCode == "fed_rekey_needed" {
                 return
             }
             await disconnect(reason: .protocolViolation(
                 byeCode: {
-                    if case .string(let code) = frame.header["code"] { return code }
+                    if let code = frame.byeCode { return code }
                     return "fed_goodbye"
                 }()
             ))

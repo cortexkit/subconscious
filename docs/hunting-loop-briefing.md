@@ -194,6 +194,8 @@ Before calling a class closed:
 | 107 | Would this detector fire on healthy cases? | A signal that flags normal convergence gets switched off within a week, so partition by what the value means before thresholding it |
 | 108 | Does your detector print its exempt population? | An exemption nobody can see cannot be audited, so a wrongly-exempt case is invisible for as long as the rule stands |
 | 109 | Two checks with complementary blind spots — did you ship the better one, or both? | When each check covers the other's gap, choosing between them halves the coverage while feeling like a simplification |
+| 110 | A regression check passed — did the population it measures actually change? | Re-running a census minutes after a deploy proves only that it still reads the same store |
+| 111 | Is the claim wrong, or is your summary of it wrong? | A review summary can be wrong independently of what it reviews, and the summary is the artifact that travels |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4361,6 +4363,40 @@ exactly the other's coverage.**
 Worth stating as a general question because the pull is always toward picking the
 better check: **when two checks have complementary blind spots, choosing between
 them halves the coverage while feeling like a simplification.**
+
+### A regression check over an unchanged population
+
+The guard shipped, and the census re-ran clean: same campaign count, same round
+count, zero new losses. It would have been easy to record that as the fix working.
+
+The round count was **identical** — 339 before, 339 after. No new work had run
+under the guard, so there was nothing for it to have prevented. **The measurement
+was correct and the inference was empty.**
+
+The owner flagged it before I could, which is the right instinct: a regression
+check run minutes after a deploy proves only that it still reads the same data.
+The evidence accrues as new work passes through. **Before reading a clean
+regression result, confirm the population it measures has actually changed.**
+
+### The summary is the artifact that travels
+
+The same owner sent a review note claiming two diagnostic lists were disjoint,
+then read the source, found they deliberately overlap, and corrected it **before I
+quoted it anywhere.**
+
+The timing is the point. I was one message from writing the false claim into a
+durable record, where it would have been checked by nobody and inherited by
+everyone.
+
+Their framing is worth keeping exactly: **the wrong sentence was the summary, not
+the code.** A review summary is an artifact that can be wrong independently of
+what it reviews — and it is the artifact that travels, gets quoted, and outlives
+the review.
+
+The corrected design was also better than the claim it replaced. The lists overlap
+because they **answer different questions**: why something was refused, versus
+whether the submission was destructive. Collapsing them would have disarmed the
+recovery path for precisely the case that needs it most.
 
 ### A guard with no path forward
 

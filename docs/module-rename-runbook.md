@@ -59,8 +59,26 @@ never examined, because nobody re-derives a number that agrees with them.
    Afterwards it is a rescue, and the resident spends the gap unable to run the
    commands needed to diagnose it.
 2. **Stop the module** if its storage location derives from its identity.
-3. **Move, never copy.** The single-writer lock is per-location, so a copy leaves
-   a second openable store and two live writers become possible.
+3. **Move, never copy — and move the whole directory, never individual files.**
+   The single-writer lock is per-location, so a copy leaves a second openable
+   store and two live writers become possible. A database in write-ahead mode is
+   also several files: recently committed data lives in a sidecar until it is
+   folded into the main one, so copying the main file alone silently drops the
+   most recent writes. Any pre-move backup must be the whole directory for the
+   same reason — a partial-file backup is worse than none, because it would be
+   trusted.
+
+   Measured here: 520 audit rows lived only in the sidecar, and three of four
+   verification checks could not see the difference, because the values they read
+   were old enough to have been folded in already. **Include one continuously
+   growing table in the checks** — it is the only kind sensitive to a lost tail.
+
+   **Open verification copies read-only, and treat that as load-bearing rather
+   than good manners.** A write-ahead database missing its sidecar *refuses to
+   open* read-only, which is the loud failure you want. Opened read-write it
+   opens happily, recovers itself, and leaves a self-consistent database missing
+   its most recent writes with no remaining evidence that anything was lost — the
+   check does not merely fail to detect the loss, it removes the trace of it.
 4. Move the directory; apply the identity change; reconcile.
 5. **Verify the minted identifier** before declaring anything.
 6. **Restart the resident** so it re-binds to the real path.

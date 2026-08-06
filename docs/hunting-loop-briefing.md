@@ -131,6 +131,7 @@ Before calling a class closed:
 | 44 | When renaming an identifier, did you sweep where it is an *authority* reference and not only a *routing* one? | Nothing that resolves routes ever touches a grant list, so it survives every sweep driven by "what breaks if this name is wrong" |
 | 45 | If one side of a comparison is missing, does the check say "cannot compare" — or return a verdict? | An absent input rendered as a verdict is wrong in both directions: silently passing, or raising a false alarm that invites undoing correct work |
 | 46 | Did anything verify the *destination*, or only the artifact? | Identity checks answer "is this the right file" and say nothing about "does the consumer read from here" — two directories, one filename, and every check passes |
+| 47 | When two careful people disagree on a fact, are they describing the same object? | Both measurements can be correct about different things; the ambiguity hides in the definite article, not in the reading |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3238,6 +3239,28 @@ each truthfully. So the destination question has two parts — *which path*, and
 The generalisation: after confirming an artifact is right, confirm that the thing
 meant to load it **names the place you put it**. Read that from the consumer's
 configuration, not from your own record of where you wrote.
+
+### The ambiguity was in the definite article
+
+Two people disagreed about what a configuration said. Neither had misread — there
+were **two** configurations, and each had truthfully answered the question they
+asked of the file in front of them. The disagreement was not in the reading but
+in the phrase *"the config"*.
+
+So: **when two careful people disagree about a fact, check first whether they are
+describing the same object.** The mistake will not be in either measurement.
+
+Resolving which one was live is worth copying too. Modification times said
+nothing useful — both had been touched. **Written evidence settled it**: one had
+1,966 recorded requests and frozen evidence sets, the other had none and its
+newest file was a database handle's leftover. *A service that has never recorded
+a request has never served one.*
+
+And the contradicting evidence — a launcher entry pointing at the dead one — was
+explained rather than dismissed: it was **created and disabled before the live one
+existed**. A fossil frozen at the moment it was switched off. **Contradicting
+evidence older than the thing it contradicts is not contradicting evidence**, and
+saying so is different from waving it away.
 
 ## A missing input rendered as a verdict
 

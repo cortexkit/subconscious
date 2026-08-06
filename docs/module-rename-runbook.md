@@ -111,7 +111,13 @@ never examined, because nobody re-derives a number that agrees with them.
    only an incomplete one diverges.
 4. Move the directory; apply the identity change; reconcile.
 5. **Verify the minted identifier** before declaring anything.
-6. **Restart the resident** so it re-binds to the real path.
+6. **Restart the resident** so it re-binds to the real path. This step is not
+   optional and not reorderable: a session's project root is captured at start and
+   is *not* re-resolved per call, so a session that has not restarted is still
+   bound to the old path however the new one reads. Confirmed the hard way — a
+   resident acted before restarting, and every command was refused at a
+   precondition on the bound root, including one using only absolute paths with no
+   working-directory reference.
 7. **Remove the link, then have the resident act.** Do not verify by comparing
    path strings: a working directory is stored by the kernel as an inode, so a
    process reading it through the system call always sees the resolved path, while

@@ -180,6 +180,7 @@ Before calling a class closed:
 | 93 | Several candidates match — does your code pick one? | Any tiebreak rule is a choice derived from ambient state that nobody made; refuse and say how many matched |
 | 94 | Two people asked one decision — is there exactly one open request? | Answering one and not the other leaves each side proceeding on a different half-answer, both believing it settled |
 | 95 | Does every option in this choice behave differently? | An option with no distinct behaviour pads a decision without informing it, and makes a binary read as carefully considered |
+| 96 | Was this rule validated in the same state you apply it in? | A rule derived against a running system and applied to a stopped one was never true where it was written to be used |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4194,6 +4195,35 @@ the usual question. Most checks are classified by whether they *can* be wrong;
 this one classifies by **when** they are wrong relative to the decision. A check
 can be perfectly sound and still worthless if its validity window opens after the
 gate.
+
+### A rule validated in one state, applied in another
+
+The read-only rule above was written as: *if it refuses to open, the copy is
+incomplete — take it again.* Running the migration it was written for, both of us
+hit it independently and it was **wrong in the expensive direction: followed
+literally, it would have called a successful migration a data loss**, at exactly
+the moment when the natural response is to undo correct work.
+
+Stopping the service **checkpoints the sidecar into the main file and removes
+it**, measured — the directory went from four files to two and the main file grew
+by almost exactly the sidecar's size. With no sidecar, a read-only connection has
+nothing to attach to and refuses. So a cleanly stopped *complete* store and a
+partial copy of a *running* one produce the identical error.
+
+The author's own diagnosis is the general form: **the rule was derived against a
+running store, where the sidecar always exists, and applied at a step that only
+ever runs against a stopped one.** A rule validated in one state and applied in
+another was never true where it was written to be used.
+
+The repair moves the work to the counts: the minted identifier proves it is the
+same store, and a continuously growing table at or above its recorded floor proves
+it kept its tail — **because a partial copy comes back short while every other
+check passes.** The flag remains right for reading a live store, which is where it
+earns its keep.
+
+Note this is the earlier validity-window rule wearing different clothes, written
+by the same two people three hours later, and neither of us recognised it while
+writing it.
 
 ### Ambiguous in both directions is not weak evidence
 

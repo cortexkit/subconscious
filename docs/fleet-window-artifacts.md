@@ -108,20 +108,42 @@ Signing rewrites the binary, so **a staged file can never match the source hash
 its owner quoted**. That makes "verify by sha" unusable at the deploy path, and
 an owner instructing it in good faith sends you to a check that cannot pass.
 
-The substitute: **sign a reference copy of the verified source under the same
-filename and compare.** Signing is deterministic — two signings of identical
-bytes under the same name produce byte-identical output — so the comparison is
-exact.
+Signing **is** deterministic, but of more inputs than it first appears. It is a
+function of the input bytes, the filename, and the identifier — and "input bytes"
+includes **any signature already present**. Miss any of the three and you get a
+mismatch that means nothing.
 
-The filename is load-bearing and not obvious. macOS derives the signing
-identifier from the file's name, so signing a copy called `ref` yields a
-different result than signing the same bytes called `ck-engram`. A reference
-signed under the wrong name reports a mismatch for a file that is correct, which
-is how a good artifact gets rejected.
+Three separate people concluded "signing is non-deterministic" today, each
+holding two of the three variables:
 
-That mismatch also produced a wrong conclusion before it was chased down: signing
-looked non-deterministic, when the variable was the name introduced by the check
-itself. Two signings under a controlled name settled it.
+- **Filename.** macOS derives the identifier from the file's name, so signing a
+  copy called `ref` differs from signing the same bytes called `ck-engram`.
+  Measured: three names, three results; same name twice, identical.
+- **Prior signature.** An already-signed file is different input than a naked
+  one. Measured: signing a fresh build once gave one value, and signing it twice
+  — plain, then with a pinned identifier — reproduced the deployed artifact
+  exactly. Signing three times over gave the same value each time, so it is not
+  drift.
+- **Identifier.** Pinning one changes the blob, so it must be replayed too.
+
+So a reference comparison has to **replay the whole signing history**, not just
+the last step. That is exact, and it is fragile in proportion to how many
+invocations the deployed artifact has accumulated.
+
+**Two better instruments, both from owners rather than from me:**
+
+**LC_UUID** is set at link time and is invariant under signing entirely. It
+identifies the build with no reconstruction step. Its scope is honest but narrow:
+it varies with the build directory as well as the source, so it proves "same
+source and same build directory".
+
+**Signature-stripped comparison** — strip both, hash the naked binaries — proves
+everything except the blob, and needs no knowledge of signing history at all.
+This is the one that resolved today's dispute.
+
+Prefer both of those to hash-reproduction. Better still, **hash the binary before
+signing, at build time, and carry that value forward**: the only identity that
+needs no reconstruction is the one taken upstream of the transformation.
 
 A related asymmetry, since it nearly produced a wrong note: after signing, two of
 three hashes were **unchanged** from what their owners quoted and one changed.

@@ -106,6 +106,7 @@ Before calling a class closed:
 | 19 | For a capability grant: what can the granted set do *in combination*? | Rows enter a table one at a time and are read back one at a time, so a composition has no moment at which anyone looks at it |
 | 20 | Did you write down the *invariant* or the *remedy*? | A remedy answers the site that broke; an invariant makes the next question mechanical and finds the siblings |
 | 21 | For each step in a runbook or checklist: can you name the surface and the field that answers it? | A step nobody traced to a real field is prose, and the operator finds an adjacent signal and reads it as the check |
+| 22 | Is the key you store a record under at least as broad as the broadest statement stored under it? | A statement about an account, keyed by device, fences one device; the siblings walk through, and every key component is stable so a mutability check passes it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4666,6 +4667,43 @@ speculative hardening proposal rather than a triggerable defect, stop." A good
 one binds in both directions — that rule would have ended the loop on a weak
 round, and it also refused to allow stopping on a real defect when stopping
 would have been the tidier ending.
+
+## A key narrower than the statement it indexes
+
+Two different questions get asked of a storage key, and answering one of them
+well reads as answering both.
+
+The first is about mutability: does the key contain anything that changes? An
+epoch, a reason, a freshness marker, a generation counter — key on one of those
+and the lookup misses at exactly the moment the value moves. That rule is easy
+to state and easy to check.
+
+The second is about scope, and it is invisible from the first. A key can be
+perfectly stable in every component and still be *narrower than the statement
+stored under it*. The case: membership standing is authored about an account,
+while device binding is authored about a device. Storing the composed record
+under a key containing the device means a revocation indexes one device — so a
+sibling device, or one enrolled afterwards, presents an older assertion and is
+not fenced by it. Every component of that key was stable. A mutability review
+passes it without comment.
+
+So the companion check is: **the key must be no narrower than the broadest
+statement stored under it.** Ask what the record *asserts about*, not what it is
+filed beside.
+
+A related precedence rule falls out of the same case, and it is the mechanism
+rather than the principle. Where records carry both a class and an ordering
+value, the class must be evaluated *before* the ordering. Otherwise a record
+with sufficient ordering weight wins numerically and clears a state its class
+had no authority over. The same shape appears in a backup descriptor whose
+entries carry both a class and a mechanism: class is evaluated first, so
+guidance phrased purely in terms of mechanism misleads — it describes a test
+that never runs for the entries an earlier test already excluded.
+
+The generalisation worth carrying: where a decision has an authority dimension
+and a recency dimension, recency must never be able to overrule authority. A
+remedy may only be applied by a party at least as strong as the one that
+imposed what it undoes.
 
 ## Name the field a checklist step will read
 

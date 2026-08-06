@@ -133,6 +133,37 @@ if test -f "$MCDB"
 end
 
 say ""
+say "== git worktrees =="
+
+# Registered worktrees point back at the main repository by ABSOLUTE path, in
+# both directions: each worktree's `.git` file names a directory under the old
+# location, and the repository's own bookkeeping names each worktree. Renaming
+# breaks both halves, and git ships a repair for exactly this.
+#
+# Run it from the renamed repository and pass the worktree paths, so both
+# directions are rewritten. Without this, every worktree is orphaned and the
+# repository still believes they live at the old address.
+set -l wt_paths (git -C "$NEW" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | tail -n +2)
+if test (count $wt_paths) -gt 0
+    say "  repairing "(count $wt_paths)" registered worktree(s)"
+    git -C "$NEW" worktree repair $wt_paths 2>&1 | sed 's/^/    /'
+
+    # A repair that silently fixed nothing looks identical to one that had
+    # nothing to fix, so check a backpointer actually moved.
+    set -l first $wt_paths[1]
+    if test -f "$first/.git"
+        set -l points (string replace 'gitdir: ' '' (head -1 "$first/.git"))
+        if string match -q "$NEW*" -- "$points"
+            ok "backpointers now resolve under the new path"
+        else
+            warn "a worktree still points at $points -- repair may not have taken"
+        end
+    end
+else
+    ok "no registered worktrees"
+end
+
+say ""
 say "== verify =="
 test -d "$NEW"; and ok "directory exists at the new path"
 test ! -d "$OLD"; and ok "old path is gone"

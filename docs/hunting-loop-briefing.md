@@ -136,6 +136,8 @@ Before calling a class closed:
 | 49 | Once the live symptom is fixed, is a test the only remaining witness to the defect? | Then that test must be proven red against the pre-fix code, or it is indistinguishable from coverage and quietly retires the finding |
 | 50 | Do sibling arms of the same dispatch agree on how they match? | Each arm is defensible read alone and wrong beside its neighbours — a diff shows one arm, so review structurally cannot see it |
 | 51 | Did you mutate toward the mistake a future fixer would make, not only toward the original bug? | The plausible wrong fix is the one a green suite blesses |
+| 52 | Does one error value carry two meanings — "the remote refused" and "the connection went away"? | The caller retries a call that will refuse identically, and the remote's reason, the only thing saying what to do, is discarded at the conversion |
+| 53 | Do two sources describe the same event in incompatible terms? | Something between them is rewriting it — the disagreement is the finding, and a single source alone would read as an ordinary failure |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3212,6 +3214,45 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## One error value carrying two meanings
+
+A transport client threw the same failure value in two unrelated situations: when
+the remote **answered with an error**, and when the session **went away without
+answering**. One line converted the first into the second, discarding the
+remote's own error code.
+
+The consequence is not cosmetic. A remote refusal and a dropped connection call
+for opposite responses — retry the second, do not retry the first — and the caller
+can no longer tell them apart. So every refusal displayed as a network problem, a
+user-visible lie, while the reason that would have said what to do about it was
+thrown away at the conversion.
+
+It survived for weeks because **both stories were individually plausible**. The
+server's audit recorded "the module returned an error"; the client displayed
+"lost the connection". Either alone reads as an ordinary failure.
+
+### The disagreement is the finding
+
+What exposed it was noticing that **those two accounts cannot both describe the
+same event.** Not the volume — 546 failures produced no signal, because a bad
+network week explains 546 disconnects perfectly well. The contradiction is what
+proved something between the two sources was rewriting the event.
+
+So: **when two sources describe one event in incompatible terms, that is
+evidence, not noise.** Neither is necessarily wrong; the transformation between
+them is where to look.
+
+The ruling-out mattered equally: neighbouring calls on the *same session, in the
+same poll cycle*, succeeded. That proved the session was healthy and only the
+failing call was being converted — which is what moved the search from the network
+to the error path.
+
+One layer out, the same defect appears in the audit itself: it stores the outcome
+**class** and discards the remote's text. Both convert a specific answer into a
+generic category, and a category cannot be diagnosed. Worth noting the audit was
+still the more truthful of the two sources — had it recorded a generic "failed",
+it would have agreed with the client's story and the defect would still be live.
 
 ## Sibling arms that disagree on how they match
 

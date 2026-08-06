@@ -323,6 +323,20 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
       sleep 20
       after=$(wc -l < "$sidecar" 2>/dev/null | tr -d ' ')
       if [ "${after:-0}" -gt "${before:-0}" ] 2>/dev/null; then
+        # NUMERATOR ONLY. A denominator is available and correct -- see
+        # engram_upload_rate below, which filters the progress file and the two
+        # commit markers out of the staging listing before counting. Getting
+        # that filter right is the whole difficulty: an unfiltered listing sits
+        # three short of complete FOREVER, and the residual stops shrinking at
+        # exactly the moment the upload finishes, which is indistinguishable
+        # from a stall. That is not hypothetical -- it cost an hour of treating
+        # a finished upload as a stalled one, from an ad-hoc `ls | grep -c` at
+        # a terminal rather than from this file.
+        #
+        # A PROGRESS RATIO IS TWO MEASUREMENTS AND ONLY THE NUMERATOR IS
+        # SELF-EVIDENTLY RIGHT: the uploader writes that file. Any denominator
+        # is an assumption about which directory entries are objects. Where one
+        # is printed, the filter is the thing to check first.
         echo "  uploading gen $drain_seq: $after objects, +$((after - before)) in 20s"
       else
         # Twenty seconds at the observed ~10 objects/min is only ~3 objects, so a

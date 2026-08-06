@@ -156,6 +156,7 @@ Before calling a class closed:
 | 69 | Can the check read correct while wrong *and* wrong while correct? | Ambiguous in both directions is not weak evidence, it is none — replace it with a behavioural test |
 | 71 | When does this check become valid, relative to the decision it gates? | A sound check whose validity window opens after the gate is no check at all |
 | 70 | Did the tool answer *your* question, or a well-formed one you did not ask? | "Nothing to review" is a sentence shaped like an answer; a review of an unstaged file is indistinguishable from a clean one |
+| 72 | Can this check still *fail*? | A check whose mismatch is expected noise gives no signal in either direction — restoring its ability to fail is what makes it an instrument |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3469,6 +3470,28 @@ Generalises past disk: any exhausted resource whose usage only rises — memory
 held by a cache that never evicts, connections held by a pool that never reaps,
 file descriptors retained after close. **Ask whether release works before asking
 who is allocating.**
+
+## Recovering an instrument's ability to fail
+
+Correcting when we sign a binary — at build time rather than at deployment — had an
+effect neither of us predicted: **whole-file hashes started matching across a
+deployment for the first time.** Signing rewrites bytes inside the file, so while
+we signed after copying, the deployed file never matched the staged one.
+
+I recorded that as a convenience: the simplest check works again. The colleague
+who proposed the change had the better reading. **A mismatch now means
+something.** Previously a mismatch was expected noise, so the check gave no signal
+on a match *and* no signal on a mismatch — it could not fire usefully in either
+direction. Now a mismatch means truncation or substitution.
+
+We did not recover a check. **We recovered its ability to fail**, and an instrument
+that cannot fail is not a weak instrument.
+
+It also retires a habit: reaching for harder instruments when the simple one will
+do. The others remain for the questions they actually answer — the build
+identifier for *is this the same build across a re-sign*, file identity for *is
+the running process using the file I placed*. Different questions, not redundant
+ones.
 
 ## An answer to a question you did not ask
 

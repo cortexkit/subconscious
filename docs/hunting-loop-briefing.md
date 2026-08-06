@@ -114,6 +114,7 @@ Before calling a class closed:
 | 27 | Did an unverified premise *close* a direction rather than open one? | A wrong premise that opens gets tested by whoever builds it; one that closes is never tested, because nothing downstream exists to fail |
 | 28 | Did repairing the instrument invalidate the safety readings taken with the broken one? | A broken tool reports "nothing here" and a fixed one reports what is there; a check carried across the repair was answered by the broken version |
 | 29 | Was the control run in a state where the failure it guards against *could* occur? | A control run where the fault is impossible proves the check runs, not that it can detect — and it passes for the right reason, so nothing looks wrong |
+| 30 | Having tightened one rule of a test double, did you enumerate its others? | A double is a set of independent permissions; fixing one teaches nothing about the rest, and each remaining one certifies a different broken client |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3155,6 +3156,44 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A test double is a set of independent permissions
+
+One simulated cloud service, three separate permissive rules, all found in a
+single day and each one certifying a different broken client:
+
+1. It accepted **any** sequence-to-object binding — which certified a retry loop
+   that could never converge, because the real service compares the two and
+   refuses a mismatch.
+2. Its object store **overwrote unconditionally** — which certified a client that
+   re-encrypted its payload on retry, because the real store is write-once and
+   content-bound and rejects different bytes under a bound identifier.
+3. Its error bodies were **shaped differently** from production's — harmless
+   against the current substring matcher, and it would certify any future
+   matcher that parses the body as structured data.
+
+The sequence is the lesson. Each was independently permissive, and **fixing the
+first two taught the author nothing about the third.** Modelling one rule of a
+double does not reveal the others; the third surfaced only from deliberately
+enumerating what else the double still allowed.
+
+So the rule is not "tighten the double when a bug escapes it" but: **having found
+one permissive rule, enumerate the rest.** The count is finite and the list is
+writable. What is not discoverable is which of the remaining ones your next
+change will depend on.
+
+The general form: **a double must not make a client look correct for a reason
+production would not grant.** Every permission it extends beyond the real service
+is a green test waiting for a client that leans on it.
+
+Worth noticing that the second defect was caught by *reading the production
+service* rather than by any test, and the third by enumeration rather than by a
+failure. Neither had a failing test to lead the way, because the double was the
+thing preventing one.
+
+Record what remains permissive rather than quietly fixing everything mid-flight.
+A written list of known-permissive rules is a map of where the next false green
+will come from.
 
 ## A control run where the fault cannot occur
 

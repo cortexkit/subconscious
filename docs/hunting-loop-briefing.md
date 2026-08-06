@@ -149,6 +149,7 @@ Before calling a class closed:
 | 62 | Do both ends spell the same location the same way? | A symlink makes one side report the resolved path and the other the logical one; both are correct, neither can see the other's spelling |
 | 63 | Is the survivor a survivor, or does it match everything? | A row with a NULL scope key matches every scope, and reads as evidence of a partial failure when the truth is a scope change |
 | 64 | Diagnosing shared infrastructure — did you check the provider's status page first? | It is the cheapest instrument and the one skipped when you already have a hypothesis; one success of your own refutes total unavailability, not an outage |
+| 65 | You wrote a caveat — would the conclusion change if the caveated item were deleted? | If not, the caveat was decoration: it discharges the obligation to be rigorous without doing any of the work |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3495,6 +3496,29 @@ against the obvious source.**
 The distinction still matters when it applies — an outage means wait, contention
 means retry, a per-repository limit means check quotas — but establishing *which*
 starts with the provider's own status, not with my sample of one.
+
+### Stating the caveat is not the same as letting it change the conclusion
+
+The team that filed the original report made the mirror-image error, and named it
+better than I could have.
+
+Their evidence was a pattern across four repositories, and they had **explicitly
+flagged one of the four as inadmissible** — its last run predated the event. Then
+they drew the conclusion from the pattern anyway.
+
+That is worse than not noticing, because **the caveat discharges the obligation
+without doing the work.** Having said the honest thing, the reasoning feels
+rigorous, and the conclusion passes through unchanged. The check for it: after
+writing a caveat, ask what the conclusion would be if the caveated item were
+simply deleted. If the answer is *the same*, the caveat was decoration.
+
+Both of us skipped the same one-request instrument, from opposite directions — I
+had a hypothesis I preferred, they had an investigation they were enjoying. They
+had run a fleet-wide repository sweep, a configuration diff across the boundary, a
+four-way comparison and per-attempt job data: vastly more work than the request
+that would have ended it. **The cheap instrument is not skipped because it is
+expensive. It is skipped because it would end the investigation**, and by then the
+investigation has become the thing you are doing.
 
 ### Two failures that render identically
 

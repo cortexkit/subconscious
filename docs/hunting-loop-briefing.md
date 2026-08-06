@@ -107,6 +107,7 @@ Before calling a class closed:
 | 20 | Did you write down the *invariant* or the *remedy*? | A remedy answers the site that broke; an invariant makes the next question mechanical and finds the siblings |
 | 21 | For each step in a runbook or checklist: can you name the surface and the field that answers it? | A step nobody traced to a real field is prose, and the operator finds an adjacent signal and reads it as the check |
 | 22 | Is the key you store a record under at least as broad as the broadest statement stored under it? | A statement about an account, keyed by device, fences one device; the siblings walk through, and every key component is stable so a mutability check passes it |
+| 23 | Where one side produces artifacts the other must consume: which of theirs does nothing of yours read? | Erosion leaves a deletion someone can review; a gap that never closed leaves no diff at all, and the reachability guard that proves the directory resolves reads as proving coverage of it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3148,6 +3149,40 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A gap that never closed leaves no diff
+
+A cross-language conformance suite read its fixtures from a directory the other
+language owns. It carried the non-vacuity guard you would want: list the
+directory, assert the list is non-empty, assert a known member is present. That
+closes the case where a bad path silently resolves to nothing, and it is the
+reason the suite looked trustworthy.
+
+It consumed seven of twenty fixtures.
+
+The guard proves the directory is REACHABLE. Nothing in it speaks to coverage OF
+the directory, and the two read alike at a glance. So a fixture lands on the
+producing side, nothing on the consuming side reads it, and the suite stays green
+forever.
+
+This is worse than the erosion case it resembles. When coverage is LOST, a file
+was deleted and that deletion appears in somebody's review; there is a
+before-state to compare against. When coverage NEVER EXISTED, there is no event
+at any point: no deletion, no failure, no moment at which anything changed.
+Nothing looks wrong because nothing happened.
+
+The instrument is a set difference — which of the producer's artifacts does
+nothing of mine consume — and it must be **reported, not asserted**. Pinning an
+expected fixture count would fail the consuming side for a legitimate addition on
+the producing side, which is the typed-in-number class one section above; the
+directory is observed, not owned. Naming the unconsumed members is a coverage
+fact, and coverage facts belong where a person reads them rather than in a
+pass/fail.
+
+One caution when the check comes back clean, because a null from a
+just-written instrument is the weakest reading available: plant an unreferenced
+artifact, confirm the check names it, remove it. A clean set difference is worth
+something only after the instrument has been seen to find one.
 
 ## A check that compares a measurement to a typed-in number
 

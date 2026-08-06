@@ -97,9 +97,18 @@ only — the worker half needs its own reviewed gate.
 7. **Verify by inode, per module.** Then each owner runs their own acceptance,
    including at least one mutating call — a read-only health route proves the
    service is serving and nothing about the write path.
-8. **Sweep every store and its `-wal`/`-shm` siblings for `0600`.** Nine must
-   flip; the three already correct are the control proving the check can read a
-   correct state.
+8. **Sweep every store, its `-wal`/`-shm` siblings, and the module's `.lease`
+   for `0600`.** Nine must flip; the three already correct are the control
+   proving the check can read a correct state.
+
+   The lease is the other half of the same fix and carries a *different* risk.
+   A readable store is a confidentiality problem; the lease is the single-writer
+   fence, so anything able to write it can forge the epoch readers use to detect
+   a stale writer — an integrity problem. Both are world-readable today.
+
+   Scope the sweep to supervised module directories. Thousands of lease files
+   exist under scratch rigs and other tooling, two of those rigs are dead, and
+   folding them in makes the result noisy enough to hide a real regression.
 
 Health rows are not uniformly trustworthy immediately after a restart, and the
 reason differs per module. One owner computes their status fresh at probe time,

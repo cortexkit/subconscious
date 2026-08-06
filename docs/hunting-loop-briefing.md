@@ -133,6 +133,8 @@ Before calling a class closed:
 | 46 | Did anything verify the *destination*, or only the artifact? | Identity checks answer "is this the right file" and say nothing about "does the consumer read from here" — two directories, one filename, and every check passes |
 | 47 | When two careful people disagree on a fact, are they describing the same object? | Both measurements can be correct about different things; the ambiguity hides in the definite article, not in the reading |
 | 48 | Does the assertion bound a duration, or prove the mechanism by contrast? | A wall-clock bound is a property of the run, not the code — it fails once, under load, when a false alarm is most expensive |
+| 50 | Do sibling arms of the same dispatch agree on how they match? | Each arm is defensible read alone and wrong beside its neighbours — a diff shows one arm, so review structurally cannot see it |
+| 51 | Did you mutate toward the mistake a future fixer would make, not only toward the original bug? | The plausible wrong fix is the one a green suite blesses |
 | 49 | Once the live symptom is fixed, is a test the only remaining witness to the defect? | Then that test must be proven red against the pre-fix code, or it is indistinguishable from coverage and quietly retires the finding |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
@@ -3210,6 +3212,37 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## Sibling arms that disagree on how they match
+
+A lookup mapped credential identifiers to providers through six arms. Four
+matched by prefix; two matched exactly. The store issues a family's first
+credential under a bare identifier and every additional one under a suffixed
+variant — so the two exact-match arms accepted **only the first account**, and any
+second account under those two providers silently fell through.
+
+Neither exact-match arm is wrong read alone. **They are wrong beside their
+neighbours** — written by different hands months apart, each locally reasonable.
+A diff shows one arm, so code review structurally cannot see this; it is only
+visible by reading the arms *as a set* and asking whether they agree on their
+matching discipline.
+
+The failure was the usual absence: a warning on standard error, the provider
+still serving its first account, health reporting fine, the accounting identity
+balancing, nothing on the wire. **Capacity nobody mentioned is indistinguishable
+from capacity never bought.**
+
+Two things the fix got right:
+
+**The test enumerates the families and asserts the property once**, rather than
+adding a case per provider. A per-provider suite passes forever while the seventh
+arm reintroduces the defect.
+
+**The mutations included the wrong-fix direction** — widening an arm so one
+vendor's identifiers also match another's, which would publish one pool as
+another's capacity. Most mutation testing aims at the original bug; the more
+valuable aim is **the plausible mistake a future fixer would make**, because that
+is the one a green suite blesses.
 
 ## When a test is the last witness
 

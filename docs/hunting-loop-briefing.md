@@ -163,6 +163,7 @@ Before calling a class closed:
 | 76 | Writing a rule — which of its terms would a careful reader have to guess? | That term will be filled in wrong, with the nearest available value, by someone following the rule correctly |
 | 77 | Who does this fix arm? | Applying a rule to something already carrying a wrong value converts a dormant defect into a live one; the trigger is the remediation |
 | 78 | "Fixed" — in the place it was *made* true, or the place it must *be* true? | Merged is not deployed, published is not consumed, written is not read; two parties reading the same correct-but-wrong-scoped source will agree |
+| 79 | Handing something over — are you publishing values that *discriminate* it, or values that *describe* it? | A hash describes; an identity discriminates. Publishing the discriminating value is what lets the author find their own error first |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3557,6 +3558,33 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## Publish the value that discriminates, not the one that describes
+
+Preparing a joint test run surfaced five distinct defect classes before a single
+step of it executed. The tempting conclusion is that careful preparation pays.
+That is not what happened.
+
+Every one came from **the preparation forcing someone to state a claim precisely
+enough to be wrong in public.** Someone published a rule about keeping an identity
+stable, then had to say *which* identity, and found they had guessed. Someone
+asserted four items were closed, then had to say *where* closed, and the ancestry
+check fell out. Someone published a hash, then had to say which of two siblings,
+and the discriminating fact turned out to be the signature rather than the digest.
+
+Each was a claim made specific enough that **its own author could check it.** The
+test run would have found the same defects — one at a time, several steps in, each
+presenting as something else. **The difference is attribution, not detection.**
+
+So the transferable rule is narrower than "prepare more carefully": when handing
+over an artifact, **publish the values that discriminate it, not the ones that
+describe it.** A hash describes; an identity discriminates. "Closed" describes; an
+ancestry relation discriminates.
+
+The person who measured the wrong sibling put it best: they verified by hash when
+the discriminating fact was the signature — **and the hash was correct, which is
+exactly what made it useless.** A right answer to the wrong question is the whole
+family in one line.
 
 ## Closed where it was made true, open where it must be
 

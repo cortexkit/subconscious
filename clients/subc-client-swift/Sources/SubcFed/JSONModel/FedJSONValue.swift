@@ -76,10 +76,6 @@ public indirect enum FedJSONValue: Sendable, Equatable, Codable {
             self = .null
             return
         }
-        if let value = value as? Bool {
-            self = .boolean(value)
-            return
-        }
         if let value = value as? String {
             self = .string(value)
             return
@@ -89,14 +85,32 @@ public indirect enum FedJSONValue: Sendable, Equatable, Codable {
             return
         }
 
-        // Swift's Bool check above is intentional. Foundation bridges Bool to
-        // NSNumber, and treating it as 0/1 changes the worker call's meaning.
+        // The boolean test must run through CoreFoundation's type identity, and it
+        // must run BEFORE any `as? Bool` cast. Foundation bridges numbers and
+        // booleans to a common NSNumber, and `NSNumber(0) as? Bool` SUCCEEDS — so a
+        // Bool-first cast claims the integers 0 and 1 and sends them as `false` and
+        // `true`. Every other integer is unaffected, which is why this presented as
+        // isolated call failures rather than as a broken encoder.
         if let value = value as? NSNumber {
             if CFGetTypeID(value) == CFBooleanGetTypeID() {
                 self = .boolean(value.boolValue)
                 return
             }
             try self.init(number: value, depth: depth)
+            return
+        }
+
+        // Unreachable on iOS and macOS, the only platforms this package targets: a
+        // native Bool bridges to NSNumber, so the CoreFoundation test above already
+        // claims it. Verified by deleting this branch — the boolean tests still
+        // pass. It is retained as a guard for a Foundation without that bridge,
+        // where its absence would silently encode real flags as 1 and 0.
+        //
+        // It must stay BELOW the NSNumber branch. Above it, `NSNumber(0) as? Bool`
+        // succeeds and every 0 and 1 leaves as a boolean, which is the defect this
+        // ordering fixes.
+        if let value = value as? Bool {
+            self = .boolean(value)
             return
         }
 

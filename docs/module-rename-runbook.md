@@ -64,9 +64,25 @@ never examined, because nobody re-derives a number that agrees with them.
 4. Move the directory; apply the identity change; reconcile.
 5. **Verify the minted identifier** before declaring anything.
 6. **Restart the resident** so it re-binds to the real path.
-7. **Remove the link** — but only once the resident's own record names the new
-   path. Under path canonicalization the link is what makes the old spelling
-   resolve correctly, so removing it early takes a healed system back to broken.
+7. **Remove the link, then have the resident act.** Do not verify by comparing
+   path strings: a working directory is stored by the kernel as an inode, so a
+   process reading it through the system call always sees the resolved path, while
+   a shell hands back the logical path it remembered. Which string appears depends
+   on how it was obtained, and that is not visible from inside — so the check can
+   read *new* while running on the link, or *old* while correctly rebound.
+   Ambiguous in both directions is not weak evidence; it is none.
+
+   Remove the link first and have the resident run a command. Genuinely rebound,
+   everything works. Still on the link, its tools fail immediately with a plain
+   "no such file or directory" — the same failure as an unprepared rename, but
+   triggered deliberately while someone is watching and can restore the link in
+   one command, instead of surfacing days later when someone clears out stale
+   links.
+
+   Note the interaction with path canonicalization: while the old spelling is
+   still recorded anywhere that matters, the link is what makes it resolve
+   correctly. Remove it before that is true and a healed system goes back to
+   broken.
 
 Steps 6 and 7 are the ones that get dropped. A resident left running through a
 rename works today and breaks whenever someone tidies up.

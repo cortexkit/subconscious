@@ -102,8 +102,21 @@ So the dangerous command must be **absent** from the placement procedure rather
 than present with the right flag. A pin is not sticky: any later signature without
 an explicit identifier silently reverts it.
 
-Use a distinct identifier per environment — a development build must never share
-a principal with production, or it can inherit that grant invisibly.
+**The identifier must match the filename the binary is deployed as**, read from
+the consumer's configuration — not the name it was built as. Requiring stability
+across rebuilds is not enough on its own: someone will fill in the only name in
+front of them, which is the artifact's build-time filename, and a test build then
+carries production's identity and inherits its grants. Nothing is denied and
+nothing is logged, which is what makes it a problem rather than an error.
+
+Stated this way it is checkable in one line per binary rather than something to
+remember: read the deployed names from the configuration, read each binary's
+identifier, and compare.
+
+Expect three distinct forms when you sweep. An identifier matching the deployed
+name is correct. One ending in a long hex string was derived by the signing tool
+because no identifier was given. One carrying an *underscore* and a short hash is
+the build tool's own linker-applied identity — never signed by anyone.
 
 **Apply that rule at stage time, never at placement.** If a test artifact arrives
 carrying the production identifier and others have already verified its hash,

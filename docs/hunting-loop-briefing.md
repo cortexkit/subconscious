@@ -128,6 +128,7 @@ Before calling a class closed:
 | 41 | Does an error return skip the readback that decides whether the mutation landed? | Propagating the error abandons the only step that can tell "failed" from "succeeded, reply lost" — and every retry then fails correctly, forever |
 | 42 | Did you change an artifact after someone verified it, and republish the new value? | A fix applied after verification invalidates the verification, and the more thorough the original check the more expensive the silent invalidation |
 | 43 | Is a broken state available right now that you have been unable to test against? | The failing direction of a check is only testable while something is genuinely broken — spend an outage on the measurement, not only the recovery |
+| 44 | When renaming an identifier, did you sweep where it is an *authority* reference and not only a *routing* one? | Nothing that resolves routes ever touches a grant list, so it survives every sweep driven by "what breaks if this name is wrong" |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3204,6 +3205,39 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## An identifier used as an authority, not a route
+
+A module was renamed and every consumer swept: routing config, module ids,
+monitoring, client targets, documentation. A phone lost **all** access to the
+fleet anyway.
+
+The missed file was a federation profile granting a paired device a list of
+operations, each naming the module it may call. That is the one place the module
+id is an **authority reference** rather than a routing one — so nothing that
+resolves routes ever reads it, and it survives every sweep driven by "what breaks
+if this name is wrong".
+
+The symptom is what makes it dangerous. **The transport connected fine and every
+surface came back empty.** The device could not distinguish "you have no access"
+from "there is nothing here", and neither could the server: the grants named a
+module that no longer existed, so nothing resolved, and nothing objected.
+
+Confirmed at the log: **the daemon drops grants naming a missing module
+silently** — no warning across the whole window, verified against a control
+showing the search does find warnings. So a rename anywhere in a fleet can revoke
+a device's entire access with no error at either end.
+
+Two rules:
+
+**When renaming an identifier, enumerate where it is an authority reference
+separately from where it is a routing reference.** Grant lists, allowlists,
+policy files, capability manifests. A routing reference fails loudly on the next
+call; an authority reference fails as absence.
+
+**A grant naming an unknown subject should say so.** Fail-loud is arguable —
+silence is not, because the failure surfaces as a working connection with no
+content, which reads as "nothing to show" rather than "you were denied".
 
 ## A check whose passing state is also its null state
 

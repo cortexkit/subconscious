@@ -30,8 +30,19 @@ Supervised binaries behind their own master:
 | `ck-thalamus` | 54h | 18 |
 | `ck-subc` (daemon) | 264h | 12 |
 
-Additionally behind the shared `commons` crates, which carry the store-permission
-fix that creates database files `0600` rather than world-readable: `ck-astrocyte`,
+**Measured directly rather than inferred:** nine module stores are currently
+`0644`, including every `-wal` and `-shm` sibling; three are already `0600`. The
+three correct ones are the modules whose binaries already carry the fixed crate,
+which makes **the file mode a direct observation of whether the fix is running**
+— better than trusting that a rebuild carried it. The WAL sibling is the
+load-bearing half: recently committed rows live there before checkpointing, so a
+permissive WAL exposes the newest data while the `.db` file reads correct. A
+check on `store.db` alone passes on all nine.
+
+Backup copies keep whatever mode they were taken with and no reopen fixes them,
+so they are swept separately rather than counted in a fleet-wide result.
+
+Behind the shared `commons` crates, which carry that fix: `ck-astrocyte`,
 `ck-credentials`, `ck-engram`, `ck-mc`, `ck-plexus`, `ck-callosum`,
 `ck-subc-mcp`, `ck-thalamus`. **Those get the fix for free from any rebuild** —
 no separate step, which is why store permissions is not its own line item below.
@@ -63,6 +74,11 @@ only — the worker half needs its own reviewed gate.
 
 ## Ordering, and why
 
+0. **The credentials vault restarts first, alone, and is then excluded from the
+   bounce.** Its owner ruled this rather than me: the vault is a dependency of
+   several modules, so it gets its own verification and its own rollback
+   decision before anything else moves. If its acceptance fails, the window does
+   not proceed.
 1. **Engram's drain finishes first.** Three generations are staged and uploading.
    Restarting mid-drain is recoverable but pointless.
 2. **Stage every new binary while modules keep running.** A remove-first copy
@@ -70,13 +86,27 @@ only — the worker half needs its own reviewed gate.
    front-loads all the risky building outside the outage.
 3. **Each owner verifies their own staged artifact** before the window: version
    probe, warm exec, whatever symbol check they specify. An owner is the only one
-   who knows what discriminates their build.
+   who knows what discriminates their build — and, just as usefully, what does
+   *not*. Owners have so far ruled out a version string identical across both
+   builds, a catalog count identical before and after, and a marker that reads
+   zero in old and new alike. Each of those would have passed against a stale
+   binary.
 4. **Stop broca, move its state, leave it stopped.**
 5. **Stop the executive modules, move their stores, edit the daemon config.**
 6. **One daemon bounce.** Everything comes up on new binaries with new config.
 7. **Verify by inode, per module.** Then each owner runs their own acceptance,
    including at least one mutating call — a read-only health route proves the
    service is serving and nothing about the write path.
+8. **Sweep every store and its `-wal`/`-shm` siblings for `0600`.** Nine must
+   flip; the three already correct are the control proving the check can read a
+   correct state.
+
+Health rows are not uniformly trustworthy immediately after a restart, and the
+reason differs per module. One owner computes their status fresh at probe time,
+so a disagreement between the supervisor's row and a fresh probe is the
+supervisor's cache. Another serves a cached snapshot by design, so their row is
+eventually-consistent for roughly fifteen seconds and a live call is the truth.
+Ask per module rather than assuming one shape.
 
 Steps 4 and 5 are the only ones with data motion, and both are separated from
 the id change deliberately: if a spawn fails afterwards, the stores are already

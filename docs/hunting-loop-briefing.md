@@ -105,6 +105,7 @@ Before calling a class closed:
 | 18 | What does this test double *refuse* — and can it refuse *selectively*? | A route that never refuses certifies both answers; a rejection that is all-or-nothing makes every partial-failure interleaving unreachable |
 | 19 | For a capability grant: what can the granted set do *in combination*? | Rows enter a table one at a time and are read back one at a time, so a composition has no moment at which anyone looks at it |
 | 20 | Did you write down the *invariant* or the *remedy*? | A remedy answers the site that broke; an invariant makes the next question mechanical and finds the siblings |
+| 21 | For each step in a runbook or checklist: can you name the surface and the field that answers it? | A step nobody traced to a real field is prose, and the operator finds an adjacent signal and reads it as the check |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4665,3 +4666,37 @@ speculative hardening proposal rather than a triggerable defect, stop." A good
 one binds in both directions — that rule would have ended the loop on a weak
 round, and it also refused to allow stopping on a real defect when stopping
 would have been the tidier ending.
+
+## Name the field a checklist step will read
+
+A runbook step that has never been traced to a real surface is prose. It reads
+exactly like a step that was, and the difference only shows under the pressure
+of actually running it.
+
+The case: a migration runbook said to confirm, after the move, that the module
+appeared in the backup service's module set with its declared entries — a
+deliberate positive check, written because absence of an error cannot separate
+"enrolled and capturing" from "enrolled and inert." The reasoning was right and
+two people agreed on it. Nobody looked at the reply an operator would read. It
+reported a count of *planned* entries, so the one module whose data was never
+captured rendered identically to one capturing gigabytes. The step would have
+been performed, its expected output seen, and the window closed with more
+confidence than it opened — about a backup that did not exist.
+
+So the check would not have failed to confirm. It would have confirmed the wrong
+thing, convincingly, which is worse than having no step at all: an operator who
+finds an adjacent signal reads it as the check and stops looking.
+
+Two things follow. Name the surface and the field for every step *before* the
+window, because it is cheap in advance and cannot be done honestly mid-procedure
+with a daemon stopped. And when a field cannot answer, prefer deleting the step
+and saying so plainly over qualifying it — a qualified step still gets run, and
+the qualification is the first thing that drops under time pressure.
+
+The underlying shape is broader than runbooks: a signal that is *correct for the
+question it answers* and read as answering a neighbouring one. Three instances
+landed in a single evening — a rule stated in terms of one column when an
+earlier column decided the outcome, a descriptor entry read as coverage when it
+only ever meant discovery, and this count. In none of them was anything broken
+or lying. The reading sat adjacent to the meaning, and every layer reported
+success.

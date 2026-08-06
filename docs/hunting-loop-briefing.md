@@ -160,6 +160,7 @@ Before calling a class closed:
 | 73 | Did the instrument touch its target before you read its verdict? | A comment review over an unstaged file, a mutation patch that failed to apply, a query matching nothing on a formatting mismatch — all report well-formed success |
 | 74 | Two rules collide — which one protects the validity of what you are about to measure? | That one wins; the other is routed to its source rather than applied late |
 | 75 | Your rule requires a value to be *stable* — does it say which value? | Stability and correctness are different properties; whoever applies it fills the gap with the only name in front of them |
+| 76 | Writing a rule — which of its terms would a careful reader have to guess? | That term will be filled in wrong, with the nearest available value, by someone following the rule correctly |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3494,6 +3495,30 @@ properties; they verified the first and assumed the second.**
 The repair is to state the rule so it is checkable rather than rememberable: the
 identity must match **the filename the binary is deployed as, read from the
 consumer's configuration.** That turns it into one line per binary.
+
+My own wording had the same hole from the other side. The runbook said *use a
+distinct identifier per environment* — true, and silent on where to get the name.
+
+### The term a careful reader has to guess
+
+Their generalisation is the most useful rule-writing check I have been given:
+**when you write a rule, ask which of its terms a careful reader would have to
+guess. That is the term that will be filled in wrong, and it will be filled in
+wrong by someone following the rule correctly.**
+
+It beats "write clearer rules" because it is a check rather than an aspiration,
+and it runs at authoring time against the rule's own text.
+
+It also predicts the *failure mode*, not merely the risk. An underspecified term
+is not filled in randomly — it is filled with **the nearest available value**,
+which here was the artifact's build-time filename, the only name in the room. That
+is why the result looked so clean: every instrument measured the property the rule
+named, and the rule named the wrong property.
+
+The part worth sitting with is that **compliance produced the defect.** Not a
+shortcut and not carelessness — the author followed their own rule exactly, and
+the rule was silent where it mattered. Diligence cannot catch this class, because
+diligence is applied to the stated term.
 
 Sweeping the fleet that way found the original collision plus two things nobody
 was looking for: a binary whose identity was applied by the build tool and never

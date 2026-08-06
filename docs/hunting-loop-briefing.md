@@ -3179,6 +3179,20 @@ The result reads as "the local path won, slowly", which is why it survived: the
 fast path *did* win. It simply could not be served while nothing was looking at
 it.
 
+**The API shape invited the mistake.** The client called something that looked
+like a constructor — it took values and returned a candidate — and it committed a
+remote machine to a sixty-second wait. Nothing at the call site suggested a
+remote effect. **A call that obligates another machine should not be
+indistinguishable from building a value**, and the durable fix is at the seam:
+make side-effecting and pure options different types, so a caller cannot treat
+them alike and a racing caller cannot include the wrong one. Documenting the
+ordering rule is the weaker version of the same fix.
+
+That also bounds where parallelism is safe. **Racing a side-effecting option is
+worse than trying it serially**, because a race *guarantees* the side effect
+happens even in the case where it turned out unnecessary. Race only what costs
+nothing on failure, anywhere.
+
 Two generalisations worth more than the bug:
 
 **An already-established cheap outcome should pre-empt a speculative expensive

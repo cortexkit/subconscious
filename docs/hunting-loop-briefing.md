@@ -189,6 +189,7 @@ Before calling a class closed:
 | 102 | Does this frozen set contain anything whose correctness depends on the outside world? | A tracking surface inside an immutable set is a contradiction that surfaces the first time the tracked thing moves |
 | 103 | Your blast-radius map was wrong once — what is the chance it is complete now? | Being wrong about a map is evidence about the mapping process, not only about that map |
 | 104 | Concluding something was not retained — where would it be retained if it were? | An absence found by searching one medium is scoped to that medium; a filesystem search says nothing about a database |
+| 105 | You recovered the record — is it a document or a patch? | Applying a patch as a document silently drops everything the patch did not touch, and the result is internally consistent either way |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4264,6 +4265,32 @@ end into a two-minute lookup.
 They were also right to stop rather than reconstruct the missing material.
 **Fabricated normative content is indistinguishable from the real thing on
 review**, and would have shipped as a decision nobody made.
+
+### Then I made the same mistake one layer down
+
+I extracted the recovered record and handed it over as though it were a complete
+document. **It was a patch** — its own text says sections are retained or replaced
+— so applying it whole would have silently dropped everything that round did not
+touch. They caught it.
+
+Same shape as the error I had just corrected in them: they read an absence in one
+medium as an absence everywhere; I read a record's presence as its sufficiency.
+**Both of us stopped at "I found something" rather than asking what the thing is.**
+
+The evidence was in my own output. My summary listed one section at a quarter of
+the size they later recovered from a different source — **a fourfold shortfall
+sitting in a table I printed and did not read.**
+
+Their better source is worth generalising: they used **the payload actually sent**
+to the process, rather than the record of what it accepted. A sent payload cannot
+be incomplete without the operation itself having been incomplete, so it carries
+the full prior state by construction, while an accepted-changes record is a delta
+over a base you have to reconstruct.
+
+And one check remains before any such reconstruction is trusted: **verify the
+patch semantics rather than assuming them.** Whole-section replacement and
+within-section deltas require different application, and getting it wrong loses
+content invisibly, because the result is internally consistent either way.
 
 ### A live surface inside a frozen set
 

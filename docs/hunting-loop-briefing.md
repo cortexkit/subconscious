@@ -124,6 +124,7 @@ Before calling a class closed:
 | 37 | Does the column name describe what the column counts? | A narrower-than-it-sounds name reads as a defect to anyone who did not define it, and the suspicion outlives the question |
 | 38 | Is the uncalled component the most detailed description of intended behaviour? | Then it is read as documentation, and every capability it describes but the wired path lacks is a wrong conclusion waiting to be drawn |
 | 39 | Is an address or capability the peer *asserted* being treated as one you verified? | An assertion is a usable hint and nothing more; name it a hint in the type, or the first reader treats a claim as a fact |
+| 40 | Is the check's passing state also its null state? | Then it cannot detect the null — doing nothing satisfies it, so it reports success across a no-op |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3165,6 +3166,36 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A check whose passing state is also its null state
+
+During a deployment I restarted a module and verified it: the running process
+was executing the file at its deploy path. True, and worthless — **I had never
+copied the new binary into place**, so the deploy path still held the old one.
+The process and the path agreed because nothing had happened.
+
+That check cannot distinguish "staged and restarted correctly" from "never
+staged, restarted the same binary", because **both leave the system internally
+consistent**. It compares the system to itself, and doing nothing is the easiest
+way to be self-consistent.
+
+The rule: **a check whose passing state is also its null state cannot detect the
+null.** Coherence between two parts of a running system is not evidence that a
+change reached it. At least one acceptance step must compare against a value
+that came from **outside** — a hash the author stated, a count taken before, a
+reference artifact rebuilt independently.
+
+What caught it was the owner sending **both the old and the new hash**. The new
+one alone would have shown a mismatch and left me guessing; the old one named
+exactly which wrong state I was in. Publishing the value you expect to *not* see
+is what makes a comparison falsifiable rather than merely hopeful.
+
+The same shape appears wherever an instrument's failure and its success look
+alike: a text search returning zero for a control that has shipped for months, a
+generated test suite that silently produces fewer cases, a gauge reading zero
+because nothing wrote it. Ask what the instrument would report if the operation
+had not happened at all — if that is also the passing reading, the instrument is
+decorative.
 
 ## Uncalled code read as documentation
 

@@ -111,6 +111,7 @@ Before calling a class closed:
 | 24 | For a mechanism that produces a state: what does it do *in* that state? | Reviewers check what it does in the state that triggers it; the behaviour after it fires goes unspecified, so a fence blocks the tightening it should permit and a probe keeps running with nothing left to distinguish |
 | 25 | When a mutant survives: did the suite miss the behaviour, or did the mutation never happen? | Both read as "unproven". The second is a working bug that just demonstrated itself and got recorded as absence of evidence |
 | 26 | For each guard: is it checking the thing it protects, or something that merely correlates with it? | The correlation holds until the surrounding procedure changes shape, then the guard refuses the safe case and permits the dangerous one without a line of it changing |
+| 27 | Did an unverified premise *close* a direction rather than open one? | A wrong premise that opens gets tested by whoever builds it; one that closes is never tested, because nothing downstream exists to fail |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3152,6 +3153,43 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## An unverified premise that closes a direction
+
+Two people made the same error within hours: each asserted a property of code
+they had not read, as the *premise* for an argument rather than as its claim.
+The first proposed a design on it. The second used one to kill that design, and
+both were wrong.
+
+The two are not equally expensive, and the difference is worth naming because it
+inverts the usual intuition about which mistake to fear.
+
+A wrong premise that OPENS a direction gets tested. Somebody builds the thing,
+and the build meets the reality the premise misdescribed. The error surfaces,
+late and annoyingly, but it surfaces.
+
+A wrong premise that CLOSES a direction is never tested by anyone, because
+nothing downstream of it is ever built. There is no artifact to trip over, no
+failing test, no incident. The decision simply stands, and the reason it stands
+is a sentence nobody re-reads. **The false negative is the expensive one.**
+
+Worse, the closing argument tends to be stated with more force than the opening
+one, because refusing feels like the conservative act. "That would create a
+permanent oracle for an unauthenticated caller" ends a conversation. What the
+source actually said, once read, was that freshness and replay are checked before
+dispatch, so the exposure was bounded to a five-minute window rather than
+unbounded — a real cost, but one worth a different answer.
+
+So: when a premise is about to close something, hold it to the standard you would
+hold a claim. Read the function. And when the correction comes, **replace the
+reasoning at the site**, not just the conclusion, or the next person inherits the
+belief rather than the reading.
+
+The vacuity guard from the same episode is worth copying. The corrected behaviour
+was pinned with tests proving replay is refused and expiry is refused — and a
+third proving that a fresh request with a wrong value genuinely REACHES the check
+at all. Without the third, the first two are satisfied by a world where nothing
+ever reaches that check: identical greens, zero information.
 
 ## A guard that checks a proxy for the thing it protects
 

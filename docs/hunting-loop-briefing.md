@@ -142,6 +142,7 @@ Before calling a class closed:
 | 55 | Did the search you are quoting actually finish? | An absence asserted from an unfinished search is a fact about nothing, and it is published with the confidence of a completed one |
 | 56 | Is the resource being *consumed*, or *retained*? | A falling number looks identical either way, and every search for a writer is wasted when nothing is writing |
 | 57 | Does your existence check discriminate, or does it pass the worst case? | "The path exists" admits a live-but-wrong target; the shape of the path is the test that separates them |
+| 58 | Is the state keyed on the thing you are renaming a *cache* or a *fence*? | A lost cache announces itself as slowness; a lost fence reports a clean start, and by the time it is visible the irreversible act has happened |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3218,6 +3219,42 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## Renaming past a fence
+
+Planning a set of module renames, I enumerated the state keyed on the old names:
+routing tables, permission lists, peer registries, worktree backpointers. All of
+it fails as **silence**, and all of it is repairable afterwards by re-pointing.
+
+The module's owner named the case I had missed. Their crash-safety journal — the
+record that prevents a banked credit being spent twice — lives under a path
+derived from the binary name. If a rename moves that directory, **the new binary
+starts with an empty journal, and an empty journal is indistinguishable from a
+journal with nothing pending.** The module reports healthy either way. The
+failure is spending something real, twice.
+
+So the classification that matters before any rename is **cache or fence**:
+
+- A **cache** keyed on the old name fails as slowness. It announces itself, and
+  rebuilding costs time.
+- A **fence** keyed on the old name fails as a *clean start*. Nothing reports a
+  fence failure, because a fence with no history looks exactly like a fence with
+  nothing to stop.
+
+Caches can be repaired after the fact. Fences must be migrated **before** the
+flip, and verified with a check that distinguishes *legitimately empty* from
+*empty because it moved* — inspect the pending set, not the file's existence.
+
+The owner's own sentence is the one to keep: *"renamed and healthy will look
+identical whether or not I got this right."* Health is not evidence for a
+property health does not measure.
+
+The same owner sharpened a check I had been broadcasting. I had said: after
+re-registering, confirm the bound directory exists. **During a rename both the
+old and new paths may exist simultaneously**, so an existence check passes for the
+old path throughout the exact window in which messages are silently going
+nowhere. The check must be that the bound directory **is the new root** — a
+positive identity, not an absence.
 
 ## An existence check that passes the worst case
 

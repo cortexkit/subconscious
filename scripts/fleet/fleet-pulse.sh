@@ -548,7 +548,13 @@ print("|".join(f"^{d}/" for d in dirs))
   # obvious guess is the most important one.
   printf '  %-20s is %sh behind %s master, %s runtime file(s) unshipped -- ask the owner\n' \
     "$binname" "$gap_h" "$repo" "$n"
+  # SAY WHEN THE LIST IS A SAMPLE. This printed three names with no indication
+  # that more existed, and during a live incident I read those three as the
+  # unshipped set and told the owner their fix was not among them -- it was, in
+  # a file the truncation hid. A count in the line above plus an unmarked list
+  # below reads as a count and its contents, not as a count and a sample of it.
   echo "$runtime" | head -3 | sed 's/^/      /'
+  [ "$n" -gt 3 ] && printf '      ... and %s more (sample only -- do not read these 3 as the set)\n' "$((n - 3))"
   printed=1
 done <<EOF
 $modmap

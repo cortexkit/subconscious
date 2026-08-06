@@ -108,6 +108,7 @@ Before calling a class closed:
 | 21 | For each step in a runbook or checklist: can you name the surface and the field that answers it? | A step nobody traced to a real field is prose, and the operator finds an adjacent signal and reads it as the check |
 | 22 | Is the key you store a record under at least as broad as the broadest statement stored under it? | A statement about an account, keyed by device, fences one device; the siblings walk through, and every key component is stable so a mutability check passes it |
 | 23 | Where one side produces artifacts the other must consume: which of theirs does nothing of yours read? | Erosion leaves a deletion someone can review; a gap that never closed leaves no diff at all, and the reachability guard that proves the directory resolves reads as proving coverage of it |
+| 24 | For a mechanism that produces a state: what does it do *in* that state? | Reviewers check what it does in the state that triggers it; the behaviour after it fires goes unspecified, so a fence blocks the tightening it should permit and a probe keeps running with nothing left to distinguish |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3149,6 +3150,45 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A mechanism that is specified only in its triggering state
+
+Two findings landed a round apart, in the same design, from the same blind spot.
+Both were mine to have caught, and I passed both.
+
+The first: a latch that fires when a producer's authority counter regresses. It
+refuses new admissions and lets established sessions age out on their last known
+good policy. I checked what it prevents and what it deliberately permits, and
+approved it. What nobody asked was WHAT LEGITIMATE OPERATIONS IT BLOCKS — and a
+latched org cannot install new policy, *including policy that reduces access*. A
+security-tightening action, blocked by a security mechanism. The fail-closed
+state prevents further closing.
+
+The second: the probe that decides whether a stale-looking artifact is delivery
+reordering or a genuine regression. Correct, and specified entirely for the
+period BEFORE it answers. After the latch is confirmed the probe has nothing left
+to distinguish, so every subsequent stale artifact starts another one — work with
+no possible outcome, aimed at a system already known to be in trouble.
+
+The common shape: **a mechanism defined by its behaviour in the state that
+triggers it, silent about its behaviour in the state it creates.** Review
+naturally follows the trigger, because that is where the reasoning lives and
+where the tests are. The post-state has no such gravity: nothing in the design
+document points at it, and by the time anyone is in it they are debugging
+something else.
+
+So the question to ask of any mechanism with a durable effect: after this fires,
+what does it do next time, what does it now block, and how does it end. A latch
+needs its release path; a probe needs its stopping condition; a fence needs the
+list of operations it must still permit.
+
+A useful sibling from the same round, on how the terminal case is encoded: an
+absent value meaning "never" is indistinguishable from "not yet set", and on a
+security state those have opposite consequences — one holds a fence forever, the
+other drops it the first time something reads the field expecting a value. Branch
+on an explicit severity or state marker and let the absent value be *required* to
+accompany it, so a mismatch between the two is detectable corruption rather than
+a silent default.
 
 ## A gap that never closed leaves no diff
 

@@ -305,6 +305,61 @@ final class FedAuditHardeningTests: XCTestCase {
         XCTAssertEqual(unsettled.count, 1)
     }
 
+    /// A module answering a pure query with an error must reach the caller as a
+    /// module error carrying the module's own code — not as a lost session.
+    ///
+    /// Reporting it as a disconnect is indistinguishable from the transport
+    /// dropping, so a caller retries a call that will refuse identically and the
+    /// module's reason never surfaces anywhere. The defect was live for weeks on
+    /// a phone client, where every remote refusal displayed as "lost the
+    /// connection" regardless of what the module had actually said.
+    func testModuleErrorOnPureQueryCarriesTheModuleCode() async throws {
+        let store = FedMemoryStateStore()
+        _ = try await store.open(localPublicKey: localKey)
+        let clock = FedFakeClock()
+        let admission = FedAdmissionController(
+            responderStaticPublicKey: responder,
+            configuration: .init(policy: try FedAdmissionPolicySnapshot(), peerMaxInFlight: 2),
+            clock: clock
+        )
+        let effectLog = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+        let transport = FedLoopbackByteTransport()
+        let engine = FedSessionEngine(deps: .init(
+            transport: transport,
+            store: store,
+            clock: clock,
+            localPublicKey: localKey,
+            responderStaticPublicKey: responder,
+            helloPolicy: try FedHelloPolicy(),
+            connectionAttemptID: String(repeating: "a", count: 32),
+            sharedAdmission: admission,
+            sharedEffectLog: effectLog
+        ))
+        try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
+
+        let admitted = try await engine.admitManagementCall(
+            moduleID: "alfonso-core",
+            method: "board.post",
+            params: FedJSONObject(["t": .string("x")]),
+            policy: try FedAdmissionPolicySnapshot()
+        )
+        do {
+            _ = try await engine.handleInboundTerminal(
+                effect: admitted.effect,
+                kind: "error",
+                body: Data(),
+                bodyOmitted: false,
+                errorCode: "not_a_member",
+                isMutation: false,
+                permit: admitted.permit
+            )
+            XCTFail("a module error must reach the caller")
+        } catch let error as FedFailure {
+            XCTAssertEqual(error, .moduleError(code: "not_a_member"))
+            XCTAssertNotEqual(error, .disconnected)
+        }
+    }
+
     // MARK: - Helpers
 
     private var mutateCatalog: String {

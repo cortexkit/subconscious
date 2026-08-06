@@ -504,7 +504,11 @@ public actor FedSessionEngine {
         openPureQuerySequences.remove(effect.seq)
         await admission?.release(permit)
         if kind == "error" {
-            throw FedFailure.disconnected
+            // A module that answers with an error envelope is not a lost session.
+            // Reporting it as one converts every remote refusal into a network
+            // fault, so the caller retries a call that will refuse identically and
+            // never learns the reason. Carry the module's own code through.
+            throw FedFailure.moduleError(code: errorCode ?? "unspecified")
         }
         return body
     }

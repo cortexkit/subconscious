@@ -150,6 +150,7 @@ Before calling a class closed:
 | 63 | Is the survivor a survivor, or does it match everything? | A row with a NULL scope key matches every scope, and reads as evidence of a partial failure when the truth is a scope change |
 | 64 | Diagnosing shared infrastructure — did you check the provider's status page first? | It is the cheapest instrument and the one skipped when you already have a hypothesis; one success of your own refutes total unavailability, not an outage |
 | 65 | You wrote a caveat — would the conclusion change if the caveated item were deleted? | If not, the caveat was decoration: it discharges the obligation to be rigorous without doing any of the work |
+| 66 | Reading a trend — are the points measurements of the same subject? | Real numbers in a real order across different subjects produce a convincing curve that describes nothing |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3508,9 +3509,30 @@ they drew the conclusion from the pattern anyway.
 
 That is worse than not noticing, because **the caveat discharges the obligation
 without doing the work.** Having said the honest thing, the reasoning feels
-rigorous, and the conclusion passes through unchanged. The check for it: after
-writing a caveat, ask what the conclusion would be if the caveated item were
-simply deleted. If the answer is *the same*, the caveat was decoration.
+rigorous, and the conclusion passes through unchanged. The check for it, and it works at the moment of
+writing rather than requiring discipline afterwards: **if removing the caveat
+would not change the conclusion, the caveat is decoration.** Theirs survived
+deletion untouched — the claim read identically with or without the sentence
+admitting one data point was inadmissible.
+
+### Reading a trend across different subjects
+
+I then made the same error in miniature, inside the correction itself. Told that
+one failure showed a single executed step and another showed zero, I wrote that
+their retries had produced *a degradation curve rather than a flat failure.*
+
+They checked and refuted it: **the two results were different runs on different
+commits, not attempts of one run.** Within the run actually retried, all three
+attempts were identical — zero steps every time. The only thing that grew was how
+long each waited before being cancelled, which is queue backlog, not progressive
+degradation.
+
+That is precisely the original error one level down: **taking measurements from
+different subjects and reading a trend across them.** Their first mistake was a
+pattern across four repositories; mine was a curve across two commits. In both
+cases the numbers were real, the ordering was real, and the subjects were not
+comparable — which is invisible unless you ask what each measurement was *of*
+before asking what they show together.
 
 Both of us skipped the same one-request instrument, from opposite directions — I
 had a hypothesis I preferred, they had an investigation they were enjoying. They
@@ -3519,6 +3541,10 @@ four-way comparison and per-attempt job data: vastly more work than the request
 that would have ended it. **The cheap instrument is not skipped because it is
 expensive. It is skipped because it would end the investigation**, and by then the
 investigation has become the thing you are doing.
+
+The operational form is blunter: **run the check that could end the investigation
+first, precisely because it might.** Once an investigation has momentum, the cheap
+check reads as an interruption to it rather than the point of it.
 
 ### Two failures that render identically
 

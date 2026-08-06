@@ -40,6 +40,13 @@ legitimately be zero cannot distinguish a migrated store from a fresh one. Prefe
 an identifier minted once at creation: a recreated store produces a *different*
 one rather than a missing one.
 
+Where you do record counts, **record them as floors, never as equalities.** A
+count taken from a live system keeps moving while you prepare the operation, so a
+verifier comparing for equality reports a false failure — and it does so
+mid-migration, which is the worst possible moment to be told something is wrong
+that is not. One count on this system grew from 52 to 55 between writing the check
+and running it, purely from ordinary traffic.
+
 **Record what every observable should read, before and after.** Include changes
 you expect from *unrelated* work landing in the same window. A confound that hides
 a failure eventually announces itself; a confound that decorates a success is

@@ -148,7 +148,7 @@ Before calling a class closed:
 | 61 | Does the value you are about to publish depend on a temporary shim? | It will look verified, pass every test, and break when the shim is removed — worse than publishing nothing, which fails loudly on first use |
 | 62 | Do both ends spell the same location the same way? | A symlink makes one side report the resolved path and the other the logical one; both are correct, neither can see the other's spelling |
 | 63 | Is the survivor a survivor, or does it match everything? | A row with a NULL scope key matches every scope, and reads as evidence of a partial failure when the truth is a scope change |
-| 64 | Before calling shared infrastructure "down", did anyone succeed on it during the failure window? | One success inside the window converts an outage into contention, and the two call for opposite actions |
+| 64 | Diagnosing shared infrastructure — did you check the provider's status page first? | It is the cheapest instrument and the one skipped when you already have a hypothesis; one success of your own refutes total unavailability, not an outage |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3467,17 +3467,34 @@ who is allocating.**
 
 Three teams reported the same shared build pool as unavailable — repeated
 zero-progress failures, an annotation naming the pool, and one team's clean
-before/after boundary across an unchanged configuration. I relayed the outage
-framing myself.
+before/after boundary across an unchanged configuration.
 
-Then I checked my own runs: **a fully green build on the same pool, four minutes
-after another team's third consecutive failure on it.** Real work, not a vacuous
-pass — four jobs, thirteen executed steps each.
+I checked my own runs and found **a fully green build on that pool, four minutes
+after another team's third consecutive failure on it.** Real work — four jobs,
+thirteen executed steps each. I broadcast a correction: not an outage, contention.
 
-One success inside the failure window is enough to refute an outage, and the
-distinction is not academic: **an outage means wait, contention means retry, and a
-per-repository limit means look at quotas.** Every team was about to take the
-first action.
+**The correction was wrong.** The provider's status page showed a major outage,
+opened an hour and a half earlier, with an update reading *"some workflow runs are
+failing to start."* The incident's start time sat exactly inside the reporting
+team's before/after boundary. Their evidence had been pointing at a real event the
+whole time.
+
+Two errors, worth separating:
+
+**One success does not refute an outage — it refutes total unavailability**, which
+nobody had claimed. A degraded service serves some requests. I let a single
+success argue down seven consecutive failures across two teams: the weaker sample
+overruling the stronger, dressed up as a counterexample.
+
+**I never checked the status page.** I had checked it that same morning for a
+different false alarm and used it correctly. Hours later, with three teams
+reporting, I skipped the cheapest instrument available because I had a hypothesis
+I preferred. **A measurement I want to be true is the one I forget to check
+against the obvious source.**
+
+The distinction still matters when it applies — an outage means wait, contention
+means retry, a per-repository limit means check quotas — but establishing *which*
+starts with the provider's own status, not with my sample of one.
 
 ### Two failures that render identically
 

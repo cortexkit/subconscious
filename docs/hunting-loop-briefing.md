@@ -176,6 +176,8 @@ Before calling a class closed:
 | 89 | Adding or changing a rendering — who is reading the old one? | A broken parse fails; a broken match just stops matching, so the quality loss is silent and only the author could have known a better answer existed |
 | 90 | Does the attribution still name the same party after being passed back? | Attribution survives one hop and degrades on the second; verify against the original message, not the most recent restatement |
 | 91 | Which credits in this record favour *you*? | Nobody re-reads a line that flatters them, so those are the ones no reader is motivated to challenge — including you |
+| 92 | Blocked on a decision — half-build it with a default, or record the gap? | A provisional default becomes the contract by accident: it ships, something depends on it, and the decision nobody made is inherited by everybody |
+| 93 | Several candidates match — does your code pick one? | Any tiebreak rule is a choice derived from ambient state that nobody made; refuse and say how many matched |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3716,6 +3718,50 @@ question had two supports: one resting on my judgement about a specific category
 the other on a structural property. They adopted it on the structural one — which
 is the right move whenever support turns out to be self-referential, because it
 leaves the conclusion resting on something neither party supplied.
+
+## Recording a gap as a gap
+
+Building against the ruling above, the implementer found the surface it assumed
+does not exist — no action in the frozen vocabulary can name an application,
+deliberately, since that is the property preventing a caller from pointing the
+system at an arbitrary process.
+
+They did not build a provisional version. They recorded, in the design document,
+that the surface does not exist, that its shape is open, and that the capability
+is consequently reachable only from code already holding a permission directly —
+which is why the backend still has no production caller.
+
+**That is rarer than it should be.** The move people reach for under pressure is a
+half-built method with a plausible default, and **that default becomes the
+contract by accident**: it ships, something depends on it, and the decision nobody
+made is inherited by everybody. A zero-caller component with an explicit note is
+honest and reversible; a provisional method is neither.
+
+### A tiebreak is a decision nobody made
+
+One open question was what happens when two copies of the same application are
+running and the name matches both.
+
+Any tiebreak — the frontmost, the oldest, the first found — is a permission
+**derived from ambient state that nobody chose**, which is the same objection that
+disqualified deriving the target from whatever happened to be in front. The rule:
+**multiple matches must not resolve to one silently.** Refuse, and report how many
+matched and enough to tell them apart.
+
+A refusal here is honest and rare. A silent pick is a wrong target nobody can
+audit afterwards.
+
+### Splitting a decision by who it belongs to
+
+Three open questions came bundled. Two were engineering choices; one was not, and
+the implementer separated them rather than deciding all three.
+
+The one they escalated: whether an agent may name *any* running application, or
+only those tied to the work at hand. Their argument for escalating is the test
+worth keeping — **the two options read identically in the code and very
+differently to the person whose screen it is.** A capability whose blast radius is
+invisible at the call site is exactly the kind that gets granted by default and
+discovered later.
 
 ## A gate expensive enough to route around
 

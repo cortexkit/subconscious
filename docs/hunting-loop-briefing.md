@@ -167,6 +167,7 @@ Before calling a class closed:
 | 80 | Two people report the same metric and disagree — are they measuring the same column? | Two correct measurements of different quantities wearing one name look exactly like a defect |
 | 81 | Widening a reply shape — how long until every consumer can parse it? | A service redeploys in minutes and its consumers on restart, so a widened reply is a narrowing at the far end; make it opt-in |
 | 82 | How much of each file did your scan actually read? | A scan reporting on a third of a file is not a sweep with a caveat, it is a different question wearing the same name |
+| 83 | Does inspecting the evidence change it? | A read-write open of a damaged database repairs it into a self-consistent wrong state; the check then launders the loss instead of finding it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3561,6 +3562,39 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## An inspection that repairs the evidence
+
+A colleague testing their own migration checks found that copying a database's
+main file alone — leaving behind the sidecar holding recently committed data —
+passed three of their four checks. The values those checks read were old enough to
+have been folded into the main file already; 520 recent rows existed only in the
+sidecar.
+
+I reproduced it and got a **different result**, which turned out to matter more
+than the agreement would have. My copy would not open at all read-only. Opened
+read-write it opened fine, and a subsequent read-only open then also succeeded —
+because **the read-write open had recovered the database and left it changed.**
+
+So the hazard is worse than "the checks pass over a lossy copy." The checks pass
+over a lossy copy **and the act of checking it with the wrong flag repairs it into
+a self-consistent wrong state.** Afterwards nothing distinguishes it from a
+healthy database, and no evidence remains that anything was lost. The check does
+not merely fail to detect the loss — it removes the trace of it.
+
+Two things follow.
+
+**The read-only flag is load-bearing, not good manners.** I had been using it all
+evening out of politeness around a live service. It is actually what makes a
+damaged copy fail loudly instead of silently, which is not the reason I would have
+given for it an hour earlier.
+
+**Add one continuously growing table to any such check.** Values that stopped
+changing long ago cannot detect a lost tail; only something that grows can.
+
+And the divergence itself is the method lesson: their instructions and the command
+they ran were not identical, and only running them found that. A procedure is
+verified by someone else executing it, not by its author reviewing it.
 
 ## A scan that reads a fraction of the file
 

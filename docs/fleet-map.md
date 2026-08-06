@@ -17,7 +17,9 @@ Shipped and in production (supervised by the personal daemon today):
   (single-principal router + process supervisor, wire v2, 21-byte
   envelope, loopback TCP + HMAC), the `ck` operator CLI, `ck-subc-mcp`
   (MCP gateway for unowned hosts), client SDKs (TypeScript, Rust, Swift),
-  and the Swift chat app (`subc-chat`, the observability/testbed UI).
+  and `gpui-chat`, the desktop observability/testbed UI. The Swift package
+  is an SDK only: the iOS app consumes it, and the SwiftUI desktop app it
+  once carried was deleted when the GPUI port reached parity.
 - **aft** — code perception and editing tools (search, outline, zoom,
   callgraph, edit, bash, worktrees). The `aft_*` tool surface every agent
   uses.

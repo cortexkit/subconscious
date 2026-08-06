@@ -24,24 +24,15 @@ let package = Package(
         // (iOS, GPUI) consume the models without forking them.
         .library(name: "SubcChatAskSupport", targets: ["SubcChatAskSupport"]),
         .executable(name: "subc-swift-probe", targets: ["SubcSwiftProbe"]),
-        .executable(name: "subc-chat", targets: ["SubcChat"]),
     ],
     targets: [
         .target(name: "SubcClient"),
         .target(name: "SubcFed"),
         .target(name: "SubcChatAskSupport"),
         .executableTarget(name: "SubcSwiftProbe", dependencies: ["SubcClient"]),
-        .executableTarget(
-            name: "SubcChat",
-            dependencies: ["SubcClient", "SubcChatAskSupport", "SubcFed"]
-        ),
         .testTarget(
             name: "SubcFedTests",
             dependencies: ["SubcFed"]
-        ),
-        .testTarget(
-            name: "SubcChatIntegrationTests",
-            dependencies: ["SubcClient", "SubcChatAskSupport", "SubcFed", "SubcChat"]
         ),
         .testTarget(
             name: "SubcClientTests",

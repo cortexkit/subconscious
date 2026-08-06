@@ -138,6 +138,7 @@ Before calling a class closed:
 | 51 | Did you mutate toward the mistake a future fixer would make, not only toward the original bug? | The plausible wrong fix is the one a green suite blesses |
 | 52 | Does one error value carry two meanings — "the remote refused" and "the connection went away"? | The caller retries a call that will refuse identically, and the remote's reason, the only thing saying what to do, is discarded at the conversion |
 | 53 | Do two sources describe the same event in incompatible terms? | Something between them is rewriting it — the disagreement is the finding, and a single source alone would read as an ordinary failure |
+| 54 | Does an accessor read a field name that is real on a *different* member of the same family? | It returns a plausible absence rather than failing, so it reads as "not set" instead of "looked in the wrong place" |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3214,6 +3215,38 @@ actually a completed operation nobody could observe.
 And the belief everyone held all day — that the last good backup was the previous
 generation — was wrong in the reassuring direction. The data had been safe since
 morning.
+
+## A field name that is real somewhere else
+
+An accessor read an error code from a frame's header. The code lives in the
+**body**. But `header["code"]` is a genuine, populated key on a *different* frame
+type in the same family — so the lookup was plausible, compiled, and returned nil
+for every error frame instead of failing.
+
+A missing key returns "absent", which is indistinguishable from "present and
+empty". Had the name been invented outright someone would have noticed; being
+real one frame type over is what made it survive review.
+
+The damage went past display. The nil fed a classifier whose first branch reads
+`guard kind == "error", let code = errorCode else { return notSettled }` — so
+every remote refusal was silently classified as *unsettleable* rather than as a
+refusal. **A bug reported as a wrong string was also mis-settling durable
+state.**
+
+The fix splits the accessors by frame family rather than repointing one, so
+neither field is addressed by literal outside the type. This is the second
+instance in the same file: an earlier reader spelled a terminal kind `kind` where
+the wire writes `k`, with the same quiet default.
+
+### Four quiet defaults, stacked
+
+Four separate layers each turned "I do not know" into a confident value: an error
+type collapsing *refused* into *disconnected*; this accessor's nil; a classifier
+inheriting that nil as *not settled*; and an audit column storing an outcome
+class while discarding the text. **Not one failed loudly**, which is exactly why
+they could stack four deep and make hundreds of failures unreadable end to end.
+
+Each was survivable alone. Survivable is the property that let them accumulate.
 
 ## One error value carrying two meanings
 

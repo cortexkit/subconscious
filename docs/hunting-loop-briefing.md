@@ -181,6 +181,7 @@ Before calling a class closed:
 | 94 | Two people asked one decision — is there exactly one open request? | Answering one and not the other leaves each side proceeding on a different half-answer, both believing it settled |
 | 95 | Does every option in this choice behave differently? | An option with no distinct behaviour pads a decision without informing it, and makes a binary read as carefully considered |
 | 96 | Was this rule validated in the same state you apply it in? | A rule derived against a running system and applied to a stopped one was never true where it was written to be used |
+| 97 | About to rewrite a procedure — did the step fail, or did someone skip it? | A step-order slip presents as a broken step, and the repair rewrites something correct |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4195,6 +4196,35 @@ the usual question. Most checks are classified by whether they *can* be wrong;
 this one classifies by **when** they are wrong relative to the decision. A check
 can be perfectly sound and still worthless if its validity window opens after the
 gate.
+
+### A skipped step presents as a broken one
+
+The migration's last step is deliberate: remove the compatibility link, then have
+the affected party act. If they were still bound to the old location they lose
+their tools immediately, under supervision, with a one-command remedy — rather
+than weeks later when someone tidies a stale link and nobody connects the two.
+
+It fired. They lost their entire tool surface, and the evidence was sharper than
+expected: even a command using **only absolute paths** was refused, so the gate is
+a precondition on the session's bound root rather than a check on what the command
+touches. A session's project root is captured at start and **not re-resolved per
+call**.
+
+It also settled an earlier argument in the right direction. Fifteen minutes before
+the break, the path string read as the *new* location while the binding was still
+the *old* one. **The string was right and meant nothing.** Had we accepted it as
+proof and removed the link without a behavioural test, they would have gone dark
+with nobody watching.
+
+**Then I nearly rewrote a correct procedure.** I reported that they had restarted
+and were still bound to the old path, concluding my restart step was insufficient.
+They had not restarted — they acted first. **A step-order slip presents exactly
+like a broken step**, and the repair would have damaged something correct.
+
+I had inferred the restart from an earlier verification message rather than from
+anything stated, then reported the inference as measurement. Worth recording
+because it is the same failure the whole document is about, committed in the
+window where we were being most careful about it.
 
 ### A rule validated in one state, applied in another
 

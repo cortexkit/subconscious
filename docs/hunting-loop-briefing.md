@@ -3557,6 +3557,29 @@ different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
 
+## The one sentence under all of it
+
+A colleague reduced an evening of separate findings to one line, and it holds:
+
+> **Two outcomes rendering identically means the reader supplies the difference
+> from expectation.**
+
+Every fix that evening was the same fix. A response field distinguishing
+inheritance from refusal. Distinct signing identities. A counter reporting absent
+rather than zero. Sending a value even when it is false.
+
+And it unifies the instrument failures with the wire failures, which are easy to
+file separately: *nothing to review* over an unstaged file, an inbox reporting
+empty over hundreds of waiting messages, a mutation that never applied, a build
+cancelled with zero steps. Same shape, different layers.
+
+The reason it keeps costing is that **expectation is a plausible source.** The
+reader is not careless — they fill the gap with the most likely value, and most of
+the time they are right. That is what makes the failures rare enough to be
+expensive.
+
+**The fix is always to emit the distinction rather than to document it.**
+
 ## A success report from an instrument that never touched its target
 
 Three instrument failures in one evening, across three tools and three people,

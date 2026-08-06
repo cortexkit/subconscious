@@ -3212,10 +3212,24 @@ The cheap guard is to make the mutant prove it ran — assert the mutated path
 produced its intended effect before drawing any conclusion from the suite's
 silence. In this case: check the delete removed rows.
 
-The carrier here is worth its own note, because it reads as safe in the language
-you write and means the opposite in the language that executes. `u64::MAX` says
-"all" in Rust and arrives as `-1` in SQLite, which says "none". Any unsigned
-sentinel crossing into a signed column has this property.
+The sign mismatch is the *carrier*, not the property. `u64::MAX` says "all" in
+Rust and arrives as `-1` in SQLite, which says "none" — so any unsigned sentinel
+crossing into a signed column can do this. But the module owner swept their
+remaining casts and found the real discriminator: **a caller-supplied bound with
+neither input validation nor a result check.** A merely *wrong* bound would have
+been equally silent; the sign trap only supplied the wrongness.
+
+The control proves it. A sibling range query sits at identical numeric risk and
+is safe, because it validates its input (refusing a zero or inverted range) *and*
+verifies its output, walking the returned rows demanding contiguity — so a
+wrapped bound produces an empty result the completeness check catches. Either
+mechanism suffices; the defective one had neither. Sixteen casts narrowed to four
+bounds narrowed to one defect, and it is the safe sibling at equal risk that
+turns this from a description of one bug into a test you can apply.
+
+So the usable form: **a delete or range query that asserts nothing about what it
+touched cannot distinguish success from a no-op.** That covers the wrapped bound,
+the wrong bound, the empty table, and the mutation that never ran.
 
 Companion rule already in this file: when a mutation *does* redden something,
 read which test died. Survival can mean the mutation missed; death can mean it

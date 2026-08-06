@@ -115,6 +115,7 @@ Before calling a class closed:
 | 28 | Did repairing the instrument invalidate the safety readings taken with the broken one? | A broken tool reports "nothing here" and a fixed one reports what is there; a check carried across the repair was answered by the broken version |
 | 29 | Was the control run in a state where the failure it guards against *could* occur? | A control run where the fault is impossible proves the check runs, not that it can detect — and it passes for the right reason, so nothing looks wrong |
 | 30 | Having tightened one rule of a test double, did you enumerate its others? | A double is a set of independent permissions; fixing one teaches nothing about the rest, and each remaining one certifies a different broken client |
+| 31 | Did you verify the target, or only properties of the target you assumed? | Every property can be true of the wrong endpoint; a check whose output omits what it was pointed at cannot expose a wrong target |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3156,6 +3157,42 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## Verifying properties of the wrong target
+
+A phone could not reach a service on its own network. Two people spent hours on
+it and both produced the same class of evidence: the listener is bound to all
+interfaces, the host firewall is off, the address holds a live lease, the
+routable address accepts connections, both devices ping each other. Every fact
+true, and **every fact measured against a different address than the one the
+phone was dialing** — the service had moved, and another device had taken the old
+address.
+
+Neither of us ever asked what the client was actually targeting. We verified
+properties *of the target we assumed*, and a property of the wrong subject cannot
+contradict anything.
+
+What broke it open was a diagnostic that **echoed its input**: the client's probe
+reported the address it dialed, not merely the outcome. So: a check whose output
+omits what it was pointed at cannot expose a wrong target, however thorough it is
+about everything else. Print the subject, not just the verdict.
+
+The second tell was one both of us dismissed. Two probes seconds apart returned
+*connection refused* and then *no answer*. One host does not usually do both —
+but two different devices answering at different moments do. **An inconsistency
+that looks like flakiness is sometimes two different answerers**, and the natural
+reading is noise, which is what makes it a good signal.
+
+There is a decision lesson too. Before the cause was known, the obvious
+improvement was to shorten the timeout the dead path was burning. That would have
+made a misconfigured client fail *faster* — the symptom shrinks while the cause
+survives, and a smaller symptom is harder to notice. **An optimisation applied
+before the cause is known can bury the bug.**
+
+Underneath it: the address was hand-entered once and had no expiry. A fact
+someone typed is exactly as fresh as the moment they typed it, and nothing tracks
+that. The durable answer is resolving the peer by identity rather than by a
+remembered address — which deletes the class instead of detecting it sooner.
 
 ## A test double is a set of independent permissions
 

@@ -113,6 +113,7 @@ Before calling a class closed:
 | 26 | For each guard: is it checking the thing it protects, or something that merely correlates with it? | The correlation holds until the surrounding procedure changes shape, then the guard refuses the safe case and permits the dangerous one without a line of it changing |
 | 27 | Did an unverified premise *close* a direction rather than open one? | A wrong premise that opens gets tested by whoever builds it; one that closes is never tested, because nothing downstream exists to fail |
 | 28 | Did repairing the instrument invalidate the safety readings taken with the broken one? | A broken tool reports "nothing here" and a fixed one reports what is there; a check carried across the repair was answered by the broken version |
+| 29 | Was the control run in a state where the failure it guards against *could* occur? | A control run where the fault is impossible proves the check runs, not that it can detect — and it passes for the right reason, so nothing looks wrong |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3154,6 +3155,40 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A control run where the fault cannot occur
+
+An owner wrote an acceptance check for "is the running process executing the
+file at its deploy path", and ran three controls against it before use. All
+three passed. The check was broken: it took the path that `lsof` reports for
+the running program and re-examined that path on disk — comparing the deployed
+file against **itself**, which passes unconditionally.
+
+The controls could not have caught it. They ran before anything was staged, when
+the running and deployed files were legitimately the same, **so the check passed
+for the right reason**. Nothing looked wrong because nothing was wrong yet.
+
+The discriminating state — a binary replaced on disk while the old one keeps
+running — did not exist until someone staged a deploy. It surfaced within minutes
+of that, when a second tool reported a mismatch about the same process at the
+same moment.
+
+So: **a control run in a world where the failure cannot occur proves the check
+executes, not that it can detect.** For anything that guards a transition, the
+control has to be run *in* the transitional state, which often means during the
+operation rather than before it.
+
+The detail that made it undetectable by reading: the path is the **same string**
+in the healthy and broken cases. A replaced binary keeps its path while the
+running process holds the old file; only the identifier the kernel reports for
+the open file distinguishes them. Code that looks correct, uses the right tool,
+and compares the right kind of value can still compare one thing to itself.
+
+Auditing my own tooling for the same bug found something worse — the check was
+absent entirely, so a staged-but-not-restarted binary read as fully deployed.
+Writing it revealed a module that had been serving an eleven-day-old build since
+its binary was replaced that morning, invisible to every path-derived instrument
+including a version probe.
 
 ## A safety check answered by the tool you then repaired
 

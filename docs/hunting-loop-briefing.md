@@ -110,6 +110,7 @@ Before calling a class closed:
 | 23 | Where one side produces artifacts the other must consume: which of theirs does nothing of yours read? | Erosion leaves a deletion someone can review; a gap that never closed leaves no diff at all, and the reachability guard that proves the directory resolves reads as proving coverage of it |
 | 24 | For a mechanism that produces a state: what does it do *in* that state? | Reviewers check what it does in the state that triggers it; the behaviour after it fires goes unspecified, so a fence blocks the tightening it should permit and a probe keeps running with nothing left to distinguish |
 | 25 | When a mutant survives: did the suite miss the behaviour, or did the mutation never happen? | Both read as "unproven". The second is a working bug that just demonstrated itself and got recorded as absence of evidence |
+| 26 | For each guard: is it checking the thing it protects, or something that merely correlates with it? | The correlation holds until the surrounding procedure changes shape, then the guard refuses the safe case and permits the dangerous one without a line of it changing |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3151,6 +3152,42 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A guard that checks a proxy for the thing it protects
+
+A data-migration script refused to run while the daemon was up. Under the window
+it was written for that was exactly right: the daemon was stopped first, so
+daemon-down implied the modules writing those stores were down too. The guard
+read the daemon because the daemon was easy to read.
+
+Then the window changed shape. A capability landed that lets modules be retired
+and respawned without stopping the daemon, so the new procedure deliberately
+leaves it running. The same guard now refuses the safe case.
+
+That much is merely annoying. The dangerous half is the inverse: the script's
+process check named the binaries by their *post-rename* names, and under the old
+window a full daemon stop covered that gap. Under the new one it would find no
+matching process, conclude the coast was clear, and move stores **while the old
+modules were still writing them**.
+
+So one guard, unchanged, became wrong in both directions at once — refusing what
+is safe and permitting what is not — because the condition it checked stopped
+standing for the condition it protected. Nothing in the script changed. The world
+around it did, and a proxy has no way to notice.
+
+The repair is to name the real precondition: refuse while the *writers of the
+stores being moved* exist, and allow the daemon to be up. That guard cannot drift
+with the procedure, because it is about the thing at risk rather than about a
+circumstance that used to accompany it.
+
+Proxies are not avoidable — most guards check something observable that stands in
+for something abstract. What is avoidable is leaving the substitution unrecorded.
+Write down what the check stands for, at the check, so the next person changing
+the procedure can see whether the substitution still holds.
+
+Test it in **both** directions. A guard exercised only where it refuses cannot
+distinguish correctly-strict from refuses-everything, and this one had by then
+been wrong in each direction once.
 
 ## A surviving mutant has two readings
 

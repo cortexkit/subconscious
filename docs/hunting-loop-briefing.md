@@ -182,6 +182,7 @@ Before calling a class closed:
 | 95 | Does every option in this choice behave differently? | An option with no distinct behaviour pads a decision without informing it, and makes a binary read as carefully considered |
 | 96 | Was this rule validated in the same state you apply it in? | A rule derived against a running system and applied to a stopped one was never true where it was written to be used |
 | 97 | About to rewrite a procedure — did the step fail, or did someone skip it? | A step-order slip presents as a broken step, and the repair rewrites something correct |
+| 98 | Does a functional test of this registry prove its rows are sound? | A stale row with a live duplicate resolves correctly, so the system passes every send test while carrying the defect |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4196,6 +4197,42 @@ the usual question. Most checks are classified by whether they *can* be wrong;
 this one classifies by **when** they are wrong relative to the decision. A check
 can be perfectly sound and still worthless if its validity window opens after the
 gate.
+
+### A stale row with a live duplicate
+
+After the rename, a name that had worked all evening stopped resolving. The
+registry keys entries on the directory the peer was registered from, and that
+directory had moved.
+
+The other party measured their own registry rather than treating it as tonight's
+breakage, and found **eight rows already stale**, all from earlier renames, none of
+which had ever announced itself. So the condition was standing, not new; tonight
+added one instance to a pile eight deep. It looked new only because someone
+happened to be watching for it.
+
+I checked mine and got a result that splits the severity in a way worth keeping.
+121 rows, 8 stale — and **every stale name also had a live duplicate**, so name
+resolution still worked here. That is luck, a byproduct of re-registering peers
+after an earlier rename, not a property of the system.
+
+**Which means my registry would have passed any functional test while carrying the
+identical defect.** A send would have succeeded, resolved through the live
+duplicate, and proved nothing about the stale row beside it. Only checking each
+recorded directory against the filesystem found it — a structural check where the
+behavioural one is blind.
+
+That inverts the usual preference. Elsewhere in this document the behavioural test
+beats the string comparison, because a string can be right and mean nothing. Here
+the behavioural test is the one that cannot see the defect, because redundancy
+masks it. **The discriminator is whether a passing result could have been produced
+by something other than the property you are testing.**
+
+The failure mode is the familiar one: the name path fails as *silence* while the
+identifier path succeeds, so the sender concludes the peer is **quiet** rather
+than **unreachable** — and quiet requires no action. The minimum fix is not to
+re-key the registry but to **make a send to a row whose directory has vanished
+fail loudly**; re-keying is the better design, failing loudly is what stops the
+silence and can land first.
 
 ### A skipped step presents as a broken one
 

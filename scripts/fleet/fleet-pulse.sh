@@ -742,6 +742,19 @@ dim "  a clean line means nothing under tests/ or benches/ was checked -- ask th
 # costs far more than a line someone checks and dismisses. But an unstated upper
 # bound erodes the section's credibility the first time someone investigates a
 # phantom, so the bound is printed rather than remembered.
+#
+# AND A COMMENT-ONLY COMMIT IS NOT RELIABLY A PHANTOM, which makes the
+# over-reporting direction more right than it first appears. Panic sites embed
+# their source line numbers into the binary, so inserting comment lines above one
+# shifts every later line number and CHANGES THE COMPILED OUTPUT. Measured on a
+# sibling repo: a pure-comment commit moved the release hash. So "comments cannot
+# reach the binary" is false wherever a panic location or any line-number-bearing
+# macro is compiled in -- true only for edits inside `cfg(test)`, which is
+# compiled out entirely.
+#
+# The consequence for a deploy decision: do not dismiss a comment-only commit by
+# reading the diff. Build both commits with any embedded build stamp pinned and
+# compare artifact hashes. Only equality is conclusive.
 dim "  count is an upper bound: in-file #[cfg(test)] and comment-only edits count as runtime"
 echo
 

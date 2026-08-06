@@ -151,6 +151,7 @@ Before calling a class closed:
 | 64 | Diagnosing shared infrastructure — did you check the provider's status page first? | It is the cheapest instrument and the one skipped when you already have a hypothesis; one success of your own refutes total unavailability, not an outage |
 | 65 | You wrote a caveat — would the conclusion change if the caveated item were deleted? | If not, the caveat was decoration: it discharges the obligation to be rigorous without doing any of the work |
 | 66 | Reading a trend — are the points measurements of the same subject? | Real numbers in a real order across different subjects produce a convincing curve that describes nothing |
+| 67 | Will anything else change your observable during this operation? | A confound that *decorates* a success is never investigated, because nobody re-derives a number that agrees with them |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3464,6 +3465,37 @@ Generalises past disk: any exhausted resource whose usage only rises — memory
 held by a cache that never evicts, connections held by a pool that never reaps,
 file descriptors retained after close. **Ask whether release works before asking
 who is allocating.**
+
+## The confound that decorates a success
+
+Before a rename window, the owner of an adjacent component warned me that an
+unrelated deployment would change a number I was about to use as verification.
+Today the machine publishes **no** network candidates, so "none" is the correct
+baseline; after their next binary update it publishes **three**, and that change
+has nothing to do with my rename.
+
+Without the warning I would have renamed, seen the count go from zero to three,
+and had no way to attribute it. Worse: **the direction looks like success.** Three
+real reachable addresses appearing right after an operation reads as everything
+working, so I would not have investigated, and the misattribution would have
+entered the record uncorrected.
+
+That is the asymmetry worth naming. A confound that hides a failure eventually
+announces itself, because something stays broken. **A confound that decorates a
+success is never examined, because nobody re-derives a number that agrees with
+them.**
+
+The remedy is cheap and has to happen *before*: record both expected values in
+advance — what the observable should read now, and what it should read after the
+unrelated change — so that either one is confirmable and anything else is a
+finding.
+
+The same exchange carried a second lesson. They ran their interface enumeration
+**against the actual machine** rather than trusting their fixtures, and it
+immediately surfaced a specimen no fixture would have held: an address that
+passes every predicate and silently times out. Twenty-eight interfaces reduced to
+three, and the exclusion that mattered was one nobody would have thought to write
+down. A fixture encodes what its author believes the world looks like.
 
 ## Shared infrastructure: down, or contended
 

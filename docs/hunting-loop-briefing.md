@@ -183,6 +183,8 @@ Before calling a class closed:
 | 96 | Was this rule validated in the same state you apply it in? | A rule derived against a running system and applied to a stopped one was never true where it was written to be used |
 | 97 | About to rewrite a procedure — did the step fail, or did someone skip it? | A step-order slip presents as a broken step, and the repair rewrites something correct |
 | 98 | Does a functional test of this registry prove its rows are sound? | A stale row with a live duplicate resolves correctly, so the system passes every send test while carrying the defect |
+| 99 | Measuring a store — does anything still write it? | A dead store and a live one with stale rows are identical by their contents; the discriminator is never in the rows |
+| 100 | The other party retracted — does that make your number wrong? | A retraction from one side makes the other's figure feel like the error, and over-correcting toward it discards a correct measurement |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4233,6 +4235,42 @@ than **unreachable** — and quiet requires no action. The minimum fix is not to
 re-key the registry but to **make a send to a row whose directory has vanished
 fail loudly**; re-keying is the better design, failing loudly is what stops the
 silence and can land first.
+
+### Measuring a store nothing writes
+
+The other party's census of eight stale entries turned out to be a census of an
+**abandoned file** — 38 rows, newest six weeks old, in a directory left behind by
+an earlier rename. They found it themselves and retracted.
+
+Their statement of why it was uncheckable from inside is the durable part: **a
+dead store and a live one with stale rows are indistinguishable by their
+contents**, because both contain exactly what you expect — plausible names, real
+identifiers, a believable count. **The discriminator is never in the rows.** It is
+in whether anything still writes them.
+
+They used the newest timestamp. Checking their claim I found a stronger one: the
+dead file's table **has no such column** as the one the live schema carries — my
+query against it errored outright. A stale timestamp is ambiguous between
+*abandoned* and *merely quiet*; **a missing column cannot be produced by
+quietness.** It proves the file predates the running code, and needs no judgement
+about what "old enough" means.
+
+### Two correct measurements of two columns
+
+Then our numbers disagreed on the *live* file — four against eight — and both were
+right. The table carries two path columns: where the peer *is*, and who
+*registered* it. One governs routing; the other only affects visibility. **Nothing
+in either name tells you which one the send path reads.**
+
+So the resolving question was not *who measured correctly* but **which column does
+the operation actually use**. The reconciled defect is smaller and sharper than
+either original claim: four rows, one name, one rename.
+
+And I nearly discarded a correct measurement doing it. Having just received their
+retraction, I sent my own — attributing my larger number to a counting mistake
+that had not happened. **A retraction from one side makes the other side's figure
+feel like the error.** The pull is toward the smaller number and the more recently
+confident party, and neither is evidence.
 
 ### A skipped step presents as a broken one
 

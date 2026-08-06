@@ -109,6 +109,7 @@ Before calling a class closed:
 | 22 | Is the key you store a record under at least as broad as the broadest statement stored under it? | A statement about an account, keyed by device, fences one device; the siblings walk through, and every key component is stable so a mutability check passes it |
 | 23 | Where one side produces artifacts the other must consume: which of theirs does nothing of yours read? | Erosion leaves a deletion someone can review; a gap that never closed leaves no diff at all, and the reachability guard that proves the directory resolves reads as proving coverage of it |
 | 24 | For a mechanism that produces a state: what does it do *in* that state? | Reviewers check what it does in the state that triggers it; the behaviour after it fires goes unspecified, so a fence blocks the tightening it should permit and a probe keeps running with nothing left to distinguish |
+| 25 | When a mutant survives: did the suite miss the behaviour, or did the mutation never happen? | Both read as "unproven". The second is a working bug that just demonstrated itself and got recorded as absence of evidence |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3150,6 +3151,38 @@ refresh).
 SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
+
+## A surviving mutant has two readings
+
+The usual reading of a mutation that reddens nothing is that the suite cannot
+see the behaviour. There is a second, and it is worse.
+
+A store method was mutated by calling its clear function with `u64::MAX`, meaning
+"settle everything". Nothing was deleted, the test passed, and the honest
+conclusion recorded was "position-based settlement is unproven". The truth was
+that the mutation never ran: SQLite integers are signed, `u64::MAX as i64` is
+`-1`, and `seq <= -1` matches no row. **A real bug in the store method was hiding
+behind its own failed mutation proof** — a delete that deletes nothing while
+returning success.
+
+So when a mutant survives, two questions and not one: can the suite see this
+behaviour, and *did the mutation take effect at all*. The second reading is
+strictly more alarming. A blind spot in a suite is a gap; a mutation that
+silently no-ops is a working defect that has just demonstrated itself and been
+filed as absence of evidence.
+
+The cheap guard is to make the mutant prove it ran — assert the mutated path
+produced its intended effect before drawing any conclusion from the suite's
+silence. In this case: check the delete removed rows.
+
+The carrier here is worth its own note, because it reads as safe in the language
+you write and means the opposite in the language that executes. `u64::MAX` says
+"all" in Rust and arrives as `-1` in SQLite, which says "none". Any unsigned
+sentinel crossing into a signed column has this property.
+
+Companion rule already in this file: when a mutation *does* redden something,
+read which test died. Survival can mean the mutation missed; death can mean it
+hit something other than the subject.
 
 ## A mechanism that is specified only in its triggering state
 

@@ -79,8 +79,21 @@ only — the worker half needs its own reviewed gate.
    several modules, so it gets its own verification and its own rollback
    decision before anything else moves. If its acceptance fails, the window does
    not proceed.
-1. **Engram's drain finishes first.** Three generations are staged and uploading.
-   Restarting mid-drain is recoverable but pointless.
+1. **The backup module restages first, and its drain runs inside the window
+   rather than before it.** This inverts what the plan originally said.
+
+   The drain was the gate for hours, on the assumption it would finish on its
+   own. It cannot: the running binary mints a fresh identifier on every publish
+   attempt, checked against a rule requiring it to match the first attempt's, so
+   every retry is refused **by construction** rather than by bad luck. Three
+   generations sit behind that wall.
+
+   So waiting was waiting for something that could never happen. The fix ships
+   in the restage, which means the restage has to lead and the drain follows it.
+
+   If the drain does not start moving within a few minutes of the restart, that
+   is a signal rather than a reason for patience — this fix either works
+   immediately or does not work.
 2. **Stage every new binary while modules keep running.** A remove-first copy
    leaves the running process on its old inode, so staging is not a restart. This
    front-loads all the risky building outside the outage.

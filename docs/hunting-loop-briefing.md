@@ -3179,19 +3179,39 @@ chain is intact, because every line of code that maintains it says so.
 Both shapes come from the same root — a promise in the data with no consumer to
 keep it honest — and neither is detectable by running anything.
 
-So when a change breaks an unread invariant, the choice is: restore it, delete
-the field, or **record the constraint at the site** so a future reader inherits
-it rather than rediscovering it. A note in a plan does not travel; a comment
-beside the field does. Here the constraint was that a future walk must either
-tolerate the hole or be built only after the upstream gap that forces the skip is
-closed.
+The two shapes fail differently, and that decides where the warning goes. With a
+field nothing checks, the danger is that **nobody looks**. With an invariant
+nothing reads, the danger is that **looking reassures you** — every line
+maintaining it is evidence it holds, and the one place that stopped maintaining
+it is precisely where a reader will not think to check, because it is the place
+where maintaining it became impossible and therefore reads as an ordinary error
+branch.
+
+So: the first shape can live in a design document, whose audience is whoever
+defines the field. **The second must live at the site**, because its audience is
+whoever writes the first reader, and that person arrives through the code rather
+than through the plan. A document is addressed to someone already asking the
+question; a comment is addressed to someone who does not know there is one.
+
+When a change breaks an unread invariant the choice is: restore it, delete the
+field, or record the constraint where it will be found. Here the constraint was
+that a future walk must either tolerate the hole or be built only after the
+upstream gap forcing the skip is closed.
 
 Worth noticing what the accumulation was telling us. This was the third
 independent symptom of one missing capability — a refusal that withheld a value
 the server had already computed, an object orphaned by guessing forward, and now
 a chain that only stays intact if clients never have to guess. **Three symptoms
 with one cause is a much stronger argument for the fix than any of them alone**,
-and none of the three was individually large enough to justify it.
+and none of the three was individually large enough to justify it: the first had
+a local workaround, the second cost a few hundred bytes, the third is
+unobservable today.
+
+That generalises into a review habit. **When a proposal keeps getting deferred,
+check whether its motivations are being priced one at a time.** Each deferral is
+individually correct, the aggregate is never evaluated, and no single symptom
+ever forces the conversation — which is how a missing capability survives
+repeated encounters with people who all did the arithmetic right.
 
 ## Verifying properties of the wrong target
 

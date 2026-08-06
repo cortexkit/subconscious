@@ -75,10 +75,20 @@ never examined, because nobody re-derives a number that agrees with them.
 
    **Open verification copies read-only, and treat that as load-bearing rather
    than good manners.** A write-ahead database missing its sidecar *refuses to
-   open* read-only, which is the loud failure you want. Opened read-write it
-   opens happily, recovers itself, and leaves a self-consistent database missing
-   its most recent writes with no remaining evidence that anything was lost — the
-   check does not merely fail to detect the loss, it removes the trace of it.
+   open* read-only, because a read-only connection cannot create the shared-memory
+   file it needs. Opened read-write it opens happily and answers every query —
+   silently short. The flag converts a silent wrong answer into a hard error.
+
+   So **the error is the finding.** `unable to open database file` on a copy you
+   just made is not an obstacle to work around by dropping the flag; it is the
+   result. Retrying without it converts a correct alarm into a wrong number, which
+   is the likeliest way this bites in practice. Take the copy again, as the whole
+   directory.
+
+   The incomplete copy is missing its tail from the instant `cp` finishes, and no
+   flag on the reader changes that — a read-write open creates the sidecars but
+   leaves the main file byte-identical. A complete copy reads the same either way;
+   only an incomplete one diverges.
 4. Move the directory; apply the identity change; reconcile.
 5. **Verify the minted identifier** before declaring anything.
 6. **Restart the resident** so it re-binds to the real path.

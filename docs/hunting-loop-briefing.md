@@ -167,7 +167,8 @@ Before calling a class closed:
 | 80 | Two people report the same metric and disagree — are they measuring the same column? | Two correct measurements of different quantities wearing one name look exactly like a defect |
 | 81 | Widening a reply shape — how long until every consumer can parse it? | A service redeploys in minutes and its consumers on restart, so a widened reply is a narrowing at the far end; make it opt-in |
 | 82 | How much of each file did your scan actually read? | A scan reporting on a third of a file is not a sweep with a caveat, it is a different question wearing the same name |
-| 83 | Does inspecting the evidence change it? | A read-write open of a damaged database repairs it into a self-consistent wrong state; the check then launders the loss instead of finding it |
+| 83 | A tool refuses to open something — is the refusal the obstacle or the finding? | Retrying with a laxer flag converts a correct alarm into a silent wrong answer |
+| 84 | Right conclusion — is the mechanism behind it right too? | A wrong mechanism sends the next reader hunting for a state that never existed, even when the advice it produced was correct |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3563,7 +3564,7 @@ different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
 
-## An inspection that repairs the evidence
+## A wrong mechanism behind a right conclusion
 
 A colleague testing their own migration checks found that copying a database's
 main file alone — leaving behind the sidecar holding recently committed data —
@@ -3571,30 +3572,40 @@ passed three of their four checks. The values those checks read were old enough 
 have been folded into the main file already; 520 recent rows existed only in the
 sidecar.
 
-I reproduced it and got a **different result**, which turned out to matter more
-than the agreement would have. My copy would not open at all read-only. Opened
-read-write it opened fine, and a subsequent read-only open then also succeeded —
-because **the read-write open had recovered the database and left it changed.**
+I reproduced it and got a **different result**: my copy would not open read-only
+at all. Opened read-write it opened fine, and a subsequent read-only open then
+also succeeded. I concluded the read-write open had **recovered** the database,
+and wrote that inspecting it destroys the evidence of the loss.
 
-So the hazard is worse than "the checks pass over a lossy copy." The checks pass
-over a lossy copy **and the act of checking it with the wrong flag repairs it into
-a self-consistent wrong state.** Afterwards nothing distinguishes it from a
-healthy database, and no evidence remains that anything was lost. The check does
-not merely fail to detect the loss — it removes the trace of it.
+They checked and refuted it. The main file is **byte-identical** before and after
+— I verified the same checksum myself. What a read-write open creates is the two
+sidecar files; nothing is folded into the main one. The second read-only open
+succeeds only because the file it needs now exists.
 
-Two things follow.
+My conclusion survived; **my mechanism was wrong, and it mattered.** "Do not
+inspect it read-write or you will destroy the evidence" is false, and would send
+someone hunting for a recoverable state that never existed. The true statement is
+simpler and worse: **the copy is missing its tail from the instant it is made**,
+and no flag on the reader changes that.
 
-**The read-only flag is load-bearing, not good manners.** I had been using it all
-evening out of politeness around a live service. It is actually what makes a
-damaged copy fail loudly instead of silently, which is not the reason I would have
-given for it an hour earlier.
+The read-only flag is still load-bearing, for a sharper reason than I gave. Not
+because read-write is destructive — because **read-only cannot create the sidecars
+it needs**, so an incomplete copy is *unreadable* under it and *silently short*
+without it. The flag converts a silent wrong answer into a hard error.
+
+Which makes **the error the finding.** A refusal to open, on a copy just made, is
+not an obstacle to work around by dropping the flag — it is the result. Anyone who
+retries without it has converted a correct alarm into a wrong number, and that is
+the likeliest way this bites in practice.
 
 **Add one continuously growing table to any such check.** Values that stopped
 changing long ago cannot detect a lost tail; only something that grows can.
 
-And the divergence itself is the method lesson: their instructions and the command
-they ran were not identical, and only running them found that. A procedure is
-verified by someone else executing it, not by its author reviewing it.
+And the divergence has its own lesson, which they stated better than I could:
+their written instruction said read-only, and they measured with a bare command.
+**A procedure verified by its author running something adjacent to it is not
+verified.** It surfaced in my hands rather than theirs, because I followed their
+written instruction and they followed their habit.
 
 ## A scan that reads a fraction of the file
 

@@ -3149,6 +3149,40 @@ SO WHEN A COMMENT ENUMERATES CALL SITES OR TRIGGERS, RESOLVE THEM. A list of
 three conditions where only two exist is the same shape as a transcribed
 allowlist agreeing with its source only at the moment it was typed.
 
+## A check that compares a measurement to a typed-in number
+
+A precondition in a migration runbook read "expect 1" and "expect 3" against two
+probes of a deployed binary. Both numbers were correct when written and both are
+properties of how one build happened to be laid out — not of the binary carrying
+the feature the check exists to confirm. A later release that changes either
+count fails the precondition during the window.
+
+That timing is what makes it worse than an ordinary stale value. The natural
+reading at that moment is "the deployment is wrong", not "the check was too
+tight", because the runbook is the thing telling the operator what to suspect and
+is therefore the last thing suspected. A check that can raise a false alarm under
+maximum pressure does not merely fail to inform — it misinforms with authority.
+
+The author had written that control deliberately, because a zero from a probe is
+ambiguous without one. Then pinned the control to a number that could go stale by
+itself. Presence was the proposition all along: one probe must find the feature,
+the other must find anything at all, and the second is what makes a zero on the
+first mean something.
+
+The general form, checked against two independent codebases the same morning:
+**the class bites where a human types the expected value.** Anything comparing
+one live measurement against another is immune by construction — modules
+reporting against modules configured, files changed against files in a diff.
+Anything comparing a measurement against a remembered number is exposed. Prose
+runbooks are almost entirely the second kind, which is where to look first.
+
+Note what this does *not* say. Asserting an exact count is sometimes exactly
+right: a data-driven suite that generates its cases from files on disk must
+assert how many it generated, or a silently missing file removes cases with no
+failure. The discriminator is whether the number describes something the check
+OWNS — its own case count — or something it merely OBSERVED, which is free to
+change without the check being wrong.
+
 ## A count without its breakdown invites the reader to supply an attribution
 
 I reported "96 markdown files" from a branch and let the recipient infer which

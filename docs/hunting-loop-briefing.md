@@ -162,6 +162,7 @@ Before calling a class closed:
 | 75 | Your rule requires a value to be *stable* — does it say which value? | Stability and correctness are different properties; whoever applies it fills the gap with the only name in front of them |
 | 76 | Writing a rule — which of its terms would a careful reader have to guess? | That term will be filled in wrong, with the nearest available value, by someone following the rule correctly |
 | 77 | Who does this fix arm? | Applying a rule to something already carrying a wrong value converts a dormant defect into a live one; the trigger is the remediation |
+| 78 | "Fixed" — in the place it was *made* true, or the place it must *be* true? | Merged is not deployed, published is not consumed, written is not read; two parties reading the same correct-but-wrong-scoped source will agree |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3556,6 +3557,42 @@ A hash comparison calls them different software. They are the same software with
 different principals. Worth keeping as the standing demonstration that a digest
 conflates *what was built* with *who it claims to be*, and that the build
 identifier and the signature identity answer those two questions separately.
+
+## Closed where it was made true, open where it must be
+
+Two teams' checklists agreed that all four outstanding items were closed. Both
+checklists were accurate. One of the items was still live.
+
+The fix was committed, tested and merged — so reading the *repository* gave a
+correct answer to "is this closed". The place it had to be true was a **running
+binary**, built before the fix landed. Had the run proceeded, one side would have
+emitted a field the other silently could not read, reproducing the exact ambiguity
+that had failed the previous attempt — with the fix merged, green and pushed the
+whole time.
+
+**Cross-checking between two parties does not detect this.** Agreement is precisely
+what you get when both sides consult the same correct-but-wrong-scoped source.
+Neither ledger was stale; each was accurate about its own subject.
+
+The resolving check is one line and takes no judgement: **is the fix's commit an
+ancestor of the commit the running artifact was built from?** Not *is it merged*,
+not *is the build green*, not *does the tracker say closed* — an ancestry relation
+between the fix and the thing actually executing.
+
+It generalises past deployments, which is why it belongs here rather than in a
+deployment procedure. Any claim of the form *X is fixed* has to name **the place
+where it must be true**, not the place where it was made true: merged versus
+deployed, published versus consumed, written versus read.
+
+### A digest cannot tell you which principal
+
+The same delivery included two binaries from one build, differing only in signing
+identity — so same build identifier, different content hashes, and only one
+belonged on the test machine.
+
+**Verifying the digest cannot catch placing the wrong one.** The hash tells you
+which bytes, not which identity. The filename is a claim; the signature is the
+fact. Check the identity explicitly, before placing.
 
 ## The one sentence under all of it
 

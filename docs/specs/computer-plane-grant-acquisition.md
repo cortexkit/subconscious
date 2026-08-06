@@ -38,9 +38,15 @@ them cannot be read by anyone else — and a provenance record is worth nothing
 where the claim cannot travel to.
 
 The surrounding design is cerebellum's: the gap itself, the enumeration of
-possible mechanisms, the rejection of deriving permission from ambient state, the
-four-variant fail-closed verification, and the argument that a gate expensive
-enough to avoid gets avoided.
+possible mechanisms, the identification of ambient-state derivation as an option
+to be rejected, the four-variant fail-closed verification, and the argument that a
+gate expensive enough to avoid gets avoided.
+
+The *disqualifying* argument against ambient-state derivation — that it produces a
+permission derived from state the user does not experience as a decision, and so a
+permission nobody could later say they issued — originates here. Cerebellum's own
+objection was the race between deciding and acting, which they noted evaporates if
+the race is eliminated, while this one does not.
 
 One correction is worth recording alongside, because it happened while both
 parties were applying the attribution rule they had just agreed:
@@ -54,3 +60,9 @@ think to doubt.
 So the check is not *did I attribute this* but **does the attribution still name
 the same party after being passed back**. Verify against the original message
 rather than against the most recent restatement of it.
+
+A third round, caught by the party it favoured, narrows it further. The first two
+inversions were found because someone was being credited with something they knew
+was not theirs — uncomfortable enough to prompt a check. **Nobody re-reads a line
+that flatters them.** So verify the attributions in your own favour first: those
+are the ones no reader is motivated to challenge, including you.

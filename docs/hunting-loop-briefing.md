@@ -144,6 +144,7 @@ Before calling a class closed:
 | 57 | Does your existence check discriminate, or does it pass the worst case? | "The path exists" admits a live-but-wrong target; the shape of the path is the test that separates them |
 | 58 | Is the state keyed on the thing you are renaming a *cache* or a *fence*? | A lost cache announces itself as slowness; a lost fence reports a clean start, and by the time it is visible the irreversible act has happened |
 | 59 | Could your "it survived" check pass by luck? | A count that may legitimately be zero proves nothing; verify an identity only the original could carry |
+| 60 | Did you audit the component, or also whoever *lives in* it? | A service and the agent operating it are different subjects; asking an owner "is your state safe" reliably gets the component answer |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3249,6 +3250,42 @@ flip, and verified with a check that distinguishes *legitimately empty* from
 The owner's own sentence is the one to keep: *"renamed and healthy will look
 identical whether or not I got this right."* Health is not evidence for a
 property health does not measure.
+
+### The component is not the only resident
+
+Before renaming a directory I asked its owner whether any of their durable state
+was keyed on the old path. They audited thoroughly and answered from the running
+process rather than from source: every path came from configuration supplied
+externally, so the folder could not reach them even in principle. Correct, and
+verified better than I had asked for.
+
+The rename **took their entire tool surface down.** Their working session binds a
+project root at startup and gates every operation on that path existing. Not the
+component's state — the *agent's own footing*. They could not read a file or run a
+command to diagnose it.
+
+**The service and whoever operates it are different subjects with different
+failure modes**, and asking an owner "is your state safe" reliably gets the
+component answer, because component state is what an owner thinks of as theirs. I
+knew the operation would delete a directory somebody was working inside, had a
+full day of evidence that path-keyed state is the biting class, and still scoped
+the question to components because components were what I had been enumerating.
+
+Two procedure changes, both from the person I broke:
+
+**Put the compatibility link in before the move, not after the breakage.** Created
+ahead of time it converts a hard break into a soft one at no cost. Created
+afterwards it is a recovery, and the resident spends the intervening minutes
+unable to run the very commands needed to diagnose it.
+
+**Ask the resident to verify their own footing as a separate question.** Same
+rename, different subject, different answer.
+
+One thing went right and is worth copying: **the failure was loud.** The refusal
+named the path, the condition, and the likely cause, so it cost minutes. Every
+other path-keyed failure that day — permissions, registries, routing — failed as
+silence. Whoever wrote that check chose the right failure mode, which is why the
+victim could hand me a precise remedy instead of a symptom.
 
 ### The survival check that passes by luck
 

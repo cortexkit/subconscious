@@ -412,14 +412,18 @@ printed=0
 # whole file exists to catch.
 #
 # Only the module_id -> repo-directory step is residual, because nothing on disk
-# records it (prefrontal-core lives in prefrontal/, thalamus in ai-proxy/,
-# subc-mcp in subconscious/). A module whose directory this cannot resolve is
-# REPORTED rather than skipped, so the mapping going stale is visible instead of
-# silent -- which is how the two entries below were caught after a rename.
+# records it (prefrontal-core lives in prefrontal/, subc-mcp in subconscious/).
+# A module whose directory this cannot resolve is REPORTED rather than skipped,
+# so the mapping going stale is visible instead of silent -- which is how the
+# entries below were caught after a rename.
+#
+# Every entry here exists because a module's id disagrees with its directory, so
+# renaming a directory to match its module id DELETES an entry rather than
+# editing one. That is the direction to prefer: the fallthrough is already
+# correct for anything that agrees with itself.
 module_repo() {
   case "$1" in
     prefrontal-core | prefrontal-routing) echo prefrontal ;;
-    thalamus)     echo ai-proxy ;;
     subc-mcp)     echo subconscious ;;
     *)            echo "$1" ;;
   esac

@@ -281,6 +281,12 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             "limit": .integer(10),
         ])
         XCTAssertEqual(object["limit"], .integer(10))
+        // The module id here is an arbitrary well-formed sample, not a live
+        // module: these assertions are about validation, trimming and
+        // round-tripping, and hold for any non-blank string. The corpus keeps
+        // retired ids for the same reason -- the store golden vectors still
+        // carry `llm-runner`, renamed months ago -- so a sweep for a renamed
+        // module will match here and should leave these alone.
         let target = try FedManagementTarget(moduleID: "alfonso-core")
         XCTAssertEqual(target.moduleID, "alfonso-core")
         XCTAssertThrowsError(try FedManagementTarget(moduleID: "  "))

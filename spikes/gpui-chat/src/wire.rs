@@ -36,7 +36,7 @@ async fn load_live() -> Result<Snapshot> {
     let session_id = format!("gpui-spike-{}", uuid::Uuid::new_v4());
     let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default()).await?;
     let target = RouteTarget::ManagementSurface {
-        module_id: "alfonso-core".into(),
+        module_id: "prefrontal-core".into(),
     };
     let identity = BindIdentity {
         project_root: caller_directory.clone(),
@@ -194,7 +194,7 @@ pub fn persist_answer_blocking(request_id: String, answer: String) -> Result<Str
         let result = call(
             &consumer,
             RouteTarget::ManagementSurface {
-                module_id: "alfonso-core".into(),
+                module_id: "prefrontal-core".into(),
             },
             BindIdentity {
                 project_root: caller_directory.clone(),
@@ -781,7 +781,7 @@ pub(crate) fn rooms_call_blocking(
             let consumer =
                 SubcConsumer::connect(&connection_file, ConsumerOptions::default()).await?;
             let target = RouteTarget::ManagementSurface {
-                module_id: "alfonso-core".into(),
+                module_id: "prefrontal-core".into(),
             };
             let identity = BindIdentity {
                 project_root: caller_directory.clone(),
@@ -853,7 +853,7 @@ pub(crate) fn load_observe_blocking(
                 SubcConsumer::connect(&connection_file, ConsumerOptions::default()).await?;
             let operation = async {
                 let target = RouteTarget::ManagementSurface {
-                    module_id: "alfonso-core".into(),
+                    module_id: "prefrontal-core".into(),
                 };
                 let identity = BindIdentity {
                     project_root: caller_directory.clone(),

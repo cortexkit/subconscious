@@ -25,6 +25,7 @@ set -l RENAMES \
 
 set -l OCDB "$HOME/.local/share/opencode/opencode.db"
 set -l MCDB "$HOME/.local/share/cortexkit/magic-context/store.db"
+set -l PFDB "$HOME/.local/share/cortexkit/prefrontal-core/store.db"
 set -l STAMP (date -u +%Y%m%dT%H%M%SZ)
 set -l BACKUPS "$HOME/.local/share/cortexkit/backups/folder-rename-$STAMP"
 
@@ -97,7 +98,7 @@ mkdir -p "$BACKUPS"; chmod 700 "$BACKUPS"
 # Copy with the restrictive mode set at creation rather than after. A copy
 # inherits its source's permissions, and nothing ever opens a backup, so a fix
 # applied on open can never reach it.
-for db in "$OCDB" "$MCDB"
+for db in "$OCDB" "$MCDB" "$PFDB"
     if test -f "$db"
         set -l name (basename (dirname "$db"))"-"(basename "$db")
         cp -p "$db" "$BACKUPS/$name"; chmod 600 "$BACKUPS/$name"
@@ -164,6 +165,57 @@ for pair in $todo
         end
     end
 
+    # Peer registrations are scoped by absolute directory. A rename strands them
+    # in a way the seat cannot detect: RECEIVING KEEPS WORKING, so nothing looks
+    # wrong until it tries to SEND and gets "unknown peer". One seat found this
+    # only because it happened to be mid-exchange.
+    #
+    # Note this is NOT covered by the realpath canonicalization that closes the
+    # symlink case: a renamed path leaves a literal in the rows, and realpath of
+    # a path that no longer exists cannot produce the new name. Nothing in the
+    # store connects the two spellings, so it needs a rewrite rather than a
+    # resolver.
+    #
+    # Each DELETE below exists for a specific uniqueness constraint, named at the
+    # site. IF THE SCHEMA'S UNIQUENESS SHAPE EVER CHANGES, RE-DERIVE THEM RATHER
+    # THAN CARRYING THEM FORWARD -- they encode session-id-is-identity semantics
+    # that a future schema may not share.
+    if test -f "$PFDB"
+        sqlite3 "$PFDB" "
+BEGIN IMMEDIATE;
+-- Scope collisions first: a seat that already re-registered the same peer NAME
+-- under the new scope is newer truth. Rewriting would violate
+-- UNIQUE(added_by_directory, name), so the stale row is dropped instead.
+-- Deletes must precede updates, or the UPDATE collides with the row it
+-- supersedes.
+DELETE FROM peers WHERE rowid IN (
+  SELECT p.rowid FROM peers p WHERE p.added_by_directory = '$old'
+  AND EXISTS (SELECT 1 FROM peers q WHERE q.added_by_directory = '$new' AND q.name = p.name)
+);
+UPDATE peers SET added_by_directory = '$new' WHERE added_by_directory = '$old';
+-- Route rows (directory = where the peer lives): supersede-or-rewrite, keyed on
+-- name within the same scope.
+DELETE FROM peers WHERE rowid IN (
+  SELECT p.rowid FROM peers p WHERE p.directory = '$old'
+  AND EXISTS (SELECT 1 FROM peers q WHERE q.directory = '$new' AND q.name = p.name
+              AND COALESCE(q.added_by_directory,'') = COALESCE(p.added_by_directory,''))
+);
+UPDATE peers SET directory = '$new' WHERE directory = '$old';
+-- Message scopes carry no constraints.
+UPDATE peer_messages SET to_directory = '$new' WHERE to_directory = '$old';
+COMMIT;"
+        or fail "peer registry rewrite failed -- restore from $BACKUPS"
+
+        # A rewrite that silently moved nothing looks identical to one with
+        # nothing to move, so assert the old path is gone rather than trusting
+        # the statement. If this fires, RE-MEASURE -- do not widen the match.
+        set -l left (sqlite3 "$PFDB" "select (select count(*) from peers where directory='$old' or added_by_directory='$old') + (select count(*) from peer_messages where to_directory='$old');")
+        test "$left" -eq 0; or fail "$left peer row(s) still at $old -- re-measure, do not widen the match"
+
+        set -l now (sqlite3 "$PFDB" "select (select count(*) from peers where directory='$new') || ' peer, ' || (select count(*) from peer_messages where to_directory='$new') || ' message';")
+        ok "peer registry: $now row(s) now scoped to the new path"
+    end
+
     # Registered worktrees point back at the main repository by ABSOLUTE path in
     # both directions: each worktree's `.git` file names a directory under the
     # old location, and the repository's bookkeeping names each worktree.
@@ -213,10 +265,18 @@ say "== verify =="
 for pair in $RENAMES
     set -l old_name (string split -f1 ':' $pair)
     set -l new_name (string split -f2 ':' $pair)
-    if test -d "$ROOT/$new_name" -a ! -d "$ROOT/$old_name"
-        ok "$new_name"
-    else if test ! -d "$ROOT/$new_name" -a ! -d "$ROOT/$old_name"
+    # The old path is EXPECTED to still resolve -- as a symlink, not a directory.
+    # An earlier version of this check required it to be gone, which contradicted
+    # the compat link the script now creates: two steps that were each correct
+    # when written, disagreeing because one was added later.
+    if test -d "$ROOT/$new_name" -a -L "$ROOT/$old_name"
+        ok "$new_name (old path resolves through a compat link)"
+    else if test -d "$ROOT/$new_name" -a ! -e "$ROOT/$old_name"
+        ok "$new_name (no compat link -- already removed)"
+    else if test ! -d "$ROOT/$new_name" -a ! -e "$ROOT/$old_name"
         warn "$new_name: neither name present (was skipped)"
+    else if test -d "$ROOT/$old_name"
+        fail "$old_name is still a real directory -- the move did not happen"
     else
         fail "$old_name/$new_name did not end in the expected state"
     end

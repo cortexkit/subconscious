@@ -48,14 +48,39 @@ fi
 TAG="$CRATE-v$VERSION"
 CURRENT_HEAD=$(git rev-parse HEAD)
 
+# Verify the OUTCOME of a push, not the command. `set -e` catches a push that
+# exits non-zero, which covers the common failure -- but it checks what the
+# command CLAIMED, and the two come apart: a pipeline reports its last stage's
+# status, so a push behind `| tail` exits 0 while failing, and any future
+# wrapper here inherits that. These predicates are what would be TRUE if the
+# push landed, so they survive a false-green wrapper.
+#
+# Called from BOTH push paths deliberately. The resume path below is the one
+# taken after an earlier push failed, so a check present only on the first-run
+# path would be absent exactly where it is most needed -- the guard belongs on
+# the recovery path at least as much as on the happy one.
+verify_push_landed() {
+  local branch
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  if [[ -n "$(git rev-list "origin/$branch"..HEAD 2>/dev/null)" ]]; then
+    echo "Error: push reported success but origin/$branch is still behind HEAD"
+    exit 1
+  fi
+  if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+    echo "Error: push reported success but tag '$TAG' is not on origin"
+    exit 1
+  fi
+}
+
 # Resumable release: if the tag already exists at HEAD, just (re)push it.
 if git show-ref --verify --quiet "refs/tags/$TAG"; then
   tag_commit=$(git rev-list -n 1 "$TAG")
   if [[ "$tag_commit" == "$CURRENT_HEAD" ]]; then
     echo "→ Tag '$TAG' already at HEAD; resuming push."
     [[ "$DRY" == "--dry" ]] && { echo "[DRY] would push $TAG"; exit 0; }
-    git push origin "$TAG"
-    exit 0
+      git push origin "$TAG"
+      verify_push_landed
+      exit 0
   fi
   echo "Error: tag '$TAG' exists but points at $tag_commit, not HEAD ($CURRENT_HEAD)"
   echo "       Refusing to reuse a release tag from a different commit."
@@ -100,4 +125,7 @@ fi
 git tag -a "$TAG" -m "Release $TAG"
 git push origin HEAD
 git push origin "$TAG"
+
+verify_push_landed
+
 echo "  ✓ Pushed $TAG — CI will verify (ubuntu + windows) then publish $CRATE v$VERSION to crates.io"

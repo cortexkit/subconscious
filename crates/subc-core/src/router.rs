@@ -127,6 +127,19 @@ impl Backend {
 /// Unknown client-originated non-zero channels are translated to canonical JSON `ERROR` frames on
 /// the connection sink so the peer can continue using the same socket. Module-originated frames for
 /// released route channels are logged and dropped as the channel-gone race backstop.
+///
+/// DATA-PLANE BODIES ARE NEVER DECODED HERE, and the consequence is worth stating
+/// because it looks like a guarantee and is not. Additive fields in a request or
+/// response body reach the far side untouched — not because anything permits them,
+/// but because routing reads only the 21-byte header and treats the body as opaque
+/// bytes. That is a performance property, so **nothing prevents it from changing**:
+/// a future reason to inspect a body would convert a wire-transparent path into a
+/// filtering one, and nobody would think of it as a contract change.
+///
+/// So when a peer asks whether subc sees an additive field, the answer is per-path
+/// and this path's zero means WE NEVER LOOK rather than WE LOOK AT EVERYTHING. The
+/// control plane (typed enums at the frame boundary) and the MCP gateway (envelope
+/// unwrap plus a named struct) both narrow; only this one does not.
 pub struct Router {
     backends: HashMap<u16, Backend>,
     control: Arc<ControlHandler>,

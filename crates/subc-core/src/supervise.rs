@@ -2412,6 +2412,31 @@ fn spawn_child(
     }
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
 
+    // STDIO IS DELIBERATELY LEFT INHERITED, which is a decision no line of this
+    // function states and therefore worth stating here: every supervised child
+    // gets the daemon's own stdout/stderr, so all of them share ONE file
+    // descriptor and one file offset. That is what puts every module's output in
+    // a single daemon log without a per-child reader task.
+    //
+    // THE COST IS INTERLEAVING, and the mechanism is finer than a shared fd. A
+    // module owner measured it: an emitter that formats INCREMENTALLY issues one
+    // write syscall per format fragment, and while a process-local lock serialises
+    // those within one process, nothing serialises them ACROSS processes. Two
+    // processes on one inherited fd, 1500 lines each: 212 of 3000 lines came out
+    // spliced with an incremental emitter, 0 of 3000 when each line was formatted
+    // first and written in a single call. So the inheritance is the exposure and
+    // the multi-syscall write is what converts it into damage.
+    //
+    // CONSEQUENCE FOR ANYONE SCRAPING THE DAEMON LOG: do not anchor patterns at
+    // line start. A single-write emitter guarantees its line is WHOLE, not that it
+    // begins a line -- another process mid-write can still land a fragment ahead of
+    // it, measured at ~8% of lines. An unanchored match found 1500 of 1500 where
+    // `^`-anchored found 1382. Strip escape sequences too.
+    //
+    // The structural fix is a per-child pipe with a line-atomic writer here, which
+    // would make the property hold for modules this daemon does not own. Not done:
+    // it adds a reader task per child and moves where logs land, and the mitigation
+    // above is free for any module that adopts it.
     command.kill_on_drop(true);
     command.spawn().map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),

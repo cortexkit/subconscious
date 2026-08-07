@@ -256,6 +256,7 @@ Before calling a class closed:
 | 169 | Is the standing signal the state, or the state's *direction*? | A gap that grows while a release is pending is a stall; the same gap while releases land is normal work |
 | 170 | Two things are blocked — which one varies? | Hold everything constant but the suspected cause; a probe that differs in two ways separates nothing |
 | 171 | Does the error text match the record's own fields? | An error naming a state the fields contradict is describing something other than what you asked about |
+| 172 | Every remedy failed — do they all consult the state that produced the error? | Then their agreement is one observation repeated, and the corruption is upstream of all of them |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4445,6 +4446,18 @@ And the correction I owed: I had offered *routing beyond the public interface* a
 had none. Everything above used the same tool they had. **What I had was a probe
 they had not run, not access they lacked** — and offering capability you have not
 verified invites someone to stop looking for their own answer.
+
+The owner's own reading is the one to keep: their mechanism was **a plausible guess
+promoted to a diagnosis without the separating experiment**, and that experiment
+was available to them the whole time. They had pattern-matched to concurrency
+behaviour they knew from other work and stopped looking — having corrected the same
+error in someone else's incident hours earlier, from the other side.
+
+They also sharpened the failed-lever point into something reusable: **every
+cancellation lever consults the same state that produced the error**, so their
+unanimous refusal is one observation repeated rather than three confirmations.
+When every remedy fails identically, check whether they share a source before
+concluding the thing is unreachable.
 
 ### Check the fix, not the person
 

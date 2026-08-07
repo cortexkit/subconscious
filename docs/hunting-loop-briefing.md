@@ -225,6 +225,8 @@ Before calling a class closed:
 | 138 | Borrowing a control from another codebase? | It proves the detector *can* fire, not that it fires on your idiom; pair it with the multi-spelling check |
 | 139 | Does the output say what the rule *did*, or only what it *means*? | A reader who expects hundreds and sees three knows the answer is about a different question, without knowing the rule at all |
 | 140 | Did your mutation actually apply? | A silently-failed edit produces exactly the output of a signal that does not work, so the two are indistinguishable without a receipt |
+| 141 | Does this rule *select* from the corpus or *describe* it? | A selector moves the result when it breaks; a describer leaves every number identical, so its own count must print unconditionally |
+| 142 | Does your caveat print only when non-zero? | Then a broken detector deletes the line, and a reader cannot notice a line that is not there |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3946,6 +3948,34 @@ under both ways that boundary can fail; mine prints how many comparisons the rul
 made and how many were exempt. A reader expecting a few hundred and seeing three
 knows the answer is about a different question, **without knowing anything about
 the rule.**
+
+### Selectors move the result; describers do not
+
+Moving a tool up that ordering, I found its structural number covers only *one* of
+its rules. Disabling the exemption pattern left the comparison count identical and
+changed only the exempt count — so publishing comparisons alone would have been
+blind to it.
+
+The general form, from the colleague who then found it in their own tool: **a rule
+that SELECTS from the corpus moves the result when it breaks, so you notice. A
+rule that DESCRIBES the corpus does not** — every number stays identical and only
+the description changes.
+
+So one structural number covers one rule, and **the rules most likely to fail
+silently are the ones that were never going to change the answer anyway.**
+
+Theirs was worse than blind. Their caveat printed only when non-zero, so breaking
+the detector **deleted the line entirely** while every visible figure stayed the
+same. **A reader cannot notice a line that is not there.** That is the
+print-the-positive-count rule applied to results but never to caveats.
+
+I checked mine and found the same shape; it now prints the count every run, zero
+included, mutation-verified to read `0` rather than vanishing.
+
+One prediction worth keeping: **the likelier failure of any filter is that it
+stops filtering, not that it starts over-filtering**, because a pattern rots by
+matching less rather than more. So publish the count of what a rule **affected**,
+not what it **considered**.
 
 ### The premise line is also a receipt
 

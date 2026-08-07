@@ -458,7 +458,10 @@ Before calling a class closed:
 | 371 | Generalising from one truncated observation | The instrument decided what you concluded — do not relay it as a warning until a second run shows the same thing untruncated |
 | 372 | Dropping a check as redundant | If it reads a different SUBJECT it is not redundant — a config-derived check and a running-process check agree until the moment they matter |
 | 373 | A name appearing in a config file | Not automatically a REFERENCE to the thing it names — the same string can be an identity, a filesystem path, or a human label, and only one of them breaks when the thing is renamed |
-| 374 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 374 | A name that is actually half a lookup key | Say so AT THE DEFINITION — a consistency pass reads the file and never the history, and renaming a key derives one nothing has ever written to, which fails closed on wholly intact state |
+| 375 | Evidence whose lifetime is "until the next normal action" | Capture it at the time or not at all — the natural next step is what erases it, and here the very check I requested destroyed the timestamp proving the change it verified |
+| 376 | A redirect from an old name | It dies when something else claims that name, and then resolves to the WRONG target rather than failing — a dead redirect is noticed, a hijacked one is not |
+| 377 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

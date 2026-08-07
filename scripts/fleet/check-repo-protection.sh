@@ -17,6 +17,15 @@
 # Usage: check-repo-protection.sh [projects-dir]   (default ~/Work/Projects/CortexKit)
 
 set -uo pipefail
+
+# The two probes every verdict rests on, named once and used everywhere below.
+# The premise line prints these rather than describing them: a sentence beside
+# the code it describes can disagree with it, and a premise that disagrees is
+# worse than none, because a reader who checks it is checking a claim rather
+# than the rule.
+REACHABLE_PROBE="ls-remote --heads origin"
+AHEAD_PROBE="rev-list --count @{u}..HEAD"
+
 ROOT="${1:-$HOME/Work/Projects/CortexKit}"
 [ -d "$ROOT" ] || { echo "no such directory: $ROOT"; exit 1; }
 cd "$ROOT" || exit 1
@@ -29,7 +38,8 @@ control=""
 for d in */; do
   [ -d "$d/.git" ] || continue
   git -C "$d" remote get-url origin >/dev/null 2>&1 || continue
-  if timeout 25 git -C "$d" ls-remote --heads origin >/dev/null 2>&1; then control="${d%/}"; break; fi
+  # shellcheck disable=SC2086 # the probe is a fixed word list, not user input
+  if timeout 25 git -C "$d" $REACHABLE_PROBE >/dev/null 2>&1; then control="${d%/}"; break; fi
 done
 if [ -z "$control" ]; then
   echo "REFUSING: no remote anywhere was reachable."
@@ -38,12 +48,11 @@ if [ -z "$control" ]; then
   exit 2
 fi
 echo "probe control: ${control} reachable"
-# The premise every result below rests on. A repo is judged by whether its
-# origin answers ls-remote right now -- not by what its config says, and not by
-# any other remote it may have. The findings look identical under a different
-# rule, so a reader who would disagree cannot tell from them that a choice was
-# made.
-echo "premise: protected means origin answers ls-remote and HEAD is not ahead of it"
+# A repo is judged by whether its origin answers right now -- not by what its
+# config says, and not by any other remote it may have. The findings look
+# identical under a different rule, so a reader who would disagree cannot tell
+# from them that a choice was made.
+echo "premise: protected means 'git $REACHABLE_PROBE' succeeds and 'git $AHEAD_PROBE' is 0"
 echo
 
 # The examined count is reported alongside the findings, not just the findings.
@@ -65,12 +74,14 @@ for d in */; do
     printf 'NO REMOTE     %-24s %6s commits\n' "$name" "$commits"
     none=$((none+1)); continue
   fi
-  if ! timeout 25 git -C "$d" ls-remote --heads origin >/dev/null 2>&1; then
+  # shellcheck disable=SC2086 # the probe is a fixed word list, not user input
+  if ! timeout 25 git -C "$d" $REACHABLE_PROBE >/dev/null 2>&1; then
     printf 'DEAD REMOTE   %-24s %6s commits  -> %s\n' "$name" "$commits" "$url"
     dead=$((dead+1)); continue
   fi
   # Reachable. Ahead of upstream is a weaker problem but still unprotected work.
-  ahead=$(git -C "$d" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+  # shellcheck disable=SC2086 # the probe is a fixed word list, not user input
+  ahead=$(git -C "$d" $AHEAD_PROBE 2>/dev/null || echo 0)
   if [ "${ahead:-0}" -gt 0 ]; then
     printf 'UNPUSHED      %-24s %6s ahead\n' "$name" "$ahead"
     stale=$((stale+1))

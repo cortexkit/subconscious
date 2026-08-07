@@ -503,8 +503,10 @@ Before calling a class closed:
 | 416 | An artefact you are using to date a success | Check it proves the run CONCLUDED, not that it STARTED — builds produced and files copied are setup artefacts that survive being killed, and setup artefacts outlive verdicts because nothing writes verdicts down |
 | 417 | A truncated listing | It manufactures an absence that LOOKS COMPLETE — a head/tail cut over a sorted list hides an entire middle band, and unlike an empty result nothing in the output invites doubt |
 | 418 | A measurement offered as the fix for a bad estimate | Check its instrument too — it is more dangerous than the estimate it replaces precisely because it arrives wearing the remedy |
-| 419 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 420 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 419 | Evidence you expected to find and did not | Ask whether a CLEANUP STEP removed it — teardown, rotation, eviction and reclamation are authored by someone optimising for tidiness who has no reason to imagine a future investigation, so the deletion is correct by its own lights and survives review |
+| 420 | An unverifiable change to a reporting layer | Refuse it even under time pressure — a change to the thing that reports greenness cannot be validated by the reports, so it is self-concealing in a way an unverifiable change anywhere else is not |
+| 421 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 422 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

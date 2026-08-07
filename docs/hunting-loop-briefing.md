@@ -347,6 +347,8 @@ Before calling a class closed:
 | 260 | Deferring with a stated reason | A reasoned deferral reads as adjudicated and stops inviting questions; check the reason itself before it closes the item |
 | 261 | A research answer whose evidence snippets did not resolve | Fluent prose confabulated from filenames is worse than a refusal, because it arrives wearing citations |
 | 262 | A rule covering one direction of a two-sided property | The covered half keeps firing, so the rule feels validated; a check must be able to fail and a filter must be able to exclude |
+| 263 | An enumeration came back complete — keyed on what? | It is only as complete as the property it keys on; a sibling path reaching a different terminal state is invisible to it |
+| 264 | Two parties assume a third repo's guarantee | Neither the assumer nor the owner ever hears the assumption; it surfaces only if someone volunteers a correction against their own interest |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5742,6 +5744,31 @@ it could not read a sibling repository — confabulated from filenames, with a f
 citing the caller's own commit as though it had read the other tree. **Worse than a
 refusal**, since it arrives wearing citations. Reading the source directly took four
 minutes.
+
+The owner then confirmed the gap, documented the rationale at source, and corrected my
+enumeration: **I had missed two automatic paths**, both of which do apply to static
+records. They live on the *read* path rather than the refresh path, quarantining a
+record that fails to decrypt or decodes empty.
+
+The distinction they drew is the reason my conclusion still stands, and it is the more
+useful half: those are **integrity** checks rather than **authentication** checks.
+They catch a mangled record and cannot catch a well-formed key the provider has
+revoked, because to the vault a revoked key and a live key are byte-identical. So the
+retirement set for a revoked static key is unchanged — but the enumeration that
+produced it was incomplete, and **an enumeration is only as complete as the property
+it keys on**. I keyed on writers of one terminal state; a sibling path writing a
+different one was structurally invisible to the query.
+
+Their framing of the ownership gap is worth keeping: **a peer's assumption about a
+third party's guarantees is a defect class with no owner.** The assuming party has no
+reason to check, and the owning party never hears the assumption. This one surfaced
+only because someone volunteered a correction against their own interest, which is
+not a mechanism.
+
+And the message prompted a fix worth more than the gap it asked about: the read
+surface's own documentation still described an operation's parameters from before a
+versioning change, so a consumer author following it would build a call a live vault
+rejects, with nothing explaining why.
 
 One remedy worth copying, because the instinct is wrong: **skip the call when its
 precondition is absent rather than logging its failure.** Logging fixes the observer's

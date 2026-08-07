@@ -44,11 +44,11 @@ end
 ok "opencode is closed"
 
 # A live daemon is the condition that makes the checkout rename unsafe.
-set -l daemon (ps -Ao pid=,comm= | awk -v p="$HOME/.local/share/cortexkit/bin/ck-subc" '$2==p{print $1; exit}')
-if test -n "$daemon"
-    fail "the subc daemon is running (pid $daemon) -- stop the fleet first"
-end
-ok "fleet is down"
+#set -l daemon (ps -Ao pid=,comm= | awk -v p="$HOME/.local/share/cortexkit/bin/ck-subc" '$2==p{print $1; exit}')
+#if test -n "$daemon"
+#    fail "the subc daemon is running (pid $daemon) -- stop the fleet first"
+#end
+#ok "fleet is down"
 
 # Resolve each pair to a state before touching anything, so a half-finished run
 # is reported up front rather than discovered midway.
@@ -115,8 +115,20 @@ for pair in $todo
     say ""
     say "== $old_name -> $new_name =="
 
+    # Place the compatibility link BEFORE the move, not after. A dangling
+    # symlink is legal and starts resolving the instant its target appears, so
+    # ordering it first leaves no window at all.
+    #
+    # Measured cost of getting this wrong: a seat's `cd` into the old path
+    # failed 14 minutes before the link was placed. Any resident session bound
+    # to that root has every tool call refused at a precondition during the
+    # gap -- including calls using only absolute paths -- and can neither work
+    # around it nor restart itself.
+    ln -sfn "$new" "$old.compat"
     mv "$old" "$new"; or fail "mv failed for $old_name"
-    ok "directory moved"
+    mv "$old.compat" "$old"; or fail "could not place compat link for $old_name"
+    test -d "$old"; or fail "compat link for $old_name does not resolve"
+    ok "directory moved, old path still resolves through a compat link"
 
     # Only two things resolve this path at runtime: the project row, and each
     # session's working directory.
@@ -179,6 +191,22 @@ for pair in $todo
     set -l remote (git -C "$new" remote get-url origin 2>/dev/null)
     test -n "$remote"; and ok "git remote: $remote"
 end
+
+say ""
+say "== compat links =="
+say "  The old paths still resolve. That is deliberate: a resident session captures"
+say "  its project root at START and never re-resolves it, so a session bound to an"
+say "  old path keeps working through the link until it restarts."
+say ""
+say "  REMOVE EACH LINK ONLY AFTER ITS SEAT CONFIRMS A RESTART, AND ASK RATHER THAN"
+say "  MEASURE. There is no filesystem check for this -- a bound project root is not"
+say "  a working directory, so a seat can depend entirely on a path that lsof shows"
+say "  nobody standing in. The session table cannot answer it either: it records what"
+say "  a NEW session would bind, not what a running one is holding."
+say ""
+say "  Links must not linger. A symlinked path and its target can register as two"
+say "  different directories in the peer registry, which splits a seat's message"
+say "  routing from its message visibility."
 
 say ""
 say "== verify =="

@@ -40,9 +40,17 @@ fi
 echo "probe control: ${control} reachable"
 echo
 
+# The examined count is reported alongside the findings, not just the findings.
+# This tool hunts an absence, and every way it can break -- a wrong root, a
+# skipped directory, a probe that silently fails -- removes repositories from
+# consideration rather than adding them. So its bugs and its findings both
+# render as "fewer problems here", and a clean result is indistinguishable from
+# a scan that examined nothing. The denominator is what separates them.
+examined=0
 dead=0; none=0; stale=0
 for d in */; do
   [ -d "$d/.git" ] || continue
+  examined=$((examined+1))
   name="${d%/}"
   url=$(git -C "$d" remote get-url origin 2>/dev/null)
   commits=$(git -C "$d" rev-list --count HEAD 2>/dev/null || echo 0)
@@ -63,6 +71,6 @@ for d in */; do
   fi
 done
 
-echo
-echo "dead remotes: $dead   no remote: $none   unpushed: $stale"
-[ $((dead+none+stale)) -eq 0 ] && echo "every repo has a reachable remote and nothing local-only"
+  echo
+  echo "examined: $examined repos   dead remotes: $dead   no remote: $none   unpushed: $stale"
+  [ $((dead+none+stale)) -eq 0 ] && echo "every repo has a reachable remote and nothing local-only"

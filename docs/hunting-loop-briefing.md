@@ -299,6 +299,8 @@ Before calling a class closed:
 | 212 | One case exempted and its siblings not — deliberate? | The asymmetry is evidence; a shared exemption reason that describes all of them explains none of the difference |
 | 213 | Claiming one case covers another — same code path, or similar failure? | Check whether the consumer can distinguish them; identity is a fact about the code, similarity is an argument |
 | 214 | Would this test require building a capability you would not otherwise keep? | The cost is not the run, it is that the capability then exists |
+| 215 | Conclusion confirmed — was the supporting fact ever checked? | A true conclusion never forces its derivation to be re-examined, so a wrong fact under it travels into the next argument |
+| 216 | Registration observed — does it prove the prerequisite was met? | A component that registers and then dies on a missing requirement looks identical at that instant; sample after the check, not before |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5062,11 +5064,43 @@ on it, rather than inheriting whichever default the binary happens to carry. And
 when a rename is declared complete, the residue to look for is not references in
 running config but **defaults compiled into binaries that config has been masking**.
 
+I then overstated the rename to them — said the repository had been renamed when only
+the module and the local directory were. Worse than a slip: **the "second checkout"
+I cited was a compatibility symlink I had created myself** during the cutover, then
+read back as evidence of something it was not. **An artefact you created is the one
+you are least likely to treat as needing a source**, because you already know what it
+means, so the question never forms.
+
+Their half of it is the sharper one. They had reached the correct conclusion — the
+repository was not renamed — and supported it with a fabricated second checkout,
+produced by asking for a directory's identity **without following the link**, which
+answers *same entry* rather than *same directory*. Because the conclusion was
+independently true, **nothing downstream could ever force the supporting fact to be
+re-examined**, and it would have carried the conclusion's credibility into the next
+argument that needed it. A confirmed conclusion is not blanket validation of its
+derivation.
+
+The same missing flag sits in the deploy check in this document, where omitting it
+compares a symlink to itself and passes.
+
 The same audit priced a fixture against an assumption worth checking: the module's
 profile turned out to be plain configuration rather than a signed artifact, which
 removed the dominant cost term from the proposal. Worth stating what that check
 actually established — the shape of the live file, not what the loader requires —
-since the required set can exceed what happens to be present.
+since the required set can exceed what happens to be present. Reading the parser
+settled it at **one required field**, against four populated in the live file:
+**populated fields are evidence someone set them, never that anything demands them.**
+
+Proving the module could actually start then produced a probe worth copying. Their
+first version concluded *it registered, therefore its storage prerequisite arrived*
+— false by the module's own ordering, which registers first and awaits the
+prerequisite after, **while quoting the line numbers that disprove it**. A component
+that registers and then dies on a missing requirement is indistinguishable at that
+instant from one that is fine, so any liveness check sampling once and early cannot
+separate them. The corrected probe measures survival *past* the await at three
+points — and pairs it with a negative control, because **"it survived" is compatible
+with a harness that passes regardless** until you have watched the same probe report
+death when the requirement is genuinely unmet.
 
 ### An exemption that covers some siblings and not others
 

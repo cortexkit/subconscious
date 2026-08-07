@@ -3641,6 +3641,14 @@ trait PromptRouteClient: Send + Sync {
 /// STARTS wrapping and is called by a path that does not strip, that body decodes
 /// with every field missing. The fixtures pin the bodies we send and receive
 /// today; they cannot pin what the other module does tomorrow.
+///
+/// SIBLING KEYS ON THE ENVELOPE ARE DISCARDED HERE, not ignored downstream: this
+/// returns the inner value and the outer object is dropped, so no later code can
+/// see a key added beside `result`. Harmless while the envelope carries nothing
+/// else, and the reason to write it down is that a future sibling would be
+/// invisible by construction rather than merely unread — which reads as "we do not
+/// use it" when it is really "we cannot see it". Widening is a one-line change
+/// here; it cannot be done at the call sites.
 fn unwrap_result_envelope(
     value: serde_json::Value,
 ) -> std::result::Result<serde_json::Value, PromptBackendError> {

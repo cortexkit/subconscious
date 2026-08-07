@@ -15,7 +15,7 @@ binaries from one commit, and every check in this document passes for both.
 So the pinning has to exist where the build happens. When accepting an artifact
 built elsewhere, that is a property of the other repository's build path, not
 something this ritual can recover. Ask, rather than inferring it from a clean
-verification here. — plan
+verification here.
 
 Written 2026-08-06. Everything below was measured from the running fleet and the
 repositories on this machine, not recalled.

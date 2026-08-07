@@ -327,6 +327,7 @@ Before calling a class closed:
 | 240 | Absence found in the consuming file — did you check the producer? | That is a fact about who reads the value, not about whether it is set |
 | 241 | Status matches a known signature — did you ask a second endpoint? | One API's rendering of an event is not the event; a timeout can arrive labelled as a cancellation |
 | 242 | Count and detail disagree — same invocation? | Two calls to a live system are two samples; the contradiction can be between the samples rather than in the system |
+| 243 | Before reading agreement OR disagreement as signal | Establish what actually varied between the two readings; often it is the source or the time rather than the thing measured |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5444,6 +5445,16 @@ consecutive samples then read fourteen.
 **When a count and its detail disagree, check whether they came from the same call
 before concluding either is wrong.** The contradiction can sit between the samples
 rather than inside the system.
+
+The other seat then paired the two findings in a way neither of us had seen alone,
+and the pairing is the durable part. Theirs was **one source consulted twice**, so
+the unanimity was worth nothing. Mine was **two readings that were secretly two
+times**, so the disagreement was worth nothing. Opposite directions, same defect —
+and between them they bracket the class:
+
+**Before treating agreement or disagreement as signal, establish what actually varied
+between the two readings.** Often it is the source or the clock rather than the thing
+being measured.
 
 Two details from the same package are worth carrying. The control string proved my
 search **reached a third party's binary at all** — without it, *the marker is absent*

@@ -387,6 +387,8 @@ Before calling a class closed:
 | 300 | A fixture built from a healthy example | Dense is what everyone writes by default, and a dense fixture cannot test tolerance of sparseness |
 | 301 | A check on whether a step worked | It must consult something that step does not produce; an assertion inside the mutation is produced by the thing it checks |
 | 302 | The result agreed with you | That is exactly when to look at the other artefact — a disagreeing result gets investigated automatically, an agreeing one is where the unread warning sits |
+| 303 | "Nobody has hit this yet" | A statement about your visibility, not their behaviour; a consumer misreading your wire produces no error, no failing test and no report on your side |
+| 304 | Choosing where to record something | Rank artefacts by reach, not rigour — a test does not travel, a doc comment travels once published, a contract travels only to whoever reads that repo |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

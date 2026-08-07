@@ -308,6 +308,7 @@ Before calling a class closed:
 | 221 | Does your harness model the configuration production actually runs? | A test passing on a different configuration certifies the untested path as covered |
 | 222 | Can the property your check leans on be asserted instead of assumed? | Rejecting the condition converts a silent lease into a loud one, at the cost of the comment you would have written |
 | 223 | A guard's comment describes a threat — is the guard switched on? | The comment describes the mechanism, never the population it covers; count the entries that actually enable it |
+| 224 | Reporting a security gap — is the reach stated accurately? | An overstated threat model gets the whole finding dismissed on the overstatement, and the narrowed version is usually more pointed |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5212,6 +5213,24 @@ replacing it, so an impostor cannot displace a *live* module. That leaves exactl
 the window the comment names — while the module is down or restarting — which is not
 theoretical on a machine where modules restart several times an hour, and covered
 every module at once during a fleet bounce that morning.
+
+A second bound came from the colleague, and it corrected my write-up before it
+reached anyone: the connection file is user-owned and mode 0600, so *any process that
+can read it* is **any process running as the user**, not any local process. My phrasing
+read as a privilege-escalation claim and was false.
+
+Stating the narrower scope made the finding stronger rather than weaker. **An
+overstated threat model gets the whole finding dismissed on the overstatement** — and
+the accurate version is more pointed, because everything that matters on the machine
+already runs as that user, so file permissions cannot substitute for a mechanism
+whose entire purpose is stopping a same-user process from claiming a
+security-boundary slot.
+
+Worth noting what the standing test has and has not done across a day of firing:
+**every instance was on the finder's own work, minutes after they adopted it, and in
+every case the conclusion was true.** It has not once caught a wrong answer. It
+catches wrong routes to right answers, which is the only kind that can be caught
+before the answer starts to matter.
 
 ### An exemption that covers some siblings and not others
 

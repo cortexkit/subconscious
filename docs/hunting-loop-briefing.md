@@ -317,6 +317,8 @@ Before calling a class closed:
 | 230 | Gate covers everything — by design, or by property of the invocation? | Coverage established by passing is not coverage established by counting; name the populations and count them |
 | 231 | Policy change broke a test — can it still construct its own precondition? | The obvious repair turns a failing test green while it measures a different path, destroying the only signal |
 | 232 | Asserting a property another repo owns? | Say so in the test; it can regress from a change you never see, and a reader will otherwise think it tests yours |
+| 233 | Two parties confirmed it — or one party twice? | Trace each to its source; correlated confirmations read as corroboration and carry one claim's worth of evidence |
+| 234 | Same commit, or same compilation? | A matching build identifier proves the deployed bytes are the validated bytes; equal source leaves room for a different toolchain |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5331,6 +5333,31 @@ policy had changed — replies over an untrusted binding are text-only — and t
 still read the structured sidecar. The data was correct throughout; only the
 expectation was stale. So the test driving two subsystems together was not merely
 unrun, **it was broken, and being unrun is what let it stay broken.**
+
+### One claim arriving twice
+
+Two seats independently told me a production change was approved. Both messages were
+sincere, and one of them said *approved via* the other — so **what looked like two
+confirmations was a single claim arriving twice.**
+
+That is the correlated-source problem we had been finding in instruments all day,
+pointed at an authorisation instead of a measurement. The response is the same:
+trace each confirmation to its own source, and treat agreement between correlated
+reporters as one report. I would refuse it from a probe, so refusing it here cost one
+message against a live fleet.
+
+Worth separating the verification from the authorisation, because the verification
+was exemplary and the hold was not about it. Both artifacts matched their claimed
+digests, carried the correct signing identity, and shipped a marker string proven
+**present in the incoming build and absent from the running one**, plus a control
+string present in both — which is what distinguishes *the new bytes are absent* from
+*my search does not work*.
+
+One provenance claim in that package is worth copying: the deployed artifact carried
+the **same build identifier** as the binary that had passed validation on the test
+rig, differing only in signing identity. **Same commit leaves room for a different
+toolchain or feature set; a matching build identifier means it is the same
+compilation.**
 
 ### The repair that would have made a test measure the wrong thing
 

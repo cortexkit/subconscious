@@ -263,6 +263,8 @@ Before calling a class closed:
 | 176 | Is the trigger you are testing filtered? | A path, branch or tag filter turns "nothing happened" into correct behaviour, and no error is emitted either way |
 | 177 | Attributing a behaviour to one component — does an unrelated one do it too? | The cheapest test of a local explanation is whether the effect reproduces where the explanation does not apply |
 | 178 | Does this gauge report zero before it has looked? | Zero renders "nothing observed" identically to "nothing there"; null distinguishes them |
+| 179 | Did your mutation run the whole suite, or the binaries you picked? | Choosing which tests to run is choosing which coverage to measure, and the answer looks the same either way |
+| 180 | An unfed gauge over-reports — is that harmless? | A freshness gauge that never advances reports the exact signature of the fault it exists to detect |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4551,6 +4553,37 @@ next reader to the wrong place**, which is worse than not recording it.
 The schedule stays: spreading the first probe is what stops a fleet-wide restart
 firing fourteen simultaneous probes into a cold machine. The tradeoff is now
 written where someone weighing it will find it.
+
+### The mutation I scoped to the wrong binaries
+
+An owner turned a tally into a search — three occurrences of *a health test that
+stamps its own input* meant the gap was structural to how such tests get written,
+not three lapses. They enumerated every state mutator, counted production call
+sites, mutated each, and found a fourth.
+
+I ran the same sweep on my supervisor. Deleted the stamp that records when a health
+probe last landed, ran the tests, and got **132 green across two binaries** —
+apparently the same gap.
+
+It was not. **I had run two test binaries out of eleven.** The full suite reddens
+immediately, on an integration test asserting exactly that field. My unit and
+supervision binaries do not cover it; a third one does.
+
+The lesson is about the instrument rather than the code. **Choosing which tests to
+run is choosing which coverage to measure**, and a scoped run answers a narrower
+question in the same shape as the broad one. I had picked the binaries I thought
+relevant — which is exactly the reasoning that decides where coverage is, so it
+cannot also verify it. **Run everything, or state which binaries the null is about.**
+
+And their finding sharpens the class it belongs to. When the stamp is missing, the
+gauge does not go blank — it **ages forever**, so a healthy component reports the
+precise signature of a wedged one. **An unfed freshness gauge over-reports, which
+reads as harmless**, and that is likely why the class survives review: nobody asks
+whether the line feeding an alarming-but-conservative number is ever reached.
+
+Their other check is worth copying too: a mutator with five call sites *looked*
+protected by repetition, and they deleted one specifically rather than trusting the
+others. **Redundancy is not coverage; it makes the uncovered site harder to spot.**
 
 ### Null before the first look
 

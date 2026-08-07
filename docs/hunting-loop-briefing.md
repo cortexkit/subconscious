@@ -236,6 +236,9 @@ Before calling a class closed:
 | 149 | Is the answer uniform across every row? | Uniformity is as suspicious as emptiness — twenty rows all "covered" is a parse failure wearing a verdict |
 | 150 | Restoring a file after a probe — is anything uncommitted in it? | A restore-after-probe is indistinguishable from a restore-after-mutation, and one of them is meant to discard work |
 | 151 | Sharpening a test — did you run the mutation against the OLD assertion too? | Otherwise you cannot distinguish "I improved an assertion" from "I improved one that was already sufficient" |
+| 152 | Did the pinned run fail *at the assertion*, or earlier? | A mutation that breaks the setup reddens the test without the assertion ever mattering |
+| 153 | One demonstration, several sharpened assertions — did you prove each? | A refactor that moves one test's input into a neighbour's path leaves the siblings untouched, so the proof does not carry |
+| 154 | Did your mutation script and the test run share one invocation? | A failure in the script prints alongside a passing summary, and the summary is what gets read |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4086,6 +4089,48 @@ The change is still worth keeping, since every rule there returns one error kind
 and a future rule could absorb the input. But it is **prophylactic rather than
 proven**, and those are different claims. Recording which one you have is the
 difference between a documented margin and an imagined one.
+
+### Red is not one outcome
+
+My downgraded second pair exposed a third result beyond pass and fail: **the test
+died before the assertion mattered.** Deleting that guard let the config parse
+cleanly, so the test's own unwrapping panicked on a success value and no assertion
+ran.
+
+So **a red result does not prove the assertion is load-bearing** — it may prove
+only that the mutation broke the setup. The check needs a third question beyond
+*does the old form pass and the new form fail*: **did the new form fail at the
+assertion, or earlier?**
+
+Checking my first pair against that, it fails **at** the assertion, and the message
+names the neighbouring rule that absorbed the input. Genuinely load-bearing.
+
+One trap while confirming it: the panic's reported **line number came from the
+mutated file**, which was five lines shorter than the original, so it pointed at
+the wrong statement. **A stack trace from a mutated build is indexed against the
+mutant, not your source.** Read the message text rather than trusting the line.
+
+### One proof does not cover its siblings
+
+They ran the both-directions check on one of four sharpened assertions, watched it
+work, and shipped all four. Going back: **each needed its own refactor to
+demonstrate**, because a change that moves one test's input into a neighbouring
+rule's path leaves the siblings untouched.
+
+All three remaining ones turned out genuinely load-bearing — which is the
+uncomfortable version. **A correct conclusion from insufficient evidence leaves
+nothing to notice.** Run the fail-before per assertion, not per batch.
+
+### A script failure that reads as a test result
+
+Third instance in one evening of a mutation that did not apply. This time a
+scripting error aborted mid-run **after** the shell had already printed a passing
+test summary — which is exactly what a successful old-assertion run produces. The
+traceback sat below the summary, and the summary is what gets read.
+
+**When a mutation script and a test run share one invocation, a failure in the
+script looks like a result from the test.** Make the script assert that the file
+actually changed, and stop the run when it does not.
 
 ### Uniformity is as suspicious as emptiness
 

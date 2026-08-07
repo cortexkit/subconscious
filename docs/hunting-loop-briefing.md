@@ -313,6 +313,8 @@ Before calling a class closed:
 | 226 | Unexercised on your side — or exercised where you cannot see? | Say which; a branch written from source is an assertion about a code path until someone observes it |
 | 227 | Searched the test directory — is that the test suite? | Unit tests live in the source file, so a directory search reports faithfully about a subset |
 | 228 | Guard proven to refuse — is it proven not to over-match? | A guard that captures too much passes every positive assertion while reserving names nobody intended |
+| 229 | Counting from a run — did the run finish? | An aborted run yields a truncated count, and a small number reads as a finding about the population rather than about the run |
+| 230 | Gate covers everything — by design, or by property of the invocation? | Coverage established by passing is not coverage established by counting; name the populations and count them |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5279,6 +5281,24 @@ And the question was worth asking even though the answer was reassuring. Had hal
 the mechanism been unproven, *the fix cannot regress the mechanism* would have been
 half a claim, with the untested half being the only one in production use. **That
 asymmetry is what makes the question cheap.**
+
+The population lesson then travelled further than the answer did. They checked their
+own gate and found its inline tests run only as a property of the invocation rather
+than by anything they had verified; I checked mine and found it covers **two of
+three populations**, because the flag whose name promises everything excludes
+documentation tests. Zero runnable examples exist today, so the gap has no current
+victim — which is exactly the state in which nobody notices.
+
+Both are the same defect: **coverage established by passing rather than by
+counting.**
+
+And counting nearly caught me out on its own. My first run reported one target of
+each kind — plausible small numbers, and wrong: the run had aborted partway, so I was
+counting the targets that had started before it died. **A partial run produces a
+count, not an error**, and a small count reads as a finding about the population
+rather than about the run. The real figures were twelve and fourteen. I caught it
+only because the abort's exit status sat next to a number I had no prior for; had I
+expected roughly one, I would have recorded it.
 
 ### An exemption that covers some siblings and not others
 

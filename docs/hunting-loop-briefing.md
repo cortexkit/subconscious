@@ -351,6 +351,8 @@ Before calling a class closed:
 | 264 | Two parties assume a third repo's guarantee | Neither the assumer nor the owner ever hears the assumption; it surfaces only if someone volunteers a correction against their own interest |
 | 265 | Does this claim support your point or complicate it? | The supporting one gets waved through; direction predicts what goes unchecked better than distance from the source does |
 | 266 | Relaying a severity you later narrow | Correct it as promptly as you raised it; an overstated finding that is quietly revised turns an accepted cost into a design conversation |
+| 267 | A comment asserting how another component behaves | Your repo cannot verify or re-check it; state your side's property instead, or it goes stale where nobody who could see it will read it |
+| 268 | A zero from a file you named | Confirm the file is the right target before reading absence as a finding; a control proves the instrument works, not that it was aimed correctly |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5483,6 +5485,15 @@ all, and there were three, each already limited inline. **Find the class a prope
 can apply to before reading any count as a result**, or a large number stands in for
 an answer.
 
+A colleague applying the enumeration rule to their own pin set produced the companion
+check. Two of their queries returned zero from a file they had named, and both zeros
+were false — the behaviour lived in a sibling file, one of which shared a word with
+the question. **They keyed on file name as a proxy for behaviour**, which is the same
+substitution one level down. What saved it was confirming the file existed before
+believing the zero: since it did, the zero could not mean *absent*, only *wrong
+target*. **A positive control proves the instrument works; this proves it was aimed
+correctly**, and the two catch different failures.
+
 Its recipient placed it in the vacuity family as the mirror of a rule already banked
 there. We had the empty case — a filter returning nothing must be proven capable of
 returning something — and this is the same root from the other side: **output size is
@@ -5789,6 +5800,24 @@ design conversation nobody needed.** Worth noting the owner's answer did not dep
 the severity — they documented the rationale because it was unwritten, not because the
 exposure was large, which is the more durable reason and survives the correction
 intact.
+
+The correction then caught a defect in the fix itself, independent of the severity.
+The comment they had committed described *consumer* behaviour — that a consumer which
+never calls the operation leaves a dead record served — which is **a claim about
+another component's code, written in a repository that cannot verify it**. Precisely
+the ownerless-assumption class we had just named, and falsified within the hour by the
+consumer's own retry loop. Restated as a property of their side (the vault cannot
+observe or enforce the call, so retirement depends on consumer behaviour), which
+cannot go stale when a consumer changes its policy.
+
+And the direction rule replaced the distance rule on their side too, with better
+evidence than mine: they listed two of their own past defects — a swallowed sync that
+survived review because *we already handle this* supported the conclusion, and a green
+gate that supported shipping — **both local, and distance predicts neither.** The
+uncomfortable corollary they drew is the honest one: the rule is hardest to apply
+exactly where it matters, because the feeling that a claim needs no checking *is* the
+signal. Its value is that it says **which** assertion to spend a check on, which is
+more than a rule that says to check everything, since nobody does.
 
 And the message prompted a fix worth more than the gap it asked about: the read
 surface's own documentation still described an operation's parameters from before a

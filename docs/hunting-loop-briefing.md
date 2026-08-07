@@ -305,6 +305,8 @@ Before calling a class closed:
 | 218 | Did the wrong method and the right one agree? | Agreement is what let the wrong one survive — a disagreement would have exposed it in seconds |
 | 219 | Could this check have come out the other way on this input? | If not, the agreement carries no information, and the method is about to be reused as though it did |
 | 220 | Is this check correct by what it asks, or by what happens to be on disk? | A leased correctness lapses with no line changing, so no diff review can catch it |
+| 221 | Does your harness model the configuration production actually runs? | A test passing on a different configuration certifies the untested path as covered |
+| 222 | Can the property your check leans on be asserted instead of assumed? | Rejecting the condition converts a silent lease into a loud one, at the cost of the comment you would have written |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5098,9 +5100,14 @@ Their extension of that is the useful half: **the check's correctness is leased 
 a property of today's tree**, and the things that make the lease lapse — a path
 becoming a link, a build switching to hardlinked artifacts, a cache moving — are all
 normal changes nobody would flag as touching a check. **The lease lapses without a
-single line changing**, so no diff review can catch it. The only cheap mitigation is
-to state the dependency where the check lives, so the next reader can at least see
-what it is renting.
+single line changing**, so no diff review can catch it.
+
+Where the leased property is a filesystem shape, there is something better than a
+comment: **assert the property rather than assuming it.** Their campaign preflight
+already rejects any symlink inside a specimen rather than assuming none appear,
+which converts a silent lease into a loud one at the cost of the comment you would
+have written anyway. It does not reach caches or hardlinks, but where it applies it
+is free.
 
 The colleague's own sweep found the **opposite polarity**, which is what settles the
 rule. Their eight symlink-sensitive sites all deliberately refuse to follow — an
@@ -5158,6 +5165,33 @@ permanent test. They were one step from making that probe the actual fixture, wh
 it would have shipped as a green that agrees forever. **The countermeasure has to
 fire at first use**, because every subsequent opportunity to catch it is one where
 the method looks more proven than it did before.
+
+### A test correct about a configuration production does not use
+
+The same audit then found something better than the finding it started from. I had
+mentioned a second registration path — modules holding a *reserved* identity are
+checked against a launch credential before registering, and rejected outright
+otherwise. They checked whether it applied and found that **the module in question is
+reserved in production**, with a protected identity prefix, while their test harness
+has no field capable of expressing that at all.
+
+So a contract test written against the harness would exercise the ordinary
+registration path for a module that production registers through the credentialed
+one. **The test would have been correct about a configuration production does not
+use** — and worse than an accidentally-correct check, because a check that is right
+by luck stays right until the tree changes, while **a test passing on the wrong
+configuration actively certifies the untested path as covered.**
+
+The part with a security property is the rejection, not the registration: succeeding
+proves plumbing, whereas a second process claiming the same identity being refused
+proves the guard that stops something impersonating a security-boundary module while
+the real one restarts. A test of the ordinary path does not touch it.
+
+One detail from reading my own source for them is worth keeping generally: the
+storage descriptor is keyed on **the identity the module claimed**, not the
+configured one. So a module registering under a stale default does not merely appear
+under the wrong name — **it is pointed at a different store**, which surfaces as an
+empty database rather than as a misconfiguration.
 
 ### An exemption that covers some siblings and not others
 

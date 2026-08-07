@@ -451,6 +451,9 @@ Before calling a class closed:
 | 364 | Fixing a policy in the file you were looking at | Enumerate every invocation of the operation across the whole repo instead — checking what you believe confirms the part you already fixed and stops |
 | 365 | A repo whose CI calls both a gate script and the tool directly | It can be HALF-enforced, and a grep sees only the direct half — the count is wrong in an unknown direction, so enumerate per repo before quoting a number |
 | 366 | A run-anyway guard on a step that follows a gate | Correct alone, and with a missing enforcement flag it lets the later step pass against exactly what the gate rejected — a green specific result printed under a red general one |
+| 367 | A high pass count | State which TARGETS ran, or run all of them — a restricted target set reads like coverage, and the number climbs while the blind spot stays exactly as wide |
+| 368 | A check relating two things you control | That is a CONSISTENCY check — it survives you changing your mind about the value. Only a relation between what you declare and what a live system serves is a CORRECTNESS check |
+| 369 | Believing a flag includes what you think | Add a deliberately failing case and run the real command — reading the documentation yields the same belief with none of the evidence |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

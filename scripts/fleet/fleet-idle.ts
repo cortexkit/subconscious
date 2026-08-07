@@ -52,7 +52,11 @@ type Overview = { result?: { projects?: Project[] }; projects?: Project[] }
 // window needs no edit here; drop the fallback once the old id is gone fleet-wide.
 async function overview(): Promise<Overview> {
   let lastError: unknown
-  for (const moduleId of ["prefrontal", "alfonso-core"]) {
+  // Both names are tried because the module was renamed and an older daemon may
+  // still be running. The list must hold module ids exactly as the daemon
+  // registers them -- an id that has never existed fails identically to a module
+  // that is down, and the failure names the module rather than the lookup.
+  for (const moduleId of ["prefrontal-core", "alfonso-core"]) {
     try {
       return (await client.call(moduleId, "projects.overview", {})) as Overview
     } catch (err) {

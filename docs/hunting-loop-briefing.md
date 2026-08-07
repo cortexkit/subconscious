@@ -326,6 +326,7 @@ Before calling a class closed:
 | 239 | Credited with reasoning you did not do? | Say so; the mechanism that actually fired is the transferable part, and the compliment records the wrong one |
 | 240 | Absence found in the consuming file — did you check the producer? | That is a fact about who reads the value, not about whether it is set |
 | 241 | Status matches a known signature — did you ask a second endpoint? | One API's rendering of an event is not the event; a timeout can arrive labelled as a cancellation |
+| 242 | Count and detail disagree — same invocation? | Two calls to a live system are two samples; the contradiction can be between the samples rather than in the system |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5432,6 +5433,17 @@ So **a status matching a known signature is a reason to consult a second source,
 a substitute for one** — one API's rendering of an event is not the event. And the
 recognition-versus-immunity claim now has evidence from the person who wrote it
 down, which is the strongest form it can have.
+
+A smaller instance landed minutes later in my own status line: a health count read
+thirteen of fourteen, and the follow-up query listing the unhealthy module returned
+**nothing**. The tempting reading is a broken filter. The actual one is that **the
+count and the detail came from two separate invocations of a live system** — two
+samples, not one observation — and the module recovered between them. Three
+consecutive samples then read fourteen.
+
+**When a count and its detail disagree, check whether they came from the same call
+before concluding either is wrong.** The contradiction can sit between the samples
+rather than inside the system.
 
 Two details from the same package are worth carrying. The control string proved my
 search **reached a third party's binary at all** — without it, *the marker is absent*

@@ -393,6 +393,8 @@ Before calling a class closed:
 | 306 | A requirement to render a distinction | It must be born at the source in wire values; a consumer cannot display what the response never carried, however careful it is |
 | 307 | Two values that look alike under opposite rules | Record the split and the failure it prevents, or a later change fixes one by breaking the other |
 | 308 | Reusing an existing discipline to make new work cheap | That makes future divergence between the two a bug in one of them rather than a local choice; the discount is also a constraint |
+| 309 | A state with more than one cause | Reporting the cause you were looking for is a guess wearing a finding's clothes; name the state and let the owner supply the cause |
+| 310 | A timestamp that fits your hypothesis | It only rules out the causes it excludes — agreement is consistent with every remaining one, so it ends the check exactly when it should not |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -616,6 +616,16 @@ mod tests {
             Path::new("/tmp/subc.jsonc"),
         )
         .expect("parse");
+        // Mutating the environment is a process-wide side effect and cargo runs
+        // tests on multiple threads, so this is only safe while nothing else can
+        // read this variable concurrently. Today the sole reader is
+        // `platform_data_home` below, reached from this test alone -- checked
+        // rather than assumed. A second test touching storage defaults would
+        // race this one, and the symptom would be an occasional wrong path
+        // rather than a failure naming the environment.
+        //
+        // Under edition 2024 these calls become unsafe and the compiler raises
+        // the question for us; this crate is on 2021, so the note stands in.
         std::env::remove_var("XDG_DATA_HOME");
         assert_eq!(
             config.storage,

@@ -406,7 +406,8 @@ Before calling a class closed:
 | 319 | A health gauge reading ok | It cannot distinguish *fine* from *not asked yet* — a null is evidence only if something would have produced a non-null, and for a gauge that something is a real call |
 | 320 | A probe that exercises one path | It reports on that path only; a read-path probe answering healthy for a write-fenced module is a TRUE reading of the wrong question |
 | 321 | A narrowing pass over a subset | Record what it dropped, or the list it produces looks complete — the sweep can be right and the summary wrong, and the summary is what gets acted on |
-| 322 | A check returning the same answer for every member of a set | It is answering a question about itself; one lucky match would have hidden it |
+| 322 | A check returning the same answer for every member of a set | It is answering a question about itself — a broken instrument's failure mode is not a wrong answer but a SUSPICIOUSLY TIDY one; one lucky match yields a plausible partial result nobody questions |
+| 323 | A diagnostic you added for this exact failure | Check it has a reader and a discovery path, not just a channel — a channel nobody looks at is worse than none, because it looks solved |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

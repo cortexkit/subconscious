@@ -107,6 +107,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --workspace --all-targets
 
+      # --all-targets does NOT include doctests, despite the name: it expands to
+      # --lib --bins --tests --benches --examples. So a doc example that stops
+      # compiling leaves the gate green. The workspace has no runnable doc
+      # examples today, which is exactly why this is worth wiring now rather than
+      # later -- the first one added would otherwise arrive unchecked, and nobody
+      # would be looking for a gap whose current cost is zero.
+      - name: Doc tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc
+
       # A generated file edited by hand is invisible to every test: the suite
       # passes, and the only symptom is that the generator rewrites the file on
       # the next build. A sibling repo hit this with a Cargo.lock entry written

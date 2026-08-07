@@ -217,6 +217,8 @@ Before calling a class closed:
 | 130 | Would this pattern fail *loudly* if it were wrong? | Detectability is inversely proportional to how reasonable the output looks, so prefer spellings whose failure is absurd |
 | 131 | Is the answer you *hope for* zero? | Then loudness is unavailable and every other property agrees with a broken pattern — borrow a non-zero answer from history |
 | 132 | Does your detector distinguish the fixed state from the broken one? | An expression correct at other call sites survives the fix, so the count is identical before and after |
+| 133 | Did you read the control as a *difference* or as a *presence*? | A detector firing before the fix proves nothing if it also fires after, and an unchanged count looks like evidence while discriminating nothing |
+| 134 | Are you assuming every file a fix touched was defective? | A fix commit carries helpers, tests and unrelated corrections, so the file list is not the measurement |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3866,6 +3868,39 @@ in use.
 
 Both were visible only because the control produced a number to compare. **Without
 one, a clean sweep and a broken sweep are the same artifact.**
+
+### Read the control as a difference
+
+The first failure exposed a gap in how the remedy was stated rather than in my use
+of it. *"Run the detector against a commit where the thing is known present"* is
+not sufficient: **a detector that fires before the fix has proved nothing if it
+also fires after.**
+
+So the control is a **difference**, not a presence — pre-fix non-zero, post-fix
+zero. And an unchanged count is the worst possible result, because **it looks like
+evidence while discriminating nothing.**
+
+Checking their own controls against that, they failed once too, on a premise worth
+recording: they tested whether the detector fires on **the same files the fix
+touched**, and got three of six. Nearly wrote it up as an unsound control. But a
+fix commit carries more than the defective sites — that one also added a shared
+helper and corrected an unrelated error, so three of its files were never
+defective. **The file list is not the measurement; the difference across the fix
+is.**
+
+Both of us built a check on an assumption about what a commit *means*, and in both
+cases **the assumption was invisible in the output** — mine as a prediction
+hardcoded into a label, theirs as a set comparison that looked rigorous.
+
+### The name is not the property
+
+Counting a refusal by its string, when that string was already in use for a
+different failure, is the same defect as a file-extension list that omits an
+extension or a path prefix an index does not write — but pointed at **the target**
+rather than at the spelling.
+
+Both are guesses about how a property is written down, and both are invisible in
+the output. A count of a name is a count of a name.
 
 ### A branch nothing can reach yet
 

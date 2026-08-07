@@ -440,6 +440,9 @@ Before calling a class closed:
 | 353 | A member your checker cannot examine | Name it and its reason IN THE OUTPUT, and print how many of how many were checked — a checker that silently omits a member is indistinguishable from one that examined it |
 | 354 | A binary-producing repo with an uncommitted lockfile | Source identity no longer implies dependency identity — two builds at the same commit can link different versions, and CI attests a set nobody built against |
 | 355 | A probe that walks source structure | It encodes an assumption about layout the source need not honour — an attribute or macro between two lines is enough to make every reading zero |
+| 356 | Reading any instrument's output | This is where the uniformity check FIRES — not at write time. Every broken probe caught today was caught by output looking too uniform, never by remembering the rule while building it |
+| 357 | Evidence from a single comparison | Prefer a trend across a known-ordered set — it is self-controlling, because a broken instrument rarely produces a plausible monotone climb by accident |
+| 358 | Removing a guard, exclusion, or workaround | Put the REASON where the line used to be, not only in the commit message — the next person to reconsider it reads the file, never the history |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

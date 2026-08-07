@@ -235,6 +235,7 @@ Before calling a class closed:
 | 148 | Does your assertion pin the *rule*, or just the error kind? | If every rule returns one kind, a neighbour's refusal satisfies the assertion and the mutation stays green |
 | 149 | Is the answer uniform across every row? | Uniformity is as suspicious as emptiness — twenty rows all "covered" is a parse failure wearing a verdict |
 | 150 | Restoring a file after a probe — is anything uncommitted in it? | A restore-after-probe is indistinguishable from a restore-after-mutation, and one of them is meant to discard work |
+| 151 | Sharpening a test — did you run the mutation against the OLD assertion too? | Otherwise you cannot distinguish "I improved an assertion" from "I improved one that was already sufficient" |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4066,6 +4067,25 @@ Which completes a trio: **detection proves a rule fires, a must-not-fire case
 proves it discriminates, and isolation proves it was *this* rule that fired.**
 Missing any one leaves a test that passes for a reason other than the one in its
 name.
+
+### The fail-before for a test-quality fix
+
+Sharpening an assertion feels like an improvement by definition, which is why it
+escapes the proof everyone applies to a code fix. **Run the mutation against the
+OLD assertion as well as the new one.** That second run is the fail-before, and it
+is the only thing separating *I improved an assertion* from *I improved an
+assertion that was already sufficient.*
+
+It refuted me immediately. Having sharpened one pair of assertions where a
+neighbouring rule genuinely absorbed the mutation, I sharpened a second pair and
+was about to report the same result. Running both forms showed **both fail** —
+because deleting that guard lets the config parse cleanly, so the test's own
+unwrapping panics before any assertion is reached.
+
+The change is still worth keeping, since every rule there returns one error kind
+and a future rule could absorb the input. But it is **prophylactic rather than
+proven**, and those are different claims. Recording which one you have is the
+difference between a documented margin and an imagined one.
 
 ### Uniformity is as suspicious as emptiness
 

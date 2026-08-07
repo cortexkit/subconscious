@@ -311,6 +311,8 @@ Before calling a class closed:
 | 224 | Reporting a security gap — is the reach stated accurately? | An overstated threat model gets the whole finding dismissed on the overstatement, and the narrowed version is usually more pointed |
 | 225 | Is the check cheap enough to run while you are confident? | Confidence is the state it exists to survive; a check gated on suspicion never fires on a class whose defining property is that nothing looks wrong |
 | 226 | Unexercised on your side — or exercised where you cannot see? | Say which; a branch written from source is an assertion about a code path until someone observes it |
+| 227 | Searched the test directory — is that the test suite? | Unit tests live in the source file, so a directory search reports faithfully about a subset |
+| 228 | Guard proven to refuse — is it proven not to over-match? | A guard that captures too much passes every positive assertion while reserving names nobody intended |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5253,6 +5255,30 @@ unproven, and only saying which one you mean makes the difference visible.
 That also sharpens the underlying report rather than softening it: the mechanism is
 proven, and what is missing is that it is **switched on for one module of fourteen**.
 A configuration gap is a materially easier thing to ask for than a mechanism.
+
+They then found the half that test did not cover, and it was the half that matters:
+the guard has two arms — an exact identity match and a **prefix** match protecting a
+family of names — and the covered one was the exact arm, while the module in
+production is configured with a prefix. Searching the integration-test directory
+turned up nothing for the prefix arm, with a positive control proving the search
+worked.
+
+Mutating that arm alone settled it: **exactly one test reddened**, named for the
+rule, living as an inline unit test **inside the source file** rather than in the
+test directory. Their instrument worked, their control worked, and their population
+was wrong — in Rust the test directory is a subset of the test suite, never the whole
+of it. Their own caveat had said as much; the mutation is what converted it.
+
+The test itself is worth copying for what it asserts beyond the refusal: the
+legitimate owner is admitted, and three near-miss names — differing by delimiter, by
+truncation, and by case — are all admitted too. **Without that group, a guard that
+over-matched would pass every positive assertion while quietly reserving names
+nobody intended** — refuse-everything wearing a security costume.
+
+And the question was worth asking even though the answer was reassuring. Had half
+the mechanism been unproven, *the fix cannot regress the mechanism* would have been
+half a claim, with the untested half being the only one in production use. **That
+asymmetry is what makes the question cheap.**
 
 ### An exemption that covers some siblings and not others
 

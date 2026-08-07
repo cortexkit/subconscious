@@ -840,10 +840,16 @@ mod tests {
             Path::new("subc.jsonc"),
         )
         .unwrap_err();
-        assert!(matches!(
-            missing_targets,
-            DaemonConfigError::InvalidValue { .. }
-        ));
+        // Pin the message, not just the variant. Every rule in this validator
+        // returns InvalidValue, and the guard below rejects an empty list -- so
+        // a change that turned a missing list into an empty one would still be
+        // refused, by a different rule, and a variant-only assertion could not
+        // tell the two apart.
+        assert!(
+            matches!(&missing_targets, DaemonConfigError::InvalidValue { message, .. }
+                if message.contains("must be present")),
+            "expected the presence rule, got: {missing_targets:?}"
+        );
 
         let empty_targets = parse_doc(
             r#"{
@@ -855,10 +861,11 @@ mod tests {
             Path::new("subc.jsonc"),
         )
         .unwrap_err();
-        assert!(matches!(
-            empty_targets,
-            DaemonConfigError::InvalidValue { .. }
-        ));
+        assert!(
+            matches!(&empty_targets, DaemonConfigError::InvalidValue { message, .. }
+                if message.contains("must be non-empty")),
+            "expected the non-empty rule, got: {empty_targets:?}"
+        );
     }
 
     #[test]

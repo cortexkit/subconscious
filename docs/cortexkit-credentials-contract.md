@@ -294,7 +294,7 @@ token. We **document this residual** (rare re-login), not claim elimination.
 sink in the vault: importers parse each source format into a **canonical
 `OAuthCredential`** (token URLs, client_id, grant shape); adapters operate on the
 canonical type, NOT raw provider JSON. v1 adapters are **bounded to the providers
-the model runner uses** (anthropic/openai/google/xai-style), isolated in a
+the model runner uses** (anthropic, openai, google, xai), isolated in a
 `refresh_adapters/` submodule with **per-adapter conformance tests** (recorded HTTP
 fixtures). Adding an adapter is a contract amendment. This is an explicit, owned
 thin-core *exception for the credential module only*.

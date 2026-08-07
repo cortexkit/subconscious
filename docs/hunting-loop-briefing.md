@@ -295,6 +295,8 @@ Before calling a class closed:
 | 208 | Is your check general across how the work was done? | A check valid only under one placement style silently stops discriminating under another |
 | 209 | Same measurement, which pass condition? | A deploy wants the artifact moved and a state cycle wants it unchanged; the failure is reading a correct value as the wrong verdict |
 | 210 | Know when a restart is safe — do you know when it stops being safe? | The window is an interval; a mid-operation bounce discards in-memory state and reports as unexplained rather than as a bounce artifact |
+| 211 | Deployed identity supplied by config — what does the binary default to? | A harness launching it directly gets the compiled name, and a test asserting that name passes while testing what production does not use |
+| 212 | One case exempted and its siblings not — deliberate? | The asymmetry is evidence; a shared exemption reason that describes all of them explains none of the difference |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5039,6 +5041,46 @@ process pair, splices landing at arbitrary write boundaries — so treat it as
 evidence that *short* means shorter than people expect, not as a budget to spend
 down to. **A measured bound is not a floor**, and the difference matters most to
 whoever sizes something against it later.
+
+### The name the binary defaults to
+
+A coverage audit asked whether a federation module was in scope for a cross-module
+test run. Checking the live fleet first turned up something the question assumed
+away: **the module's compiled default identity is the pre-rename name**, and the
+correct one comes entirely from the supervisor, which sets it from the config entry
+key at spawn.
+
+Under supervision that is invisible and harmless. It bites wherever the module is
+launched **without** that environment — a test harness, a manual run, a future rig —
+where it registers under the old name. **A test written there asserts a name
+production does not use, and passes.**
+
+So for anything that spawns a module directly: set the identity explicitly and assert
+on it, rather than inheriting whichever default the binary happens to carry. And
+when a rename is declared complete, the residue to look for is not references in
+running config but **defaults compiled into binaries that config has been masking**.
+
+The same audit priced a fixture against an assumption worth checking: the module's
+profile turned out to be plain configuration rather than a signed artifact, which
+removed the dominant cost term from the proposal. Worth stating what that check
+actually established — the shape of the live file, not what the loader requires —
+since the required set can exceed what happens to be present.
+
+### An exemption that covers some siblings and not others
+
+The same measurement found three test files carrying an identical exemption comment,
+with one lifted in the pipeline and two not. The obvious move is to lift the other
+two.
+
+But **the asymmetry is evidence.** The stated reason describes all three equally, so
+it cannot explain why one runs — which means either something else distinguishes
+them, or nobody has revisited it. Lifting a gate without answering that produces a
+flaky job that gets re-exempted in a month, **which is worse than the honest zero it
+replaced.**
+
+And if the difference is deliberate, the reason belongs *in* the exemption string. A
+shared justification across cases that are not being treated alike documents none of
+them.
 
 ### Why the position beats the effort
 

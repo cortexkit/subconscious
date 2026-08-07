@@ -53,6 +53,19 @@ pub enum ModuleControlRequest {
         epoch: u32,
         target: RouteTarget,
         identity: BindIdentity,
+        /// The daemon's attestation of the consumer, and the only field here a
+        /// provider may grant privilege on.
+        ///
+        /// `Reserved` is minted at exactly one place in the daemon, on the branch
+        /// where the consumer's launch nonce matched a supervised spawn — the
+        /// function that checks is the function that mints, so the value cannot
+        /// exist without the check having run. That property is what a provider is
+        /// relying on, and it is the reason to key authority on this rather than on
+        /// `identity`, which is client-supplied and unattested (see BindIdentity).
+        ///
+        /// Absent means the daemon made no attestation, which is not the same as a
+        /// denial: it is the shape a pre-attestation peer sends. Treat it as
+        /// unattested rather than as trusted-by-default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
         /// Consumer-declared reverse-request capabilities for the route. This is

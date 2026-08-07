@@ -240,6 +240,9 @@ Before calling a class closed:
 | 153 | One demonstration, several sharpened assertions — did you prove each? | A refactor that moves one test's input into a neighbour's path leaves the siblings untouched, so the proof does not carry |
 | 154 | Did your mutation script and the test run share one invocation? | A failure in the script prints alongside a passing summary, and the summary is what gets read |
 | 155 | "Proved the gap is closed" — closed against what? | Every mutation is one you invented, so the proof is bounded by your imagination about how the code might change |
+| 156 | Is this output read *relative* to something a probe can move? | A line against a file, a count against a corpus, a time against a run — record the belief and it survives the shift |
+| 157 | Which of your proxies cost effort to produce? | That one carries the authority of work spent and goes unexamined longest |
+| 158 | Just wrote a rule down — who is running it on your code? | Running it on your own is the version that feels sufficient and demonstrably is not |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4125,6 +4128,39 @@ expectation in the assertion, not merely the value — `expected the presence ru
 got: …`. We had both adopted that form for a different reason, and this is what
 made it load-bearing.
 
+### A recorded belief is a fixed point
+
+Two habits here were adopted for one reason and turned out load-bearing for
+another. The derived premise line was added so a reader could reject the
+reasoning; it became the receipt that a mutation had actually applied. The
+expectation-naming assertion was added to explain why an earlier mutation was
+green; it became the only readable part of a stack trace whose line numbers had
+moved.
+
+**Both work by making the tool state what it believed** — and a statement of belief
+is useful against any failure that corrupts the surrounding context. The second
+use is not a bonus so much as the same property meeting a different corruption.
+
+Which turns it into something predictive rather than an observation: **anchor a
+claim outside the thing that can shift.** Every failure mode above worked by making
+the *context* unreliable while leaving a record intact.
+
+So the place to apply it next is **anywhere output is interpreted relative to a
+state a probe can alter** — a line number against a file, a count against a corpus,
+a timestamp against a run. Stating the belief costs nothing there and buys a
+second use you cannot yet name.
+
+### The proxy that costs effort goes unexamined longest
+
+A reddening mutation was the last proxy to fail tonight, and the reason is worth
+separating from the finding: **it is the only one that requires work to produce.**
+Names and counts are free, a green suite is free, but a mutation costs a
+deliberate edit and a rerun — so it carries the authority of effort spent.
+
+That authority is what stopped either of us asking whether the red was the *right*
+red. **The proxy that feels most like evidence is the one that goes unexamined
+longest.**
+
 ### The three questions, and the limit past them
 
 The check settled into three questions, each closing a gap the previous two admit:
@@ -4187,6 +4223,19 @@ uncommitted fix** along with the probe.
 **A restore-after-probe is indistinguishable from a restore-after-mutation, and
 one of them is meant to discard work.** They caught it only because a later sweep
 flagged the test they had just fixed.
+
+### Write a rule down, then hand it to someone else
+
+Twelve findings across two people in one evening, in both directions, and **none
+found by the person who wrote the code.** Every proxy either of us had — test
+names, counts, a green suite, even a reddening mutation — failed in turn. The only
+thing that worked was another person applying a rule its author had written down
+and not applied to themselves.
+
+The observation does not survive contact with a busy afternoon, so bank the
+operational form instead: **when you write a rule down, the next action is to ask
+someone else to run it on your code.** Running it on your own is the version that
+feels sufficient and demonstrably is not.
 
 ### The habit does not transfer on its own
 

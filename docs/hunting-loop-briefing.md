@@ -275,6 +275,7 @@ Before calling a class closed:
 | 188 | Just told someone you avoid a hazard — do you? | Stating a constraint is the moment to check you obey it, and the claim will otherwise be true only of the code you were looking at |
 | 189 | Did you enumerate every operation that touches the state, or only the one you were defending? | Searching for the operation that closes a window cannot find the one that opens it |
 | 190 | Which defect did you notice, and which announces itself? | The loud one costs minutes; the silent one costs a wrong value nobody re-derives — noticing is not severity |
+| 191 | Did the cross-check hold in *both* directions? | One-directional results cannot separate "they are sharper" from "their position is better placed", and those recommend different things |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4751,6 +4752,25 @@ prior is at its highest exactly when the artifact is newest and least examined.
 Same mechanism as the cost inversion, on a shorter timescale — **earned credibility
 transfers to the next artifact, which has not earned any.** The only defence is to
 keep the subject the artifact rather than its author.
+
+### Why the position beats the effort
+
+Across one long cross-seat exchange, every finding came from the other party and
+**the result held in both directions with no exceptions.** That symmetry is what
+makes it evidence rather than an anecdote: a one-directional result cannot separate
+*they are sharper* from *their position is better placed*, and those recommend
+completely different things.
+
+The mechanism, named by the colleague on the other side: **the author knows what
+the code is for, and that knowledge is exactly what supplies the missing evidence.**
+They read *"two binaries scrub it"* and their model filled in that the tests must
+therefore be covered, because they knew why the scrub existed. I could not fill it
+in, so I asked the question that broke it.
+
+So being close to the code is **not a handicap of attention but a handicap of
+inference**, and no amount of care fixes it from the inside. Which is why *look
+harder at your own work* was never going to produce these: the gap is structural,
+and the remedy is another position rather than more effort.
 
 ### Write a rule down, then hand it to someone else
 

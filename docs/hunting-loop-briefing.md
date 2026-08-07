@@ -301,6 +301,8 @@ Before calling a class closed:
 | 214 | Would this test require building a capability you would not otherwise keep? | The cost is not the run, it is that the capability then exists |
 | 215 | Conclusion confirmed — was the supporting fact ever checked? | A true conclusion never forces its derivation to be re-examined, so a wrong fact under it travels into the next argument |
 | 216 | Registration observed — does it prove the prerequisite was met? | A component that registers and then dies on a missing requirement looks identical at that instant; sample after the check, not before |
+| 217 | Is this check about the path or about the object? | Following and refusing to follow are both correct somewhere; the defect is an unstated intent, not a missing flag |
+| 218 | Did the wrong method and the right one agree? | Agreement is what let the wrong one survive — a disagreement would have exposed it in seconds |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5083,6 +5085,24 @@ derivation.
 The same missing flag sits in the deploy check in this document, where omitting it
 compares a symlink to itself and passes.
 
+Sweeping my own tooling for it found three more sites asking for a **path's** age when
+the question is about the **binary behind it**. The deploy directory holds no links
+today, so those sites were correct by accident of what is on disk rather than by what
+they ask — and a deploy path that became a link would report the link's timestamp, so
+a stale binary behind a fresh link reads as current. Fixed, with a control proving
+the flag changes the answer when a link is actually present.
+
+The colleague's own sweep found the **opposite polarity**, which is what settles the
+rule. Their eight symlink-sensitive sites all deliberately refuse to follow — an
+output that is a link is rejected outright — so *always follow* would be exactly
+wrong there. **The rule is to decide whether a check is about the path or about the
+object, and make that choice explicit at every site.** Both of our defects were the
+same underlying error: an unstated intent to follow.
+
+And theirs was at a terminal while their codebase had the polarity right at all eight
+sites, which is worth noticing on its own: **the habit lived in their code review and
+not in their hands.**
+
 The same audit priced a fixture against an assumption worth checking: the module's
 profile turned out to be plain configuration rather than a signed artifact, which
 removed the dominant cost term from the proposal. Worth stating what that check
@@ -5101,6 +5121,15 @@ separate them. The corrected probe measures survival *past* the await at three
 points — and pairs it with a negative control, because **"it survived" is compatible
 with a harness that passes regardless** until you have watched the same probe report
 death when the requirement is genuinely unmet.
+
+Their explanation for why the bad probe lasted is the part to keep. **The wrong probe
+and the right one returned the same verdict.** Storage does arrive; the conclusion was
+true both times. Had the invalid route produced a wrong answer it would have been
+caught in seconds — instead it produced a right answer, and **the agreement is
+precisely what protected the broken derivation from scrutiny.** That is the second
+instance of the same pairing within an hour, alongside the symlink identity above,
+which makes *true conclusion shielding bad method* the most reliable way a flawed
+approach survives here.
 
 ### An exemption that covers some siblings and not others
 

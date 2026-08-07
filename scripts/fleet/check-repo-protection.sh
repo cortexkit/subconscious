@@ -38,6 +38,12 @@ if [ -z "$control" ]; then
   exit 2
 fi
 echo "probe control: ${control} reachable"
+# The premise every result below rests on. A repo is judged by whether its
+# origin answers ls-remote right now -- not by what its config says, and not by
+# any other remote it may have. The findings look identical under a different
+# rule, so a reader who would disagree cannot tell from them that a choice was
+# made.
+echo "premise: protected means origin answers ls-remote and HEAD is not ahead of it"
 echo
 
 # The examined count is reported alongside the findings, not just the findings.

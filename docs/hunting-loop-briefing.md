@@ -375,8 +375,9 @@ Before calling a class closed:
 | 288 | A justification that is half true | Stickier than a false one — checking it returns a real reason and the reader stops before finding the half that expired |
 | 289 | Sweeping a document rather than code | The vocabulary saturates because the document is about the thing you are searching for; key on a structural target, not a lexical one |
 | 290 | A perfect score from a detector you just wrote | It does not feel like it needs checking, which is the property that makes it worth checking |
-| 291 | "Additive, so consumers can ignore it" | Ask instead whether they COULD read it without changing their transport; unreachable-by-construction is not the same as unread |
+| 291 | "Additive, so consumers can ignore it" | Trace one response from the socket to the code that would act on it and find the first narrowing, wherever it lives; transport is often not where it happens |
 | 292 | A claim about how consumers behave | It is true for the consumers you pictured, and the ones you did not are invisible from the producer side by construction |
+| 293 | Answering a canvass with a constraint | State what would have to change for the answer to flip; a bare "no, by construction" is inert and rots, because nothing ever prompts a review |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5832,6 +5833,31 @@ outer object, so a future sibling key would be invisible to every call site rath
 than unread. Harmless while nothing else rides that envelope, and recorded at the
 helper because **widening is a one-line change there and impossible at the call
 sites**.
+
+The consumer then corrected their own claim, and the correction reaches both notes.
+*Unreachable by construction* was too strong: their helper is private, in a file they
+own, with two callers — so adoption is one added method, not a library change. **Three
+buckets, not two:** consumers who read the envelope, consumers who unwrap in a helper
+**they own**, and consumers who unwrap in shared code **someone else owns**. Only the
+third is expensive, and **the second and third are indistinguishable from outside
+because both answer "no"** while differing by an order of magnitude in what adoption
+costs. A bucket-two seat recording itself as walled off stops being canvassed for
+changes it could adopt in a line — and worse, a bucket-three seat reading that
+all-clear gets a false one.
+
+Hence the rule for answering any canvass with a constraint: **say what would have to
+change for the answer to flip.** "No, and here is the size of the change that would
+make it yes" carries its own re-check trigger; **a bare "no, by construction" is inert,
+and inert claims rot silently because nothing ever prompts a review.**
+
+And their revision of the check itself is the part that generalises furthest. A third
+seat's transport decodes the whole body faithfully while a *classify* step one layer
+in drops everything but the payload — so **"check your transport layer" returned a true
+answer to the wrong question**. The portable form: **trace one response from the socket
+to the code that would act on it, and find the first place the object becomes an
+array, wherever that turns out to live.** Running it here found a second narrowing the
+original note had missed — deserializing into a named struct at each call site drops
+unknown keys inside the payload as well, so the reach is two layers rather than one.
 
 One hazard from their case is worth separating: **a misread there is not conservative,
 it is lossy.** The natural inference routes away from credit that expires whether or

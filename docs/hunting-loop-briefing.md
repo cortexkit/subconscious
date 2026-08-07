@@ -446,6 +446,8 @@ Before calling a class closed:
 | 359 | A mutation-proof returning the expected code | Verify the MUTANT APPLIED before reading any exit code — a string replace that matched nothing produces a clean run indistinguishable from a passing one |
 | 360 | A mutant that fails in BOTH arms | It is testing the wrong thing — malformed input fails everywhere, so the mutant must be VALID-BUT-WRONG to discriminate |
 | 361 | A measurement that mutates what it measures | Restore the measured state; do not adopt the mutated one — both leave you with a valid artifact, which is what makes it easy to ship the mutation under the measurement's commit message |
+| 362 | An enumeration anchored on what you expect to find | It can only confirm, never surprise — read the collection's END rather than a range located from a marker, or a later member stays invisible however often you re-run it |
+| 363 | A file hash across a signing or packaging step | Wrong instrument — the bytes change by construction; verify content by distinctive strings BEFORE the step, and identity by inode after |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

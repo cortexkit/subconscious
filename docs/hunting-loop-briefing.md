@@ -261,6 +261,8 @@ Before calling a class closed:
 | 174 | Hand-rolled client instead of the SDK? | Every operational affordance the SDK accumulated is absent by default, and a missing diagnostic fails as silence rather than at compile time |
 | 175 | Before running a probe — can it produce the positive result? | A probe incapable of succeeding returns the negative you feared, and a decision rule then fires on nothing |
 | 176 | Is the trigger you are testing filtered? | A path, branch or tag filter turns "nothing happened" into correct behaviour, and no error is emitted either way |
+| 177 | Attributing a behaviour to one component — does an unrelated one do it too? | The cheapest test of a local explanation is whether the effect reproduces where the explanation does not apply |
+| 178 | Does this gauge report zero before it has looked? | Zero renders "nothing observed" identically to "nothing there"; null distinguishes them |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4524,6 +4526,45 @@ measurement that could not have come out any other way.
 anything event-triggered, read the trigger's filters first: a path, branch or tag
 filter turns *nothing happened* into correct behaviour, and emits no error either
 way.
+
+### A trait of the system, not of the component
+
+After restaging a module I saw its health read *unknown* for about 45 seconds, and
+recorded it as *that module has a visible warm window* — offering it to the owner as
+a property of theirs.
+
+They traced it in **my** source instead and returned the correction: the supervisor
+schedules every probe at `cadence + jitter`, **including the first**, so any freshly
+registered module reads *unknown* for a full cadence no matter how quickly it can
+answer. Nothing about their module was slow.
+
+I verified rather than accepting it, and by **prediction rather than by reading**:
+if the explanation is the schedule, an unrelated module must show the same window.
+Restarted one and sampled — *unknown* through 22 seconds, *ok* by 32. **The cheapest
+test of a local explanation is whether the effect reproduces where the explanation
+does not apply.**
+
+Had I banked my version, the next person would have hunted a warm-up that does not
+exist — in the wrong module. **A trait wrongly attributed to a component sends the
+next reader to the wrong place**, which is worse than not recording it.
+
+The schedule stays: spreading the first probe is what stops a fleet-wide restart
+firing fourteen simultaneous probes into a cold machine. The tradeoff is now
+written where someone weighing it will find it.
+
+### Null before the first look
+
+The same owner added connection counts to their health report and chose **null
+until the first probe rather than zero**. Worth copying: **zero renders "nothing
+observed" identically to "nothing there"**, so an operator checking whether a
+connector survived a restart would read a confident zero from a module that has not
+looked yet.
+
+Two companions from the same change. **Counts, never a verdict** — a degraded
+connection does not degrade the module, and if it did, a real module fault would be
+indistinguishable from a vendor having a bad afternoon. And **count at the start of
+the pass**, because the pass repairs what it finds; counting afterwards reports
+zero and hides the condition that prompted the work.
 
 ### Check the fix, not the person
 

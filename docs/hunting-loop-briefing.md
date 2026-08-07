@@ -482,8 +482,10 @@ Before calling a class closed:
 | 395 | A lookup table that GROWS as the fleet gets more consistent | It is pointed the wrong way round — entries should exist only for things that disagree with themselves, so fixing a disagreement DELETES an entry |
 | 396 | A fix derived from an enumeration | Prove the enumeration COMPLETE first — an incomplete one closes the instances you listed and reports the class as handled |
 | 397 | A hand-rolled parser standing in for a tool | Ask the authority instead — both of us mis-enumerated a fleet by parsing manifests when `cargo metadata` and the daemon config answer exactly, and each error made the problem look smaller |
-| 398 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 399 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 398 | A gate whose input the gated party supplies | Not a gate — a caller wanting the restricted path declares whatever unlocks it and fails worse later. Put the check where the property is OBSERVABLE, not where it is asserted |
+| 399 | Ageing anything by file mtime after you acted on it | It reports YOUR write, in the reassuring direction — everything reads fresh, so nothing reads stranded. Durable ages live in the records' own timestamps |
+| 400 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 401 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

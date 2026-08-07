@@ -291,6 +291,8 @@ Before calling a class closed:
 | 204 | Detecting a formatting defect? | The detector is written in the same formatting it is inspecting, so it fails the way its subject does |
 | 205 | Measured the earliest X — or the earliest X you searched for? | The true boundary can precede your marker, and the error lands in the unsafe direction |
 | 206 | Is that bound a floor or a sample? | A plausible integer gets written down and reused, where a null would have invited a second look |
+| 207 | Verifying a deploy — does your marker discriminate? | Prove it absent from the outgoing binary too; the digest names the bytes but says nothing about what changed |
+| 208 | Is your check general across how the work was done? | A check valid only under one placement style silently stops discriminating under another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4956,6 +4958,19 @@ was unsafe for a reason it was not, and will not recognise the reason it is.
 The cheap discriminator was in the shell history: which placement command actually
 ran. **A mechanism that explains the observation is not thereby the mechanism that
 produced it.**
+
+The next swap showed what the first one lacked. Its owner supplied a **marker string
+pre-verified in both directions** — present in the incoming binary, absent from the
+one being replaced — so a single check separates *the new bytes are here* from *this
+string reads present everywhere*. **The digest names the bytes but says nothing
+about what changed**; a two-direction marker names the fix.
+
+They also supplied a check that survives the placement question entirely: **file
+modification time earlier than process start time**, which distinguishes
+swapped-and-restarted from swapped-only under every placement style. Worth
+preferring, because a check that is only valid under one style stops discriminating
+silently when someone uses another — their own inode caveat was true of copying in
+place and not of what either of us actually runs.
 
 ### A shared log under-reports rather than garbles
 

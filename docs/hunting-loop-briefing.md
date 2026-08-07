@@ -250,6 +250,8 @@ Before calling a class closed:
 | 163 | You closed a documentation trap — was anyone in it? | A latent trap is worth closing, but reporting it as a live defect is a different and false claim |
 | 164 | A rule found nothing on first use — wrong, or unexposed? | The two look identical, and the natural response guarantees it never reaches the instance it was written for |
 | 165 | Are you checking the artifact, or the person who produced it? | A fix arrives with its own validation attached from someone just proven right, so the prior peaks where the artifact is newest |
+| 166 | Does one run report two things that cannot both be true? | The contradiction is the finding; a probe that names a subsystem makes its own failure read as a fact about that subsystem |
+| 167 | Future-proofing a name — did you check the identifier exists? | A name that has never existed fails exactly like one that has gone away, and the guess is never exercised until the rename |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4354,6 +4356,32 @@ And the generalisation the whole practice rests on: **any remedy can be right wh
 the harm it prevents is zero so far, and the two claims need different words.** It
 covered three surfaces in one session — a sharpened assertion, and two
 documentation gaps — having started as a hedge about a single test.
+
+### A guessed identifier fails like a real outage
+
+A monitoring run reported *"idle probe unavailable (executive down?)"* two lines
+below *"14 modules ok"*. **Two claims from one run that cannot both be true**, and
+the contradiction is what surfaced it.
+
+The cause was my own future-proofing. Anticipating a module rename, I had added the
+new name to a lookup list — and guessed it wrong by a suffix. **The guess sat
+unexercised for eleven days**, because until the rename happened the fallback name
+still worked. The moment the rename landed, the only remaining name was the wrong
+one.
+
+The lesson is not "check spelling". It is that **an identifier that has never
+existed fails exactly like one that has gone away** — the daemon says *not
+registered* in both cases. So a lookup list of guessed names is a set of untested
+claims that all report the same way, and none is exercised until precisely the
+moment you were preparing for.
+
+Worse, the probe **named a subsystem in its failure text**, so a lookup miss
+rendered as a fact about that subsystem. A message that attributes its own failure
+to a component is a claim the probe is not entitled to make; *"could not resolve
+the executive module"* would have pointed at the lookup instead.
+
+When future-proofing an identifier, **verify the new name against the thing that
+registers it** rather than composing it from the rename plan.
 
 ### Check the fix, not the person
 

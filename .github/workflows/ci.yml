@@ -87,14 +87,14 @@ jobs:
       # a check that follows another CHECK.
       - name: Clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # --all-targets lints the dev profile only, so warnings inside
       # #[cfg(not(debug_assertions))] (or release-only dead code) never fail the
       # gate above. Lint the release profile too so those surface in CI.
       - name: Clippy (release profile)
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --release -- -D warnings
+        run: cargo clippy --workspace --release --locked -- -D warnings
 
       # Runs even when a lint step above failed, because a lint failure must not
       # silently suppress the test signal. A sibling repo lost twenty commits of
@@ -105,7 +105,7 @@ jobs:
       # unknown" is not, and the two are indistinguishable from the outside.
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
 
       # --all-targets does NOT include doctests, despite the name: it expands to
       # --lib --bins --tests --benches --examples. So a doc example that stops
@@ -115,7 +115,7 @@ jobs:
       # would be looking for a gap whose current cost is zero.
       - name: Doc tests
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --doc --locked
 
       # A generated file edited by hand is invisible to every test: the suite
       # passes, and the only symptom is that the generator rewrites the file on

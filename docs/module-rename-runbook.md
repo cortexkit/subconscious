@@ -24,6 +24,24 @@ in any of the four cases.
 So ask both questions before starting: **what is keyed on this name, and what is
 keyed on this path.**
 
+**And a third, which the first two cannot reach: what is DERIVED from the path.**
+A derived identity is invisible to a reference sweep *and* to a path sweep, because
+the path itself never appears anywhere — only its digest, computed at runtime.
+
+The vault rename found two: a keychain service named
+`<prefix>:<first 8 bytes of SHA-256(canonical data_dir)>`, and an anti-splice vault
+id that is a full SHA-256 over the same bytes, each derived independently by the
+daemon and the CLI from their own view of the directory. Neither is greppable.
+
+This produces a failure ordering worth internalising: **moving the store alone was
+worse than moving nothing.** Nothing moved leaves a vault that reads as empty;
+store-only leaves a vault that is *locked*, because a real store opens and its key
+is looked up under a scope that has never existed — and it presents as a key problem
+rather than a rename problem, so the symptom points away from the change that caused
+it. A partial migration can also self-repair into a plausible wrong state: the CLI's
+default data dir follows the module id, so it would bootstrap a **new empty vault**
+at the new path rather than erroring.
+
 ## Before the move
 
 **Classify the state as cache or fence.** A cache keyed on the old name fails as

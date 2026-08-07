@@ -227,6 +227,8 @@ Before calling a class closed:
 | 140 | Did your mutation actually apply? | A silently-failed edit produces exactly the output of a signal that does not work, so the two are indistinguishable without a receipt |
 | 141 | Does this rule *select* from the corpus or *describe* it? | A selector moves the result when it breaks; a describer leaves every number identical, so its own count must print unconditionally |
 | 142 | Does your caveat print only when non-zero? | Then a broken detector deletes the line, and a reader cannot notice a line that is not there |
+| 143 | Have you listed this tool's rules one row each? | Reading for "does each rule report" invites yes; a row per rule makes an empty cell unmissable |
+| 144 | A rule did not fire — was it forgotten, or filed under another category? | A rule that exists and feels applied is nastier than an unwritten one, because the category boundary does the forgetting |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3976,6 +3978,51 @@ One prediction worth keeping: **the likelier failure of any filter is that it
 stops filtering, not that it starts over-filtering**, because a pattern rots by
 matching less rather than more. So publish the count of what a rule **affected**,
 not what it **considered**.
+
+### List the rules, one row each
+
+Run as a mechanical enumeration rather than as a lens, that classification caught
+both of us asserting coverage we had never tested. They had mutation-checked two
+of four rules and *claimed* a third — reasonably, and correctly, as it turned out
+when they finally ran it. **But a right belief with no measurement is
+indistinguishable from a wrong one until someone checks.**
+
+I enumerated mine and found two of three untested. Both hold, and the third was
+worth the trouble: a key that stops pairing sections across rounds drops the
+comparison count to zero and finds nothing — **which looks exactly like a clean
+corpus.**
+
+Why enumeration works where reading does not: **reading a tool for "does each rule
+report something" invites the answer "yes, there are lines". Listing the rules
+forces a row each, and an empty cell is unmissable.** The same reason a table
+finds gaps that prose about the same subject never does — you cannot notice an
+absent paragraph by reading the paragraphs.
+
+### The category boundary does the forgetting
+
+Both of us applied our own denominator rule to findings and not to caveats, twice
+each, **without either of us noticing we had a rule for it.** The rule was filed
+under *results*; the caveat was filed under *commentary*.
+
+A caveat is a **result about the instrument** rather than about the corpus, and
+that re-filing is what let a live rule sit unapplied. **That is nastier than an
+unwritten rule, because the rule exists and feels applied.**
+
+So when a rule fails to fire, the useful question is not *did I forget it* but
+**was the object filed under a different category.**
+
+### The visibility work is the easier half
+
+Worth recording as a limit on everything above: **all of it makes an instrument's
+failure visible in its own output. None of it makes the instrument correct.**
+
+A tool can print a plausible premise, a moving structural number, and honest
+unconditional caveats — and still answer the wrong question competently. The
+multi-spelling check and the borrowed control are the only two things here that
+test the **question** rather than the **machinery**, and both are weaker than what
+we built for the machinery.
+
+Do not mistake the completeness of the visibility work for coverage.
 
 ### The premise line is also a receipt
 

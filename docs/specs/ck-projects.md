@@ -36,6 +36,20 @@ wire; the CK App and a `ck projects` CLI domain are its editors. The daemon is u
 routing stays on canonical directory paths (route.open unchanged; cortexkit-paths remains
 the canonicalization floor). Project-id re-keying is consumer-side.
 
+**Why a module rather than part of the daemon** (asked 2026-08-07, settled): the daemon
+owns **no durable state today** — no store dependency, no data directory, only a
+connection file and a start lock. Folding a journal-spine store into it would hand it a
+failure class it currently cannot have, where a bad migration stops the daemon starting
+and takes the whole fleet with it rather than degrading one registry. The deploy coupling
+is the practical half: registry semantics will churn, and every change would need a daemon
+restart — the most expensive restart in the fleet, since every module and client
+reconnects — where a module restarts in isolation via `supervisor.rescan`.
+
+The piece that *is* correctly in the daemon is path canonicalization and root resolution:
+pure, stateless, on the request path, and it must never require an RPC. The registry is
+the opposite on all three counts. **Different failure properties, different homes** — that
+is the split, not a judgement about where topology conceptually belongs.
+
 The model: a WORKSPACE is a set of project references. A PROJECT is a set of canonical
 directory roots. The registry is the TOPOLOGY authority and nothing else:
 

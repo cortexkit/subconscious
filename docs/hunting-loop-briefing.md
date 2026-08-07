@@ -223,6 +223,8 @@ Before calling a class closed:
 | 136 | Is this the first time you have swept for this? | A codebase with neither the defect nor a control cannot verify its own sweep, so the first run is the least trustworthy |
 | 137 | Can your stated premise disagree with the code? | A premise that can disagree is worse than none — a reader who checks it is checking a claim rather than the rule |
 | 138 | Borrowing a control from another codebase? | It proves the detector *can* fire, not that it fires on your idiom; pair it with the multi-spelling check |
+| 139 | Does the output say what the rule *did*, or only what it *means*? | A reader who expects hundreds and sees three knows the answer is about a different question, without knowing the rule at all |
+| 140 | Did your mutation actually apply? | A silently-failed edit produces exactly the output of a signal that does not work, so the two are indistinguishable without a receipt |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3935,6 +3937,32 @@ Better still where the shape allows: a tool that **prints both halves of its
 partition** states its premise without describing it. A derived premise can still
 be derived from the wrong thing; **a structural one cannot be wrong without the
 result being wrong too.**
+
+So there is an ordering — **structural, derived, transcribed, implicit** — and only
+the first is safe by construction. The distinction that makes it worth climbing:
+**a derived premise tells you what the rule says; a structural one tells you what
+it did.** Their version prints the share of bytes its boundary kept, which moves
+under both ways that boundary can fail; mine prints how many comparisons the rule
+made and how many were exempt. A reader expecting a few hundred and seeing three
+knows the answer is about a different question, **without knowing anything about
+the rule.**
+
+### The premise line is also a receipt
+
+An unexpected second use appeared within the hour. Their attempt to mutate the
+boundary **silently failed to apply** — a shell-escaping problem left the file
+unchanged — and the output looked entirely plausible: identical figures, which
+they were about to write down as *the structural signal does not move under this
+mutation.*
+
+What caught it was the derived premise line still naming the old pattern. Had the
+edit taken, that line would have moved with it.
+
+**A mutation that silently fails to apply produces exactly the output of a signal
+that does not work.** The two are indistinguishable, and the conclusion drawn from
+the first is the more damaging: it retires a working check. So a derived premise
+doubles as a receipt that the edit landed — which is the cheapest answer I know to
+*did my mutation actually apply*, a question both of us got wrong tonight.
 
 One thing the audit made obvious: all four of my tools had their premise in a
 source comment, which is not four oversights but one belief — **that writing an

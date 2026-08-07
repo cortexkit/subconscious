@@ -371,6 +371,8 @@ Before calling a class closed:
 | 284 | One correct caller — enforced or merely correct? | "Cannot be violated" and "has not been violated" look identical at a call site; the discriminator is whether the value can exist without the check |
 | 285 | Documented a mechanism — where does a reader stand when they need it? | Mint-side writing feels complete because it is accurate about the mechanism and silent about the audience |
 | 286 | An optional field | Say what absence means; a consumer will infer something, and the fail-open inference is the one that reads as normal |
+| 287 | A gate with a documented reason for being weak | Check whether the reason still holds; the comment converts an oversight into a decision, and decisions do not get re-examined |
+| 288 | A justification that is half true | Stickier than a false one — checking it returns a real reason and the reader stops before finding the half that expired |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -6066,6 +6068,38 @@ over-inclusive population makes **absence claims more reliable and presence clai
 less**. Their zero could not have been corrupted by the extra directories; a non-zero
 would have been reporting worktrees and husks as consumers. **The direction of the
 error tells you which results need follow-up.**
+
+Using the triage as a counterweight rather than a licence, they then ran it across
+every conditional suite in their gate and four landed in the fix-it bucket. Three
+skipped silently when a sibling binary was absent — not hypothetical, since a rename
+had already stopped three suites exercising a module for weeks with the gate reporting
+success throughout.
+
+The fourth is the one to keep. It *had* a gate, keyed on a variable **no workflow has
+ever set**, and its comment explained the weaker behaviour by a condition that had
+since stopped being true. **A gate whose justification has expired is worse than no
+gate, because the comment argues against fixing it** — a reader who checks finds a
+documented reason and moves on, so **the comment converts an oversight into a
+decision, and decisions do not get re-examined**.
+
+Running it here found the same shape, still open: five test blocks behind an
+environment flag no workflow sets, covering the byte-identity proof that drives the
+real daemon over loopback — the one thing whose own header correctly says no unit test
+can substitute for it. **The justification is half alive, which is why it survived:**
+the stated reason (keeping one job free of a toolchain) is still true for that job,
+while a second job has the toolchain and never runs the suite. **A half-true
+justification is stickier than a false one**, because checking it returns a real
+reason and the reader stops before finding the half that expired.
+
+Their probe lied while proving the fix, and the direction analysis is the part worth
+carrying: **a broken probe reporting "not fixed" is survivable; the same bug reporting
+"fixed" ships inert gates with a green proof attached.** Their cause corrects a rule
+banked here earlier from the opposite side — a *missing* pipefail once hid a real
+failure, an *added* one here manufactured a false one, so the invariant is not "use
+pipefail" but **the exit code of a pipeline is not the answer to your question unless
+you have checked which command produced it**. Mine failed in the same hour: a control
+for "does CI set this variable" returned zero for a variable I knew existed elsewhere,
+and only re-running against a term certainly present separated the two.
 
 The structural cause is worth generalising: two of the pins are constants inside a
 frozen normative set whose verifier requires byte-equality against a historical

@@ -367,6 +367,8 @@ Before calling a class closed:
 | 280 | A defect whose failure lands in another repository | No gate on either side can see it; the owner's suite is structurally incapable rather than deficient, and only a message crosses the gap |
 | 281 | Found an unasserted property — what happens when it is violated? | A loud named failure at the point of use is already a guard; adding an earlier check then buys latency, not safety |
 | 282 | An existence question over an over-inclusive population | Absence claims get more reliable and presence claims less; a zero needs no follow-up, every hit does |
+| 283 | Audited a guard — which side? | Who may ACT on the privileged value and who may CREATE it are separate audits; attention goes to the consequence side, authority originates on the other |
+| 284 | One correct caller — enforced or merely correct? | "Cannot be violated" and "has not been violated" look identical at a call site; the discriminator is whether the value can exist without the check |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5717,6 +5719,30 @@ One detail from their fix worth copying: they verified the guard did not lose it
 defence in the move, by deleting it at the *new* site and confirming the named tests
 still redden. **A refactor that relocates a check can silently disconnect it**, and a
 still-passing suite says nothing either way.
+
+The exchange then produced the general shape, because we had each stopped on opposite
+halves of the same thing. **A guard has two sides and they need separate audits: who
+may act on the privileged value, and who may create it.** They had fixed consumption
+and never asked who sets the flag; I had mutation-tested refusal and never asked
+whether the privileged value could be minted around the check. **Attention goes to the
+side where the consequence is visible; authority originates on the other.**
+
+And the minting audit produced different verdicts for the same call-site evidence.
+Both of us had exactly one correct production caller — but theirs sets the flag through
+a public setter taking a bare boolean, where the check happens elsewhere and the value
+arrives stripped of its provenance, while here the function that checks is the
+function that mints. **Enforced versus merely correct**, or *cannot be violated*
+versus *has not been violated*, and **a call-site audit cannot tell them apart because
+both show one correct caller**.
+
+Their remedy when a witness type was too expensive is the honest fallback and they
+labelled it as judgement rather than principle: state at the **definition** what
+entitles a caller to set the value. The setter's comment had described its mechanics —
+how to set it without touching other call sites — **which reads as an invitation**.
+Running the same question here found the mirror gap: the attested value was documented
+where it is *minted* and said nothing where it is *read*, so a provider deciding what
+to trust saw it beside an unattested field that did carry a warning. Fixed at the
+field.
 
 ### The noticer must not be downstream of the failure
 

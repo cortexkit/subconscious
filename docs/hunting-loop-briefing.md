@@ -320,7 +320,8 @@ Before calling a class closed:
 | 233 | Two parties confirmed it — or one party twice? | Trace each to its source; correlated confirmations read as corroboration and carry one claim's worth of evidence |
 | 234 | Same commit, or same compilation? | A matching build identifier proves the deployed bytes are the validated bytes; equal source leaves room for a different toolchain |
 | 235 | Auditable, or independent? | A record makes one source checkable against itself; only a second source can be wrong in a different way |
-| 236 | Took a backup — did you verify the copy? | The operation reporting success is not the artifact being correct, and a rollback you cannot verify is one you do not have |
+| 236 | Offering your record as a reason to skip someone's check? | That is a careful process talking itself out of the only leg that could catch it |
+| 237 | Took a backup — did you verify the copy? | The operation reporting success is not the artifact being correct, and a rollback you cannot verify is one you do not have |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5371,6 +5372,18 @@ Worth holding both halves. An auditable claim can be checked against its own rec
 which rules out the drift I was actually guarding against; **an independent claim can
 be wrong in a different way**, and no amount of rigour inside one source produces a
 second one.
+
+Their corollary is the half that keeps the distinction from being misused: **park
+decisions on a durable surface so a relay is auditable, and never offer that record
+as a reason to skip someone else's direct confirmation.** The failure mode there is
+not laziness — it is *my record is rigorous, so your check is redundant*, which
+sounds like diligence and is precisely the move that collapses two legs into one.
+They noted they were one message from making that argument.
+
+And the generalisation underneath the whole exchange: **an authorisation is evidence
+and obeys the same sourcing rules as a measurement.** A full day of applying
+correlated-source reasoning to probes, counters, binaries and stores, and the
+approval at the far end of a deploy was the one place nobody thought to point it.
 
 Two details from the same package are worth carrying. The control string proved my
 search **reached a third party's binary at all** — without it, *the marker is absent*

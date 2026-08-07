@@ -246,6 +246,7 @@ Before calling a class closed:
 | 159 | You measured rather than recalled — did you control the result? | A measurement with no control is a recollection with better typography |
 | 160 | A rule returned a null here — does this codebase have its precondition? | A null from a codebase that lacks the precondition tests nothing; the rule was never exposed |
 | 161 | A guard is deliberately absent on one path — where is the reason recorded? | If it lives at the call sites, a third caller reads a guard with no sign that skipping it is ever correct |
+| 162 | Which definition does the next caller open *first*? | Documenting an exemption on the opt-in helper documents it for the person who already found it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4292,6 +4293,20 @@ no indication that skipping it is ever correct. **The risk is not the bypass; it
 the next caller inheriting it** and assuming the guard is universal, which here
 would silently reintroduce the truncation the second path exists to avoid.
 Recorded on the function, where a new caller will actually meet it.
+
+The failure direction is what makes it worth the trouble: **the careful reader,
+doing what the code appears to ask, is the one who breaks it.**
+
+A colleague then ran that rule on their own crate and returned a clause it needed.
+Their asymmetric guard's reason **was** on a definition — but on the opt-in helper
+you only reach if you already suspect the rule exists, while the function a new
+author actually opens said nothing. So: **the definition it must live at is the one
+the next caller opens first, not merely a definition.**
+
+Checking my own fix against that, it failed the same way one level over. The
+rationale now sits on the capping function, but the bypassing handler is reached
+without passing through it — and there the omission reads as *nobody considered the
+cap* rather than as a decision. Noted at the bypass site too.
 
 ### Write a rule down, then hand it to someone else
 

@@ -2928,16 +2928,28 @@ mod tests {
         let candidates = connection_file_candidates_with(None, Some(named.clone()));
         assert_eq!(
             candidates,
-            vec![named],
+            vec![named.clone()],
             "a named connection file must not be followed by discovery paths"
         );
 
         // Absence must still produce candidates, or discovery could never run and
         // the assertion above would hold for the wrong reason.
+        //
+        // The property is that discovery RAN and produced something other than the
+        // named path -- not how many candidates it found. An earlier version
+        // asserted a count above one, which is a Unix-shaped proxy: Windows has no
+        // XDG runtime dir and no HOME, so its discovery correctly yields exactly
+        // one candidate (the per-user temp path the daemon actually publishes to).
+        // The count stood in for the property and disagreed with it on a platform
+        // where the code was right.
         let discovered = connection_file_candidates_with(None, None);
         assert!(
-            discovered.len() > 1,
-            "without a named file, discovery must offer several candidates"
+            !discovered.is_empty(),
+            "without a named file, discovery must offer at least one candidate"
+        );
+        assert!(
+            !discovered.contains(&named),
+            "discovery must not reach for the named path it was not given"
         );
     }
 

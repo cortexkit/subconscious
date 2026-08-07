@@ -330,6 +330,9 @@ Before calling a class closed:
 | 243 | Before reading agreement OR disagreement as signal | Establish what actually varied between the two readings; often it is the source or the time rather than the thing measured |
 | 244 | Verified a deploy — has the changed path actually run? | Installed and serving are different claims; drive one real request and read a counter only the durable path moves |
 | 245 | Building a safeguard — does it fire, or does it need noticing? | Prefer conditions that hold without anyone paying attention at the right moment; the right moment is when nobody is |
+| 246 | Asserting a count — is the count the property? | A count is a proxy shaped by the platform you wrote it on, and it disagrees with the property where the code is right |
+| 247 | Restoring after a mutation — does the restore reach only the mutation? | A checkout reverts the repair too; back up the file first and restore from that |
+| 248 | A red gate for hours — has anything landed on top of it? | Every commit after the first failure inherits an unverified base, and cancelled runs make the count look smaller than it is |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5551,6 +5554,37 @@ unknown. They have since seen it survive twice — but both times without a rest
 which is the ordinary path and says nothing about persistence. **That hypothesis is
 still open rather than resolved**, and two ordinary observations should not be
 allowed to quietly read as evidence against it.
+
+### A count standing in for the property
+
+Wiring the missing doctest step surfaced that the previous commit had failed on
+Windows — and it was mine, from that morning, red for three hours while I shipped on
+top of it.
+
+The assertion was a guard against a check passing for the wrong reason: after proving
+that a named connection file is used exclusively, it required discovery to offer
+**more than one** candidate, so the first assertion could not hold merely because
+discovery was broken. Sound intent. But **the count is a proxy, and it was shaped by
+the platform I wrote it on**: Unix discovery offers a runtime directory, a home path
+and a temp fallback, while Windows has neither of the first two and correctly yields
+exactly one. The code was right on Windows and the proxy disagreed with it.
+
+The repair asserts the property directly — discovery produced something, and what it
+produced is **not** the named path — which is what the guard always meant and holds on
+any platform. Mutation-proved by removing the exclusivity: the test fails, and it
+fails on the exclusivity assertion rather than the guard.
+
+Two process failures worth more than the fix. First, **thirty-seven commits landed on
+a red gate**, and I did not notice because the failure was one platform's leg inside
+otherwise-passing runs, with most later runs superseded before finishing. **A
+superseded run reports neither pass nor fail**, so the failure count looks smaller
+than the exposure.
+
+Second, restoring after the mutation I used a checkout, which **reverted my repair
+along with the mutant** — the repair was uncommitted, so the restore reached further
+than the thing it was undoing. Redone with a file copy taken before mutating. **A
+restore must reach the mutation and nothing else**, and a working tree with genuine
+uncommitted work is exactly where a version-control restore fails that test.
 
 ### Why the position beats the effort
 

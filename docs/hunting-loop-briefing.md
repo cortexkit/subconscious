@@ -219,6 +219,8 @@ Before calling a class closed:
 | 132 | Does your detector distinguish the fixed state from the broken one? | An expression correct at other call sites survives the fix, so the count is identical before and after |
 | 133 | Did you read the control as a *difference* or as a *presence*? | A detector firing before the fix proves nothing if it also fires after, and an unchanged count looks like evidence while discriminating nothing |
 | 134 | Are you assuming every file a fix touched was defective? | A fix commit carries helpers, tests and unrelated corrections, so the file list is not the measurement |
+| 135 | Does your tool print the premise its results rest on? | The one thing a reader cannot infer from the output is the assumption that produced it, and identical numbers follow from any rule |
+| 136 | Is this the first time you have swept for this? | A codebase with neither the defect nor a control cannot verify its own sweep, so the first run is the least trustworthy |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3891,6 +3893,44 @@ is.**
 Both of us built a check on an assumption about what a commit *means*, and in both
 cases **the assumption was invisible in the output** — mine as a prediction
 hardcoded into a label, theirs as a set comparison that looked rigorous.
+
+### Print the premise beside the result
+
+Both of our errors above shared one property: **the assumption was the thing that
+never got printed** — mine as a prediction hardcoded into a label, theirs as a set
+comparison that looked rigorous.
+
+Applied to the tools themselves, this is stronger than a debugging aid. A scan
+reporting counts and caveats without stating the definition every number rests on
+produces **identical output under any competing rule**, so a reader who would
+disagree cannot tell from the numbers that a choice was made.
+
+**A printed premise is what makes a tool auditable by someone who did not write
+it.** The one thing a reader cannot infer from the output is the assumption that
+produced it.
+
+And that is exactly how the test-exclusion boundary's own incompleteness surfaced
+tonight: one of us could say the anchor was wrong **because they knew which anchor
+was in use.** Had it been implicit, the finding would have stayed in one
+repository.
+
+Derive the printed line from the constants rather than transcribing it beside
+them, and check that changing the constant changes the line — otherwise the
+premise becomes prose beside a derived artifact, which is its own rot.
+
+### The first sweep is the least trustworthy
+
+One uncomfortable corollary of borrowing controls from history: **a codebase with
+no record of a defect has no control for it**, so its clean result is exactly the
+unfalsifiable kind.
+
+Which inverts the intuition that a clean history is a strong position. **The first
+time you sweep for something is the time you can least trust the answer** —
+neither the defect nor the evidence that your detector can find it.
+
+The converse is the useful half: a repository that has fixed a class of bug is
+better equipped to sweep for it than one that never had it. **The history of being
+wrong is the instrument.**
 
 ### The name is not the property
 

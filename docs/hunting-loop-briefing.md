@@ -363,6 +363,8 @@ Before calling a class closed:
 | 276 | A public type changed without a wire change | Round-tripping tests pass forever; it breaks at compile time in someone else's tree, arriving as a bug report rather than a red gate |
 | 277 | Cross-repo impact scan by identifier | A name match is not a type match; discriminate on a field only one candidate has, or compile the consumer |
 | 278 | Assessing a source-breaking change | Exposure is set by how consumers pin, not whether they depend; a path-pinned consumer breaks on push, a rev-pinned one on its next bump |
+| 279 | A fleet-wide scan run over local checkouts | The local set is a superset and a subset at once — worktrees and husks inflate it, uncloned repos are missing — and neither is visible in the output |
+| 280 | A defect whose failure lands in another repository | No gate on either side can see it; the owner's suite is structurally incapable rather than deficient, and only a message crosses the gap |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5966,6 +5968,26 @@ Worth checking one's own exposure while the rule is fresh — this repository de
 type with the very name that collided, and twenty-two repositories path-pin its
 crates, so the same assessment here has a much larger population and the same two
 discriminators.
+
+A third party then closed the question fleet-wide, and bounded their answer to *the
+repositories checked out on this machine*. Testing that edge rather than accepting it
+found two repositories that exist only on the remote; querying their manifests
+directly closed the population, with a positive control at the same scope and a check
+that each manifest **exists** before reading its zero as an absence.
+
+The count on the way there was its own finding: **thirty-nine local directories
+against twenty-seven repositories.** The local set is not a subset of the fleet, it is
+a superset and a subset at once — worktrees and husks inflate it while uncloned
+repositories are missing — and **neither direction is visible from the scan output**.
+Harmless when the answer is zero, since extra directories can only add false
+positives; not harmless for any scan that returns a hit.
+
+Their framing of the whole class is the one to keep: **a defect whose failure lands in
+another repository cannot be found by the owner's gate no matter how good it is.** The
+round-tripping suite stays green forever; the stale pin was invisible because the
+party who would have seen it was not building it. Neither gate is deficient, both are
+structurally incapable — and **the only thing that crosses the gap is a message**,
+which makes those messages infrastructure rather than courtesy.
 
 The structural cause is worth generalising: two of the pins are constants inside a
 frozen normative set whose verifier requires byte-equality against a historical

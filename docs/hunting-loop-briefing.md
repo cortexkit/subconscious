@@ -249,6 +249,7 @@ Before calling a class closed:
 | 162 | Which definition does the next caller open *first*? | Documenting an exemption on the opt-in helper documents it for the person who already found it |
 | 163 | You closed a documentation trap — was anyone in it? | A latent trap is worth closing, but reporting it as a live defect is a different and false claim |
 | 164 | A rule found nothing on first use — wrong, or unexposed? | The two look identical, and the natural response guarantees it never reaches the instance it was written for |
+| 165 | Are you checking the artifact, or the person who produced it? | A fix arrives with its own validation attached from someone just proven right, so the prior peaks where the artifact is newest |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4353,6 +4354,18 @@ And the generalisation the whole practice rests on: **any remedy can be right wh
 the harm it prevents is zero so far, and the two claims need different words.** It
 covered three surfaces in one session — a sharpened assertion, and two
 documentation gaps — having started as a hedge about a single test.
+
+### Check the fix, not the person
+
+The last three findings of that session were each of us checking the other's
+**fix** rather than the original defect, and all three turned up something. That is
+harder than checking a claim, for a specific reason: **a fix arrives with its own
+validation attached, from someone who has just demonstrated they were right.** The
+prior is at its highest exactly when the artifact is newest and least examined.
+
+Same mechanism as the cost inversion, on a shorter timescale — **earned credibility
+transfers to the next artifact, which has not earned any.** The only defence is to
+keep the subject the artifact rather than its author.
 
 ### Write a rule down, then hand it to someone else
 

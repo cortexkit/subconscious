@@ -270,6 +270,7 @@ Before calling a class closed:
 | 183 | Green suite — immune, or already fixed? | "My tests pass" and "this cannot bite me" are different claims, and only reading the guard separates them |
 | 184 | Diffing two runs — did you strip the clock? | A comparison containing a timestamp always differs, and it manufactures a positive rather than hiding one |
 | 185 | Does the flag's name promise breadth? | "All targets" reads as a superset while excluding a category; count the target kinds rather than trusting the word |
+| 186 | Is your immunity structural or defensive? | Structural immunity is one refactor from evaporating, and the guard it would then need lives somewhere the new code never reaches |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4660,6 +4661,22 @@ reddened because my crate has no such scrub.
 They then did what my correction was asking for: ran the suite with and without the
 variables and **compared per-binary verdicts**, making the baseline a measured
 result rather than an assumption.
+
+Applying the distinction to themselves, their first answer was wrong in an
+instructive way. The scrub they cited lives in **binary entry points**, which a test
+binary never runs — true about the binaries, irrelevant to the tests. The real
+reason their suite survives is that it boots the daemon in-process and never spawns
+a subprocess, so **their immunity is structural rather than defensive.** Their own
+warning: it is one refactor from evaporating, and the day a test spawns a real
+process, the guard it would need sits in the binary being invoked rather than in
+the test.
+
+**A right conclusion resting on the wrong evidence survives every check aimed at
+the conclusion.** Mine was the mirror: the daemon my tests spawn *is* scrubbed — the
+leak is the client, which runs in the test process and reads the same variables. I
+had the correct fix and the wrong model of why it was needed, and recorded the
+mechanism at the spawn site so the next person meeting that failure does not spend
+an evening on a code defect that is a property of their terminal.
 
 One trap inside that check, and it is the dangerous direction: their first
 comparison diffed raw result lines and reported a difference — **the difference was

@@ -408,6 +408,9 @@ Before calling a class closed:
 | 321 | A narrowing pass over a subset | Record what it dropped, or the list it produces looks complete — the sweep can be right and the summary wrong, and the summary is what gets acted on |
 | 322 | A check returning the same answer for every member of a set | It is answering a question about itself — a broken instrument's failure mode is not a wrong answer but a SUSPICIOUSLY TIDY one; one lucky match yields a plausible partial result nobody questions |
 | 323 | A diagnostic you added for this exact failure | Check it has a reader and a discovery path, not just a channel — a channel nobody looks at is worse than none, because it looks solved |
+| 324 | Reading a SQLite store with `immutable=1` | It ignores the -wal, so on a LIVE database it answers about the past without erroring — `immutable=1` for quiescent stores, `mode=ro` for live ones |
+| 325 | A value that does not move when you expected it to | Ask whether the mechanism WRITES on success — a rejected write writes nothing, so an unchanged counter can be the fingerprint of the failure rather than evidence against it |
+| 326 | Renaming a module whose store carries a fence | The lease counter is keyed on the module id and lives in a FILE; the fence lives in a ROW keyed on nothing. A rename resets the counter to zero against a store still demanding the old epoch — pre-seed the new lease file before first open |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

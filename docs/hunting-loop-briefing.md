@@ -349,6 +349,8 @@ Before calling a class closed:
 | 262 | A rule covering one direction of a two-sided property | The covered half keeps firing, so the rule feels validated; a check must be able to fail and a filter must be able to exclude |
 | 263 | An enumeration came back complete — keyed on what? | It is only as complete as the property it keys on; a sibling path reaching a different terminal state is invisible to it |
 | 264 | Two parties assume a third repo's guarantee | Neither the assumer nor the owner ever hears the assumption; it surfaces only if someone volunteers a correction against their own interest |
+| 265 | Does this claim support your point or complicate it? | The supporting one gets waved through; direction predicts what goes unchecked better than distance from the source does |
+| 266 | Relaying a severity you later narrow | Correct it as promptly as you raised it; an overstated finding that is quietly revised turns an accepted cost into a design conversation |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5764,6 +5766,29 @@ third party's guarantees is a defect class with no owner.** The assuming party h
 reason to check, and the owning party never hears the assumption. This one surfaced
 only because someone volunteered a correction against their own interest, which is
 not a mechanism.
+
+The finder then narrowed their own severity before the owner could scope work off it.
+The discarded report is fired from inside the fetch path on every rejected fetch, and
+a rejected credential is a non-transient failure in their retry loop — so a
+*transient* delivery failure heals on the next tick minutes later. The residual gap is
+narrower and sharper: **a persistently failing report leaves the record stuck, because
+every retry reproduces the failure and repetition is not evidence of delivery.**
+
+Their diagnosis of why they got it wrong is better than the correction. They asserted
+it about **code they had written, six lines from the call site**, in the same hour as
+correcting an unverified claim about a repository they had never opened. So **the
+predictor is not distance from the source — it is which direction the claim pushes.**
+One assertion made a deferral defensible and the other made a finding sharper; a claim
+that supports the point being made gets waved through, and one that complicates it
+gets checked. The claims most in need of checking are the ones that feel least like
+they need it.
+
+Relaying the softening as promptly as the finding is part of the same obligation: **an
+overstated severity corrected quietly later is how a small accepted cost becomes a
+design conversation nobody needed.** Worth noting the owner's answer did not depend on
+the severity — they documented the rationale because it was unwritten, not because the
+exposure was large, which is the more durable reason and survives the correction
+intact.
 
 And the message prompted a fix worth more than the gap it asked about: the read
 surface's own documentation still described an operation's parameters from before a

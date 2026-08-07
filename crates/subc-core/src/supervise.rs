@@ -151,6 +151,23 @@ impl Default for HealthConfig {
     }
 }
 
+/// The supervisor's view of one module's health, relayed to clients over
+/// channel-0 and rendered by `ck health`.
+///
+/// THIS TYPE IS WHERE THE ABSENCE MEANINGS ARE CREATED, which is why they are
+/// stated here rather than only at the wire type a consumer reads. A reader can
+/// look up what `None` means; only a writer can silently change it, and the
+/// writer has no reason to go looking at a downstream contract before editing.
+///
+/// `last_probe_ms: None` MEANS NEVER PROBED, not probed-long-ago. It is cleared
+/// back to `None` on re-registration precisely so a respawned module does not
+/// carry its predecessor's timestamp — so an old value and an absent one call for
+/// opposite readings, and anything that defaulted this to a number would make a
+/// never-probed module indistinguishable from one probed at the epoch.
+///
+/// `detail` and `metrics` are `None` when the module published none on this
+/// probe, which does not mean it reported nothing wrong — it is also the shape
+/// when the probe never reached it. `last_probe_ms` is what separates those.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleHealthStatus {
     pub status: SupervisorHealthStatus,
@@ -159,6 +176,9 @@ pub struct ModuleHealthStatus {
     pub metrics: Option<Value>,
     pub consecutive_failures: u32,
     pub last_action: Option<String>,
+    /// Set together with `last_action`; the pair moves as one, and both being
+    /// absent means no escalation has ever been taken rather than that the last
+    /// one succeeded.
     pub last_action_ms: Option<u64>,
 }
 

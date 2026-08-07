@@ -133,7 +133,22 @@ under the new keychain scope** (their hands, not mine — it needs the key mater
 write path and its audit append. **Then** callers flip.
 
 Rollback: the old directory stays untouched until 21/21 is confirmed under the new
-one.
+one — **but the free-rollback window closes at the first served credential refresh,
+not at the verification.** After that the two stores have diverged: the new one holds
+a rotated token the old one does not, and rolling back resurrects a refresh token the
+provider has already invalidated. Detectable and self-healing, at the cost of a
+re-login per credential that rotated. So run the non-writing checks first — status,
+chain integrity, and the mint/revoke round-trip, none of which touch provider tokens
+— and treat the first served refresh as the boundary. Not a reason to hold refreshes
+off; a reason for both parties to know which side of the line they are on when they
+call it good.
+
+The key move is **in-process**, not an operator copy: the resolver's backend exposes
+slot load/store keyed by data dir, so the material moves from the old scope to the new
+through the typed path that enforces slot semantics, never landing in a shell, a file,
+or anyone's context. Verified by **fingerprint against the anchor the database itself
+records**, never by an item existing at the new service — existence is satisfied by
+anything, including a fresh item minted by a half-applied migration.
 
 The repo directory move is a **separate, later** decision. Two moves in one window
 means a failure has two candidate causes.

@@ -369,6 +369,8 @@ Before calling a class closed:
 | 282 | An existence question over an over-inclusive population | Absence claims get more reliable and presence claims less; a zero needs no follow-up, every hit does |
 | 283 | Audited a guard — which side? | Who may ACT on the privileged value and who may CREATE it are separate audits; attention goes to the consequence side, authority originates on the other |
 | 284 | One correct caller — enforced or merely correct? | "Cannot be violated" and "has not been violated" look identical at a call site; the discriminator is whether the value can exist without the check |
+| 285 | Documented a mechanism — where does a reader stand when they need it? | Mint-side writing feels complete because it is accurate about the mechanism and silent about the audience |
+| 286 | An optional field | Say what absence means; a consumer will infer something, and the fail-open inference is the one that reads as normal |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5743,6 +5745,31 @@ Running the same question here found the mirror gap: the attested value was docu
 where it is *minted* and said nothing where it is *read*, so a provider deciding what
 to trust saw it beside an unattested field that did carry a warning. Fixed at the
 field.
+
+They then added the third question, and it is the one that generalises furthest:
+**where does someone stand when they need this, and is the explanation there.** Their
+diagnosis of why the answer is usually no is the best of the day — **mint-side
+documentation is written by the person who understands the mechanism at the moment
+they understand it best**, which is exactly why it feels complete and exactly why it
+lands in the wrong file. Three good explanations written the same day, all mint-side,
+with the consumer-facing contract untouched. Not negligence: **the feeling of
+completeness is produced by the writing, and it is accurate about the mechanism and
+silent about the audience.**
+
+Checking here, the read-side document does answer it properly — and the reason is
+worth more than the pass. Its own status line records that the absence rule arrived as
+a **consumer's policy delta folded in during their review**. The read-side rule is
+there because someone standing on the other side put it there, not because the owner
+anticipated them; the same mechanism as the cross-repo messages above. What remained
+was the residue: the document was right and the *field itself* said nothing, so an
+author reading the type rather than the design note got no warning.
+
+One hazard from their case is worth separating: **a misread there is not conservative,
+it is lossy.** The natural inference routes away from credit that expires whether or
+not it is used, so the cautious-looking reading destroys the thing the feature exists
+to capture — and the value can jump discontinuously in one poll, which **a careful
+consumer's anomaly filter would suppress**. The more careful the consumer, the more
+likely they discard the one reading that matters.
 
 ### The noticer must not be downstream of the failure
 

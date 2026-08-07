@@ -1,5 +1,44 @@
 # Module rename runbook
 
+## Renaming a GitHub repository burns the old name permanently
+
+GitHub redirects the old repository path to the new one, and that redirect is
+what every existing clone, bookmark and API reference relies on. It has one
+fatal property: **creating a new repository at the old path silently replaces
+the redirect, and deleting that repository does not bring the redirect back.**
+The loss is permanent.
+
+So every name we rename away from becomes a burned namespace. The realistic
+way to trigger it is somebody months later creating a small helper repo under
+the old familiar name, with no idea it was ever taken. Low probability, zero
+recovery.
+
+Burned so far: `cortexkit-credentials`, `subc-federation`, `ck-projects`,
+`ai-provider-quota`, `alfonso`.
+
+## `uses:` is the one reference that does not redirect
+
+A workflow step that consumes an action from a renamed repository fails with
+`repository not found`. There is no compatibility window for that one case,
+which makes renaming a repository that HOSTS an action a hard breaking change
+for every consumer.
+
+Everything else follows the redirect, verified per layer rather than assumed:
+git fetch, the REST API, and the tarball endpoint `actions/checkout` uses. Each
+layer can fail independently, so one working does not license the others.
+
+Before renaming, check both keys across every workflow in the fleet, and prove
+the search can return something before trusting an empty result:
+
+```sh
+find . -maxdepth 4 -path '*/.github/workflows/*.y*ml' | wc -l   # must be non-zero
+find . -maxdepth 4 -path '*/.github/workflows/*.y*ml' -print0 |
+  xargs -0 grep -nE '^\s*(uses|repository):' | grep '<old-name>'
+```
+
+An unbounded `find` over these trees can stall and return empty rather than
+erroring, which reads exactly like a clean fleet.
+
 Covers renaming a supervised module's directory, module id, or both. Written
 after the `ai-proxy` -> `thalamus` rename, which broke four things that a
 reference sweep could not have found.

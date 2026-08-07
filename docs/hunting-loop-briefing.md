@@ -248,6 +248,7 @@ Before calling a class closed:
 | 161 | A guard is deliberately absent on one path — where is the reason recorded? | If it lives at the call sites, a third caller reads a guard with no sign that skipping it is ever correct |
 | 162 | Which definition does the next caller open *first*? | Documenting an exemption on the opt-in helper documents it for the person who already found it |
 | 163 | You closed a documentation trap — was anyone in it? | A latent trap is worth closing, but reporting it as a live defect is a different and false claim |
+| 164 | A rule found nothing on first use — wrong, or unexposed? | The two look identical, and the natural response guarantees it never reaches the instance it was written for |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4329,6 +4330,29 @@ One corollary about rules, from the pair of subtle violations above: **a rule's
 value is not measured by what it catches on the day it is written.** The crude
 instances are caught by the rule as first stated; the subtle ones only become
 visible once it has been sharpened, which cannot happen before it exists.
+
+### A rule that finds nothing looks like a rule that is wrong
+
+Which exposes the failure mode of this whole practice. **A rule that finds nothing
+on first application is indistinguishable from a rule that is wrong**, and the
+natural response — stop applying it — guarantees it never reaches the instance it
+was written for.
+
+The two-emission-paths rule sat exactly there: run here, null returned, and the
+null turned out to be about this codebase lacking the precondition rather than
+about the rule. **Unbounded, it would have retired a rule on evidence that tested
+nothing.**
+
+The ordering is the reassuring part, and it is not optional. **A rule arrives blunt
+and is sharpened by its own easy cases.** The subtle instance above was reachable
+only because a crude one came first and forced *at a definition* to become *at the
+definition the next caller opens first*. So a first application that turns up
+something trivial is not a weak result — it is the mechanism working in order.
+
+And the generalisation the whole practice rests on: **any remedy can be right while
+the harm it prevents is zero so far, and the two claims need different words.** It
+covered three surfaces in one session — a sharpened assertion, and two
+documentation gaps — having started as a hedge about a single test.
 
 ### Write a rule down, then hand it to someone else
 

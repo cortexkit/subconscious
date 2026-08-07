@@ -1,4 +1,21 @@
-# Fleet restart window — plan
+# Fleet restart window
+
+## What this runbook does not cover
+
+Every step below starts from "you have a binary". The build itself is not here,
+and for artifacts built by another seat it happens in their repository
+entirely.
+
+That matters because the verification chain proves less than it appears to.
+Hash, distinctive strings, inode and schema all establish WHICH SOURCE an
+artifact came from. None of them establishes WHICH DEPENDENCY SET IT LINKED. A
+build whose dependency resolution was not pinned can produce two different
+binaries from one commit, and every check in this document passes for both.
+
+So the pinning has to exist where the build happens. When accepting an artifact
+built elsewhere, that is a property of the other repository's build path, not
+something this ritual can recover. Ask, rather than inferring it from a clean
+verification here. — plan
 
 Written 2026-08-06. Everything below was measured from the running fleet and the
 repositories on this machine, not recalled.

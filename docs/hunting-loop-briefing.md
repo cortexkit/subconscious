@@ -414,6 +414,7 @@ Before calling a class closed:
 | 327 | A suite of checks that all passed during an outage | Ask whether any of them COUNTS — consistency checks measure internal agreement and are silent about a silent subtraction; a set that shrinks stays consistent |
 | 328 | A review or tool answering about the wrong target | Establish what it EXAMINED before judging whether it is right — a finding aimed at the wrong place is unaddressed, not wrong, and discarding it loses a real defect |
 | 329 | An explanation that fits the case you looked at | Check whether it generalises before letting it stand as the rule — one member's special-case behaviour explains that member, and reads as the shape of the whole class |
+| 330 | Asking whether a mechanism RAN | Read an event log, not a state value — state answers what is true now, and an idempotent or equal-case path changes nothing on success, so a constant proves only that you cannot see |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

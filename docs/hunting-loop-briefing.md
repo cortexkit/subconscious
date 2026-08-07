@@ -271,6 +271,8 @@ Before calling a class closed:
 | 184 | Diffing two runs — did you strip the clock? | A comparison containing a timestamp always differs, and it manufactures a positive rather than hiding one |
 | 185 | Does the flag's name promise breadth? | "All targets" reads as a superset while excluding a category; count the target kinds rather than trusting the word |
 | 186 | Is your immunity structural or defensive? | Structural immunity is one refactor from evaporating, and the guard it would then need lives somewhere the new code never reaches |
+| 187 | Is the subject of your evidence the subject of your claim? | A category mismatch inside your own sentence is a cheaper trigger than doubt, and it does not require suspecting the result |
+| 188 | Just told someone you avoid a hazard — do you? | Stating a constraint is the moment to check you obey it, and the claim will otherwise be true only of the code you were looking at |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4671,12 +4673,29 @@ warning: it is one refactor from evaporating, and the day a test spawns a real
 process, the guard it would need sits in the binary being invoked rather than in
 the test.
 
+Their trigger for looking is cheaper than doubt and worth copying: they noticed the
+claim was about **binaries** while the thing being explained was a **test run** — a
+category mismatch inside their own sentence. **Check that the subject of your
+evidence is the subject of your claim**, which requires no suspicion about the
+result.
+
 **A right conclusion resting on the wrong evidence survives every check aimed at
 the conclusion.** Mine was the mirror: the daemon my tests spawn *is* scrubbed — the
 leak is the client, which runs in the test process and reads the same variables. I
 had the correct fix and the wrong model of why it was needed, and recorded the
 mechanism at the spawn site so the next person meeting that failure does not spend
 an evening on a code defect that is a property of their terminal.
+
+One more fell out of it. Explaining why I *could not* clear those variables
+in-process — doing so is unsafe once a process has threads — I checked and found
+**four such calls in my own workspace.** All test-only, and the one that mutates a
+variable something else reads is safe only because the sole reader is reached from
+that test alone. Safety by position, not by enforcement: a second test touching the
+same defaults would race it, and the symptom would be an occasional wrong value
+rather than a failure naming the cause.
+
+**Stating a constraint is the moment to check that you obey it.** The claim was true
+of the code I was looking at, and I offered it as a property of the workspace.
 
 One trap inside that check, and it is the dangerous direction: their first
 comparison diffed raw result lines and reported a difference — **the difference was

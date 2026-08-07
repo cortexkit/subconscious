@@ -1108,6 +1108,18 @@ fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Liv
 }
 
 fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Child {
+    // The spawned daemon is scrubbed here, but the CONSUMER in these tests runs
+    // in this process and reads the same two variables through
+    // `consumer_identity_from_env`. So a shell that already carries a supervised
+    // module's identity -- an agent session, or any terminal launched under the
+    // supervisor -- makes the client attest as that module, and route.open is
+    // refused with `bad_consumer_identity` naming a module nobody mentioned.
+    //
+    // The failure reads as a code defect and is a property of the terminal. There
+    // is no in-process scrub because `std::env::remove_var` is unsafe in a
+    // multi-threaded process and these tests are threaded; run the suite with
+    // `env -u SUBC_MODULE_ID -u SUBC_LAUNCH_NONCE` instead, which is what CI does
+    // by virtue of not running under the supervisor.
     Command::new(daemon_bin)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)

@@ -259,6 +259,8 @@ Before calling a class closed:
 | 172 | Every remedy failed — do they all consult the state that produced the error? | Then their agreement is one observation repeated, and the corruption is upstream of all of them |
 | 173 | Correcting someone about shared code — do they use it? | Both parties can be right about their own layer and wrong about the other's; verify which code the other actually executes |
 | 174 | Hand-rolled client instead of the SDK? | Every operational affordance the SDK accumulated is absent by default, and a missing diagnostic fails as silence rather than at compile time |
+| 175 | Before running a probe — can it produce the positive result? | A probe incapable of succeeding returns the negative you feared, and a decision rule then fires on nothing |
+| 176 | Is the trigger you are testing filtered? | A path, branch or tag filter turns "nothing happened" into correct behaviour, and no error is emitted either way |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4491,6 +4493,37 @@ reported one supervised module as having no client at all — impossible, since 
 speaks the wire. My file glob was too shallow. **A category that cannot exist is
 the cheapest possible signal that a classifier is broken**, and it was only visible
 because I knew that module must have a client.
+
+### A probe that could not have succeeded
+
+The sequel to the wedged-run case, and it is worse than the original error.
+
+After the dispatch proved push events were the suspect layer, the owner and I agreed
+a decision rule: push an empty commit, and if it mints a run, delivery is healthy
+and the release can be cut. It did not mint. Three times. They held the release.
+
+**The workflow filters pushes by path.** An empty commit changes no paths, matches
+nothing, and can never mint a run. Measured with a control: the three probe commits
+changed zero files each; the one commit that did mint changed four.
+
+So **the probe was incapable of producing the positive result**, and its negative
+carried no information about the thing being tested. A decision rule then fired on
+it and was about to hold a release indefinitely.
+
+This is the zero-expected trap in live form. **We chose a probe whose failure mode
+was invisible precisely because we both expected it might legitimately not mint** —
+the answer we feared and the answer a broken probe produces are the same answer. I
+endorsed that probe and never read the trigger.
+
+It also dissolved the original evidence. The two pushes that started the
+investigation — *"both post-recovery pushes minted nothing"* — were **also empty**,
+so they were never evidence of a dropped event. Hours of investigation rested on a
+measurement that could not have come out any other way.
+
+**Before running a probe, establish that it can produce the positive result.** For
+anything event-triggered, read the trigger's filters first: a path, branch or tag
+filter turns *nothing happened* into correct behaviour, and emits no error either
+way.
 
 ### Check the fix, not the person
 

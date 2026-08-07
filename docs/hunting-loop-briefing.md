@@ -365,6 +365,8 @@ Before calling a class closed:
 | 278 | Assessing a source-breaking change | Exposure is set by how consumers pin, not whether they depend; a path-pinned consumer breaks on push, a rev-pinned one on its next bump |
 | 279 | A fleet-wide scan run over local checkouts | The local set is a superset and a subset at once — worktrees and husks inflate it, uncloned repos are missing — and neither is visible in the output |
 | 280 | A defect whose failure lands in another repository | No gate on either side can see it; the owner's suite is structurally incapable rather than deficient, and only a message crosses the gap |
+| 281 | Found an unasserted property — what happens when it is violated? | A loud named failure at the point of use is already a guard; adding an earlier check then buys latency, not safety |
+| 282 | An existence question over an over-inclusive population | Absence claims get more reliable and presence claims less; a zero needs no follow-up, every hit does |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5987,7 +5989,30 @@ another repository cannot be found by the owner's gate no matter how good it is.
 round-tripping suite stays green forever; the stale pin was invisible because the
 party who would have seen it was not building it. Neither gate is deficient, both are
 structurally incapable — and **the only thing that crosses the gap is a message**,
-which makes those messages infrastructure rather than courtesy.
+which makes those messages infrastructure rather than courtesy. Its failure mode is a
+peer who does not send one because it seems minor, **invisible by construction, since
+nothing records a message that was not sent**.
+
+The superset finding then sent them to test a property of their pin set nobody had
+asserted: is every pinned revision reachable on the remote, or could one be a
+local-only commit that builds here and fails where it runs — the same class as the
+stale pin, one step earlier. All six reachable, with a synthetic bad revision as the
+control.
+
+And they declined to add a test for it, which is the counterweight to most of tonight.
+The reflex on finding an unasserted property is to assert it; asking what happens
+*without* the check answered it — the checkout step fails loudly and names the ref. **An
+unasserted property is not automatically a gap.** The question is not *is there a
+check* but **what happens when the property is violated**, and where the answer is a
+loud, well-named failure at the point of use, an earlier check buys latency rather
+than safety. Distinct from the cases where the answer was *exit zero having validated
+nothing* or *nobody ever runs it*.
+
+One asymmetry from the same exchange, worth having before any existence scan: an
+over-inclusive population makes **absence claims more reliable and presence claims
+less**. Their zero could not have been corrupted by the extra directories; a non-zero
+would have been reporting worktrees and husks as consumers. **The direction of the
+error tells you which results need follow-up.**
 
 The structural cause is worth generalising: two of the pins are constants inside a
 frozen normative set whose verifier requires byte-equality against a historical

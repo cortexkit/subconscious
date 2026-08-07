@@ -200,6 +200,8 @@ Before calling a class closed:
 | 113 | Why did this spread without anyone noticing? | Ask whether every check that *would* be run passes — a defect invisible to the standard toolchain needs no carelessness to propagate |
 | 114 | Your sweep found two categories — is there a third? | A binary can be pinned, re-signed wrong, or never signed at all; a two-state sweep files the third under the milder label |
 | 115 | Output looks wrong — is the source wrong, or is the binary older than it? | A wrong output does not localise the fault to the source that produced it, and "fixing" correct code is the likely next step |
+| 116 | Publishing a set of values — did you enumerate them, or list the ones you have seen? | A distribution is a measurement, not an enumeration, and the missing member is missing precisely when nothing is broken |
+| 117 | A correct fallback handled it — do you know whether it was handled or merely survived? | A safe default hides the difference, so behaviour cannot tell you which one you have |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3581,6 +3583,37 @@ Worth noting what this would have cost: the deployed binary was already correctl
 pinned, so placing the new one would have **moved it from pinned to derived** —
 undoing a fix rather than carrying one. A regression arriving inside a careful
 upgrade.
+
+### A distribution is not an enumeration
+
+A colleague published the set of categories their new field can carry, listing six.
+They later corrected it to seven: they had written down **the ones visible on the
+live wire** and treated the observed set as the complete one.
+
+The missing member was the one that appears only when their own code has failed —
+so it was absent from the sample **precisely because nothing was broken.** Neither
+of us could have caught that from the data. Only re-deriving the set from the
+function that produces it gives an enumeration.
+
+The same correction found a second instance in prose: their contract document
+pinned a distribution from an older measurement, and the live figures had already
+moved. **A count in a document ages into a small lie that nothing checks** — worse
+than a stale constant in code, because no test reads a sentence. They replaced it
+with the ratio it was illustrating, which keeps the point and drops the rot.
+
+### Handled, or merely survived
+
+Checking their report against my own code, two of the three cases were already
+correct. The interesting part is that **they could not have discovered that from
+behaviour.**
+
+My fallback for an unrecognised category is deliberately safe, so an unhandled
+member of the set would have rendered acceptably. **A correct default hides the
+difference between "handled" and "happened to survive"** — the output is
+indistinguishable, and only reading the source separates them.
+
+Which is the argument for telling a counterpart what you shipped rather than
+testing whether they cope: a safe fallback means coping proves nothing.
 
 ### The binary older than its own source
 

@@ -428,6 +428,7 @@ Before calling a class closed:
 | 341 | Several instruments agreeing | Prove they CAN disagree — a blind instrument produces the same agreement as a healthy one, so agreement is the outcome that most needs a control |
 | 342 | Two instruments disagreeing | That is one instrument plus a hypothesis — add instruments until every disagreement is explained, rather than explaining the first one you see |
 | 343 | A path resolved through a fallback chain | Break each branch INDEPENDENTLY — either alone still passes, so a partial fix is indistinguishable from a complete one and fails only for whoever takes the other branch |
+| 344 | Sizing a migration or a fix off a row count | Size it off what the affected party CANNOT DO — a correct count of rows in a stale state overstates the damage wherever something resolves across it, and the inflated number then sets the blast radius |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -51,6 +51,10 @@ pub enum ClientControlRequest {
     ServerDescribe {},
     #[serde(rename = "catalog.list")]
     CatalogList {
+        /// Absent lists every registered module; present narrows to one. A
+        /// narrowed list for an unregistered id is an empty list rather than an
+        /// error, so absent and unregistered are distinguishable only by which
+        /// question you asked.
         #[serde(default)]
         module_id: Option<String>,
     },
@@ -58,6 +62,14 @@ pub enum ClientControlRequest {
     RouteOpen {
         target: RouteTarget,
         identity: BindIdentity,
+        /// The consumer's claim to a supervised launch, which the daemon verifies
+        /// against its live spawn nonces before stamping a principal.
+        ///
+        /// Absent is a legitimate shape, not an omission: a direct key-holder has
+        /// no launch nonce to present, and the daemon stamps `Direct`. So absence
+        /// means NO CLAIM WAS MADE, never that a claim was refused — a refused
+        /// claim is an error frame and the route never opens. A provider deciding
+        /// what to trust reads the stamped principal on the bind, not this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_identity: Option<ConsumerIdentity>,
         /// Consumer-declared reverse-request capabilities for the route. This is
@@ -214,6 +226,11 @@ pub struct SupervisorEntry {
     pub enabled: bool,
     pub live: bool,
     pub health: SupervisorHealthStatus,
+    /// When the daemon last collected this module's health, as unix
+    /// milliseconds. Absent means NEVER PROBED (a module inside its first probe
+    /// window, whose `health` is therefore `Unknown` rather than good), not
+    /// probed-long-ago. An old value and an absent one call for opposite
+    /// readings, so do not render them alike.
     #[serde(default)]
     pub last_probe_ms: Option<u64>,
     /// Exit code of the module's most recent process exit, if the process has
@@ -242,13 +259,28 @@ pub enum SupervisorHealthStatus {
 pub struct SupervisorHealthEntry {
     pub module_id: String,
     pub status: SupervisorHealthStatus,
+    /// The module's own human-readable note on its state. Absent means the
+    /// module said nothing, which is the ordinary shape for a healthy module and
+    /// is NOT a claim that nothing is wrong. Never parse it: it is prose the
+    /// module may reword freely, and `status` plus `metrics` are the machine
+    /// surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The module's own metrics object, relayed opaquely. Absent means the module
+    /// published none on this probe — either it reports no metrics at all, or the
+    /// probe did not reach it — so absence cannot distinguish "nothing to report"
+    /// from "nobody asked". Read `last_probe_ms` to tell those apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<serde_json::Value>,
     pub consecutive_failures: u32,
+    /// The escalation the supervisor last took for this module (report, restart,
+    /// alert). Absent means NO ACTION HAS EVER BEEN TAKEN, not that the last one
+    /// succeeded — a module that has never misbehaved and one whose action record
+    /// predates a daemon restart both present as absent.
     #[serde(default)]
     pub last_action: Option<String>,
+    /// When `last_action` was taken, as unix milliseconds. Absent exactly when
+    /// `last_action` is absent; the pair moves together.
     #[serde(default)]
     pub last_action_ms: Option<u64>,
     /// When the daemon last collected this entry, as unix milliseconds.

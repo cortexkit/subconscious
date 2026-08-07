@@ -202,6 +202,8 @@ Before calling a class closed:
 | 115 | Output looks wrong — is the source wrong, or is the binary older than it? | A wrong output does not localise the fault to the source that produced it, and "fixing" correct code is the likely next step |
 | 116 | Publishing a set of values — did you enumerate them, or list the ones you have seen? | A distribution is a measurement, not an enumeration, and the missing member is missing precisely when nothing is broken |
 | 117 | A correct fallback handled it — do you know whether it was handled or merely survived? | A safe default hides the difference, so behaviour cannot tell you which one you have |
+| 118 | Which parts of this system never misbehave? | Well-built degradation makes its own coverage unobservable, so the quiet paths are the ones needing source inspection |
+| 119 | Prose beside a correct table — was it derived or recalled? | The table's correctness makes the paragraph look checked, and nothing reads a sentence |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3614,6 +3616,32 @@ indistinguishable, and only reading the source separates them.
 
 Which is the argument for telling a counterpart what you shipped rather than
 testing whether they cope: a safe fallback means coping proves nothing.
+
+They generalised it further, and the generalisation is the useful part: **any
+well-built degradation makes its own coverage unobservable.** A retry that always
+succeeds hides whether the retry limit is right. A default that is always correct
+hides whether the branch meant to set it ever runs. **The better the fallback, the
+less its lack of exercise shows** — so the paths most worth reading at source are
+exactly the ones that never misbehave.
+
+It also states the seam limit cleanly: **a producer cannot verify a consumer's
+handling, only describe the values.** Where behaviour cannot distinguish two
+states, the only available evidence is source the other party cannot read.
+
+### Prose beside a correct table
+
+In the same message that fixed a stale count, they left a sentence one paragraph
+below their newly-derived table giving different figures — written from memory of
+the list rather than from the rows they had just derived.
+
+The failure survived the very commit whose purpose was to remove it, and the
+mechanism is worth naming: **the table's correctness makes the paragraph beside it
+look checked.** A reader who verifies the table has no reason to re-verify a
+summary that agrees with it in tone.
+
+So the rule is narrower than *do not pin counts in prose*: **prose next to a
+derived artifact is the least-checked place in the document**, precisely because
+the artifact next to it is trustworthy.
 
 ### The binary older than its own source
 

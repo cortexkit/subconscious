@@ -199,6 +199,7 @@ Before calling a class closed:
 | 112 | You satisfied the rule's *precondition* — did you check its *outcome*? | Signing under the right filename does not produce the right identifier; the input check passes either way |
 | 113 | Why did this spread without anyone noticing? | Ask whether every check that *would* be run passes — a defect invisible to the standard toolchain needs no carelessness to propagate |
 | 114 | Your sweep found two categories — is there a third? | A binary can be pinned, re-signed wrong, or never signed at all; a two-state sweep files the third under the milder label |
+| 115 | Output looks wrong — is the source wrong, or is the binary older than it? | A wrong output does not localise the fault to the source that produced it, and "fixing" correct code is the likely next step |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3580,6 +3581,28 @@ Worth noting what this would have cost: the deployed binary was already correctl
 pinned, so placing the new one would have **moved it from pinned to derived** —
 undoing a fix rather than carrying one. A regression arriving inside a careful
 upgrade.
+
+### The binary older than its own source
+
+A colleague shipped a field that classifies why each entry is degraded, and noted
+that my command-line tool was still matching their prose instead. I went to fix
+that and **found the fix already written** — committed eight days earlier, reading
+the new field directly.
+
+The executable on my path was built **two days before that commit**. A string
+search found zero occurrences of the field name, so it could not have read it
+under any circumstances. Every reading I had taken since was produced by code that
+no longer exists.
+
+This is *merged is not deployed* on my own tooling, which I had spent the evening
+repeating to other people. An operator tool is the easiest place for it to hide,
+because nothing restarts it and nothing reports its version.
+
+The near-miss is the part worth keeping. **I was one step from "fixing" correct
+code because the output looked wrong.** A wrong output does not localise the fault
+to the source that produced it — the code, the build, and the thing on the path
+are three separate claims, and only the first is what you are about to edit.
+Reading the source before changing it is what stopped it.
 
 ### Why it spread without a single error
 

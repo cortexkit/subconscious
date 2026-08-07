@@ -287,6 +287,8 @@ Before calling a class closed:
 | 200 | Agreeing with someone's absence claim — same instrument? | Two people running the same query agree for the same reason; the independent leg is at the source, not the schema |
 | 201 | Reporting a deploy — did the pid move, or did the bytes? | A restart and a deploy are indistinguishable by pid; the digest names the bytes and the inode names which file is executing |
 | 202 | Your mechanism explains the observation — did it occur? | Two mechanisms can produce the same symptoms, and adopting a right fix for a wrong reason buries the reason it was right |
+| 203 | Scraping a shared log — short anchor, and escapes handled? | Interleaved writes cut long patterns and colour escapes break level matches; either alone returns a confident zero |
+| 204 | Detecting a formatting defect? | The detector is written in the same formatting it is inspecting, so it fails the way its subject does |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4952,6 +4954,36 @@ was unsafe for a reason it was not, and will not recognise the reason it is.
 The cheap discriminator was in the shell history: which placement command actually
 ran. **A mechanism that explains the observation is not thereby the mechanism that
 produced it.**
+
+### A shared log under-reports rather than garbles
+
+A colleague measured the fleet's shared log file and found six of their module's ten
+lines **spliced mid-message** by another process's output, the earliest cut landing
+at character 32. Every line kept its prefix and first word contiguous, so short
+anchors survive and long ones do not.
+
+The failure direction is what makes it worth knowing: **the splice does not garble
+visibly, it under-reports silently.** A grep for a full message misses the spliced
+instances and returns *no occurrences* — during an incident that reads as *the
+condition never occurred*. Garbled output gets investigated; a confident zero ends
+the investigation.
+
+They deliberately measured the effect and declined to assert a mechanism. The
+mechanism turned out to be on the daemon side and stronger than the obvious guess:
+the supervisor sets no stream configuration when spawning children, so **every child
+inherits the daemon's own descriptors** — verified live, daemon and module fd1 are
+the same open file. Not several writers to one path but several processes sharing
+one file description, where interleaving is the expected outcome. **Their restraint
+is why anyone went looking**; a plausible story would have closed the question.
+
+And my first detector for it read zero across five modules, which looked like a
+clean refutation. It was the instrument: **the file carries colour escapes**, so a
+pattern matching a log level followed by a space never matched. Dropping the space
+reproduced their six exactly. **A detector for a formatting defect is written in the
+same formatting it is inspecting**, so it fails the way its subject does.
+
+The two constraints compose badly and either alone yields a clean-looking null:
+anchor on a short prefix, and strip or tolerate escapes.
 
 ### Why the position beats the effort
 

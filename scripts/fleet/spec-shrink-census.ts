@@ -83,6 +83,14 @@ for (const row of rows) {
   }
 }
 
+// State the premise the counts rest on. The output looks identical under any
+// floor or any exemption list, so a reader who would disagree with these
+// cannot tell from the numbers that a choice was made at all. Printing them
+// lets someone reject the reasoning without reading the source.
+console.log(
+  `premise: a section is a defect if it kept under ${RETAINED_FLOOR * 100}% ` +
+    `of its previous size, unless its name matches ${CONVERGING.source}`,
+);
 console.log(`campaigns ${campaigns.size}   rounds ${rows.length}`);
 console.log(`\nNORMATIVE sections that lost content (investigate):`);
 console.log(normative.length ? normative.join("\n") : "  none");

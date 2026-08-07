@@ -4161,6 +4161,22 @@ That authority is what stopped either of us asking whether the red was the *righ
 red. **The proxy that feels most like evidence is the one that goes unexamined
 longest.**
 
+Stated generally: **we trust results in proportion to what they cost, and cost is
+uncorrelated with validity.** A free proxy gets doubted immediately; an expensive
+one buys itself a long unexamined run.
+
+Outside testing it is worse, because the effort is **visible to others** — a
+benchmark that took an afternoon, a migration verified by a long manual pass, an
+audit that consumed a day. The social cost of questioning it lands on the
+questioner, so **the more it cost, the more the question looks like an
+accusation.**
+
+Which makes the countermeasure structural rather than cultural: **state what the
+expensive measurement would have shown if it were measuring the wrong thing, at
+the moment of producing it** — while that answer is still cheap to give. The same
+shape as a printed premise: a belief recorded before it becomes expensive to
+revisit.
+
 ### The three questions, and the limit past them
 
 The check settled into three questions, each closing a gap the previous two admit:

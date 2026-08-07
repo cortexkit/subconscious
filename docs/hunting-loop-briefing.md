@@ -438,6 +438,8 @@ Before calling a class closed:
 | 351 | A property that can only be established by consuming the thing | Name it unprovable rather than leaving it as a gap — for a rotating credential a dry run invalidates the copy you hold, so no amount of tooling closes it |
 | 352 | Building a check that reports a value | Prefer one asserting a RELATION between two independently-authored artefacts — a value can go green by measuring the wrong thing, a relation can only pass by holding |
 | 353 | A member your checker cannot examine | Name it and its reason IN THE OUTPUT, and print how many of how many were checked — a checker that silently omits a member is indistinguishable from one that examined it |
+| 354 | A binary-producing repo with an uncommitted lockfile | Source identity no longer implies dependency identity — two builds at the same commit can link different versions, and CI attests a set nobody built against |
+| 355 | A probe that walks source structure | It encodes an assumption about layout the source need not honour — an attribute or macro between two lines is enough to make every reading zero |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

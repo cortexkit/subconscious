@@ -375,6 +375,8 @@ Before calling a class closed:
 | 288 | A justification that is half true | Stickier than a false one — checking it returns a real reason and the reader stops before finding the half that expired |
 | 289 | Sweeping a document rather than code | The vocabulary saturates because the document is about the thing you are searching for; key on a structural target, not a lexical one |
 | 290 | A perfect score from a detector you just wrote | It does not feel like it needs checking, which is the property that makes it worth checking |
+| 291 | "Additive, so consumers can ignore it" | Ask instead whether they COULD read it without changing their transport; unreachable-by-construction is not the same as unread |
+| 292 | A claim about how consumers behave | It is true for the consumers you pictured, and the ones you did not are invisible from the producer side by construction |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5798,6 +5800,38 @@ false when someone adds a third path.
 And the line that connects it to the direction rule: **a perfect score does not feel
 like it needs checking, which is precisely the property that makes it worth checking.**
 The instrument-shaped version of a claim that flatters its author.
+
+Running the structural version on their own published type found sixteen of
+twenty-four optional fields with **no doc comment at all** — and answered the
+where-does-a-reader-stand question better than their prose had. Their consumer
+contract is thorough and lives in *their* repository, while a consumer stands at the
+type and hovers the field. **Careful documentation one repository away from the person
+who needs it is the mint-side failure one layer out.**
+
+A returning consumer then corrected a design claim in the same hour, and the pair is
+the generalisation. They had argued for adding a key beside an existing payload rather
+than a second operation, on the grounds that it is *additive and invisible until a
+consumer chooses to read it*. **That assumed every consumer reads the envelope.** One
+unwraps it in a shared request helper and hands the inner value onward, so
+envelope-level keys are **unreachable by construction rather than merely unread** — and
+the difference is that ignoring a key is revisitable in the code that wants the data,
+while being unable to see one makes adoption a **transport-layer change**, arriving
+exactly when someone urgently needs the field. The question that does not depend on
+current intent: not *do I use this* but **could I, without touching my transport**.
+
+The shape under both: **a claim that is true for the consumers you happened to
+picture.** Neither was a wrong belief about their own code; both were correct
+statements with an unstated population, and **the population is invisible from the
+producer side because every consumer you can think of is one you have already thought
+of.** What surfaced them was someone standing somewhere the author was not — a
+structural detector for one, a consumer returning after three weeks dark for the
+other.
+
+Worth noting the same property here: this repository's envelope unwrapper drops the
+outer object, so a future sibling key would be invisible to every call site rather
+than unread. Harmless while nothing else rides that envelope, and recorded at the
+helper because **widening is a one-line change there and impossible at the call
+sites**.
 
 One hazard from their case is worth separating: **a misread there is not conservative,
 it is lossy.** The natural inference routes away from credit that expires whether or

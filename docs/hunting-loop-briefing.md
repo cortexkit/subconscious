@@ -254,6 +254,8 @@ Before calling a class closed:
 | 167 | Future-proofing a name — did you check the identifier exists? | A name that has never existed fails exactly like one that has gone away, and the guess is never exercised until the rename |
 | 168 | Told your filter misses something — does it? | Verify against the filter before applying the fix; a no-op change reads as a closed gap and retires the caveat that still applies |
 | 169 | Is the standing signal the state, or the state's *direction*? | A gap that grows while a release is pending is a stall; the same gap while releases land is normal work |
+| 170 | Two things are blocked — which one varies? | Hold everything constant but the suspected cause; a probe that differs in two ways separates nothing |
+| 171 | Does the error text match the record's own fields? | An error naming a state the fields contradict is describing something other than what you asked about |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4411,6 +4413,38 @@ And the division of labour is the point: my count is an upper bound because it
 cannot see test-only blocks inside a source file; **they read the hunks and I did
 not, so their reading is authoritative.** Sending the caveat rather than a verdict
 is what made that possible.
+
+### The probe that separated two theories
+
+An owner reported their release pipeline blocked: a run stuck queued for nine
+hours, every push to the main branch minting nothing, and a plausible mechanism —
+the dead run holding the workflow's concurrency slot. They were about to rename the
+concurrency group to route around it, reluctantly committing permanent history for
+a transient failure.
+
+The evidence they had could not distinguish two theories. A successful run on
+another branch was consistent with **both** *the slot is held for this branch* and
+*push delivery is broken*.
+
+The probe that separates them holds everything constant but the trigger: **dispatch
+the same workflow manually on the same branch.** It minted instantly and ran —
+**while the dead run was still sitting queued.** Those states cannot coexist under
+a concurrency block, which either cancels the old run or waits. So the slot was
+never held; the push events were dropped.
+
+The remedy would have failed, and worse, **it would have looked like a considered
+fix.** The rename changes nothing when the block is elsewhere.
+
+Two details worth keeping. **Every cancellation lever refused, and the refusal text
+named a state the record's own fields contradict** — it spoke of a re-run while the
+attempt count was one and the previous-attempt link was null. **An error describing
+a state the fields deny is describing something other than what you asked about**,
+which is why no lever reached it.
+
+And the correction I owed: I had offered *routing beyond the public interface* and
+had none. Everything above used the same tool they had. **What I had was a probe
+they had not run, not access they lacked** — and offering capability you have not
+verified invites someone to stop looking for their own answer.
 
 ### Check the fix, not the person
 

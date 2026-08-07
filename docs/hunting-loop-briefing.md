@@ -417,6 +417,8 @@ Before calling a class closed:
 | 330 | Asking whether a mechanism RAN | Read an event log, not a state value — state answers what is true now, and an idempotent or equal-case path changes nothing on success, so a constant proves only that you cannot see |
 | 331 | A caller map built from design notes or contracts | Derive it from composition instead — a dependency that is specified, tested, and never wired reads as a live caller and is not one |
 | 332 | Relying on a library's cleanup or panic hook | Read what it restores — it knows only what IT set up, so anything you enable after its init is outside its scope; chain your hook ahead of theirs rather than replacing it |
+| 333 | Green was read and the reader was wrong | Ask whether the question has an instrument AT ALL before hardening one — a narrow-but-true gauge needs a reader fix, an absent one needs building, and both present identically |
+| 334 | Adding a gauge | Make its unobserved state distinguishable from its zero state — a fresh gauge reporting 0 converts an absent answer into a confident wrong one |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

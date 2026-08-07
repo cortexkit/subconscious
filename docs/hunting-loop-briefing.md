@@ -267,6 +267,9 @@ Before calling a class closed:
 | 180 | An unfed gauge over-reports — is that harmless? | A freshness gauge that never advances reports the exact signature of the fault it exists to detect |
 | 181 | Widened a scope and found new failures — are they yours? | Check the wider scope on a clean tree first; the instinct is to attribute them to the change in hand |
 | 182 | Does your shell carry variables the program reads? | An inherited variable is invisible in the command you typed, so it explains a failure without appearing in the evidence |
+| 183 | Green suite — immune, or already fixed? | "My tests pass" and "this cannot bite me" are different claims, and only reading the guard separates them |
+| 184 | Diffing two runs — did you strip the clock? | A comparison containing a timestamp always differs, and it manufactures a positive rather than hiding one |
+| 185 | Does the flag's name promise breadth? | "All targets" reads as a superset while excluding a category; count the target kinds rather than trusting the word |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4621,6 +4624,49 @@ whether the line feeding an alarming-but-conservative number is ever reached.
 Their other check is worth copying too: a mutator with five call sites *looked*
 protected by repetition, and they deleted one specifically rather than trusting the
 others. **Redundancy is not coverage; it makes the uncovered site harder to spot.**
+
+### A name that promises breadth
+
+A colleague compared our two test-gate invocations — mine passes a flag whose name
+claims to cover everything — and measured instead of assuming mine was the superset.
+It is not: **that flag silently excludes documentation tests.** Identical compiled
+coverage, minus a whole target kind, behind a word that reads as *more*.
+
+On this workspace it costs nothing, and I verified that rather than taking it: six
+documentation-test targets exist and execute **zero** tests, because the only fenced
+block in the workspace is a wire-layout table marked as plain text.
+
+My first control was invalid, and I caught it only because zero was the answer I
+wanted. I ran their repository with a flag that suppresses the listing entirely,
+got zero where they had measured three, and nearly recorded agreement. **A control
+that agrees with the thing it controls for, for its own reason, is worse than no
+control** — it converts a coincidence into a confirmation.
+
+The general point is theirs: **"widen the scope" invites reaching for the
+widest-sounding option, which is how a name substitutes for a measurement.** Count
+the target kinds.
+
+### Green, or already fixed
+
+The same colleague found the identical environment leak in their own shell — and
+their suite is green anyway. They checked **why** rather than concluding immunity:
+two of their binaries scrub those variables at startup, because this exact class bit
+their harness months earlier.
+
+**"My tests pass" and "this cannot bite me" are different claims**, and only reading
+the guard separates them. Their greenness is a fix someone already paid for; mine
+reddened because my crate has no such scrub.
+
+They then did what my correction was asking for: ran the suite with and without the
+variables and **compared per-binary verdicts**, making the baseline a measured
+result rather than an assumption.
+
+One trap inside that check, and it is the dangerous direction: their first
+comparison diffed raw result lines and reported a difference — **the difference was
+the elapsed-time text.** A comparison containing a clock always differs, so it
+**manufactures a positive**; they would have reported an environment-dependent
+baseline that does not exist. Same family as a file hash changing when only a
+signature moved. Strip non-deterministic fields before diffing.
 
 ### Null before the first look
 

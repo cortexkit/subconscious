@@ -283,6 +283,8 @@ Before calling a class closed:
 | 196 | Third cycle of the same loop — is the loop the only oracle? | Each cycle looks affordable alone, so the cost is visible only in aggregate; a cheap oracle answers questions the loop cannot pose |
 | 197 | Installed a fix — is the thing you invoke the thing you built? | A stale copy earlier in the path leaves the fix live in the repo and absent from the shell |
 | 198 | Which step of this operation has no undo? | It is rarely the interesting one; discarding the recovery arrives as housekeeping after attention has moved on |
+| 199 | Cut durable state — what does a peer cache about it? | An in-memory view of a monotonic quantity outlives the surgery that rewound it, and the refusal names the consumer |
+| 200 | Agreeing with someone's absence claim — same instrument? | Two people running the same query agree for the same reason; the independent leg is at the source, not the schema |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4865,6 +4867,37 @@ dry-run had discovered into a permanent test in their suite. **An oracle that ne
 remembering will be reached past again**, by the same habit, for the same reason —
 so the durable fix is not "use the harness next time" but moving the question into
 something that runs without being chosen.
+
+### Cut state, bounce the consumers
+
+After the seed landed, the next turn failed. Not a fault on either side: the
+consuming gateway keeps a per-conversation counter that only ever advances, so a
+slow response cannot overtake a newer one. Twenty warm-up turns had walked it to
+nine; the surgery legitimately reset the producer's side to one; the seeded response
+arrived truthfully labelled one and was refused as a straggler.
+
+**Both sides were correct, and the unmodelled case is a deliberate out-of-band
+rewind of a quantity that only ever advances** — true of every path except surgery.
+
+The general rule the owner drew is the keeper: **treat "cut durable state" and
+"bounce the consumers of that state" as one operation rather than two.** The
+consumer is not wrong; its in-memory view of a monotonic property outlives the
+surgery that rewound it, so it refuses correctly while looking exactly like the
+fault — and **the failure names the consumer**, which is the misleading direction.
+
+They also declined to special-case the guard to tolerate a rewind, which is right: a
+guard relaxed for an operation that has a human in the loop is relaxed for every
+operation that does not.
+
+One caveat I added by looking. Their reasoning rested on the counter being in memory
+only, checked by finding no table of that name. Their store does carry two persisted
+per-conversation monotonic quantities, both empty for this key — so the fix holds as
+applied, while the general claim is narrower than it reads. **We had both
+absence-checked by table name, which is the same instrument**, so my agreement was
+weak evidence; the independent leg is at their source, reading whether the guard
+touches those tables at all. If it does, a bounce would not clear it and the next
+seeded drive fails identically **with the remedy already applied**, which is the
+expensive shape.
 
 ### Why the position beats the effort
 

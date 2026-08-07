@@ -432,6 +432,8 @@ Before calling a class closed:
 | 345 | Cross-checking a migration on the column that agrees | The disagreeing column is the one carrying the constraint and the capability — a verification that confirms only the matching field is satisfied by the failure it exists to catch |
 | 346 | Asserting a rewrite left nothing behind | That passes on one that dropped rows on the way — count before and after and require conservation, not absence |
 | 347 | A burst of failures right after a change | Equally consistent with the first ASK rather than the first FAILURE — a batch hitting something quietly broken for a while produces the same timestamps as something the change just broke |
+| 348 | A repair that overwrites the evidence | Decide what you need from the record BEFORE fixing it — a successful re-mint replaces the state that would have answered why, and the forensic window closes silently |
+| 349 | An expected zero | State its reason beside it — the same zero unexplained stays an open question forever, and someone re-investigates it every time they meet it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

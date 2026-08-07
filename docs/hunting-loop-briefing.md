@@ -294,6 +294,7 @@ Before calling a class closed:
 | 207 | Verifying a deploy — does your marker discriminate? | Prove it absent from the outgoing binary too; the digest names the bytes but says nothing about what changed |
 | 208 | Is your check general across how the work was done? | A check valid only under one placement style silently stops discriminating under another |
 | 209 | Same measurement, which pass condition? | A deploy wants the artifact moved and a state cycle wants it unchanged; the failure is reading a correct value as the wrong verdict |
+| 210 | Know when a restart is safe — do you know when it stops being safe? | The window is an interval; a mid-operation bounce discards in-memory state and reports as unexplained rather than as a bounce artifact |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4893,6 +4894,18 @@ The general rule the owner drew is the keeper: **treat "cut durable state" and
 consumer is not wrong; its in-memory view of a monotonic property outlives the
 surgery that rewound it, so it refuses correctly while looking exactly like the
 fault — and **the failure names the consumer**, which is the misleading direction.
+
+A later round supplied the other half of the timing. That rule gives a lower bound
+— after the cut — and there is an upper one: **before the next drive starts, never
+mid-drive.** Bouncing between a request and the turn that answers it discards
+in-memory notes the answer depends on, and the result reports as unexplained rather
+than as a bounce artifact, which is the harder failure to attribute. **The safe
+window is an interval, not a deadline.**
+
+Worth recording alongside it *why* such notes live in memory: writing them to disk
+would put a write on the very path whose freedom from writes makes the surrounding
+optimisation safe. **The fragility is a deliberate price**, and without that
+rationale attached the next reader removes it by persisting the note.
 
 They also declined to special-case the guard to tolerate a rewind, which is right: a
 guard relaxed for an operation that has a human in the loop is relaxed for every

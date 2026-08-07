@@ -381,6 +381,8 @@ Before calling a class closed:
 | 294 | Answered a structural question about your own code | The answer can differ BY PATH inside one binary; a seat cannot answer it once for itself |
 | 295 | A zero narrowing count | "We never look" and "we look at everything" are the same number from opposite causes; only one of them is a decision anyone would defend |
 | 296 | Counting what you remember | A forgotten instance is an absence, and a search for what you recall cannot surface it; enumerate the population instead |
+| 297 | Scraping a log written by several processes | Do not anchor at line start; a single-write emitter guarantees a whole line, not a line-anchored one, and `^` silently dropped 8% |
+| 298 | A property about syscalls | Assert over the syscalls, not the output; a passing in-process test proves only that nobody raced, never that a race is survivable |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

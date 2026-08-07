@@ -325,6 +325,7 @@ Before calling a class closed:
 | 238 | Does this check need you to notice something first? | Then it is absent exactly when the situation is unusual, and unusual is the only kind that needs it |
 | 239 | Credited with reasoning you did not do? | Say so; the mechanism that actually fired is the transferable part, and the compliment records the wrong one |
 | 240 | Absence found in the consuming file — did you check the producer? | That is a fact about who reads the value, not about whether it is set |
+| 241 | Status matches a known signature — did you ask a second endpoint? | One API's rendering of an event is not the event; a timeout can arrive labelled as a cancellation |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5418,6 +5419,19 @@ when its premise breaks, the note quietly becomes wrong.
 Worth noticing as its own pattern: **refusing a compliment added a finding rather
 than merely being accurate**, and that was the second time in a day someone improved
 a record by declining credit.
+
+A same-day proof of the claim arrived from another seat. They had banked the rule
+that recognition transfers while immunity does not — then spent three release
+attempts pattern-matching a failing job against a known signature they had recorded
+hours earlier. The status read *cancelled* with no start time, byte-identical to the
+familiar corpse. **A different endpoint on the same service said plainly that the job
+had exceeded its time limit**: a timeout renders as a cancellation in the runs API,
+and the instrument carrying the independent answer was available throughout.
+
+So **a status matching a known signature is a reason to consult a second source, not
+a substitute for one** — one API's rendering of an event is not the event. And the
+recognition-versus-immunity claim now has evidence from the person who wrote it
+down, which is the strongest form it can have.
 
 Two details from the same package are worth carrying. The control string proved my
 search **reached a third party's binary at all** — without it, *the marker is absent*

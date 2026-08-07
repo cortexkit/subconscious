@@ -401,7 +401,8 @@ Before calling a class closed:
 | 314 | A plausible small count | Worse than a zero, because a zero invites a second look and a small non-zero does not — and the most confidence-recruiting output is an accurate one from an instrument blind elsewhere |
 | 315 | `git add -A` in a shared tree | It commits whatever else is uncommitted — another seat's work, or your own from a different thread — under a message that describes neither |
 | 316 | Ruling out one candidate | That is not evidence for another; disproving your own reading of a number leaves every other reading standing |
-| 317 | A reviewer that judges a merged unit | An adjacent good neighbour absorbs a bad one — so the gate is weakest exactly when you are also writing the careful comment beside it |
+| 317 | A reviewer that judges a merged unit | A good neighbour absorbs a bad one once it DOMINATES — one good line still flags, twelve do not, so the gate is weakest exactly where you wrote the most careful explanation |
+| 318 | Two defects found in one instrument | Test whether either can occur alone; assuming one explains the other leaves a second fix untargeted |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

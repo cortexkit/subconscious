@@ -252,6 +252,8 @@ Before calling a class closed:
 | 165 | Are you checking the artifact, or the person who produced it? | A fix arrives with its own validation attached from someone just proven right, so the prior peaks where the artifact is newest |
 | 166 | Does one run report two things that cannot both be true? | The contradiction is the finding; a probe that names a subsystem makes its own failure read as a fact about that subsystem |
 | 167 | Future-proofing a name — did you check the identifier exists? | A name that has never existed fails exactly like one that has gone away, and the guess is never exercised until the rename |
+| 168 | Told your filter misses something — does it? | Verify against the filter before applying the fix; a no-op change reads as a closed gap and retires the caveat that still applies |
+| 169 | Is the standing signal the state, or the state's *direction*? | A gap that grows while a release is pending is a stall; the same gap while releases land is normal work |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4382,6 +4384,33 @@ the executive module"* would have pointed at the lookup instead.
 
 When future-proofing an identifier, **verify the new name against the thing that
 registers it** rather than composing it from the rename plan.
+
+### A suggested fix that was already done
+
+An owner read the diff behind a reported deploy gap, confirmed the changes were
+deliberate, and offered a tuning suggestion: my filter counts a test file it should
+exclude.
+
+I checked before applying it. **The filter already excludes that directory**, the
+named file was dropped before the count, and all eight reported files are genuine
+source. Controlled it rather than asserting the null — with the exclusion eight,
+without it nine — so the pattern demonstrably fires and the count is a fact about
+the tree.
+
+Applying it would have been a no-op that **reads as a closed gap.** Worse, it would
+have retired the wrong caveat: I had handed over two, and the one that actually
+bites their diff is the other one. **A fix aimed at the wrong caveat leaves the
+live one looking addressed.**
+
+The good half of the exchange is theirs. My report was *the gap exists*; their
+signal is **the gap grew without a release landing** — which distinguishes a stall
+from normal work, where the raw state cannot. **Prefer the derivative to the level
+for any standing signal whose healthy value is non-zero.**
+
+And the division of labour is the point: my count is an upper bound because it
+cannot see test-only blocks inside a source file; **they read the hunks and I did
+not, so their reading is authoritative.** Sending the caveat rather than a verdict
+is what made that possible.
 
 ### Check the fix, not the person
 

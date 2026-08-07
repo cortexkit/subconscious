@@ -206,6 +206,8 @@ Before calling a class closed:
 | 119 | Prose beside a correct table — was it derived or recalled? | The table's correctness makes the paragraph look checked, and nothing reads a sentence |
 | 120 | Is every member of this list exact? | One approximate member inside an enumeration inherits the precision of the others, so a reader cannot tell membership from resemblance |
 | 121 | Does the prose claim something the artifact beside it can confirm? | If the artifact answers it, delete the prose; if the prose adds something, make it nameable from the artifact |
+| 122 | Does this reference point into a list that can grow? | "The last three" and "the other two" rot exactly like counts while containing no number, so a digit sweep misses every one |
+| 123 | An index is stale — is anything simply *absent* from it? | A wrong number is a lie a reader can catch; an absent row is a tool they never learn exists |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3677,6 +3679,40 @@ earned.
 
 A hedge in ordinary prose is honest. **A hedge inside an enumeration is a category
 wearing a member's clothes.**
+
+### Positions rot exactly like counts
+
+Having swept my documents for stale counts and fixed one, I treated the class as
+closed. A colleague then broke the same rule an hour after adopting it, in a way
+no count sweep could find: adding a row made *"the last three clear on their
+own"* false, and **there is no number in that sentence.**
+
+Positions and ordinals — *the last three*, *the first two*, *the other one* —
+depend on a list's length and order exactly as counts do, while looking nothing
+like counts. **A sweep for digits and number-words misses every one.** My earlier
+sweep was correct and its scope was narrower than the defect.
+
+The discriminator for the legitimate case: **does the reference point into a list
+that can grow?** *"Those two added together"*, where both are named in the same
+sentence, is fine and verifiable without the artifact.
+
+The general repair is theirs: **a summary that names the artifact's structure
+instead of its contents cannot go stale when the contents change.** Point at the
+column rather than restating it.
+
+### The absent row beneath the stale number
+
+Applying that rule found one in my own repository, and the stale count was the
+small half. A tools index said *"three standing checks"* when there were seven —
+and **four had no row at all.**
+
+The undocumented ones were the newest, which is to say the ones a stranger is
+least likely to know about and most likely to need. **A wrong number is a lie a
+reader can catch. An absent row is a tool they never learn exists.**
+
+So when a stale index turns up, the count is the visible defect and the missing
+entries are the expensive one. Verify by comparing the index against the thing it
+indexes rather than by re-reading it.
 
 ### The binary older than its own source
 

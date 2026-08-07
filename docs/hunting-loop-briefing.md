@@ -229,6 +229,9 @@ Before calling a class closed:
 | 142 | Does your caveat print only when non-zero? | Then a broken detector deletes the line, and a reader cannot notice a line that is not there |
 | 143 | Have you listed this tool's rules one row each? | Reading for "does each rule report" invites yes; a row per rule makes an empty cell unmissable |
 | 144 | A rule did not fire — was it forgotten, or filed under another category? | A rule that exists and feels applied is nastier than an unwritten one, because the category boundary does the forgetting |
+| 145 | Does a broken version of this rule produce the output you were hoping for? | Then it recruits the reader's own preference against detection, and only a refuse-on-examined-nothing guard catches it |
+| 146 | Does your mutation convert the input into the *next* guard's case? | The suite then stays green for a reason unrelated to coverage, and you have built a masked guard while hunting for one |
+| 147 | Where else does this technique apply? | Ask before banking it, not after — the important tool already feels examined, so the habit does not transfer on its own |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3997,6 +4000,55 @@ report something" invites the answer "yes, there are lines". Listing the rules
 forces a row each, and an empty cell is unmissable.** The same reason a table
 finds gaps that prose about the same subject never does — you cannot notice an
 absent paragraph by reading the paragraphs.
+
+### The third failure mode: breakage that looks like success
+
+My keying find turned out to be a category beyond selector and describer. A
+selector's failure **changes** the answer, so you notice. A describer's failure
+**removes a line**. But a rule that pairs records — that decides what gets compared
+to what — fails by finding **nothing**, which is the output everyone is hoping for.
+
+**It recruits the reader's own preference against detection.** I would have read a
+zero as good news.
+
+No counter defends against it, because the counters go to zero too and zero is a
+plausible clean result. The only defence is a **refuse-when-nothing-was-examined**
+guard — which is why that guard is not redundant with a denominator. A counter
+tells you the tool did something; only the refusal tells you it did the *right*
+something.
+
+### Three instruments wrong before one answer
+
+Applying the enumeration to my daemon's config validator produced no code findings
+and three instrument failures, which was the more useful result.
+
+**First**, my extractor returned twenty rules with **every field unparsed and every
+row marked covered.** A uniform verdict across twenty rows is a broken extractor,
+not a clean result — I was matching a key that does not exist in those error
+variants, and the all-clear was produced by the failure to parse anything.
+
+**Second**, keyed on the rules' actual text, four looked uncovered. Two were
+string-matching artefacts. The other two are exercised by a test **named for
+neither of them**, which is the test-name proxy failing — a rule I already had and
+did not apply.
+
+**Third**, my mutation was wrong in a way worth naming. I deleted a
+presence-guard by defaulting the value, which turned the missing case into the
+**empty** case — and the very next guard rejects empty. **My mutation converted the
+input into the next guard's case**, so the suite stayed green for a reason
+unrelated to coverage. A masked-guard mutation, built while hunting masked guards.
+
+### The habit does not transfer on its own
+
+Both of us built this enumeration for a small tool, banked it, and only ran it on
+the checks that actually gate our products after the other reported doing so.
+
+Their diagnosis: **a technique proven on a small tool does not automatically get
+applied to the important one, because the important one already feels examined.**
+It has been looked at more, so it feels covered — while the specific question was
+never asked of it.
+
+**Ask where else the technique applies before banking it, not after.**
 
 ### The category boundary does the forgetting
 

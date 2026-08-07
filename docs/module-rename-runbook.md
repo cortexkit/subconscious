@@ -190,6 +190,14 @@ never examined, because nobody re-derives a number that agrees with them.
    written down from two earlier occurrences without being carried into this
    runbook -- a note that has to be remembered is not a procedure.
 5. Move the directory; apply the identity change; reconcile.
+
+   **A rescan reconciles the module SET; only a restart reconciles the binary.**
+   `supervisor.rescan` diffs which modules exist, so editing an existing
+   module's `program` path reports no change at all — the daemon keeps running
+   the old executable while the config reads new. Every path-derived check then
+   agrees with the config rather than with the process, which is why the inode
+   comparison is load-bearing: it is the only step that reads the running
+   image.
 6. **Verify the minted identifier** before declaring anything, and **verify a
    write commits** rather than only that the module reports healthy. Reads are
    unfenced, so a store that has lost write authority answers every read

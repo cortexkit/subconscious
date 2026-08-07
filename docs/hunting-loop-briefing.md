@@ -329,6 +329,7 @@ Before calling a class closed:
 | 242 | Count and detail disagree — same invocation? | Two calls to a live system are two samples; the contradiction can be between the samples rather than in the system |
 | 243 | Before reading agreement OR disagreement as signal | Establish what actually varied between the two readings; often it is the source or the time rather than the thing measured |
 | 244 | Verified a deploy — has the changed path actually run? | Installed and serving are different claims; drive one real request and read a counter only the durable path moves |
+| 245 | Building a safeguard — does it fire, or does it need noticing? | Prefer conditions that hold without anyone paying attention at the right moment; the right moment is when nobody is |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5418,6 +5419,16 @@ Their sharpening of why: **a check whose operation depends on the operator notic
 something is absent precisely when the situation is unusual** — and unusual is the
 only kind that needs it. The same argument as a test versus a note: the test fails
 when its premise breaks, the note quietly becomes wrong.
+
+A third seat then noticed the same shape in their own rollback condition, which is
+tied to an event rather than a clock — hold until the changed path has actually run.
+**A clock and a hunch fail quietly; a hard rule and an event condition do not.**
+
+And that turns out to be what the entire evening's toolkit converges on: permanent
+contract tests, mechanical ancestry checks, pre-declared expected values, markers
+proven in both directions. **Every durable artifact built today replaces noticing
+with firing.** The ones that failed were the ones asking someone to be alert at the
+right moment, and the right moment is reliably when nobody is.
 
 Worth noticing as its own pattern: **refusing a compliment added a finding rather
 than merely being accurate**, and that was the second time in a day someone improved

@@ -3066,8 +3066,14 @@ mod jitter_tests {
     use super::jittered_health_delay;
     use std::{collections::HashSet, time::Duration};
 
-    /// The module ids supervised in production, so the dispersal claim is about
-    /// the fleet that actually runs rather than about invented names.
+    /// Module ids drawn from a real fleet, so the dispersal claim is about names
+    /// that actually occur rather than invented ones.
+    ///
+    /// This is a SAMPLE, not a registry: the property under test is that distinct
+    /// ids disperse, which holds for any set of distinct strings. Several entries
+    /// are already historical (modules get renamed), and that costs nothing here --
+    /// but it means a reader must not mistake this for the live module set, and a
+    /// rename sweep will match it without there being anything to change.
     const FLEET: [&str; 14] = [
         "aft",
         "alfonso-core",

@@ -297,6 +297,8 @@ Before calling a class closed:
 | 210 | Know when a restart is safe — do you know when it stops being safe? | The window is an interval; a mid-operation bounce discards in-memory state and reports as unexplained rather than as a bounce artifact |
 | 211 | Deployed identity supplied by config — what does the binary default to? | A harness launching it directly gets the compiled name, and a test asserting that name passes while testing what production does not use |
 | 212 | One case exempted and its siblings not — deliberate? | The asymmetry is evidence; a shared exemption reason that describes all of them explains none of the difference |
+| 213 | Claiming one case covers another — same code path, or similar failure? | Check whether the consumer can distinguish them; identity is a fact about the code, similarity is an argument |
+| 214 | Would this test require building a capability you would not otherwise keep? | The cost is not the run, it is that the capability then exists |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5081,6 +5083,43 @@ replaced.**
 And if the difference is deliberate, the reason belongs *in* the exemption string. A
 shared justification across cases that are not being treated alike documents none of
 them.
+
+### The window that could not be held
+
+A colleague asked me to restart their module inside the gap between two requests —
+the one case all day where a mid-operation restart was the thing under test rather
+than a hazard. They planned to hold the gap open by simply not driving.
+
+Then they measured it and stood the whole thing down: **both requests were written
+in the same second**, inside one invocation, so the gap closes in well under a
+second and cannot be held at all. The plan's central assumption was wrong, and
+**measuring found it before it cost either of us a run** rather than the run failing
+and being misattributed.
+
+The honest entry they proposed is the right one: record the leg as not drivable by
+hand, with the measurement, rather than marking it passed on the argument that
+another leg covers its failure mode. **A leg marked passed on an argument is worse
+than one marked unreached**, because the ledger stops distinguishing what was proven
+from what was reasoned, and the next reader inherits the reasoning as a result.
+
+Their coverage claim does have a checkable form, which is worth reaching for before
+settling for an argument: it holds exactly if **the consumer cannot distinguish
+absent-because-lost from absent-because-never-written.** If the lookup is a plain
+presence check, the two are the same path and the other leg exercises it by
+identity; if anything distinguishes them, it does not. One read of the source
+converts the claim from an argument into a fact.
+
+On the other side, the only mechanism I had for hitting a sub-second window was
+teaching my supervisor to kill a module on observing a particular frame. Declined,
+for the same reason they declined to add a pause to a live gateway: **the cost is
+not the test, it is that the capability then exists** in the daemon permanently.
+
+One loose end worth not losing. Their original pre-declaration named the *surviving*
+note as the alarming outcome, since it would mean the value reaches disk somewhere
+unknown. They have since seen it survive twice — but both times without a restart,
+which is the ordinary path and says nothing about persistence. **That hypothesis is
+still open rather than resolved**, and two ordinary observations should not be
+allowed to quietly read as evidence against it.
 
 ### Why the position beats the effort
 

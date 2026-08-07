@@ -448,6 +448,9 @@ Before calling a class closed:
 | 361 | A measurement that mutates what it measures | Restore the measured state; do not adopt the mutated one — both leave you with a valid artifact, which is what makes it easy to ship the mutation under the measurement's commit message |
 | 362 | An enumeration anchored on what you expect to find | It can only confirm, never surprise — read the collection's END rather than a range located from a marker, or a later member stays invisible however often you re-run it |
 | 363 | A file hash across a signing or packaging step | Wrong instrument — the bytes change by construction; verify content by distinctive strings BEFORE the step, and identity by inode after |
+| 364 | Fixing a policy in the file you were looking at | Enumerate every invocation of the operation across the whole repo instead — checking what you believe confirms the part you already fixed and stops |
+| 365 | A repo whose CI calls both a gate script and the tool directly | It can be HALF-enforced, and a grep sees only the direct half — the count is wrong in an unknown direction, so enumerate per repo before quoting a number |
+| 366 | A run-anyway guard on a step that follows a gate | Correct alone, and with a missing enforcement flag it lets the later step pass against exactly what the gate rejected — a green specific result printed under a red general one |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

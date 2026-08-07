@@ -4264,6 +4264,18 @@ operational form instead: **when you write a rule down, the next action is to as
 someone else to run it on your code.** Running it on your own is the version that
 feels sufficient and demonstrably is not.
 
+**Calibration, so that count is not read as evidence of unusual rigour.**
+Everything either of us produced that evening was *cheap to question*: no result
+cost an afternoon, nothing was staked on being right, and neither of us had to
+spend standing to ask. Those are the conditions that make the outside view work —
+and by the self-sealing property above, **they disappear exactly when the stakes
+rise.**
+
+One behavioural condition is worth naming alongside them: **neither of us ever
+defended.** Not one exchange was spent establishing that a finding was wrong before
+checking it. The measurement always came first, and every time it agreed with the
+person who was not looking at their own code.
+
 ### The habit does not transfer on its own
 
 Both of us built this enumeration for a small tool, banked it, and only ran it on

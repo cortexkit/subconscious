@@ -83,9 +83,24 @@ round-trip that touches no external token), and treat the first real write as th
 boundary. The point is not to hold writes off; it is that both parties should know
 which side of the line they are on when they call it good.
 
-**Verify a key by fingerprint against an anchor the data itself carries**, never by
-observing that an item exists at the new location. Existence is satisfied by anything
-— including a fresh item created by a half-applied migration.
+**Existence is not identity.** Verify a key by fingerprint against an anchor the data
+itself carries, never by observing that an item exists at the new location — and the
+same instrument as verifying a deployed binary by the running image's inode rather
+than by a file with the right name sitting at the path. Both are cases where **the
+cheap observation is satisfied by the exact failure it is meant to catch**: a freshly
+bootstrapped keychain item and a stale binary each pass an existence test and fail an
+identity test.
+
+**Move state through the shipped code path, not a bespoke one.** Two properties fall
+out of it that a hand-written copy cannot claim: the derivation runs in the same code
+the daemon will use, so a scope cannot be typed into existence; and the write keeps
+its real semantics, so it cannot silently clobber something a half-applied attempt
+already put at the destination. Check whether the destination is occupied before
+writing rather than assuming the copy is into emptiness.
+
+**Carry the pending slot as well as the current one.** A two-phase handover leaves an
+unpromoted successor behind after a crash — an empty one costs a check, a dropped one
+converts a recoverable pending rotation into a lost key.
 
 **Record what every observable should read, before and after.** Include changes
 you expect from *unrelated* work landing in the same window. A confound that hides

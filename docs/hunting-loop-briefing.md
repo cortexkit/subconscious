@@ -379,6 +379,8 @@ Before calling a class closed:
 | 292 | A claim about how consumers behave | It is true for the consumers you pictured, and the ones you did not are invisible from the producer side by construction |
 | 293 | Answering a canvass with a constraint | State what would have to change for the answer to flip; a bare "no, by construction" is inert and rots, because nothing ever prompts a review |
 | 294 | Answered a structural question about your own code | The answer can differ BY PATH inside one binary; a seat cannot answer it once for itself |
+| 295 | A zero narrowing count | "We never look" and "we look at everything" are the same number from opposite causes; only one of them is a decision anyone would defend |
+| 296 | Counting what you remember | A forgotten instance is an absence, and a search for what you recall cannot surface it; enumerate the population instead |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5868,6 +5870,26 @@ path in question and false of another in the same file, which makes the rule **a
 cannot answer this question once for itself.** The same holds here — the daemon's data
 plane never deserializes a body at all, its control plane decodes into typed enums,
 and the gateway has two layers. Three answers, one repository.
+
+One of those three answers needs its own clause, and the consumer supplied it: **a
+zero that means "we never look" and a zero that means "we look at everything" are the
+same number from opposite causes**, and the question cannot tell them apart. The
+router's zero is the first kind — additive fields survive because routing reads only
+the header and treats the body as opaque, which is a **performance property, not a
+permission**. A lax parser's zero is a decision someone would defend; this one is a
+decision never made, so **a future reason to inspect a body would convert a
+wire-transparent path into a filtering one and nobody would call it a contract
+change**. Recorded at the type with that clause, which is the size-of-the-change rule
+applied to a property that looks like it needs no clause precisely because it is
+already maximally permissive.
+
+A smaller asymmetry from the same pair of counts, and it decides which method to use.
+My miscount was a **real call that happened to sit in a test** — it appeared in the
+search and had to be examined. Theirs, had it been wrong, would have been an
+**absence**: a decode they had forgotten about, and **a search for what you remember
+cannot surface what you forgot**. They only caught it by enumerating rather than
+recalling, which is the same reason the enumeration beat both detector settings
+earlier.
 
 Their account of why they overstated is worth more than the correction. **The
 flattery was self-directed:** *unreachable by construction* describes a clean

@@ -383,6 +383,8 @@ Before calling a class closed:
 | 296 | Counting what you remember | A forgotten instance is an absence, and a search for what you recall cannot surface it; enumerate the population instead |
 | 297 | Scraping a log written by several processes | Do not anchor at line start; a single-write emitter guarantees a whole line, not a line-anchored one, and `^` silently dropped 8% |
 | 298 | A property about syscalls | Assert over the syscalls, not the output; a passing in-process test proves only that nobody raced, never that a race is survivable |
+| 299 | A change applied outside the file under test | Verify it took effect before reading the result — a patch stanza, lockfile, mutation script or heredoc that silently no-ops produces the success case exactly |
+| 300 | A fixture built from a healthy example | Dense is what everyone writes by default, and a dense fixture cannot test tolerance of sparseness |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5775,6 +5777,16 @@ there because someone standing on the other side put it there, not because the o
 anticipated them; the same mechanism as the cross-repo messages above. What remained
 was the residue: the document was right and the *field itself* said nothing, so an
 author reading the type rather than the design note got no warning.
+
+Four instances in one day gave that class a general form, and it is worth stating
+separately because the earlier members looked unrelated. Two mutations that never
+applied, a shell-escaping failure, and a dependency patch stanza cargo declined to use
+— the last caught only because a full suite passing against a changed dependency felt
+too smooth, with the tell in a warning above the output and in the resolved metadata,
+neither of which anyone reads when the result agrees with them. **When a change is
+applied outside the file under test — a patch stanza, a lockfile, a mutation script, a
+heredoc — verify it took effect before reading the result**, because the result cannot
+distinguish *applied and passed* from *never applied*.
 
 Turning that into an enumeration is what makes it operable, and their run of it is
 the best worked example of the day. A proximity detector scored **every optional field

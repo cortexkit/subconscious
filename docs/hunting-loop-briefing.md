@@ -247,6 +247,7 @@ Before calling a class closed:
 | 160 | A rule returned a null here — does this codebase have its precondition? | A null from a codebase that lacks the precondition tests nothing; the rule was never exposed |
 | 161 | A guard is deliberately absent on one path — where is the reason recorded? | If it lives at the call sites, a third caller reads a guard with no sign that skipping it is ever correct |
 | 162 | Which definition does the next caller open *first*? | Documenting an exemption on the opt-in helper documents it for the person who already found it |
+| 163 | You closed a documentation trap — was anyone in it? | A latent trap is worth closing, but reporting it as a live defect is a different and false claim |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4307,6 +4308,27 @@ Checking my own fix against that, it failed the same way one level over. The
 rationale now sits on the capping function, but the bypassing handler is reached
 without passing through it — and there the omission reads as *nobody considered the
 cap* rather than as a decision. Noted at the bypass site too.
+
+### Was anyone in the trap
+
+Both of us then checked whether the missing documentation had actually caught
+anyone, rather than stopping at the fix. Neither had.
+
+Their enumeration: 53 files, four production callers of the exempt path, three
+opting into the guard and the fourth correctly not needing it. Mine: 51 files,
+three production callers of the uncapped path, all of them wanting the uncapped
+value — **zero callers that would want the cap and silently miss it.**
+
+So both gaps were **latent, not live** — traps for the next caller rather than
+defects in the current ones. Worth closing, and worth reporting as what they are:
+**a latent trap and a live defect are different claims**, and stating the second
+when you have the first is the same error as calling a prophylactic fix a proven
+one.
+
+One corollary about rules, from the pair of subtle violations above: **a rule's
+value is not measured by what it catches on the day it is written.** The crude
+instances are caught by the rule as first stated; the subtle ones only become
+visible once it has been sharpened, which cannot happen before it exists.
 
 ### Write a rule down, then hand it to someone else
 

@@ -429,6 +429,9 @@ Before calling a class closed:
 | 342 | Two instruments disagreeing | That is one instrument plus a hypothesis — add instruments until every disagreement is explained, rather than explaining the first one you see |
 | 343 | A path resolved through a fallback chain | Break each branch INDEPENDENTLY — either alone still passes, so a partial fix is indistinguishable from a complete one and fails only for whoever takes the other branch |
 | 344 | Sizing a migration or a fix off a row count | Size it off what the affected party CANNOT DO — a correct count of rows in a stale state overstates the damage wherever something resolves across it, and the inflated number then sets the blast radius |
+| 345 | Cross-checking a migration on the column that agrees | The disagreeing column is the one carrying the constraint and the capability — a verification that confirms only the matching field is satisfied by the failure it exists to catch |
+| 346 | Asserting a rewrite left nothing behind | That passes on one that dropped rows on the way — count before and after and require conservation, not absence |
+| 347 | A burst of failures right after a change | Equally consistent with the first ASK rather than the first FAILURE — a batch hitting something quietly broken for a while produces the same timestamps as something the change just broke |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

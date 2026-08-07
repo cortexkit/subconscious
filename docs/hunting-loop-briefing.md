@@ -319,6 +319,8 @@ Before calling a class closed:
 | 232 | Asserting a property another repo owns? | Say so in the test; it can regress from a change you never see, and a reader will otherwise think it tests yours |
 | 233 | Two parties confirmed it — or one party twice? | Trace each to its source; correlated confirmations read as corroboration and carry one claim's worth of evidence |
 | 234 | Same commit, or same compilation? | A matching build identifier proves the deployed bytes are the validated bytes; equal source leaves room for a different toolchain |
+| 235 | Auditable, or independent? | A record makes one source checkable against itself; only a second source can be wrong in a different way |
+| 236 | Took a backup — did you verify the copy? | The operation reporting success is not the artifact being correct, and a rollback you cannot verify is one you do not have |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5358,6 +5360,23 @@ the **same build identifier** as the binary that had passed validation on the te
 rig, differing only in signing identity. **Same commit leaves room for a different
 toolchain or feature set; a matching build identifier means it is the same
 compilation.**
+
+The relaying seat then drew the distinction that refines the whole rule. Their
+approval had not been chat prose they paraphrased — it came through a durable
+decision surface with named options and a stated default of leaving production
+alone, so the wording approved is on record. Their own framing: **that does not make
+it two legs, it makes one leg auditable, which is a different property.**
+
+Worth holding both halves. An auditable claim can be checked against its own record,
+which rules out the drift I was actually guarding against; **an independent claim can
+be wrong in a different way**, and no amount of rigour inside one source produces a
+second one.
+
+Two details from the same package are worth carrying. The control string proved my
+search **reached a third party's binary at all** — without it, *the marker is absent*
+and *my search finds nothing anywhere* are the same observation, which is exactly
+what had fooled me that morning. And the rollback copies were digest-verified after
+copying rather than trusted: **a rollback you cannot verify is one you do not have.**
 
 ### The repair that would have made a test measure the wrong thing
 

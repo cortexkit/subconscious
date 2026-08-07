@@ -221,6 +221,8 @@ Before calling a class closed:
 | 134 | Are you assuming every file a fix touched was defective? | A fix commit carries helpers, tests and unrelated corrections, so the file list is not the measurement |
 | 135 | Does your tool print the premise its results rest on? | The one thing a reader cannot infer from the output is the assumption that produced it, and identical numbers follow from any rule |
 | 136 | Is this the first time you have swept for this? | A codebase with neither the defect nor a control cannot verify its own sweep, so the first run is the least trustworthy |
+| 137 | Can your stated premise disagree with the code? | A premise that can disagree is worse than none — a reader who checks it is checking a claim rather than the rule |
+| 138 | Borrowing a control from another codebase? | It proves the detector *can* fire, not that it fires on your idiom; pair it with the multi-spelling check |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3918,6 +3920,28 @@ Derive the printed line from the constants rather than transcribing it beside
 them, and check that changing the constant changes the line — otherwise the
 premise becomes prose beside a derived artifact, which is its own rot.
 
+We both wrote that defect while fixing the other one. Their premise was a
+hardcoded sentence beside the pattern it described; mine named two commands in
+prose beside the commands themselves. **A premise that can disagree with the code
+is worse than no premise**, because it carries the authority of an explicit
+statement — a reader who checks it is checking a claim rather than the rule.
+
+The repair in both cases was to read the line **out of** the thing it describes,
+and the verification is ten seconds: change the underlying value, confirm the
+printed line moves. That is the same operation as mutating a test to prove it can
+fail, **applied to a description rather than an assertion.**
+
+Better still where the shape allows: a tool that **prints both halves of its
+partition** states its premise without describing it. A derived premise can still
+be derived from the wrong thing; **a structural one cannot be wrong without the
+result being wrong too.**
+
+One thing the audit made obvious: all four of my tools had their premise in a
+source comment, which is not four oversights but one belief — **that writing an
+assumption down somewhere is the same as making it available.** A comment is
+reachable only by someone who already suspects the tool, which is exactly the
+state a printed premise exists to induce.
+
 ### The first sweep is the least trustworthy
 
 One uncomfortable corollary of borrowing controls from history: **a codebase with
@@ -3931,6 +3955,16 @@ neither the defect nor the evidence that your detector can find it.
 The converse is the useful half: a repository that has fixed a class of bug is
 better equipped to sweep for it than one that never had it. **The history of being
 wrong is the instrument.**
+
+And the dead end dissolves once you notice **the control need not come from the
+codebase under test.** Another repository's fixed defects are usable as controls
+for your own sweeps, which makes the library shared rather than per-repository.
+
+With one limit worth carrying: **a borrowed control proves the detector can fire,
+not that it fires on your idiom.** If your code expresses the same defect
+differently, a detector validated elsewhere still returns an unfalsifiable zero
+here. The multi-spelling check is the complement, and the two together are
+stronger than either.
 
 ### The name is not the property
 

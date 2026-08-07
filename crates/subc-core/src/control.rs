@@ -1830,6 +1830,10 @@ impl ControlHandler {
                         "health.check RPC returned a non-health response",
                     )?]);
                 };
+                // Metrics go out whole here. The supervisor's cached snapshot
+                // caps this blob (see truncate_health_metrics), and this path
+                // exists precisely to answer without that cap -- so applying it
+                // here would leave no way to see what the cached view drops.
                 let HealthReport {
                     status,
                     detail,

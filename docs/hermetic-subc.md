@@ -50,9 +50,18 @@ Inside that directory the daemon creates `subc-connection.json` and
 written there, and the daemon has **no durable state of its own** — no store, no
 data directory, nothing to migrate or back up.
 
-Whether `$XDG_DATA_HOME` must pre-exist was not established: the failing run above
-died before reaching storage resolution. Create it anyway; a module that opens a
-store under it will need it regardless.
+**`$XDG_DATA_HOME` need not exist, and the daemon never creates it.** Measured
+directly rather than inferred: a daemon configured with a `data_home` pointing at a
+non-existent directory starts normally and does not create it. The reason is in the
+resolver — subc only ever *formats a path string* into the storage descriptor it
+hands each module in `HELLO_ACK`, and never touches the filesystem. So **the
+directory is the module's problem, not the daemon's**, and a bad `data_home` fails at
+the first module that opens a store rather than at boot.
+
+Create it anyway in a container. The point of measuring was to know which component
+fails and when: with modules configured, an unwritable `data_home` surfaces as a
+module that spawns and then dies, which reads as a broken module rather than a
+misconfigured path.
 
 ## Spawn order
 

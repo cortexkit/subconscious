@@ -303,6 +303,8 @@ Before calling a class closed:
 | 216 | Registration observed — does it prove the prerequisite was met? | A component that registers and then dies on a missing requirement looks identical at that instant; sample after the check, not before |
 | 217 | Is this check about the path or about the object? | Following and refusing to follow are both correct somewhere; the defect is an unstated intent, not a missing flag |
 | 218 | Did the wrong method and the right one agree? | Agreement is what let the wrong one survive — a disagreement would have exposed it in seconds |
+| 219 | Could this check have come out the other way on this input? | If not, the agreement carries no information, and the method is about to be reused as though it did |
+| 220 | Is this check correct by what it asks, or by what happens to be on disk? | A leased correctness lapses with no line changing, so no diff review can catch it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5092,6 +5094,14 @@ they ask — and a deploy path that became a link would report the link's timest
 a stale binary behind a fresh link reads as current. Fixed, with a control proving
 the flag changes the answer when a link is actually present.
 
+Their extension of that is the useful half: **the check's correctness is leased from
+a property of today's tree**, and the things that make the lease lapse — a path
+becoming a link, a build switching to hardlinked artifacts, a cache moving — are all
+normal changes nobody would flag as touching a check. **The lease lapses without a
+single line changing**, so no diff review can catch it. The only cheap mitigation is
+to state the dependency where the check lives, so the next reader can at least see
+what it is renting.
+
 The colleague's own sweep found the **opposite polarity**, which is what settles the
 rule. Their eight symlink-sensitive sites all deliberately refuse to follow — an
 output that is a link is rejected outright — so *always follow* would be exactly
@@ -5122,6 +5132,16 @@ points — and pairs it with a negative control, because **"it survived" is comp
 with a harness that passes regardless** until you have watched the same probe report
 death when the requirement is genuinely unmet.
 
+That suggests a standing test for any measurement: **could this have come out the
+other way on this input?** If the derivation is incapable of producing a different
+verdict here, the agreement carries no information — the same emptiness as a control
+that cannot fail. Applied to their own next claim it survived, but only after they
+read the daemon source and confirmed the catalog reports what a module *claimed*
+rather than what the config asked for; had the daemon echoed its own configuration,
+the check would have agreed regardless. **The claim was never unsound, it was
+ungrounded** — and an ungrounded true claim cannot be defended when challenged, so it
+gets abandoned or merely reasserted.
+
 Their explanation for why the bad probe lasted is the part to keep. **The wrong probe
 and the right one returned the same verdict.** Storage does arrive; the conclusion was
 true both times. Had the invalid route produced a wrong answer it would have been
@@ -5130,6 +5150,14 @@ precisely what protected the broken derivation from scrutiny.** That is the seco
 instance of the same pairing within an hour, alongside the symlink identity above,
 which makes *true conclusion shielding bad method* the most reliable way a flawed
 approach survives here.
+
+And it does not merely survive — **it gets promoted.** A method that agrees once is
+reused, and every later agreement adds confidence without adding evidence, so the
+bad derivation accumulates apparent support until it becomes the shape of a
+permanent test. They were one step from making that probe the actual fixture, where
+it would have shipped as a green that agrees forever. **The countermeasure has to
+fire at first use**, because every subsequent opportunity to catch it is one where
+the method looks more proven than it did before.
 
 ### An exemption that covers some siblings and not others
 

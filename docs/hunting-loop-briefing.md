@@ -243,6 +243,7 @@ Before calling a class closed:
 | 156 | Is this output read *relative* to something a probe can move? | A line against a file, a count against a corpus, a time against a run — record the belief and it survives the shift |
 | 157 | Which of your proxies cost effort to produce? | That one carries the authority of work spent and goes unexamined longest |
 | 158 | Just wrote a rule down — who is running it on your code? | Running it on your own is the version that feels sufficient and demonstrably is not |
+| 159 | You measured rather than recalled — did you control the result? | A measurement with no control is a recollection with better typography |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4176,6 +4177,16 @@ expensive measurement would have shown if it were measuring the wrong thing, at
 the moment of producing it** — while that answer is still cheap to give. The same
 shape as a printed premise: a belief recorded before it becomes expensive to
 revisit.
+
+It also inverts the timing problem. **The question is free before the effort is
+spent and expensive afterwards**, so ask it while it is still free and record the
+answer. That gives a later questioner something to point at which is not a person
+— they are checking a stated condition rather than doubting someone's day.
+
+The sharpest form of the hazard: **the outside view is exactly what an expensive
+measurement prices out.** The result most in need of an independent check is the
+one that most effectively prevents it. This exchange worked partly because nothing
+either of us produced cost enough to make the question rude.
 
 ### The three questions, and the limit past them
 

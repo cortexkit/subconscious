@@ -318,7 +318,7 @@ Before calling a class closed:
 | 231 | Policy change broke a test — can it still construct its own precondition? | The obvious repair turns a failing test green while it measures a different path, destroying the only signal |
 | 232 | Asserting a property another repo owns? | Say so in the test; it can regress from a change you never see, and a reader will otherwise think it tests yours |
 | 233 | Two parties confirmed it — or one party twice? | Trace each to its source; correlated confirmations read as corroboration and carry one claim's worth of evidence |
-| 234 | Same commit, or same compilation? | A matching build identifier proves the deployed bytes are the validated bytes; equal source leaves room for a different toolchain |
+| 234 | Same commit, or same compilation? | A build identifier compared against the artifact you staged proves same compilation; without that artifact in hand it is linker-assigned and degrades to a marker check |
 | 235 | Auditable, or independent? | A record makes one source checkable against itself; only a second source can be wrong in a different way |
 | 236 | Offering your record as a reason to skip someone's check? | That is a careful process talking itself out of the only leg that could catch it |
 | 237 | Took a backup — did you verify the copy? | The operation reporting success is not the artifact being correct, and a rollback you cannot verify is one you do not have |
@@ -340,6 +340,8 @@ Before calling a class closed:
 | 253 | Pinning a reference commit — reachable, or first-parent? | Reachable includes every branch tip ever merged; the tree may be a state the main line was never in, and it builds and tests green |
 | 254 | Your evidence and theirs agree — can either see the review verdict? | Build evidence and ancestry are both blind to "this was rejected", which only the owner holds |
 | 255 | Holding a rule you can justify | A justification makes the rule negotiable in the moment; the version that fires is the one held as a commitment |
+| 256 | Banking a technique | Put its precondition in the same sentence, never a footnote; a footnote is what gets dropped when the technique is recalled in a hurry |
+| 257 | Named a backstop — does it cover every consequence? | It can cover the diagnosis and not the remediation; ask notice what, not only what would notice |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5388,11 +5390,16 @@ digests, carried the correct signing identity, and shipped a marker string prove
 string present in both — which is what distinguishes *the new bytes are absent* from
 *my search does not work*.
 
-One provenance claim in that package is worth copying: the deployed artifact carried
-the **same build identifier** as the binary that had passed validation on the test
-rig, differing only in signing identity. **Same commit leaves room for a different
-toolchain or feature set; a matching build identifier means it is the same
-compilation.**
+One provenance claim in that package is worth copying, stated with its precondition
+rather than beside it: **compared against the staged artifact still in hand**, a
+matching build identifier means the deployed bytes are the same compilation — where
+equal source would leave room for a different toolchain or feature set. Its owner
+supplied the limit and it belongs in the same breath as the technique: the identifier
+is linker-assigned, so it answers *is this the artifact I staged* rather than *was
+this built from commit X*, and **without the staged file to compare against it
+degrades to the marker check it was meant to beat**. The strong form is tempting
+exactly where it does not hold, because losing the staged artifact is when you most
+want a strong claim.
 
 The relaying seat then drew the distinction that refines the whole rule. Their
 approval had not been chat prose they paraphrased — it came through a durable
@@ -5638,7 +5645,25 @@ the wrong reason, without ever establishing the backstop exists.
 Hence the sharpened form: **the thing that notices must not be the thing that failed.**
 Two signals descending from one underlying failure are fine if they travel
 independently; a noticer downstream of the failure it is meant to catch is not a
-backstop at all.
+backstop at all — and that is the shape which feels safest to write, because it
+usually sits right next to the call.
+
+Three backstop shapes are worth naming, since *what would notice* is far easier to
+answer against a list than from scratch: **control flow** (a fallback chain funnels
+failure into a value the caller acts on), **an independent signal** (the same
+underlying failure surfaces by a path that does not depend on this call), and **a
+counter plus a reclaim path** (the failure is recorded and the state it would have
+released is recovered anyway). The list does something none of the three say on their
+own: **optional enrichment matches none of them by construction**, because the data it
+adds is the only evidence it ran. The audit becomes a lookup with one residual
+category, and the residual category is the defect class.
+
+One refinement its author added while I was writing it up: *what would notice* needs
+the follow-up **notice what**. Their independent signal covers the diagnosis — the
+failure still reaches the wire honestly — and not the remediation, since the discarded
+report is also what retires a dead record. **A backstop can cover one consequence of a
+failure and not another**, and naming the shape is not the same as bounding what it
+covers.
 
 One remedy worth copying, because the instinct is wrong: **skip the call when its
 precondition is absent rather than logging its failure.** Logging fixes the observer's

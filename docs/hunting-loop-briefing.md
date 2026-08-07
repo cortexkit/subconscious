@@ -353,6 +353,8 @@ Before calling a class closed:
 | 266 | Relaying a severity you later narrow | Correct it as promptly as you raised it; an overstated finding that is quietly revised turns an accepted cost into a design conversation |
 | 267 | A comment asserting how another component behaves | Your repo cannot verify or re-check it; state your side's property instead, or it goes stale where nobody who could see it will read it |
 | 268 | A zero from a file you named | Confirm the file is the right target before reading absence as a finding; a control proves the instrument works, not that it was aimed correctly |
+| 269 | A zero from a query keyed on a field | The existence check cannot help — the target is right and the key is wrong; that one needs the positive control |
+| 270 | Scoped a sweep to where you expect the problem | You keyed on your own guess; widen to where the shape can occur and keep a control |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5493,6 +5495,14 @@ substitution one level down. What saved it was confirming the file existed befor
 believing the zero: since it did, the zero could not mean *absent*, only *wrong
 target*. **A positive control proves the instrument works; this proves it was aimed
 correctly**, and the two catch different failures.
+
+They bounded it precisely when it went into this document, which is the reason to
+trust it: the existence check works **only when the target is a file**, because a
+stat answers a different question than the search. It does nothing for a query keyed
+on the wrong *field* — there the target exists and the key is wrong, and only a
+positive control catches that. Neither subsumes the other, and the case that
+motivated it needed the second because the first would have passed: a working search,
+over a file that exists, for a string genuinely not in it.
 
 Its recipient placed it in the vacuity family as the mirror of a rule already banked
 there. We had the empty case — a filter returning nothing must be proven capable of

@@ -289,6 +289,8 @@ Before calling a class closed:
 | 202 | Your mechanism explains the observation — did it occur? | Two mechanisms can produce the same symptoms, and adopting a right fix for a wrong reason buries the reason it was right |
 | 203 | Scraping a shared log — short anchor, and escapes handled? | Interleaved writes cut long patterns and colour escapes break level matches; either alone returns a confident zero |
 | 204 | Detecting a formatting defect? | The detector is written in the same formatting it is inspecting, so it fails the way its subject does |
+| 205 | Measured the earliest X — or the earliest X you searched for? | The true boundary can precede your marker, and the error lands in the unsafe direction |
+| 206 | Is that bound a floor or a sample? | A plausible integer gets written down and reused, where a null would have invited a second look |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4959,8 +4961,8 @@ produced it.**
 
 A colleague measured the fleet's shared log file and found six of their module's ten
 lines **spliced mid-message** by another process's output, the earliest cut landing
-at character 32. Every line kept its prefix and first word contiguous, so short
-anchors survive and long ones do not.
+at character 28 — verified independently. Every line kept its prefix and first word
+contiguous, so short anchors survive and long ones do not.
 
 The failure direction is what makes it worth knowing: **the splice does not garble
 visibly, it under-reports silently.** A grep for a full message misses the spliced
@@ -4984,6 +4986,23 @@ same formatting it is inspecting**, so it fails the way its subject does.
 
 The two constraints compose badly and either alone yields a clean-looking null:
 anchor on a short prefix, and strip or tolerate escapes.
+
+The escapes then produced a second, opposite error. Their first bound was 32,
+measured by finding the earliest foreign **timestamp** — but the escape precedes the
+timestamp by four bytes, so the first foreign byte lands earlier than the first
+foreign thing they looked for. True earliest: 28, off in the unsafe direction.
+
+**Same cause, opposite symptoms: escapes gave me a confident null and gave them a
+confident number** — and their framing of which is worse is right. A null invites a
+second look; **a plausible integer gets written down and reused.** I would have
+recorded 32 on their authority, and a pattern sized against it can be cut.
+
+The rule that survives is the one that does not depend on the number: **anchor as
+short as uniqueness allows.** Their measured bound is a sample — ten lines, one
+process pair, splices landing at arbitrary write boundaries — so treat it as
+evidence that *short* means shorter than people expect, not as a budget to spend
+down to. **A measured bound is not a floor**, and the difference matters most to
+whoever sizes something against it later.
 
 ### Why the position beats the effort
 

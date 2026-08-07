@@ -2462,19 +2462,42 @@ fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConn
 }
 
 fn connection_file_candidates(override_path: Option<&Path>) -> Vec<PathBuf> {
+    connection_file_candidates_with(
+        override_path,
+        non_empty_os_var("SUBC_CONNECTION_FILE").map(PathBuf::from),
+    )
+}
+
+/// The candidate list, with the environment-named path passed in rather than read.
+///
+/// Taking it as a parameter is what makes the exclusivity rule below testable:
+/// reading it here would force a test to mutate the process environment, which
+/// races under threaded test execution.
+fn connection_file_candidates_with(
+    override_path: Option<&Path>,
+    env_named: Option<PathBuf>,
+) -> Vec<PathBuf> {
     if let Some(path) = override_path {
         return vec![path.to_path_buf()];
     }
 
-    let mut candidates = Vec::new();
-    // Honour SUBC_CONNECTION_FILE ahead of discovery. Someone who sets it has
-    // named the daemon they mean; silently ignoring it and auto-discovering a
-    // different one turns a stated intent into a mutation against the wrong
-    // target that still reports success. `--subc` still wins, since an explicit
-    // flag beats an inherited environment.
-    if let Some(from_env) = non_empty_os_var("SUBC_CONNECTION_FILE") {
-        push_unique(&mut candidates, PathBuf::from(from_env));
+    // SUBC_CONNECTION_FILE names the daemon the caller means, so it is EXCLUSIVE
+    // rather than first-in-a-list. It used to be pushed ahead of the discovery
+    // candidates, which reads as honouring it and is not: a path that is set and
+    // wrong falls through to discovery and answers from whichever daemon is found
+    // -- in practice production. The reply is then true and about the wrong
+    // machine, and every later verdict inherits that while the operator believes
+    // they are reading a rig.
+    //
+    // A fallback is only a hazard where the primary is optional, so removing the
+    // fallback for a deliberately supplied value removes the class. Returning a
+    // single candidate keeps the existing error path: the file is stat-ed, and an
+    // unreadable one is reported as a failure naming that path.
+    if let Some(only) = env_named {
+        return vec![only];
     }
+
+    let mut candidates = Vec::new();
     if let Some(runtime_dir) = non_empty_os_var("XDG_RUNTIME_DIR") {
         push_unique(
             &mut candidates,
@@ -2889,6 +2912,33 @@ mod tests {
                 "{class} names something a person can fix"
             );
         }
+    }
+
+    /// A connection file named in the environment must be the ONLY candidate.
+    ///
+    /// It used to be pushed ahead of the discovery paths, which reads as honouring
+    /// it and is not: a path that is set and wrong falls through and answers from
+    /// whichever daemon discovery finds, in practice production. The reply is then
+    /// true and about the wrong machine. This cost a real operation, where a
+    /// mistyped rig path reported a production module as healthy one step before a
+    /// stop command.
+    #[test]
+    fn an_environment_named_connection_file_is_the_only_candidate() {
+        let named = PathBuf::from("/rig/x.json");
+        let candidates = connection_file_candidates_with(None, Some(named.clone()));
+        assert_eq!(
+            candidates,
+            vec![named],
+            "a named connection file must not be followed by discovery paths"
+        );
+
+        // Absence must still produce candidates, or discovery could never run and
+        // the assertion above would hold for the wrong reason.
+        let discovered = connection_file_candidates_with(None, None);
+        assert!(
+            discovered.len() > 1,
+            "without a named file, discovery must offer several candidates"
+        );
     }
 
     /// A stored health record must disclose its age, because the surface is read

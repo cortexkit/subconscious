@@ -473,7 +473,10 @@ while read -r modid binname; do
     printed=1
     continue
   fi
-  if ! bin_epoch=$(stat -f '%m' "$BIN/$binname" 2>/dev/null) || [ -z "$bin_epoch" ]; then
+  # -L deliberately: this asks when the BINARY was built, not when a path to it was
+  # created. Without it a deploy path that is a symlink reports the link's own
+  # timestamp, so a stale binary behind a fresh link reads as current.
+  if ! bin_epoch=$(stat -Lf '%m' "$BIN/$binname" 2>/dev/null) || [ -z "$bin_epoch" ]; then
     echo "  $modid: cannot stat $binname -- UNCHECKED, not current"
     printed=1
     continue
@@ -606,7 +609,7 @@ EOF
 # mcp shim or a client SDK moves subconscious HEAD without touching the daemon.
 subc_dir="$HOME/Work/Projects/CortexKit/subconscious"
 if [ -d "$subc_dir/.git" ] && [ -f "$BIN/ck-subc" ]; then
-  d_bin=$(stat -f '%m' "$BIN/ck-subc" 2>/dev/null)
+  d_bin=$(stat -Lf '%m' "$BIN/ck-subc" 2>/dev/null)
   d_head=$(cd "$subc_dir" && git log -1 --format='%ct' 2>/dev/null)
   if [ -n "$d_bin" ] && [ -n "$d_head" ]; then
     d_gap=$(( (d_head - d_bin) / 3600 ))
@@ -687,7 +690,7 @@ for f in "$BIN"/*; do
   fi
   d="$HOME/Work/Projects/CortexKit/$owner"
   h=$(cd "$d" && git log -1 --format='%ct' 2>/dev/null) || continue
-  m=$(stat -f '%m' "$f" 2>/dev/null) || continue
+  m=$(stat -Lf '%m' "$f" 2>/dev/null) || continue
   g=$(( (h - m) / 3600 ))
   [ "$g" -ge 24 ] || continue
   printf '  %-24s %sh behind %s master (not a supervised module -- check if still wanted)\n' "$b" "$g" "$owner"

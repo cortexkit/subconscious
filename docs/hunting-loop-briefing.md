@@ -335,6 +335,10 @@ Before calling a class closed:
 | 248 | A red gate for hours — has anything landed on top of it? | Every commit after the first failure inherits an unverified base, and cancelled runs make the count look smaller than it is |
 | 249 | Pinning a set of repos — does anything build each member? | Hashing proves authorship, never mutual compatibility; a member nobody builds has an unfalsified pin rather than a verified one |
 | 250 | A committed lock file with a path dependency | The lock records the sibling's tree at lock time, so the pin is really a pair and unexplained lock churn may not be yours |
+| 251 | A best-effort call whose result is discarded | Permanent failure and success-finding-nothing are identical; ask what would notice its absence, and check origin against credential |
+| 252 | Sweep came back clean — audited, or precondition absent? | The second is not a finding about the code; say which, or a structural gap reads as a passing grade |
+| 253 | Pinning a reference commit — reachable, or first-parent? | Reachable includes every branch tip ever merged; the tree may be a state the main line was never in, and it builds and tests green |
+| 254 | Your evidence and theirs agree — can either see the review verdict? | Build evidence and ancestry are both blind to "this was rejected", which only the owner holds |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5618,6 +5622,27 @@ One limit worth stating when answering a question like this: I could establish t
 candidate revision is an ancestor of the shipped line and that it builds, and I could
 **not** establish whether its own owner knows of a defect in it. Build evidence,
 ancestry, and the owner's knowledge are three legs, and any two leave a gap.
+
+That caution paid immediately, and against my own answer. **My ancestry check was
+wrong.** Both candidates were worker branch tips rather than main-line commits, and
+an ancestry test cannot tell the difference: it answers *is this reachable from the
+main line*, which I read as *is this a state the main line was ever in*. Every commit
+on every merged branch is reachable. The right check in a repository that lands work
+through review merges is **first-parent membership**, which I ran afterwards and
+which separates them cleanly.
+
+The two candidates were not academic failures. One was **the exact tree the reviewer
+rejected** — the next commit exists because their mutation check found the
+load-bearing wiring had zero observers. The other was **missing a half that had
+already merged**, three minutes earlier, absent from the branch tip because the
+branch predated it. **Both would have built and passed all five contract tests**, so
+the colleague's build evidence was correct and could not have caught either.
+
+The shape to keep: **reachable is not shipped**, and the failure is silent because a
+branch tip compiles, tests green, and looks exactly like a released state. Two legs
+agreed here and the third was the one that mattered — build evidence and ancestry are
+both structurally blind to *this was reviewed and rejected*, which only the owner
+holds.
 
 ### Why the position beats the effort
 

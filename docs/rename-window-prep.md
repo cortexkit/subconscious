@@ -143,6 +143,14 @@ chain integrity, and the mint/revoke round-trip, none of which touch provider to
 off; a reason for both parties to know which side of the line they are on when they
 call it good.
 
+The boundary is **any divergent write, not only a refresh** — a login, a mint or an
+invalidate through the running daemon diverges the stores too. The mint/revoke check
+is deliberately self-cancelling so record state matches the old copy afterwards, but
+the **audit chain grows two entries either way**. That does not invalidate rollback:
+rolling back loses those two entries and nothing else, which is a clean loss rather
+than a corrupt one. Written down so nobody discovers it mid-rollback and wonders
+whether the chain is broken. It will not be.
+
 The key move is **in-process**, not an operator copy: the resolver's backend exposes
 slot load/store keyed by data dir, so the material moves from the old scope to the new
 through the typed path that enforces slot semantics, never landing in a shell, a file,

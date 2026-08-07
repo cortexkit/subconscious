@@ -273,7 +273,7 @@ Before calling a class closed:
 | 186 | Is your immunity structural or defensive? | Structural immunity is one refactor from evaporating, and the guard it would then need lives somewhere the new code never reaches |
 | 187 | Is the subject of your evidence the subject of your claim? | A category mismatch inside your own sentence is a cheaper trigger than doubt, and it does not require suspecting the result |
 | 188 | Just told someone you avoid a hazard — do you? | Stating a constraint is the moment to check you obey it, and the claim will otherwise be true only of the code you were looking at |
-| 189 | Did you enumerate by the operation, or by the instance in hand? | A search shaped by the case you already have cannot surface the others, and it returns a confident clean |
+| 189 | Did you enumerate every operation that touches the state, or only the one you were defending? | Searching for the operation that closes a window cannot find the one that opens it |
 | 190 | Which defect did you notice, and which announces itself? | The loud one costs minutes; the silent one costs a wrong value nobody re-derives — noticing is not severity |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
@@ -4704,7 +4704,12 @@ by **the variable they already knew about**; mine by **the operation I happened 
 be defending** — I searched only for removals, and the four assignments turned out
 to matter more, since the race window opens at the assignment. Both conclusions
 held, and **held because we re-derived them rather than because the first pass was
-sound.** Enumerate by the operation class, never by the instance in hand.
+sound.**
+
+The rule is sharper than *enumerate by operation*, and it was theirs to sharpen: a
+race needs a writer and a remover, so **searching only for the remover finds the
+half that closes the window.** Enumerate every operation that touches the state, not
+the one you happen to be defending.
 
 Their severity ranking corrected mine, and the reasoning generalises past this case.
 I had been treating the identity leak as the serious one **because it cost me ten

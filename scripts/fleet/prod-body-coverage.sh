@@ -70,9 +70,13 @@ while IFS= read -r f; do
   done < <(grep -n '#\[cfg(test)\]' "$f" 2>/dev/null)
 done < <(grep -rl '#\[cfg(test)\]' "$root" --include='*.rs' 2>/dev/null)
 
+# Printed every run, zero included. This count DESCRIBES the corpus rather than
+# selecting from it, so if the detector above breaks, every other number stays
+# identical and only this line changes -- and a line that prints solely when
+# non-zero simply disappears. A reader cannot notice a line that is not there.
+echo
+echo "$item_level test-only item(s) carry the attribute with no module after it."
 if [ "$item_level" -gt 0 ]; then
-  echo
-  echo "$item_level test-only item(s) carry the attribute with no module after it."
   echo "Those sit inside the production body under either anchor. A sweep that"
   echo "finds what it wants in one of them reports a false clean."
 fi

@@ -468,8 +468,10 @@ Before calling a class closed:
 | 381 | A comment documenting a LIMITATION | Worse than one documenting behaviour — it does not merely mislead, it ARGUES AGAINST THE FIX, so anyone who wonders finds an authoritative-sounding answer and stops |
 | 382 | Reporting a DIRECTION from a diff | The sides are encoded positionally and position is the first thing lost in the retelling — query each side by name and print both labelled readings, so they cannot be transposed |
 | 383 | Data placed beside a binary that did not ship with it | Ask whether the RUNNING build would accept it — strict parsing makes new data binary-forward, and no hash or inode check asks this |
-| 384 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 385 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 384 | A design two reviewers agreed on | Review checks whether the MECHANISM is sound; only running it twice checks whether it answers the QUESTION YOU HAVE — a correct instrument pointed at the wrong property survives any amount of reviewing |
+| 385 | A new gauge motivated by an incident | Ask what it would have reported DURING that incident — one line, and it kills a wrong axis before it is built |
+| 386 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 387 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

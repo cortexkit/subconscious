@@ -79,15 +79,40 @@ for d in */; do
     printf 'DEAD REMOTE   %-24s %6s commits  -> %s\n' "$name" "$commits" "$url"
     dead=$((dead+1)); continue
   fi
-  # Reachable. Ahead of upstream is a weaker problem but still unprotected work.
+  # Reachable. Ahead of upstream means work exists only here -- and that is ALL
+  # it means. The state has several causes: a push that failed, a push that was
+  # never attempted, work held behind a test gate, and work held because the
+  # owner was authorised to integrate locally but not to publish. Two of those
+  # four turned up in one sweep, both reported by this tool as if the first cause
+  # were established.
+  #
+  # So the label says AHEAD rather than UNPUSHED, and the line names no cause.
+  # Only the owner can supply one; from outside, a deliberate hold and a stranded
+  # push are the same two commits. Reporting the cause you went looking for is a
+  # guess wearing a finding's clothes, and it arrives with enough true context
+  # around it to be believed rather than checked.
   # shellcheck disable=SC2086 # the probe is a fixed word list, not user input
   ahead=$(git -C "$d" $AHEAD_PROBE 2>/dev/null || echo 0)
   if [ "${ahead:-0}" -gt 0 ]; then
-    printf 'UNPUSHED      %-24s %6s ahead\n' "$name" "$ahead"
+    printf 'AHEAD         %-24s %6s commits local-only  (cause unknown: ask the owner)\n' "$name" "$ahead"
     stale=$((stale+1))
   fi
 done
 
   echo
-  echo "examined: $examined repos   dead remotes: $dead   no remote: $none   unpushed: $stale"
-  [ $((dead+none+stale)) -eq 0 ] && echo "every repo has a reachable remote and nothing local-only"
+  echo "examined: $examined repos   dead remotes: $dead   no remote: $none   ahead: $stale"
+  if [ $((dead+none+stale)) -eq 0 ]; then
+    echo "every repo has a reachable remote and nothing local-only"
+  fi
+
+# Exit 0 whether or not there were findings; 2 is the refusal above, when the
+# probe could not succeed anywhere and no result would have meant anything.
+#
+# Until now the last line was a bare `[ ... ] && echo`, so the script's status
+# was that test's -- clean exited 0 and any finding exited 1. That is a
+# defensible convention and it was never chosen: it fell out of which command
+# happened to be last, so appending one line would have silently changed what
+# the exit code meant. A finding here is also not a failure: these are states
+# for a human to ask about, not errors, and the one condition that genuinely
+# invalidates the run already exits 2.
+exit 0

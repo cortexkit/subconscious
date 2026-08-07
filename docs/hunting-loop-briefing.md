@@ -333,6 +333,8 @@ Before calling a class closed:
 | 246 | Asserting a count — is the count the property? | A count is a proxy shaped by the platform you wrote it on, and it disagrees with the property where the code is right |
 | 247 | Restoring after a mutation — does the restore reach only the mutation? | A checkout reverts the repair too; back up the file first and restore from that |
 | 248 | A red gate for hours — has anything landed on top of it? | Every commit after the first failure inherits an unverified base, and cancelled runs make the count look smaller than it is |
+| 249 | Pinning a set of repos — does anything build each member? | Hashing proves authorship, never mutual compatibility; a member nobody builds has an unfalsified pin rather than a verified one |
+| 250 | A committed lock file with a path dependency | The lock records the sibling's tree at lock time, so the pin is really a pair and unexplained lock churn may not be yours |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5585,6 +5587,37 @@ along with the mutant** — the repair was uncommitted, so the restore reached f
 than the thing it was undoing. Redone with a file copy taken before mutating. **A
 restore must reach the mutation and nothing else**, and a working tree with genuine
 uncommitted work is exactly where a version-control restore fails that test.
+
+### A pin that was never asked the question
+
+A colleague building a cross-repo contract test discovered their reviewed pin set does
+not compile. The reviewed sibling predates its own adaptation to a protocol change by
+two days, so the pinned pair predates compatibility. **Nothing had ever built that
+repository**: the pipeline checks it out at the reviewed revision and records its
+provenance, which proves the bytes are the reviewed ones and says nothing about
+whether they work with the rest of the set. Five siblings get built somewhere; this
+one only ever got hashed.
+
+The generalisation is worth more than the fix. **A pin set is a claim about mutual
+compatibility, and hashing each member verifies none of it.** The check that would
+falsify it is a build, so a member nobody builds has a pin that is **unfalsified
+rather than verified** — and in a green pipeline those render identically. It is the
+leased-correctness shape at its strongest, because the lease had never been tested
+even once.
+
+Their supporting measurement is the part to copy. They found a dependency present in
+the sibling's committed lock and absent when resolved against the reviewed tree, and
+dating it from my side settled it: that dependency entered my repository two days
+**after** the reviewed revision. So the lock is a **fingerprint of the sibling's tree
+at lock time** — path dependencies pull one repository's transitive set into the
+other's lock, which means such a pin is really a pin on a *pair*, bounded below by
+the protocol break and above by whenever the neighbour's dependencies move. Neither
+boundary is visible from either repository's history alone.
+
+One limit worth stating when answering a question like this: I could establish that a
+candidate revision is an ancestor of the shipped line and that it builds, and I could
+**not** establish whether its own owner knows of a defect in it. Build evidence,
+ancestry, and the owner's knowledge are three legs, and any two leave a gap.
 
 ### Why the position beats the effort
 

@@ -285,6 +285,8 @@ Before calling a class closed:
 | 198 | Which step of this operation has no undo? | It is rarely the interesting one; discarding the recovery arrives as housekeeping after attention has moved on |
 | 199 | Cut durable state — what does a peer cache about it? | An in-memory view of a monotonic quantity outlives the surgery that rewound it, and the refusal names the consumer |
 | 200 | Agreeing with someone's absence claim — same instrument? | Two people running the same query agree for the same reason; the independent leg is at the source, not the schema |
+| 201 | Reporting a deploy — did the pid move, or did the bytes? | A restart and a deploy are indistinguishable by pid; the digest names the bytes and the inode names which file is executing |
+| 202 | Your mechanism explains the observation — did it occur? | Two mechanisms can produce the same symptoms, and adopting a right fix for a wrong reason buries the reason it was right |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4898,6 +4900,58 @@ weak evidence; the independent leg is at their source, reading whether the guard
 touches those tables at all. If it does, a bounce would not clear it and the next
 seeded drive fails identically **with the remedy already applied**, which is the
 expensive shape.
+
+### A restart and a deploy are indistinguishable by pid
+
+Mid-swap, a colleague measured the rig module and flagged it: the process id had
+moved but the artifact digest had not. **The observable state at that instant was
+the exact shape of a completed deploy**, and reporting it as done was one step away.
+
+Their discriminator is the keeper. **A moved pid proves a process died; it says
+nothing about which bytes came back.** The digest names the bytes, and the inode
+names whether the running process is executing the file at the deploy path. Together
+they separate three states that pid alone cannot: not swapped (disk old),
+swapped-but-not-restarted (disk new, running inode still the old file), and done
+(disk new, running inode equal to the path's).
+
+Note the direction: **a mid-flight window that is indistinguishable from done fails
+toward done**, and the cost lands on whoever acts next rather than on the operator.
+Here the next actor would have hit the identical failure that prompted the fix and
+spent real time deciding whether the fix was wrong, when it had simply not arrived.
+
+What made the exchange cheap was framing as much as content: they sent a measurement
+carrying its own caveat — *if the swap is still in flight, ignore this* — rather than
+a verdict. **A measurement with its error bars attached costs the recipient one
+command; a verdict costs them an argument.**
+
+Also worth pinning: on any binary that gets re-signed, **the whole-file digest is not
+a stable identity** — ad-hoc signing rewrites it while the build's embedded UUID
+carries through. Verify the running image's UUID, not only the digest on disk.
+
+### The right amendment for the wrong reason
+
+The same colleague then proposed a placement change, reasoning that copying over a
+file in place reuses its inode and therefore destroys the inode check's power.
+
+The mechanism is real — measured, same inode before and after. **It is not what
+happened.** The placement had removed the file first, which mints a new inode, and
+the observed inode did move. The state measured was not *placed-but-not-restarted*
+but *before placement*: the module was stopped and the copy had not yet landed, so
+old bytes and old inode were both correct together. **Two mechanisms produce the
+same triple of symptoms, and we picked the wrong one.**
+
+The amendment is still right, for a different defect: removing first leaves a window
+where the deploy path **does not exist at all**, so anything that executes during it
+fails with a missing file rather than with either version. Copy to a temporary name
+and rename is atomic, keeps the new inode, and closes that window.
+
+So it was adopted with the rationale corrected. **Banking a right fix under a wrong
+reason buries the reason it was right** — the next reader concludes the old approach
+was unsafe for a reason it was not, and will not recognise the reason it is.
+
+The cheap discriminator was in the shell history: which placement command actually
+ran. **A mechanism that explains the observation is not thereby the mechanism that
+produced it.**
 
 ### Why the position beats the effort
 

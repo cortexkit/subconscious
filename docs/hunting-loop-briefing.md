@@ -328,6 +328,7 @@ Before calling a class closed:
 | 241 | Status matches a known signature — did you ask a second endpoint? | One API's rendering of an event is not the event; a timeout can arrive labelled as a cancellation |
 | 242 | Count and detail disagree — same invocation? | Two calls to a live system are two samples; the contradiction can be between the samples rather than in the system |
 | 243 | Before reading agreement OR disagreement as signal | Establish what actually varied between the two readings; often it is the source or the time rather than the thing measured |
+| 244 | Verified a deploy — has the changed path actually run? | Installed and serving are different claims; drive one real request and read a counter only the durable path moves |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5455,6 +5456,23 @@ and between them they bracket the class:
 **Before treating agreement or disagreement as signal, establish what actually varied
 between the two readings.** Often it is the source or the clock rather than the thing
 being measured.
+
+The window itself then closed cleanly, and the closing evidence is the part worth
+copying. The owner did not stop at *the new binary is installed* — they drove one
+real request through production and read a counter that **only the durable store
+moves** on a resolve. **A module can report installed and still fail on first contact
+with real state**; a health surface agreeing with itself cannot distinguish those.
+
+They also declined to release the rollback, on the grounds that production had not
+yet exercised the specific path the change alters. **Until that path runs live,
+"verified" means "verified on the rig"** — and holding a rollback you do not need is
+cheaper than releasing one you do.
+
+Their framing of the difference from the morning's swap is the one to keep: that one
+had a single check, so catching a mid-flight instant that looked like completion was
+**luck riding on a habit**. In the evening window every check had a pre-declared
+expected value, so there was nothing left to notice in the moment — which is the same
+property as a rule that fires without requiring attention.
 
 Two details from the same package are worth carrying. The control string proved my
 search **reached a third party's binary at all** — without it, *the marker is absent*

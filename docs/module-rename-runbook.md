@@ -164,16 +164,44 @@ never examined, because nobody re-derives a number that agrees with them.
    flag on the reader changes that — a read-write open creates the sidecars but
    leaves the main file byte-identical. A complete copy reads the same either way;
    only an incomplete one diverges.
-4. Move the directory; apply the identity change; reconcile.
-5. **Verify the minted identifier** before declaring anything.
-6. **Restart the resident** so it re-binds to the real path. This step is not
+4. **Pre-seed the single-writer lease before the module's first open under the new
+   name.** The counter that guards the store lives in a *file* named by a hash of
+   the module id; the value it must beat lives in a *row inside the database*,
+   keyed on nothing. So a new name mints a fresh counter starting at zero against
+   a store still demanding the epoch the old name accumulated over its lifetime.
+
+   The store then serves reads and refuses every write, permanently. Restarting
+   adds one per attempt, so it cannot catch up -- measured here at 4 against a
+   required 174, and that gap only grows with the store's age.
+
+   With the module stopped and the lease file unheld: read the epoch from the
+   fence row, then write that number into the new name's lease file. First open
+   claims epoch+1, which beats every writer the database has ever had.
+
+   Seed the lease *up*; do not lower the row. Lowering it leaves any pre-rename
+   copy -- including the rollback target, still holding the old epoch -- able to
+   fence the live store from the other direction later.
+
+   **This is the step most likely to be skipped, because its failure arrives
+   minutes later and does not look like a rename problem.** Reads keep working,
+   so health is green and callers succeed; only writes fail, so credentials serve
+   until individual tokens need refreshing and then fail one at a time with the
+   cause several steps upstream. It cost a live outage here, and it had been
+   written down from two earlier occurrences without being carried into this
+   runbook -- a note that has to be remembered is not a procedure.
+5. Move the directory; apply the identity change; reconcile.
+6. **Verify the minted identifier** before declaring anything, and **verify a
+   write commits** rather than only that the module reports healthy. Reads are
+   unfenced, so a store that has lost write authority answers every read
+   normally. Mint and revoke something, then confirm the fence row advanced.
+7. **Restart the resident** so it re-binds to the real path. This step is not
    optional and not reorderable: a session's project root is captured at start and
    is *not* re-resolved per call, so a session that has not restarted is still
    bound to the old path however the new one reads. Confirmed the hard way — a
    resident acted before restarting, and every command was refused at a
    precondition on the bound root, including one using only absolute paths with no
    working-directory reference.
-7. **Remove the link, then have the resident act.** Do not verify by comparing
+8. **Remove the link, then have the resident act.** Do not verify by comparing
    path strings: a working directory is stored by the kernel as an inode, so a
    process reading it through the system call always sees the resolved path, while
    a shell hands back the logical path it remembered. Which string appears depends
@@ -193,8 +221,17 @@ never examined, because nobody re-derives a number that agrees with them.
    correctly. Remove it before that is true and a healed system goes back to
    broken.
 
-Steps 6 and 7 are the ones that get dropped. A resident left running through a
+Steps 7 and 8 are the ones that get dropped. A resident left running through a
 rename works today and breaks whenever someone tidies up.
+
+Reading a store during any of this: use `mode=ro` on a **live** database and
+`immutable=1` only on a **stopped** one. The immutable flag cannot write, which
+is why it is right for a rollback target -- but it also ignores the write-ahead
+sidecar, so against a running store it returns a pre-write snapshot confidently
+and without erroring. Measured here on one file at one instant: it said 174
+while a read-only open said 175, with 189 KB of committed data in the sidecar
+that the first could not see. The property that makes it safe on a stopped store
+is the same property that makes it wrong on a live one.
 
 ## Placing a signed binary
 

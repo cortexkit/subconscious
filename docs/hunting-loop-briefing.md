@@ -232,6 +232,9 @@ Before calling a class closed:
 | 145 | Does a broken version of this rule produce the output you were hoping for? | Then it recruits the reader's own preference against detection, and only a refuse-on-examined-nothing guard catches it |
 | 146 | Does your mutation convert the input into the *next* guard's case? | The suite then stays green for a reason unrelated to coverage, and you have built a masked guard while hunting for one |
 | 147 | Where else does this technique apply? | Ask before banking it, not after — the important tool already feels examined, so the habit does not transfer on its own |
+| 148 | Does your assertion pin the *rule*, or just the error kind? | If every rule returns one kind, a neighbour's refusal satisfies the assertion and the mutation stays green |
+| 149 | Is the answer uniform across every row? | Uniformity is as suspicious as emptiness — twenty rows all "covered" is a parse failure wearing a verdict |
+| 150 | Restoring a file after a probe — is anything uncommitted in it? | A restore-after-probe is indistinguishable from a restore-after-mutation, and one of them is meant to discard work |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4037,6 +4040,52 @@ presence-guard by defaulting the value, which turned the missing case into the
 **empty** case — and the very next guard rejects empty. **My mutation converted the
 input into the next guard's case**, so the suite stayed green for a reason
 unrelated to coverage. A masked-guard mutation, built while hunting masked guards.
+
+### Pin the rule, not the error kind
+
+My masked mutation had a mirror on the assertion side, and fixing one exposed the
+other.
+
+Every rule in that validator returns the **same error kind**, and the tests
+asserted only the kind. So when my mutation turned the missing case into the empty
+case, the neighbouring rule refused it and the assertion was satisfied — by a
+different rule than the one the test is named for.
+
+The assertions now pin the message. The same mutation reddens, and **the failure
+names the neighbour that absorbed it** rather than merely reporting a mismatch.
+
+Their version was on the fixture side: an input that overran a limit by 20% also
+tripped a second rule sitting beside it, so a search-the-findings assertion would
+have passed on the neighbour alone. Fixed by overrunning **by one**, so the rule
+under test is the sole explanation.
+
+**Same defect, two surfaces** — the input can wander into a neighbouring rule's
+domain, or the assertion can be broad enough to accept a neighbour's answer.
+
+Which completes a trio: **detection proves a rule fires, a must-not-fire case
+proves it discriminates, and isolation proves it was *this* rule that fired.**
+Missing any one leaves a test that passes for a reason other than the one in its
+name.
+
+### Uniformity is as suspicious as emptiness
+
+Worth pairing with the absurd-zero rule. My broken extractor did not return
+nothing — it returned **twenty rows, every one marked covered**, and that read as
+reassurance rather than as a fault.
+
+**Twenty identical verdicts is a parse failure wearing a verdict.** An empty result
+at least looks like an absence; a uniform one looks like a finding. So the tell is
+not only *did this return nothing* but **did it return the same thing every time.**
+
+### A restore that discards a fix
+
+One procedural hazard from the same hour: they used a temporary probe to inspect a
+value, then restored the file from version control — which reverted **an
+uncommitted fix** along with the probe.
+
+**A restore-after-probe is indistinguishable from a restore-after-mutation, and
+one of them is meant to discard work.** They caught it only because a later sweep
+flagged the test they had just fixed.
 
 ### The habit does not transfer on its own
 

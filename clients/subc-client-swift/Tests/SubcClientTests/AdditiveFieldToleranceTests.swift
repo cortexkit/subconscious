@@ -110,4 +110,21 @@ final class AdditiveFieldToleranceTests: XCTestCase {
         XCTAssertEqual(row.consultId, "consult_1")
         XCTAssertEqual(row.consultClass, "spec")
     }
+
+    /// The producer has always sent `callerSession`; this type had no property for
+    /// it, so every row decoded with the field silently discarded and consult
+    /// lists could not be attributed to an agent. Tolerating unknown fields is
+    /// what let that persist, so the tolerance test above cannot also cover it.
+    func testConsultRowCarriesCallerSession() throws {
+        let row = try decode(ConsultRow.self, withUnknownFields([
+            "consultId": "consult_1",
+            "callerSession": "ses_abc123",
+        ]))
+        XCTAssertEqual(row.callerSession, "ses_abc123")
+
+        let unattributed = try decode(ConsultRow.self, withUnknownFields([
+            "consultId": "consult_2",
+        ]))
+        XCTAssertNil(unattributed.callerSession)
+    }
 }

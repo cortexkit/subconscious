@@ -315,6 +315,8 @@ Before calling a class closed:
 | 228 | Guard proven to refuse — is it proven not to over-match? | A guard that captures too much passes every positive assertion while reserving names nobody intended |
 | 229 | Counting from a run — did the run finish? | An aborted run yields a truncated count, and a small number reads as a finding about the population rather than about the run |
 | 230 | Gate covers everything — by design, or by property of the invocation? | Coverage established by passing is not coverage established by counting; name the populations and count them |
+| 231 | Policy change broke a test — can it still construct its own precondition? | The obvious repair turns a failing test green while it measures a different path, destroying the only signal |
+| 232 | Asserting a property another repo owns? | Say so in the test; it can regress from a change you never see, and a reader will otherwise think it tests yours |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5315,6 +5317,44 @@ replaced.**
 And if the difference is deliberate, the reason belongs *in* the exemption string. A
 shared justification across cases that are not being treated alike documents none of
 them.
+
+The owner checked and the difference was deliberate, but not for the reason I
+guessed: the enabled one has its sibling repository checked out and the other two do
+not, so lifting their gate produces a job that fails on a missing dependency. **I
+predicted the consequence and would have prescribed the wrong fix** — flakiness
+argues for leaving them off, a missing checkout argues for adding it. The repaired
+exemption strings now name each file's specific missing dependency, which is what
+lets someone who was not there re-evaluate them.
+
+Running them locally then found the real cost: two of the three **failed**. A serving
+policy had changed — replies over an untrusted binding are text-only — and the tests
+still read the structured sidecar. The data was correct throughout; only the
+expectation was stale. So the test driving two subsystems together was not merely
+unrun, **it was broken, and being unrun is what let it stay broken.**
+
+### The repair that would have made a test measure the wrong thing
+
+One of those tests read a large binary file expecting to exceed a size cap. Under the
+new text-only policy that read returns a short summary, so **the over-cap path is no
+longer reachable at all** — and the obvious repair, teaching the test the new
+accessor, **would have turned it green while measuring the under-cap path instead.**
+
+That is worse than an ordinary stale test: the failure was the only signal that the
+precondition had evaporated, and the natural fix destroys the signal. The owner
+replaced the fixture instead, with a mutation check that fails loudly — *the reply
+must exceed the cap, or this test proves nothing about the over-cap path.* **Stating
+a precondition as an assertion** tells the next person what they broke, rather than
+letting a green test quietly change subject.
+
+The general form: **when a policy change makes a test fail, ask whether it can still
+construct its own precondition before asking how to make it pass.**
+
+Two assertions were deliberately loosened in the same repair, and recorded rather
+than buried. The test they used to decide is worth copying: **keep what this repo
+owns.** *A module error is not reframed as a federation error* is federation's
+contract; another module's rounding of a size summary is not, and an assertion
+pinning a neighbour's formatting fails on their cosmetics while teaching nobody
+anything.
 
 ### The window that could not be held
 

@@ -399,6 +399,7 @@ Before calling a class closed:
 | 312 | Restoring a mutation with git | The mutant and the real edit share one tree, so a tree-level restore cannot tell them apart; copy the file out first, or mutate in a throwaway worktree |
 | 313 | A denominator beside a clean verdict | Present and non-zero is not enough — change the input and confirm the number MOVES; a static count is indistinguishable from a stuck one |
 | 314 | A plausible small count | Worse than a zero, because a zero invites a second look and a small non-zero does not |
+| 315 | `git add -A` in a shared tree | It commits whatever else is uncommitted — another seat's work, or your own from a different thread — under a message that describes neither |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

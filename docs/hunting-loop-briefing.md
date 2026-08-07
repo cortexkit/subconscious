@@ -282,6 +282,7 @@ Before calling a class closed:
 | 195 | Hedging between two mechanisms? | A hedge is an unread source file wearing a caveat; one read replaces it, and the hedge would have shipped as a live risk |
 | 196 | Third cycle of the same loop — is the loop the only oracle? | Each cycle looks affordable alone, so the cost is visible only in aggregate; a cheap oracle answers questions the loop cannot pose |
 | 197 | Installed a fix — is the thing you invoke the thing you built? | A stale copy earlier in the path leaves the fix live in the repo and absent from the shell |
+| 198 | Which step of this operation has no undo? | It is rarely the interesting one; discarding the recovery arrives as housekeeping after attention has moved on |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4819,6 +4820,17 @@ where it agreed are not evidence it was unnecessary — they are the price of th
 where it was**, and dropping it after the first agreement on the grounds that it
 confirmed what someone already knew costs a whole extra cycle at the second. The
 value of a cheap check is its expected cost over rounds, not its hit rate.
+
+The last step of that operation was an instruction to delete the backups, and it is
+worth separating from the rest. **Every other action across three rounds was
+recoverable** — a bad edit restores, a bad seed re-cuts, a bad restart re-restarts.
+Discarding the recovery was the only irreversible move, and it arrived as routine
+housekeeping *after* the interesting work was finished and attention had moved on.
+
+So the store got read before the backups went: not the reported success but the
+actual rows, matching the shape that had been rehearsed. **The risk profile of a step
+and its apparent importance are uncorrelated**, and this one is inverted — the least
+interesting step carried all the irreversibility.
 
 I had offered two possible consequences for that extra row and hedged between them.
 The owner read their own source and resolved it in one line. **A hedge between two

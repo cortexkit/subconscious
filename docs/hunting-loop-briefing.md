@@ -342,6 +342,7 @@ Before calling a class closed:
 | 255 | Holding a rule you can justify | A justification makes the rule negotiable in the moment; the version that fires is the one held as a commitment |
 | 256 | Banking a technique | Put its precondition in the same sentence, never a footnote; a footnote is what gets dropped when the technique is recalled in a hurry |
 | 257 | Named a backstop — does it cover every consequence? | It can cover the diagnosis and not the remediation; ask notice what, not only what would notice |
+| 258 | A filter returning half the population | It has not narrowed anything; find the class the property can apply to before reading any result as a finding |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5457,6 +5458,22 @@ held as a rule fires before the situation can argue with it.
 Same shape as the identity caveat one level up. **A technique applied past the reason
 it works still looks like it is working; a rule reasoned about past its trigger looks
 like judgement.**
+
+The practical form its author settled on keeps it from reading as anti-intellectual:
+for the few things that must never be negotiated in the moment — production changes,
+destructive operations, approval gates — **hold a rule, not a rationale**, and write
+the reasoning where it shapes the next rule instead. **The reasoning is relocated,
+not discarded.** Same separation as a test and a comment: one participates in the
+decision, the other explains it afterwards.
+
+The sweep afterwards produced its own lesson. My first attempt to find vulnerable
+entries excluded any row containing a limiting word, which returned **half the
+document** — not a finding but a filter that had not narrowed anything. The reason is
+structural: most rows are *questions*, and a question carries no precondition to
+state. Only rows asserting that a method establishes a fact can carry the defect at
+all, and there were three, each already limited inline. **Find the class a property
+can apply to before reading any count as a result**, or a large number stands in for
+an answer.
 
 Worth noticing as its own pattern: **refusing a compliment added a finding rather
 than merely being accurate**, and that was the second time in a day someone improved

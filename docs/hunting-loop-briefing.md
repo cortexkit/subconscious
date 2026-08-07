@@ -307,6 +307,7 @@ Before calling a class closed:
 | 220 | Is this check correct by what it asks, or by what happens to be on disk? | A leased correctness lapses with no line changing, so no diff review can catch it |
 | 221 | Does your harness model the configuration production actually runs? | A test passing on a different configuration certifies the untested path as covered |
 | 222 | Can the property your check leans on be asserted instead of assumed? | Rejecting the condition converts a silent lease into a loud one, at the cost of the comment you would have written |
+| 223 | A guard's comment describes a threat — is the guard switched on? | The comment describes the mechanism, never the population it covers; count the entries that actually enable it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5192,6 +5193,25 @@ storage descriptor is keyed on **the identity the module claimed**, not the
 configured one. So a module registering under a stale default does not merely appear
 under the wrong name — **it is pointed at a different store**, which surfaces as an
 empty database rather than as a misconfiguration.
+
+I read that at the source and could not have distinguished it from *keyed on the
+configured identity*, because every supervised module has the two equal by
+construction — the supervisor applies the override last and unconditionally. **They
+had to leave supervision entirely to build an experiment capable of disagreeing**:
+connecting a second process by hand, claiming an identity with no configuration
+entry at all. It registered and was given a real database under the claimed name.
+
+Then the population check. The guard's own comment describes protecting a
+security-boundary module from impersonation while the real one restarts — and in
+production **one of fourteen modules has it enabled**, not including the credential
+vault. **A guard's comment describes the mechanism, never the population it covers**,
+and I had been reading it as a property of the fleet.
+
+One real mitigation bounds it: the registry refuses a duplicate identity rather than
+replacing it, so an impostor cannot displace a *live* module. That leaves exactly
+the window the comment names — while the module is down or restarting — which is not
+theoretical on a machine where modules restart several times an hour, and covered
+every module at once during a fleet bounce that morning.
 
 ### An exemption that covers some siblings and not others
 

@@ -209,6 +209,8 @@ Before calling a class closed:
 | 122 | Does this reference point into a list that can grow? | "The last three" and "the other two" rot exactly like counts while containing no number, so a digit sweep misses every one |
 | 123 | An index is stale — is anything simply *absent* from it? | A wrong number is a lie a reader can catch; an absent row is a tool they never learn exists |
 | 124 | Does this absence-hunting tool print what it examined? | Every way such a tool breaks removes evidence, so its bugs and its findings render identically — the denominator is the only separator |
+| 125 | Did you run the rule against the *remedy* it motivated? | The fix for a class is the highest-leverage place for that class to hide, because everything downstream inherits its blind spot |
+| 126 | Does your detector encode one *spelling* of what it seeks? | Correctness expressed differently reads as absence, and a denominator does not catch it — the count is right and the finding is still wrong |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3727,6 +3729,39 @@ I audited my own tools for it. Two already reported what they examined, one
 reported both halves of its partition, and one reported only its findings — fixed,
 since a clean result there was indistinguishable from a scan that examined
 nothing.
+
+### The remedy is where the class hides
+
+They then checked the one tool they had built **that week** to make absence sweeps
+trustworthy — written after an earlier truncation defect — and it had the same
+flaw: it printed only the files missing the thing it sought, so a run examining
+forty files and a run examining one rendered identically when both found nothing.
+They had already used it for two security sweeps and reported both nulls as
+evidence.
+
+My audit had its own instance in the same hour: my check for
+denominator-printing flagged a healthy tool as defective, because that tool
+reports its denominator with different wording than I had searched for.
+
+**Neither of us checked the remedy with the rule that motivated it** — and the
+remedy is the highest-leverage place for the bug to hide, because everything
+downstream inherits its blind spot.
+
+### One spelling of the thing you seek
+
+Three failures that week shared a shape the denominator rule does not cover: a
+file-extension list omitting the extension actually used, a path-prefix pattern
+against an index written as bare filenames, and my search for one phrasing of a
+count.
+
+In each, **the detector encoded one spelling of what it sought, and correctness
+expressed differently read as absence.** Worth separating from the denominator
+rule because printing the count does not help: in my case the denominator was
+right and the finding was still wrong.
+
+The defence is a positive control **written in a different form than the pattern
+expects** — a known-good case the tool should find, spelled the way someone else
+would write it.
 
 ### The absent row beneath the stale number
 

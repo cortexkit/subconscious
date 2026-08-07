@@ -419,6 +419,7 @@ Before calling a class closed:
 | 332 | Relying on a library's cleanup or panic hook | Read what it restores — it knows only what IT set up, so anything you enable after its init is outside its scope; chain your hook ahead of theirs rather than replacing it |
 | 333 | Green was read and the reader was wrong | Ask whether the question has an instrument AT ALL before hardening one — a narrow-but-true gauge needs a reader fix, an absent one needs building, and both present identically |
 | 334 | Adding a gauge | Make its unobserved state distinguishable from its zero state — a fresh gauge reporting 0 converts an absent answer into a confident wrong one |
+| 335 | A conservation identity or partition check holding steady | It cannot see a change in what the partition is OF — members moving between buckets keep the sum exact while the population itself is disappearing |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -265,6 +265,8 @@ Before calling a class closed:
 | 178 | Does this gauge report zero before it has looked? | Zero renders "nothing observed" identically to "nothing there"; null distinguishes them |
 | 179 | Did your mutation run the whole suite, or the binaries you picked? | Choosing which tests to run is choosing which coverage to measure, and the answer looks the same either way |
 | 180 | An unfed gauge over-reports — is that harmless? | A freshness gauge that never advances reports the exact signature of the fault it exists to detect |
+| 181 | Widened a scope and found new failures — are they yours? | Check the wider scope on a clean tree first; the instinct is to attribute them to the change in hand |
+| 182 | Does your shell carry variables the program reads? | An inherited variable is invisible in the command you typed, so it explains a failure without appearing in the evidence |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4582,11 +4584,23 @@ middle row is the one that matters:
     the whole package                   1 failing
     the whole workspace                 1 failing
 
-So the defect was in **choosing binaries**, not in choosing a package — but a
-sibling crate's integration test *also* reddens, in a crate I did not edit. **Scope
-is narrow at more than one level at once**, and widening one level does not
-establish the other. The rule that survives: **any mutation result you will report
-or act on gets the widest run available; scoped runs are for the edit loop only.**
+So the defect was in **choosing binaries**, not in choosing a package. The rule that
+survives: **any mutation result you will report or act on gets the widest run
+available; scoped runs are for the edit loop only.**
+
+I first read the workspace row as a *second* narrowness — a sibling crate reddening
+in code I had not edited. Checking it on a clean tree, **those five failures are
+pre-existing and have nothing to do with the mutation.** My shell carries the
+supervisor's spawn-attestation variables, so an integration test that launches a
+real daemon inherits an identity that is not its own; a clean-environment run is
+fully green.
+
+Two things worth keeping from that. **Widening a scope surfaces unrelated failures,
+and the first instinct is to attribute them to the change in hand** — I nearly
+reported a second finding that was a property of my terminal. And this is the same
+environment leakage that broke a monitoring probe earlier the same night: **an
+inherited variable is invisible in the command you typed**, so it explains a
+failure without appearing in any of the evidence.
 
 The owner who prompted this found the same defect in their own work on reading it —
 every *"the entire suite stayed green"* they had said that evening was measured on

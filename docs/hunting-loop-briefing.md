@@ -278,6 +278,8 @@ Before calling a class closed:
 | 191 | Did the cross-check hold in *both* directions? | One-directional results cannot separate "they are sharper" from "their position is better placed", and those recommend different things |
 | 192 | Pointed a tool at a non-default target — did it go there? | A wrong path in a target override does not fail, it retargets, and every later verdict is confidently about the wrong system |
 | 193 | Handed a list of things to change — is the list complete? | Enumerate the schema yourself; a remembered list is not a derived one, and destructive work is where that difference lands |
+| 194 | Split code to make it testable — is the decision still inside what you test? | Extracting a helper can move the decision into the caller, and the split feels like an improvement while it happens |
+| 195 | Hedging between two mechanisms? | A hedge is an unread source file wearing a caveat; one read replaces it, and the hedge would have shipped as a live risk |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4770,6 +4772,27 @@ Caught only because I checked the file existed before trusting the answer. **A w
 path in a target override does not fail, it retargets** — so assert the target
 resolves, and compare an identifying value from both candidates before acting.
 
+The structural fix came from the colleague who ran the same wrong path through their
+own tool and found it clean: theirs takes the target as a mandatory argument, so
+there is nothing to fall back *to*. **A fallback is a hazard exactly where the
+primary is optional.** If the override must stay optional, a value that is set and
+wrong has to be a hard error — silently ignoring something deliberately supplied is
+the step that turns a typo into a confident answer about the wrong machine. Fixed:
+the named path is now exclusive rather than first in a list.
+
+Two things about the fix are worth more than the fix. **The comment above that code
+already described the behaviour I had to implement** — it said ignoring the value
+would turn stated intent into action against the wrong target — and the code beneath
+it did the opposite. Reading the file did not catch that; using it did.
+
+And **my first test for the fix was vacuous.** I extracted a small helper and
+asserted on it; restoring the exact defect left the test green, because the helper
+only mapped a value through and **the decision lived in the caller the test never
+touched.** I had tested the part I had just written rather than the part that had
+been wrong. Splitting code to make it testable can move the decision out of the
+thing you then test, and the split feels like an improvement while it happens.
+Caught by mutation, not by review.
+
 ### A remembered list is not a derived one
 
 The same operation came with a list of three tables to delete while the module was
@@ -4782,6 +4805,17 @@ recollection; a list you derived is a measurement** — and destructive work und
 stopped process is exactly where that difference lands. The same enumeration also
 showed that three table names mentioned in passing do not exist in this store, which
 is worth knowing before a script names them.
+
+The second round is why that check runs even when it looks like ceremony. The handed
+list named two tables; the derived one found **three**, and the extra row sat in the
+table that **gates the very operation being retried** — leaving it would have forced
+a third stop-and-restart cycle. **A check that only pays on the round it fires is
+still paid for by that round.**
+
+I had offered two possible consequences for that extra row and hedged between them.
+The owner read their own source and resolved it in one line. **A hedge between two
+mechanisms is an unread source file wearing a caveat** — mine was honest about
+uncertainty and would have shipped into a drive record as a live risk.
 
 ### Why the position beats the effort
 

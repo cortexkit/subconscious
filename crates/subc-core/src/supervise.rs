@@ -1762,6 +1762,20 @@ fn jittered_health_delay(module_id: &str, probe_index: u64, cadence: Duration) -
     if cadence_ms == 0 {
         return cadence;
     }
+    // Note that this never returns less than one cadence, including for the FIRST
+    // probe. So a freshly registered module reports health `unknown` for a full
+    // cadence plus jitter -- 30-33s at the default -- no matter how quickly it is
+    // ready to answer.
+    //
+    // That is a property of the supervisor's schedule, not of any module: an
+    // operator watching a restart sees `unknown` and cannot tell it from a module
+    // that is slow to warm. Measured on two unrelated modules, both flipping to
+    // `ok` between 22s and 32s after restart.
+    //
+    // Left as-is because spreading the first probe is what keeps a fleet-wide
+    // restart from firing fourteen simultaneous probes into a cold machine. The
+    // alternative -- probe at t+0 and jitter only from the second onward -- trades
+    // that thundering herd for a faster first reading.
     let jitter_span = (cadence_ms / 10).max(1);
     let hash = module_id.as_bytes().iter().fold(
         probe_index.wrapping_mul(0x9E37_79B9_7F4A_7C15),

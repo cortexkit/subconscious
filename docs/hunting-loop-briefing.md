@@ -411,6 +411,9 @@ Before calling a class closed:
 | 324 | Reading a SQLite store with `immutable=1` | It ignores the -wal, so on a LIVE database it answers about the past without erroring — `immutable=1` for quiescent stores, `mode=ro` for live ones |
 | 325 | A value that does not move when you expected it to | Ask whether the mechanism WRITES on success — a rejected write writes nothing, so an unchanged counter can be the fingerprint of the failure rather than evidence against it |
 | 326 | Renaming a module whose store carries a fence | The lease counter is keyed on the module id and lives in a FILE; the fence lives in a ROW keyed on nothing. A rename resets the counter to zero against a store still demanding the old epoch — pre-seed the new lease file before first open |
+| 327 | A suite of checks that all passed during an outage | Ask whether any of them COUNTS — consistency checks measure internal agreement and are silent about a silent subtraction; a set that shrinks stays consistent |
+| 328 | A review or tool answering about the wrong target | Establish what it EXAMINED before judging whether it is right — a finding aimed at the wrong place is unaddressed, not wrong, and discarding it loses a real defect |
+| 329 | An explanation that fits the case you looked at | Check whether it generalises before letting it stand as the rule — one member's special-case behaviour explains that member, and reads as the shape of the whole class |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -49,10 +49,14 @@ public struct ConsultRow: Codable, Identifiable {
     public var sentinels: [String]?
     public var evidenceCount: Int?
     public var verdictCount: Int?
+    /// Session that requested the consult, letting a client attribute each row to
+    /// one agent. Absent for consults raised outside a session context, which
+    /// belong to no single agent rather than to an unknown one.
+    public var callerSession: String?
 
     public enum CodingKeys: String, CodingKey {
         case consultId, phase, terminalReason, questionPreview, startedAtMs, finishedAtMs,
-             ordinal, memberRoutes, sentinels, evidenceCount, verdictCount
+             ordinal, memberRoutes, sentinels, evidenceCount, verdictCount, callerSession
         case consultClass = "class"
     }
 

@@ -204,6 +204,8 @@ Before calling a class closed:
 | 117 | A correct fallback handled it — do you know whether it was handled or merely survived? | A safe default hides the difference, so behaviour cannot tell you which one you have |
 | 118 | Which parts of this system never misbehave? | Well-built degradation makes its own coverage unobservable, so the quiet paths are the ones needing source inspection |
 | 119 | Prose beside a correct table — was it derived or recalled? | The table's correctness makes the paragraph look checked, and nothing reads a sentence |
+| 120 | Is every member of this list exact? | One approximate member inside an enumeration inherits the precision of the others, so a reader cannot tell membership from resemblance |
+| 121 | Does the prose claim something the artifact beside it can confirm? | If the artifact answers it, delete the prose; if the prose adds something, make it nameable from the artifact |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3642,6 +3644,39 @@ summary that agrees with it in tone.
 So the rule is narrower than *do not pin counts in prose*: **prose next to a
 derived artifact is the least-checked place in the document**, precisely because
 the artifact next to it is trustworthy.
+
+### Two defects, one remedy
+
+Running that rule against each other's documents found one instance in each, and
+they are not the same defect.
+
+Mine was a count sitting beside the list it counted. **A count beside its own list
+carries no information and can only drift** — strictly negative value, since
+everything it says is already visible and the only thing it can do over time is
+contradict what it summarises.
+
+Theirs was a claim that *added* something — which rows in a table had been found
+undefended — but **could not be checked from the table.** A reader cannot tell
+which two rows, so verification requires history, and it turns false silently the
+moment a row is added.
+
+One remedy covers both: **if the artifact answers it, delete the prose. If the
+prose adds something, make it nameable from the artifact.** They named the rows,
+which also turned an abstract point concrete.
+
+### A hedge inside an enumeration
+
+The clause I fixed had a third defect I had not seen. *"anthropic / openai /
+google / xai-style"* — three exact names and one approximate one.
+
+**A list of exact members lends its precision to an approximate one**, so a reader
+checking coverage cannot tell whether the last item is *in* the set or merely
+*resembles* it. Same mechanism as a correct table lending authority to the
+paragraph beside it: the surrounding rigour is doing work the hedge has not
+earned.
+
+A hedge in ordinary prose is honest. **A hedge inside an enumeration is a category
+wearing a member's clothes.**
 
 ### The binary older than its own source
 

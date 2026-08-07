@@ -1538,6 +1538,18 @@ fn quota_window_rows_for_entry(entry: &Value) -> Vec<(String, Value)> {
         return rows;
     };
 
+    // THE THREE SLOTS ARE POSITIONS, NOT A RANKING, AND THEY CAN HAVE HOLES: each
+    // is filled from its own optional upstream field, so `secondary` may be absent
+    // while `tertiary` is present. Walk all three unconditionally and never stop at
+    // the first gap -- another consumer of this wire shipped a status bar reading
+    // 25% for an account whose binding constraint was a weekly at 36%, by treating
+    // the first slot as the answer.
+    //
+    // This loop tolerates holes because it is a filter rather than a search, which
+    // was luck rather than intent when it was written. The note exists so that
+    // stays a decision: an "optimisation" that breaks on the first absent slot
+    // compiles, passes these tests (the fixtures are dense), and reproduces that
+    // bug silently.
     for slot in ["primary", "secondary", "tertiary"] {
         if let Some(window) = usage.get(slot).filter(|w| !w.is_null()) {
             rows.push((rate_window_label(window, slot), window.clone()));
@@ -2774,6 +2786,35 @@ mod tests {
         let line = format_quota_window_line("5h", &rows[0].1, templates[1].len(), false);
         assert!(line.contains("7% used"), "line: {line}");
         assert!(line.contains("●"), "status dot missing: {line}");
+    }
+
+    #[test]
+    fn window_slots_are_walked_past_a_hole() {
+        // The three slots are positions, not a ranking, and each is filled from
+        // its own optional upstream field -- so a middle slot can be absent while
+        // a later one is present. Every other fixture here is dense, which means
+        // a walker that stopped at the first gap would pass all of them.
+        let entry = serde_json::json!({
+            "provider": "anthropic",
+            "usage": {
+                "primary": { "usedPercent": 25.0, "windowMinutes": 300 },
+                "tertiary": { "usedPercent": 36.0, "windowMinutes": 10080 }
+            }
+        });
+        let rows = quota_window_rows_for_entry(&entry);
+        assert_eq!(
+            rows.len(),
+            2,
+            "a hole at `secondary` must not truncate the walk: {rows:?}"
+        );
+        // Walking past the hole matters because the LATER slot carries the binding
+        // constraint: reporting only the first shows 25% for an account limited at
+        // 36%, which is the bug another consumer of this wire shipped.
+        let worst = rows
+            .iter()
+            .filter_map(|(_, w)| w.get("usedPercent").and_then(Value::as_f64))
+            .fold(f64::MIN, f64::max);
+        assert_eq!(worst, 36.0, "binding constraint lost: {rows:?}");
     }
 
     #[test]

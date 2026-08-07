@@ -213,6 +213,8 @@ Before calling a class closed:
 | 126 | Does your detector encode one *spelling* of what it seeks? | Correctness expressed differently reads as absence, and a denominator does not catch it — the count is right and the finding is still wrong |
 | 127 | Did you run the sweep under two or three plausible spellings? | The spread is the signal: where they disagree is the population one pattern was blind to. Disagreement proves blindness; agreement proves nothing |
 | 128 | Is this defensive branch reachable by today's code? | If not, the only way to test it is to simulate the change it guards against — otherwise you are writing a comment that compiles |
+| 129 | Your filter under-includes — does the fix now over-include? | Under-including produces a finding somebody investigates; over-including produces a null nobody looks at twice |
+| 130 | Would this pattern fail *loudly* if it were wrong? | Detectability is inversely proportional to how reasonable the output looks, so prefer spellings whose failure is absurd |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3788,6 +3790,45 @@ Spellings that share a premise share a blind spot — all three of mine assume t
 target is a literal substring, so none would find test code reached through a
 macro. **Disagreement is evidence of blindness; agreement is not evidence of
 correctness.**
+
+### The mirror direction is the quiet one
+
+My finding about test-only items sent them back to their own tool's premise, and
+it was wrong in the opposite direction: six such items across four files sat
+**inside** what the tool called production code, because it anchors on the
+attribute followed by a module and those have no module.
+
+The asymmetry is what makes this worth its own row. **Under-including reports
+things absent that are present, which produces a finding somebody investigates.
+Over-including reports things present that exist only in test builds** — so a
+sweep asking *does every file do X* can find X in a test-only helper and call the
+file fine. A null nobody looks at twice.
+
+So the fix for an under-including filter is a candidate for the opposite defect,
+and the opposite defect is quieter.
+
+I checked my own equivalent and found twelve, across five files. Both of us
+**reported rather than excised**: removing them needs each item's span, and a
+brace-matched span is the same guessing game that produced the original defect.
+Naming them lets a reader check whether a result rests on one; pretending to
+remove them adds a second silent guess on top of the first.
+
+Their re-check then produced a false positive immediately — a call flagged as
+test-only that sits six lines past where the test-only item closes. **The warning
+narrows where to look; it does not answer.** Same limit as the multi-spelling
+procedure, and worth shipping as a caveat that says *check this* rather than a
+filter that silently decides.
+
+### Prefer a spelling that fails absurdly
+
+One more thing fell out of the false zero above. It was caught **because it was
+absurd** — no test code at all in a workspace full of tests. A pattern that had
+missed a third of the files would have returned a plausible number and been
+believed.
+
+**The detectability of a broken sweep is inversely proportional to how reasonable
+its output looks.** Which is an argument for choosing spellings whose failure mode
+is loud, not merely spellings that differ from each other.
 
 ### A branch nothing can reach yet
 

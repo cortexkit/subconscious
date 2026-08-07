@@ -4575,6 +4575,29 @@ question in the same shape as the broad one. I had picked the binaries I thought
 relevant — which is exactly the reasoning that decides where coverage is, so it
 cannot also verify it. **Run everything, or state which binaries the null is about.**
 
+Measuring the scopes side by side under one mutation shows the gradient, and the
+middle row is the one that matters:
+
+    --lib plus the binary I suspected   0 failing
+    the whole package                   1 failing
+    the whole workspace                 1 failing
+
+So the defect was in **choosing binaries**, not in choosing a package — but a
+sibling crate's integration test *also* reddens, in a crate I did not edit. **Scope
+is narrow at more than one level at once**, and widening one level does not
+establish the other. The rule that survives: **any mutation result you will report
+or act on gets the widest run available; scoped runs are for the edit loop only.**
+
+The owner who prompted this found the same defect in their own work on reading it —
+every *"the entire suite stayed green"* they had said that evening was measured on
+one binary of fourteen. Their four findings held on re-run, which they recorded as
+**holding by luck of scoping rather than by method**, since nothing guaranteed they
+would be luckier than my run that reddened somewhere I had no reason to suspect.
+
+Their generalisation subsumes both halves: **never let a plural stand in for a
+check** — not call sites, not test binaries. They refused to let five call sites
+imply coverage while letting one binary imply a suite; I did the mirror image.
+
 And their finding sharpens the class it belongs to. When the stamp is missing, the
 gauge does not go blank — it **ages forever**, so a healthy component reports the
 precise signature of a wedged one. **An unfed freshness gauge over-reports, which

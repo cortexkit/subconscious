@@ -136,14 +136,24 @@ it remained. Staging copies matter because they are placed later, which is
 exactly when the derived identifier comes back.
 
 **For a binary a process is already running, do not sign in place.** That rewrites
-the live process's text pages, the same hazard that makes remove-first copying
-load-bearing. Copy to a temporary name, sign the copy, and rename over the path:
-the running process keeps its inode and the path gets a new one.
+the live process's text pages, the same hazard that makes in-place copying unsafe.
+Copy to a temporary name, sign the copy, and rename over the path: the running
+process keeps its inode and the path gets a new one. Prefer that rename over
+removing the target first — both mint a new inode, but a rename is atomic, while a
+remove leaves an interval where the path does not exist and anything executing it
+fails with a missing file rather than with either version.
 
 And note which question each instrument answers, because during a window they
-disagree correctly: the build identifier answers *is this file the artifact I
-staged*, and only the inode answers *is that what is running*. Reading the path
-alone reports a restart as done when it has not happened.
+disagree correctly: the digest answers *which bytes are these*, the build
+identifier answers *which principal will the system treat this as*, and only the
+inode answers *is that what is running*. A moved process id answers none of them —
+a restart and a deploy are indistinguishable by process id, since a moved id proves
+a process died and says nothing about which bytes came back.
+
+Those three separate the states that matter during a swap: **not placed** (disk
+digest still the old one), **placed but not restarted** (disk digest new, running
+inode still the old file), and **done** (disk digest new, running inode equal to
+the path's). Reading any one of them alone reports a mid-swap window as complete.
 
 Verified invariant: the same identifier results from entirely different bytes, so
 it survives every future rebuild. All staged binaries now carry their own name as

@@ -108,9 +108,20 @@ is the same shape as the absent-config hazard the refusal guards against.
    If the drain does not start moving within a few minutes of the restart, that
    is a signal rather than a reason for patience — this fix either works
    immediately or does not work.
-2. **Stage every new binary while modules keep running.** A remove-first copy
-   leaves the running process on its old inode, so staging is not a restart. This
-   front-loads all the risky building outside the outage.
+2. **Stage every new binary while modules keep running.** Placement mints a new
+   inode, so the running process keeps executing its old one and staging is not a
+   restart. This front-loads all the risky building outside the outage.
+
+   Place by copying to a temporary name in the destination directory and renaming
+   over the target. Renaming is atomic, so the deploy path always resolves to one
+   complete binary; removing first leaves a window where the path does not exist
+   at all, and anything that executes during it fails with a missing file rather
+   than with either version. Both approaches mint a new inode, which is what keeps
+   the running-versus-disk comparison meaningful.
+
+   Do not copy over the file in place: that reuses the inode and rewrites the
+   pages of the running process, and it also destroys the comparison, since
+   running and disk then agree while the bytes differ.
 3. **Each owner verifies their own staged artifact** before the window: version
    probe, warm exec, whatever symbol check they specify. An owner is the only one
    who knows what discriminates their build — and, just as usefully, what does

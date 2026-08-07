@@ -425,6 +425,9 @@ Before calling a class closed:
 | 338 | Your own record says you did it | A note written at the moment of intent is indistinguishable from one written after the act — confirm the artifact exists before relying on the record, especially before deleting what it made redundant |
 | 339 | Reading a value you wrote yourself | It confirms your own write, not the system's state — check who authored each field before treating a row as independent evidence |
 | 340 | Two states with identical observables | Stop hunting for a better observable and make the system ACT — a functional test needs no guess about which way the reading is lying, which is why it belongs as the default rather than the fallback |
+| 341 | Several instruments agreeing | Prove they CAN disagree — a blind instrument produces the same agreement as a healthy one, so agreement is the outcome that most needs a control |
+| 342 | Two instruments disagreeing | That is one instrument plus a hypothesis — add instruments until every disagreement is explained, rather than explaining the first one you see |
+| 343 | A path resolved through a fallback chain | Break each branch INDEPENDENTLY — either alone still passes, so a partial fix is indistinguishable from a complete one and fails only for whoever takes the other branch |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

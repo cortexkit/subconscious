@@ -357,6 +357,8 @@ Before calling a class closed:
 | 270 | Scoped a sweep to where you expect the problem | You keyed on your own guess; widen to where the shape can occur and keep a control |
 | 271 | Could a future caller get this wrong without the compiler objecting? | Correct-today-undefended-tomorrow has no failing observation, so nothing triggers the question; ask it while the file is already open |
 | 272 | Relocated a guard | Mutate it at its new site; a refactor can disconnect a check while every test still passes |
+| 273 | A known condition described with an adjective | "Old" is true at twenty and at six hundred; the number is what makes a known condition decidable |
+| 274 | A constant inside a frozen set | Freezing suits artifacts fixed at freeze time and breaks anything whose job is to track; both look identical until one must change |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5903,6 +5905,27 @@ at lock time** — path dependencies pull one repository's transitive set into t
 other's lock, which means such a pin is really a pin on a *pair*, bounded below by
 the protocol break and above by whenever the neighbour's dependencies move. Neither
 boundary is visible from either repository's history alone.
+
+Afterwards its owner measured how far the whole pin set sits from current heads —
+roughly three weeks and 2,255 commits across six repositories — having previously
+known only that the pins were *old*. **An adjective absorbs any magnitude:** "old"
+was equally true at twenty commits and at six hundred, so the word never forced a
+decision. The number converts a known condition into a decidable one, which is why
+measuring something already known was worth the minutes.
+
+Splitting the count changed what it meant. For this repository the wire itself had not
+moved — both protocol commits in that window were comment-only, no signature or type
+changes — while the control plane behind it moved nineteen times. **Two claims that a
+single number conflates:** the surface is unchanged, the behaviour behind it is not,
+and a regression in the second is precisely what the gate exists to catch and
+currently cannot see.
+
+The structural cause is worth generalising: two of the pins are constants inside a
+frozen normative set whose verifier requires byte-equality against a historical
+commit. **Freezing is right for artifacts whose value is fixed at freeze time and
+wrong for anything whose job is to track a moving target** — the two are
+indistinguishable inside the set, since both are constants, and the difference only
+surfaces when one of them needs to change and cannot.
 
 One limit worth stating when answering a question like this: I could establish that a
 candidate revision is an ancestor of the shipped line and that it builds, and I could

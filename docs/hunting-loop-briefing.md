@@ -4814,6 +4814,12 @@ table that **gates the very operation being retried** — leaving it would have 
 a third stop-and-restart cycle. **A check that only pays on the round it fires is
 still paid for by that round.**
 
+Across three rounds the derived list agreed twice and disagreed once. **The rounds
+where it agreed are not evidence it was unnecessary — they are the price of the round
+where it was**, and dropping it after the first agreement on the grounds that it
+confirmed what someone already knew costs a whole extra cycle at the second. The
+value of a cheap check is its expected cost over rounds, not its hit rate.
+
 I had offered two possible consequences for that extra row and hedged between them.
 The owner read their own source and resolved it in one line. **A hedge between two
 mechanisms is an unread source file wearing a caveat** — mine was honest about

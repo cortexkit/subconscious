@@ -109,7 +109,7 @@ if [[ "$NEEDS_BUMP" == "1" && "$DRY" != "--dry" ]]; then
   rm -f "$MANIFEST.bak"
 fi
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo publish --package "$CRATE" --dry-run
 
 if [[ "$DRY" == "--dry" ]]; then

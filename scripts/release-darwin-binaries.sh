@@ -40,7 +40,7 @@ git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null || { echo "tag ${TAG} no
   echo "HEAD is not at ${TAG}; checkout the tag first" >&2; exit 1;
 }
 
-cargo build --release -p subc-core -p subc-mcp \
+cargo build --release --locked -p subc-core -p subc-mcp \
   --bin ck-subc --bin subc-probe --bin ck --bin fake-aft-stub --bin ck-subc-mcp
 
 DIST=$(mktemp -d)

@@ -70,7 +70,7 @@ jobs:
           fi
 
       - name: Build release binaries
-        run: cargo build --release -p subc-core -p subc-mcp --bin ck-subc --bin subc-probe --bin ck --bin fake-aft-stub --bin ck-subc-mcp
+        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck-subc --bin subc-probe --bin ck --bin fake-aft-stub --bin ck-subc-mcp
 
       # Asset naming: <bin>-<target>.tar.gz containing the bare binary, plus a
       # .sha256 sidecar per asset — consumers pin the tag and verify the digest.

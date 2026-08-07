@@ -443,6 +443,9 @@ Before calling a class closed:
 | 356 | Reading any instrument's output | This is where the uniformity check FIRES — not at write time. Every broken probe caught today was caught by output looking too uniform, never by remembering the rule while building it |
 | 357 | Evidence from a single comparison | Prefer a trend across a known-ordered set — it is self-controlling, because a broken instrument rarely produces a plausible monotone climb by accident |
 | 358 | Removing a guard, exclusion, or workaround | Put the REASON where the line used to be, not only in the commit message — the next person to reconsider it reads the file, never the history |
+| 359 | A mutation-proof returning the expected code | Verify the MUTANT APPLIED before reading any exit code — a string replace that matched nothing produces a clean run indistinguishable from a passing one |
+| 360 | A mutant that fails in BOTH arms | It is testing the wrong thing — malformed input fails everywhere, so the mutant must be VALID-BUT-WRONG to discriminate |
+| 361 | A measurement that mutates what it measures | Restore the measured state; do not adopt the mutated one — both leave you with a valid artifact, which is what makes it easy to ship the mutation under the measurement's commit message |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

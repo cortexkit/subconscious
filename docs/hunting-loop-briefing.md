@@ -257,6 +257,8 @@ Before calling a class closed:
 | 170 | Two things are blocked — which one varies? | Hold everything constant but the suspected cause; a probe that differs in two ways separates nothing |
 | 171 | Does the error text match the record's own fields? | An error naming a state the fields contradict is describing something other than what you asked about |
 | 172 | Every remedy failed — do they all consult the state that produced the error? | Then their agreement is one observation repeated, and the corruption is upstream of all of them |
+| 173 | Correcting someone about shared code — do they use it? | Both parties can be right about their own layer and wrong about the other's; verify which code the other actually executes |
+| 174 | Hand-rolled client instead of the SDK? | Every operational affordance the SDK accumulated is absent by default, and a missing diagnostic fails as silence rather than at compile time |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4458,6 +4460,37 @@ cancellation lever consults the same state that produced the error**, so their
 unanimous refusal is one observation repeated rather than three confirmations.
 When every remedy fails identically, check whether they share a source before
 concluding the thing is unreachable.
+
+### Right about your own layer, wrong about theirs
+
+A colleague described their client retrying a wrong module id forever. I corrected
+them from source: both SDKs bound that retry to a deadline and fail with an error
+naming the module.
+
+They checked, and **the correction was true and did not reach them** — they do not
+use either SDK. Their module depends on the wire crates only and hand-rolls its
+frame loop, so the deadline and the error string live in code they never execute.
+Their per-call retry is bounded; the **outer refresh loop** is not, and it
+stale-serves indefinitely.
+
+**Both of us were right about our own layer and wrong about the other's.** Before
+correcting someone about shared code, establish that they run it.
+
+The consequence sharpens their fix rather than softening it: the SDK's error is the
+only place that id is ever printed, and **their process had no such string at all.**
+Not swallowed, not re-wrapped — absent.
+
+Which names a cost worth stating plainly. **A hand-rolled client starts without
+every operational affordance the SDK accumulated** — retry budgets, exhaustion
+verdicts, error text naming the target — and each arrives only when someone notices
+it missing. A wire change fails loudly at compile time; **a missing diagnostic fails
+as silence.**
+
+Sweeping my own fleet for who hand-rolls: six of twelve, and the first sweep
+reported one supervised module as having no client at all — impossible, since it
+speaks the wire. My file glob was too shallow. **A category that cannot exist is
+the cheapest possible signal that a classifier is broken**, and it was only visible
+because I knew that module must have a client.
 
 ### Check the fix, not the person
 

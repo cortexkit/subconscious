@@ -436,6 +436,8 @@ Before calling a class closed:
 | 349 | An expected zero | State its reason beside it — the same zero unexplained stays an open question forever, and someone re-investigates it every time they meet it |
 | 350 | A gauge reporting a weaker property than its label claims | Check the COST BOUND before calling it an oversight — a cheap probe often cannot see the stronger property by construction, and the fix belongs on a path that already pays that cost |
 | 351 | A property that can only be established by consuming the thing | Name it unprovable rather than leaving it as a gap — for a rotating credential a dry run invalidates the copy you hold, so no amount of tooling closes it |
+| 352 | Building a check that reports a value | Prefer one asserting a RELATION between two independently-authored artefacts — a value can go green by measuring the wrong thing, a relation can only pass by holding |
+| 353 | A member your checker cannot examine | Name it and its reason IN THE OUTPUT, and print how many of how many were checked — a checker that silently omits a member is indistinguishable from one that examined it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

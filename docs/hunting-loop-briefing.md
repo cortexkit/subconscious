@@ -343,6 +343,9 @@ Before calling a class closed:
 | 256 | Banking a technique | Put its precondition in the same sentence, never a footnote; a footnote is what gets dropped when the technique is recalled in a hurry |
 | 257 | Named a backstop — does it cover every consequence? | It can cover the diagnosis and not the remediation; ask notice what, not only what would notice |
 | 258 | A filter returning near-none or near-all | Output size is evidence about the predicate, not only the corpus; name the class the defect can exist in before reading any count as a finding |
+| 259 | Named the noticer — who verified it exists, against what? | The backstop claim is itself an unchecked result, and it is usually a claim about code you do not own |
+| 260 | Deferring with a stated reason | A reasoned deferral reads as adjudicated and stops inviting questions; check the reason itself before it closes the item |
+| 261 | A research answer whose evidence snippets did not resolve | Fluent prose confabulated from filenames is worse than a refusal, because it arrives wearing citations |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5694,6 +5697,34 @@ failure still reaches the wire honestly — and not the remediation, since the d
 report is also what retires a dead record. **A backstop can cover one consequence of a
 failure and not another**, and naming the shape is not the same as bounding what it
 covers.
+
+They then corrected their own deferral, and the correction is the sharpest result of
+the whole sweep. They had told me the gap was safe to defer because another path
+re-checks; I banked that as measured. **It was assumed** — the claim was about a
+repository they had never opened.
+
+Reading it settles both halves. For refreshable credentials the claim holds by a
+better mechanism than described: a refresh returning an invalid grant invalidates the
+record directly, and the source comment states the self-heal outright. For **static
+keys there is no refresh at all**, so that chain is unreachable. Enumerating every
+production writer rather than the one named makes it sharper still — all the
+automatic paths hang off the refresh and rotation machinery, and a static record
+never enters them, so the complete set of retirement mechanisms for that class is
+**the discarded report, or a human**.
+
+Their own naming of the shape is the rule: **the backstop claim is itself a discarded
+result.** The check asks what would notice, accepts a named mechanism, and never asks
+who established that the mechanism exists. And a deferral **with** a stated reason
+reads as adjudicated — an unexplained one invites a question, a reasoned one closes
+it. Hence the extra column: *who verified the noticer exists, and against what*, given
+that an independent-signal claim is usually a claim about code you do not own.
+
+One tooling note from the same episode, worth carrying: a research assistant returned
+a fluent answer twice where **every evidence snippet had failed to resolve**, because
+it could not read a sibling repository — confabulated from filenames, with a footer
+citing the caller's own commit as though it had read the other tree. **Worse than a
+refusal**, since it arrives wearing citations. Reading the source directly took four
+minutes.
 
 One remedy worth copying, because the instinct is wrong: **skip the call when its
 precondition is absent rather than logging its failure.** Logging fixes the observer's

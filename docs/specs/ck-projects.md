@@ -97,6 +97,38 @@ render identically to a user and only one of them is a reason to go look at some
 Proven: MC's real 1,524-pair corpus imported in 20ms. Seed the registry from the
 consumer's own topology, then flip; there is never a moment when both answer.
 
+### Consequences for the read op (MC and ALF, accepting the clauses)
+
+**The trichotomy is born at the source, in wire VALUES.** A consumer cannot render a
+distinction the response does not carry, so *unavailable*, *empty set*, and *not in a
+workspace* must be three distinct wire states on the membership read. If the op answers
+`[]` on outage, clause 2's visibility requirement is unimplementable downstream however
+carefully the consumer is written — the discrimination has to exist before anyone can
+display it.
+
+**Topology answers are never stale; cache identity may be.** A registry-backed consumer
+may hold a last-good workspace fingerprint for cache-stability purposes only, so an
+outage does not force a fold storm. It must never answer a sharing question from it. The
+two halves look like the same value and are governed by opposite rules, which is exactly
+how a later change "fixes" one by breaking the other — so they are recorded as a split
+rather than as one cached topology.
+
+**Derived peer rows key on session id, not directory.** The registry publishes member
+session ids directly. Directory is a live route that renames break, and identity riding
+announcement prose has already produced mis-registration in practice; a derived row built
+from a directory inherits that failure class for free.
+
+**Departure and arrival are not symmetric.** A member APPEARING mid-session is safe by
+default — worst case is a peer nobody messaged. A member LEAVING with undelivered
+messages is the blind-inbox shape, where a message lands in a scope nobody reads. So
+departure retires the derived row and MUST NOT delete undelivered messages: the failure
+stays recoverable by re-add rather than becoming silent loss.
+
+**Acceptance on the first consumer:** stop the registry module and the fleet keeps
+working. The derived list is a POPULATION mechanism, never a delivery dependency —
+delivery keys on the consumer's own rows, which survive the registry's death by
+construction. Proven by killing it, not by reading this document.
+
 ## 4. Store: journal spine (Ufuk's call, revising S3's file clause)
 
 The module owns its store outright: ordinary cortexkit-store sqlite under

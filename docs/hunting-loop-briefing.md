@@ -309,6 +309,8 @@ Before calling a class closed:
 | 222 | Can the property your check leans on be asserted instead of assumed? | Rejecting the condition converts a silent lease into a loud one, at the cost of the comment you would have written |
 | 223 | A guard's comment describes a threat — is the guard switched on? | The comment describes the mechanism, never the population it covers; count the entries that actually enable it |
 | 224 | Reporting a security gap — is the reach stated accurately? | An overstated threat model gets the whole finding dismissed on the overstatement, and the narrowed version is usually more pointed |
+| 225 | Is the check cheap enough to run while you are confident? | Confidence is the state it exists to survive; a check gated on suspicion never fires on a class whose defining property is that nothing looks wrong |
+| 226 | Unexercised on your side — or exercised where you cannot see? | Say which; a branch written from source is an assertion about a code path until someone observes it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5231,6 +5233,26 @@ Worth noting what the standing test has and has not done across a day of firing:
 every case the conclusion was true.** It has not once caught a wrong answer. It
 catches wrong routes to right answers, which is the only kind that can be caught
 before the answer starts to matter.
+
+Their corollary explains why those firings clustered where they did: **the check has
+to be cheap enough to run while you are confident, because confidence is exactly the
+state it exists to survive.** A class whose defining property is that nothing looks
+wrong offers no symptom, therefore no trigger — so a check gated on suspicion is
+unreachable for it, and only something mechanical ever fires.
+
+The finding then closed in a way worth recording. They shipped a reproduction script
+with one branch marked honestly as **written from source rather than observed**,
+because their harness could not make the guard fire. Checking my side, the guard is
+covered by a test that spawns a real protected module, then opens a second
+authenticated connection claiming the same identity without credentials and asserts
+the refusal. I did not take the test's existence as evidence — mutating the guard to
+always admit fails it on that exact assertion. **So their unexercised branch was
+exercised somewhere they could not see**, which is a different statement from
+unproven, and only saying which one you mean makes the difference visible.
+
+That also sharpens the underlying report rather than softening it: the mechanism is
+proven, and what is missing is that it is **switched on for one module of fourteen**.
+A configuration gap is a materially easier thing to ask for than a mechanism.
 
 ### An exemption that covers some siblings and not others
 

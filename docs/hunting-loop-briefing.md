@@ -355,6 +355,8 @@ Before calling a class closed:
 | 268 | A zero from a file you named | Confirm the file is the right target before reading absence as a finding; a control proves the instrument works, not that it was aimed correctly |
 | 269 | A zero from a query keyed on a field | The existence check cannot help — the target is right and the key is wrong; that one needs the positive control |
 | 270 | Scoped a sweep to where you expect the problem | You keyed on your own guess; widen to where the shape can occur and keep a control |
+| 271 | Could a future caller get this wrong without the compiler objecting? | Correct-today-undefended-tomorrow has no failing observation, so nothing triggers the question; ask it while the file is already open |
+| 272 | Relocated a guard | Mutate it at its new site; a refactor can disconnect a check while every test still passes |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5669,6 +5671,42 @@ along with the mutant** — the repair was uncommitted, so the restore reached f
 than the thing it was undoing. Redone with a file copy taken before mutating. **A
 restore must reach the mutation and nothing else**, and a working tree with genuine
 uncommitted work is exactly where a version-control restore fails that test.
+
+### Correct today, undefended tomorrow
+
+A colleague applied the argument-versus-adjacency point to their highest-consequence
+transform rather than banking it, and found the shape. The transform publishes a
+number the provider never reported, and consumers act on it — so an ungated
+application makes an exhausted account read as idle. Its eligibility check sat at
+**both** call sites while the transform itself took only the value, so a third caller
+could apply it ungated and **nothing would fail to compile**. They moved the gate
+inside, taking the evidence as a parameter.
+
+What makes this worth separating from everything else: **it was correct at every
+observation.** Both call sites right, tests green, live output honest. **No audit
+asking "is this correct" can find it, because the answer is yes** — only *could a
+future caller get this wrong without the compiler objecting* finds it, and that
+question has no failing observation behind it, so nothing triggers it.
+
+Which sets its scheduling rule apart from every other check here. It has **no urgency
+signal of its own**, so it loses any contest against a real defect; the argument for
+doing it is that the fix is minutes while the file is already open, against a latent
+invitation that persists indefinitely. **The trigger has to be proximity rather than
+severity.**
+
+Running the same question on this daemon's privileged principal came out the other
+way, and the asymmetry is the useful part. The value a supervised module is stamped
+with — the one downstream modules make trust decisions on — has exactly one production
+construction site, inside the function that checks the launch attestation. **The gate
+is not adjacent to the construction, it is the only path to it.** Worth noting I did
+not know that before the question arrived: I had mutation-tested that the guard
+*refuses* correctly and never asked whether the privileged value could be minted
+around it. **Those are different questions and only the first had been asked.**
+
+One detail from their fix worth copying: they verified the guard did not lose its
+defence in the move, by deleting it at the *new* site and confirming the named tests
+still redden. **A refactor that relocates a check can silently disconnect it**, and a
+still-passing suite says nothing either way.
 
 ### The noticer must not be downstream of the failure
 

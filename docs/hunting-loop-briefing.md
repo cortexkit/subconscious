@@ -385,6 +385,8 @@ Before calling a class closed:
 | 298 | A property about syscalls | Assert over the syscalls, not the output; a passing in-process test proves only that nobody raced, never that a race is survivable |
 | 299 | A change applied outside the file under test | Verify it took effect before reading the result — a patch stanza, lockfile, mutation script or heredoc that silently no-ops produces the success case exactly |
 | 300 | A fixture built from a healthy example | Dense is what everyone writes by default, and a dense fixture cannot test tolerance of sparseness |
+| 301 | A check on whether a step worked | It must consult something that step does not produce; an assertion inside the mutation is produced by the thing it checks |
+| 302 | The result agreed with you | That is exactly when to look at the other artefact — a disagreeing result gets investigated automatically, an agreeing one is where the unread warning sits |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5787,6 +5789,15 @@ neither of which anyone reads when the result agrees with them. **When a change 
 applied outside the file under test — a patch stanza, a lockfile, a mutation script, a
 heredoc — verify it took effect before reading the result**, because the result cannot
 distinguish *applied and passed* from *never applied*.
+
+Two refinements make it usable. **The check must consult something the failing step
+does not produce**: an assertion inside a mutation script catches a *drifted* anchor,
+which is the common failure, but cannot catch one that matched somewhere **adjacent** —
+and that outcome is worse, because it reddens for the wrong reason and so *confirms*
+what you hoped. Reading the diff of the mutated file costs one command and closes
+both. And the tell is available **precisely when the result agrees with you**: a
+disagreeing result gets investigated automatically, so the unread warning line only
+ever sits above an agreeable one. **The anomaly is in the ease, not in the output.**
 
 Turning that into an enumeration is what makes it operable, and their run of it is
 the best worked example of the day. A proximity detector scored **every optional field

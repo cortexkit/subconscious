@@ -4842,6 +4842,12 @@ instrument was already available and the faster habit reached past it. **An orac
 you already have in your hand beats a better one you have to remember exists** —
 until someone counts.
 
+The owner then did the thing that makes it stick: they turned the contract the
+dry-run had discovered into a permanent test in their suite. **An oracle that needs
+remembering will be reached past again**, by the same habit, for the same reason —
+so the durable fix is not "use the harness next time" but moving the question into
+something that runs without being chosen.
+
 ### Why the position beats the effort
 
 Across one long cross-seat exchange, every finding came from the other party and

@@ -361,6 +361,8 @@ Before calling a class closed:
 | 274 | A constant inside a frozen set | Freezing suits artifacts fixed at freeze time and breaks anything whose job is to track; both look identical until one must change |
 | 275 | Counted commits touching a contract surface | The count says nothing about whether the contract moved; read the diff for removed or altered public items |
 | 276 | A public type changed without a wire change | Round-tripping tests pass forever; it breaks at compile time in someone else's tree, arriving as a bug report rather than a red gate |
+| 277 | Cross-repo impact scan by identifier | A name match is not a type match; discriminate on a field only one candidate has, or compile the consumer |
+| 278 | Assessing a source-breaking change | Exposure is set by how consumers pin, not whether they depend; a path-pinned consumer breaks on push, a rev-pinned one on its next bump |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5940,6 +5942,30 @@ with no wire change is invisible to every test that round-trips**, so the owning
 repository's suite stays green indefinitely. It breaks at compile time in a consumer's
 tree, which means the owner learns about it as a bug report rather than as a failing
 gate.
+
+Relaying it to the owner closed it, and their method is the part to keep. Four
+repositories depend on those crates and none break — established by **compiling the
+one that tracks their master live**, not by reasoning about it. The discriminator was
+not whether a consumer depends but **how it pins**: rev-pinned consumers meet the
+change only when they choose to bump, which is exactly when a compile error is cheap,
+while a path-pinned consumer would have broken the moment it was pushed. Only the
+latter mattered, and it survived because it constructs the *element* type whose fields
+were unchanged rather than the *container* that moved.
+
+Their near-miss is the sharper finding. Their first scan matched a constructor in the
+path-pinned consumer and they were one step from reporting it — **the type belonged to
+a different crate with the same obvious name**. What caught it was a field the real
+candidate does not have, so the shape did not fit and the import resolved elsewhere.
+**A name match is not a type match, and a search cannot tell them apart**; in a
+workspace where several crates define a `CallOptions` or a `Tool`, an
+identifier-keyed impact scan produces false positives that read exactly like true
+ones. Cheap discriminator: a field only one candidate has. Certain one: compile the
+consumer.
+
+Worth checking one's own exposure while the rule is fresh — this repository defines a
+type with the very name that collided, and twenty-two repositories path-pin its
+crates, so the same assessment here has a much larger population and the same two
+discriminators.
 
 The structural cause is worth generalising: two of the pins are constants inside a
 frozen normative set whose verifier requires byte-equality against a historical

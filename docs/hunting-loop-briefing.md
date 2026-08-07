@@ -454,9 +454,10 @@ Before calling a class closed:
 | 367 | A high pass count | State which TARGETS ran, or run all of them — a restricted target set reads like coverage, and the number climbs while the blind spot stays exactly as wide |
 | 368 | A check relating two things you control | That is a CONSISTENCY check — it survives you changing your mind about the value. Only a relation between what you declare and what a live system serves is a CORRECTNESS check |
 | 369 | Believing a flag includes what you think | Add a deliberately failing case and run the real command — reading the documentation yields the same belief with none of the evidence |
-| 370 | An operation reporting no change | Its report may describe a CATEGORY that excludes the mutation it performed — true, and silent about exactly what you changed |
-| 371 | Dropping a check as redundant | If it reads a different SUBJECT it is not redundant — a config-derived check and a running-process check agree until the moment they matter |
-| 372 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 370 | An operation reporting no change | Read its WHOLE output before believing it — a `head -n` that shows the empty categories and cuts the informative row makes a successful reload look like nothing happened |
+| 371 | Generalising from one truncated observation | The instrument decided what you concluded — do not relay it as a warning until a second run shows the same thing untruncated |
+| 372 | Dropping a check as redundant | If it reads a different SUBJECT it is not redundant — a config-derived check and a running-process check agree until the moment they matter |
+| 373 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

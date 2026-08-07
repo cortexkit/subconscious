@@ -3644,11 +3644,17 @@ trait PromptRouteClient: Send + Sync {
 ///
 /// SIBLING KEYS ON THE ENVELOPE ARE DISCARDED HERE, not ignored downstream: this
 /// returns the inner value and the outer object is dropped, so no later code can
-/// see a key added beside `result`. Harmless while the envelope carries nothing
-/// else, and the reason to write it down is that a future sibling would be
-/// invisible by construction rather than merely unread — which reads as "we do not
-/// use it" when it is really "we cannot see it". Widening is a one-line change
-/// here; it cannot be done at the call sites.
+/// see a key added beside `result`. A second narrowing follows at each call site,
+/// where `from_value` into a named struct drops unknown keys INSIDE `result` too.
+/// So the reach is two layers, and both are here.
+///
+/// STATED WITH ITS SIZE, because a bare "cannot see it" is inert and rots: this
+/// function is private, in this file, with two call sites, so adopting a new
+/// sibling is a one-line change beside it plus a field on the relevant struct.
+/// That is cheap — the expensive version of this shape is an unwrapper in shared
+/// code owned by someone else, and the two are indistinguishable from outside
+/// because both answer "no". Anyone canvassing consumers about an additive key
+/// should read this as YES-IF-ASKED, not as walled off.
 fn unwrap_result_envelope(
     value: serde_json::Value,
 ) -> std::result::Result<serde_json::Value, PromptBackendError> {

@@ -208,6 +208,7 @@ Before calling a class closed:
 | 121 | Does the prose claim something the artifact beside it can confirm? | If the artifact answers it, delete the prose; if the prose adds something, make it nameable from the artifact |
 | 122 | Does this reference point into a list that can grow? | "The last three" and "the other two" rot exactly like counts while containing no number, so a digit sweep misses every one |
 | 123 | An index is stale — is anything simply *absent* from it? | A wrong number is a lie a reader can catch; an absent row is a tool they never learn exists |
+| 124 | Does this absence-hunting tool print what it examined? | Every way such a tool breaks removes evidence, so its bugs and its findings render identically — the denominator is the only separator |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3699,6 +3700,33 @@ sentence, is fine and verifiable without the artifact.
 The general repair is theirs: **a summary that names the artifact's structure
 instead of its contents cannot go stale when the contents change.** Point at the
 column rather than restating it.
+
+### A detector that hunts absence has one failure direction
+
+A colleague ran the index check against their own repository and got a genuine
+clean result — but their sweep lied twice on the way there. First it reported all
+nine documents as unindexed because its file-extension list omitted the one
+extension they use, so it was **structurally incapable of returning anything
+else.** Then, after that fix, it required a path prefix the index does not write,
+and reported five of nine missing when the answer was none.
+
+Both failures pointed **the same way as the defect being hunted.**
+
+Their generalisation is the valuable part, and it is structural rather than bad
+luck: **a detector looking for absence fails by finding more absence.** Every way
+it can break — a narrow pattern, a truncated input, a missing extension, a skipped
+directory — removes evidence rather than adding it. Such a tool has **no failure
+mode in the opposite direction**, so its bugs and its findings are
+indistinguishable.
+
+The cheap guard caught their second one: **print the positive count beside the
+negative.** *"Nine of nine indexed"* is checkable at a glance; *"nine missing"* is
+not, because the denominator is invisible.
+
+I audited my own tools for it. Two already reported what they examined, one
+reported both halves of its partition, and one reported only its findings — fixed,
+since a clean result there was indistinguishable from a scan that examined
+nothing.
 
 ### The absent row beneath the stale number
 

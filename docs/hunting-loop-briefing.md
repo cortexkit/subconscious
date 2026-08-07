@@ -324,6 +324,7 @@ Before calling a class closed:
 | 237 | Took a backup — did you verify the copy? | The operation reporting success is not the artifact being correct, and a rollback you cannot verify is one you do not have |
 | 238 | Does this check need you to notice something first? | Then it is absent exactly when the situation is unusual, and unusual is the only kind that needs it |
 | 239 | Credited with reasoning you did not do? | Say so; the mechanism that actually fired is the transferable part, and the compliment records the wrong one |
+| 240 | Absence found in the consuming file — did you check the producer? | That is a fact about who reads the value, not about whether it is set |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5086,6 +5087,20 @@ So for anything that spawns a module directly: set the identity explicitly and a
 on it, rather than inheriting whichever default the binary happens to carry. And
 when a rename is declared complete, the residue to look for is not references in
 running config but **defaults compiled into binaries that config has been masking**.
+
+The owner later corrected their own version of that risk, and the correction enlarged
+the finding. They had reported the divergence as **live in their tests today**,
+having searched the test files for the identity variable and found nothing. But the
+variable is set by the *supervisor*, unconditionally, for every spawned module — so
+their rigs were never reading the compiled default. **An absence found in the
+consuming file is a fact about who reads the value, not about whether it is set**,
+and the producer was one file away in a repository they had already read that day.
+
+Being wrong about the mechanism is what sent them looking at what the rigs *do*
+supply: their generated configuration names the module by its **pre-rename key**,
+which the daemon then echoes back as the override. So the tests were exercising an
+identity production does not use and asserting against it successfully — the exact
+hazard, reached by a route neither of us had described.
 
 I then overstated the rename to them — said the repository had been renamed when only
 the module and the local directory were. Worse than a slip: **the "second checkout"

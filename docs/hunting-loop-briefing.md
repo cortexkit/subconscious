@@ -475,8 +475,11 @@ Before calling a class closed:
 | 388 | A ceiling you are about to raise | Measure the DEPTH you need, not the coverage you get — coverage improves with the limit, depth worsens with fleet activity, and only the second says whether raising it helps |
 | 389 | Two classification errors in opposite directions | They preserve the total, so the count reconciles and nothing prompts a look — read the classifications against what you already know, never the summary |
 | 390 | Judging a checkout stale by activity | Activity is not the property — ask whether the tree is a DISTINCT repository or a COPY of one already in your list, which is exact and cheap |
-| 391 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 392 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 391 | A fix that changes the instance | Check it does not preserve the CLASS — swapping one wrong signal for another in the same family is worse than no fix, because it consumes the attention the class would otherwise get |
+| 392 | An answer naming where the work belongs | It must terminate at something ACTIONABLE — pointing at another discounted item is true and useless, and sends the reader one step further from the thing that can receive the edit |
+| 393 | Two implementations that agree | They must differ in METHOD, not just in code — and the acceptance criterion is that their EXCLUDED lists match, since that is where a disagreement means someone edits a tree with no effect or skips one that needs it |
+| 394 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 395 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

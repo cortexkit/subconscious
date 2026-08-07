@@ -322,6 +322,8 @@ Before calling a class closed:
 | 235 | Auditable, or independent? | A record makes one source checkable against itself; only a second source can be wrong in a different way |
 | 236 | Offering your record as a reason to skip someone's check? | That is a careful process talking itself out of the only leg that could catch it |
 | 237 | Took a backup — did you verify the copy? | The operation reporting success is not the artifact being correct, and a rollback you cannot verify is one you do not have |
+| 238 | Does this check need you to notice something first? | Then it is absent exactly when the situation is unusual, and unusual is the only kind that needs it |
+| 239 | Credited with reasoning you did not do? | Say so; the mechanism that actually fired is the transferable part, and the compliment records the wrong one |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5384,6 +5386,23 @@ And the generalisation underneath the whole exchange: **an authorisation is evid
 and obeys the same sourcing rules as a measurement.** A full day of applying
 correlated-source reasoning to probes, counters, binaries and stores, and the
 approval at the far end of a deploy was the one place nobody thought to point it.
+
+Except that is not how it happened, and the difference is the transferable part. The
+colleague credited me with reasoning to that generalisation; **a standing rule fired
+mechanically** — no production deploy without direct confirmation — and the framing
+came afterwards as an explanation for why the rule was right here. Correcting the
+credit changed what the entry is for: not *think about source correlation on
+authorisations*, which is forgotten at the moment it costs something, but **have a
+rule that fires without requiring you to be paying attention.**
+
+Their sharpening of why: **a check whose operation depends on the operator noticing
+something is absent precisely when the situation is unusual** — and unusual is the
+only kind that needs it. The same argument as a test versus a note: the test fails
+when its premise breaks, the note quietly becomes wrong.
+
+Worth noticing as its own pattern: **refusing a compliment added a finding rather
+than merely being accurate**, and that was the second time in a day someone improved
+a record by declining credit.
 
 Two details from the same package are worth carrying. The control string proved my
 search **reached a third party's binary at all** — without it, *the marker is absent*

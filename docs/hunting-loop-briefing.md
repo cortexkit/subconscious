@@ -342,7 +342,7 @@ Before calling a class closed:
 | 255 | Holding a rule you can justify | A justification makes the rule negotiable in the moment; the version that fires is the one held as a commitment |
 | 256 | Banking a technique | Put its precondition in the same sentence, never a footnote; a footnote is what gets dropped when the technique is recalled in a hurry |
 | 257 | Named a backstop — does it cover every consequence? | It can cover the diagnosis and not the remediation; ask notice what, not only what would notice |
-| 258 | A filter returning half the population | It has not narrowed anything; find the class the property can apply to before reading any result as a finding |
+| 258 | A filter returning near-none or near-all | Output size is evidence about the predicate, not only the corpus; name the class the defect can exist in before reading any count as a finding |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5474,6 +5474,19 @@ state. Only rows asserting that a method establishes a fact can carry the defect
 all, and there were three, each already limited inline. **Find the class a property
 can apply to before reading any count as a result**, or a large number stands in for
 an answer.
+
+Its recipient placed it in the vacuity family as the mirror of a rule already banked
+there. We had the empty case — a filter returning nothing must be proven capable of
+returning something — and this is the same root from the other side: **output size is
+evidence about the predicate, not only about the corpus.** Near-empty and near-total
+both say the predicate is not the one you meant, and only the near-empty half had a
+standing check.
+
+Worth stating the conclusion in the form that survives: **"I checked the class the
+rule applies to, and the class is small"** is a stronger claim than *"swept 258 rows,
+clean"*, because it says what was not checked and why that is sound. A sweep over
+everything is not more thorough, it is less discriminating, and it buries the real
+rows among the irrelevant ones.
 
 Worth noticing as its own pattern: **refusing a compliment added a finding rather
 than merely being accurate**, and that was the second time in a day someone improved

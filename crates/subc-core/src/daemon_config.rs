@@ -883,7 +883,14 @@ mod tests {
                 }}"#
             );
             let err = parse_doc(&doc, Path::new("subc.jsonc")).unwrap_err();
-            assert!(matches!(err, DaemonConfigError::InvalidValue { .. }));
+            // Pin which refusal fired. Both inputs are also missing nothing
+            // else, so without this the neighbouring "must name a configured
+            // module" rule would satisfy the assertion if this one were removed.
+            assert!(
+                matches!(&err, DaemonConfigError::InvalidValue { message, .. }
+                    if message.contains("enabled reserved module")),
+                "expected the enabled-and-reserved rule, got: {err:?}"
+            );
         }
 
         let absent = parse_doc(
@@ -896,7 +903,11 @@ mod tests {
             Path::new("subc.jsonc"),
         )
         .unwrap_err();
-        assert!(matches!(absent, DaemonConfigError::InvalidValue { .. }));
+        assert!(
+            matches!(&absent, DaemonConfigError::InvalidValue { message, .. }
+                if message.contains("must name a configured module")),
+            "expected the configured-module rule, got: {absent:?}"
+        );
     }
 
     #[test]

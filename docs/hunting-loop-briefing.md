@@ -197,6 +197,8 @@ Before calling a class closed:
 | 110 | A regression check passed — did the population it measures actually change? | Re-running a census minutes after a deploy proves only that it still reads the same store |
 | 111 | Is the claim wrong, or is your summary of it wrong? | A review summary can be wrong independently of what it reviews, and the summary is the artifact that travels |
 | 112 | You satisfied the rule's *precondition* — did you check its *outcome*? | Signing under the right filename does not produce the right identifier; the input check passes either way |
+| 113 | Why did this spread without anyone noticing? | Ask whether every check that *would* be run passes — a defect invisible to the standard toolchain needs no carelessness to propagate |
+| 114 | Your sweep found two categories — is there a third? | A binary can be pinned, re-signed wrong, or never signed at all; a two-state sweep files the third under the milder label |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3578,6 +3580,37 @@ Worth noting what this would have cost: the deployed binary was already correctl
 pinned, so placing the new one would have **moved it from pinned to derived** —
 undoing a fix rather than carrying one. A regression arriving inside a careful
 upgrade.
+
+### Why it spread without a single error
+
+The person whose artifact I held supplied the best explanation for why this defect
+reached most of the fleet: **it is invisible to every check anyone would normally
+run.**
+
+It does not appear in a version probe, a file listing, a content hash, or a
+signature validity check. I confirmed the last one on live binaries — a correctly
+pinned identity, a derived one, and an unsigned one **all report valid**, because
+a derived identity is perfectly legitimate, merely unstable. It surfaces only
+under a verbose inspection flag nobody uses without already suspecting something.
+
+That is a better explanation than people forgetting a flag, and it generalises
+into a diagnostic question: when something has spread widely without complaint,
+ask **whether every check that would be run passes.** If so, the spread needs no
+carelessness to explain it.
+
+### The third state a two-state sweep cannot see
+
+Sweeping the fleet for this, I looked for two categories — pinned or derived — and
+found something that fit neither. One binary carried its build tool's default
+identity: a different shape entirely, meaning **nobody had ever signed it**.
+
+Stable across rebuilds, so milder in one way. Not matching its own filename, so
+worse in another. A two-state sweep files it under the gentler label and moves on.
+
+**When a sweep partitions into two states, check whether the thing being measured
+admits a third.** Here the states are set-correctly, set-wrongly, and never-set,
+and only the last is invisible to a check that assumes the value was set by
+someone.
 
 ### The term a careful reader has to guess
 

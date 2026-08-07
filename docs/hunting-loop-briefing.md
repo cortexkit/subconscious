@@ -273,6 +273,8 @@ Before calling a class closed:
 | 186 | Is your immunity structural or defensive? | Structural immunity is one refactor from evaporating, and the guard it would then need lives somewhere the new code never reaches |
 | 187 | Is the subject of your evidence the subject of your claim? | A category mismatch inside your own sentence is a cheaper trigger than doubt, and it does not require suspecting the result |
 | 188 | Just told someone you avoid a hazard — do you? | Stating a constraint is the moment to check you obey it, and the claim will otherwise be true only of the code you were looking at |
+| 189 | Did you enumerate by the operation, or by the instance in hand? | A search shaped by the case you already have cannot surface the others, and it returns a confident clean |
+| 190 | Which defect did you notice, and which announces itself? | The loud one costs minutes; the silent one costs a wrong value nobody re-derives — noticing is not severity |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4696,6 +4698,21 @@ rather than a failure naming the cause.
 
 **Stating a constraint is the moment to check that you obey it.** The claim was true
 of the code I was looking at, and I offered it as a property of the workspace.
+
+Both of our searches were then narrow in the same way, one each. Theirs enumerated
+by **the variable they already knew about**; mine by **the operation I happened to
+be defending** — I searched only for removals, and the four assignments turned out
+to matter more, since the race window opens at the assignment. Both conclusions
+held, and **held because we re-derived them rather than because the first pass was
+sound.** Enumerate by the operation class, never by the instance in hand.
+
+Their severity ranking corrected mine, and the reasoning generalises past this case.
+I had been treating the identity leak as the serious one **because it cost me ten
+minutes** — but it cost ten minutes *because it fails loudly and names a boundary*.
+The storage race produces an occasional wrong path with no error at all, and two
+tests touching the same defaults is an ordinary thing for someone to write. **The
+defect you noticed is the one that announced itself; the one worth fixing is the one
+that would not.**
 
 One trap inside that check, and it is the dangerous direction: their first
 comparison diffed raw result lines and reported a difference — **the difference was

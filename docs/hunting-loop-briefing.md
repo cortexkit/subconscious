@@ -276,6 +276,8 @@ Before calling a class closed:
 | 189 | Did you enumerate every operation that touches the state, or only the one you were defending? | Searching for the operation that closes a window cannot find the one that opens it |
 | 190 | Which defect did you notice, and which announces itself? | The loud one costs minutes; the silent one costs a wrong value nobody re-derives — noticing is not severity |
 | 191 | Did the cross-check hold in *both* directions? | One-directional results cannot separate "they are sharper" from "their position is better placed", and those recommend different things |
+| 192 | Pointed a tool at a non-default target — did it go there? | A wrong path in a target override does not fail, it retargets, and every later verdict is confidently about the wrong system |
+| 193 | Handed a list of things to change — is the list complete? | Enumerate the schema yourself; a remembered list is not a derived one, and destructive work is where that difference lands |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4752,6 +4754,34 @@ prior is at its highest exactly when the artifact is newest and least examined.
 Same mechanism as the cost inversion, on a shorter timescale — **earned credibility
 transfers to the next artifact, which has not earned any.** The only defence is to
 keep the subject the artifact rather than its author.
+
+### A target override that retargets instead of failing
+
+Asked to stop a module on a test rig, my first command **targeted production**. I
+passed an environment override pointing at the rig's connection file and got the
+path subtly wrong — the rig keeps it under a different directory name than I assumed.
+
+The tool did not fail. **It fell back to discovery and answered from production**,
+reporting the module healthy: a true statement about the wrong system. Every verdict
+after that would have been confidently about the wrong daemon, and the next step was
+to stop a module.
+
+Caught only because I checked the file existed before trusting the answer. **A wrong
+path in a target override does not fail, it retargets** — so assert the target
+resolves, and compare an identifying value from both candidates before acting.
+
+### A remembered list is not a derived one
+
+The same operation came with a list of three tables to delete while the module was
+down. Rather than trusting it, I enumerated **every table in the schema carrying the
+relevant column** and counted rows for that key: exactly those three, one row each,
+everything else zero.
+
+The list was right, and checking it cost a minute. **A list you were handed is a
+recollection; a list you derived is a measurement** — and destructive work under a
+stopped process is exactly where that difference lands. The same enumeration also
+showed that three table names mentioned in passing do not exist in this store, which
+is worth knowing before a script names them.
 
 ### Why the position beats the effort
 

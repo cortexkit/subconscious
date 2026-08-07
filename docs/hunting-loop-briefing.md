@@ -211,6 +211,8 @@ Before calling a class closed:
 | 124 | Does this absence-hunting tool print what it examined? | Every way such a tool breaks removes evidence, so its bugs and its findings render identically — the denominator is the only separator |
 | 125 | Did you run the rule against the *remedy* it motivated? | The fix for a class is the highest-leverage place for that class to hide, because everything downstream inherits its blind spot |
 | 126 | Does your detector encode one *spelling* of what it seeks? | Correctness expressed differently reads as absence, and a denominator does not catch it — the count is right and the finding is still wrong |
+| 127 | Did you run the sweep under two or three plausible spellings? | The spread is the signal: where they disagree is the population one pattern was blind to. Disagreement proves blindness; agreement proves nothing |
+| 128 | Is this defensive branch reachable by today's code? | If not, the only way to test it is to simulate the change it guards against — otherwise you are writing a comment that compiles |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3762,6 +3764,47 @@ right and the finding was still wrong.
 The defence is a positive control **written in a different form than the pattern
 expects** — a known-good case the tool should find, spelled the way someone else
 would write it.
+
+They turned that into a procedure: **run the sweep under two or three spellings a
+different author would plausibly choose, and where they disagree is the population
+your pattern was blind to.** No second tool, one extra command, and it converts an
+invisible assumption into a visible discrepancy.
+
+Running it here produced the failure it detects, while demonstrating it. Three
+spellings of *which files contain test code* gave 0, 22 and 25. **The zero was the
+best result**: my pattern's parentheses were read as grouping, so it searched for
+a string that occurs nowhere — a confident, clean, entirely false zero. That one
+was absurd enough to catch; a subtler pattern would have produced a plausible
+wrong number.
+
+The 25-versus-22 gap was a real population: a differently-named test module, and
+**a test-only item with no module at all.** The second is exactly the boundary
+case that defeated a colleague's span-based filter weeks earlier — membership in
+the region expressed in a form the filter does not model. The procedure found it
+without anyone knowing to look.
+
+**Its limit, stated by its author: it detects disagreement, not correctness.**
+Spellings that share a premise share a blind spot — all three of mine assume the
+target is a literal substring, so none would find test code reached through a
+macro. **Disagreement is evidence of blindness; agreement is not evidence of
+correctness.**
+
+### A branch nothing can reach yet
+
+Closing the zero-input gap above meant writing a guard **unreachable by today's
+code** — argument parsing rejects the empty case before it runs. Writing it and
+stopping would have shipped an untested branch whose only purpose is to survive a
+future change.
+
+So they simulated the change: relaxed the argument handling in a throwaway
+harness, confirmed the guard fires with its reason instead of reporting a clean
+sweep of nothing, and restored.
+
+**A guard against a future refactor cannot be exercised by today's code, so the
+only way to test it is to simulate the refactor. If you are not willing to do
+that, you are writing a comment that compiles.** Same discipline as mutating a fix
+to prove its test would have caught the defect, applied forward in time rather
+than backward.
 
 ### The absent row beneath the stale number
 

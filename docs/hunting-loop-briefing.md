@@ -196,6 +196,7 @@ Before calling a class closed:
 | 109 | Two checks with complementary blind spots — did you ship the better one, or both? | When each check covers the other's gap, choosing between them halves the coverage while feeling like a simplification |
 | 110 | A regression check passed — did the population it measures actually change? | Re-running a census minutes after a deploy proves only that it still reads the same store |
 | 111 | Is the claim wrong, or is your summary of it wrong? | A review summary can be wrong independently of what it reviews, and the summary is the artifact that travels |
+| 112 | You satisfied the rule's *precondition* — did you check its *outcome*? | Signing under the right filename does not produce the right identifier; the input check passes either way |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3552,6 +3553,31 @@ exactly.
 The question to carry into any cleanup pass: **what does this fix arm?** Applying
 a rule to something already holding a wrong value is not the same as applying it
 to something holding none.
+
+### Satisfying the precondition instead of the outcome
+
+Hours after the identity rule was restated, a careful handoff arrived carrying the
+same defect. The note said the binary was *"signed under the deployed filename so
+the signing identifier matches"* — and the filename was right, and the identifier
+was still derived.
+
+The signing tool derives an identity from the build's content unless told
+otherwise, **regardless of what the file is called.** The suffix on the produced
+identity was the build identifier itself.
+
+So they satisfied the rule's **precondition** and never checked its **outcome**,
+and the precondition check passes either way. That is the same shape as the
+original defect one level over: the earlier failure was a rule that did not say
+*which* identity; this one is a rule whose stated action does not by itself
+produce the required result.
+
+**Check the property, not the step you believe produces it.** One command reads
+the identity directly; nothing else in the handoff could have revealed it.
+
+Worth noting what this would have cost: the deployed binary was already correctly
+pinned, so placing the new one would have **moved it from pinned to derived** —
+undoing a fix rather than carrying one. A regression arriving inside a careful
+upgrade.
 
 ### The term a careful reader has to guess
 

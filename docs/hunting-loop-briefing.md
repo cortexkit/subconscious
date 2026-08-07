@@ -392,6 +392,7 @@ Before calling a class closed:
 | 305 | Scheduling a class whose consequence is invisible | Proximity is the only rule that needs no estimate; severity requires judging a consequence you cannot see from where you would judge it |
 | 306 | A requirement to render a distinction | It must be born at the source in wire values; a consumer cannot display what the response never carried, however careful it is |
 | 307 | Two values that look alike under opposite rules | Record the split and the failure it prevents, or a later change fixes one by breaking the other |
+| 308 | Reusing an existing discipline to make new work cheap | That makes future divergence between the two a bug in one of them rather than a local choice; the discount is also a constraint |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

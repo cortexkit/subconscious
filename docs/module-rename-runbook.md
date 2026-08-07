@@ -201,7 +201,21 @@ never examined, because nobody re-derives a number that agrees with them.
    resident acted before restarting, and every command was refused at a
    precondition on the bound root, including one using only absolute paths with no
    working-directory reference.
-8. **Remove the link, then have the resident act.** Do not verify by comparing
+8. **Remove the link only after the resident confirms it has restarted, and
+   confirm it by asking rather than by measuring.** There is no filesystem
+   check for this. A session's bound project root is not its working directory,
+   so a seat can be entirely dependent on a path that `lsof` shows nobody
+   standing in — the measurement is accurate and answers a different question.
+
+   Removing a link on that evidence wedges the seat completely: every tool call
+   is refused at a precondition, including calls using only absolute paths, and
+   the session can neither work around it nor restart itself. It can still send
+   messages, which is the only reason you find out.
+
+   Links must not linger either. A symlinked path and its target can register
+   as two different directories in the peer registry, which splits a seat's
+   message routing from its message visibility.
+9. **Remove the link, then have the resident act.** Do not verify by comparing
    path strings: a working directory is stored by the kernel as an inode, so a
    process reading it through the system call always sees the resolved path, while
    a shell hands back the logical path it remembered. Which string appears depends
@@ -221,8 +235,8 @@ never examined, because nobody re-derives a number that agrees with them.
    correctly. Remove it before that is true and a healed system goes back to
    broken.
 
-Steps 7 and 8 are the ones that get dropped. A resident left running through a
-rename works today and breaks whenever someone tidies up.
+Steps 7 through 9 are the ones that get dropped. A resident left running through
+a rename works today and breaks whenever someone tidies up.
 
 Reading a store during any of this: use `mode=ro` on a **live** database and
 `immutable=1` only on a **stopped** one. The immutable flag cannot write, which

@@ -33,6 +33,11 @@ The vault rename found two: a keychain service named
 id that is a full SHA-256 over the same bytes, each derived independently by the
 daemon and the CLI from their own view of the directory. Neither is greppable.
 
+**Ask this question of each owner rather than trying to answer it centrally.** It is
+a genuine limit rather than a weak sweep: grep cannot find a hash of a string that is
+never written down, so the only way to find a derived identity is to read the code
+that computes it — which the component's owner is uniquely positioned to do.
+
 This produces a failure ordering worth internalising: **moving the store alone was
 worse than moving nothing.** Nothing moved leaves a vault that reads as empty;
 store-only leaves a vault that is *locked*, because a real store opens and its key
@@ -67,6 +72,20 @@ verifier comparing for equality reports a false failure — and it does so
 mid-migration, which is the worst possible moment to be told something is wrong
 that is not. One count on this system grew from 52 to 55 between writing the check
 and running it, purely from ordinary traffic.
+
+**Find the point of no easy return, and say which side of it you are on.** "The old
+copy stays until the new one is verified" sounds like free rollback and usually is
+— but only until the new instance *writes*. The vault's window closes at its first
+served credential refresh: after that the two stores have diverged, and rolling back
+resurrects a superseded token the provider has already invalidated. So order the
+verification to put the non-writing checks first (status, chain integrity, a
+round-trip that touches no external token), and treat the first real write as the
+boundary. The point is not to hold writes off; it is that both parties should know
+which side of the line they are on when they call it good.
+
+**Verify a key by fingerprint against an anchor the data itself carries**, never by
+observing that an item exists at the new location. Existence is satisfied by anything
+— including a fresh item created by a half-applied migration.
 
 **Record what every observable should read, before and after.** Include changes
 you expect from *unrelated* work landing in the same window. A confound that hides

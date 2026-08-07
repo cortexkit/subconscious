@@ -3612,11 +3612,14 @@ type PromptRouteFuture<'a> = Pin<
 
 trait PromptRouteClient: Send + Sync {
     /// `bind_session` overrides the route's bind session for this call.
-    /// The shim's routes normally bind the per-launch instance token, but
-    /// magic-context keys its sessions by the conversation key that thalamus
-    /// mints from provider traffic and validates a request's session_id
-    /// against the channel's bound session. A status query therefore has to
-    /// bind the conversation key it is asking about, not the instance token.
+    ///
+    /// Our side of the contract: the shim's routes normally bind the per-launch
+    /// instance token, and a status query instead binds the conversation key it
+    /// is asking about. The reason lives in the module being called, which this
+    /// repository cannot verify — as of 2026-08-07 it keys sessions by that
+    /// conversation key and checks a request's session_id against the channel's
+    /// bound session, so binding the instance token would ask the wrong session.
+    /// If that changes, nothing here fails; the override simply becomes wrong.
     fn call<'a>(
         &'a self,
         target: PromptRouteTarget,
@@ -3625,11 +3628,19 @@ trait PromptRouteClient: Send + Sync {
     ) -> PromptRouteFuture<'a>;
 }
 
-/// Thalamus's management surface wraps every successful payload as
-/// {"result": ...} (uniform across proxy.status, session.resolve, and
-/// session.command.enqueue); magic-context's tool provider responds flat.
-/// Backends strip the envelope before decoding thalamus payload shapes, so
-/// fixtures exercise the real wire body.
+/// Strip the `{"result": ...}` wrapper, failing loud when it is absent.
+///
+/// The shape belongs to the module on the other end and this repository cannot
+/// verify it, so what is stated here is OUR side: these backends require the
+/// wrapper on the management targets they call, and treat a flat body as a
+/// contract violation rather than decoding it as absent fields. The tool-provider
+/// targets are called without it.
+///
+/// The drift mode, named because nothing here would catch it: if a management
+/// target stops wrapping, this rejects loudly — the honest direction. If a target
+/// STARTS wrapping and is called by a path that does not strip, that body decodes
+/// with every field missing. The fixtures pin the bodies we send and receive
+/// today; they cannot pin what the other module does tomorrow.
 fn unwrap_result_envelope(
     value: serde_json::Value,
 ) -> std::result::Result<serde_json::Value, PromptBackendError> {

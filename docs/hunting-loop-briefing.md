@@ -4109,7 +4109,21 @@ names the neighbouring rule that absorbed the input. Genuinely load-bearing.
 One trap while confirming it: the panic's reported **line number came from the
 mutated file**, which was five lines shorter than the original, so it pointed at
 the wrong statement. **A stack trace from a mutated build is indexed against the
-mutant, not your source.** Read the message text rather than trusting the line.
+mutant, not your source.**
+
+And correcting the number is not the fix. **The displaced line does not land on
+nothing — it lands on some other real statement**, which is why it produces a
+plausible wrong answer rather than an obvious one. Mine landed on the test's own
+unwrapping, which would have told me the opposite of the truth. A colleague's
+mutation shifted the other way, so the offset has no reliable sign either.
+
+What settles it without arithmetic is the assertion's own message. **Of the three
+things a failure gives you, only the message survives the mutation intact:** the
+line number is indexed against the mutant, the test name says what it was supposed
+to check, and only the message says what actually answered. So state the
+expectation in the assertion, not merely the value — `expected the presence rule,
+got: …`. We had both adopted that form for a different reason, and this is what
+made it load-bearing.
 
 ### The three questions, and the limit past them
 

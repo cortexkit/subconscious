@@ -293,6 +293,7 @@ Before calling a class closed:
 | 206 | Is that bound a floor or a sample? | A plausible integer gets written down and reused, where a null would have invited a second look |
 | 207 | Verifying a deploy — does your marker discriminate? | Prove it absent from the outgoing binary too; the digest names the bytes but says nothing about what changed |
 | 208 | Is your check general across how the work was done? | A check valid only under one placement style silently stops discriminating under another |
+| 209 | Same measurement, which pass condition? | A deploy wants the artifact moved and a state cycle wants it unchanged; the failure is reading a correct value as the wrong verdict |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4971,6 +4972,13 @@ swapped-and-restarted from swapped-only under every placement style. Worth
 preferring, because a check that is only valid under one style stops discriminating
 silently when someone uses another — their own inode caveat was true of copying in
 place and not of what either of us actually runs.
+
+An hour later the same three instruments ran against a state cycle, where the
+artifact **must not** move. Same commands, same values, **opposite pass condition** —
+and the only thing that settles which is right is what the operation was meant to
+do. So the failure mode here is not reading a wrong value but **reading a correct
+value as the wrong verdict**, which is why the expectation is worth stating before
+the command rather than after it.
 
 ### A shared log under-reports rather than garbles
 

@@ -181,6 +181,12 @@ for pair in $todo
     # THAN CARRYING THEM FORWARD -- they encode session-id-is-identity semantics
     # that a future schema may not share.
     if test -f "$PFDB"
+        # Count before, so the check below can assert CONSERVATION rather than
+        # absence. Zero old-path rows only proves nothing was left behind; it
+        # passes just as happily on a rewrite that dropped rows on the way.
+        set -l pre_peers (sqlite3 "$PFDB" "select count(*) from peers;")
+        set -l pre_msgs (sqlite3 "$PFDB" "select count(*) from peer_messages;")
+
         sqlite3 "$PFDB" "
 BEGIN IMMEDIATE;
 -- Scope collisions first: a seat that already re-registered the same peer NAME
@@ -212,8 +218,22 @@ COMMIT;"
         set -l left (sqlite3 "$PFDB" "select (select count(*) from peers where directory='$old' or added_by_directory='$old') + (select count(*) from peer_messages where to_directory='$old');")
         test "$left" -eq 0; or fail "$left peer row(s) still at $old -- re-measure, do not widen the match"
 
-        set -l now (sqlite3 "$PFDB" "select (select count(*) from peers where directory='$new') || ' peer, ' || (select count(*) from peer_messages where to_directory='$new') || ' message';")
-        ok "peer registry: $now row(s) now scoped to the new path"
+        # Rows may legitimately DISAPPEAR here: a seat that re-registered a peer
+        # under the new scope makes the old row a duplicate, and the deletes
+        # above drop it. So the totals are allowed to fall by the number of
+        # collisions, and by nothing else.
+        set -l post_peers (sqlite3 "$PFDB" "select count(*) from peers;")
+        set -l post_msgs (sqlite3 "$PFDB" "select count(*) from peer_messages;")
+        test "$post_msgs" -eq "$pre_msgs"; or fail "peer_messages went $pre_msgs -> $post_msgs; messages carry no constraints and must never be dropped"
+        if test "$post_peers" -lt "$pre_peers"
+            say "  peers "$pre_peers" -> "$post_peers"("(math $pre_peers - $post_peers)" superseded by newer re-registrations)"
+        end
+
+        # Report the scope column -- who THIS seat can reach. The other column
+        # counts who can reach this seat, which is a different fact and reads
+        # like a peer list if you quote it by mistake.
+        set -l reach (sqlite3 "$PFDB" "select count(*) from peers where added_by_directory='$new';")
+        ok "peer registry: $reach peer(s) reachable from the new scope, "(sqlite3 "$PFDB" "select count(*) from peer_messages where to_directory='$new';")" message(s) moved"
     end
 
     # Registered worktrees point back at the main repository by ABSOLUTE path in

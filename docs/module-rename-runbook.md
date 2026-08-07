@@ -4,8 +4,11 @@ Covers renaming a supervised module's directory, module id, or both. Written
 after the `ai-proxy` -> `thalamus` rename, which broke four things that a
 reference sweep could not have found.
 
-Two renames are queued against this: `subc-federation` -> `callosum` and
-`ai-provider-quota` -> `insula`.
+Renames queued against this: `cortexkit-credentials` -> `claustrum` (ratified;
+the Latin means "a bolt, an enclosure", which is what a vault is) and
+`ai-provider-quota` -> `insula` (agreed with its owner, blocked on migrating a
+name-keyed crash-safety journal — starting empty would double-spend reset
+credits). `subc-federation` -> `callosum` is done.
 
 ## Why a reference sweep is not enough
 

@@ -215,6 +215,8 @@ Before calling a class closed:
 | 128 | Is this defensive branch reachable by today's code? | If not, the only way to test it is to simulate the change it guards against — otherwise you are writing a comment that compiles |
 | 129 | Your filter under-includes — does the fix now over-include? | Under-including produces a finding somebody investigates; over-including produces a null nobody looks at twice |
 | 130 | Would this pattern fail *loudly* if it were wrong? | Detectability is inversely proportional to how reasonable the output looks, so prefer spellings whose failure is absurd |
+| 131 | Is the answer you *hope for* zero? | Then loudness is unavailable and every other property agrees with a broken pattern — borrow a non-zero answer from history |
+| 132 | Does your detector distinguish the fixed state from the broken one? | An expression correct at other call sites survives the fix, so the count is identical before and after |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -3829,6 +3831,41 @@ believed.
 **The detectability of a broken sweep is inversely proportional to how reasonable
 its output looks.** Which is an argument for choosing spellings whose failure mode
 is loud, not merely spellings that differ from each other.
+
+### When the answer you hope for is zero
+
+The loud-failure refinement above has a hole exactly where it is needed most, and
+its recipient found it before agreeing: **loudness is not a property of the
+spelling, it is a property of the spelling against your prior about the answer.**
+Zero is deafening when you expect forty-three. It is silent when you expect zero.
+
+And expecting zero is the defining case of a security sweep. *Does any lane send a
+credential in the clear?* — hoped-for answer, none. **A broken pattern returns
+exactly the answer you wanted**, and every property discussed above fails to
+distinguish it: the denominator is right, the spellings agree (all equally broken
+agree at zero), and the failure is as quiet as it can be.
+
+Their remedy: **borrow a non-zero answer from history.** Run the detector against
+a commit where the thing is known to be present — the commit before its fix. And
+the supply is free: **every fixed defect in a repository is one of these lying
+around, indexed by the commit that fixed it.**
+
+I tried it against a real fix here and failed twice in five minutes, which is the
+best argument for it.
+
+**First**, my detector searched for the defective expression — and returned the
+same count before and after, because that expression is *correct* at two other
+call sites and survives the fix. A detector that cannot discriminate, which
+without the control I would have kept reporting as a finding.
+
+**Second**, I wrote a detector for the refusal the fix introduced and hardcoded my
+prediction into its output label. The label said *pre-fix zero*; the run said two.
+An older refusal of the same name already existed for a different failure. **The
+name is not the property** — I was counting a string, and the string was already
+in use.
+
+Both were visible only because the control produced a number to compare. **Without
+one, a clean sweep and a broken sweep are the same artifact.**
 
 ### A branch nothing can reach yet
 

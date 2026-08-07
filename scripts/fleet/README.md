@@ -1,15 +1,19 @@
 # Fleet checks
 
-Three standing checks. `fleet-pulse.sh` runs on a cadence; the other two are run
-when something prompts them.
+`fleet-pulse.sh` runs on a cadence; everything else here runs when something
+prompts it.
 
 | script | question |
 | --- | --- |
 | `fleet-pulse.sh` | which seats are idle, which modules are unhealthy |
 | `check-repo-protection.sh` | which repos have no working off-machine copy |
 | `reap-orphan-lsp.sh` | which language servers outlived their project root |
+| `verify-running-image.sh` | is each module running the binary on disk |
+| `spec-shrink-census.ts` | which spec sections lost content between rounds |
+| `prod-body-coverage.sh` | how much of each file a test-excluding scan reads |
+| `fleet-idle.ts` | per-seat idleness from the authoritative op |
 
-All three refuse to report rather than reporting a clean result when their own
+These refuse to report rather than returning a clean result when their own
 instrument cannot produce a positive answer. That property is the point of them:
 each was written after a survey returned a confident, wrong, reassuring number.
 

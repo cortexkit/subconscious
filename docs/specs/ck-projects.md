@@ -79,6 +79,24 @@ their own declared strength, and no consumer may assume another's:
 "Workspace" never means one enforcement level fleet-wide; that interpretation is explicitly
 rejected.
 
+Three clauses settled with Ufuk on 2026-08-07, when the first two consumers were named:
+
+**Which resolver is active is CONFIGURED, never DETECTED.** MC must keep working standalone
+for users who have no daemon at all, so local-internal and registry-backed are two
+permanent implementations of one interface rather than a migration. Exactly one is active.
+If a consumer instead inferred "registry unreachable, use internal", a registry outage
+would silently move a boundary its owner declared fail-closed.
+
+**On outage the answer is "unavailable", not the stale local one, AND IT MUST BE VISIBLE.**
+Once a consumer is registry-backed its internal topology is stale by construction, because
+the registry has been the one accepting edits. Degrading to per-project isolation is
+correct; degrading SILENTLY is not, because "no shared memories" and "sharing unavailable"
+render identically to a user and only one of them is a reason to go look at something.
+
+**An existing standalone user upgrading is a one-time seed, not a coexistence window.**
+Proven: MC's real 1,524-pair corpus imported in 20ms. Seed the registry from the
+consumer's own topology, then flip; there is never a moment when both answer.
+
 ## 4. Store: journal spine (Ufuk's call, revising S3's file clause)
 
 The module owns its store outright: ordinary cortexkit-store sqlite under

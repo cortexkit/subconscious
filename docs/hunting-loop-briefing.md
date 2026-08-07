@@ -280,6 +280,8 @@ Before calling a class closed:
 | 193 | Handed a list of things to change — is the list complete? | Enumerate the schema yourself; a remembered list is not a derived one, and destructive work is where that difference lands |
 | 194 | Split code to make it testable — is the decision still inside what you test? | Extracting a helper can move the decision into the caller, and the split feels like an improvement while it happens |
 | 195 | Hedging between two mechanisms? | A hedge is an unread source file wearing a caveat; one read replaces it, and the hedge would have shipped as a live risk |
+| 196 | Third cycle of the same loop — is the loop the only oracle? | Each cycle looks affordable alone, so the cost is visible only in aggregate; a cheap oracle answers questions the loop cannot pose |
+| 197 | Installed a fix — is the thing you invoke the thing you built? | A stale copy earlier in the path leaves the fix live in the repo and absent from the shell |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4816,6 +4818,29 @@ I had offered two possible consequences for that extra row and hedged between th
 The owner read their own source and resolved it in one line. **A hedge between two
 mechanisms is an unread source file wearing a caveat** — mine was honest about
 uncertainty and would have shipped into a drive record as a live risk.
+
+### When the loop is the only oracle
+
+Three rounds of a cross-seat operation — stop a module, edit its store, restart,
+verify — were spent discovering defects in the payload being seeded. On the third,
+the owner ran an in-process test harness instead and got the answer in a fraction of
+a second.
+
+The harness already existed. Nobody built it that day. **The loop kept being used
+because it was the path in hand**, and each individual cycle looked affordable; the
+cost was only visible in aggregate.
+
+The third verdict is what makes this more than an efficiency note. It was not *this
+payload is wrong* but **this class of payload can never work** — the operation
+requires a real identifier that a synthetic one cannot supply. So the two earlier
+rounds were refining a shape that was unreachable from the start, and **no number of
+full cycles would have converged.** A cheap oracle answers general questions; an
+expensive one only ever answers the specific one you posed.
+
+The same shape had appeared twice already that night in unrelated work: the broader
+instrument was already available and the faster habit reached past it. **An oracle
+you already have in your hand beats a better one you have to remember exists** —
+until someone counts.
 
 ### Why the position beats the effort
 

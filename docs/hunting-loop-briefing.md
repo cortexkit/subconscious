@@ -245,6 +245,7 @@ Before calling a class closed:
 | 158 | Just wrote a rule down — who is running it on your code? | Running it on your own is the version that feels sufficient and demonstrably is not |
 | 159 | You measured rather than recalled — did you control the result? | A measurement with no control is a recollection with better typography |
 | 160 | A rule returned a null here — does this codebase have its precondition? | A null from a codebase that lacks the precondition tests nothing; the rule was never exposed |
+| 161 | A guard is deliberately absent on one path — where is the reason recorded? | If it lives at the call sites, a third caller reads a guard with no sign that skipping it is ever correct |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4283,6 +4284,14 @@ one path and absent on another — but that is one call site and a deliberate by
 (the second path exists to return the untruncated value), not a guard written twice
 and tested once. **Present-once-absent-once and present-twice-tested-once look
 alike from a distance and are different findings.**
+
+The near-miss turned out to be its own small finding. A deliberately asymmetric
+guard is safe **exactly as long as its reason survives** — and the reason lived
+only at the call sites, so anyone reading the function itself would see a cap with
+no indication that skipping it is ever correct. **The risk is not the bypass; it is
+the next caller inheriting it** and assuming the guard is universal, which here
+would silently reintroduce the truncation the second path exists to avoid.
+Recorded on the function, where a new caller will actually meet it.
 
 ### Write a rule down, then hand it to someone else
 

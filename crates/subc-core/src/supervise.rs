@@ -1712,6 +1712,17 @@ fn supervisor_health_status(status: HealthStatus) -> SupervisorHealthStatus {
     }
 }
 
+/// Caps the metrics blob stored in the cached supervisor snapshot, which is
+/// returned to every `supervisor.list` and `supervisor.health` caller.
+///
+/// This cap is deliberately NOT applied on the one-shot `supervisor.health_probe`
+/// path: that request exists to return a module's complete metrics object, and
+/// `ck health <module-id>` documents it as the way to see what the cached view
+/// truncates. The asymmetry is the feature.
+///
+/// So a new caller must decide which side it is on rather than assume the cap is
+/// universal. Reaching for it on a fresh-probe path would silently reintroduce
+/// the truncation that path exists to avoid.
 fn truncate_health_metrics(metrics: Option<Value>) -> Option<Value> {
     let metrics = metrics?;
     match serde_json::to_vec(&metrics) {

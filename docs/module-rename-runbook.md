@@ -215,28 +215,28 @@ never examined, because nobody re-derives a number that agrees with them.
    Links must not linger either. A symlinked path and its target can register
    as two different directories in the peer registry, which splits a seat's
    message routing from its message visibility.
-9. **Remove the link, then have the resident act.** Do not verify by comparing
-   path strings: a working directory is stored by the kernel as an inode, so a
-   process reading it through the system call always sees the resolved path, while
-   a shell hands back the logical path it remembered. Which string appears depends
-   on how it was obtained, and that is not visible from inside — so the check can
-   read *new* while running on the link, or *old* while correctly rebound.
-   Ambiguous in both directions is not weak evidence; it is none.
+   The confirmation is a claim, so verify it the same way: **remove the link,
+   then have the resident act, while you are watching.** Do not verify by
+   comparing path strings. A working directory is stored by the kernel as an
+   inode, so a process reading it through the system call always sees the
+   resolved path, while a shell hands back the logical path it remembered. Which
+   string appears depends on how it was obtained, and that is not visible from
+   inside — so the check can read *new* while running on the link, or *old*
+   while correctly rebound. Ambiguous in both directions is not weak evidence;
+   it is none.
 
-   Remove the link first and have the resident run a command. Genuinely rebound,
-   everything works. Still on the link, its tools fail immediately with a plain
-   "no such file or directory" — the same failure as an unprepared rename, but
-   triggered deliberately while someone is watching and can restore the link in
-   one command, instead of surfacing days later when someone clears out stale
-   links.
+   Genuinely rebound, everything works. Still on the link, its tools fail
+   immediately — the same failure as an unprepared rename, but triggered
+   deliberately while someone can restore the link in one command, instead of
+   surfacing days later when someone clears out stale links.
 
    Note the interaction with path canonicalization: while the old spelling is
    still recorded anywhere that matters, the link is what makes it resolve
    correctly. Remove it before that is true and a healed system goes back to
    broken.
 
-Steps 7 through 9 are the ones that get dropped. A resident left running through
-a rename works today and breaks whenever someone tidies up.
+Steps 7 and 8 are the ones that get dropped. A resident left running through a
+rename works today and breaks whenever someone tidies up.
 
 Reading a store during any of this: use `mode=ro` on a **live** database and
 `immutable=1` only on a **stopped** one. The immutable flag cannot write, which

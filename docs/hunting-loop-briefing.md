@@ -494,8 +494,12 @@ Before calling a class closed:
 | 407 | Testing a category through one member | Pick the member by CONSEQUENCE, not convenience — the easiest one to assert silently narrows the claim to itself, and the one that matters is usually harder to reach |
 | 408 | A risk you are charging to a proposed change | Compute it under the CURRENT design too — a term common to both is a risk the change fails to fix, not one it introduces, and pricing a shared term as a delta kills good changes |
 | 409 | A guarantee you are about to weaken | Ask whether a narrower mechanism delivers the SAME guarantee with less collateral — refusing only the operations that write can preserve what refusing everything was protecting |
-| 410 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 411 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 410 | A count measured inside a window | Measure the same count OUTSIDE it — a large number in the right subsystem at the right time reads as a smoking gun when it is constant background noise |
+| 411 | A control that showed constancy | Check what era it SPANS — three windows can agree perfectly and all sit after the transition you are hunting, so it answers a narrower question than the one you asked |
+| 412 | An empty bucket in a time series | Prove the source COVERED that period before believing the zero — a retention gap and a real absence look identical, and the false one produces a confident wrong onset |
+| 413 | A number you are about to state to two significant figures | Check its provenance — precision is a claim about where a number came from, and a reconstructed one stated precisely gets built on by others |
+| 414 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 415 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

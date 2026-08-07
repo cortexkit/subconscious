@@ -397,6 +397,8 @@ Before calling a class closed:
 | 310 | A timestamp that fits your hypothesis | It only rules out the causes it excludes — agreement is consistent with every remaining one, so it ends the check exactly when it should not |
 | 311 | A guard whose reasoning you agree with | Check what it proves, not what it argues; a sound rationale can sit above an implementation satisfying something weaker |
 | 312 | Restoring a mutation with git | The mutant and the real edit share one tree, so a tree-level restore cannot tell them apart; copy the file out first, or mutate in a throwaway worktree |
+| 313 | A denominator beside a clean verdict | Present and non-zero is not enough — change the input and confirm the number MOVES; a static count is indistinguishable from a stuck one |
+| 314 | A plausible small count | Worse than a zero, because a zero invites a second look and a small non-zero does not |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

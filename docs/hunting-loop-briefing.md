@@ -239,6 +239,7 @@ Before calling a class closed:
 | 152 | Did the pinned run fail *at the assertion*, or earlier? | A mutation that breaks the setup reddens the test without the assertion ever mattering |
 | 153 | One demonstration, several sharpened assertions — did you prove each? | A refactor that moves one test's input into a neighbour's path leaves the siblings untouched, so the proof does not carry |
 | 154 | Did your mutation script and the test run share one invocation? | A failure in the script prints alongside a passing summary, and the summary is what gets read |
+| 155 | "Proved the gap is closed" — closed against what? | Every mutation is one you invented, so the proof is bounded by your imagination about how the code might change |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4109,6 +4110,27 @@ One trap while confirming it: the panic's reported **line number came from the
 mutated file**, which was five lines shorter than the original, so it pointed at
 the wrong statement. **A stack trace from a mutated build is indexed against the
 mutant, not your source.** Read the message text rather than trusting the line.
+
+### The three questions, and the limit past them
+
+The check settled into three questions, each closing a gap the previous two admit:
+
+1. **Does the old assertion pass under the mutation?** — is there a gap at all.
+2. **Does the new assertion fail under the same one?** — does the change close it.
+3. **Does that failure occur at the assertion?** — is the change what closed it.
+
+Two alone admits a false positive: a mutation that breaks the setup satisfies the
+second while proving nothing. **A test can go red for a reason other than the one
+in its name just as easily as it can go green for one.**
+
+And the limit past all three, which is worth writing down rather than letting the
+proof read as general: **every mutation in it is one you invented.** The exposure
+demonstrated is bounded by your own imagination about how the code might change,
+and a real future edit will be something nobody modelled.
+
+The sharpened assertions are better regardless. But *we proved the gap is closed*
+means **closed against the refactors we thought of**, and those are different
+claims — the same distinction as prophylactic versus proven, one level up.
 
 ### One proof does not cover its siblings
 

@@ -422,6 +422,7 @@ Before calling a class closed:
 | 335 | A conservation identity or partition check holding steady | It cannot see a change in what the partition is OF — members moving between buckets keep the sum exact while the population itself is disappearing |
 | 336 | A row in a non-terminal state | Distinguish live from abandoned before costing it — a process that dies mid-work leaves the same value as one still working, and without a timestamp the state alone cannot tell them apart |
 | 337 | Durable and safe is not resumed | Sealing a cut unit of work guarantees the loss is CLEAN, not that anything repairs it — measure whether callers actually re-drive before treating crash machinery as recovery |
+| 338 | Your own record says you did it | A note written at the moment of intent is indistinguishable from one written after the act — confirm the artifact exists before relying on the record, especially before deleting what it made redundant |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

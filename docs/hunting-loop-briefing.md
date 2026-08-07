@@ -373,6 +373,8 @@ Before calling a class closed:
 | 286 | An optional field | Say what absence means; a consumer will infer something, and the fail-open inference is the one that reads as normal |
 | 287 | A gate with a documented reason for being weak | Check whether the reason still holds; the comment converts an oversight into a decision, and decisions do not get re-examined |
 | 288 | A justification that is half true | Stickier than a false one — checking it returns a real reason and the reader stops before finding the half that expired |
+| 289 | Sweeping a document rather than code | The vocabulary saturates because the document is about the thing you are searching for; key on a structural target, not a lexical one |
+| 290 | A perfect score from a detector you just wrote | It does not feel like it needs checking, which is the property that makes it worth checking |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5765,6 +5767,37 @@ there because someone standing on the other side put it there, not because the o
 anticipated them; the same mechanism as the cross-repo messages above. What remained
 was the residue: the document was right and the *field itself* said nothing, so an
 author reading the type rather than the design note got no warning.
+
+Turning that into an enumeration is what makes it operable, and their run of it is
+the best worked example of the day. A proximity detector scored **every optional field
+documented** — a perfect result from a check written ninety seconds earlier. They ran
+the control anyway: a field name **that does not exist** also scored clean, because
+absence-language appears every couple of hundred characters in a document *about
+optional fields*, so every mentioned name matched by construction.
+
+That is a defect class of its own. **A code sweep fails loose when the pattern is too
+broad; a document sweep fails loose because the document is about the thing you are
+searching for, so the vocabulary saturates.** The two need different defences — a code
+sweep can be tightened, a document sweep needs a **structural** target rather than a
+lexical one. Tightening theirs produced two false positives out of the first two
+checked, both fields with excellent absence notes that scored as gaps because the name
+sat one sentence away.
+
+Neither detector setting was the answer. **The enumeration was**, because it forced
+every field to be looked at once rather than whichever field prompted the question —
+the detector only decides the order you read them in. Running it here keyed on
+something unambiguous (does the field carry a doc comment at all) and found sixteen of
+twenty-eight silent, six of which had genuinely ambiguous absence: a claim field where
+absence means *no claim was made* rather than *a claim was refused*, a timestamp where
+absence means *never measured* rather than *measured long ago* — opposite readings that
+were rendering alike — and a metrics field whose absence cannot distinguish *nothing
+to report* from *nobody asked*. One paired-absence claim was **verified at the write
+sites** before shipping, since that is exactly the kind that is true today and becomes
+false when someone adds a third path.
+
+And the line that connects it to the direction rule: **a perfect score does not feel
+like it needs checking, which is precisely the property that makes it worth checking.**
+The instrument-shaped version of a claim that flatters its author.
 
 One hazard from their case is worth separating: **a misread there is not conservative,
 it is lossy.** The natural inference routes away from credit that expires whether or

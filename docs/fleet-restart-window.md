@@ -17,6 +17,23 @@ built elsewhere, that is a property of the other repository's build path, not
 something this ritual can recover. Ask, rather than inferring it from a clean
 verification here.
 
+## Data and code that ship separately have a direction
+
+A module whose config, catalog or manifest parsing rejects unknown fields can
+only accept data produced by a build at least as new as the data. Placing newer
+data beside an older binary is not a stale module but a dead one: strict
+parsing fails the whole ingest, and if that ingest runs before serving, the
+module will not start.
+
+No check in this document asks that question. A hash proves which bytes, an
+inode proves which image, and neither asks whether the running build would
+ACCEPT the data being placed next to it.
+
+So when a deploy carries both halves, the binary goes first. Where a module can
+ingest offline, prove it: run the old build's parser against the new data, with
+a control on the old data so a rejection is attributable to the change rather
+than to the probe.
+
 Written 2026-08-06. Everything below was measured from the running fleet and the
 repositories on this machine, not recalled.
 

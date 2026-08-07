@@ -244,6 +244,7 @@ Before calling a class closed:
 | 157 | Which of your proxies cost effort to produce? | That one carries the authority of work spent and goes unexamined longest |
 | 158 | Just wrote a rule down — who is running it on your code? | Running it on your own is the version that feels sufficient and demonstrably is not |
 | 159 | You measured rather than recalled — did you control the result? | A measurement with no control is a recollection with better typography |
+| 160 | A rule returned a null here — does this codebase have its precondition? | A null from a codebase that lacks the precondition tests nothing; the rule was never exposed |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -4250,6 +4251,38 @@ uncommitted fix** along with the probe.
 **A restore-after-probe is indistinguishable from a restore-after-mutation, and
 one of them is meant to discard work.** They caught it only because a later sweep
 flagged the test they had just fixed.
+
+### A null that tests nothing
+
+The two-emission-paths rule above was authored in one repository and confirmed
+only there. Its author asked for it to be run elsewhere — and asked explicitly for
+a null to be reported, since **silence reads as confirmation**, which is the
+absence-with-no-denominator defect pointed at a claim rather than at a sweep.
+
+I ran it on three dual-emission surfaces here and got a null on all three. But the
+null is nearly worthless, and saying why matters more than the result.
+
+**The rule needs two independent producers of the same data**, each doing its own
+work, so a guard genuinely has to be written twice. Every surface here is **one
+producer with two renderers** — the value is computed once and then either
+serialised or formatted, so there is only ever one place for a guard to live. **The
+duplication the rule needs is absent by construction.**
+
+So the rule was never exposed, and a null from a codebase lacking the precondition
+tests nothing. Demoting a rule on that evidence would be the same error as
+confirming it.
+
+Which argues for stating a rule's **precondition** beside it. Without one, the next
+reader runs it on a surface that cannot exhibit the defect and either discards a
+good rule or concludes their code is clean when it was never checked — the
+narrower-control failure again: the check ran, returned a value, and answered a
+different question.
+
+One near-miss worth recording: the closest candidate here **is** a guard applied on
+one path and absent on another — but that is one call site and a deliberate bypass
+(the second path exists to return the untruncated value), not a guard written twice
+and tested once. **Present-once-absent-once and present-twice-tested-once look
+alike from a distance and are different findings.**
 
 ### Write a rule down, then hand it to someone else
 

@@ -378,6 +378,7 @@ Before calling a class closed:
 | 291 | "Additive, so consumers can ignore it" | Trace one response from the socket to the code that would act on it and find the first narrowing, wherever it lives; transport is often not where it happens |
 | 292 | A claim about how consumers behave | It is true for the consumers you pictured, and the ones you did not are invisible from the producer side by construction |
 | 293 | Answering a canvass with a constraint | State what would have to change for the answer to flip; a bare "no, by construction" is inert and rots, because nothing ever prompts a review |
+| 294 | Answered a structural question about your own code | The answer can differ BY PATH inside one binary; a seat cannot answer it once for itself |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5858,6 +5859,23 @@ to the code that would act on it, and find the first place the object becomes an
 array, wherever that turns out to live.** Running it here found a second narrowing the
 original note had missed — deserializing into a named struct at each call site drops
 unknown keys inside the payload as well, so the reach is two layers rather than one.
+
+Running it properly rather than reusing their earlier answer, the same consumer then
+found **the count differs by path inside one binary**: one narrowing on the path we
+had been discussing, because it carries untyped values to the point of use, and two on
+a second path that decodes into shared structs. Their earlier answer was true of the
+path in question and false of another in the same file, which makes the rule **a seat
+cannot answer this question once for itself.** The same holds here — the daemon's data
+plane never deserializes a body at all, its control plane decodes into typed enums,
+and the gateway has two layers. Three answers, one repository.
+
+Their account of why they overstated is worth more than the correction. **The
+flattery was self-directed:** *unreachable by construction* describes a clean
+architecture, *invisible today, one method away* describes a helper — so the sharper
+claim was also the more flattering one, **which is why it did not feel like a stretch
+when written**. It took three separate seats pushing on claims they had made about
+their own tree in one afternoon, and the two that were wrong were both wrong in the
+direction that suited them.
 
 One hazard from their case is worth separating: **a misread there is not conservative,
 it is lossy.** The natural inference routes away from credit that expires whether or

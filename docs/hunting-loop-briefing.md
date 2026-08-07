@@ -434,6 +434,8 @@ Before calling a class closed:
 | 347 | A burst of failures right after a change | Equally consistent with the first ASK rather than the first FAILURE — a batch hitting something quietly broken for a while produces the same timestamps as something the change just broke |
 | 348 | A repair that overwrites the evidence | Decide what you need from the record BEFORE fixing it — a successful re-mint replaces the state that would have answered why, and the forensic window closes silently |
 | 349 | An expected zero | State its reason beside it — the same zero unexplained stays an open question forever, and someone re-investigates it every time they meet it |
+| 350 | A gauge reporting a weaker property than its label claims | Check the COST BOUND before calling it an oversight — a cheap probe often cannot see the stronger property by construction, and the fix belongs on a path that already pays that cost |
+| 351 | A property that can only be established by consuming the thing | Name it unprovable rather than leaving it as a gap — for a rotating credential a dry run invalidates the copy you hold, so no amount of tooling closes it |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

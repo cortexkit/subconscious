@@ -359,6 +359,8 @@ Before calling a class closed:
 | 272 | Relocated a guard | Mutate it at its new site; a refactor can disconnect a check while every test still passes |
 | 273 | A known condition described with an adjective | "Old" is true at twenty and at six hundred; the number is what makes a known condition decidable |
 | 274 | A constant inside a frozen set | Freezing suits artifacts fixed at freeze time and breaks anything whose job is to track; both look identical until one must change |
+| 275 | Counted commits touching a contract surface | The count says nothing about whether the contract moved; read the diff for removed or altered public items |
+| 276 | A public type changed without a wire change | Round-tripping tests pass forever; it breaks at compile time in someone else's tree, arriving as a bug report rather than a red gate |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5919,6 +5921,25 @@ changes — while the control plane behind it moved nineteen times. **Two claims
 single number conflates:** the surface is unchanged, the behaviour behind it is not,
 and a regression in the second is precisely what the gate exists to catch and
 currently cannot see.
+
+Running the same split across the whole set then corrected the instrument. Four of the
+six repositories reported no protocol surface — which their author nearly wrote up as
+a finding before checking whether the directory existed at all. It did; those
+repositories simply have no protocol crate and consume this one. **The contract
+surface across the set is two repositories, not six**, which is a far more tractable
+claim than a count of drift.
+
+And the remaining one had genuinely moved: five public fields changed type under two
+performance commits, with the serialized form unchanged. So **the count of commits
+touching a contract surface says nothing about whether the contract moved** — the same
+line read identically for a comment-only pair and a type change, and only reading the
+diff for the specific breaking shape separates them.
+
+That class deserves its own note because of where it surfaces: **a public type change
+with no wire change is invisible to every test that round-trips**, so the owning
+repository's suite stays green indefinitely. It breaks at compile time in a consumer's
+tree, which means the owner learns about it as a bug report rather than as a failing
+gate.
 
 The structural cause is worth generalising: two of the pins are constants inside a
 frozen normative set whose verifier requires byte-equality against a historical

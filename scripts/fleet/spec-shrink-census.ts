@@ -58,6 +58,13 @@ const previous = new Map<string, number>();
 const normative: string[] = [];
 const converging: string[] = [];
 const campaigns = new Set<string>();
+// How many section-to-section comparisons the rule actually made. This is the
+// rule's own output rather than a description of it: the premise line says what
+// the rule means, this says what it did. A reader who expects a few hundred and
+// sees three knows the answer is about a different question, without knowing
+// anything about the threshold or the exemption list.
+let comparisons = 0;
+let exempted = 0;
 
 for (const row of rows) {
   campaigns.add(row.campaign_id);
@@ -74,7 +81,10 @@ for (const row of rows) {
     const key = `${row.campaign_id}\u0000${name}`;
     const before = previous.get(key);
     previous.set(key, size);
-    if (!before || size >= before * RETAINED_FLOOR) continue;
+    if (!before) continue; // First sighting of a section: nothing to compare to.
+    comparisons += 1;
+    if (CONVERGING.test(name)) exempted += 1;
+    if (size >= before * RETAINED_FLOOR) continue;
 
     const line =
       `  ...${row.campaign_id.slice(-12)}  r${row.round}  ` +
@@ -91,7 +101,10 @@ console.log(
   `premise: a section is a defect if it kept under ${RETAINED_FLOOR * 100}% ` +
     `of its previous size, unless its name matches ${CONVERGING.source}`,
 );
-console.log(`campaigns ${campaigns.size}   rounds ${rows.length}`);
+console.log(
+  `campaigns ${campaigns.size}   rounds ${rows.length}   ` +
+    `comparisons ${comparisons} (${exempted} exempt by name)`,
+);
 console.log(`\nNORMATIVE sections that lost content (investigate):`);
 console.log(normative.length ? normative.join("\n") : "  none");
 console.log(`\nconverging sections that shrank (expected, listed for control):`);

@@ -335,10 +335,11 @@ Before calling a class closed:
 | 248 | A red gate for hours — has anything landed on top of it? | Every commit after the first failure inherits an unverified base, and cancelled runs make the count look smaller than it is |
 | 249 | Pinning a set of repos — does anything build each member? | Hashing proves authorship, never mutual compatibility; a member nobody builds has an unfalsified pin rather than a verified one |
 | 250 | A committed lock file with a path dependency | The lock records the sibling's tree at lock time, so the pin is really a pair and unexplained lock churn may not be yours |
-| 251 | A best-effort call whose result is discarded | Permanent failure and success-finding-nothing are identical; ask what would notice its absence, and check origin against credential |
+| 251 | A best-effort call whose result is discarded | Permanent failure and success-finding-nothing are identical; ask what would notice its absence, and confirm the noticer is not downstream of the same failure |
 | 252 | Sweep came back clean — audited, or precondition absent? | The second is not a finding about the code; say which, or a structural gap reads as a passing grade |
 | 253 | Pinning a reference commit — reachable, or first-parent? | Reachable includes every branch tip ever merged; the tree may be a state the main line was never in, and it builds and tests green |
 | 254 | Your evidence and theirs agree — can either see the review verdict? | Build evidence and ancestry are both blind to "this was rejected", which only the owner holds |
+| 255 | Holding a rule you can justify | A justification makes the rule negotiable in the moment; the version that fires is the one held as a commitment |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -5439,6 +5440,17 @@ proven in both directions. **Every durable artifact built today replaces noticin
 with firing.** The ones that failed were the ones asking someone to be alert at the
 right moment, and the right moment is reliably when nobody is.
 
+One seat then supplied the mechanism behind that, which is the sharpest form of it:
+**a rule reconstructed from its justification is weaker than the rule.** Once the
+reasoning exists, the rule reads as a *conclusion* rather than a commitment — and a
+conclusion is negotiable in the moment, because *"I know why this exists and this
+situation is different"* is available only to whoever holds the justification. A rule
+held as a rule fires before the situation can argue with it.
+
+Same shape as the identity caveat one level up. **A technique applied past the reason
+it works still looks like it is working; a rule reasoned about past its trigger looks
+like judgement.**
+
 Worth noticing as its own pattern: **refusing a compliment added a finding rather
 than merely being accurate**, and that was the second time in a day someone improved
 a record by declining credit.
@@ -5591,6 +5603,48 @@ along with the mutant** — the repair was uncommitted, so the restore reached f
 than the thing it was undoing. Redone with a file copy taken before mutating. **A
 restore must reach the mutation and nothing else**, and a working tree with genuine
 uncommitted work is exactly where a version-control restore fails that test.
+
+### The noticer must not be downstream of the failure
+
+A colleague's sweep for discarded results found a defect: an optional secondary fetch
+that had **never once succeeded**, because it was sent the wrong credential. Nothing
+noticed, by design — the data it would add is the only evidence it ran, so permanent
+failure and finding-nothing are the same observation. Their predictor was a
+**credential boundary**: the risk arrives when a call reaches a second surface,
+because reusing the credential already in hand is the natural thing to write and it
+compiles.
+
+Running it here produced a clean result for a reason worth stating precisely: subc has
+**one credential kind and one surface**, so the precondition is absent rather than the
+sites being audited and found correct. *Clean because inapplicable* and *clean because
+checked* render identically in a report, and only the second is a finding about the
+code. Banked against the day a second credentialed surface exists, since that is the
+day the natural thing to write is wrong and nobody re-reads a rule while adding a
+credential.
+
+Translating rather than copying gave the general condition: **a discarded result is
+safe exactly when something else would notice its absence.** The credential boundary
+predicts that condition failing; it is not the condition, and a call can be
+permanently broken for reasons unrelated to credentials with the same silence
+following.
+
+They then re-ran the wider sweep and it changed their answer — 103 sites where the
+narrower framing had stopped at three. The valuable group was the one that **looks
+identical to the defect at the call site** and is safe for a reason **not visible from
+the code that discards it**: a fire-and-forget report whose failure also surfaces
+through an independent path. Under their own rule those would have been cleared for
+the wrong reason, without ever establishing the backstop exists.
+
+Hence the sharpened form: **the thing that notices must not be the thing that failed.**
+Two signals descending from one underlying failure are fine if they travel
+independently; a noticer downstream of the failure it is meant to catch is not a
+backstop at all.
+
+One remedy worth copying, because the instinct is wrong: **skip the call when its
+precondition is absent rather than logging its failure.** Logging fixes the observer's
+visibility and leaves the machine making a rejected request forever. Skipping converts
+*silently failing* into *not attempted*, so anything that does go out could in
+principle have worked.
 
 ### A pin that was never asked the question
 

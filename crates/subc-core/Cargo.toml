@@ -25,7 +25,7 @@ harness = false
 required-features = ["bench-harness"]
 
 [dependencies]
-cortexkit-paths = "0.1"
+cortexkit-paths = "0.1.1"
 fs4 = "1"
 getrandom = "0.2"
 rlimit = "0.11"

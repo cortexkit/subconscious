@@ -107,6 +107,20 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     public var answeredAt: Int64?
     public var resolvedAt: Int64?
 
+    // TERMINAL TIMESTAMPS, WHICH ARE THE ONLY SETTLEMENT SIGNAL ON A RAW RECORD.
+    //
+    // `ask.get` returns the producer's stored record, and that type HAS NO
+    // `state` FIELD -- verified by enumerating it, not inferred. So `state` is
+    // always absent from a get, and isPending below used to return true for
+    // every record fetched by id no matter how it had settled. A dismissed ask
+    // re-read from the server rendered as still waiting, and the branch that
+    // would have shown the resolution was unreachable for the same reason.
+    //
+    // A dismissal records canceledAt with answeredAt left NULL, so answeredAt
+    // alone cannot see it. These two complete the set.
+    public var canceledAt: Int64?
+    public var autoProceededAt: Int64?
+
     public var id: String { requestID }
 
     /// Converts the wire's epoch-millisecond timestamp for SwiftUI date formatting.
@@ -117,7 +131,15 @@ public struct AskRequest: Codable, Equatable, Identifiable {
 
     /// A record without a terminal state remains actionable. Unknown state strings
     /// are considered actionable so a new server state does not hide the ask.
+    ///
+    /// A TERMINAL TIMESTAMP IS CHECKED FIRST AND IS DECISIVE, because it is a
+    /// fact the server recorded while `state` is a projection some replies omit
+    /// entirely. Reading `state` first meant a settled record with no projected
+    /// state reported itself as pending.
     public var isPending: Bool {
+        if answeredAt != nil || canceledAt != nil || autoProceededAt != nil || resolvedAt != nil {
+            return false
+        }
         guard let state = state?.lowercased() else { return true }
         return ![
             "answered", "resolved", "canceled", "cancelled", "auto_proceeded",

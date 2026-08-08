@@ -104,6 +104,59 @@ final class AskModelsTests: XCTestCase {
         XCTAssertEqual(ask.silencePolicy?.mode, "future_silence_mode")
     }
 
+    // A SETTLED RECORD MUST NOT REPORT ITSELF PENDING WHEN `state` IS ABSENT.
+    //
+    // `ask.get` returns the producer's stored record, and that type has no
+    // `state` field at all, so every record fetched by id arrived with state nil
+    // and isPending returned true regardless of how it had settled. On the phone
+    // a dismissed ask kept rendering "if you don't answer...", and the branch
+    // that would have shown the resolution was unreachable for the same reason.
+    //
+    // A dismissal writes canceledAt and leaves answeredAt NULL, so answeredAt
+    // alone cannot see it -- which is why this asserts the cancel path
+    // specifically rather than settlement in general.
+    func testCanceledRecordWithoutStateIsNotPending() throws {
+        let ask = try decodeAsk([
+            "requestID": "ask-cancel",
+            "question": "Deploy now?",
+            "askedAt": 1_786_219_000_000,
+            "canceledAt": 1_786_219_586_479,
+            "answer": "dismissed from the phone",
+        ])
+
+        // The VALUE must arrive, not merely be tolerated: the additive-tolerance
+        // test passes on a payload carrying this field without consuming it.
+        XCTAssertEqual(ask.canceledAt, 1_786_219_586_479)
+        XCTAssertNil(ask.answeredAt)
+        XCTAssertNil(ask.state)
+        XCTAssertFalse(ask.isPending, "a record with canceledAt is settled even with no state")
+    }
+
+    func testAutoProceededRecordWithoutStateIsNotPending() throws {
+        let ask = try decodeAsk([
+            "requestID": "ask-auto",
+            "question": "Ship it?",
+            "askedAt": 1_786_219_000_000,
+            "autoProceededAt": 1_786_219_900_000,
+        ])
+
+        XCTAssertEqual(ask.autoProceededAt, 1_786_219_900_000)
+        XCTAssertFalse(ask.isPending)
+    }
+
+    // The other half of the pair: without this, an implementation that reported
+    // EVERYTHING settled would satisfy both tests above.
+    func testRecordWithNoTerminalTimestampStaysPending() throws {
+        let ask = try decodeAsk([
+            "requestID": "ask-open",
+            "question": "Still waiting?",
+            "askedAt": 1_786_219_000_000,
+        ])
+
+        XCTAssertNil(ask.canceledAt)
+        XCTAssertTrue(ask.isPending)
+    }
+
     func testEpochMillisecondsConvertToDate() throws {
         let askedAt: Int64 = 1_700_000_123_456
         let ask = try decodeAsk([

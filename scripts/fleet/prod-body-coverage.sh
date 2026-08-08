@@ -23,7 +23,9 @@ threshold=${2:-50}
 
 printf '%-52s %7s %7s %7s\n' FILE CUT TOTAL READS
 found=0
+scanned=0
 while IFS= read -r f; do
+  scanned=$((scanned + 1))
   cut=$(grep -n '#\[cfg(test)\]' "$f" 2>/dev/null | head -1 | cut -d: -f1) || true
   [ -n "${cut:-}" ] || continue
   total=$(wc -l < "$f" | tr -d ' ')
@@ -36,12 +38,24 @@ while IFS= read -r f; do
 done < <(find "$root" -name '*.rs' | sort)
 
 echo
-if [ "$found" -eq 0 ]; then
-  echo "No file would truncate below ${threshold}%."
-  echo "If that seems too clean, check the search found any files at all:"
-  echo "  find $root -name '*.rs' | wc -l"
+# THE DENOMINATOR GATES THE CLAIM, and it must be checked BEFORE the findings.
+# Over an empty tree every finding count is zero -- including any count that
+# exists to detect a broken scan -- so a guard placed inside the "we found
+# something" branch is unreachable in exactly the case it was written for. A
+# vacuity guard that depends on the scan having worked is not a guard.
+#
+# This previously printed the clean line plus a suggestion that the reader check
+# the file count by hand. Advice is not a guard either: it is discharged only if
+# someone reads it and acts, and a clean result is the least likely thing anyone
+# re-examines.
+if [ "$scanned" -eq 0 ]; then
+  echo "NO FILES EXAMINED under $root -- this run proves nothing."
+  echo "Check the root is right: find $root -name '*.rs' | wc -l"
+  exit 2
+elif [ "$found" -eq 0 ]; then
+  echo "No file would truncate below ${threshold}% (${scanned} file(s) examined)."
 else
-  echo "$found file(s) would truncate at or below ${threshold}%."
+  echo "$found of ${scanned} file(s) would truncate at or below ${threshold}%."
   echo "Anchor on '#[cfg(test)]' immediately followed by a module instead."
 fi
 

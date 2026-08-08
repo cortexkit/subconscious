@@ -529,8 +529,11 @@ Before calling a class closed:
 | 442 | An assertion phrased as an ABSENCE | Phrase it as a PRESENCE where there is a choice — the direction a check fails in belongs to the phrasing, not the check, so the same broken plumbing yields a recoverable false alarm or an investigation-ending false all-clear depending on how the test reads |
 | 443 | A count produced by EXCLUDING what you do not want | It cannot report its own failure — an unreadable source yields 0, and 0 is a legal value that renders as a real reading |
 | 444 | Your own diagnosis of a broken instrument | Check whether the fault is COMPOUND — fixing one of two independent causes reproduces the original wrong answer with more confidence attached |
-| 445 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 446 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 445 | A step whose work is proportional to a count | It must REPORT the count — zero iterations render as success, so a loop over a silently-empty list prints its done line having done nothing |
+| 446 | A clean claim ("every X is fine") | Gate it on a NON-ZERO denominator — over an empty set it is true and worthless, and the finding counters read zero identically whether the fleet is clean or discovery found nothing |
+| 447 | A rule you are about to sweep for | Its GREPPABLE form is narrower than the rule — the dangerous instances have no negation and no keyword in them; ask each site "what does this print when it looked at nothing?" instead of searching for the rule's name |
+| 448 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 449 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

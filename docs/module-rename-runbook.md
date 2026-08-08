@@ -45,9 +45,17 @@ reference sweep could not have found.
 
 Renames queued against this: `cortexkit-credentials` -> `claustrum` (ratified;
 the Latin means "a bolt, an enclosure", which is what a vault is) and
-`ai-provider-quota` -> `insula` (agreed with its owner, blocked on migrating a
-name-keyed crash-safety journal — starting empty would double-spend reset
-credits). `subc-federation` -> `callosum` is done.
+`ai-provider-quota` -> `insula`. `subc-federation` -> `callosum` is done.
+
+All three have since landed. The quota rename was held for a week on a belief
+that its name-keyed crash journal had to migrate first, or an empty one would
+double-spend reset credits. Both halves of that were wrong, and both were
+checked only when someone finally read the source: the journal path is a
+hardcoded literal that a module-id rename cannot move, and losing the file
+exposes at most a thirty-minute window against a server that is already
+idempotent on the redemption id. See `rename-window-prep.md` for the corrected
+sizing — the blocking belief failed safe, which is exactly why nothing pressed
+anyone to test it.
 
 ## Why a reference sweep is not enough
 

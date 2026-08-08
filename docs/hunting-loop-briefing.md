@@ -509,10 +509,12 @@ Before calling a class closed:
 | 422 | A codebase with a good convention for test seams | Search for everything doing that job BY ANOTHER MEANS — conventions are enforced by resemblance, so the one member shaped differently is the one that inherits none of the discipline and gets no review |
 | 423 | A gate that must be re-applied at every build or call site | Prefer one that is a property of the ARTEFACT — forgetting a per-site pin is silent, so it will eventually not be applied |
 | 424 | A two-sided error message (expected vs actual) | Safe if INEQUALITY IS THE CONSTRUCTION GUARD, suspect if the caller merely believes they differ — look specifically at ABSENCE paths, where the second value stops existing and gets filled from the first |
-| 425 | A diagnostic you are tempted to treat as wording | Ask whether two states needing OPPOSITE remedies share a wire code — if so the prose IS the interface, and it is read at the worst possible moment |
-| 426 | An enumeration that came back small | Falsify it with a member you KNOW is present — a positive control applied to the SEARCH, not the result, is the difference between a sweep and a reassurance |
-| 427 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 428 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 425 | A diagnostic you are tempted to treat as wording | Ask whether two states needing OPPOSITE remedies are separable by anything THE READER HAS AT THAT MOMENT — a distinction visible in the type system is the active hazard, not a neutral pass, because it is what makes the author feel the case is handled |
+| 426 | An error type demanding a pair of values | Check every path that can supply only one — a not-found path fills the empty slot from the value in scope, the compiler cannot object, and the fix is a variant with ONE field so the degenerate message is unconstructible rather than corrected |
+| 427 | A sweep whose hypothesis lights up everywhere | Distrust the RUNG, not the code — a filter matching most of what it sees has stopped filtering, and a high yield is evidence about the query rather than the repo |
+| 428 | An enumeration that came back small | Falsify it with a member you KNOW is present — a positive control applied to the SEARCH, not the result, is the difference between a sweep and a reassurance |
+| 429 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 430 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

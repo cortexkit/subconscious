@@ -43,7 +43,9 @@ live = set(sys.argv[1].split())
 # being allowlisted.
 SYNTHETIC = {"fixture-module"}
 
-tokens = 0
+matched = 0
+decoded = 0
+skipped: list[tuple[str, str]] = []
 found: dict[str, int] = {}
 offenders: list[tuple[str, str]] = []
 
@@ -55,11 +57,21 @@ def payload(tok: str):
 for path in sorted(glob.glob("docs/**/*.json", recursive=True)):
     text = open(path).read()
     for tok in re.findall(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}", text):
-        tokens += 1
+        matched += 1
         try:
             claims = payload(tok)
-        except Exception:
+        except Exception as exc:
+            # A TOKEN THIS SCAN CANNOT READ IS NOT A TOKEN THAT IS CLEAN.
+            # This arm used to `continue` in silence, which meant a fixture
+            # minted in any shape the decoder does not handle would be walked
+            # past while the rest of the corpus still produced a pass. That is
+            # the found-SOMETHING vs found-EVERYTHING gap: recognising ids in
+            # the tokens it can read says nothing about the ones it skipped,
+            # and a corpus that passes because the offending token was never
+            # visited is indistinguishable from a clean one.
+            skipped.append((path, str(exc)[:60]))
             continue
+        decoded += 1
         for mod in re.findall(r'"module"\s*:\s*"([^"]+)"', json.dumps(claims)):
             if mod in SYNTHETIC:
                 continue
@@ -69,9 +81,19 @@ for path in sorted(glob.glob("docs/**/*.json", recursive=True)):
 
 recognised = sum(c for m, c in found.items() if m in live)
 
-print(f"  tokens decoded: {tokens}")
+# Report matched and decoded SEPARATELY. A single "tokens" number cannot show
+# the gap between what the scan found and what it could actually read.
+print(f"  tokens matched: {matched}")
+print(f"  tokens decoded: {decoded}")
 print(f"  recognised ids: {recognised}")
 print(f"  unknown ids:    {len(offenders)}")
+
+if skipped:
+    print(f"FAIL: {len(skipped)} token(s) matched but could not be decoded.")
+    print("  The scan cannot vouch for a token it never read.")
+    for path, why in skipped[:5]:
+        print(f"  {path}: {why}")
+    sys.exit(1)
 
 # THE POSITIVE CONTROL, AND IT IS THE REASON THIS SCRIPT IS TRUSTWORTHY.
 # "unknown = 0" is produced BOTH by a clean corpus and by a decoder that silently
@@ -79,7 +101,7 @@ print(f"  unknown ids:    {len(offenders)}")
 # written by hand: it reported 16 dead and 0 live, having never once demonstrated
 # it could see a CORRECT id. A corpus with no recognised ids is therefore treated
 # as a broken instrument, not as a pass.
-if tokens and recognised == 0:
+if decoded and recognised == 0:
     print("FAIL: decoded tokens but recognised zero known module ids.")
     print("  Treat this as a BROKEN DECODER rather than a clean corpus:")
     print("  a scan that cannot see a correct id cannot report a wrong one.")

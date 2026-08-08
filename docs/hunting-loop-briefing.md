@@ -598,8 +598,10 @@ Before calling a class closed:
 | 511 | Choosing between a must-disagree control and refusing to report | They partition rather than rank — the control needs a known-different specimen and wins while you are confident; refusal is the only mechanism where no second reading exists at any price |
 | 512 | Cleaning up the artefact you just replaced | Keep it — it is the only known-different specimen you will have, so discarding it silently converts a falsifiable check into an unfalsifiable one that still produces a reading |
 | 513 | A rule you apply to others' work | Apply it to your own instruments in the same session — I spent a day demanding non-vacuity proofs and ran two checks that had never been observed failing |
-| 514 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 515 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 514 | "It needs N fixes" | Ask whether N came from ENUMERATING WHAT THE OUTCOME REQUIRES or from counting what you FOUND — the second survives review because each item is individually real, and it is wrong by omission only |
+| 515 | A live-state row consistent with your diagnosis | Check whether a PREVIOUS defect stranded at the same step — a matching fingerprint is corroboration, and the same fingerprint has more than one author |
+| 516 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 517 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

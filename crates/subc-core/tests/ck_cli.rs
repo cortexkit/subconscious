@@ -185,7 +185,7 @@ async fn module_restart_stop_start_json_drive_supervisor() {
 async fn quota_table_renders_providers_and_used_percent() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
-    let module_id = "ai-provider-quota";
+    let module_id = "insula";
     let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
@@ -235,7 +235,7 @@ async fn quota_table_renders_providers_and_used_percent() {
 async fn quota_filters_by_provider_id() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
-    let module_id = "ai-provider-quota";
+    let module_id = "insula";
     let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
@@ -261,7 +261,7 @@ async fn quota_filters_by_provider_id() {
 async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
-    let module_id = "ai-provider-quota";
+    let module_id = "insula";
     let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
@@ -283,7 +283,7 @@ async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
 async fn quota_json_emits_wrapped_reply_verbatim() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
-    let module_id = "ai-provider-quota";
+    let module_id = "insula";
     let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 

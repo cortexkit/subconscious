@@ -580,8 +580,10 @@ Before calling a class closed:
 | 493 | A blocking premise two parties assert independently | Agreement is not corroboration when both inferred it from the same neighbouring case — ours cost two days and was falsifiable in one command against the live process |
 | 494 | A symptom you have just fixed one cause of | Look for a SECOND cause of the same symptom — a stale copy on PATH and a compiled constant both produced "dials the old id", and fixing either alone leaves it broken while looking deployed |
 | 495 | A binary on PATH | Check whether it is a symlink or a separate copy — a copy makes every future deploy to the canonical path invisible, and the failure looks like the deploy not taking |
-| 496 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 497 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 496 | A blocking premise that has never been crossed | Ask whether being WRONG about it would have caused an incident — a protective premise ("do not do X or it breaks") fails safe, so nothing bad happens while it stands and nothing pressures anyone to test it; a gate nobody has tried to cross is a gate nobody has measured |
+| 497 | A constant you classified as a DEFINITION | Check whether the same string is also a TARGET inside its own crate — one name in two roles, and the caller sweep that enumerates external consumers will not list the owning repo's own tools |
+| 498 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 499 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

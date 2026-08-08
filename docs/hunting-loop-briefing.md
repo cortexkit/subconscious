@@ -10456,3 +10456,43 @@ tokens count"* is a rule about the world. A pattern written to describe the data
 in front of you silently promotes the first into the second, and the promotion is
 invisible because the pattern **looks like a specification**. Nobody chooses that
 assumption, which is exactly why nobody re-examines it.
+
+### A check that passes on both the good and the bad artifact is not a check of the property you care about
+
+Two instances in one evening, different seats, different mechanisms, same shape:
+**the observation agrees with the hypothesis and would also agree with its
+negation.**
+
+**Instance one — a digest with no discriminating power.** A module owner staged a
+replacement binary after discovering the previous one carried illegal tool names,
+the defect that had taken the fleet's tool surface down. The verification was to
+recompute an embedded lockfile digest against the repo. It matched exactly.
+
+Then the control: the digest embedded in the **superseded** artifact. Byte-identical.
+`Cargo.lock` had not changed across those commits, so the digest is the same in
+both builds — the correct check, run correctly, **passing just as cleanly on the
+defective artifact**. It measures the dependency graph; the defect was a rename,
+which does not touch it. An instrument insensitive to the change in question, its
+agreement read as assurance.
+
+What actually discriminated: a count of the illegal string (1 vs 0), with a
+control count of a string present in both to prove the probe could see anything.
+
+**Instance two — a counter reading satisfied by two opposite states.** A proposed
+acceptance criterion was "the restart budget decays: an old failure ages out."
+A single reading of zero is satisfied by *a failure was recorded and aged out*
+**and** by *no failure was ever recorded*. On a quiet fleet the second is more
+likely, because the deploy resets the counter — so the natural post-deploy state
+is exactly the one that cannot discriminate. It needs two readings: at least one
+first as the positive control, then zero, with no restart in between.
+
+The practice, and it costs one command: **before trusting a check, run it against
+something you know is bad.** If it passes, the check is measuring something else.
+Choose the instrument by asking what the change actually touched, not by what is
+convenient to compute.
+
+Related and worse: **a deploy that resets state as a side effect manufactures its
+own success signal.** Restarting the daemon clears every module's restart budget,
+so a fully-broken fix and a correct one both produce a quiet fleet afterwards —
+and the quiet is caused by the restart in both cases. Any acceptance built on
+absence-of-symptom is measuring the restart. Assert that the new mechanism *ran*.

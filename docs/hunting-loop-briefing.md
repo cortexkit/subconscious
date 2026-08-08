@@ -10598,3 +10598,54 @@ Two remedies, and prefer the second:
 Record luck as luck. A clean result from an accident says nothing about the next
 edit, and writing it down as a pass lets the next person inherit a false sense of
 a protected tree.
+
+### A parked blocker is a cost claim with no expiry date
+
+Third lifecycle of the unmeasured-cost claim, and the worst of the three because
+nothing can catch it.
+
+- An assumption **wrong when made** — a stub believed incapable of producing the
+  state. Catchable by checking.
+- An assumption **contradicted by existing code** — a harness already building the
+  state. Catchable by looking.
+- A claim that was **right when written and became false without any event** —
+  a note parking a proof on "needs a live vendor token", where the vendor
+  reasoning was correct but the dependency was never real, since a stubbed error
+  produces the same status the code parses.
+
+The third has no transition to notice. **A parked blocker's entire function is to
+stop you looking, so the mechanism that would re-examine it is the one it
+disables.**
+
+Operational form: **a parked item must record what would make it unblocked, not
+what blocks it.** "Needs a live Linear token" cannot expire. "Needs a 401 from any
+source, live or stubbed" is checkable in seconds and would have died months ago.
+
+### A trait default that returns a value answers on the implementor's behalf
+
+An empty default body (`fn on_event(&self) {}`) is a silent opt-out no implementor
+must acknowledge — the same class as a bare `except: continue` or a discarded
+`let _ =`: the mechanism exists, the call happens, the effect is dropped by
+something that reads as ordinary.
+
+**A default that returns a value is worse.** An empty body answers *nothing*; a
+returning default answers *something*, on behalf of code that was never written.
+
+Worked instance: `ModuleHandler::health()` defaults to `HealthReport::ok()`. A
+module that never implemented health is **indistinguishable on the wire** from one
+that measured itself and found nothing wrong — and the supervisor acts on the
+difference, since a healthy report suppresses escalation while an absent
+implementation means nothing was checked. Same shape as the outage that cost the
+fleet its tool surface twice in one day, one layer up: there the daemon could not
+distinguish *busy* from *dead*; here the trait cannot distinguish *healthy* from
+*never implemented*.
+
+**Sweeping for it:** grepping `fn ... {}` finds only the empty form. That pattern
+was taken from a description of one defect rather than from the property, and it
+is structurally blind to the returning form. Widen it to any default with a body,
+and read what each one asserts.
+
+Where the default is legitimately optional, the fix is at the only place an
+implementor reads — the doc comment naming what the default asserts and which
+implementors are at risk. Record that as guidance, which is the weakest instrument
+available, rather than as closure.

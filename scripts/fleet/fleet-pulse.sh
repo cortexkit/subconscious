@@ -310,10 +310,29 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
     # live: "gen 99 has no upload sidecar yet" printed for ten minutes while gen 97
     # was uploading at ~10 objects/min, so a recovering backup read as a dead one.
     # MAKING TWO SELECTION RULES CONSISTENT IS NOT THE SAME AS MAKING EITHER CORRECT.
-    drain_seq=$(sqlite3 "$ENGRAM_STORE" \
-      "SELECT MIN(device_seq) FROM generations WHERE published = 0;" 2>/dev/null)
-    drain_pub=$(sqlite3 "$ENGRAM_STORE" \
-      "SELECT lower(hex(pub_id)) FROM generations WHERE device_seq = ${drain_seq:-0};" 2>/dev/null)
+    # KEEP THE EXIT STATUS. These ran with 2>/dev/null and no status check, so a
+    # query that FAILED -- renamed column, locked store, missing table -- yielded
+    # an empty string, which ${drain_seq:-0} then turned into a lookup for
+    # device_seq 0. That returns nothing, sidecar stays empty, and the branch
+    # below prints "publish not started": a confident operational claim, in the
+    # right vocabulary, from an instrument that never ran.
+    # A LOUD FAILURE IS ONLY LOUD WHERE SOMEONE HEARS IT. sqlite exits nonzero on
+    # a bad column; 2>/dev/null plus a defaulted substitution is what converts
+    # that fail-closed error into this script's fail-open silence.
+    drain_fail=""
+    if ! drain_seq=$(sqlite3 "$ENGRAM_STORE" \
+      "SELECT MIN(device_seq) FROM generations WHERE published = 0;" 2>&1); then
+      drain_fail="$drain_seq"
+      drain_seq=""
+      drain_pub=""
+    elif ! drain_pub=$(sqlite3 "$ENGRAM_STORE" \
+      "SELECT lower(hex(pub_id)) FROM generations WHERE device_seq = ${drain_seq:-0};" 2>&1); then
+      drain_fail="$drain_pub"
+      drain_pub=""
+    fi
+    if [ -n "$drain_fail" ]; then
+      echo "  BACKUP PROBE FAILED (store unreadable or schema moved): $drain_fail"
+    fi
     sidecar=""
     if [ -n "$drain_pub" ]; then
       sidecar=$(ls -t "$HOME/.local/share/cortexkit/engram/staging/$drain_pub"/uploaded-*.hex 2>/dev/null | head -1)
@@ -347,7 +366,13 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
     else
       # No sidecar on the DRAIN TARGET means uploading has not begun -- distinct
       # from begun-and-stalled, and the remedies differ.
-      echo "  gen ${drain_seq:-?} (oldest unpublished) has no upload sidecar yet -- publish not started"
+      # Reachable now only when the queries SUCCEEDED, so an absent sidecar is a
+      # fact about the generation rather than about the probe.
+      if [ -n "$drain_fail" ]; then
+        echo "  drain target unknown -- publish state NOT REPORTED (probe failed above)"
+      else
+        echo "  gen ${drain_seq:-?} (oldest unpublished) has no upload sidecar yet -- publish not started"
+      fi
     fi
   else
     echo "  gen $maxpub published ($pub/$total)"

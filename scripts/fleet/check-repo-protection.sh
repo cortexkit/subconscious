@@ -108,7 +108,13 @@ done
   # counts being zero is the same reading in both cases; only the denominator
   # tells them apart, so the denominator has to gate the sentence.
   if [ "$examined" -eq 0 ]; then
+    # NON-ZERO, because a caller reads the exit code and not the tail. When this
+    # guard was added it only printed, which made it advice rather than a check:
+    # the run still exited 0, so anything invoking this script saw a clean fleet
+    # from a run that examined nothing -- the exact defect the message describes,
+    # committed inside the fix for it.
     echo "NO REPOS EXAMINED -- discovery found nothing, so this run proves nothing"
+    exit 2
   elif [ $((dead+none+stale)) -eq 0 ]; then
     echo "every repo has a reachable remote and nothing local-only"
   fi

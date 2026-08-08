@@ -630,8 +630,11 @@ Before calling a class closed:
 | 543 | A closure criterion you are about to deploy against | Confirm the defect is HAPPENING at deploy time — bouncing into a quiet window buys a green reading with no discriminating power, because post-deploy zero is indistinguishable from the pre-deploy zero you never checked |
 | 544 | A log path you have quoted before | Ask the supervisor where it writes — a path that does not exist greps empty, and empty reads as a count; every earlier claim measured against it was about a missing file |
 | 545 | A search literal recalled rather than copied | Take it from the file or the diff — paraphrase reads 0 of two million lines and looks like absence; two seats made this same error within an hour, on each other's evidence |
-| 546 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 547 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 546 | A failure type that is a struct with one string field | Enumerate its construction sites — fifteen call sites that each KNOW what they observed collapse into one message, and the decision downstream cannot recover the distinction the callers already had |
+| 547 | Two signals treated with equal weight | Ask which is PROOF and which is ABSENCE OF EVIDENCE — a dead lane proves death, a timeout proves nothing, and under load the absence fires far more often, so the weakest signal drives the most decisions |
+| 548 | A timeout path that cancels its own waiter | Check what a LATE answer would land on — cancelling deletes the record of the question, so the reply that would prove the peer alive is dropped as unrecognised, one line before the timeout is used as evidence of death |
+| 549 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 550 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

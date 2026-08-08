@@ -546,8 +546,10 @@ Before calling a class closed:
 | 459 | An empty artifact left on disk | Ask whether it means "nothing was found" or "nothing was looked at" — the first is a legitimate empty state worth persisting, the second is the defect |
 | 460 | A fix prompted by a lesson about one channel | Enumerate the OTHER channels — a fix inherits the frame of the lesson that prompted it, so being told about a channel actively blinds you to its neighbour; ask what a caller sees on stdout, in the exit code, and in any file left behind |
 | 461 | A count you have quoted more than once | ENUMERATE it — a running total carried across a conversation drifts upward and reads as a measurement, and a number backed by real work is credible rather than checkable; I published three different figures for one set of nine |
-| 462 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 463 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 462 | The POSITIVE fixture in a two-branch verification | Prove it took as well — a broken positive fixture makes the success branch look like the failure branch, so both assertions collapse into one observation and the report reads "both branches verified" having exercised neither |
+| 463 | An exit code read after a pipe | It is the LAST command's status — piping a tool through sed reports sed's success, which is a false all-clear from an instrument you just built |
+| 464 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 465 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

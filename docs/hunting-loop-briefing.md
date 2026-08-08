@@ -619,8 +619,10 @@ Before calling a class closed:
 | 532 | A defect visible in exactly one signal | Count how many surfaces are QUIET — disk flat, health `ready`, only raw log volume loud; and if the loud one is about to be rate-limited, that signal must survive as a count or the defect becomes unobservable |
 | 533 | A correction you are about to send | Check it addresses the SAME SUBJECT as the claim — I answered "my module's contribution is trivial" with an aggregate figure; both true, correction was noise, and only measuring attribution showed the component was 0.9% |
 | 534 | A census reporting zero findings | Confirm it still finds the KNOWN-OLD ones — a guard that holds and a census that stopped looking both report zero, and only the surviving historical hits distinguish them |
-| 535 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 536 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 535 | An artifact sent to support a claim | Check the DISCRIMINATING FACT is IN it — a census file listed ten losses with no dates, so it could not show they predated the guard; the dating lived in the covering message, which scrolls away while the file persists and reads as evidence AGAINST the guard |
+| 536 | A size threshold standing in for a semantic property | State the blind spot in the artifact — a shrink census cannot see a normative loss that did not shrink the bytes, and the premise line otherwise implies completeness |
+| 537 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 538 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

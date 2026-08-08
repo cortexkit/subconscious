@@ -54,9 +54,46 @@ def payload(tok: str):
     body += "=" * (-len(body) % 4)
     return json.loads(base64.urlsafe_b64decode(body))
 
+TOKEN_RE = r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"
+
+def walk_strings(node):
+    """Yield every string value in a parsed JSON document.
+
+    A SECOND DISCOVERY MECHANISM WITH A DIFFERENT BLIND SPOT FROM THE REGEX
+    SWEEP, which is the only thing that makes a second count worth having.
+    Two counts derived from one mechanism move together and agree while both
+    are wrong -- they duplicate rather than cross-check.
+
+    The two differ concretely: this walk sees a token that is a string value in
+    its own right and MISSES one embedded inside a longer string; the raw-byte
+    sweep below sees both. So a token the walk skips still lands in the sweep,
+    the counts disagree, and the mismatch fires. Neither mechanism checks the
+    OTHER's shape assumption -- a token in a form matching neither (CKCRED and
+    CALLO constructed an `alg:none` with an empty third segment) is invisible to
+    both, and that limit is known rather than closed.
+    """
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from walk_strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from walk_strings(v)
+
+walk_seen = 0
+sweep_seen = 0
+
 for path in sorted(glob.glob("docs/**/*.json", recursive=True)):
     text = open(path).read()
-    for tok in re.findall(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}", text):
+    sweep_seen += len(re.findall(TOKEN_RE, text))
+    try:
+        walk_seen += sum(1 for s in walk_strings(json.loads(text)) if re.fullmatch(TOKEN_RE, s))
+    except Exception:
+        # An unparseable document is not a document without tokens. Count it as
+        # a walk failure rather than as zero, so the mismatch below fires.
+        pass
+    for tok in re.findall(TOKEN_RE, text):
         matched += 1
         try:
             claims = payload(tok)
@@ -83,10 +120,16 @@ recognised = sum(c for m, c in found.items() if m in live)
 
 # Report matched and decoded SEPARATELY. A single "tokens" number cannot show
 # the gap between what the scan found and what it could actually read.
-print(f"  tokens matched: {matched}")
+print(f"  tokens matched: {matched}  (sweep {sweep_seen} / walk {walk_seen})")
 print(f"  tokens decoded: {decoded}")
 print(f"  recognised ids: {recognised}")
 print(f"  unknown ids:    {len(offenders)}")
+
+if sweep_seen != walk_seen:
+    print(f"FAIL: the two discovery mechanisms disagree ({sweep_seen} vs {walk_seen}).")
+    print("  One of them is missing tokens the corpus contains. This is a true")
+    print("  positive about the SCAN, not about the corpus -- fix the scan first.")
+    sys.exit(1)
 
 if skipped:
     print(f"FAIL: {len(skipped)} token(s) matched but could not be decoded.")

@@ -633,8 +633,11 @@ Before calling a class closed:
 | 546 | A failure type that is a struct with one string field | Enumerate its construction sites — fifteen call sites that each KNOW what they observed collapse into one message, and the decision downstream cannot recover the distinction the callers already had |
 | 547 | Two signals treated with equal weight | Ask which is PROOF and which is ABSENCE OF EVIDENCE — a dead lane proves death, a timeout proves nothing, and under load the absence fires far more often, so the weakest signal drives the most decisions |
 | 548 | A timeout path that cancels its own waiter | Check what a LATE answer would land on — cancelling deletes the record of the question, so the reply that would prove the peer alive is dropped as unrecognised, one line before the timeout is used as evidence of death |
-| 549 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 550 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 549 | A threshold you are about to pick by judgement | Set it from a measured tail instead — the value is not accuracy but DEFENSIBILITY: a taste-chosen number has no answer when it kills something healthy, and no signal when the tail moves |
+| 550 | A fix that also measures its own parameter | Ship the measuring half FIRST and leave the parameter unset — a placeholder constant with a comment promising to tune it later is a comment nobody reads |
+| 551 | Closure evidence that is an absence over an uncontrolled window | Prefer an injected test that is falsifiable on demand — "no failures this week" cannot separate a working fix from a week that happened to be easy, and the aggressor removing itself looks identical to the defect being fixed |
+| 552 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 553 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

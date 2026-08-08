@@ -1622,6 +1622,7 @@ impl ControlHandler {
                 added,
                 removed,
                 changed_pending_reload,
+                enabled_changes: enabled_changes.iter().cloned().collect(),
                 unchanged,
                 preview: true,
             });
@@ -1690,6 +1691,7 @@ impl ControlHandler {
             added,
             removed,
             changed_pending_reload,
+            enabled_changes: enabled_changes.iter().cloned().collect(),
             unchanged,
             preview: false,
         })

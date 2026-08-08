@@ -241,6 +241,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     added: vec!["new-tools".to_string()],
                     removed: vec!["old-tools".to_string()],
                     changed_pending_reload: vec!["aft-tools".to_string()],
+                    enabled_changes: vec!["paused-tools".to_string()],
                     unchanged: 3,
                     preview: false,
                 },

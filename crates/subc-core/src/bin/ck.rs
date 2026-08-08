@@ -626,10 +626,16 @@ async fn health_detail(
             println!("  {detail}");
         }
     }
-    if let Some(metrics) = value.get("metrics") {
-        if !metrics.is_null() {
-            print_metrics_tree(metrics, 1);
-        }
+    // Say so when a module published nothing, rather than printing a bare
+    // status line. The operator ran this verb to see metrics, so silence is
+    // read as "nothing to report" when it is equally the shape of a module
+    // that publishes no metrics at all and of a reporting path that regressed.
+    // Naming the absence does not distinguish those two, but it stops the
+    // third reading -- that metrics were seen and were unremarkable -- which
+    // is the one a bare `module: ok` invites.
+    match value.get("metrics") {
+        Some(metrics) if !metrics.is_null() => print_metrics_tree(metrics, 1),
+        _ => println!("  (module published no metrics on this probe)"),
     }
     Ok(())
 }

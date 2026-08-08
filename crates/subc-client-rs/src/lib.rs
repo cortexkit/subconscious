@@ -506,7 +506,26 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// Called after an accepted bind ACK is queued and the handle is installed.
     async fn on_bound(&self, _handle: &RouteHandle) {}
 
-    /// Return cheap in-memory health for the module. The default reports healthy.
+    /// Return cheap in-memory health for the module.
+    ///
+    /// THE DEFAULT ASSERTS HEALTH ON BEHALF OF A MODULE THAT NEVER WROTE ANY.
+    /// A module that has not implemented this is indistinguishable on the wire
+    /// from one that measured itself and found nothing wrong -- and the daemon
+    /// acts on the difference, since a healthy report suppresses escalation
+    /// while an absent implementation means nothing was ever checked.
+    ///
+    /// It stays a default because health is genuinely optional: a module that
+    /// advertises no health capability is never probed, so the value is unread
+    /// for those. The hazard is the module that DOES advertise health and
+    /// inherits this -- it answers "ok" forever, including while wedged.
+    ///
+    /// Per Health-Path-Rule v3 an implementation must derive its status
+    /// mechanically from signals the dispatch path stamps (a monotonic
+    /// heartbeat, oldest-queued age), never from its own opinion, and must not
+    /// take a blocking lock, touch disk, or spawn a subprocess on this path.
+    /// A health reply that execs queues behind the host's slowest shared
+    /// resource -- which is exactly the resource degraded under the conditions
+    /// being probed.
     async fn health(&self) -> HealthReport {
         HealthReport::ok()
     }

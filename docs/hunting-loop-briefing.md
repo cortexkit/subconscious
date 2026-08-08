@@ -526,8 +526,11 @@ Before calling a class closed:
 | 439 | "Their half is already in place" | MERGED is a fact about a repository, IN PLACE is a fact about a running process — verify the deployed artifact, because an ordering constraint satisfied on paper and violated in production is worse than one obviously unmet, the paper being what anyone checks |
 | 440 | A verification that came back EMPTY | Run it against something you KNOW is good — `codesign -d` without `-vv` prints no identifier and writes to stderr, so a plain grep reports "unsigned" for every binary; the same shape with an inverted test fails CLOSED and passes a bad artifact silently |
 | 441 | A claim about someone else's deployed state | The claim belongs to whoever holds the INSTRUMENTS — for your own component the check is nearly free, for theirs the repository fact is the only one visible and it substitutes silently; state your own deployment status unasked |
-| 442 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 443 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 442 | An assertion phrased as an ABSENCE | Phrase it as a PRESENCE where there is a choice — the direction a check fails in belongs to the phrasing, not the check, so the same broken plumbing yields a recoverable false alarm or an investigation-ending false all-clear depending on how the test reads |
+| 443 | A count produced by EXCLUDING what you do not want | It cannot report its own failure — an unreadable source yields 0, and 0 is a legal value that renders as a real reading |
+| 444 | Your own diagnosis of a broken instrument | Check whether the fault is COMPOUND — fixing one of two independent causes reproduces the original wrong answer with more confidence attached |
+| 445 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 446 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

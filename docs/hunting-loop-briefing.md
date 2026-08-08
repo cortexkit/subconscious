@@ -605,8 +605,10 @@ Before calling a class closed:
 | 518 | "It stopped moving, so it finished" | A stall looks identical — wait for the terminal event, not the absence of progress |
 | 519 | `ps -o %cpu` for "what is it doing now" | Wrong quantity — it is a decayed average over process lifetime; measured against a cputime delta it read 2.4% against a true 32.8%, then 65.3% against a true 11.1%, so the bias is not even consistent in direction |
 | 520 | A trigger hypothesis tested on episode windows | It will confirm itself — you only sample when something breaks, so the discriminating evidence is QUIET PERIODS BEING CLEAN, not activity near failures |
-| 521 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 522 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 521 | A risk characterisation you are about to relay | Attach a NUMBER or refuse to pass it on — the conclusion fits in a message and the evidence does not, so it propagates faster than its measurement and the relayer is least equipped to check it |
+| 522 | Two independent blockers on one piece of work | Suspect both — where the cost of a wrong blocker is only DELAY, nothing generates evidence against it, so false blockers accumulate rather than being caught |
+| 523 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 524 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

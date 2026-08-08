@@ -1316,15 +1316,106 @@ impl HealthProbeRuntime {
     }
 }
 
+/// What a failed health probe actually OBSERVED, kept apart from how it reads.
+///
+/// This was a struct with a single `message: String`, and every one of the
+/// fifteen construction sites collapsed into it. Each site knows exactly what it
+/// saw -- the lane is gone, the module did not answer in time, the module
+/// answered with the wrong thing -- and `handle_health_probe_failure` then
+/// treated all of them identically: increment a counter, compare to a threshold,
+/// restart the module. THE DISTINCTION EXISTED AT EVERY CALL SITE AND WAS
+/// DESTROYED BEFORE THE DECISION THAT NEEDED IT.
+///
+/// The distinction that matters is not severity, it is EVIDENTIAL WEIGHT:
+///
+/// * `LaneDead` is PROOF. The module's control connection is gone; nothing will
+///   answer on it again.
+/// * `NoAnswer` is ABSENCE OF EVIDENCE. It is consistent with a wedged module
+///   AND with a perfectly healthy one that lost a CPU race -- which is what
+///   happens under machine load, and is how this supervisor killed a healthy
+///   module three times in one day.
+/// * `BadAnswer` proves the module is ALIVE. It replied; the reply was wrong.
+///   Restarting on it is defensible, but it is not the silence case and should
+///   never be counted as one.
+/// * `Misconfigured` is a daemon-side fault. The module has not been asked
+///   anything, so it cannot be evidence about the module at all.
+///
+/// The asymmetry is the whole point: under saturation the WEAKEST signal is the
+/// one that fires most often, and while every variant collapsed into one string
+/// it carried the same weight as the strongest.
+#[derive(Debug)]
+enum HealthProbeEvidence {
+    /// The module's control lane is gone. Proof of death.
+    LaneDead,
+    /// No reply within the deadline. Proves nothing about the module's state.
+    NoAnswer,
+    /// The module replied, but not with a usable health report. Proves it is alive.
+    BadAnswer,
+    /// The daemon could not ask. Says nothing about the module.
+    Misconfigured,
+}
+
 #[derive(Debug)]
 struct HealthProbeError {
+    evidence: HealthProbeEvidence,
     message: String,
 }
 
 impl HealthProbeError {
-    fn new(message: impl Into<String>) -> Self {
+    fn lane_dead(message: impl Into<String>) -> Self {
+        Self::with(HealthProbeEvidence::LaneDead, message)
+    }
+
+    fn no_answer(message: impl Into<String>) -> Self {
+        Self::with(HealthProbeEvidence::NoAnswer, message)
+    }
+
+    fn bad_answer(message: impl Into<String>) -> Self {
+        Self::with(HealthProbeEvidence::BadAnswer, message)
+    }
+
+    fn misconfigured(message: impl Into<String>) -> Self {
+        Self::with(HealthProbeEvidence::Misconfigured, message)
+    }
+
+    fn with(evidence: HealthProbeEvidence, message: impl Into<String>) -> Self {
         Self {
+            evidence,
             message: message.into(),
+        }
+    }
+
+    /// Whether this observation is proof the module cannot serve.
+    ///
+    /// Only `LaneDead` qualifies. `NoAnswer` is deliberately excluded: it is the
+    /// variant that fires under CPU starvation, and treating it as proof is the
+    /// defect this enum exists to make impossible to reintroduce silently.
+    ///
+    /// NOT YET CONSULTED BY THE RESTART DECISION, deliberately. Requiring proof
+    /// to restart also needs a bound for the case it excludes -- a genuinely
+    /// wedged module, alive but never answering -- and that bound must come from
+    /// the distribution of real late-answer latencies, which nothing measures
+    /// yet. Landing the classification first makes the later change a one-line
+    /// decision against evidence that already exists, rather than two unproven
+    /// changes at once.
+    #[allow(dead_code)]
+    fn is_proof_of_death(&self) -> bool {
+        matches!(self.evidence, HealthProbeEvidence::LaneDead)
+    }
+
+    /// Short stable label for logs and the health snapshot.
+    ///
+    /// An operator reading `ck health` currently cannot tell "the module is gone"
+    /// from "the module did not answer in five seconds", because both render as
+    /// prose in the same field. These labels are what make the two
+    /// distinguishable at a glance, and they are what a later restart-policy
+    /// change will be argued from.
+    fn label(&self) -> &'static str {
+        match self.evidence {
+            HealthProbeEvidence::LaneDead => "lane-dead",
+            HealthProbeEvidence::NoAnswer => "no-answer",
+            HealthProbeEvidence::BadAnswer => "bad-answer",
+            HealthProbeEvidence::Misconfigured => "daemon-misconfigured",
         }
     }
 }
@@ -1379,14 +1470,18 @@ async fn probe_module_health(
     runtime: &SupervisorRuntimeConfig,
 ) -> Result<HealthReport, HealthProbeError> {
     let Some(forwarding) = runtime.forwarding.as_ref() else {
-        return Err(HealthProbeError::new(
+        return Err(HealthProbeError::misconfigured(
             "supervisor was not configured with a forwarding table",
         ));
     };
     let deadline = Instant::now() + runtime.health.deadline;
     let pending = forwarding
         .begin_module_control_rpc_for(&spec.module_id, MODULE_CONTROL_OP_HEALTH_CHECK, deadline)
-        .map_err(|err| HealthProbeError::new(format!("failed to begin health.check RPC: {err}")))?;
+        .map_err(|err| {
+            // The endpoint is not registered, so there is no live control lane to
+            // ask. That is the module being absent, not slow.
+            HealthProbeError::lane_dead(format!("failed to begin health.check RPC: {err}"))
+        })?;
     let PendingModuleControlRpc {
         endpoint,
         module_sink,
@@ -1394,8 +1489,9 @@ async fn probe_module_health(
         corr,
         receiver,
     } = pending;
-    let body = serde_json::to_vec(&ModuleControlRequest::HealthCheck {})
-        .map_err(|err| HealthProbeError::new(format!("failed to encode health.check: {err}")))?;
+    let body = serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).map_err(|err| {
+        HealthProbeError::misconfigured(format!("failed to encode health.check: {err}"))
+    })?;
     let frame = Frame::build_with_version(
         negotiated_ver,
         FrameType::Request,
@@ -1405,7 +1501,9 @@ async fn probe_module_health(
         corr,
         body,
     )
-    .map_err(|err| HealthProbeError::new(format!("failed to build health.check frame: {err}")))?;
+    .map_err(|err| {
+        HealthProbeError::misconfigured(format!("failed to build health.check frame: {err}"))
+    })?;
 
     // The enqueue itself must be bounded by the probe deadline: FrameSink.send
     // blocks waiting for capacity when the module's egress queue is full, and an
@@ -1416,46 +1514,61 @@ async fn probe_module_health(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
-            return Err(HealthProbeError::new(format!(
+            // A closed sink means the module's egress channel is gone -- the
+            // receiving half is dropped when its connection tears down. Proof.
+            return Err(HealthProbeError::lane_dead(format!(
                 "failed to send health.check: {err}"
             )));
         }
         Err(_elapsed) => {
             let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
-            return Err(HealthProbeError::new(
+            // A full egress queue means the module is not draining its socket, which
+            // is consistent with a wedged module AND with one whose reader is merely
+            // starved. Silence, not proof.
+            return Err(HealthProbeError::no_answer(
                 "health.check send timed out before enqueue (module egress full)",
             ));
         }
     }
 
     match timeout_at(deadline, receiver).await {
+        // Each arm records WHAT WAS OBSERVED. Four of them are the module
+        // demonstrably answering -- rejected, non-health, malformed, wrong op --
+        // and those prove it is alive even though the probe failed.
         Ok(Ok(ModuleControlRpcOutcome::Response(response))) => {
             response.health_report().ok_or_else(|| {
-                HealthProbeError::new("health.check RPC returned a non-health response")
+                HealthProbeError::bad_answer("health.check RPC returned a non-health response")
             })
         }
-        Ok(Ok(ModuleControlRpcOutcome::Rejected(body))) => Err(HealthProbeError::new(format!(
-            "health.check rejected: {}",
-            body.message
-        ))),
-        Ok(Ok(ModuleControlRpcOutcome::ModuleGone(message))) => Err(HealthProbeError::new(message)),
+        Ok(Ok(ModuleControlRpcOutcome::Rejected(body))) => Err(HealthProbeError::bad_answer(
+            format!("health.check rejected: {}", body.message),
+        )),
+        Ok(Ok(ModuleControlRpcOutcome::ModuleGone(message))) => {
+            Err(HealthProbeError::lane_dead(message))
+        }
         Ok(Ok(ModuleControlRpcOutcome::MalformedResponse(message))) => {
-            Err(HealthProbeError::new(message))
+            Err(HealthProbeError::bad_answer(message))
         }
         Ok(Ok(ModuleControlRpcOutcome::UnexpectedOp { expected, actual })) => {
-            Err(HealthProbeError::new(format!(
+            Err(HealthProbeError::bad_answer(format!(
                 "expected module-control op '{expected}', got '{actual}'"
             )))
         }
-        Ok(Ok(ModuleControlRpcOutcome::DeadlineElapsed)) => Err(HealthProbeError::new(
+        // A LATE ANSWER IS PROOF OF LIFE. This arm is currently UNREACHABLE from
+        // the health path: the `Err(_)` arm below cancels the waiter at deadline,
+        // which deletes the pending record a late reply would land on, so the
+        // reply arrives at a map that has no memory of the question and is
+        // dropped. Classified correctly here so that replacing that cancel with a
+        // tombstone needs no second decision about what a late answer means.
+        Ok(Ok(ModuleControlRpcOutcome::DeadlineElapsed)) => Err(HealthProbeError::bad_answer(
             "module answered health.check after its daemon deadline",
         )),
-        Ok(Err(_)) => Err(HealthProbeError::new(
+        Ok(Err(_)) => Err(HealthProbeError::misconfigured(
             "health.check waiter was canceled before the module responded",
         )),
         Err(_) => {
             let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
-            Err(HealthProbeError::new(format!(
+            Err(HealthProbeError::no_answer(format!(
                 "module did not answer health.check within {:?}",
                 runtime.health.deadline
             )))
@@ -1518,7 +1631,11 @@ async fn handle_health_probe_failure(
 ) {
     let threshold = runtime.health.failure_threshold.max(1);
     let mut failures = 0;
-    let detail = err.to_string();
+    // Carry the evidence class into the operator-visible detail. Without it,
+    // "module did not answer within 5s" and "the control lane is gone" are two
+    // prose strings in the same field, and the reader has to know the codebase to
+    // tell which one is proof of anything.
+    let detail = format!("[{}] {err}", err.label());
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.health.last_probe_ms = Some(now_ms);
         state.health.consecutive_failures = state.health.consecutive_failures.saturating_add(1);
@@ -1532,6 +1649,7 @@ async fn handle_health_probe_failure(
             module_id = %spec.module_id,
             consecutive_failures = failures,
             threshold,
+            evidence = err.label(),
             detail = %detail,
             "health.check probe failed"
         );
@@ -1542,10 +1660,14 @@ async fn handle_health_probe_failure(
         state.state = ModuleState::Unresponsive;
         state.health.status = SupervisorHealthStatus::Unresponsive;
     });
+    // The evidence class is logged at the kill site because this is the line an
+    // operator reads after an unexplained restart. A streak of `no-answer` under
+    // machine load is the known false-positive shape; a `lane-dead` is not.
     if runtime.health.critical {
         error!(
             module_id = %spec.module_id,
             status = "unresponsive",
+            evidence = err.label(),
             detail = %detail,
             "critical module health alert"
         );
@@ -1553,6 +1675,7 @@ async fn handle_health_probe_failure(
         warn!(
             module_id = %spec.module_id,
             status = "unresponsive",
+            evidence = err.label(),
             detail = %detail,
             "module health threshold breached"
         );
@@ -3059,6 +3182,59 @@ fn lock_snapshot(
     snapshot
         .lock()
         .map_err(|_| SuperviseError::StatePoisoned { module_id: None })
+}
+
+#[cfg(test)]
+mod health_evidence_tests {
+    use super::{HealthProbeError, HealthProbeEvidence};
+    use std::collections::HashSet;
+
+    /// The evidential asymmetry, asserted rather than described.
+    ///
+    /// Exactly ONE observation is proof a module cannot serve, and the one that
+    /// fires under CPU starvation is not it. Before the split, all fifteen
+    /// construction sites collapsed into a single String, so a timeout carried the
+    /// same weight as a dead lane -- which is how a healthy module was restarted
+    /// three times in one day.
+    #[test]
+    fn only_a_dead_lane_is_proof_of_death() {
+        assert!(HealthProbeError::lane_dead("gone").is_proof_of_death());
+        // Three non-proof classes, each for a different reason: silence is
+        // consistent with health, a bad answer proves the module ALIVE, and a
+        // daemon-side fault never reached the module at all.
+        assert!(!HealthProbeError::no_answer("timed out").is_proof_of_death());
+        assert!(!HealthProbeError::bad_answer("garbage").is_proof_of_death());
+        assert!(!HealthProbeError::misconfigured("no table").is_proof_of_death());
+    }
+
+    /// Labels must be distinct, or the operator-facing distinction is cosmetic.
+    ///
+    /// A shared label renders two different observations identically in the line an
+    /// operator reads after an unexplained restart -- the exact confusion this
+    /// change removes.
+    #[test]
+    fn every_evidence_class_has_a_distinct_label() {
+        let labels = [
+            HealthProbeError::lane_dead("").label(),
+            HealthProbeError::no_answer("").label(),
+            HealthProbeError::bad_answer("").label(),
+            HealthProbeError::misconfigured("").label(),
+        ];
+        let unique: HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "labels collided: {labels:?}");
+    }
+
+    /// The class is additional information, not a replacement.
+    ///
+    /// An operator needs both "this was silence" and the specific text saying how
+    /// long we waited; a classification that swallowed the message would trade one
+    /// missing distinction for another.
+    #[test]
+    fn classification_preserves_the_original_message() {
+        let err = HealthProbeError::no_answer("module did not answer within 5s");
+        assert_eq!(err.to_string(), "module did not answer within 5s");
+        assert!(matches!(err.evidence, HealthProbeEvidence::NoAnswer));
+    }
 }
 
 #[cfg(test)]

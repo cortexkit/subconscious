@@ -523,8 +523,9 @@ Before calling a class closed:
 | 436 | A fix to a REFUSAL | Something behind it has never been exercised — a refusal at stage N makes every later stage unobservable, so verify by EXECUTION and treat an error that MOVES to a later stage as the proof, since a vanished error is equally consistent with a skipped test or a loosened assertion |
 | 437 | A failure found while spanning a large version gap | Locate where the requirement was INTRODUCED before classifying it — the same evidence means their break if it predates your pin and your own drift if it postdates it |
 | 438 | A behaviour you are about to relax in a SHARED crate | Find who depends on the CURRENT behaviour first — a rejection is API, and someone may have built a detector on it; a design conversation reasons about the caller in the room, not the published contract |
-| 439 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 440 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 439 | "Their half is already in place" | MERGED is a fact about a repository, IN PLACE is a fact about a running process — verify the deployed artifact, because an ordering constraint satisfied on paper and violated in production is worse than one obviously unmet, the paper being what anyone checks |
+| 440 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 441 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

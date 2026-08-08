@@ -38,7 +38,7 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_FILE_NAME: &str = "subc-connection.json";
 const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
-const QUOTA_MODULE_ID: &str = "ai-provider-quota";
+const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
 
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";

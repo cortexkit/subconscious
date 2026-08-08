@@ -116,18 +116,24 @@ console.log(
   `campaigns ${campaigns.size}   rounds ${rows.length}   ` +
     `comparisons ${comparisons} (${exempted} exempt by name)`,
 );
+// THE DENOMINATOR IS CHECKED BEFORE ANY FINDING IS PRINTED, and it exits
+// non-zero. This previously printed the same notice AFTER the findings and then
+// fell through to `exit(normative.length ? 1 : 0)` -- which is 0 over an empty
+// store, because an empty store has no normative losses to count. So a caller
+// reading the exit code got a clean census from a run that examined nothing,
+// and the notice was visible only to a human reading the tail.
+//
+// A vacuity notice that does not reach the exit code is advice, not a guard.
+if (!rows.length) {
+  console.log(
+    `\nNO ROUNDS EXAMINED -- this run proves nothing. Check the store: ${STORE}`,
+  );
+  process.exit(2);
+}
+
 console.log(`\nNORMATIVE sections that lost content (investigate):`);
 console.log(normative.length ? normative.join("\n") : "  none");
 console.log(`\nconverging sections that shrank (expected, listed for control):`);
 console.log(converging.length ? converging.join("\n") : "  none");
-
-// A census reporting zero is only meaningful if it could have reported
-// something, so say what was examined rather than leaving an empty list to
-// speak for itself.
-if (!rows.length) {
-  console.log(
-    `\nNo rounds examined. Check the store path exists: ${STORE}`,
-  );
-}
 
 process.exit(normative.length ? 1 : 0);

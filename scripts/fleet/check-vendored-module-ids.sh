@@ -209,12 +209,33 @@ if [ ! -d "$PRODUCER/.git" ]; then
   exit 0
 fi
 
+# THE PAIR LIST IS TRANSCRIBED, SO IT CAN GO STALE SILENTLY.
+#
+# A fifth vendored corpus added under docs/team-mode is checked for LIVE IDS by
+# the scan above -- it discovers files itself -- but is invisible to the
+# authenticity loop below, which only knows what is written here. The success
+# line would still say "all 4", which is a TRANSCRIBED COUNT rather than a
+# measured one: it reports coverage it never established.
+#
+# So the list is cross-checked against what the scan actually found. Any file
+# carrying tokens that is absent from the list fails, rather than being silently
+# skipped while the summary implies it was covered.
+CORPORA=$(python3 - <<'PY'
+import glob, re
+TOK = r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]*"
+for p in sorted(glob.glob("docs/**/*.json", recursive=True)):
+    if re.search(TOK, open(p).read()):
+        print(p)
+PY
+)
+
+LIST="room1-contract-samples.json:docs/team-mode/fixtures/room1-contract-samples.mirror.json
+room1-contract-samples.json:docs/team-mode/conformance/vectors/ckcred/room1-contract-samples.json
+room2-contract-samples.json:docs/team-mode/fixtures/room2-ckcred-fixtures.json
+room2-contract-samples.json:docs/team-mode/appendices/room2-ckcred-fixtures.json"
+
 fail=0
-for pair in \
-  "room1-contract-samples.json:docs/team-mode/fixtures/room1-contract-samples.mirror.json" \
-  "room1-contract-samples.json:docs/team-mode/conformance/vectors/ckcred/room1-contract-samples.json" \
-  "room2-contract-samples.json:docs/team-mode/fixtures/room2-ckcred-fixtures.json" \
-  "room2-contract-samples.json:docs/team-mode/appendices/room2-ckcred-fixtures.json"; do
+for pair in $LIST; do
   name=${pair%%:*}; mine=${pair#*:}
   src=$(cd "$PRODUCER" && git show "$COMMIT" --stat --name-only 2>/dev/null | grep "/$name\$" | head -1)
   if [ -z "$src" ]; then
@@ -229,7 +250,23 @@ for pair in \
   fi
 done
 
+# Every corpus the scan found must appear in the list above. Without this, the
+# only signal that a new mirror went unchecked is that nobody remembered to add
+# it -- which is not a signal.
+checked=0
+for corpus in $CORPORA; do
+  checked=$((checked + 1))
+  case "$LIST" in
+    *"$corpus"*) ;;
+    *)
+      echo "AUTHENTICITY FAIL: $corpus carries tokens but is not in the pair list."
+      echo "  It was checked for live ids and NOT for authenticity."
+      fail=1
+      ;;
+  esac
+done
+
 if [ $fail -ne 0 ]; then
   exit 1
 fi
-echo "OK: all 4 mirrors are byte-identical to the producer at ${COMMIT:0:8}."
+echo "OK: $checked mirrors byte-identical to the producer at ${COMMIT:0:8}."

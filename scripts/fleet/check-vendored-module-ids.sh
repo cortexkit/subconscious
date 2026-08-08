@@ -173,3 +173,63 @@ if offenders:
 
 print("OK: every signed module id is a live module.")
 PY
+
+rc=$?
+[ $rc -ne 0 ] && exit $rc
+
+# --- AUTHENTICITY, WHICH IS A DIFFERENT QUESTION FROM EVERYTHING ABOVE -------
+#
+# Everything up to here asserts properties of the bytes IN HAND: the ids are
+# live, the tokens decode, the two discovery mechanisms agree. None of it can
+# tell whether these bytes are the ones the producer published -- a hand-edit
+# that keeps every id live passes all of it.
+#
+# docs/team-mode/VENDORED.md records per-file digests, but comparing a file to a
+# digest I wrote down myself proves INTERNAL CONSISTENCY, not authenticity: it
+# confirms the bytes match my own record of them. PLEX hit exactly this shape in
+# their acceptance script -- an embedded lock digest that matched the lock at the
+# commit the binary CLAIMED, which reads like an answer to "is this the build we
+# mean" and is not one.
+#
+# The stronger check is available whenever the producer repo is on this machine:
+# compare against the artifact at the named commit. When it is not available this
+# SAYS SO rather than passing quietly, because a check that silently degrades to
+# a weaker one reports the same success either way.
+PRODUCER=~/Work/Projects/CortexKit/cortexkit-account
+COMMIT=$(grep -oE '`[0-9a-f]{40}`' docs/team-mode/VENDORED.md | head -1 | tr -d '`')
+
+if [ -z "$COMMIT" ]; then
+  echo "AUTHENTICITY: NOT CHECKED -- no source commit recorded in VENDORED.md"
+  exit 0
+fi
+
+if [ ! -d "$PRODUCER/.git" ]; then
+  echo "AUTHENTICITY: NOT CHECKED -- producer repo absent at $PRODUCER"
+  echo "  The checks above verify the ids, not that these bytes are the published ones."
+  exit 0
+fi
+
+fail=0
+for pair in \
+  "room1-contract-samples.json:docs/team-mode/fixtures/room1-contract-samples.mirror.json" \
+  "room1-contract-samples.json:docs/team-mode/conformance/vectors/ckcred/room1-contract-samples.json" \
+  "room2-contract-samples.json:docs/team-mode/fixtures/room2-ckcred-fixtures.json" \
+  "room2-contract-samples.json:docs/team-mode/appendices/room2-ckcred-fixtures.json"; do
+  name=${pair%%:*}; mine=${pair#*:}
+  src=$(cd "$PRODUCER" && git show "$COMMIT" --stat --name-only 2>/dev/null | grep "/$name\$" | head -1)
+  if [ -z "$src" ]; then
+    echo "AUTHENTICITY: $name not found at $COMMIT in the producer repo"
+    fail=1; continue
+  fi
+  want=$(cd "$PRODUCER" && git show "$COMMIT:$src" | shasum -a 256 | cut -d' ' -f1)
+  got=$(shasum -a 256 "$mine" | cut -d' ' -f1)
+  if [ "$want" != "$got" ]; then
+    echo "AUTHENTICITY FAIL: $mine does not match the producer at $COMMIT"
+    fail=1
+  fi
+done
+
+if [ $fail -ne 0 ]; then
+  exit 1
+fi
+echo "OK: all 4 mirrors are byte-identical to the producer at ${COMMIT:0:8}."

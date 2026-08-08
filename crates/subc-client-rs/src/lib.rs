@@ -527,7 +527,22 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// resource -- which is exactly the resource degraded under the conditions
     /// being probed.
     async fn health(&self) -> HealthReport {
-        HealthReport::ok()
+        // SAY THAT NOBODY MEASURED, rather than that everything is fine.
+        //
+        // The status stays Ok because a module advertising no health capability
+        // is never probed, and one that advertises health but has nothing to
+        // report is not unhealthy. What changes is that the report now
+        // IDENTIFIES ITSELF as the inherited default, so an operator reading
+        // `ck health <module>` can tell "measured, nothing wrong" from "nobody
+        // wrote a health path" -- which were previously the same bytes.
+        //
+        // `detail` is carried verbatim by the daemon and rendered for humans;
+        // nothing parses it, so this is display-only and cannot change any
+        // supervision decision.
+        HealthReport {
+            detail: Some("no health implementation; inherited default".to_string()),
+            ..HealthReport::ok()
+        }
     }
 
     /// A route was torn down, rejected, or abandoned before its bind ACK was queued.
@@ -1601,9 +1616,26 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Response);
         assert_eq!(response.header.channel, 0);
         assert_eq!(response.header.corr, 77);
-        assert_eq!(
-            serde_json::from_slice::<ModuleControlResponse>(&response.body).unwrap(),
-            ModuleControlResponse::from(HealthReport::ok())
+
+        // Assert the PROPERTIES that matter rather than byte-equality with
+        // HealthReport::ok(). Comparing against the constructor made this test a
+        // restatement of the implementation: it reddened on any change to the
+        // default without saying which property had broken.
+        let parsed = serde_json::from_slice::<ModuleControlResponse>(&response.body).unwrap();
+        let ModuleControlResponse::HealthCheck { status, detail, .. } = parsed else {
+            panic!("expected a health.check response");
+        };
+        // A module that never implemented health is not UNHEALTHY -- the daemon
+        // must not escalate on it.
+        assert_eq!(status, HealthStatus::Ok);
+        // ...but the report must SAY that nobody measured, so an operator can
+        // tell it from a real all-clear. Substring rather than exact text: the
+        // wording is for humans and nothing parses it.
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no health implementation")),
+            "the inherited default must identify itself, got {detail:?}"
         );
     }
 

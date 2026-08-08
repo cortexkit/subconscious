@@ -204,7 +204,18 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
         } => {
             assert_eq!(module_id, MODULE_ID);
             assert_eq!(status, HealthStatus::Ok);
-            assert_eq!(detail, None);
+            // This module implements no health(), so it inherits the trait
+            // default -- which now identifies itself rather than being byte
+            // identical to a measured all-clear. Asserting the marker END TO END
+            // proves the daemon carries detail verbatim from the module to the
+            // control plane, which is the property that makes the marker
+            // reachable by an operator at all.
+            assert!(
+                detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("no health implementation")),
+                "expected the inherited-default marker, got {detail:?}"
+            );
             assert_eq!(metrics, None);
         }
         other => panic!("unexpected health response: {other:?}"),

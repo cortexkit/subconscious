@@ -567,8 +567,11 @@ Before calling a class closed:
 | 480 | A marker chosen to prove a deploy landed | Prove it can be PRESENT somewhere — a doc comment reads absent in both binaries, which is indistinguishable from a correct swap if you only assert absence in the old one |
 | 481 | A post-swap check comparing deployed against staged | It is unconditionally true — same build, so it can never fail; keep the PRE-STATE copy, which is the only artefact that can disagree, and treat it as evidence before recovery |
 | 482 | A striking ratio in one arm | Run the same ratio on a known-good arm before reporting it — an optional field is absent in the healthy population too, and the number looks damning until the control exists |
-| 483 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 484 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 483 | An argument resting on a field being absent | Check whether the field is NULLABLE, and run the same ratio on the known-good rows of the same population — an optional column is absent in the healthy majority too, so its absence discriminates nothing |
+| 484 | A control you are reluctant to run | That reluctance is the signal to run it — the control is most expensive exactly when the finding is most striking, because what it costs you IS the finding |
+| 485 | Any filter over a state or status column | Print the distribution first — a hand-written list of states is a transcription, and one omitted member inflated a real count fourfold |
+| 486 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 487 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -10546,3 +10546,55 @@ mode, and `git status` shows the content diff without flagging it unless you loo
 Same family as everything else here: **the instrument moved something outside the
 frame you were watching.** Use a rewrite that preserves mode, and check `ls -la`
 after.
+
+### The cost claim is itself a check that must be run
+
+The constructibility boundary above has an escape hatch — *"the specimen is too
+expensive to construct here"* — and it is **the one part of the rule that carries
+no obligation to measure anything**. It is unfalsifiable until someone tries, so
+it is a hypothesis wearing a conclusion's clothes.
+
+Two instances within minutes of the boundary being stated, both by seats who had
+just agreed to it:
+
+- PLEX named their poller's transient-credential carve-out as needing a real
+  vendor failure. Checking: their stub already accepts an arbitrary error per
+  handle, so a locked vault is **one line**.
+- I named my daemon's budget-decay leg as needing a real starvation episode.
+  Checking: `crates/subc-core/tests/forwarding.rs` **already contains** a test
+  that drives a stub to budget exhaustion with an injected deadline and
+  threshold 1. The discriminating state is constructed by a harness I maintain.
+
+Mine is the worse of the two: the assumption was contradicted by code already in
+the repository. **The hatch is attractive precisely because it is available before
+you have looked, and looking is what it excuses.**
+
+So: **expensive-to-construct is a measurement, not an impression.** Before
+claiming it, check whether a stub, fixture, or existing test already produces the
+state.
+
+### A red result is not self-explaining — identify which assertion fired
+
+Third instance in one day, across three seats. A mutation reddens a suite and the
+assertion you were trying to prove **may still be untouched**:
+
+- a cycle assertion absorbed a state mutant, leaving the stored-state assertions
+  unproven;
+- a list assertion absorbed a property mutant, leaving the property unproven;
+- a mutant broke the interpreter, so the suite failed on a `SyntaxError` — red
+  for a reason with no bearing on the guard.
+
+And the inverse, which is easy to misread as evidence about the subject: a fixture
+whose **handle-specific** value silently wins over the **default** you overrode, so
+the operation succeeds and the test asserts nothing. It fails loudly, for a reason
+about the fixture rather than the code.
+
+Two remedies, and prefer the second:
+
+- check the failure reason after the fact — makes the wrong reason *detectable*;
+- **widen the matcher until only the target can fail** — makes the wrong reason
+  *impossible*. Structure over vigilance.
+
+Record luck as luck. A clean result from an accident says nothing about the next
+edit, and writing it down as a pass lets the next person inherit a false sense of
+a protected tree.

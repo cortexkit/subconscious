@@ -518,8 +518,10 @@ Before calling a class closed:
 | 431 | A check you are about to tighten | Enumerate every producer that must satisfy it FIRST — tightening is a de facto enumeration, and skipping it converts a contract change into a sequence of surprises found one at a time by whoever runs each lane next |
 | 432 | The second or third fix of one class | Stop fixing and enumerate — each earlier fix looked complete from inside its own slice, which is exactly why the population was never listed |
 | 433 | An enumeration delivered as a list | Record PER-ENTRY DISPOSITION and the QUERY THAT PRODUCED IT — a bare list cannot separate "checked, already correct" from "never looked at", and a list ages silently while a query re-executes |
-| 434 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 435 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 434 | An enumeration of where a value is EMITTED | Enumerate every place the value can LIVE — a duplicate DEFINITION drifts by the same mechanism as a second announcement site, and predicting the carrier closes the sweep one class early |
+| 435 | A word that survives a rename | Read the FIELD, not the word — one term serving two vocabularies makes a grep report confident false drifts, and the enumeration is the artefact that can record "deliberately untouched" |
+| 436 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 437 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -36,6 +36,30 @@ IDLE_ALERT_MIN=${IDLE_ALERT_MIN:-90}
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 dim()  { printf '\033[2m%s\033[0m\n' "$1"; }
 
+# Run a query and FAIL LOUDLY. Callers were `$(sqlite3 ... 2>/dev/null)`, which
+# returns empty on a renamed column, a locked store or a missing table -- and
+# empty is a legal answer everywhere here, so a failed probe printed a clean
+# operational claim. The file-readability guards elsewhere in this script do not
+# cover it: a store can be perfectly readable while the QUERY is wrong.
+#
+# The message goes to STDERR deliberately. This is called from inside command
+# substitution, so a warning on stdout would be captured into the caller's
+# variable and never seen -- which is how ENGRAM's equivalent fix swallowed its
+# own failures ten minutes after being written to prevent swallowing. Returning
+# nonzero is what lets a caller separate empty-result from did-not-run.
+#
+# DEFINED HERE, ABOVE EVERY CALLER. Placed further down it parsed fine and was
+# simply not yet defined at first use, so every guarded query failed with
+# "command not found" -- a fix that manufactured the failures it reports.
+sq() {
+  local db=$1 q=$2 out
+  if ! out=$(sqlite3 "$db" "$q" 2>&1); then
+    echo "  QUERY FAILED on $(basename "$db"): $out" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
 echo
 bold "FLEET PULSE  $(date '+%Y-%m-%d %H:%M %Z')"
 echo
@@ -141,7 +165,7 @@ echo
 # remedies -- resend versus restart the session. Only the host transcript
 # separates them, by counting assistant turns after the wake landed.
 bold "CAMPAIGNS (terminal in the last 12h -- compare against idle times above)"
-terminal=$(sqlite3 "$STORE" "
+terminal=$(sq "$STORE" "
   SELECT substr(consult_id, -12), consult_kind, phase,
          COALESCE(terminal_reason,'-'),
          COALESCE((SELECT name FROM peers WHERE session_id = caller_session), caller_session),
@@ -151,18 +175,22 @@ terminal=$(sqlite3 "$STORE" "
     AND consult_kind IN ('spec','campaign')
     AND caller_session IS NOT NULL AND caller_session <> ''
     AND updated_at > (strftime('%s','now') - 43200) * 1000
-  ORDER BY updated_at DESC LIMIT 6;" 2>/dev/null)
+  ORDER BY updated_at DESC LIMIT 6;") || terminal="__FAILED__"
 # The LIMIT above keeps a busy day from burying the rest of the report, but a
 # truncated list that does not say it was truncated is a clean-looking result over
 # a partial set -- the same shape as a scanner that will not print what it
 # skipped. So count the window separately and say when rows were withheld.
-terminal_total=$(sqlite3 "$STORE" "
+terminal_total=$(sq "$STORE" "
   SELECT COUNT(*) FROM consult
   WHERE phase IN ('failed','done')
     AND consult_kind IN ('spec','campaign')
     AND caller_session IS NOT NULL AND caller_session <> ''
-    AND updated_at > (strftime('%s','now') - 43200) * 1000;" 2>/dev/null)
-if [ -n "$terminal" ]; then
+    AND updated_at > (strftime('%s','now') - 43200) * 1000;") || terminal_total=""
+if [ "$terminal" = "__FAILED__" ]; then
+  # A failed query used to land on the "none terminal" branch below: a clean
+  # answer about campaigns, from a probe that never ran.
+  echo "  campaign query FAILED (see error above) -- terminals UNCHECKED this cycle"
+elif [ -n "$terminal" ]; then
   printf '%s\n' "$terminal" | while IFS='|' read -r id kind phase reason who age; do
     printf '  %-14s %-8s %-7s %-26s %s  (%sm ago)\n' "$id" "$kind" "$phase" "$reason" "$who" "$age"
   done

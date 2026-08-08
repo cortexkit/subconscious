@@ -600,8 +600,11 @@ Before calling a class closed:
 | 513 | A rule you apply to others' work | Apply it to your own instruments in the same session — I spent a day demanding non-vacuity proofs and ran two checks that had never been observed failing |
 | 514 | "It needs N fixes" | Ask whether N came from ENUMERATING WHAT THE OUTCOME REQUIRES or from counting what you FOUND — the second survives review because each item is individually real, and it is wrong by omission only |
 | 515 | A live-state row consistent with your diagnosis | Check whether a PREVIOUS defect stranded at the same step — a matching fingerprint is corroboration, and the same fingerprint has more than one author |
-| 516 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 517 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 516 | Any list you are about to call complete | Ask what its TERMINATION CONDITION was — a screen ends where the screen ends and "the ones I found" ends when you stop finding; neither artefact can distinguish complete from partial, and every entry being true is what makes it unreviewable |
+| 517 | Several sites with the same defect | Look for a shape that FORCES it — an enum variant with nowhere to put a matched parameter makes every arm routed through it discard what it matched, so the sites are symptoms and the next one added will be born broken while looking correct |
+| 518 | "It stopped moving, so it finished" | A stall looks identical — wait for the terminal event, not the absence of progress |
+| 519 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 520 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

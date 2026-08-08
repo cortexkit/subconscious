@@ -520,8 +520,10 @@ Before calling a class closed:
 | 433 | An enumeration delivered as a list | Record PER-ENTRY DISPOSITION and the QUERY THAT PRODUCED IT — a bare list cannot separate "checked, already correct" from "never looked at", and a list ages silently while a query re-executes |
 | 434 | An enumeration of where a value is EMITTED | Enumerate every place the value can LIVE — a duplicate DEFINITION drifts by the same mechanism as a second announcement site, and predicting the carrier closes the sweep one class early |
 | 435 | A word that survives a rename | Read the FIELD, not the word — one term serving two vocabularies makes a grep report confident false drifts, and the enumeration is the artefact that can record "deliberately untouched" |
-| 436 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 437 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 436 | A fix to a REFUSAL | Something behind it has never been exercised — a refusal at stage N makes every later stage unobservable, so verify by EXECUTION and treat an error that MOVES to a later stage as the proof, since a vanished error is equally consistent with a skipped test or a loosened assertion |
+| 437 | A failure found while spanning a large version gap | Locate where the requirement was INTRODUCED before classifying it — the same evidence means their break if it predates your pin and your own drift if it postdates it |
+| 438 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 439 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

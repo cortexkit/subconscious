@@ -550,8 +550,10 @@ Before calling a class closed:
 | 463 | An exit code read after a pipe | It is the LAST command's status — piping a tool through sed reports sed's success, which is a false all-clear from an instrument you just built |
 | 464 | A figure returned to you by another seat | Check whether it is CORROBORATION or an ECHO — a number you supplied and they repeated arrives looking independently confirmed, which is the strongest evidence a figure can have and the easiest to manufacture |
 | 465 | The SUMMARY of an investigation | Point an instrument at it — scrutiny aims at the work, the summary reads as bookkeeping, and it is the claim that travels furthest; a number you did not count is not a number you know |
-| 466 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 467 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 466 | A check with one solid leg and one hollow one | A WHOLLY broken check announces itself; a HALF-GOOD one recruits its working half as cover — the true result sits beside the meaningless one and lends it credibility, so the good leg is what suppresses the question |
+| 467 | "The tag moved, rebuild" | Check whether what moved is IN the build — four commits past a tag reads as staleness; four commits of scripts is not staleness of a binary |
+| 468 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 469 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

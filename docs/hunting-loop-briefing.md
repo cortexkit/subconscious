@@ -536,8 +536,11 @@ Before calling a class closed:
 | 449 | A control that is a printed SUGGESTION | Advice is not a guard — it is discharged only if someone reads it and acts, and a clean result is the least likely thing anyone re-examines |
 | 450 | A guard written right after being burned by its class | Recency buys motivation, not correctness — and it buys a false sense the class is handled, which is itself a reason nobody re-examines it |
 | 451 | An explanation that keeps checking out | Ask whether it is TRUE BUT INOPERATIVE — a false explanation gets falsified, a true-but-not-operative one never does, because every check of it confirms it |
-| 452 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 453 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 452 | A guard whose trigger counts BAD entries | It is silent on TOTAL failure — partial drift leaves entries to warn about, complete drift leaves none, so the more completely it fails the quieter it gets |
+| 453 | A vacuity notice you did write | Check it reaches the EXIT CODE — a warning printed then followed by an exit computed from the finding count is invisible to every caller, because an empty corpus has no findings to count |
+| 454 | A guard's PLACEMENT | It follows the author's imagined failure story, not the guard's requirement — a mistyped-path story puts it up front where arguments are validated, a pattern-drift story puts it where the patterns are used; reviewing intent never catches this, asking what it prints over nothing always does |
+| 455 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 456 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

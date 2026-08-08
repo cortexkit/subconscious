@@ -591,8 +591,11 @@ Before calling a class closed:
 | 504 | A remedy for a condition that is not currently active | Running it tests nothing: its predicted effect is indistinguishable from the condition staying absent on its own, and it spends the specimen you would need to ask the better question |
 | 505 | A sweep whose output you SCROLLED | Count it instead — my caller enumeration before an irreversible rename was truncated at the head and I read the visible portion as the whole list; a repo third-largest in the results was invisible, and its module broke in production |
 | 506 | A file-count per repo in a caller sweep | Counts tell you nothing about which hits are DIALS — open each one; of eleven source-carrying repos exactly four held a live route target and the rest were prose, tests and deliberate fixtures |
-| 507 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 508 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 507 | A wrong query that ANSWERS | Worse than one that errors — `pragma user_version` is the conventional place to look, returns a well-formed integer, and is permanently 0 for a store that does not use it; when a value is load-bearing the query must come from whoever owns the schema, not from convention |
+| 508 | A baseline quoted in a message | Re-capture it immediately before the action — for a climbing quantity a stale low baseline makes ANY later reading pass, so "resumed rather than restarted" stops discriminating |
+| 509 | Selecting a file or directory by newest mtime | Resolve it by the LEDGER instead — a retained cache from the previous generation can be newer than the one you mean |
+| 510 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 511 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

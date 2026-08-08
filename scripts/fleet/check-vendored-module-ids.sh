@@ -54,7 +54,22 @@ def payload(tok: str):
     body += "=" * (-len(body) % 4)
     return json.loads(base64.urlsafe_b64decode(body))
 
-TOKEN_RE = r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"
+# The third segment has NO MINIMUM LENGTH, deliberately.
+#
+# It used to require 10+ characters, which silently assumed every token is
+# SIGNED. An `alg:none` token has an EMPTY third segment, so the narrow form
+# missed it entirely -- and a corpus carrying one would pass this check while
+# containing a dead module id, which is precisely the failure the check exists
+# to catch.
+#
+# I had recorded that as a known limit on a reachability argument: nothing in
+# our corpora emits unsigned tokens, so the case was unreachable. That was the
+# wrong frame. I priced it as ADDING A SPECIAL CASE for a shape nobody emits,
+# when it is REMOVING AN ASSUMPTION I had no reason to make. Measured on the
+# clean corpus both forms find exactly 92 tokens, so the widening costs nothing
+# and closes the hole. CKCRED and CALLO reached the same correction on their
+# scanners independently.
+TOKEN_RE = r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]*"
 
 def walk_strings(node):
     """Yield every string value in a parsed JSON document.

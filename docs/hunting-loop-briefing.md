@@ -586,8 +586,9 @@ Before calling a class closed:
 | 499 | A config file you are checking for presence | Check the FEATURE instead — a config present but unread looks identical to one that was read, so the discriminator must be a value only produced when the feature is armed |
 | 500 | A wrong mechanism you are about to correct | Correcting it is not only about accuracy — a wrong mechanism DELETES QUESTIONS, so the risks it makes unaskable are invisible rather than mis-assessed |
 | 501 | A checker sharing a failure mode with its subject | Acceptable only if a SECOND independent route to the same facts exists — removing the shared failure mode is usually unachievable, having a second route is not |
-| 502 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 503 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 502 | A naming inconsistency you are about to clean up | It is evidence of a missed rename only if NO DESIGN DECISION EXPLAINS IT — an old-looking name beside a renamed thing looks identical whether it is debt or a deliberate namespace boundary, and the discriminator lives in a repo you cannot see from here; ask the owner rather than tidying |
+| 503 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 504 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

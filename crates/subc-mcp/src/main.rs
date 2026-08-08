@@ -2264,40 +2264,70 @@ fn desired_session_from_catalog(
             continue;
         }
 
+        // ONE BAD PROVIDER MUST NOT DELETE EVERY OTHER PROVIDER'S TOOLS.
+        //
+        // These four checks previously used `?`/`return Err`, which aborted
+        // construction of the WHOLE session. A single module publishing an
+        // MCP-illegal tool name therefore took the entire Claude Code tool
+        // surface down fleet-wide -- every ctx_* tool, every aft tool, all of
+        // them -- because one provider's manifest was malformed.
+        //
+        // It presented as `Connection reset by peer` at the client, since the
+        // module refuses and closes the socket while the actual reason stays in
+        // the daemon log. Two seats ran experiments against two connection files
+        // and got two different transport errors, both downstream of this, and
+        // neither carrying the cause.
+        //
+        // A per-provider defect now costs that provider and nobody else. The
+        // rejection is still LOUD -- it is logged with the module and the
+        // offending name -- because a provider silently missing from the surface
+        // is the failure mode this fix must not introduce.
         let namespace = config.provider_namespace(&entry.module_id);
-        validate_mcp_name_component("provider namespace", &namespace).map_err(|message| {
-            other_error(format!(
-                "provider '{}' has invalid namespace '{namespace}': {message}; set providers.{}.namespace to an MCP-safe value",
+        if let Err(message) = validate_mcp_name_component("provider namespace", &namespace) {
+            eprintln!(
+                "subc-mcp: skipping provider '{}': invalid MCP namespace '{namespace}': {message}; set providers.{}.namespace to an MCP-safe value",
                 entry.module_id, entry.module_id
-            ))
-        })?;
+            );
+            continue;
+        }
 
         let mut tools = Vec::new();
         for tool in manifest_tools {
-            validate_mcp_name_component("tool name", &tool.name).map_err(|message| {
-                other_error(format!(
-                    "provider '{}' manifest has invalid tool name '{}': {message}",
+            if let Err(message) = validate_mcp_name_component("tool name", &tool.name) {
+                eprintln!(
+                    "subc-mcp: skipping tool '{}.{}': manifest name is not MCP-safe: {message}",
                     entry.module_id, tool.name
-                ))
-            })?;
+                );
+                continue;
+            }
             if !config.tool_enabled(&entry.module_id, &tool.name) {
                 continue;
             }
 
             let exposed_name = format!("{namespace}_{}", tool.name);
             if is_reserved_meta_tool_name(&exposed_name) {
-                return Err(other_error(format!(
-                    "MCP tool name collision for reserved exposed name '{exposed_name}'"
-                )));
+                eprintln!(
+                    "subc-mcp: skipping tool '{}.{}': exposed name '{exposed_name}' collides with a reserved meta-tool",
+                    entry.module_id, tool.name
+                );
+                continue;
             }
             if let Some((other_module, other_bare)) = exposed_names.insert(
                 exposed_name.clone(),
                 (entry.module_id.clone(), tool.name.clone()),
             ) {
-                return Err(other_error(format!(
-                    "MCP tool name collision for '{exposed_name}': {}.{} and {}.{}",
-                    other_module, other_bare, entry.module_id, tool.name
-                )));
+                // Keep the FIRST claimant and skip this one, and put the map back
+                // so the winner still owns the name -- `insert` has already
+                // overwritten it with the loser at this point.
+                exposed_names.insert(
+                    exposed_name.clone(),
+                    (other_module.clone(), other_bare.clone()),
+                );
+                eprintln!(
+                    "subc-mcp: skipping tool '{}.{}': exposed name '{exposed_name}' already claimed by '{other_module}.{other_bare}'",
+                    entry.module_id, tool.name
+                );
+                continue;
             }
 
             let description = config
@@ -5232,6 +5262,76 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
     use super::*;
+
+    /// One malformed provider must not delete every other provider's tools.
+    ///
+    /// This is the fleet-wide Claude Code outage, reduced: `plexus` published a
+    /// tool named `plexus.connections`, dots are illegal in MCP names, and the
+    /// validation failure propagated with `?` out of session construction. Every
+    /// session came up with ZERO subc tools -- no ctx_*, no aft -- and the client
+    /// saw only `Connection reset by peer`, because the module refuses and closes
+    /// while the reason stays in the daemon log.
+    ///
+    /// THE ASSERTION THAT MATTERS IS THE SURVIVOR, not the absence of an error.
+    /// A version of this test that only checked "construction succeeded" would
+    /// pass just as well if the fix skipped every provider, which is the same
+    /// outage wearing a success code.
+    #[test]
+    fn one_provider_with_an_illegal_tool_name_does_not_erase_the_others() {
+        fn provider(module_id: &str, tool_names: &[&str]) -> CatalogEntry {
+            CatalogEntry {
+                module_id: module_id.to_string(),
+                roles: vec![ProviderRole::ToolProvider {
+                    tools: tool_names
+                        .iter()
+                        .map(|name| ManifestTool {
+                            name: (*name).to_string(),
+                            description: None,
+                            execution_mode: ExecutionMode::Pure,
+                            schema: serde_json::json!({"type": "object"}),
+                        })
+                        .collect(),
+                    identity_scope: Vec::new(),
+                    concurrency: subc_protocol::manifest::Concurrency::Serial,
+                    emits_push: false,
+                    sub_supervises: false,
+                }],
+                control_ops: Vec::new(),
+            }
+        }
+
+        let modules = vec![
+            // The offender, first in the list so it aborts before the others are
+            // ever reached under the old control flow.
+            provider("plexus", &["plexus.connections"]),
+            provider("thalamus", &["gateway_status"]),
+            provider("aft", &["aft_search"]),
+        ];
+
+        let desired = desired_session_from_catalog(&GatewayConfig::facade_default(), &modules)
+            .expect("a malformed provider must not fail the whole session");
+
+        let exposed: Vec<String> = desired
+            .providers
+            .iter()
+            .flat_map(|p| p.tools.iter().map(|t| t.exposed_tool.manifest.name.clone()))
+            .collect();
+
+        // The survivors are present...
+        assert!(
+            exposed.iter().any(|n| n.contains("gateway_status")),
+            "a sibling provider's tools must survive a malformed provider; got {exposed:?}"
+        );
+        assert!(
+            exposed.iter().any(|n| n.contains("aft_search")),
+            "aft tools must survive a malformed sibling; got {exposed:?}"
+        );
+        // ...and the offending tool is not silently exposed under a mangled name.
+        assert!(
+            !exposed.iter().any(|n| n.contains("connections")),
+            "the illegal tool must be skipped, not renamed into the surface; got {exposed:?}"
+        );
+    }
 
     #[test]
     fn route_closed_error_carries_unknown_outcome_and_route_identity() {

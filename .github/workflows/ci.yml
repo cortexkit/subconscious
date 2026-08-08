@@ -182,3 +182,61 @@ jobs:
       - name: Test
         if: ${{ !cancelled() }}
         run: bun test
+
+      # THE LIVE SUITE IS THE ONLY CROSS-LANGUAGE PROOF AND IT HAD NEVER RUN HERE.
+      #
+      # Three files in clients/subc-client/tests boot a real ck-subc daemon over
+      # loopback and complete the HMAC handshake, which is the one check that
+      # catches a drift in proof construction, framing, or envelope layout
+      # between the Rust and TypeScript implementations. Every block sits behind
+      # `describe.skipIf(!LIVE)` gated on RUN_SUBC_LIVE, and NO WORKFLOW SET IT --
+      # so a divergence would have shipped green. The committed wire vectors and
+      # the golden-conformance suite pin BYTES; only this pins a live handshake.
+      #
+      # It ran nowhere for a half-true reason, which is why it survived review:
+      # the suite is off by default so the unit lane can stay bun-only, and this
+      # job genuinely had no Rust toolchain. True, and it explains the DEFAULT
+      # rather than the absence -- nobody had added the toolchain to the one job
+      # that runs bun. A justification that answers a neighbouring question is
+      # stickier than a false one, because checking it returns a real reason and
+      # the reader stops.
+      #
+      # Restricted to the subc-client leg: the store package has no daemon tests,
+      # so building a daemon there would be pure cost.
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !cancelled() && matrix.pkg == 'subc-client' }}
+      # tests/live-daemon.ts builds the daemon itself when target/debug/ck-subc is
+      # missing, so this step is not what makes the suite work -- it moves the
+      # build OUT of the first test, where a cold compile would run against bun's
+      # per-test timeout and fail as a daemon defect rather than a slow build.
+      # Path and target must stay in step with DAEMON in that helper.
+      - name: Pre-build ck-subc for the live suite
+        if: ${{ !cancelled() && matrix.pkg == 'subc-client' }}
+        working-directory: .
+        run: cargo build --locked -p subc-core --bin ck-subc
+      # RUN_SUBC_LIVE only OPENS the gate; it cannot prove the blocks executed.
+      # A skipped describe and a passing one both report success, so the step
+      # asserts the live tests actually ran -- see the guard in the run body.
+      - name: Live daemon suite
+        if: ${{ !cancelled() && matrix.pkg == 'subc-client' }}
+        env:
+          RUN_SUBC_LIVE: "1"
+        run: |
+          set -o pipefail
+          bun test tests/live-handshake.test.ts tests/live-provider.test.ts \
+            tests/live-streaming.test.ts 2>&1 | tee /tmp/live.log
+          # FAIL LOUDLY ON A VACUOUS PASS. With the gate shut every block is
+          # skipped and bun still exits 0 -- which is exactly the state this job
+          # was in before today, reporting green while proving nothing.
+          #
+          # Measured both outputs rather than assuming the shape: skipped prints
+          # "4 skip" and NO pass line at all; a real run prints "2 pass". So a
+          # guard looking for the literal "0 pass" could never fire -- it was my
+          # first version, and the closed-gate control is what caught it. Reading
+          # the count and defaulting an ABSENT line to zero covers both.
+          passed=$(sed -nE 's/^[[:space:]]*([0-9]+) pass.*/\1/p' /tmp/live.log | head -1)
+          if [ "${passed:-0}" -eq 0 ]; then
+            echo "live suite executed no tests -- RUN_SUBC_LIVE did not open the gate"
+            exit 1
+          fi
+          echo "live suite executed ${passed} tests against a real daemon"

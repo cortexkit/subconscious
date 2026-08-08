@@ -557,8 +557,9 @@ Before calling a class closed:
 | 470 | A pattern found in ONE codebase | It looks like a quirk of one author until a second repository confirms it — the observation and its generality are separate evidence, and some findings are not attributable to a seat because their evidence is necessarily distributed |
 | 471 | A detector you are ARGUING is weaker | Run it against defects you already hold — a demonstrated false negative on a known case gives you a measured sensitivity; an argument gives you an opinion |
 | 472 | Being RIGHT about an instrument you did not test | That is the weakest possible evidence you understood it — a wrong reason and a right one produce identical output on a case that passes, and unlike a wrong command a right-for-the-wrong-reason one never gets falsified, so the unearned confidence compounds |
-| 473 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 474 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 473 | A post-swap marker check against the STAGED file | It is comparing a file to itself — after placement the two are the same build, so the check can only infer. Search the deployed file against the ROLLBACK COPY, which is the only genuinely discriminating pair once the swap has happened |
+| 474 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 475 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

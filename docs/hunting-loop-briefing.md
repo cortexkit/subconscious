@@ -603,8 +603,10 @@ Before calling a class closed:
 | 516 | Any list you are about to call complete | Ask what its TERMINATION CONDITION was — a screen ends where the screen ends and "the ones I found" ends when you stop finding; neither artefact can distinguish complete from partial, and every entry being true is what makes it unreviewable |
 | 517 | Several sites with the same defect | Look for a shape that FORCES it — an enum variant with nowhere to put a matched parameter makes every arm routed through it discard what it matched, so the sites are symptoms and the next one added will be born broken while looking correct |
 | 518 | "It stopped moving, so it finished" | A stall looks identical — wait for the terminal event, not the absence of progress |
-| 519 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 520 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 519 | `ps -o %cpu` for "what is it doing now" | Wrong quantity — it is a decayed average over process lifetime; measured against a cputime delta it read 2.4% against a true 32.8%, then 65.3% against a true 11.1%, so the bias is not even consistent in direction |
+| 520 | A trigger hypothesis tested on episode windows | It will confirm itself — you only sample when something breaks, so the discriminating evidence is QUIET PERIODS BEING CLEAN, not activity near failures |
+| 521 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 522 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -572,8 +572,10 @@ Before calling a class closed:
 | 485 | Any filter over a state or status column | Print the distribution first — a hand-written list of states is a transcription, and one omitted member inflated a real count fourfold |
 | 486 | Two timestamps you are about to compare | Print the DATE with them — a time-of-day format does not leave a gap where the date was, it leaves a plausible value, and "11:20 is after 09:06" is true only if you assume one day |
 | 487 | "staged and exec-verified" from a peer | Ask which PATH — exec-verifying the build proves it runs, not that it is deployed, and where the built name differs from the deployed name a copy can succeed against neither |
-| 488 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 489 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 488 | A deploy marker confirmed PRESENT in the new build | Also prove it ABSENT in the old one, and note the window — that check is only possible BEFORE the old file is replaced, and a marker present in both reads as a successful verification every time, forever |
+| 489 | A staging script that reports success | Read which PATH it writes — it did exactly what it was written to do and reported honestly; the gap is between what it staged and what "staged" is taken to mean downstream |
+| 490 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 491 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

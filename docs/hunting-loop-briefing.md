@@ -561,8 +561,10 @@ Before calling a class closed:
 | 474 | A non-zero exit read as a verdict | DECODE THE SIGNAL — 0, 124 (timeout) and 137 (SIGKILL) are three different mechanisms, and a fast SIGKILL reads as a fast pass in any column that only records pass/fail |
 | 475 | A control binary you copied to test exec | On macOS an APPLE PLATFORM binary is SIGKILLed from a copied path by launch constraints — the copy never reaches the policy path, so it tests your choice of test binary rather than the fault |
 | 476 | A measurement window shorter than the phenomenon's period | It reports zero change with full confidence — I called a file static across three 5s samples when it grew 1.28 MB over 4 minutes |
-| 477 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 478 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 477 | A value you are about to quote from your own probe's output | Decode it AT THE POINT OF PRINTING — every rule here aims at faulty instruments, and none catches a CORRECT instrument whose output was transcribed wrong; a raw status column conflates 0, 124 and 137 into "some small number" exactly when you are scanning for the one that matters |
+| 478 | Two people reading the same output column | Both will reach for the column the investigation is ABOUT — we each read the timing and skipped the status, in the same hour, in opposite directions, because timing was the subject |
+| 479 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 480 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

@@ -515,8 +515,10 @@ Before calling a class closed:
 | 428 | An enumeration that came back small | Falsify it with a member you KNOW is present — a positive control applied to the SEARCH, not the result, is the difference between a sweep and a reassurance |
 | 429 | A test that passes in isolation | Ask whether the isolated run RECREATES THE CONDITION UNDER TEST — for a load-dependent failure isolation destroys it and proves nothing, for a deterministic one it preserves it exactly and proves everything; the same procedure is decisive or vacuous depending on the mechanism, so choose the reading AFTER forming a hypothesis |
 | 430 | A fixture that hand-builds a value the producer emits | It is a second copy of a contract enforced only by tests — it drifts from the runtime copy independently and stays green across exactly the break it exists to catch, so fix how the fixture OBTAINS the value, not the value |
-| 431 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 432 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 431 | A check you are about to tighten | Enumerate every producer that must satisfy it FIRST — tightening is a de facto enumeration, and skipping it converts a contract change into a sequence of surprises found one at a time by whoever runs each lane next |
+| 432 | The second or third fix of one class | Stop fixing and enumerate — each earlier fix looked complete from inside its own slice, which is exactly why the population was never listed |
+| 433 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 434 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

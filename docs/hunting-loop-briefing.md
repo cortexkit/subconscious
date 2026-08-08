@@ -577,8 +577,11 @@ Before calling a class closed:
 | 490 | A single-sample gate over a variable quantity | It is a fact about that DRAW, not about the host — and the cheap fast sample is the one most likely to be taken when healthy, so it is least likely to catch the bad regime; sample repeatedly and refuse on the WORST draw |
 | 491 | A fault you have characterised as on/off | Look for a middle regime — measured 455ms, then 30s timeout, then 13s, then 7.5s, then six draws near 350ms, all on one host with one binary; the readings you filed as "recovering transient" may be a state it returns to |
 | 492 | A bracket resting on one known-good endpoint | If the quantity is variable, that endpoint may be a lucky draw and the onset is earlier and unmeasured |
-| 493 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 494 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 493 | A blocking premise two parties assert independently | Agreement is not corroboration when both inferred it from the same neighbouring case — ours cost two days and was falsifiable in one command against the live process |
+| 494 | A symptom you have just fixed one cause of | Look for a SECOND cause of the same symptom — a stale copy on PATH and a compiled constant both produced "dials the old id", and fixing either alone leaves it broken while looking deployed |
+| 495 | A binary on PATH | Check whether it is a symlink or a separate copy — a copy makes every future deploy to the canonical path invisible, and the failure looks like the deploy not taking |
+| 496 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 497 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

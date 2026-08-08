@@ -5,6 +5,9 @@
   "changed_pending_reload": [
     "aft-tools"
   ],
+  "enabled_changes": [
+    "paused-tools"
+  ],
   "op": "supervisor.rescan",
   "removed": [
     "old-tools"

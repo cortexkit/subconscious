@@ -534,6 +534,73 @@ async fn rescan_preview_reports_the_removal_it_would_make_and_makes_none() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_preview_reports_an_enabled_flip_it_would_apply() {
+    // Rescan calls set_enabled for an enabled-flip, so a preview that omits them
+    // under-reports a mutation class it performs. The bucket arithmetic is what
+    // exposes it: a module changing only its enabled flag is deliberately not
+    // counted as unchanged, so before this field existed the buckets summed to one
+    // less than the configured module count and nothing else in the output moved.
+    //
+    // Asserting the sum is what makes this fail if a FUTURE mutation class is added
+    // without a bucket; naming the field alone would only cover this one.
+    let module_id = "rescan-preview-enabled";
+    let daemon = RunningDaemon::start(
+        "daemon-rescan-preview-enabled",
+        Some(config_doc([stub_module(module_id, true, [])])),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+
+    fs::write(
+        &daemon.config_path,
+        config_doc([stub_module(module_id, false, [])]),
+    )
+    .unwrap();
+    let preview = supervisor_rescan_with(&daemon.connection_file_path, 940, true).await;
+
+    assert_eq!(
+        preview.enabled_changes,
+        vec![module_id.to_string()],
+        "an enabled flip must appear in the preview, or the operator is told a rescan \
+         will change nothing while it is about to stop a live module"
+    );
+    assert!(preview.added.is_empty());
+    assert!(preview.removed.is_empty());
+    assert!(preview.changed_pending_reload.is_empty());
+    assert_eq!(
+        preview.added.len()
+            + preview.removed.len()
+            + preview.changed_pending_reload.len()
+            + preview.enabled_changes.len()
+            + preview.unchanged as usize,
+        1,
+        "every configured module must land in exactly one bucket; a shortfall means the \
+         preview performs a mutation class it does not report"
+    );
+
+    // The effect assertion: the preview reported the flip and must not have applied
+    // it, so the module is still enabled and live.
+    let after = supervisor_modules(&daemon.connection_file_path, 941).await;
+    assert_eq!(after.len(), 1);
+    assert!(
+        after[0].enabled && after[0].live,
+        "preview must not apply the enabled flip it reported"
+    );
+
+    // And the applying call reports the same bucket, so a reader cannot conclude the
+    // field is preview-only decoration.
+    let applied = supervisor_rescan_with(&daemon.connection_file_path, 942, false).await;
+    assert_eq!(applied.enabled_changes, vec![module_id.to_string()]);
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| entry.state == "disabled" && !entry.enabled && !entry.live,
+        STATE_TIMEOUT,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rescan_applies_enabled_flips_without_daemon_restart() {
     let module_id = "rescan-enabled";
     let daemon = RunningDaemon::start(

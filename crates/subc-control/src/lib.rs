@@ -207,6 +207,20 @@ pub struct SupervisorRescanResult {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed_pending_reload: Vec<String>,
+    /// Modules whose enabled flag differs between config and running state.
+    ///
+    /// Rescan calls `set_enabled` for these, so omitting them made the preview
+    /// describe two of the three mutation classes it performs. A module changing
+    /// only its enabled flag landed in no bucket at all -- not added, removed or
+    /// changed, and deliberately not counted as unchanged either -- so the sole
+    /// evidence was that the buckets no longer summed to the configured module
+    /// count. A preview is consulted precisely when someone is being careful,
+    /// which is the worst place to under-report.
+    ///
+    /// Empty is skipped so consumers written against the older shape keep
+    /// parsing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_changes: Vec<String>,
     pub unchanged: u32,
     /// True when this reconciliation was computed but NOT applied.
     ///

@@ -1871,6 +1871,7 @@ fn print_rescan_table(result: &Value) {
             "changed-pending-reload".to_string(),
             module_ids("changed_pending_reload"),
         ],
+        vec!["enabled-changed".to_string(), module_ids("enabled_changes")],
         vec![
             "unchanged".to_string(),
             result

@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
+    time::Duration,
 };
 
 use subc_control::ClientControlResponse;
@@ -23,6 +24,11 @@ const DEFAULT_MODULE_MANAGED_WINDOW: usize = 32;
 
 /// High per-channel cap for stateless modules; this is an OOM guard, not scheduling policy.
 const STATELESS_PARALLEL_WINDOW: usize = 1024;
+
+/// A stopped probe cycle cannot retain its last unanswered correlation forever.
+/// Active endpoints replace the tombstone on their next serial health probe;
+/// this backstop covers endpoints that stop probing altogether.
+const HEALTH_PROBE_TOMBSTONE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Module connection identity used in forwarding keys.
 ///
@@ -181,11 +187,30 @@ pub(crate) enum ModuleControlRpcOutcome {
     DeadlineElapsed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModuleControlRpcCompletion {
+    Unknown,
+    Settled,
+    LateHealthAnswer {
+        module_id: String,
+        latency: Duration,
+    },
+}
+
 #[derive(Debug)]
 struct PendingModuleControlRpcEntry {
     expected_op: String,
     deadline: Instant,
+    health_probe_started_at: Option<Instant>,
     sender: oneshot::Sender<ModuleControlRpcOutcome>,
+}
+
+#[derive(Debug)]
+struct HealthProbeTombstone {
+    expected_op: String,
+    module_id: String,
+    probe_started_at: Instant,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +278,7 @@ struct ForwardingInner {
     pending_relays: HashMap<(ModuleEndpointId, u64), PendingRouteBindRelayEntry>,
     next_control_corr: HashMap<ModuleEndpointId, u64>,
     pending_control_rpcs: HashMap<(ModuleEndpointId, u64), PendingModuleControlRpcEntry>,
+    health_probe_tombstones: HashMap<(ModuleEndpointId, u64), HealthProbeTombstone>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +307,7 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 /// Dynamic forwarding state shared by the control plane and data-plane router.
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
-    inner: RwLock<ForwardingInner>,
+    inner: Arc<RwLock<ForwardingInner>>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
     counters: DaemonCounters,
 }
@@ -435,6 +461,31 @@ impl ForwardingTable {
         expected_op: &str,
         deadline: Instant,
     ) -> Result<PendingModuleControlRpc, ForwardingError> {
+        self.begin_module_control_rpc_inner(module_id, expected_op, deadline, None)
+    }
+
+    pub(crate) fn begin_health_probe_rpc_for(
+        &self,
+        module_id: &str,
+        expected_op: &str,
+        probe_started_at: Instant,
+        deadline: Instant,
+    ) -> Result<PendingModuleControlRpc, ForwardingError> {
+        self.begin_module_control_rpc_inner(
+            module_id,
+            expected_op,
+            deadline,
+            Some(probe_started_at),
+        )
+    }
+
+    fn begin_module_control_rpc_inner(
+        &self,
+        module_id: &str,
+        expected_op: &str,
+        deadline: Instant,
+        health_probe_started_at: Option<Instant>,
+    ) -> Result<PendingModuleControlRpc, ForwardingError> {
         let mut inner = self.write_inner()?;
         let module = inner
             .modules_by_id
@@ -453,6 +504,14 @@ impl ForwardingTable {
             return Err(ForwardingError::ConnectionClosing {
                 connection_id: module.endpoint.connection_id,
             });
+        }
+        if health_probe_started_at.is_some() {
+            // Recurring health probes are serial per endpoint. Once the next one
+            // starts, an older answer can no longer improve the current snapshot,
+            // so retaining more than the newest unanswered probe has no value.
+            inner
+                .health_probe_tombstones
+                .retain(|(endpoint, _), _| *endpoint != module.endpoint);
         }
         let corr = match inner.allocate_control_corr(module.endpoint) {
             Ok(corr) => corr,
@@ -474,6 +533,7 @@ impl ForwardingTable {
             PendingModuleControlRpcEntry {
                 expected_op: expected_op.to_string(),
                 deadline,
+                health_probe_started_at,
                 sender,
             },
         );
@@ -689,6 +749,65 @@ impl ForwardingTable {
         Ok(())
     }
 
+    pub(crate) fn tombstone_health_probe_rpc(
+        &self,
+        endpoint: ModuleEndpointId,
+        corr: u64,
+    ) -> Result<bool, ForwardingError> {
+        let key = (endpoint, corr);
+        let expires_at = Instant::now() + HEALTH_PROBE_TOMBSTONE_TTL;
+        {
+            let mut inner = self.write_inner()?;
+            let Some(pending) = inner.pending_control_rpcs.remove(&key) else {
+                return Ok(false);
+            };
+            let Some(probe_started_at) = pending.health_probe_started_at else {
+                inner.pending_control_rpcs.insert(key, pending);
+                return Ok(false);
+            };
+            let module_id = inner
+                .module_id_by_endpoint
+                .get(&endpoint)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            inner.health_probe_tombstones.insert(
+                key,
+                HealthProbeTombstone {
+                    expected_op: pending.expected_op,
+                    module_id,
+                    probe_started_at,
+                    expires_at,
+                },
+            );
+        }
+        self.schedule_health_probe_tombstone_expiration(key, expires_at);
+        Ok(true)
+    }
+
+    fn schedule_health_probe_tombstone_expiration(
+        &self,
+        key: (ModuleEndpointId, u64),
+        expires_at: Instant,
+    ) {
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(expires_at).await;
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let Ok(mut inner) = inner.write() else {
+                return;
+            };
+            let expired = inner
+                .health_probe_tombstones
+                .get(&key)
+                .is_some_and(|tombstone| tombstone.expires_at <= Instant::now());
+            if expired {
+                inner.health_probe_tombstones.remove(&key);
+            }
+        });
+    }
+
     pub(crate) fn complete_pending_relay(
         &self,
         connection_id: ConnectionId,
@@ -780,10 +899,18 @@ impl ForwardingTable {
         let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
             return Ok(None);
         };
+        let key = (endpoint, corr);
         Ok(inner
             .pending_control_rpcs
-            .get(&(endpoint, corr))
-            .map(|pending| pending.expected_op.clone()))
+            .get(&key)
+            .map(|pending| pending.expected_op.clone())
+            .or_else(|| {
+                inner
+                    .health_probe_tombstones
+                    .get(&key)
+                    .filter(|tombstone| tombstone.expires_at > Instant::now())
+                    .map(|tombstone| tombstone.expected_op.clone())
+            }))
     }
 
     pub(crate) fn complete_module_control_rpc(
@@ -792,31 +919,58 @@ impl ForwardingTable {
         corr: u64,
         actual_op: Option<&str>,
         outcome: ModuleControlRpcOutcome,
-    ) -> Result<bool, ForwardingError> {
+    ) -> Result<ModuleControlRpcCompletion, ForwardingError> {
+        let now = Instant::now();
         let mut inner = self.write_inner()?;
         let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
-            return Ok(false);
+            return Ok(ModuleControlRpcCompletion::Unknown);
         };
-        let Some(pending) = inner.pending_control_rpcs.remove(&(endpoint, corr)) else {
-            return Ok(false);
-        };
-        if Instant::now() >= pending.deadline {
-            let _ = pending
-                .sender
-                .send(ModuleControlRpcOutcome::DeadlineElapsed);
-            return Ok(true);
-        }
-        let outcome = match actual_op {
-            Some(actual) if actual != pending.expected_op => {
-                ModuleControlRpcOutcome::UnexpectedOp {
-                    expected: pending.expected_op,
-                    actual: actual.to_string(),
-                }
+        let key = (endpoint, corr);
+        if let Some(pending) = inner.pending_control_rpcs.remove(&key) {
+            if now >= pending.deadline {
+                let late_health_answer = pending.health_probe_started_at.map(|probe_started_at| {
+                    ModuleControlRpcCompletion::LateHealthAnswer {
+                        module_id: inner
+                            .module_id_by_endpoint
+                            .get(&endpoint)
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        latency: now.saturating_duration_since(probe_started_at),
+                    }
+                });
+                let _ = pending
+                    .sender
+                    .send(ModuleControlRpcOutcome::DeadlineElapsed);
+                return Ok(late_health_answer.unwrap_or(ModuleControlRpcCompletion::Settled));
             }
-            _ => outcome,
+            let outcome = match actual_op {
+                Some(actual) if actual != pending.expected_op => {
+                    ModuleControlRpcOutcome::UnexpectedOp {
+                        expected: pending.expected_op,
+                        actual: actual.to_string(),
+                    }
+                }
+                _ => outcome,
+            };
+            let _ = pending.sender.send(outcome);
+            return Ok(ModuleControlRpcCompletion::Settled);
+        }
+
+        let Some(tombstone) = inner.health_probe_tombstones.remove(&key) else {
+            return Ok(ModuleControlRpcCompletion::Unknown);
         };
-        let _ = pending.sender.send(outcome);
-        Ok(true)
+        if tombstone.expires_at <= now {
+            return Ok(ModuleControlRpcCompletion::Unknown);
+        }
+        Ok(ModuleControlRpcCompletion::LateHealthAnswer {
+            module_id: tombstone.module_id,
+            latency: now.saturating_duration_since(tombstone.probe_started_at),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn health_probe_tombstone_count(&self) -> Result<usize, ForwardingError> {
+        Ok(self.read_inner()?.health_probe_tombstones.len())
     }
 
     pub(crate) fn module_endpoint_for_connection(
@@ -1622,6 +1776,9 @@ fn remove_module_connection_locked(
     inner.next_module_channel.remove(&endpoint);
     inner.next_control_corr.remove(&endpoint);
     inner
+        .health_probe_tombstones
+        .retain(|(pending_endpoint, _), _| *pending_endpoint != endpoint);
+    inner
         .module_slot_epochs
         .retain(|key, _| key.endpoint != endpoint);
     let reserved_module_keys: Vec<ModuleRouteKey> = inner
@@ -2239,22 +2396,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rpc.corr, 2);
-        assert!(forwarding
-            .complete_module_control_rpc(
-                module_connection,
-                rpc.corr,
-                Some("health.check"),
-                ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
-                    status: subc_protocol::session::HealthStatus::Ok,
-                    detail: None,
-                    metrics: None,
-                }),
-            )
-            .unwrap());
+        assert_eq!(
+            forwarding
+                .complete_module_control_rpc(
+                    module_connection,
+                    rpc.corr,
+                    Some("health.check"),
+                    ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                        status: subc_protocol::session::HealthStatus::Ok,
+                        detail: None,
+                        metrics: None,
+                    }),
+                )
+                .unwrap(),
+            ModuleControlRpcCompletion::Settled
+        );
         assert!(matches!(
             rpc.receiver.blocking_recv().unwrap(),
             ModuleControlRpcOutcome::DeadlineElapsed
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_probe_tombstone_ttl_removes_an_endpoint_that_stops_probing() {
+        let (forwarding, _, endpoint, _, _, _) = route_fixture("tombstone-ttl");
+        let probe_started_at = Instant::now();
+        let rpc = forwarding
+            .begin_health_probe_rpc_for(
+                "tombstone-ttl",
+                "health.check",
+                probe_started_at,
+                probe_started_at + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(forwarding
+            .tombstone_health_probe_rpc(endpoint, rpc.corr)
+            .unwrap());
+        assert_eq!(forwarding.health_probe_tombstone_count().unwrap(), 1);
+
+        tokio::time::advance(HEALTH_PROBE_TOMBSTONE_TTL).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(forwarding.health_probe_tombstone_count().unwrap(), 0);
     }
 
     #[test]

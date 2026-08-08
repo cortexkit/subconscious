@@ -26,9 +26,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     forwarding::{
-        CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
-        ModuleEndpointId, PendingModuleControlRpc, RouteBindRelayOutcome, RoutePollSnapshot,
-        RouteRelease,
+        CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcCompletion,
+        ModuleControlRpcOutcome, ModuleEndpointId, PendingModuleControlRpc, RouteBindRelayOutcome,
+        RoutePollSnapshot, RouteRelease,
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
@@ -1367,6 +1367,8 @@ impl ControlHandler {
                     detail: status.health.detail,
                     metrics: status.health.metrics,
                     consecutive_failures: status.health.consecutive_failures,
+                    late_answer_count: status.health.late_answer_count,
+                    last_late_answer_latency_ms: status.health.last_late_answer_latency_ms,
                     last_action: status.health.last_action,
                     last_action_ms: status.health.last_action_ms,
                     last_probe_ms: status.health.last_probe_ms,
@@ -2095,6 +2097,42 @@ impl ControlHandler {
         )?])
     }
 
+    pub(crate) fn observe_module_control_completion(
+        &self,
+        completion: ModuleControlRpcCompletion,
+    ) -> bool {
+        match completion {
+            ModuleControlRpcCompletion::Unknown => false,
+            ModuleControlRpcCompletion::Settled => true,
+            ModuleControlRpcCompletion::LateHealthAnswer { module_id, latency } => {
+                let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+                info!(
+                    module_id = %module_id,
+                    latency_ms,
+                    "late health.check answer proves the module is alive"
+                );
+                match self
+                    .supervisor
+                    .record_late_health_answer(&module_id, latency_ms)
+                {
+                    Ok(true) => {}
+                    Ok(false) => debug!(
+                        module_id = %module_id,
+                        latency_ms,
+                        "late health.check answer has no active supervisor snapshot"
+                    ),
+                    Err(err) => warn!(
+                        module_id = %module_id,
+                        latency_ms,
+                        error = %err,
+                        "failed to record late health.check answer"
+                    ),
+                }
+                true
+            }
+        }
+    }
+
     fn handle_module_relay_response(
         &self,
         connection_id: ConnectionId,
@@ -2138,7 +2176,7 @@ impl ControlHandler {
                             probe.op
                         )),
                     };
-                    let settled = self
+                    let completion = self
                         .forwarding
                         .complete_module_control_rpc(
                             connection_id,
@@ -2147,7 +2185,7 @@ impl ControlHandler {
                             outcome,
                         )
                         .map_err(RouterError::Forwarding)?;
-                    if !settled {
+                    if !self.observe_module_control_completion(completion) {
                         debug!(
                             connection_id = connection_id.get(),
                             corr = frame.header.corr,
@@ -2163,7 +2201,7 @@ impl ControlHandler {
                         .pending_module_control_op(connection_id, frame.header.corr)
                         .map_err(RouterError::Forwarding)?
                     {
-                        let settled = self
+                        let completion = self
                             .forwarding
                             .complete_module_control_rpc(
                                 connection_id,
@@ -2174,7 +2212,7 @@ impl ControlHandler {
                                 )),
                             )
                             .map_err(RouterError::Forwarding)?;
-                        if !settled {
+                        if !self.observe_module_control_completion(completion) {
                             debug!(
                                 connection_id = connection_id.get(),
                                 corr = frame.header.corr,
@@ -2205,7 +2243,7 @@ impl ControlHandler {
                             "malformed module-control ERROR body: {err}"
                         )),
                     };
-                    let settled = self
+                    let completion = self
                         .forwarding
                         .complete_module_control_rpc(
                             connection_id,
@@ -2214,7 +2252,7 @@ impl ControlHandler {
                             outcome,
                         )
                         .map_err(RouterError::Forwarding)?;
-                    if !settled {
+                    if !self.observe_module_control_completion(completion) {
                         debug!(
                             connection_id = connection_id.get(),
                             corr = frame.header.corr,
@@ -2668,7 +2706,7 @@ fn send_goodbye_target_best_effort(target: &GoodbyeTarget, context: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     use serde_json::{json, Value};
     use subc_protocol::{
@@ -4151,6 +4189,67 @@ mod tests {
         handler
             .cleanup_connection(module_ctx.connection_id)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_health_reply_is_recorded_through_the_module_response_path() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor_handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new(Arc::clone(&registry), crate::RestartPolicy::default())
+            .with_forwarding(Arc::clone(&forwarding))
+            .with_handle(supervisor_handle.clone());
+        let module = supervisor
+            .supervise_configured(
+                crate::ModuleSpec {
+                    module_id: "late-health-response".to_string(),
+                    program: PathBuf::from("disabled-module"),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                },
+                false,
+            )
+            .unwrap();
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor_handle);
+        let (module_ctx, _module_rx) = route_ctx(ConnectionId::new(39));
+        handler
+            .handle_control_frame(
+                &module_ctx,
+                hello_frame_with_control_ops(
+                    "late-health-response",
+                    PROTOCOL_VERSION,
+                    7,
+                    Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+                ),
+            )
+            .await
+            .unwrap();
+        let probe_started_at = Instant::now() - Duration::from_millis(80);
+        let pending = forwarding
+            .begin_health_probe_rpc_for(
+                "late-health-response",
+                MODULE_CONTROL_OP_HEALTH_CHECK,
+                probe_started_at,
+                Instant::now() - Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(forwarding
+            .tombstone_health_probe_rpc(pending.endpoint, pending.corr)
+            .unwrap());
+
+        let responses = handler
+            .handle_control_frame(&module_ctx, health_response(pending.corr, HealthStatus::Ok))
+            .await
+            .unwrap();
+
+        assert!(responses.is_empty());
+        let health = module.status().unwrap().health;
+        assert_eq!(health.late_answer_count, 1);
+        assert!(health.last_late_answer_latency_ms.unwrap() >= 80);
     }
 
     #[tokio::test]

@@ -287,6 +287,13 @@ pub struct SupervisorHealthEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<serde_json::Value>,
     pub consecutive_failures: u32,
+    /// Number of recurring health replies received after their daemon deadline.
+    /// Each increment is evidence that the module remained alive despite a miss.
+    #[serde(default)]
+    pub late_answer_count: u64,
+    /// End-to-end latency of the newest late reply, measured from probe start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_late_answer_latency_ms: Option<u64>,
     /// The escalation the supervisor last took for this module (report, restart,
     /// alert). Absent means NO ACTION HAS EVER BEEN TAKEN, not that the last one
     /// succeeded — a module that has never misbehaved and one whose action record

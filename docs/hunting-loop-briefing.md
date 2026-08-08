@@ -609,8 +609,10 @@ Before calling a class closed:
 | 522 | Two independent blockers on one piece of work | Suspect both — where the cost of a wrong blocker is only DELAY, nothing generates evidence against it, so false blockers accumulate rather than being caught |
 | 523 | A timeline built from a directory that gets CLEANED UP | Survivorship, not history — an hour with no surviving artefact reads identical to an hour with no work, and the empty baseline makes any later burst look dramatic; widening the search found 363 executables in a window the first query called empty |
 | 524 | A correlation you proposed yourself | Name its falsifier and run THAT — the peer who offered the burst hypothesis killed it two messages later by checking whether healthy hours were quiet; they were not, and the busiest bucket of the morning sat inside one |
-| 525 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 526 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 525 | Log or storage volume you are about to cap | ATTRIBUTE IT FIRST, by bytes rather than lines — a cap manages the symptom, and capping while the cause runs is the fix-the-instance-not-the-class shape; measured, 93% of a daemon log's bytes sat in the category my line-count pass called "other" |
+| 526 | A repeated log line in near-perfect ratio with its neighbours | Ask whether it is a path being ENTERED REPEATEDLY or an event logged once per call — those readings have opposite implications and identical output, and a rate limit would hide the first |
+| 527 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 528 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

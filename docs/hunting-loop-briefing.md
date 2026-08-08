@@ -617,8 +617,10 @@ Before calling a class closed:
 | 530 | Two fixes landing in either order | Check whether the FIRST one alone would produce the closure signal you are watching for — a log rate-limit shipped before a loop fix makes volume drop while the loop runs, which is the false-closure shape one layer over |
 | 531 | A "backstop" for an instrument you distrust | Check it does not read through the SAME instrument — a lock count offered as log-independent was only obtainable from the log; the real one was the lease file's mtime on disk |
 | 532 | A defect visible in exactly one signal | Count how many surfaces are QUIET — disk flat, health `ready`, only raw log volume loud; and if the loud one is about to be rate-limited, that signal must survive as a count or the defect becomes unobservable |
-| 533 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 534 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 533 | A correction you are about to send | Check it addresses the SAME SUBJECT as the claim — I answered "my module's contribution is trivial" with an aggregate figure; both true, correction was noise, and only measuring attribution showed the component was 0.9% |
+| 534 | A census reporting zero findings | Confirm it still finds the KNOWN-OLD ones — a guard that holds and a census that stopped looking both report zero, and only the surviving historical hits distinguish them |
+| 535 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 536 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

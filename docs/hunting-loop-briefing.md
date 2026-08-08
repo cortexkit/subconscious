@@ -539,8 +539,11 @@ Before calling a class closed:
 | 452 | A guard whose trigger counts BAD entries | It is silent on TOTAL failure — partial drift leaves entries to warn about, complete drift leaves none, so the more completely it fails the quieter it gets |
 | 453 | A vacuity notice you did write | Check it reaches the EXIT CODE — a warning printed then followed by an exit computed from the finding count is invisible to every caller, because an empty corpus has no findings to count |
 | 454 | A guard's PLACEMENT | It follows the author's imagined failure story, not the guard's requirement — a mistyped-path story puts it up front where arguments are validated, a pattern-drift story puts it where the patterns are used; reviewing intent never catches this, asking what it prints over nothing always does |
-| 455 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 456 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 455 | A fix aimed at what a tool SAYS | Check what it RETURNS — replacing a vacuous message with an honest one does not put the exit code in the frame, and a caller reads the code rather than the tail |
+| 456 | A language guarantee reached through indirection | Build the structure in isolation — `set -e` is reliable, `set -e` through a wrapper invoking "$@" inside a function is a claim about composition, which is where guarantees stop being obvious |
+| 457 | A negative case you constructed | PROVE THE CONSTRUCTION TOOK before reading the result — assert the fixture is empty, the path is the one you meant, the schema matches; otherwise "the guard fired" and "the harness lied" are the same output |
+| 458 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 459 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

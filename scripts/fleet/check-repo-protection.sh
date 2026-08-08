@@ -101,7 +101,15 @@ done
 
   echo
   echo "examined: $examined repos   dead remotes: $dead   no remote: $none   ahead: $stale"
-  if [ $((dead+none+stale)) -eq 0 ]; then
+  # The clean claim is conditioned on having examined something. Vacuous truth is
+  # the failure mode: over an empty set "every repo has a reachable remote" is
+  # true and worthless, and it is exactly what prints if repo discovery silently
+  # yields nothing -- a moved parent directory, a changed layout. The finding
+  # counts being zero is the same reading in both cases; only the denominator
+  # tells them apart, so the denominator has to gate the sentence.
+  if [ "$examined" -eq 0 ]; then
+    echo "NO REPOS EXAMINED -- discovery found nothing, so this run proves nothing"
+  elif [ $((dead+none+stale)) -eq 0 ]; then
     echo "every repo has a reachable remote and nothing local-only"
   fi
 

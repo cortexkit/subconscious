@@ -6,7 +6,9 @@
       "detail": "warming model",
       "last_action": "report",
       "last_action_ms": 1700000000100,
+      "last_late_answer_latency_ms": 8000,
       "last_probe_ms": 1700000000050,
+      "late_answer_count": 2,
       "metrics": {
         "queue_depth": 3
       },

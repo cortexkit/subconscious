@@ -175,6 +175,11 @@ pub struct ModuleHealthStatus {
     pub detail: Option<String>,
     pub metrics: Option<Value>,
     pub consecutive_failures: u32,
+    /// Number of replies received after a recurring health probe's deadline.
+    /// Unlike a timeout, every increment proves the module was alive.
+    pub late_answer_count: u64,
+    /// End-to-end latency of the newest late reply, measured from probe start.
+    pub last_late_answer_latency_ms: Option<u64>,
     pub last_action: Option<String>,
     /// Set together with `last_action`; the pair moves as one, and both being
     /// absent means no escalation has ever been taken rather than that the last
@@ -190,6 +195,8 @@ impl Default for ModuleHealthStatus {
             detail: None,
             metrics: None,
             consecutive_failures: 0,
+            late_answer_count: 0,
+            last_late_answer_latency_ms: None,
             last_action: None,
             last_action_ms: None,
         }
@@ -568,6 +575,21 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         modules.get(module_id).cloned()
+    }
+
+    pub(crate) fn record_late_health_answer(
+        &self,
+        module_id: &str,
+        latency_ms: u64,
+    ) -> Result<bool, SuperviseError> {
+        let Some(module) = self.get(module_id) else {
+            return Ok(false);
+        };
+        update_snapshot(&module.inner.snapshot, Some(module_id), |state| {
+            state.health.late_answer_count = state.health.late_answer_count.saturating_add(1);
+            state.health.last_late_answer_latency_ms = Some(latency_ms);
+        })?;
+        Ok(true)
     }
 
     pub fn list(&self) -> Vec<SupervisedModule> {
@@ -1474,9 +1496,15 @@ async fn probe_module_health(
             "supervisor was not configured with a forwarding table",
         ));
     };
-    let deadline = Instant::now() + runtime.health.deadline;
+    let probe_started_at = Instant::now();
+    let deadline = probe_started_at + runtime.health.deadline;
     let pending = forwarding
-        .begin_module_control_rpc_for(&spec.module_id, MODULE_CONTROL_OP_HEALTH_CHECK, deadline)
+        .begin_health_probe_rpc_for(
+            &spec.module_id,
+            MODULE_CONTROL_OP_HEALTH_CHECK,
+            probe_started_at,
+            deadline,
+        )
         .map_err(|err| {
             // The endpoint is not registered, so there is no live control lane to
             // ask. That is the module being absent, not slow.
@@ -1554,12 +1582,9 @@ async fn probe_module_health(
                 "expected module-control op '{expected}', got '{actual}'"
             )))
         }
-        // A LATE ANSWER IS PROOF OF LIFE. This arm is currently UNREACHABLE from
-        // the health path: the `Err(_)` arm below cancels the waiter at deadline,
-        // which deletes the pending record a late reply would land on, so the
-        // reply arrives at a map that has no memory of the question and is
-        // dropped. Classified correctly here so that replacing that cancel with a
-        // tombstone needs no second decision about what a late answer means.
+        // A reply that crosses the deadline before this waiter observes it is
+        // still proof of life. The forwarding path records its end-to-end latency
+        // before delivering this classification.
         Ok(Ok(ModuleControlRpcOutcome::DeadlineElapsed)) => Err(HealthProbeError::bad_answer(
             "module answered health.check after its daemon deadline",
         )),
@@ -1567,7 +1592,7 @@ async fn probe_module_health(
             "health.check waiter was canceled before the module responded",
         )),
         Err(_) => {
-            let _ = forwarding.cancel_module_control_rpc(endpoint, corr);
+            let _ = forwarding.tombstone_health_probe_rpc(endpoint, corr);
             Err(HealthProbeError::no_answer(format!(
                 "module did not answer health.check within {:?}",
                 runtime.health.deadline
@@ -3234,6 +3259,178 @@ mod health_evidence_tests {
         let err = HealthProbeError::no_answer("module did not answer within 5s");
         assert_eq!(err.to_string(), "module did not answer within 5s");
         assert!(matches!(err.evidence, HealthProbeEvidence::NoAnswer));
+    }
+}
+
+#[cfg(test)]
+mod health_tombstone_tests {
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
+    use subc_protocol::{
+        manifest::Concurrency,
+        session::{HealthStatus, ModuleControlResponse},
+    };
+    use tokio::sync::mpsc;
+
+    use super::{
+        probe_module_health, HealthAction, HealthConfig, HealthProbeEvidence, ModuleSpec,
+        RestartPolicy, Supervisor, SupervisorRuntimeConfig,
+    };
+    use crate::{
+        control::ControlHandler,
+        forwarding::{ForwardingTable, ModuleControlRpcCompletion, ModuleControlRpcOutcome},
+        registry::{ConnectionId, Registry},
+        router::FrameSink,
+    };
+
+    struct ProbeHarness {
+        spec: ModuleSpec,
+        runtime: SupervisorRuntimeConfig,
+        forwarding: Arc<ForwardingTable>,
+        module_connection: ConnectionId,
+        module_rx: mpsc::Receiver<crate::Frame>,
+        handler: ControlHandler,
+        module: super::SupervisedModule,
+    }
+
+    fn probe_harness() -> ProbeHarness {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor_handle = super::SupervisorHandle::new();
+        let health = HealthConfig {
+            cadence: Duration::from_secs(30),
+            deadline: Duration::from_secs(5),
+            failure_threshold: 3,
+            on_degraded: HealthAction::Report,
+            on_failing: HealthAction::Report,
+            critical: false,
+        };
+        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+            .with_forwarding(Arc::clone(&forwarding))
+            .with_handle(supervisor_handle.clone())
+            .with_health_config(health);
+        let spec = ModuleSpec {
+            module_id: "late-health-module".to_string(),
+            program: PathBuf::from("disabled-module"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+        let module = supervisor
+            .supervise_configured(spec.clone(), false)
+            .unwrap();
+        let runtime = supervisor.runtime_config();
+        let handler = ControlHandler::with_forwarding(registry, Arc::clone(&forwarding))
+            .with_supervisor(supervisor_handle);
+        let module_connection = ConnectionId::new(700);
+        let (module_tx, module_rx) = mpsc::channel(8);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                spec.module_id.clone(),
+                subc_protocol::PROTOCOL_VERSION,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+
+        ProbeHarness {
+            spec,
+            runtime,
+            forwarding,
+            module_connection,
+            module_rx,
+            handler,
+            module,
+        }
+    }
+
+    async fn finish_after(
+        harness: &mut ProbeHarness,
+        stall: Duration,
+    ) -> ModuleControlRpcCompletion {
+        assert!(stall > harness.runtime.health.deadline);
+        let deadline = harness.runtime.health.deadline;
+        let probe = probe_module_health(&harness.spec, &harness.runtime);
+        let answer = async {
+            let frame = harness.module_rx.recv().await.expect("health.check frame");
+            tokio::time::advance(deadline).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(stall - deadline).await;
+            harness
+                .forwarding
+                .complete_module_control_rpc(
+                    harness.module_connection,
+                    frame.header.corr,
+                    Some("health.check"),
+                    ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                        status: HealthStatus::Ok,
+                        detail: None,
+                        metrics: None,
+                    }),
+                )
+                .unwrap()
+        };
+        let (probe_result, completion) = tokio::join!(probe, answer);
+        let err = probe_result.expect_err("probe must miss its deadline");
+        assert!(matches!(err.evidence, HealthProbeEvidence::NoAnswer));
+        completion
+    }
+
+    async fn time_out_without_answer(harness: &mut ProbeHarness) {
+        let deadline = harness.runtime.health.deadline;
+        let probe = probe_module_health(&harness.spec, &harness.runtime);
+        let exhaust_deadline = async {
+            let _frame = harness.module_rx.recv().await.expect("health.check frame");
+            tokio::time::advance(deadline).await;
+            tokio::task::yield_now().await;
+        };
+        let (probe_result, ()) = tokio::join!(probe, exhaust_deadline);
+        let err = probe_result.expect_err("probe must miss its deadline");
+        assert!(matches!(err.evidence, HealthProbeEvidence::NoAnswer));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_health_answers_record_start_anchored_latency_for_two_stalls() {
+        let mut harness = probe_harness();
+
+        let first = finish_after(&mut harness, Duration::from_secs(8)).await;
+        let first_latency = match &first {
+            ModuleControlRpcCompletion::LateHealthAnswer { latency, .. } => *latency,
+            other => panic!("late answer was not retained: {other:?}"),
+        };
+        assert!(harness.handler.observe_module_control_completion(first));
+
+        let second = finish_after(&mut harness, Duration::from_secs(11)).await;
+        let second_latency = match &second {
+            ModuleControlRpcCompletion::LateHealthAnswer { latency, .. } => *latency,
+            other => panic!("late answer was not retained: {other:?}"),
+        };
+        assert!(harness.handler.observe_module_control_completion(second));
+
+        assert_eq!(first_latency, Duration::from_secs(8));
+        assert_eq!(
+            second_latency - first_latency,
+            Duration::from_secs(3),
+            "latency must grow linearly with the additional stall"
+        );
+        let health = harness.module.status().unwrap().health;
+        assert_eq!(health.late_answer_count, 2);
+        assert_eq!(health.last_late_answer_latency_ms, Some(11_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_serial_probe_cycles_keep_one_tombstone_per_endpoint() {
+        let mut harness = probe_harness();
+
+        for _ in 0..20 {
+            time_out_without_answer(&mut harness).await;
+            assert_eq!(
+                harness.forwarding.health_probe_tombstone_count().unwrap(),
+                1
+            );
+        }
     }
 }
 

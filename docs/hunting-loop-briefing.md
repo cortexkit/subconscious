@@ -563,8 +563,12 @@ Before calling a class closed:
 | 476 | A measurement window shorter than the phenomenon's period | It reports zero change with full confidence — I called a file static across three 5s samples when it grew 1.28 MB over 4 minutes |
 | 477 | A value you are about to quote from your own probe's output | Decode it AT THE POINT OF PRINTING — every rule here aims at faulty instruments, and none catches a CORRECT instrument whose output was transcribed wrong; a raw status column conflates 0, 124 and 137 into "some small number" exactly when you are scanning for the one that matters |
 | 478 | Two people reading the same output column | Both will reach for the column the investigation is ABOUT — we each read the timing and skipped the status, in the same hour, in opposite directions, because timing was the subject |
-| 479 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 480 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 479 | A filter written as "not in my list of finished states" | Invert it — a denylist of known-good values fails OPEN into the alarming category, so a state you forgot becomes a finding rather than a silence, and nobody audits a check that is finding things |
+| 480 | A marker chosen to prove a deploy landed | Prove it can be PRESENT somewhere — a doc comment reads absent in both binaries, which is indistinguishable from a correct swap if you only assert absence in the old one |
+| 481 | A post-swap check comparing deployed against staged | It is unconditionally true — same build, so it can never fail; keep the PRE-STATE copy, which is the only artefact that can disagree, and treat it as evidence before recovery |
+| 482 | A striking ratio in one arm | Run the same ratio on a known-good arm before reporting it — an optional field is absent in the healthy population too, and the number looks damning until the control exists |
+| 483 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 484 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

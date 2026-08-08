@@ -621,8 +621,10 @@ Before calling a class closed:
 | 534 | A census reporting zero findings | Confirm it still finds the KNOWN-OLD ones — a guard that holds and a census that stopped looking both report zero, and only the surviving historical hits distinguish them |
 | 535 | An artifact sent to support a claim | Check the DISCRIMINATING FACT is IN it — a census file listed ten losses with no dates, so it could not show they predated the guard; the dating lived in the covering message, which scrolls away while the file persists and reads as evidence AGAINST the guard |
 | 536 | A size threshold standing in for a semantic property | State the blind spot in the artifact — a shrink census cannot see a normative loss that did not shrink the bytes, and the premise line otherwise implies completeness |
-| 537 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 538 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 537 | Tests failing right after your commit, in the area you touched | Run the A/B before debugging the diff — a host fault manufactured six failures in a suite that spawns fresh binaries; the parent commit failed the same test in 10.04s while mine PASSED it in 1.06s, and the discriminator was wall time, not code |
+| 538 | A suite whose RUNTIME jumped alongside its failures | Treat the runtime as the finding — 260s against a normal 0.91s was the tell, and reverting a correct change would have "fixed" it once the host cleared, banking the wrong lesson with a green suite as proof |
+| 539 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 540 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

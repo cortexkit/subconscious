@@ -505,8 +505,11 @@ Before calling a class closed:
 | 418 | A measurement offered as the fix for a bad estimate | Check its instrument too — it is more dangerous than the estimate it replaces precisely because it arrives wearing the remedy |
 | 419 | Evidence you expected to find and did not | Ask whether a CLEANUP STEP removed it — teardown, rotation, eviction and reclamation are authored by someone optimising for tidiness who has no reason to imagine a future investigation, so the deletion is correct by its own lights and survives review |
 | 420 | An unverifiable change to a reporting layer | Refuse it even under time pressure — a change to the thing that reports greenness cannot be validated by the reports, so it is self-concealing in a way an unverifiable change anywhere else is not |
-| 421 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 422 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 421 | An env var read on a refusal path | Ask whether it makes the process MORE TRUSTED or LESS WELL-BEHAVED — both look identical to a grep, but only the first is a bypass; a fault-injection double holding no authority is noise that buries the real finding |
+| 422 | A codebase with a good convention for test seams | Search for everything doing that job BY ANOTHER MEANS — conventions are enforced by resemblance, so the one member shaped differently is the one that inherits none of the discipline and gets no review |
+| 423 | A gate that must be re-applied at every build or call site | Prefer one that is a property of the ARTEFACT — forgetting a per-site pin is silent, so it will eventually not be applied |
+| 424 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 425 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

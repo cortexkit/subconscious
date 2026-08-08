@@ -1072,7 +1072,17 @@ export class SubcClient {
     }
 
     if (frame.header.ty === FrameType.Goodbye && handle) {
-      this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)"));
+      // Carries `route_closed` like the other two route-close sites (closeRoute,
+      // late route.open). It was the only one without a code, so a consumer
+      // branching on `route_closed` to recognise a gone route saw this one as an
+      // uncoded generic failure and fell through to whatever its default was.
+      //
+      // THE CODE MUST NOT MAKE THIS RETRYABLE. A GOODBYE arriving mid-request
+      // means the request was already forwarded and the module may have run it,
+      // so it stays kind=outcome_unknown -- the same class as a mid-flight socket
+      // drop, and never the not_sent/unknown_channel class that call() retries.
+      // The code says WHICH route ended, not that it is safe to send again.
+      this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)", "route_closed"));
       if (this.liveRoutes.get(handle.channel) === handle) this.liveRoutes.delete(handle.channel);
       this.evictRouteHandle(handle);
       return;

@@ -558,8 +558,11 @@ Before calling a class closed:
 | 471 | A detector you are ARGUING is weaker | Run it against defects you already hold — a demonstrated false negative on a known case gives you a measured sensitivity; an argument gives you an opinion |
 | 472 | Being RIGHT about an instrument you did not test | That is the weakest possible evidence you understood it — a wrong reason and a right one produce identical output on a case that passes, and unlike a wrong command a right-for-the-wrong-reason one never gets falsified, so the unearned confidence compounds |
 | 473 | A post-swap marker check against the STAGED file | It is comparing a file to itself — after placement the two are the same build, so the check can only infer. Search the deployed file against the ROLLBACK COPY, which is the only genuinely discriminating pair once the swap has happened |
-| 474 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 475 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 474 | A non-zero exit read as a verdict | DECODE THE SIGNAL — 0, 124 (timeout) and 137 (SIGKILL) are three different mechanisms, and a fast SIGKILL reads as a fast pass in any column that only records pass/fail |
+| 475 | A control binary you copied to test exec | On macOS an APPLE PLATFORM binary is SIGKILLed from a copied path by launch constraints — the copy never reaches the policy path, so it tests your choice of test binary rather than the fault |
+| 476 | A measurement window shorter than the phenomenon's period | It reports zero change with full confidence — I called a file static across three 5s samples when it grew 1.28 MB over 4 minutes |
+| 477 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 478 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

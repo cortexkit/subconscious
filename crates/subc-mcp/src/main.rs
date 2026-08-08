@@ -4359,13 +4359,7 @@ impl SubcMcpServer {
                 }
                 frame = frames.recv() => {
                     let Some(frame) = frame else {
-                        return Err(ErrorData::internal_error(
-                            format!(
-                                "subc route ({}, {}) closed before terminal tool response for corr {corr}",
-                                route.channel, route.epoch
-                            ),
-                            None,
-                        ));
+                        return Err(route_closed_error(route, corr));
                     };
 
                     match frame.header.ty {
@@ -4555,6 +4549,22 @@ async fn forward_progress(
         .notify_progress(notification)
         .await
         .map_err(mcp_internal_error)
+}
+
+fn route_closed_error(route: RouteHandle, corr: u64) -> ErrorData {
+    ErrorData::internal_error(
+        format!(
+            "subc route ({}, {}) closed after the request was dispatched; it may have been executed, so repeating it may repeat any side effect (corr {corr})",
+            route.channel, route.epoch
+        ),
+        Some(serde_json::json!({
+            "subc_code": "route_closed",
+            "send_outcome": "outcome_unknown",
+            "request_dispatched": true,
+            "route_channel": route.channel,
+            "route_epoch": route.epoch,
+        })),
+    )
 }
 
 fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
@@ -5222,6 +5232,30 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
     use super::*;
+
+    #[test]
+    fn route_closed_error_carries_unknown_outcome_and_route_identity() {
+        let error = route_closed_error(
+            RouteHandle {
+                channel: 17,
+                epoch: 42,
+                connection_token: 9,
+            },
+            99,
+        );
+        let data = error
+            .data
+            .expect("route closure must provide machine-readable data");
+
+        assert_eq!(data["subc_code"], "route_closed");
+        assert_eq!(data["send_outcome"], "outcome_unknown");
+        assert_eq!(data["request_dispatched"], true);
+        assert_eq!(data["route_channel"], 17);
+        assert_eq!(data["route_epoch"], 42);
+        assert!(error
+            .message
+            .contains("repeating it may repeat any side effect"));
+    }
 
     #[test]
     fn mutation_command_id_is_stable_per_request_and_distinct_across_sessions() {

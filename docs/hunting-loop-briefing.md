@@ -582,8 +582,12 @@ Before calling a class closed:
 | 495 | A binary on PATH | Check whether it is a symlink or a separate copy — a copy makes every future deploy to the canonical path invisible, and the failure looks like the deploy not taking |
 | 496 | A blocking premise that has never been crossed | Ask whether being WRONG about it would have caused an incident — a protective premise ("do not do X or it breaks") fails safe, so nothing bad happens while it stands and nothing pressures anyone to test it; a gate nobody has tried to cross is a gate nobody has measured |
 | 497 | A constant you classified as a DEFINITION | Check whether the same string is also a TARGET inside its own crate — one name in two roles, and the caller sweep that enumerates external consumers will not list the owning repo's own tools |
-| 498 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
-| 499 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 498 | "No rebuild needed" | It does not mean no change — a restart re-runs everything the module only does once, so startup-only config is re-decided; if the file is missing or unparseable the feature defaults off, the module comes up healthy, and nothing on any surface says so |
+| 499 | A config file you are checking for presence | Check the FEATURE instead — a config present but unread looks identical to one that was read, so the discriminator must be a value only produced when the feature is armed |
+| 500 | A wrong mechanism you are about to correct | Correcting it is not only about accuracy — a wrong mechanism DELETES QUESTIONS, so the risks it makes unaskable are invisible rather than mis-assessed |
+| 501 | A checker sharing a failure mode with its subject | Acceptable only if a SECOND independent route to the same facts exists — removing the shared failure mode is usually unachievable, having a second route is not |
+| 502 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
+| 503 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever

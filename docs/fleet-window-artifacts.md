@@ -26,6 +26,42 @@ because that set happened to contain a manifest the old build rejected. A check
 that passed for a reason that no longer holds is worse than one that never
 worked, because nobody re-derives it.
 
+### The one provenance check a third party can run
+
+Every identity value in the table above verifies the *report*, not the artifact:
+I compare a hash against a number the builder told me, so it establishes that
+the file I hold is the file they described — and nothing about where it came
+from. Trust in the build machine is doing the work.
+
+The connectors module closed that gap by embedding two values in the binary:
+
+    buildCommit9c4d562bc5f1
+    lockDigest924fe7dd1245f826
+
+and `git show 9c4d562:Cargo.lock | shasum -a 256` reproduces the digest. I did
+not build the artifact and hold no relationship to the machine that did, and I
+can still establish which source tree it came from using only the binary and
+the repository.
+
+What makes it work is that the digest is over **an input the builder does not
+choose freely**. A version string is an assertion; a lockfile digest is a
+computation anyone can repeat.
+
+Two mechanics it depends on, both measured:
+
+- **Substring matching only.** The digest is emitted merged with its
+  neighbours — `it9c4d562bc5f1lockDigest924fe7dd…` — so an anchored match
+  returns nothing. Same rustc literal-packing that makes anchored probes read
+  zero for every binary including their control.
+- **A binary can never carry the pin that names it.** The artifact embeds its
+  own build commit, so its UUID depends on which commit it was built from, and
+  the pin lives inside a commit that does not exist yet when the build runs.
+  The pin therefore comes from a build of the *parent* and is committed
+  afterwards — sound only while the pinning commit changes no source. The
+  natural repair, rebuilding at head so the pin matches, destroys the property:
+  the mismatch is the mechanism working, so it belongs in a comment beside the
+  script rather than being tidied away by the next reader.
+
 ### Probe the old binary before you replace it
 
 A discriminator needs two readings, and **one of them is only available before

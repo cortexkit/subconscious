@@ -1139,7 +1139,28 @@ impl ControlHandler {
             // and the configured destination allowlist.
         }
 
-        let project_root = match ProjectRootId::from_path(&identity.project_root) {
+        // Bind admits a root that no longer exists on disk, because refusing here
+        // closes the only exit from a paused run: cancel needs a bound route, and a
+        // renamed or reclaimed directory makes that route unopenable forever. The
+        // run itself is intact and still addressable by its recorded identity.
+        //
+        // This does NOT relax the rule the strict constructor protects. That rule is
+        // that no root is ever aliased into NEW durable state -- a missing component
+        // can reappear as a symlink elsewhere, which would move the identity and
+        // split a session's history across two of them. The engine now refuses the
+        // two operations that create such state (send and import) at admission,
+        // which is a narrower way to hold the same invariant: reads and terminations
+        // are admitted, writes are not. That refusal had to ship before this line
+        // changed, or there is an interval where a send commits under a provisional
+        // identity -- the exact failure the original policy existed to prevent.
+        //
+        // Resolution follows realpath rather than lexical cleanup: the longest
+        // existing ancestor is canonicalized and the missing tail re-appended, so a
+        // live root is unchanged and a vanished leaf keeps the identity it was
+        // admitted under. Lexical cleanup would mint a DIFFERENT identity for the
+        // same caller the moment the directory vanished, which strands the run more
+        // quietly than refusing it.
+        let project_root = match ProjectRootId::from_path_allowing_missing(&identity.project_root) {
             Ok(project_root) => project_root,
             Err(err) => {
                 return Ok(vec![control_error_frame(

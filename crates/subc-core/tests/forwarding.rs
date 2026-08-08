@@ -2396,16 +2396,32 @@ async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
     module.stop().await.unwrap();
 }
 
+// A vanished root must ADMIT. This test asserted the opposite until the bind
+// relaxation landed, and the inversion is deliberate rather than a weakening:
+// refusing here closed the only exit from a paused run, because cancel needs a
+// bound route and a renamed directory made that route unopenable forever. The
+// aliasing guarantee the old refusal protected now lives in the engine, which
+// refuses the two operations that create durable state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn route_open_invalid_project_root_returns_error_without_provider_attach() {
+async fn route_open_vanished_project_root_attaches_under_its_recorded_identity() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
-    let module_id = "fake-aft-invalid-project-root";
+    let module_id = "fake-aft-vanished-project-root";
     let (module, events_path) =
-        spawn_stub_with_events_path(&server, &supervisor, module_id, "invalid-project-root").await;
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "vanished-project-root").await;
 
+    // Create the root, mint the identity a run would have been recorded under,
+    // then delete it. Minting BEFORE deletion is the whole point: the assertion
+    // below is that a cancel arriving afterwards addresses that same identity.
     let project = TestProject::new();
-    let missing_root = project.path.join("definitely").join("missing");
+    let vanished_root = project.path.join("worktree");
+    std::fs::create_dir(&vanished_root).unwrap();
+    let identity_while_present = subc_core::ProjectRootId::from_path(&vanished_root)
+        .unwrap()
+        .as_path()
+        .to_path_buf();
+    std::fs::remove_dir(&vanished_root).unwrap();
+
     let mut client = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
@@ -2414,7 +2430,66 @@ async fn route_open_invalid_project_root_returns_error_without_provider_attach()
             module_id: module_id.to_string(),
         },
         identity: BindIdentity {
-            project_root: missing_root,
+            project_root: vanished_root,
+            harness: "opencode".to_string(),
+            session: "ses-vanished-project-root".to_string(),
+        },
+        consumer_identity: None,
+        consumer_capabilities: None,
+        admission_facts: None,
+    };
+    write_frame(&mut client, &control_request_frame(481, request))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let frame = read_frame_timeout(&mut client).await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "a vanished root must not close the route that cancel arrives on"
+    );
+
+    let attach_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    // The identity must equal the one minted while the directory existed. A
+    // lexically-normalized path would differ here on any host where the root is
+    // reached through a symlink, and the caller would address an empty lineage
+    // and be told, confidently, that the run does not exist.
+    assert_eq!(
+        attach_event["identity"]["project_root"].as_str(),
+        identity_while_present.to_str(),
+        "a run must keep the identity it was recorded under once its root vanishes"
+    );
+
+    module.stop().await.unwrap();
+}
+
+// The relaxation is not blanket. A tail with no file name cannot be honestly
+// re-appended once the path stops existing, so it is still refused -- and it is
+// refused BEFORE the provider is attached, which is the property the original
+// test was written to hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_unreconstructable_project_root_returns_error_without_provider_attach() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-invalid-project-root";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "invalid-project-root").await;
+
+    let project = TestProject::new();
+    let unreconstructable = project.path.join("definitely").join("missing").join("..");
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let request = ClientControlRequest::RouteOpen {
+        target: RouteTarget::ToolProvider {
+            module_id: module_id.to_string(),
+        },
+        identity: BindIdentity {
+            project_root: unreconstructable,
             harness: "opencode".to_string(),
             session: "ses-invalid-project-root".to_string(),
         },
@@ -2433,7 +2508,7 @@ async fn route_open_invalid_project_root_returns_error_without_provider_attach()
     let events = stub_events(&events_path);
     assert!(
         events.iter().all(|event| event["kind"] != "attach"),
-        "invalid project_root must be rejected before route.bind attach; events: {events:?}"
+        "an unreconstructable project_root must be rejected before route.bind attach; events: {events:?}"
     );
 
     module.stop().await.unwrap();

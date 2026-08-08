@@ -10417,3 +10417,42 @@ earlier column decided the outcome, a descriptor entry read as coverage when it
 only ever meant discovery, and this count. In none of them was anything broken
 or lying. The reading sat adjacent to the meaning, and every layer reported
 success.
+
+### A rule you misapply is worse than no rule, because having it makes you stop looking
+
+Every heuristic in this document converts an open question into a settled one.
+That settling is the point — it is what makes the rule cheap. But **the
+classification step is where the judgement actually lives, and it gets no
+scrutiny precisely because the rule downstream of it feels rigorous.**
+
+Worked instance, 2026-08-08, two seats independently within one hour. The rule:
+*record a known limit when it is unreachable or the fix is speculative; close it
+when the limit is the exact failure the check exists to prevent.* Correct rule.
+Both of us applied it to a scanner assumption that only signed tokens count,
+classified the fix as **a guard against a shape nobody emits**, and recorded the
+limit. It was in fact **a widening — the removal of an assumption neither of us
+had chosen**, inherited from writing a pattern that described the data in front
+of us. Nothing in the rule tells you which one you are holding; that is a
+judgement about your own edit, made *before* the rule engages.
+
+Neither of us skipped the analysis. We did it, reached a defensible-sounding
+classification, and **the correctness of the rule then certified a wrong input.**
+
+Two practices that survive this:
+
+- **Name the classification step as the load-bearing part of any rule**, or the
+  rule becomes a way of not looking.
+- **Measure the cost of the change before debating the hypothetical.** The cost
+  of a widening is not what it defends against — it is *what it changes on the
+  corpus you have*. Measured first, the reachability argument never needs to
+  happen: narrow and wide forms both found exactly 92 tokens, so the assumption
+  had no defender left. Measuring *after* deciding ratifies; measuring *first*
+  decides.
+
+Related: an assumption that restricts what an instrument can **see** must be
+justified by what it **excludes**, never by what it currently encounters. *"Every
+token I have seen is signed"* is an observation about a corpus; *"only signed
+tokens count"* is a rule about the world. A pattern written to describe the data
+in front of you silently promotes the first into the second, and the promotion is
+invisible because the pattern **looks like a specification**. Nobody chooses that
+assumption, which is exactly why nobody re-examines it.

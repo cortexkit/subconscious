@@ -800,7 +800,17 @@ engram_upload_rate() {
   [ -z "$pub" ] && { echo "  engram: nothing unpublished"; return 0; }
   sidecar=$(ls ~/.local/share/cortexkit/engram/staging/"$pub"/uploaded-*.hex 2>/dev/null | head -1)
   [ -z "$sidecar" ] && { echo "  engram: gen unpublished, no sidecar yet (sealing)"; return 0; }
-  sealed=$(ls ~/.local/share/cortexkit/engram/staging/"$pub" 2>/dev/null | grep -vc 'uploaded-\|journal')
+  # ASSERT WHAT SHOULD BE PRESENT, NOT WHAT SHOULD BE ABSENT. This counts entries
+  # by EXCLUDING the two sidecar kinds, so an unreadable or renamed staging
+  # directory yields 0 -- and 0 is a legal value that prints as "1220/0 objects",
+  # a broken probe wearing the shape of a real reading. A count phrased as an
+  # exclusion cannot distinguish "nothing matched" from "nothing was looked at".
+  local staging_dir=~/.local/share/cortexkit/engram/staging/"$pub"
+  if [ -d "$staging_dir" ]; then
+    sealed=$(ls "$staging_dir" 2>/dev/null | grep -vc 'uploaded-\|journal')
+  else
+    sealed="?"
+  fi
   n1=$(wc -l < "$sidecar")
   sleep 30
   n2=$(wc -l < "$sidecar")

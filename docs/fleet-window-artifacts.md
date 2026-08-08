@@ -26,6 +26,30 @@ because that set happened to contain a manifest the old build rejected. A check
 that passed for a reason that no longer holds is worse than one that never
 worked, because nobody re-derives it.
 
+### Probe the old binary before you replace it
+
+A discriminator needs two readings, and **one of them is only available before
+placement**: present in the new build, and *absent from the file currently
+deployed*. Once the old file is overwritten the second reading cannot be taken
+at all, and a marker that happens to be present in both then reads as a
+successful verification every time it is ever run.
+
+Both failure directions have now been measured, a day apart:
+
+| Marker | New | Old | Reads as |
+|---|---|---|---|
+| a phrase from a doc comment | 0 | 0 | a perfect swap, if only absence-in-old is asserted |
+| a literal an earlier release also shipped | 1 | 1 | a perfect swap, if only presence-in-new is asserted |
+
+Neither can fail. The instinct is to confirm presence in the new build and
+stop, because that is the reading you want to be true — so the order matters:
+take the old reading *first*, while it still exists.
+
+Keep the pre-swap copy for the same reason. After placement, comparing the
+deployed file against the staged one is unconditionally true — same build, so
+it cannot fail while reading as verification. The old copy is the only artefact
+that can disagree, which makes it evidence before it is a rollback.
+
 ## Per module
 
 **daemon and MCP gateway** (mine): marker `preview` — 0 in the deployed

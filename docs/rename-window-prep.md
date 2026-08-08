@@ -88,11 +88,27 @@ at all; its state is `~/.local/state/cortexkit/ck-quota/`, keyed on the **binary
 name rather than the module id. So the module id can move on its own, and the state
 directory moves only if `ck-quota` becomes `ck-insula`.
 
-That directory holds `redemptions.json`, the crash-safety journal that prevents
-double-spending reset credits — a **fence** in the runbook's sense: it reads its own
-history to avoid repeating an action, so a fresh empty one is indistinguishable
-from having nothing to do, and the failure is silent double-spend rather than an
-error.
+That directory holds `redemptions.json`, a crash-safety journal — a **fence** in the
+runbook's sense: it reads its own history to avoid repeating an action, so a fresh
+empty one is indistinguishable from having nothing to do, and the failure is silent
+rather than an error.
+
+**Corrected after the window, and the correction is the point.** Both of us described
+losing this file as "silently re-spends credits already consumed". The owner read
+their own code before acting on that characterisation and it is wrong where it
+matters. A resolved record blocks a further spend on that account for **thirty
+minutes**, not indefinitely; the seven-day retention keeps records that are already
+inert. And the authoritative fence is **not local** — the consume endpoint is
+idempotent on the redemption id and answers `already_redeemed`, so this journal
+decides whether we ask under a reusable id while the *server* decides whether asking
+spends anything.
+
+So the honest size is *local half of an idempotent remote fence, thirty-minute
+exposure*, not *silent re-spend*. The wrong framing was mine to propagate: it arrived
+without a number, I wrote it here, and it would have justified a backup mechanism
+sized for a far larger risk. It is the protective-premise shape again — a
+characterisation that fails safe attracts no pressure to check it, and **a
+characterisation of a risk travels faster than the measurement of it**.
 
 **The journal is not a migration item at all**, and the reason is stronger than
 binary-keying. Its path is a **hardcoded string literal** — `"cortexkit/ck-quota"`

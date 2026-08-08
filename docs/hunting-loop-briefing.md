@@ -10496,3 +10496,53 @@ own success signal.** Restarting the daemon clears every module's restart budget
 so a fully-broken fix and a correct one both produce a quiet fleet afterwards —
 and the quiet is caused by the restart in both cases. Any acceptance built on
 absence-of-symptom is measuring the restart. Assert that the new mechanism *ran*.
+
+### Enumerating success sites needs a second clause, and the rule has a boundary
+
+**The enumeration.** To close the "examined nothing" class rather than fixing one
+instance, list every site in a check that emits a **success** and ask what each is
+conditioned on. That finds the empty-loop specimens: a glob that matches nothing
+emits nothing, and a reader scanning for failures sees none.
+
+**It is not sufficient, and the gap was found by running it.** PLEX enumerated
+their acceptance script, caught a lease loop that printed nothing on an empty
+set, and **missed a second instance in the same script** — because that step *is*
+conditioned on a real comparison. It compares against a **transcribed list**. A
+manifest added to the repository and not added to the expected list is invisible,
+and the comparison still agrees, because both sides are the old set. **Two stale
+things matching is not agreement about anything.**
+
+So the enumeration question has two clauses:
+
+1. What is this success conditioned on?
+2. **Is what it compares against itself derived, or asserted?**
+
+The same shape appeared independently in this repo the same hour: the id scan
+*discovers* its corpora by globbing while the authenticity leg iterated a
+hand-written list, and the summary line said "all 4" — a **transcribed count
+reporting coverage it never established**. A transcribed count is worse than an
+empty output, because absence offers nothing to trust while a confident number
+invites belief in a denominator nobody measured.
+
+**Keep both the derived and the transcribed form where they answer different
+questions.** A transcribed list asks *is production what we decided before the
+window*; a live read asks *is production what the repository holds now*. A check
+composed entirely from current state cannot notice the current state being wrong.
+Cross-check them against each other rather than replacing one with the other.
+
+**The boundary, which must travel with the rule.** Proving an instrument's
+sensitivity requires a specimen that differs in the property you care about. That
+holds wherever the bad specimen is **constructible** — a lease-free directory, a
+short list, a hand-edited file, all cheap. It **degrades to an argument exactly
+where construction is expensive**: a real vendor returning a real failure, a host
+in a fault state, a corrupted store. State that boundary whenever handing the rule
+to anyone, or it gets applied as an unconditional standard and quietly abandoned
+at the first hard case.
+
+**Instrument trap from doing this work.** On macOS `sed -i '' file` **replaces the
+file and drops the exec bit**. The next run fails with "Permission denied", which
+reads like the script rejecting something. Nothing in the sed output mentions the
+mode, and `git status` shows the content diff without flagging it unless you look.
+Same family as everything else here: **the instrument moved something outside the
+frame you were watching.** Use a rewrite that preserves mode, and check `ls -la`
+after.

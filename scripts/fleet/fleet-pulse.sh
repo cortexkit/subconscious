@@ -340,6 +340,18 @@ else
     printf '  size %s MB, %s lines total\n' "$dl_mb" "$dl_total"
     if [ "$dl_hits" -eq 0 ] && [ "$dl_supp" -eq 0 ]; then
       printf '  bind-rejection flood: none in last 20k lines (control: %s lines exist)\n' "$dl_total"
+      # THE FOURTH STATE, AND IT ARRIVES EXACTLY WHEN SOMEONE IS WATCHING.
+      # A suppressed count rides the NEXT emission after its window, so for the
+      # first window after any restart there is nothing to carry a count and BOTH
+      # numbers read zero -- indistinguishable from the loop being dead. Measured
+      # live: immediately after a bounce this printed 0 and 0 while the loop was
+      # provably still running, because the client-side fix reaches hosts only on
+      # THEIR restart, which had not happened. Zero here means "not yet
+      # observable" if the emitter restarted within the last window.
+      if [ -n "$(find "$DLOG" -newermt '-90 seconds' 2>/dev/null)" ]; then
+        echo "  note: if a module restarted in the last ~60s, this zero is NOT YET"
+        echo "        OBSERVABLE rather than clean -- re-read after a full window"
+      fi
     elif [ "$dl_supp" -eq 0 ]; then
       printf '  bind-rejection flood: %s lines / 20k, NO suppression suffixes\n' "$dl_hits"
       echo   "    -> rate limit not yet deployed; the line count IS the rate"

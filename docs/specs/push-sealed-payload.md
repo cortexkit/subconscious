@@ -313,7 +313,7 @@ is the only observer.
 ### What each observation proves, and what it does not
 
 Three checkpoints on this path each look like success and each establishes less
-than a reader will take from it. **All three must be stated at the moment of the
+than a reader will take from it. **All of them must be stated at the moment of the
 result rather than remembered**, because they are read at the worst possible time.
 
 | observation | proves | does NOT prove |
@@ -324,9 +324,20 @@ result rather than remembered**, because they are read at the worst possible tim
 | tapping opens the app and stays put | nothing | it has THREE causes: the ask id was absent, the extension never ran, or the tap routing is broken |
 | nothing arrives at all | delivery failed | nothing about the seal, the envelope, or the extension -- none of them ran |
 
-**Only the first case is unambiguous.** An earlier version of this table said a tap
-landing nowhere meant the blob never opened -- that was wrong, and the correction
-is the reason the row above exists.
+**Only the tap-opens-to-the-ask case is unambiguous. Every other row is an
+enumeration, and that form is deliberate.**
+
+Three independent versions of the ambiguous-tap row were written in one hour and
+TWO WERE WRONG, in OPPOSITE directions, each by someone who had just correctly
+diagnosed the class. The first said the symptom meant the blob never opened --
+naming one cause, which sends the investigation at the seal. The second said it
+does NOT mean the decrypt failed -- excluding a cause that is genuinely on the
+list, which sends the investigation away from a real one.
+
+**A negative claim about causation is still a claim about causation**, and it is
+the more dangerous form because it wears the costume of a correction. On a symptom
+with several causes the only safe shape is to enumerate them and say the
+observation proves nothing.
 
 The tap traverses three hops after the extension: the extension writes the ask id,
 a notification delegate reads it, and the root view routes it. **Each of those

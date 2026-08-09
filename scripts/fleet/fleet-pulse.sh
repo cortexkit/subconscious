@@ -316,7 +316,48 @@ if [ -f "$ENGRAM_STORE" ] && gens=$(sqlite3 "$ENGRAM_STORE" \
     # labelled rather than dropped because the absolute counts on the HALTED line
     # below carry the real signal; an unlabelled ratio beside them invites reading
     # the reassuring one.
-    echo "  gen $newest unpublished (last published $maxpub; $pub/$total published all-time)"
+      echo "  gen $newest unpublished (last published $maxpub; $pub/$total published all-time)"
+      # WHAT IS BACKED UP IS NOT WHAT WAS ASKED FOR, AND ONLY ONE OF THOSE IS
+      # COUNTED HERE. entry_count is the number of entries CAPTURED. A module can
+      # declare an entry that engram enrols, plans, and then classifies out of the
+      # capture set -- an unimplemented mechanism, or a class engram excludes by
+      # design -- and every counter in this section reads exactly the same as if
+      # the module had declared nothing at all.
+      #
+      # TWO LIVE SPECIMENS, and they fail differently:
+      #
+      # DECLARED-AND-DECLINED: broca declares four entries, one a 1.2GB WAL it
+      # cannot rebuild. That entry's capture mechanism is unimplemented, so it has
+      # been declared and refused for four weeks while entry_count read 2 across
+      # all 94 generations -- both of them another module's. The refusal IS
+      # published (backup.status plannedEntries carries an `uncapturable` status)
+      # and was read by nobody until a question about an unrelated module
+      # surfaced it.
+      #
+      # DECLARED-AND-REJECTED, which is worse and has no surface at all: engram
+      # rejects a descriptor whose declared module_id disagrees with its directory
+      # name, and builds an `invalid` classification carrying both values. That
+      # classification is put in the backup.run reply and NEVER PERSISTED -- the
+      # autonomous scheduler prints two fields of that reply and drops the rest.
+      # broca's descriptor sat in a directory named llm-runner-state until a
+      # rename this morning, so the rejection was computed correctly ~94 times and
+      # discarded microseconds later. A COMPUTED-AND-DISCARDED VALUE IS
+      # INDISTINGUISHABLE FROM A CHECK NOBODY WROTE, except that the code reads as
+      # though the check is working.
+      #
+      # NEITHER can be computed from the store: entry_count records what was
+      # captured, and no local column holds what was declared-and-declined or
+      # declared-and-rejected. Until backup.status carries both counts and this
+      # polls it, the denominator is unavailable -- and saying so is the honest
+      # report, because an uncounted refusal rendered as a clean number is the
+      # failure this whole file exists to catch.
+      # `|| echo '?'` would NOT cover the interesting failure: sqlite3 exits 0 and
+      # prints NOTHING when the row is absent or the column moves, so the fallback
+      # never fires and the line renders a blank where a number belongs. Test the
+      # value, not the exit code.
+      captured=$(sqlite3 "$ENGRAM_STORE" "SELECT entry_count FROM generations WHERE device_seq=$newest;" 2>/dev/null)
+      [ -n "$captured" ] || captured="UNREADABLE"
+      echo "  entries captured: $captured (DECLARED-BUT-UNCAPTURABLE ENTRIES ARE NOT COUNTED HERE -- read backup.status plannedEntries)"
     # The generation counter above cannot see WITHIN a generation: one that is
     # 60% uploaded and one that has not started read identically. That gap is
     # how a stalled publish hides -- it looks exactly like a slow one, and the

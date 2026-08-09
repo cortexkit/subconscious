@@ -6,6 +6,7 @@ prompts it.
 | script | question |
 | --- | --- |
 | `fleet-pulse.sh` | which seats are idle, which modules are unhealthy |
+| `ci-redness.sh` | how long each repo's default branch has been failing CI |
 | `check-repo-protection.sh` | which repos have no working off-machine copy |
 | `reap-orphan-lsp.sh` | which language servers outlived their project root |
 | `verify-running-image.sh` | is each module running the binary on disk |

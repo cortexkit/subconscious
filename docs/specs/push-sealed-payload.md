@@ -704,11 +704,40 @@ This is the already-enrolled defect above reached by a different road: same
 terminal state (an empty registry column, no error, no log line), different cause,
 and the reachability fix does not close it.
 
-**THE REGISTRY HOLDS A SECOND COPY OF EVERY DEVICE-HELD VALUE, AND THE ONLY MOMENT
+**THE SERVER HOLDS A SECOND COPY OF EVERY DEVICE-HELD VALUE, AND THE ONLY MOMENT
 BOTH COPIES EXIST IN ONE PROCESS IS REGISTRATION.** The sealing key and the push
-token are each held by the device and stored by the server, and both diverge the
+token are each held by the device and stored server-side, and both diverge the
 same silent way: enrollment succeeded weeks ago, notifications never arrive for
 that device, and every component reports healthy.
+
+**They are stored in TWO tables with two writers and two refresh rates, and the
+difference decides everything below.** "The registry" reads as one thing; the
+divergence risk lives entirely in the fact that it is two:
+
+| value | written | refreshed | stale copy |
+| --- | --- | --- | --- |
+| push token | route table | EVERY launch and foreground, unconditionally | **self-heals** on next launch |
+| sealing key | device row | ONCE, during the enrollment ceremony | **permanent** |
+
+**A stale sealing key never repairs itself, and it can go stale with nothing
+failing** -- a keychain wipe, an app reinstall, any path where the device
+regenerates its keypair without re-enrolling. The server then holds a key the
+device no longer has, forever, and sealing to it produces a notification that
+arrives and never opens: the ambiguous row of the table above, permanently, with
+no error at any layer.
+
+That is the one-time-ceremony rule one step later. **A value bound to a ceremony
+that runs once cannot be refreshed by any routine path, so its divergence is
+permanent by construction.**
+
+**THEREFORE THE FREQUENT PATH MUST CARRY A FINGERPRINT OF THE RARE ONE.** Device
+registration already runs every launch and is already device-authenticated;
+carrying a hash of the sealing key the device currently holds costs one field and
+converts a permanent silent divergence into a loud one on the next app launch.
+**The self-healing path is the only thing that runs often enough to detect the
+non-self-healing one.** Without it the sole detector is a failed decrypt on the
+operator's phone -- the observation this document has already established cannot
+be attributed to a cause.
 
 **So the comparison MUST happen at registration, not at send.** At send time there
 is nothing to compare against, because the device is not in the conversation --

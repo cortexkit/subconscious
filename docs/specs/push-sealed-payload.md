@@ -257,6 +257,40 @@ So the endpoint's cap MUST be derived from `version` rather than stored as a
 constant. The version byte is the signal that the envelope changed; a cap that
 does not read it cannot know.
 
+## The APNs realisation
+
+**This section exists because the join between three seats' deliverables was
+written down by nobody.** The sealer emits raw bytes, the submit path takes hex,
+this document said "base64 for the APNs payload field" and named no field, and the
+endpoint spec on the other side said nothing about the APNs JSON at all -- by
+design, since the payload is opaque to it. Each seat's own half was correct and
+complete. **A boundary owned by nobody has no author to notice it is missing.**
+
+The realisation is normative and lives here:
+
+```json
+{"aps":{"alert":{"title":"...","body":"..."},"mutable-content":1},
+ "cks":"<base64 of version || enc || ct>"}
+```
+
+| element | value | failure if wrong |
+| --- | --- | --- |
+| blob key | `cks` | extension finds no blob; LOUD only because the reader distinguishes absent from malformed |
+| `mutable-content` | `1` | **the extension NEVER RUNS**; notification displays, blob silently ignored |
+| `aps.alert` | title or body present | notification discarded by iOS |
+
+**`mutable-content: 1` is the one to check before the first send.** It is a
+SENDER-side key, so it correctly appears nowhere in the client, which is precisely
+why it had no owner. Without it the notification arrives, looks almost right, and
+nothing decrypts -- and the first suspect will be the seal, the piece with tests
+and mutation proofs, rather than a missing integer in a dictionary no document
+mentioned. **All three failures return 200 from APNs**, on a path where the device
+is the only observer.
+
+**Hand the blob across seat boundaries in ONE encoding.** Hex from the sealer, with
+base64 applied once by the submit path. A blob re-encoded at each hop is a
+transcription error waiting for a reader.
+
 ## Plaintext contents
 
 **Rule, not an enumeration: the payload MAY carry only values that are useless

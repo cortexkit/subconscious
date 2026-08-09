@@ -104,6 +104,17 @@ terms**. MUST NOT truncate: a truncated blob does not decrypt to a fragment, it
 fails to decrypt entirely, and renders as the generic pre-decrypt placeholder —
 indistinguishable from a phone that has not been unlocked since boot.
 
+**The two caps are enforced by different parties, and the second is a function of
+the first.** The composer self-limits on plaintext, because it is the only party
+holding plaintext. The delivery endpoint sees only sealed bytes, so its cap is
+necessarily the derived number — and a derived constant ages: if a primitive
+changes, the endpoint refuses valid payloads or admits ones the push transport
+will drop, silently either way.
+
+So the endpoint's cap MUST be derived from `version` rather than stored as a
+constant. The version byte is the signal that the envelope changed; a cap that
+does not read it cannot know.
+
 ## Plaintext contents
 
 **Rule, not an enumeration: the payload MAY carry only values that are useless
@@ -131,6 +142,12 @@ Each vector carries the recipient private key, the ephemeral private key, the
 plaintext, and the expected sealed bytes — so both implementations produce
 byte-identical output from fixed inputs rather than merely round-tripping their
 own work.
+
+**The ephemeral private key is in the corpus deliberately and MUST NOT be removed
+as redundant.** Nothing needs it to *decrypt*, so a later reader regenerating the
+corpus will see an unused field. It is what makes sealing deterministic, and
+without it the only checkable property is that each side can open its own output —
+which is satisfied by two implementations that disagree.
 
 **Every typed open-failure MUST have a negative vector, and each negative MUST
 carry a positive control in the same test.** Not merely the same suite: with them
@@ -162,5 +179,16 @@ recipient to the Noise static fails it.
 - Trigger and selection (which asks are pushed, when) — `prefrontal`.
 - Delivery endpoint, collapse keys, alerting-vs-silent — `callosum`.
 - Reconciliation of the lock screen against live state — the app.
+
+**Whether the opener can read its own key is out of scope here, and it is the
+failure this feature has already hit twice.** A blob can be byte-perfect and
+unopenable, because the private half was written to a keychain group the
+extension cannot reach. That is not a property of the bytes, so no vector can
+reach it: it is a property of the two-process arrangement and MUST be proven on a
+device, reading from the extension's identity rather than the app's.
+
+It matters here because a green vector suite reads as "sealing works" when all it
+establishes is that the bytes are right — and this failure renders as the same
+generic placeholder as `truncated_ct` and as a phone that has not been unlocked.
 
 Named so a reader does not infer silence means "unconstrained".

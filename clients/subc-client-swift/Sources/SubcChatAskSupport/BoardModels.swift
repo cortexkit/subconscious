@@ -47,15 +47,37 @@ public struct BoardAskProps: Codable, Equatable {
     public var resolvedAt: Int64?
 }
 
+/// A Board v2 artifact block.
+///
+/// **Carries `body` XOR `path`.** `path` is a POINTER artifact -- the deliverable
+/// is the file, and inlining it here is the artifact-as-status-essay pattern v2
+/// exists to prevent. `body` is an INLINE artifact. Both absent is malformed;
+/// both present renders `body` and treats `path` as provenance.
+///
+/// So `body` is optional by contract, not by tolerance. The producer's own digest
+/// builder reads it the same way (`string_prop(props, "body").map_or(0, ...)`) --
+/// an explicit zero default for absence rather than an oversight.
 public struct BoardShowProps: Codable, Equatable {
     public var title: String
     public var language: String?
-    public var body: String
+    public var body: String?
+    /// Pointer to the deliverable on disk, for artifacts whose body is the file.
+    public var path: String?
+    /// Short caption shown with a pointer artifact.
+    public var note: String?
 }
 
-/// Known v1 property shapes plus an opaque fallback for future vocabulary.
-/// Keeping unknown properties as JSON lets a newer block render its digest instead
-/// of making the entire board.state reply fail to decode.
+/// Known v1 property shapes plus an opaque fallback.
+///
+/// `.opaque` covers TWO cases. An earlier version of this comment claimed only the
+/// first, which let a reader conclude the model was robust against producer drift
+/// and stop checking:
+///  1. an unknown KIND, whose props this model has no struct for;
+///  2. a KNOWN kind whose props do not match its declared struct.
+///
+/// The second is the one that hurt. It used to throw, failing the block, then the
+/// block array, then the whole board reply -- so one producer-legal block this
+/// model had not caught up with cost the operator every other block on screen.
 public enum BoardBlockProps: Codable, Equatable {
     case text(BoardTextProps)
     case status(BoardStatusProps)
@@ -84,6 +106,10 @@ public enum BoardBlockProps: Codable, Equatable {
 /// author it. A blockId's higher revision replaces its lower revision in a fold, but
 /// this model never invents or increments revisions from client-side state.
 public struct BoardBlock: Codable, Equatable, Identifiable {
+    /// Kinds this model has a typed struct for. Kept in sync with the switch in
+    /// `init(from:)` -- see the note there.
+    public static let knownKinds: Set<String> = ["text", "status", "ask", "show"]
+
     public var blockId: String
     public var lane: String
     public var kind: String
@@ -129,13 +155,35 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
         digest = try container.decode(BoardDigest.self, forKey: .digest)
         updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs)
 
-        switch kind {
-        case "text": props = .text(try container.decode(BoardTextProps.self, forKey: .props))
-        case "status": props = .status(try container.decode(BoardStatusProps.self, forKey: .props))
-        case "ask": props = .ask(try container.decode(BoardAskProps.self, forKey: .props))
-        case "show": props = .show(try container.decode(BoardShowProps.self, forKey: .props))
-        default: props = .opaque(try container.decode(JSONValue.self, forKey: .props))
+        // A TYPED ARM THAT FAILS DEGRADES TO `.opaque` RATHER THAN THROWING.
+        //
+        // This is a READER model for a surface whose producers are agents writing
+        // against prompt guidance rather than a validated schema, so malformed
+        // blocks are expected upstream -- the producer's own digest builder
+        // already filters them, with a test named for skipping them.
+        //
+        // Without this, one bad block fails its array, which fails the whole
+        // board: the operator gets a decode error where their agent's status
+        // should be. That is not hypothetical; it happened on the phone, and six
+        // blocks rendered as zero.
+        //
+        // `.opaque` keeps the block's JSON, so a degraded block still renders its
+        // digest instead of vanishing. Callers count them via `degradedBlockCount`
+        // -- a half-decoded board must not be indistinguishable from a healthy one.
+        func typed<T: Decodable>(_ type: T.Type, _ wrap: (T) -> BoardBlockProps) -> BoardBlockProps? {
+            (try? container.decode(type, forKey: .props)).map(wrap)
         }
+        // Any kind added here must also join `knownKinds` above, or a failure to
+        // decode it will read as forward-compatibility rather than as degradation.
+        let decoded: BoardBlockProps? =
+            switch kind {
+            case "text": typed(BoardTextProps.self, BoardBlockProps.text)
+            case "status": typed(BoardStatusProps.self, BoardBlockProps.status)
+            case "ask": typed(BoardAskProps.self, BoardBlockProps.ask)
+            case "show": typed(BoardShowProps.self, BoardBlockProps.show)
+            default: nil
+            }
+        props = try decoded ?? .opaque(container.decode(JSONValue.self, forKey: .props))
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -206,6 +254,34 @@ public struct BoardState: Codable, Equatable {
     public var lanes: [String]
     public var blocks: [BoardBlock]
     public var health: BoardHealth?
+    /// Server-side truncation counts. Absent from older module builds.
+    ///
+    /// A reader that shows 20 blocks without these cannot tell a complete board
+    /// from a truncated one -- the same silence as a degraded block that renders
+    /// as ordinary content.
+    public var servedBlocks: Int?
+    public var totalBlocks: Int?
+
+    /// Blocks whose typed props failed to decode and fell back to `.opaque`.
+    ///
+    /// Load-bearing rather than diagnostic: lenient decoding buys a readable board
+    /// at the cost of making a PARTIAL board look complete. Without a count, 9 of
+    /// 10 blocks decoded is indistinguishable from 10 of 10, which converts a loud
+    /// failure into a silent one -- the trade this model exists to avoid.
+    ///
+    /// Counts only KNOWN kinds that fell back. An unknown kind decoding to
+    /// `.opaque` is the fallback working as designed, not a degradation -- counting
+    /// it would make every forward-compatible board look damaged and train a
+    /// reader to ignore the number.
+    ///
+    /// Computed rather than stored, so it cannot disagree with `blocks`.
+    public var degradedBlockCount: Int {
+        blocks.reduce(into: 0) { total, block in
+            if case .opaque = block.props, BoardBlock.knownKinds.contains(block.kind) {
+                total += 1
+            }
+        }
+    }
 
     public func folded() -> BoardState {
         var copy = self

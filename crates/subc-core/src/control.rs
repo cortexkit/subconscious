@@ -9,7 +9,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    SupervisorEntry, SupervisorHealthEntry, SupervisorRescanResult,
+    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry,
+    SupervisorRescanResult,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
@@ -32,6 +33,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
+    stderr_tail::{CaptureState, TailEntry},
     supervise::{validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SupervisorHandle},
     ConnectedClients, DaemonCounters, Frame, ProjectRootId, Supervisor,
 };
@@ -838,6 +840,11 @@ impl ControlHandler {
                 self.handle_supervisor_health_probe(frame, module_id).await
             }
             ClientControlRequest::SupervisorHealth {} => self.handle_supervisor_health(frame),
+            ClientControlRequest::SupervisorStderrTail {
+                module_id,
+                max_lines,
+                max_bytes,
+            } => self.handle_supervisor_stderr_tail(frame, module_id, max_lines, max_bytes),
         }
     }
 
@@ -1359,6 +1366,60 @@ impl ControlHandler {
             &frame,
             &response,
             "ClientControlResponse::SupervisorList",
+        )?])
+    }
+
+    fn handle_supervisor_stderr_tail(
+        &self,
+        frame: Frame,
+        module_id: String,
+        max_lines: Option<u32>,
+        max_bytes: Option<u32>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(module) = self
+            .supervisor
+            .list()
+            .into_iter()
+            .find(|module| module.module_id() == module_id)
+        else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{module_id}' is not supervised"),
+            )?]);
+        };
+
+        let snapshot = module.stderr_tail(
+            max_lines.map(|value| value as usize),
+            max_bytes.map(|value| value as usize),
+        );
+
+        let response = ClientControlResponse::SupervisorStderrTail {
+            module_id,
+            tail: StderrTail {
+                capture: match snapshot.capture {
+                    CaptureState::Captured => StderrCaptureState::Captured,
+                    CaptureState::NotCaptured { reason } => {
+                        StderrCaptureState::NotCaptured { reason }
+                    }
+                },
+                entries: snapshot
+                    .entries
+                    .into_iter()
+                    .map(|entry| match entry {
+                        TailEntry::Line { text, truncated } => {
+                            StderrTailEntry::Line { text, truncated }
+                        }
+                        TailEntry::ProcessStart => StderrTailEntry::ProcessStart,
+                    })
+                    .collect(),
+                dropped_lines: snapshot.dropped_lines,
+            },
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorStderrTail",
         )?])
     }
 

@@ -17,6 +17,7 @@ pub mod observability;
 pub mod registry;
 pub mod router;
 pub mod server;
+pub mod stderr_tail;
 pub mod supervise;
 pub mod watchdog;
 

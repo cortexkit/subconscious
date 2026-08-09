@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt, io,
     path::PathBuf,
-    process::ExitStatus,
+    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +28,7 @@ use crate::{
         ModuleDrainTarget, PendingModuleControlRpc,
     },
     registry::RegistryError,
+    stderr_tail::{pump_stderr, StderrRing, StderrTailConfig, StderrTailSnapshot},
     Frame, Registry,
 };
 
@@ -366,6 +367,13 @@ struct SupervisorRuntimeConfig {
     /// The shared handle, so every spawn path (initial, restart, reload) records the
     /// reserved-module launch nonce the HELLO verifier checks against.
     supervisor_handle: Option<SupervisorHandle>,
+    /// This module's stderr tail, shared with the [`SupervisedModule`] that answers
+    /// status queries.
+    ///
+    /// One ring per module, held across every respawn. The lines explaining an exit
+    /// are written BEFORE that exit, so a ring recreated per process would be empty
+    /// exactly when it is asked for.
+    stderr_ring: Arc<Mutex<StderrRing>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,10 +705,11 @@ impl Supervisor {
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let child = spawn_child(
-            &spec,
-            runtime.connection_file_path.as_deref(),
-            self.supervisor_handle.as_ref(),
-        )?;
+                    &spec,
+                    runtime.connection_file_path.as_deref(),
+                    self.supervisor_handle.as_ref(),
+                    &runtime.stderr_ring,
+                )?;
         set_running(&snapshot, child.id())?;
         self.process_liveness
             .track(spec.module_id.clone(), Arc::clone(&snapshot));
@@ -728,10 +737,11 @@ impl Supervisor {
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         match spawn_child(
-            &spec,
-            runtime.connection_file_path.as_deref(),
-            self.supervisor_handle.as_ref(),
-        ) {
+                    &spec,
+                    runtime.connection_file_path.as_deref(),
+                    self.supervisor_handle.as_ref(),
+                    &runtime.stderr_ring,
+                ) {
             Ok(child) => {
                 set_running(&snapshot, child.id())?;
                 self.process_liveness
@@ -768,10 +778,11 @@ impl Supervisor {
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         match spawn_child(
-            &spec,
-            runtime.connection_file_path.as_deref(),
-            self.supervisor_handle.as_ref(),
-        ) {
+                    &spec,
+                    runtime.connection_file_path.as_deref(),
+                    self.supervisor_handle.as_ref(),
+                    &runtime.stderr_ring,
+                ) {
             Ok(child) => {
                 set_running(&snapshot, child.id())?;
                 self.process_liveness
@@ -808,6 +819,7 @@ impl Supervisor {
             connection_file_path: self.connection_file_path.clone(),
             forwarding: self.forwarding.clone(),
             supervisor_handle: self.supervisor_handle.clone(),
+            stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
         }
     }
 
@@ -822,6 +834,7 @@ impl Supervisor {
             spec: spec.clone(),
             health: runtime.health,
         }));
+        let stderr_ring = Arc::clone(&runtime.stderr_ring);
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
@@ -840,6 +853,7 @@ impl Supervisor {
                 registry: Arc::clone(&self.registry),
                 snapshot,
                 configuration,
+                stderr_ring,
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
             }),
@@ -869,6 +883,7 @@ struct SupervisedModuleInner {
     registry: Arc<Registry>,
     snapshot: SharedSnapshot,
     configuration: Arc<Mutex<SupervisedConfiguration>>,
+    stderr_ring: Arc<Mutex<StderrRing>>,
     commands: mpsc::Sender<SupervisorCommand>,
     monitor: Mutex<Option<JoinHandle<()>>>,
 }
@@ -889,6 +904,24 @@ impl SupervisedModule {
 
     pub fn state(&self) -> Result<ModuleState, SuperviseError> {
         Ok(lock_snapshot(&self.inner.snapshot)?.state)
+    }
+
+    /// The module's retained stderr, newest lines last.
+    ///
+    /// Deliberately NOT on [`Self::status`]: a bounded tail is kilobytes per
+    /// module, `supervisor.list` renders every module, and putting it in the
+    /// shared snapshot would make each status read carry a payload almost nobody
+    /// asked for. Callers that want the text ask for it.
+    pub fn stderr_tail(
+        &self,
+        max_lines: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> StderrTailSnapshot {
+        self.inner
+            .stderr_ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot(max_lines, max_bytes)
     }
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
@@ -2557,6 +2590,7 @@ fn spawn_child(
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
+    ring: &Arc<Mutex<StderrRing>>,
 ) -> Result<Child, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
@@ -2580,36 +2614,70 @@ fn spawn_child(
     }
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
 
-    // STDIO IS DELIBERATELY LEFT INHERITED, which is a decision no line of this
-    // function states and therefore worth stating here: every supervised child
-    // gets the daemon's own stdout/stderr, so all of them share ONE file
-    // descriptor and one file offset. That is what puts every module's output in
-    // a single daemon log without a per-child reader task.
+    // STDOUT STAYS INHERITED; STDERR IS PIPED. The asymmetry is the whole design,
+    // so it is worth saying why rather than leaving it to be inferred.
     //
-    // THE COST IS INTERLEAVING, and the mechanism is finer than a shared fd. A
-    // module owner measured it: an emitter that formats INCREMENTALLY issues one
-    // write syscall per format fragment, and while a process-local lock serialises
-    // those within one process, nothing serialises them ACROSS processes. Two
-    // processes on one inherited fd, 1500 lines each: 212 of 3000 lines came out
-    // spliced with an incremental emitter, 0 of 3000 when each line was formatted
-    // first and written in a single call. So the inheritance is the exposure and
-    // the multi-syscall write is what converts it into damage.
+    // Inheriting both was the original choice: every child wrote to the daemon's
+    // own descriptors, which put all module output in one log with no per-child
+    // reader task. That was correct about interleaving and silent about DURABILITY,
+    // and durability is the axis that decides whether a crash can be diagnosed.
+    // A module's stderr is the only diagnostic input with no in-memory path --
+    // `last_exit` survives a respawn because the supervisor holds it, while the
+    // text explaining that exit went to a sink that rotates or fills. Measured on
+    // two hosts: a systemd journal at its size cap retaining ~3.2 hours, and a
+    // plain log file reaching 908 MB with one module accounting for 98% of it. In
+    // both, the noisiest module sets everyone else's retention and the victim has
+    // no way to know its window shrank.
     //
-    // CONSEQUENCE FOR ANYONE SCRAPING THE DAEMON LOG: do not anchor patterns at
-    // line start. A single-write emitter guarantees its line is WHOLE, not that it
-    // begins a line -- another process mid-write can still land a fragment ahead of
-    // it, measured at ~8% of lines. An unanchored match found 1500 of 1500 where
-    // `^`-anchored found 1382. Strip escape sequences too.
+    // So stderr is piped into a bounded in-memory ring the supervisor owns, and
+    // every line is forwarded on so the daemon log keeps its current content. That
+    // forwarding is MANDATORY rather than courteous: the log is overwhelmingly
+    // module output (4727 of 5000 sampled lines carried a module tag), so a tap
+    // that captured without forwarding would leave it nearly empty and every
+    // existing reader would report clean on nothing -- an absence that reads as
+    // calm, which is worse than the interleaving it replaces.
     //
-    // The structural fix is a per-child pipe with a line-atomic writer here, which
-    // would make the property hold for modules this daemon does not own. Not done:
-    // it adds a reader task per child and moves where logs land, and the mitigation
-    // above is free for any module that adopts it.
+    // THE TAP MAKES LINE ATOMICITY THIS DAEMON'S PROBLEM. Previously a module's
+    // own write reached the fd in one syscall and the splicing came from emitters
+    // that formatted incrementally: two processes on one inherited fd, 1500 lines
+    // each, produced 212 spliced lines of 3000 with an incremental emitter and 0
+    // of 3000 when each line was formatted first and written once. Reading a pipe
+    // and re-emitting can split a line that WAS atomic, so the reader reassembles
+    // to a complete line and writes it in a single call -- otherwise this change
+    // introduces a defect the previous design did not have.
+    //
+    // Stdout is left inherited: modules use it for ordinary output rather than
+    // diagnostics, and piping it would double the reader tasks for no diagnostic
+    // gain.
+    command.stderr(Stdio::piped());
     command.kill_on_drop(true);
-    command.spawn().map_err(|source| SuperviseError::Spawn {
+    let mut child = command.spawn().map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),
         source,
-    })
+    })?;
+
+    match child.stderr.take() {
+        Some(stderr) => {
+            ring.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_process_start();
+            tokio::spawn(pump_stderr(stderr, Arc::clone(ring)));
+        }
+        None => {
+            // Spawning succeeded but the pipe did not materialise. Recording it as
+            // uncaptured keeps the tail honest: the alternative is an empty tail
+            // that reads as a module which printed nothing.
+            ring.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mark_not_captured("stderr pipe was not available on spawn");
+            warn!(
+                module_id = %spec.module_id,
+                "spawned child exposed no stderr pipe; tail will be unavailable"
+            );
+        }
+    }
+
+    Ok(child)
 }
 
 /// A fresh 256-bit CSPRNG launch nonce, lowercase hex. Used to bind a reserved
@@ -2649,6 +2717,7 @@ fn spawn_and_mark_running(
         spec,
         runtime.connection_file_path.as_deref(),
         runtime.supervisor_handle.as_ref(),
+        &runtime.stderr_ring,
     )?;
     set_running(snapshot, child.id())?;
     Ok(child)

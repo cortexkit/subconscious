@@ -1,6 +1,7 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use subc_core::{
+    stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
     ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
     SupervisedModule, Supervisor,
 };
@@ -520,6 +521,162 @@ async fn wait_for_registration(
         }
         if Instant::now() >= deadline {
             panic!("module {module_id} did not register within {wait:?}");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The case #7 was filed about: a module that dies with its cause on stderr.
+///
+/// The claustrum incident had `exit_code: 1` and the reason -- a missing config
+/// section -- only in the text, which was gone from the journal by the time
+/// anyone looked. This asserts the text is recoverable from the supervisor after
+/// the process is dead, with no log file in the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 0, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "stderr-tail-crasher".to_string(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "echo 'config error: missing top-level `storage`' >&2; exit 1".to_string(),
+            ],
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+    let status = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Failed
+    })
+    .await;
+    assert_eq!(
+        status.last_exit.as_ref().and_then(|exit| exit.code),
+        Some(1),
+        "precondition: the module should have exited non-zero"
+    );
+
+    let tail = module.stderr_tail(None, None);
+    assert!(
+        matches!(tail.capture, CaptureState::Captured),
+        "a spawned module must report captured, not an empty tail that reads as silence"
+    );
+
+    let lines: Vec<&str> = tail
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TailEntry::Line { text, .. } => Some(text.as_str()),
+            TailEntry::ProcessStart => None,
+        })
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("missing top-level `storage`")),
+        "the cause of the exit was not recoverable from the tail; got {lines:?}"
+    );
+}
+
+/// A module that exits cleanly having printed nothing must not look like one
+/// nobody was listening to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 0, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "stderr-tail-silent".to_string(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "exit 3".to_string()],
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+    wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Failed
+    })
+    .await;
+
+    let tail = module.stderr_tail(None, None);
+    assert!(
+        matches!(tail.capture, CaptureState::Captured),
+        "silence and absence must be distinguishable; got {:?}",
+        tail.capture
+    );
+    assert!(
+        tail.entries.is_empty(),
+        "expected no lines from a module that printed nothing; got {:?}",
+        tail.entries
+    );
+}
+
+/// The tail has to outlive the process whose death it explains.
+///
+/// A ring recreated per spawn would be empty exactly when asked, and the restart
+/// boundary has to be visible in-band -- which side of a restart a line falls on
+/// is unanswerable from a count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "stderr-tail-looper".to_string(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "echo \"boot $$\" >&2; exit 1".to_string(),
+            ],
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        tail.entries
+            .iter()
+            .filter(|entry| matches!(entry, TailEntry::ProcessStart))
+            .count()
+            >= 2
+    })
+    .await;
+
+    let boots = tail
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, TailEntry::Line { text, .. } if text.starts_with("boot ")))
+        .count();
+    assert!(
+        boots >= 2,
+        "output from before the restart was lost; got {:?}",
+        tail.entries
+    );
+}
+
+async fn wait_for_tail(
+    module: &SupervisedModule,
+    wait: Duration,
+    matches: impl Fn(&StderrTailSnapshot) -> bool,
+) -> StderrTailSnapshot {
+    let deadline = Instant::now() + wait;
+    loop {
+        let tail = module.stderr_tail(None, None);
+        if matches(&tail) {
+            return tail;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "module {} did not reach the expected stderr tail within {wait:?}; last: {tail:?}",
+                module.module_id()
+            );
         }
         sleep(Duration::from_millis(10)).await;
     }

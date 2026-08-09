@@ -1,0 +1,22 @@
+{
+  "capture": {
+    "state": "captured"
+  },
+  "dropped_lines": 12,
+  "entries": [
+    {
+      "kind": "line",
+      "text": "config error: missing top-level `storage`"
+    },
+    {
+      "kind": "process_start"
+    },
+    {
+      "kind": "line",
+      "text": "config error: missing top-level `stor",
+      "truncated": true
+    }
+  ],
+  "module_id": "aft-tools",
+  "op": "supervisor.stderr_tail"
+}

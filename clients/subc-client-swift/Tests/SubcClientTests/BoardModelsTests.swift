@@ -174,4 +174,78 @@ final class BoardModelsTests: XCTestCase {
         case invalidShape
         case invalidReference
     }
+
+    // MARK: - Producer drift must not cost the reader the whole board
+
+    /// The live defect: a pointer artifact carries `path` and no `body`.
+    ///
+    /// Producer-legal by contract -- a show block carries body XOR path, and the
+    /// producer's own digest builder already reads body as optional. Against this
+    /// model it was a hard failure, which failed the block array, which failed the
+    /// whole board reply.
+    func testPointerArtifactWithoutBodyDecodes() throws {
+        let json = """
+        {"blockId":"artifact.doc","lane":"artifacts","kind":"show","rev":1,
+         "digest":{"title":"d"},
+         "props":{"title":"Cutover design v1","note":"F1-F5 rulings folded",
+                  "path":".cortexkit/alfonso/plans/cutover-v1.md"}}
+        """
+        let block = try JSONDecoder().decode(BoardBlock.self, from: Data(json.utf8))
+        guard case .show(let props) = block.props else {
+            return XCTFail("pointer artifact must decode as a typed show block")
+        }
+        XCTAssertNil(props.body, "a pointer artifact has no body: the file is the body")
+        XCTAssertEqual(props.path, ".cortexkit/alfonso/plans/cutover-v1.md")
+        XCTAssertEqual(props.note, "F1-F5 rulings folded")
+    }
+
+    /// One block this model cannot type must not cost the reader the others.
+    ///
+    /// Asserts the EFFECT -- surviving blocks present AND still typed -- rather
+    /// than that decoding did not throw. A model that dropped the bad block
+    /// entirely would also not throw, and would lose it silently.
+    func testOneUntypeableBlockDoesNotCostTheOthers() throws {
+        let json = """
+        [{"blockId":"a","lane":"status","kind":"status","rev":1,"digest":{"title":"d"},
+          "props":{"text":"working","state":"active"}},
+         {"blockId":"b","lane":"artifacts","kind":"show","rev":1,"digest":{"title":"d"},
+          "props":{"title":42}},
+         {"blockId":"c","lane":"chat","kind":"text","rev":1,"digest":{"title":"d"},
+          "props":{"text":"hello"}}]
+        """
+        let blocks = try JSONDecoder().decode([BoardBlock].self, from: Data(json.utf8))
+        XCTAssertEqual(blocks.count, 3, "a malformed block must not remove its neighbours")
+        guard case .status = blocks[0].props else { return XCTFail("neighbour lost its type") }
+        guard case .text = blocks[2].props else { return XCTFail("neighbour lost its type") }
+        guard case .opaque = blocks[1].props else {
+            return XCTFail("an untypeable known kind must degrade to opaque, not vanish")
+        }
+    }
+
+    /// Lenient decoding trades a loud failure for a quiet one unless the reader can
+    /// see it. An unknown KIND is the fallback working as designed, so it must not
+    /// be counted -- otherwise every forward-compatible board reads as damaged and
+    /// the number stops meaning anything.
+    func testDegradedCountSeparatesBrokenBlocksFromFutureOnes() throws {
+        let json = """
+        {"roomId":"r","sessionId":"s","vocabulary":"v2","servedSeq":1,
+         "lanes":["status"],
+         "servedBlocks":3,"totalBlocks":9,
+         "blocks":[
+           {"blockId":"a","lane":"status","kind":"status","rev":1,"digest":{"title":"d"},
+            "props":{"text":"working","state":"active"}},
+           {"blockId":"b","lane":"artifacts","kind":"show","rev":1,"digest":{"title":"d"},
+            "props":{"title":42}},
+           {"blockId":"c","lane":"x","kind":"chart","rev":1,"digest":{"title":"d"},
+            "props":{"series":[1,2]}}]}
+        """
+        let state = try JSONDecoder().decode(BoardState.self, from: Data(json.utf8))
+        XCTAssertEqual(state.blocks.count, 3)
+        XCTAssertEqual(
+            state.degradedBlockCount, 1,
+            "only the broken show block counts; unknown kind 'chart' is forward compatibility"
+        )
+        XCTAssertEqual(state.servedBlocks, 3, "truncation counts tell a reader the board is partial")
+        XCTAssertEqual(state.totalBlocks, 9)
+    }
 }

@@ -1020,6 +1020,24 @@ impl ControlHandler {
             "handling route.open"
         );
 
+        // WHY THESE REPLIES DISCRIMINATE FREELY, since the usual rule is the
+        // opposite. Below, a caller learns whether a module is unregistered,
+        // supervised-but-down (with state/enabled/live), or registered without the
+        // requested role. Elsewhere that is an enumeration leak: a probe learning
+        // the shape of a fleet it cannot otherwise see.
+        //
+        // It is not one here, and the reason is the ACCESS MODEL rather than
+        // anything about these errors. Reaching route.open requires the
+        // pre-envelope HMAC handshake, whose key lives in a 0600 user-owned
+        // connection file, so any caller who completes it already runs as this
+        // user -- and can read subc.jsonc for the module list and `ck module
+        // status` for live state. The reply discloses nothing the caller cannot
+        // read more easily from disk, while the precision is load-bearing:
+        // `unknown_module` is retryable and a missing role is not.
+        //
+        // IF THE HANDSHAKE EVER ADMITS A PRINCIPAL THAT IS NOT THIS USER -- a
+        // remote transport, a sandboxed caller, a shared-host mode -- THAT
+        // PREMISE DIES AND THESE THREE REPLIES MUST COLLAPSE INTO ONE.
         let Some(registration) = self
             .registry
             .get_module(&target_module_id)

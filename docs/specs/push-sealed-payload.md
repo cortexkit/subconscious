@@ -276,6 +276,70 @@ question text itself.
 The device joins the ask id against live fleet state and renders from that. A
 forged blob therefore produces a notification that opens to nothing.
 
+**THE QUESTION TEXT IS THE ITEM THIS RULE EXISTS TO EXCLUDE, AND IT FAILS THE
+TEST IN THE STRONGEST WAY: it is not merely useful without a lookup, it is the
+entire product of the lookup.** A blob carrying it needs no fleet state at all, so
+a forged one renders a complete, plausible, attacker-chosen question on the lock
+screen. That is the difference between a forgery that dead-ends and a forgery
+that speaks.
+
+### What this means for the notification extension
+
+A notification service extension therefore decrypts an ask id and CANNOT render
+the question. It has no fed session and no useful network window, so it can only
+render from state already on the device at delivery time.
+
+**v1: the lock-screen line is generic but honest** — a real ask is waiting — and
+the question appears when the app opens through the deep link and performs the
+join. This is the forgery bound working as specified rather than a limitation of
+it.
+
+**A local cache of pending asks is not a deferred alternative; it is the wrong
+mechanism.** A cache is populated only for asks the app has already seen, and the
+notification's entire purpose is to reach the operator about an ask they have
+NOT seen — so the cache is empty in precisely the case the feature exists for.
+That is a correctness argument, independent of the (also real) point that it
+would place question text on the device before the operator unlocks it.
+
+**A v2 that carries the question MUST close the forgery gap first**, by moving to
+an authenticated sealing mode so a blob's ORIGIN is provable rather than only its
+integrity. Rendering attacker-chosen text on a lock screen is the same threshold
+as the reply button named above, reached one step earlier. Authenticated mode
+first, question text second, never the reverse.
+
+## The APNs environment is measured, not assumed
+
+**The provider key is PRODUCTION-configured, established by measurement rather
+than by the portal screen or anyone's recollection.** Recorded here because it was
+the link every seat named as the first suspect for a vanished notification, and
+because the measurement is cheap to repeat and needs no real device token:
+
+    api.push.apple.com          400  BadDeviceToken             <- key ACCEPTED, device rejected
+    api.sandbox.push.apple.com  403  BadEnvironmentKeyInToken   <- key refused BY NAME
+    control: prod host, corrupted bearer
+                                403  InvalidProviderToken       <- the prod answer depended on the key
+
+The order is what carries it. Production authenticated the key and got as far as
+the device lookup; sandbox refused the key itself naming the environment; and the
+control proves production's answer was about the key rather than what that host
+tells everyone. The environment check precedes the device lookup, so **a fake
+device token is sufficient for this experiment**.
+
+**A CORRECTION WORTH KEEPING, because four seats repeated the wrong version
+within an hour:** the belief in circulation was that a mismatched environment key
+is *accepted at submit and silently dropped*. It is not. APNs refuses it loudly
+with a reason string that names the problem. The error was reasoning from a true
+general property (a token minted for one environment is rejected by the other) to
+an invented specific failure mode, without checking whether the boundary reports
+it. **It spread quickly because it matched the pattern the reviewers were already
+hunting** — a claim that fits the room's current theory is the one that gets least
+scrutiny.
+
+Consequence: if a submitted notification is accepted and never arrives, the
+environment is the LAST suspect rather than the first. The honest candidates are
+the device token, the seal/open agreement, the extension's keychain access, and
+the topic.
+
 ## Vectors
 
 Vectors are the contract. Prose is commentary.

@@ -79,3 +79,39 @@ the repo — which reads as "this vendoring points at nothing" rather than as a
 formatting artifact. A display-oriented command's output parsed by a machine is
 its own defect class; prefer the machine-readable form even when the human form
 looks identical on the examples in front of you.
+
+## The producer's own check, verified at source
+
+The producer does not merely store these corpora — it REGENERATES them and
+requires byte-identity, which is what makes "the bytes published at commit X" a
+meaningful claim rather than a label. Verified in `cortexkit-account` at
+`workers/account/test/fixtures/verify-contract-fixtures.mjs`:
+
+    const first  = regenerate(generator);
+    const second = regenerate(generator);
+    assert.equal(second, first, `${generator} must be deterministic`);
+    assert.equal(readFileSync(join(fixtureDir, artifact), "utf8"), first,
+                 `${artifact} is stale`);
+
+Both assertions matter and neither substitutes: the first proves the generator
+is deterministic across two runs, the second proves the stored artifact is that
+output. A generator that varied per run would satisfy the second alone on the
+run that wrote the file.
+
+It is ENFORCED rather than available — `workers/account/package.json` chains it
+ahead of the test suite (`fixtures:verify && … && vitest run`), so a stale
+artifact fails at the `&&` rather than depending on someone remembering to run
+it. And the generator list is DERIVED by enumerating `mint-*.mjs` rather than
+transcribed, with an explicit refusal when the enumeration comes back empty —
+so a corpus cannot be silently excluded by being omitted from a list. Both
+corpora vendored here have generators (`mint-room1-contract-samples.mjs`,
+`mint-room2-contract-samples.mjs`), so both are covered.
+
+Recorded because subconscious commit `8c3994e9` asserts this property in its
+message, and a pushed commit body cannot be amended. The claim was relayed when
+written and confirmed afterwards at the citation above — noted so a later reader
+finds a confirmation with a location rather than an unsourced assertion.
+
+Finding it is harder than it looks: the check is a standalone node script
+chained in a package script, NOT a case in the vitest suite. Searching the test
+suite for it — the obvious move — structurally cannot find it.

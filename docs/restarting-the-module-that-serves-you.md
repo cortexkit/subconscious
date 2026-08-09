@@ -43,8 +43,8 @@ Consequences:
 - **Never blind-retry a mutation** after this error. Re-running a `git push`, a
   migration, or an `rm` because the transport lost the answer is how one
   completed operation becomes two.
-- **Verify state, don't re-run.** `ck module health` and `ck module status <id>`
-  go over a fresh connection and will tell you what actually happened.
+- **Verify state, don't re-run.** `ck module status <id>` and `ck health <id>` go
+  over a fresh connection and will tell you what actually happened.
 - A wrapper script that treats a nonzero exit here as "the restart failed" will
   classify a successful restart as a failure. If you automate around
   `ck module restart`, check module state afterwards rather than trusting the
@@ -70,4 +70,5 @@ Run the restart from somewhere the module does not serve — a plain terminal, o
 a session backed by a different module — and the ack table prints normally.
 
 If you must restart from a session that module serves, expect the error, and
-confirm with `ck module health` rather than reading anything into the exit line.
+confirm with `ck module status <id>` rather than reading anything into the exit
+line.

@@ -1521,13 +1521,31 @@ impl ControlHandler {
             config.modules,
         );
 
-        if configured_port != context.configured_port
-            || storage_config != context.storage_config
-            || admission_facts_carrier_module_id != context.admission_facts_carrier_module_id
-            || admission_facts_targets != context.admission_facts_targets
-        {
+        // Collect the sections rescan cannot apply, so the REPLY carries them.
+        //
+        // The warning below has always been correct and has always gone only to
+        // the journal -- addressed to whoever reads logs, while the person who
+        // just edited the config is looking at the CLI. Naming each section
+        // individually rather than setting a flag: "something outside modules
+        // changed" sends the operator back to diffing their own file, which is
+        // the work this is meant to save.
+        let mut restart_required = Vec::new();
+        if configured_port != context.configured_port {
+            restart_required.push("port".to_string());
+        }
+        if storage_config != context.storage_config {
+            restart_required.push("storage".to_string());
+        }
+        if admission_facts_carrier_module_id != context.admission_facts_carrier_module_id {
+            restart_required.push("admission_facts_carrier_module_id".to_string());
+        }
+        if admission_facts_targets != context.admission_facts_targets {
+            restart_required.push("admission_facts_targets".to_string());
+        }
+        if !restart_required.is_empty() {
             warn!(
                 config_path = %context.config_path.display(),
+                sections = %restart_required.join(", "),
                 "daemon config changed outside the modules section; restart the daemon to apply those changes"
             );
         }
@@ -1551,6 +1569,8 @@ impl ControlHandler {
                 return Ok(vec![control_error_frame(&frame, "rescan_failed", message)?])
             }
         };
+        let mut result = result;
+        result.restart_required = restart_required;
         let response = ClientControlResponse::SupervisorRescan { result };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -1648,6 +1668,10 @@ impl ControlHandler {
                 enabled_changes: enabled_changes.iter().cloned().collect(),
                 unchanged,
                 preview: true,
+                // Filled by the caller on both paths, so the preview reports
+                // restart-required sections identically to an executed rescan --
+                // the preview is where an operator is most likely to be looking.
+                restart_required: Vec::new(),
             });
         }
 
@@ -1717,6 +1741,9 @@ impl ControlHandler {
             enabled_changes: enabled_changes.iter().cloned().collect(),
             unchanged,
             preview: false,
+            // Filled by the caller, which is the only layer that can see the
+            // previous config to diff against.
+            restart_required: Vec::new(),
         })
     }
 

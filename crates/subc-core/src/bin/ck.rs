@@ -1900,6 +1900,18 @@ fn print_rescan_table(result: &Value) {
     {
         println!("\npreview only — nothing was changed. Run `ck module rescan` to apply.");
     }
+
+    // Sections rescan cannot apply. Printed AFTER the change table and the
+    // preview line, so it is the last thing on screen: it is the only part of
+    // this output that requires a further action, and a module whose config did
+    // not take crash-loops rather than failing visibly.
+    let restart_required = module_ids("restart_required");
+    if restart_required != "-" {
+        println!(
+            "\nRESTART REQUIRED — these config sections changed and rescan cannot apply them: {restart_required}\n\
+             Modules depending on them keep running their old config until the daemon restarts."
+        );
+    }
 }
 
 fn print_status_table(module: &Value, health: Option<&Value>) {

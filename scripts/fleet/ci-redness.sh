@@ -32,6 +32,17 @@ STALE_H=${CI_STALE_H:-4}
 # branch, so its "default branch" is a branch nobody merges to. Including them
 # added four entries that reported UNCHECKED forever: noise that trains the reader
 # to skim the section, which is the failure this file exists to prevent.
+# --porcelain emits one TAB-SEPARATED row per repo INCLUDING GREEN ONES, for
+# other seats to wire into their own sweeps:
+#   repo <TAB> state(green|red|unchecked) <TAB> red_hours <TAB> tip_sha <TAB> tip_is_failing
+# red_hours is -1 when unknown and -2 when no success exists in the fetched page
+# (a LOWER BOUND, not a duration). tip_is_failing is yes/no_run_yet/unknown and
+# answers a different question from red_hours: whether the CURRENT tip is broken,
+# which is what a merge gate cares about, versus how long the branch has been
+# broken, which is what neglect-hunting cares about.
+PORCELAIN=""
+[ "${1:-}" = "--porcelain" ] && PORCELAIN=1
+
 repos=()
 for dir in "$ROOT"/*/; do
   name=$(basename "$dir")
@@ -78,10 +89,23 @@ probe() {
       # No verdict at all is NOT clean. A repo whose workflows never run looks
       # exactly like one that always passes, and the difference is the whole
       # question.
-      printf '  %-22s no completed runs on %s -- UNCHECKED\n' "$name" "$branch" >"$out"
+      if [ -n "$PORCELAIN" ]; then
+        printf '%s\tunchecked\t-1\t%s\t-\n' "$name" "$(git -C "$dir" rev-parse --short "origin/$branch" 2>/dev/null || echo -)" >"$out"
+      else
+        printf '  %-22s no completed runs on %s -- UNCHECKED\n' "$name" "$branch" >"$out"
+      fi
       ;;
     success)
-      : >"$out"
+      # PORCELAIN EMITS GREEN ROWS; the human report does not. A consumer that
+      # only ever sees problem rows cannot tell a clean fleet from a scan that
+      # did not run, which is the failure this whole file exists to prevent --
+      # and it is a failure the human reader is protected from by the examined
+      # count at the end.
+      if [ -n "$PORCELAIN" ]; then
+        printf '%s\tgreen\t0\t%s\t-\n' "$name" "$(git -C "$dir" rev-parse --short "origin/$branch" 2>/dev/null || echo -)" >"$out"
+      else
+        : >"$out"
+      fi
       ;;
     *)
       # Red. Age it from the last SUCCESS, which is what separates "someone is
@@ -135,7 +159,18 @@ probe() {
         fi
       fi
 
-      if [ "$hours" -ge "$STALE_H" ]; then
+      if [ -n "$PORCELAIN" ]; then
+        # tip_is_failing answers "is the CURRENT tip broken" -- distinct from
+        # red_hours, which is about the branch. A repo can be red for a day with
+        # a tip nobody has run yet, and a consumer gating a merge cares about the
+        # tip while a consumer chasing neglect cares about the duration.
+        local tip_failing="unknown"
+        [ "$last_run_epoch" -gt 0 ] && [ "$head_epoch" -gt 0 ] && {
+          if [ "$head_epoch" -gt "$last_run_epoch" ]; then tip_failing=no_run_yet; else tip_failing=yes; fi
+        }
+        printf '%s\tred\t%s\t%s\t%s\n' "$name" "$hours" \
+          "$(git -C "$dir" rev-parse --short "origin/$branch" 2>/dev/null || echo -)" "$tip_failing" >"$out"
+      elif [ "$hours" -ge "$STALE_H" ]; then
         printf '  %-22s RED for ~%sh (last green %s)%s  %s\n' "$name" "$hours" "${last_ok:0:16}" "$pushed_since" "$title" >"$out"
       elif [ "$hours" -eq -2 ]; then
         printf '  %-22s RED, no green in the last 20 runs  %s\n' "$name" "$title" >"$out"
@@ -166,7 +201,14 @@ done
 # ALWAYS state the denominator. A silent section is ambiguous between "all green"
 # and "the loop ran zero times", and this file exists because a clean-looking
 # absence hid a real failure for a day.
-if [ "$printed" -eq 0 ]; then
+# The denominator goes to STDERR in porcelain mode, never stdout. A consumer
+# splitting stdout on tabs would read this line as a malformed repo row -- but it
+# must still be EMITTED, because it is the only thing distinguishing "scanned 24,
+# all green" from "scanned nothing". Dropping it to keep the stream clean would
+# trade a parse error for a silent false clean, which is the worse failure.
+if [ -n "$PORCELAIN" ]; then
+  printf 'examined %s repos\n' "${#repos[@]}" >&2
+elif [ "$printed" -eq 0 ]; then
   printf '  all %s repos green on their default branch\n' "${#repos[@]}"
 else
   printf '  (%s repos examined)\n' "${#repos[@]}"

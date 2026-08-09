@@ -565,6 +565,36 @@ not on the completion, where it would be stored and vouched for by nothing.
 
 Named so a reader does not infer silence means "unconstrained".
 
+### The already-enrolled population
+
+**A FIELD BOUND INTO A ONE-TIME CEREMONY IS ONLY OBTAINABLE BY DEVICES THAT HAVE
+NOT YET PERFORMED IT.** Binding the sealing key into the enrollment transcript is
+correct and this document keeps that rule. What it originally failed to say is
+what becomes of a device that enrolled BEFORE the field existed.
+
+Measured on a live device rather than reasoned about: the key is generated inside
+the enrollment call, enrollment runs only from the pairing screen, and the pairing
+screen is shown only when the device is unpaired. **An already-paired device
+therefore cannot reach the generation site at all.** Following this specification
+exactly produces a device that can receive notifications and has no key to receive
+them with -- permanently, with no error anywhere. Not a refusal: an ABSENCE. An
+empty registry column, no exception, no log line, on a path whose visible outcome
+is already silence.
+
+**So: any field bound into a one-time ceremony MUST ship with its re-entry path in
+the same change, and this document MUST name the already-completed population
+explicitly.** Not as a migration note afterwards -- the gap is invisible precisely
+when the change looks complete, because tests construct the ceremony directly and
+therefore always exercise the after-path. The generation code can be correct,
+tested and mutation-proved while nothing on a shipped device can invoke it.
+
+**Prefer a re-entry path that reuses the ceremony's EXISTING rotation affordance**
+(`rotation_sig_hex`, already sent on every enrollment and already specified for
+same-key live re-enrollment) over a bespoke add-a-key endpoint. The rotation path
+inherits the transcript binding; a second endpoint writing the same registry
+column would be a second door into it, and only one of the two would be covered by
+the reasoning above.
+
 **THE FIELD SET HAS THREE INDEPENDENT PRODUCERS, AND THE THIRD IS THE ONE THAT
 GETS MISSED.** The enrollment proof context is built separately by the rendezvous
 server's verifier, by the Swift client, and by the Rust client the Mac daemon

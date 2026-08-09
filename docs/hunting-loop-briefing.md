@@ -638,6 +638,9 @@ Before calling a class closed:
 | 551 | Closure evidence that is an absence over an uncontrolled window | Prefer an injected test that is falsifiable on demand — "no failures this week" cannot separate a working fix from a week that happened to be easy, and the aggressor removing itself looks identical to the defect being fixed |
 | 552 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
 | 553 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
+| 554 | A negative result from a fixture nobody proved could produce the positive | Mutation cannot see this — break the mechanism and the fixture still reports the same nothing, which reads as the test working. Ask whether this input can exhibit the behaviour AT ALL before believing it does not |
+| 555 | A swept parameter whose outcome does not move | Cutting at 99.9% and 33% giving the identical answer means the sweep is not reaching the mechanism you think it is. Usable by a reader who knows nothing about the format, which is why it beats explaining the collapse |
+| 556 | A zero you are about to report on someone else's behalf | A favour is framed as a lookup and lookups do not get controls, so the skip is never a decision. Plant one positive, confirm the detector fires — the trigger is not "am I testing something" but "am I about to report a number someone will act on" |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
 its discriminator is half-guidance**, and the half that travels is whichever
@@ -676,6 +679,65 @@ provenance stamp in the thing being measured, never in the thing doing the
 measuring.** When a build commit comes from the running module's own health
 report, a stale reader can fail to *ask*, but it cannot report a stale answer as
 current.
+
+### Mutation testing has one blind spot, and it is not a gap in rigour
+
+This document leans on mutation harder than on any other check: break the
+mechanism, watch the test redden, and the test is proven non-vacuous. That is
+sound whenever the *test* is the thing that might be wrong. It cannot see a
+defect in the **fixture**.
+
+The specimen. Testing whether a torn copy of an append-only log is replayable,
+the first run reported that every truncated copy decodes **zero** frames — a
+clean table, a passing control, internally consistent numbers, and a false
+conclusion. The fixture was one 2.48MB frame followed by two tiny ones, so every
+percentage-offset cut landed inside frame 0, and losing frame 0 loses
+everything. **A single-huge-frame file makes "torn" and "empty" the same
+outcome.** Re-run against a real 512-frame log cut at ten places, every cut
+yielded exactly the intact prefix — the opposite answer.
+
+Mutation is structurally blind here. Break the decoder and the fixture still
+reports zero, *which reads as the test working*. Every signal a mutation run
+produces is consistent with a healthy test, because the apparatus was never
+capable of the discrimination in the first place.
+
+The cheapest tell needs no knowledge of the data: **control and treatment
+disagreed too cleanly.** Cutting at 99.9% and at 33% gave the identical answer.
+A real degradation curve degrades. Generally — *when a treatment sweeps a
+parameter and the outcome does not move, the parameter is probably not reaching
+the mechanism you think it is.* They were sweeping how much of frame 0 survives
+while believing they were sweeping how many frames survive. This tell is usable
+by a reader who knows nothing about the format, which matters, because the
+outsider is the one still looking.
+
+So the check that precedes mutation: **before believing a negative result, ask
+whether the fixture can produce the positive.** Not "does my instrument work"
+but *can this input exhibit the behaviour at all.* Refusals are the least
+re-examined result on any team, because they feel conservative.
+
+### The rule gets applied where the work is and skipped where the favour is
+
+Two seats hit this within one hour, on the day they each wrote the rule down.
+One ran a filename-collision check over another module's 14,213 files, got zero,
+and reported the tree clean — from a detector nobody had shown could fire. The
+same seat had applied the identical discipline to a guard they merged three
+hours earlier.
+
+The mechanism, and it is the useful part: **clearing someone else's tree does
+not feel like an experiment.** A favour is framed as a *lookup*, and lookups do
+not get controls. The skip is not a decision — the decision is never reached,
+because nothing about the act announces itself as measurement.
+
+So the trigger is not "am I testing something." It is **am I about to report a
+number someone will act on.** That number was going to authorise capture of a
+1.2GB dataset.
+
+The miss always has one shape, which makes it cheap to guard: **an unfalsifiable
+zero.** A folding check returning 0 reads identically whether the corpus is clean
+or the normaliser did nothing; so does a grep whose pattern is wrong, a query
+whose column moved, a scan pointed at the wrong tree. Plant one positive and
+confirm the detector fires. One line, and the zero becomes a measurement — the
+same zero, now meaning something.
 
 ## The targeting principle
 

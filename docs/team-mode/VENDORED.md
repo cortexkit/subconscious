@@ -115,3 +115,19 @@ finds a confirmation with a location rather than an unsourced assertion.
 Finding it is harder than it looks: the check is a standalone node script
 chained in a package script, NOT a case in the vitest suite. Searching the test
 suite for it — the obvious move — structurally cannot find it.
+
+## A known expiry in the authenticity check
+
+Comparing against the producer at the recorded commit works today because the
+upstream files still sit at their original paths. **A rename upstream, or a
+history rewrite, ends it** — the commit stays reachable while the path inside it
+no longer resolves, and the check reports the corpus missing from the producer.
+That failure names the wrong cause: it reads as a broken vendoring rather than a
+moved file.
+
+Recorded here rather than left to be discovered on the day it breaks, because
+the symptom is confident and misdirecting. If it fires, check whether the path
+moved upstream before concluding anything about these bytes.
+
+The manifest digests above are unaffected — they compare against this repo's own
+record and need no producer at all, which is why both checks exist.

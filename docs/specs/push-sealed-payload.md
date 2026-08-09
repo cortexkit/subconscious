@@ -336,7 +336,7 @@ whole time with nobody learning it.
 On this path the stakes are asymmetric — an opener that refuses everything looks
 like a phone with no notifications, which looks like a quiet week.
 
-Required negatives:
+Required negatives — **`vector-set: 2`**:
 
 | vector | asserts |
 |---|---|
@@ -388,6 +388,44 @@ of anyone's test code.
 A generator adding a case is not an error; it is a signal that the spec has moved
 and the consumer has not. The correct response to the addition arm firing is to
 update this table, not to relax the check.
+
+### The copies are deliberate; the drift is not
+
+This set now exists in at least three places — this table, each consumer's
+harness, and the generator. **That duplication is load-bearing rather than
+accidental, and de-duplicating it would destroy the check.** A consumer that
+derived the required set from the corpus could not detect an omission: it would be
+asking the artifact under test what it should contain. The check works precisely
+BECAUSE each consumer holds an independent transcription of this table.
+
+So the usual remedy — one definition, consumed by both — is wrong here, and this
+is the exception to it: **where a check's value comes from a second opinion,
+sharing the definition removes the second opinion.**
+
+What is genuinely wrong is that nothing detects the copies DRIFTING. Two changes
+in one evening moved this table while consumers held the old shape, and each time
+the symptom appeared as a corpus failure naming the wrong artifact.
+
+**Therefore `vector-set` above is a monotonic integer, and every consumer MUST pin
+the value it was written against and refuse when the corpus declares a different
+one** — naming both values and this document. The corpus declares its
+`vector-set` in a single non-vector line named `corpus_meta`:
+
+```json
+{"name": "corpus_meta", "vector_set": 2}
+```
+
+Consumers MUST exclude `corpus_meta` from the vector name diff **by that exact
+name**, not by a prefix rule. A prefix would let a future non-vector line be
+introduced without anyone noticing, and the diff's entire purpose is to make new
+corpus content meet a human. A consumer pinned at 2 receiving a corpus
+declaring 3 stops immediately with "pinned to vector-set 2, corpus declares 3",
+which is the true statement; without it the same drift arrives as an unexplained
+missing or unexpected vector name.
+
+Bump it whenever a name is added, removed, or renamed — not for wording changes in
+the `asserts` column. The number's only job is to make a stale transcription fail
+loudly and say so.
 
 ## What this specification does not cover
 

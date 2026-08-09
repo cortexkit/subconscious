@@ -85,6 +85,28 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
     /// missing one.
     func testCorpusCarriesEveryNegativeTheSpecRequires() throws {
         let vectors = try loadVectors()
+
+        // PINNED TO THE SPEC'S vector-set. The list below is a TRANSCRIPTION of
+        // the spec's required-negatives table, and transcriptions go stale: that
+        // table moved twice in one evening while this file held the old shape,
+        // and both times the symptom was a corpus failure naming the CORPUS
+        // rather than the drift between two copies of one fact.
+        //
+        // The copy is deliberate. Deriving the required names from the corpus
+        // would be asking the artifact under test what it should contain, which
+        // cannot detect an omission -- so the defect to guard is not duplication
+        // but SILENT divergence, and the pin is what makes divergence loud.
+        let pinnedVectorSet = 2
+        let declaredSets = vectors.compactMap { $0["vector_set"] as? Int }
+        if let declared = declaredSets.first, declared != pinnedVectorSet {
+            XCTFail(
+                "pinned to vector-set \(pinnedVectorSet), corpus declares \(declared). "
+                    + "Re-read the required-negatives table in "
+                    + "docs/specs/push-sealed-payload.md and update this list."
+            )
+            return
+        }
+
         let required: Set<String> = [
             "unknown_version",
             "truncated_enc",
@@ -109,8 +131,13 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
         // Whoever adds a vector here is meant to meet this failure and decide
         // what the opener should do with it, rather than discover years later
         // that it was never exercised.
+        // `corpus_meta` carries the vector-set declaration and is not a vector.
+        // Excluded by name rather than by a prefix rule, because a prefix would
+        // let a future non-vector line be introduced silently -- and this arm's
+        // whole job is to make new corpus content meet a human.
         let unexpected = present
             .subtracting(required)
+            .subtracting(["corpus_meta"])
             .filter { !$0.hasPrefix("valid_") }
         XCTAssertTrue(
             unexpected.isEmpty,

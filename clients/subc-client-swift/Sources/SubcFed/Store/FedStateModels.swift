@@ -127,7 +127,28 @@ public struct FedDestinationState: Sendable, Equatable, Codable {
     public var unresolvedEffects: [FedUnresolvedEffectRecord]
     /// Poisoned serving ledger epochs that must never classify misses as not_sent.
     public var poisonedLedgerEpochs: [String]
-    public var reconciliationComplete: Bool
+
+    // NOTE: a `reconciliationComplete` flag lived here and was REMOVED.
+    //
+    // It was written `false` on reserve and on a peer-incarnation change, and the
+    // only thing that could set it true had NO CALLERS -- so it was monotonically
+    // false from the first reservation and nothing in the library ever read it.
+    // A persisted field whose clearing path is unreachable still RENDERS AS A
+    // STATUS: an operator inspecting the file reads `false` and concludes
+    // reconciliation is stuck, which is a conclusion the value cannot support.
+    // That is worse than an absent field, because absence prompts a question and
+    // `false` answers one -- which cost real time when someone inspecting the
+    // file drew exactly that conclusion.
+    //
+    // Deleted rather than wired up because it was also REDUNDANT: whether
+    // reconciliation is outstanding is derivable from `unresolvedEffects`
+    // (`hasLiveUnresolvedEffects`), which is the state reconciliation is actually
+    // driven from on restart. A second representation of a derived fact can only
+    // disagree with it.
+    //
+    // Old files carrying the key still decode -- JSONDecoder ignores unknown
+    // keys, and `fed_state_document_decodes_files_written_before_a_field_was_removed`
+    // pins that, because a device can sit on a stale file across app updates.
 
     public init(
         responderStaticPublicKey: Data,
@@ -135,8 +156,7 @@ public struct FedDestinationState: Sendable, Equatable, Codable {
         observedPeerLedgerEpoch: String? = nil,
         confirmedWatermark: FedConfirmedWatermark? = nil,
         unresolvedEffects: [FedUnresolvedEffectRecord] = [],
-        poisonedLedgerEpochs: [String] = [],
-        reconciliationComplete: Bool = true
+        poisonedLedgerEpochs: [String] = []
     ) {
         self.responderStaticPublicKey = responderStaticPublicKey
         self.observedPeerIncarnation = observedPeerIncarnation
@@ -144,7 +164,6 @@ public struct FedDestinationState: Sendable, Equatable, Codable {
         self.confirmedWatermark = confirmedWatermark
         self.unresolvedEffects = unresolvedEffects
         self.poisonedLedgerEpochs = poisonedLedgerEpochs
-        self.reconciliationComplete = reconciliationComplete
     }
 
     public var hasLiveUnresolvedEffects: Bool {

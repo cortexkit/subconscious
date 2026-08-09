@@ -128,7 +128,6 @@ public actor FedAtomicFileStateStore: FedStateStore {
             stored.disposition = .unknown
             stored.terminalBody = nil
             destination.unresolvedEffects.append(stored)
-            destination.reconciliationComplete = false
             doc.destinations[key] = destination
             return 0
         }
@@ -215,23 +214,8 @@ public actor FedAtomicFileStateStore: FedStateStore {
                 destination.observedPeerIncarnation = peerIncarnation
                 destination.observedPeerLedgerEpoch = peerLedgerEpoch
                 if destination.hasLiveUnresolvedEffects {
-                    destination.reconciliationComplete = false
                 }
             }
-            doc.destinations[key] = destination
-            return 0
-        }
-    }
-
-    public func setReconciliationComplete(
-        responderStaticPublicKey: Data,
-        complete: Bool
-    ) async throws {
-        _ = try mutate { doc -> UInt64 in
-            let key = FedStateDocument.destinationKey(forResponderPublicKey: responderStaticPublicKey)
-            var destination = doc.destinations[key]
-                ?? FedDestinationState(responderStaticPublicKey: responderStaticPublicKey)
-            destination.reconciliationComplete = complete
             doc.destinations[key] = destination
             return 0
         }

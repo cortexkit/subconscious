@@ -79,6 +79,15 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(state.servedSeq, 412)
         XCTAssertEqual(state.lanes, ["chat", "asks", "status", "artifacts", "work"])
         XCTAssertEqual(state.blocks.count, 6)
+        // The count alone became vacuous the moment element decoding went
+        // fail-soft: six blocks that each lost every typed field would still be
+        // six blocks. CKIOS hit this in their own suite -- a count assertion
+        // written against fail-loud semantics keeps passing after the semantics
+        // change, and nothing flags it.
+        XCTAssertEqual(
+            state.degradedBlockCount, 0,
+            "every known-kind block in the fixture must decode to its typed arm"
+        )
         XCTAssertEqual(state.health?.props.teeCounters?.wellFormed, 41)
         XCTAssertEqual(state.health?.props.teeCounters?.malformed, 1)
         XCTAssertEqual(state.health?.props.rung2Counters?.proseQuestionsAtTurnEnd, 0)

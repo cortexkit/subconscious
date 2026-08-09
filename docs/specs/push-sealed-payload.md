@@ -193,7 +193,13 @@ strings on one registry row, so the substitution is one field lookup away — th
 specification names the field to make that substitution visible rather than
 default.
 
-- Registry field: `hpke_pubkey_hex`.
+- Registry field and enrollment-challenge field: **`push_seal_pubkey_hex`**.
+  Named for its ROLE rather than its mechanism, and the reason is this document's
+  own subject: `x25519_pubkey_hex` sits on the same row and names a CURVE, which
+  is what let "supplies the device public key" resolve to the transport key
+  earlier in this design. A second curve-named field one row over would have
+  repeated exactly that. An earlier draft of this line said `hpke_pubkey_hex`,
+  which names the mechanism and was the same mistake one field further on.
 - The private half lives on the device, written with an **explicit** keychain
   access group shared by the app and its notification extension.
 - Keychain service string: `io.cortexkit.alfonso.push-seal`. **Stated as a
@@ -494,3 +500,29 @@ its proofs already cover — carried on the challenge, where the proofs reach it
 not on the completion, where it would be stored and vouched for by nothing.
 
 Named so a reader does not infer silence means "unconstrained".
+
+**THE FIELD SET HAS THREE INDEPENDENT PRODUCERS, AND THE THIRD IS THE ONE THAT
+GETS MISSED.** The enrollment proof context is built separately by the rendezvous
+server's verifier, by the Swift client, and by the Rust client the Mac daemon
+uses to enroll itself. Two of those are obvious from the phone-facing design; the
+third only appears if someone enumerates producers rather than counting sides.
+Adding a field to two of the three produces a context mismatch and refuses EVERY
+enrollment from the missing one.
+
+**A fourth is structurally impossible and it is worth recording why**, so nobody
+re-derives it: `SubcFed` owns the proof CONSTRUCTION (`FedDualPoP`) and takes the
+context as a caller-supplied `[String: String]`. It canonicalizes and signs
+whatever it is handed, enumerating no fields, so it cannot hold an opinion about
+the field set to disagree with.
+
+Both canonicalizers sort object keys byte-lexicographically and serialize the KEY
+NAMES into the hashed bytes, verified at source on each side. Two consequences,
+both load-bearing: the new field has no POSITION to negotiate, and a name
+mismatch changes the hash on both sides, so it **fails at the first enrollment
+rather than silently leaving the key unbound**.
+
+**The safe landing order follows from the server building its context from the
+STORED challenge record rather than from the completion request:** a field the
+server does not yet store is simply absent from its context. So accept-and-store
+can land first with no window; the BINDING is the lockstep moment, and it must be
+simultaneous across all three producers.

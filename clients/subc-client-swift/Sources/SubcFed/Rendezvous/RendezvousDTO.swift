@@ -151,7 +151,7 @@ public struct RdvRegistryRow: Sendable, Equatable {
     /// registry snapshot, not just that device. So a column added server-side
     /// before this shipped would stop every current client seeing ANY peer, on the
     /// peer-discovery path, presenting as a transport fault.
-    public let hpkePubkeyHex: String?
+    public let pushSealPubkeyHex: String?
 
     public init(
         x25519PubkeyHex: String,
@@ -164,7 +164,7 @@ public struct RdvRegistryRow: Sendable, Equatable {
         reenrolledAfterTombstone: Bool,
         enrollmentID: String? = nil,
         supersessionGeneration: String? = nil,
-        hpkePubkeyHex: String? = nil
+        pushSealPubkeyHex: String? = nil
     ) {
         self.x25519PubkeyHex = x25519PubkeyHex
         self.ed25519PubkeyHex = ed25519PubkeyHex
@@ -176,7 +176,7 @@ public struct RdvRegistryRow: Sendable, Equatable {
         self.reenrolledAfterTombstone = reenrolledAfterTombstone
         self.enrollmentID = enrollmentID
         self.supersessionGeneration = supersessionGeneration
-        self.hpkePubkeyHex = hpkePubkeyHex
+        self.pushSealPubkeyHex = pushSealPubkeyHex
     }
 
     static func decode(_ object: RdvJSONObject) throws -> RdvRegistryRow {
@@ -202,7 +202,7 @@ public struct RdvRegistryRow: Sendable, Equatable {
             // before these fields existed still decodes.
             enrollmentID: try decoder.optionalString("enrollment_id"),
             supersessionGeneration: try decoder.optionalDecimalString("supersession_generation"),
-            hpkePubkeyHex: try decoder.optionalString("hpke_pubkey_hex")
+            pushSealPubkeyHex: try decoder.optionalString("push_seal_pubkey_hex")
         )
         try decoder.finish()
         return row

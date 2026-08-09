@@ -2442,25 +2442,74 @@ async fn mcp_facade_default_deny_requires_global_enable() {
     project_harness.shutdown().await;
 }
 
+// THESE FOUR TESTS ASSERTED THE BEHAVIOUR 27289612 DELIBERATELY REMOVED.
+//
+// They were written when ONE malformed name aborted the whole surface: an
+// invalid namespace, an MCP-illegal tool name, or a collision made
+// `desired_session_from_catalog` return Err, the module rejected the attach, and
+// the shim exited. That is what `expect_shim_attach_failure` asserts.
+//
+// It shipped a fleet outage. `plexus` published dotted tool names, and every
+// Claude Code session on the machine came up with ZERO subc tools -- no ctx_*,
+// no aft -- because one provider's illegal name erased every other provider's.
+// The fix made each offending ENTRY skip with a warning while the rest of the
+// surface is served.
+//
+// So the tests now assert the OPPOSITE of the contract, and they are rewritten
+// rather than deleted: the interesting property did not disappear, it INVERTED.
+// "one bad name is refused" became "one bad name is refused AND its neighbours
+// survive", which is a strictly stronger thing to hold, and deleting them would
+// have left the outage's own regression test missing.
+//
+// Each keeps a NEIGHBOUR in the fixture and asserts both halves -- the illegal
+// entry absent, the legal one present. Asserting only the absence would pass on
+// a build that skipped everything, which is the outage.
 #[tokio::test]
-async fn mcp_meta_tool_name_collision_fails_attach_closed() {
+async fn mcp_meta_tool_name_collision_skips_the_entry_and_keeps_the_rest() {
     let user_config = r#"
     {
       "version": 1,
       "providers": { "aft": { "namespace": "tools" } }
     }
     "#;
-    expect_shim_attach_failure(
+    let harness = McpHarness::start_configured(
         "mcp-meta-reserved-collision",
-        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "search")])],
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "search,read")],
+        )],
         Some(user_config),
         None,
     )
     .await;
+
+    let names: Vec<String> = harness
+        .client
+        .peer()
+        .list_tools(None)
+        .await
+        .unwrap()
+        .tools
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+
+    // `tools_search` is a reserved meta-tool name, so the namespaced `search`
+    // collides and must be dropped -- but `read` from the same provider survives.
+    assert!(
+        !names.contains(&"tools_search".to_string()),
+        "the reserved-name collision must be skipped, got {names:?}"
+    );
+    assert!(
+        names.contains(&"tools_read".to_string()),
+        "the sibling tool must still be served, got {names:?}"
+    );
+
+    harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn mcp_invalid_namespace_fails_attach_closed() {
+async fn mcp_invalid_namespace_skips_the_provider_and_keeps_the_rest() {
     let user_config = r#"
     {
       "version": 1,
@@ -2469,28 +2518,95 @@ async fn mcp_invalid_namespace_fails_attach_closed() {
       }
     }
     "#;
-    expect_shim_attach_failure(
+    let harness = McpHarness::start_configured(
         "mcp-invalid-namespace",
-        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
+        vec![
+            StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")]),
+            StubProvider::new("mc", &[("FAKE_AFT_TOOLS", "recall")]),
+        ],
         Some(user_config),
         None,
     )
     .await;
+
+    let names: Vec<String> = harness
+        .client
+        .peer()
+        .list_tools(None)
+        .await
+        .unwrap()
+        .tools
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+
+    // An unusable namespace drops that PROVIDER; the other provider is untouched.
+    // This is the exact shape of the outage: one bad config entry must not cost
+    // the surface every other module's tools.
+    assert!(
+        !names.iter().any(|n| n.contains("read")),
+        "the provider with an invalid namespace must be skipped, got {names:?}"
+    );
+    assert!(
+        names.contains(&"mc_recall".to_string()),
+        "the healthy provider must still be served, got {names:?}"
+    );
+
+    harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn mcp_invalid_tool_name_fails_attach_closed() {
-    expect_shim_attach_failure(
+async fn mcp_invalid_tool_name_skips_the_tool_and_keeps_the_rest() {
+    let harness = McpHarness::start_configured(
         "mcp-invalid-tool-name",
-        vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "bad tool")])],
+        vec![StubProvider::new(
+            "aft",
+            &[("FAKE_AFT_TOOLS", "bad tool,read")],
+        )],
         None,
         None,
     )
     .await;
+
+    let names: Vec<String> = harness
+        .client
+        .peer()
+        .list_tools(None)
+        .await
+        .unwrap()
+        .tools
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+
+    // The illegal name must be SKIPPED, never sanitised into the surface: a
+    // renamed tool would be addressable under a name the module does not answer.
+    assert!(
+        !names.iter().any(|n| n.contains("bad")),
+        "the illegal tool must be skipped, not renamed, got {names:?}"
+    );
+    assert!(
+        names.contains(&"aft_read".to_string()),
+        "the legal sibling tool must still be served, got {names:?}"
+    );
+
+    harness.shutdown().await;
 }
 
+/// Two providers claiming one exposed name: the FIRST claimant is kept.
+///
+/// Rewritten alongside the other three (see the note above
+/// `mcp_meta_tool_name_collision_skips_the_entry_and_keeps_the_rest`) -- this
+/// one carries an extra property the others do not. A collision has two
+/// survivable resolutions, keep-first and keep-neither, and only keep-first is
+/// correct: dropping both would let a newly-installed module silently delete a
+/// tool the user already depends on.
+///
+/// So the assertion is that exactly ONE `dup_read` is served, not merely that
+/// the surface is non-empty. A count of two would mean duplicate names on the
+/// wire, which is what the collision check exists to prevent.
 #[tokio::test]
-async fn mcp_namespace_collision_fails_attach_closed() {
+async fn mcp_namespace_collision_keeps_the_first_claimant() {
     let user_config = r#"
     {
       "version": 1,
@@ -2500,7 +2616,7 @@ async fn mcp_namespace_collision_fails_attach_closed() {
       }
     }
     "#;
-    expect_shim_attach_failure(
+    let harness = McpHarness::start_configured(
         "mcp-collision",
         vec![
             StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")]),
@@ -2510,6 +2626,25 @@ async fn mcp_namespace_collision_fails_attach_closed() {
         None,
     )
     .await;
+
+    let names: Vec<String> = harness
+        .client
+        .peer()
+        .list_tools(None)
+        .await
+        .unwrap()
+        .tools
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+
+    assert_eq!(
+        names.iter().filter(|n| n.as_str() == "dup_read").count(),
+        1,
+        "exactly one claimant must survive a name collision, got {names:?}"
+    );
+
+    harness.shutdown().await;
 }
 
 #[tokio::test]

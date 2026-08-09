@@ -1047,11 +1047,32 @@ export class SubcClient {
     const pending = this.pending.get(key);
     if (pending) {
       if (pending.acceptFrame && !pending.acceptFrame(frame)) return;
-      switch (frame.header.ty) {
-        case FrameType.Push:
-        case FrameType.StreamData:
-          pending.onProgress?.(frame.body);
-          return;
+        switch (frame.header.ty) {
+          case FrameType.Push:
+          case FrameType.StreamData:
+            // A THROW FROM CALLER CODE MUST NOT REACH THE READ LOOP.
+            //
+            // `onProgress` (and `onEvent`, which is the same slot) is supplied by
+            // the caller and runs INSIDE readLoop's frame dispatch. An escaping
+            // throw unwinds into readLoop's catch, which treats it as a socket
+            // failure: it calls fail(), rejecting EVERY in-flight request on this
+            // connection -- other routes included -- with the caller's own error as
+            // the reported cause, and stops reading. One consumer's bad event
+            // handler therefore drops the whole connection, and the surfaced error
+            // names the handler rather than the transport, so the failure reads as
+            // a subc fault.
+            //
+            // Swallowing is deliberate and is NOT hiding a fault from the caller:
+            // the throw happened in their own callback, on their own stack, where
+            // they are the party able to catch it. What the client owes them is
+            // that the stream and every sibling route keep working.
+            try {
+              pending.onProgress?.(frame.body);
+            } catch {
+              // Swallow the caller's own handler error so one bad callback cannot
+              // abort the read loop or fail unrelated requests. See above.
+            }
+            return;
         case FrameType.Response:
         case FrameType.StreamEnd:
           this.settle(key, pending, () => pending.resolve(frame));

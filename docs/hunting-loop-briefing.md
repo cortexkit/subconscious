@@ -654,6 +654,8 @@ Before calling a class closed:
 | 554 | A negative result from a fixture nobody proved could produce the positive | FALLBACK, not the first move — see 554a. Mutation cannot see this: break the mechanism and the fixture still reports the same nothing, which reads as the test working. Ask whether this input can exhibit the behaviour AT ALL before believing it does not |
 | 554a | A null argued from a probe where a structural claim was available | Prefer "no shipped path can construct this" over "zero occurrences in the corpus" — a structural null never asked a fixture anything and so cannot be defeated by fixture incapacity, while a census is wrong the moment someone writes a file nobody scanned |
 | 555 | A swept parameter whose outcome does not move | Cutting at 99.9% and 33% giving the identical answer means the sweep is not reaching the mechanism you think it is. Usable by a reader who knows nothing about the format, which is why it beats explaining the collapse |
+| 555a | A passing control on a result that discriminates between two hypotheses | The instrument control proves the probe can SEE and cannot catch a fixture incapable of the DIFFERENCE — it fires on its planted positive, passes, and licenses the false reading. Ask separately whether any input here could have produced the other answer |
+| 555b | A conclusion derived from a label you invented | A control proves an instrument can produce a signal, not that the signal has ONE cause — `UNREADABLE` meant both "file absent" and "my pattern assumed no space after the colon". Read the value, not your own label for it |
 | 556 | A zero you are about to report on someone else's behalf | A favour is framed as a lookup and lookups do not get controls, so the skip is never a decision. Plant one positive, confirm the detector fires — the trigger is not "am I testing something" but "am I about to report a number someone will act on" |
 
 Row 17 is the shape of every entry here worth trusting: **a rule recorded without
@@ -772,6 +774,34 @@ or the normaliser did nothing; so does a grep whose pattern is wrong, a query
 whose column moved, a scan pointed at the wrong tree. Plant one positive and
 confirm the detector fires. One line, and the zero becomes a measurement — the
 same zero, now meaning something.
+
+### There are two controls and fusing them is how the false conclusion gets licensed
+
+They answer different questions and neither substitutes:
+
+- An **instrument control** proves the probe *can see* — plant a known positive,
+  confirm the detector fires.
+- A **treatment control** proves the fixture *can differ* — before believing a
+  result that discriminates between two hypotheses, ask whether **any** input in
+  this fixture could have produced the other answer.
+
+The trap is that the instrument control **cannot catch a fixture incapable of
+the difference**. It sees its planted positive, passes, and that success is
+precisely what licenses the wrong reading. On the one-huge-frame log above, no
+cut could ever have yielded a nonzero partial count: the fixture was
+*disqualified from answering*, and one command would have shown it.
+
+A third specimen from the same night, and it is the cheapest to reproduce. A
+script compared each module's declared identifier against its directory name and
+reported a mismatch. Its control was honest — pointed at a nonexistent file, the
+extractor did return `UNREADABLE`, so it demonstrably could fail. But
+`UNREADABLE` also meant *my pattern assumed no space after the colon*, and one
+file was pretty-printed. **The control passing is what made it dangerous.**
+
+So: **a control proves an instrument can produce a signal; it does not prove the
+signal has one cause.** When a label you invented stands between the measurement
+and the conclusion, stop deriving the conclusion from the label and read the
+value.
 
 ## The targeting principle
 

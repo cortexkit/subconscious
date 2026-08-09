@@ -71,6 +71,20 @@ const FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH_ENV: &str = "FAKE_AFT_HEALTH_NEVER_
 const FAKE_AFT_HEALTH_STATUS_ENV: &str = "FAKE_AFT_HEALTH_STATUS";
 const FAKE_AFT_HEALTH_DETAIL_ENV: &str = "FAKE_AFT_HEALTH_DETAIL";
 const FAKE_AFT_HEALTH_METRICS_ENV: &str = "FAKE_AFT_HEALTH_METRICS";
+/// Id used when `FAKE_AFT_MODULE_ID` is absent.
+///
+/// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
+/// DIFFERS FROM THIS ONE, or the assertion is vacuous: a stub that never
+/// received its id falls back to exactly the string being asserted, so
+/// "registered under the configured id" and "registered under the default"
+/// become the same observation. Every id in the suite today differs from
+/// `fake-aft`, which makes those assertions real -- but that holds because of
+/// how they happen to be NAMED, not because any test states it, so it can be
+/// lost by a future test that picks this string.
+///
+/// Reported by CKE2E, who hit the live form in their own catalog registration
+/// tests: where a module's compiled default equals its configured id, the
+/// assertion passes whether or not the environment ever reached the process.
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;

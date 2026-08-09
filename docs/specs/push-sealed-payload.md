@@ -73,9 +73,29 @@ a defensible one.
 
 `info` is empty deliberately rather than by omission. It binds into the key
 schedule, so an unstated value is not "no value" — it is two implementations
-guessing. It is also the domain-separation hook that becomes load-bearing if
-authorship is ever closed by reusing a key for a second purpose; empty is correct
-while this is the only purpose.
+guessing.
+
+**It is empty BECAUSE the recipient key is dedicated to this purpose, and it
+stops being safely empty the moment that stops being true.** `info` is the key
+schedule's domain separator: it earns its keep when one recipient key serves more
+than one application, by stopping a context derived for one purpose being usable
+for another. Ours serves exactly one, so there is nothing to separate.
+
+So the two decisions are coupled, and they are stated in different sections:
+
+| recipient key | `info` |
+| --- | --- |
+| dedicated to this purpose | empty is safe |
+| shared with another protocol | empty is a real weakness |
+
+The live case is not hypothetical. Closing authorship later by reusing the
+device's pinned Noise static under an authenticated mode would be cross-protocol
+key reuse, and **a fixed non-empty domain string is the mitigation** — so anyone
+making that change must change this value in the same breath.
+
+Written as a condition rather than a conclusion because the reader who reuses the
+key is exactly the reader who cannot see why it mattered: without the condition,
+`info: empty` reads as a free choice and there is no reason to revisit it.
 
 **The version byte is the associated data, so it is authenticated.** Cleartext
 and unbound, flipping it would not be detected by the tag — it would silently

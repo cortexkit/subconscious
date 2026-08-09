@@ -170,13 +170,24 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
                     vector["plaintext_utf8"],
                     "\(name): a valid vector must state its expected plaintext"
                 )
-                // Present so sealing is checkable as DETERMINISTIC rather than
-                // merely reversible. Nothing needs it to decrypt, which is why
-                // the spec marks it MUST NOT remove.
+                // The seed REGENERATES the corpus; the ephemeral key is the
+                // recorded CONSEQUENCE of that seed. Neither side's HPKE API
+                // accepts a caller-supplied ephemeral -- verified at source in
+                // CryptoKit and hpke 0.14 -- so a seeded RNG is the only
+                // mechanism that makes regeneration reproducible.
+                XCTAssertNotNil(
+                    vector["rng_seed_hex"],
+                    "\(name): missing rng seed -- without it the corpus cannot be "
+                        + "regenerated and a hand-edited vector is undetectable"
+                )
+                // Kept for a narrower reason than it looks: if an hpke upgrade
+                // changes ephemeral derivation, every enc moves, and this field
+                // makes that a diff on a named value rather than unexplained
+                // churn in opaque bytes.
                 XCTAssertNotNil(
                     vector["ephemeral_private_key_hex"],
-                    "\(name): missing ephemeral key -- without it the only "
-                        + "checkable property is that each side opens its own output"
+                    "\(name): missing ephemeral key -- the corpus loses its "
+                        + "cross-check on the library's derivation"
                 )
             }
         }

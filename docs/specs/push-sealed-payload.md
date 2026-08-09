@@ -239,38 +239,53 @@ forged blob therefore produces a notification that opens to nothing.
 
 Vectors are the contract. Prose is commentary.
 
-Each vector carries the recipient private key, the ephemeral private key, the
-plaintext, and the expected sealed bytes.
+Each vector carries the recipient private key, the **generator RNG seed**, the
+recorded ephemeral private key, the plaintext, and the expected sealed bytes.
 
 **The property is that THE OPENER OPENS THE GENERATOR'S BYTES to the expected
 plaintext.** It is deliberately not "both sides produce identical bytes from
-identical inputs": CryptoKit's `HPKE.Sender` accepts no caller-supplied
-ephemeral key on any initializer, so the Swift side CANNOT be made to reproduce a
-given `enc` — not "does not in production", but has no API to. A spec asserting
-byte-identity would be asserting something one implementation structurally cannot
-execute.
+identical inputs", and the reason is a property of HPKE rather than of either
+platform: **base mode has no caller-supplied ephemeral parameter on either side.**
+Verified at source on both:
+
+| side | sending entry points | ephemeral seam |
+| --- | --- | --- |
+| Swift `CryptoKit` | `HPKE.Sender.init(...)` | none on any initializer |
+| Rust `hpke 0.14` | `setup_sender[_with_rng]`, `single_shot_seal[_with_rng]` | `_with_rng` takes a `CryptoRng`, a RANDOM SOURCE, not a key |
+
+The `kat` feature does not provide an escape hatch, which is worth recording
+because it is the obvious next place to look: `encap_with_eph` is `pub(crate)`
+and `TestableKem` lives in a private `mod kat_tests` gated on `cfg(test)`, so it
+compiles only when building `hpke`'s OWN test suite. **A downstream crate cannot
+reach it even with the feature enabled.**
+
+So the mechanism for a reproducible corpus is a SEEDED DETERMINISTIC RNG: the
+generator seeds, the library derives the ephemeral from that seed, and the
+resulting private key is recorded.
 
 This loses less than it appears to, because every disagreement that matters still
-fails: a wrong suite, a wrong `info`, a wrong AAD, a wrong recipient key, or a
-wrong envelope split all make the open FAIL rather than differ. What it stops
-proving is that a hypothetical second SEALER agrees, and there is no second
+fails: a wrong suite, a wrong KDF, a wrong `info`, a wrong AAD, a wrong recipient
+key, or a wrong envelope split all make the open FAIL rather than differ. What it
+stops proving is that a hypothetical second SEALER agrees, and there is no second
 sealer.
 
-The asymmetry is in the API rather than in our design, and it generalises:
-`HPKE.Recipient` takes every input as a parameter, so opening is fully
-specifiable from fixed inputs while sealing is not. **A Swift implementation can
-be a conformance CONSUMER and cannot be a conformance PRODUCER.**
+**The seed is INPUT and the ephemeral private key is RECORDED OUTPUT.** They are
+different kinds of field and only the first regenerates the corpus.
 
-**The ephemeral private key is in the corpus deliberately and MUST NOT be removed
-as redundant.** Nothing needs it to *decrypt*, so a later reader regenerating the
-corpus will see an unused field. It is what makes the GENERATOR'S OWN
-REGENERATION byte-identical — which is the check that stops a hand-edited corpus
-surviving. It is not what makes the cross-language check possible.
+**Both MUST be kept, and the ephemeral key's reason is not the one a reader will
+guess.** Nothing needs it to *decrypt*, so a later reader will see an unused
+field. It is a CROSS-CHECK ON THE LIBRARY'S DERIVATION: if an `hpke` upgrade
+changes how an ephemeral is derived from a seed, every `enc` in the corpus
+changes, and a recorded ephemeral makes that a visible diff on a named field
+rather than an unexplained churn in opaque bytes.
 
-That distinction is worth the words: a MUST-NOT-REMOVE justified by something a
-reader can falsify is weaker than one with a narrower true reason, because the
-reader who disproves the stated justification is licensed to conclude the field
-is vestigial — which is the exact removal the annotation exists to prevent.
+That is a stronger property than the one this document claimed for it before, and
+the correction is itself the point: the field was previously justified as "what
+makes regeneration byte-identical", which is the SEED's job. A MUST-NOT-REMOVE
+justified by something a reader can falsify is weaker than one with a narrower
+true reason, because the reader who disproves the stated justification is
+licensed to conclude the field is vestigial — which is the exact removal the
+annotation exists to prevent. This one had a reason that named the wrong field.
 
 **The generator's own suite passing is NOT evidence of interoperability.** It
 compares an implementation to itself, so it can only fail if the generator

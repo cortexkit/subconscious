@@ -862,9 +862,24 @@ async fn wait_for_catalog_module(path: &Path, module_id: &str, wait: Duration) {
 /// WHAT THIS DOES NOT PROVE: that the daemon's `SUBC_MODULE_ID` injection
 /// reached the module. The stub reads its id from its OWN variable
 /// (`FAKE_AFT_MODULE_ID`), so these assertions establish that the stub honours
-/// its own config and are silent on daemon injection. THE INJECTION PROOF LIVES
-/// IN `crates/subc-core/src/control.rs` -- the spawn-attestation tests, where a
-/// mismatched consumer identity must be refused with no route bind.
+/// its own config and are silent on daemon injection.
+///
+/// NOR IS THAT PROVEN ELSEWHERE, and this comment first claimed it was. The
+/// spawn-attestation tests in `control.rs` assert the daemon REFUSES a bad
+/// consumer identity and STAMPS `Reserved` for a good one -- they seed the
+/// nonce directly via `set_spawn_nonce` and never spawn a process, so they
+/// prove the guard's logic and are equally silent on whether a spawned child
+/// receives the variable. The two suites fail in the same direction, which is
+/// why reading either one leaves the impression the other covers it.
+///
+/// What is actually established: the daemon SETS the variable at the spawn site
+/// (`supervise.rs`, `command.env(SUBC_MODULE_ID_ENV, ..)`), and the real client
+/// library CONSUMES it (`subc-client-rs::serve` overrides `manifest.module_id`).
+/// Both are single-line source facts; neither is under test end to end.
+/// Proving it needs a supervised module spawned WITHOUT the variable, asserted
+/// to register under its compiled fallback -- a configuration production never
+/// uses, which is why it does not exist yet. Recorded as a gap rather than left
+/// to be inferred as coverage.
 ///
 /// The pointer is here because this is where a reader forms the wrong
 /// conclusion: someone auditing "is id delivery tested" finds module-id

@@ -257,17 +257,23 @@ final class FedAdmissionAndEffectLogTests: XCTestCase {
         )
         XCTAssertNil(internalAfter.disposition)
 
-            // Both spellings of session-ended classify identically.
+            // Session teardown and runtime teardown classify identically.
+            //
+            // These are two DISTINCT conditions -- fed_session_closed is this
+            // peer session ending mid-call, fed_shutdown is the serving runtime
+            // going away -- and both are permanent, not a migration pair. They
+            // agree here because neither is an outcome: an interrupted call is
+            // equally un-settled either way. They differ only in what they tell
+            // a human reading a log.
             //
             // THIS PINS THE OUTCOME, NOT THE SET MEMBERSHIP, and the difference
             // is measured rather than assumed: deleting "fed_session_closed"
             // from nonSettlingCodes leaves all 308 tests green, because the
             // fed_-prefix fallback in classify already returns the same
             // disposition for any unrecognised control code. So this seam is
-            // defended by the fallback, and the set entry is documentation of
-            // intent.
+            // defended by the fallback, and the set entry states intent.
             //
-            // That is worth keeping anyway. The fallback is a general default
+            // Worth keeping regardless: the fallback is a general default
             // someone may reasonably narrow later; the day it stops covering
             // unknown codes, every seam relying on it breaks silently and this
             // assertion breaks loudly instead.

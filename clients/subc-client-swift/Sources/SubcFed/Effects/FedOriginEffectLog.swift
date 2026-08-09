@@ -65,22 +65,31 @@ public actor FedOriginEffectLog {
     /// cancelled, session-ended, dispatch_ambiguous. Any other fed_ control code
     /// is unknown and classifies as non-settling, never recorded.
     ///
-    /// `fed_session_closed` and `fed_shutdown` are the SAME condition under two
-    /// names, held together for one deploy generation. The serving side is
-    /// renaming it because "shutdown" reads as the daemon restarting when it
-    /// means only that this peer session ended mid-call -- a distinction an
-    /// operator gets wrong precisely during an incident, when it is most
-    /// expensive. Accepting both lets every fielded client learn the new name
-    /// before any producer emits it; the old spelling comes out once no client
-    /// in the field can still receive it.
+    /// `fed_session_closed` and `fed_shutdown` are TWO DISTINCT CONDITIONS that
+    /// until now shared one spelling, and BOTH ARE PERMANENT:
     ///
-    /// Listing it here is NOT what makes it safe. An unrecognised `fed_`-
+    ///   fed_session_closed  this peer session ended while the call was in
+    ///                       flight (per-session forwarder teardown; ordinary
+    ///                       transport turnover, the serving process is fine)
+    ///   fed_shutdown        the serving runtime itself is going away
+    ///
+    /// The split exists because "shutdown" was being emitted for the first case,
+    /// where it reads as the daemon restarting under load -- a wrong turn an
+    /// operator takes precisely during an incident, when it costs most.
+    ///
+    /// Both classify identically HERE, since neither is an outcome: a call
+    /// interrupted by session teardown and one interrupted by runtime teardown
+    /// are equally un-settled. They differ in what they tell a human reading a
+    /// log, which is the entire point of separating them.
+    ///
+    /// Listing them here is NOT what makes this safe. An unrecognised `fed_`-
     /// prefixed code already falls through to the same disposition (see the
-    /// prefix branch in `classify`), so this seam would survive the rename even
-    /// if nobody touched this set -- it is defended by the fallback rather than
-    /// by the name. That is worth stating because it is easy to mistake for a
-    /// guarantee: the day someone narrows the unknown-code default, every seam
-    /// relying on that accident breaks silently and this one does not.
+    /// prefix branch in `classify`), so this seam would have survived the rename
+    /// even if nobody touched this set -- it is defended by the fallback rather
+    /// than by the name, measured rather than assumed. That is worth stating
+    /// because it is easy to mistake for a guarantee: the day someone narrows
+    /// the unknown-code default, every seam relying on that accident breaks
+    /// silently and this one does not.
     public static let nonSettlingCodes: Set<String> = [
         "fed_deadline",
         "fed_cancelled",

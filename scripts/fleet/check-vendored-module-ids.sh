@@ -321,6 +321,23 @@ if [ "$parsed" -ne "$rows" ]; then
   fail=1
 fi
 
+# ZERO ROWS IS A BROKEN CHECK, NOT A CLEAN ONE.
+#
+# The comparison above agrees at 0 == 0, so anything that stops the row pattern
+# matching -- a renamed file, a reformatted table, an edit to the pattern --
+# printed "0 of 0 recorded digests match" and exited 0. Proven by mutation
+# rather than reasoned: breaking only the row pattern left the whole script
+# green, with the mirror half still reporting its 4 files, so the summary read
+# as a full pass while the digest half examined nothing.
+#
+# Every guard here was written against a WRONG value; none covered NO value.
+if [ "$rows" -lt 1 ]; then
+  echo "MANIFEST FAIL: no digest rows found in docs/team-mode/VENDORED.md"
+  echo "  the table is missing, renamed, or its row format changed --"
+  echo "  a zero here means this check did not run, not that it passed"
+  fail=1
+fi
+
 if [ $fail -ne 0 ]; then
   exit 1
 fi

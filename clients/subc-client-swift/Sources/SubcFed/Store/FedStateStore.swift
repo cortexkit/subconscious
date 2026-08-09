@@ -44,12 +44,6 @@ public protocol FedStateStore: Sendable {
         peerLedgerEpoch: String
     ) async throws
 
-    /// Marks reconciliation complete or incomplete for a destination.
-    func setReconciliationComplete(
-        responderStaticPublicKey: Data,
-        complete: Bool
-    ) async throws
-
     /// Poisons a serving ledger epoch after proven regression.
     func poisonLedgerEpoch(
         responderStaticPublicKey: Data,
@@ -77,7 +71,6 @@ public actor FedFaultInjectingStateStore: FedStateStore {
         case commitTerminal
         case commitWatermark
         case observePeer
-        case setReconciliation
         case poison
         case snapshot
     }
@@ -168,17 +161,6 @@ public actor FedFaultInjectingStateStore: FedStateStore {
             responderStaticPublicKey: responderStaticPublicKey,
             peerIncarnation: peerIncarnation,
             peerLedgerEpoch: peerLedgerEpoch
-        )
-    }
-
-    public func setReconciliationComplete(
-        responderStaticPublicKey: Data,
-        complete: Bool
-    ) async throws {
-        try check(.setReconciliation)
-        try await inner.setReconciliationComplete(
-            responderStaticPublicKey: responderStaticPublicKey,
-            complete: complete
         )
     }
 

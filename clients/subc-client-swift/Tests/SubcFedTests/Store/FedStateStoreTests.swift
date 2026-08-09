@@ -7,6 +7,55 @@ final class FedStateStoreTests: XCTestCase {
     private let responderA = Data(repeating: 0xAA, count: 32)
     private let responderB = Data(repeating: 0xBB, count: 32)
 
+    /// A file written before a field was removed must still load.
+    ///
+    /// A device persists this store across app updates and can sit on a stale
+    /// file for weeks, so removing a key from the model has to stay readable in
+    /// the old direction. `reconciliationComplete` was removed as a dead
+    /// write-only-false flag; JSONDecoder ignores unknown keys, and this pins
+    /// that rather than leaving it as an assumption about Foundation.
+    ///
+    /// Builds the legacy file by encoding a real document and INJECTING the
+    /// removed key, rather than hand-writing one: a hand-written fixture
+    /// encodes what I believe the format was, and my first attempt at one was
+    /// missing a required field entirely -- it failed for that reason and
+    /// proved nothing about the removed key. Injection guarantees the fixture
+    /// differs from a current file in exactly the one dimension under test.
+    func testFedStateDocumentDecodesFilesWrittenBeforeAFieldWasRemoved() throws {
+        let responder = Data(repeating: 0xAA, count: 32)
+        let key = FedStateDocument.destinationKey(forResponderPublicKey: responder)
+        let current = FedStateDocument(
+            localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localKey),
+            global: FedGlobalReservationState(
+                localIncarnation: "inc",
+                localLedgerEpoch: "epoch"
+            ),
+            destinations: [key: FedDestinationState(responderStaticPublicKey: responder)]
+        )
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(current))
+                as? [String: Any]
+        )
+        var destinations = try XCTUnwrap(json["destinations"] as? [String: Any])
+        var destination = try XCTUnwrap(destinations[key] as? [String: Any])
+        destination["reconciliationComplete"] = false
+        destinations[key] = destination
+        json["destinations"] = destinations
+
+        let legacy = try JSONSerialization.data(withJSONObject: json)
+        // Control: the injected key really is present, so a pass cannot come
+        // from decoding a file identical to one today's encoder would write.
+        XCTAssertTrue(
+            String(decoding: legacy, as: UTF8.self).contains("reconciliationComplete"),
+            "fixture does not carry the removed key, so it tests nothing"
+        )
+
+        let decoded = try JSONDecoder().decode(FedStateDocument.self, from: legacy)
+        let restored = try XCTUnwrap(decoded.destinations[key])
+        XCTAssertEqual(restored.responderStaticPublicKey, responder)
+        XCTAssertTrue(restored.unresolvedEffects.isEmpty)
+    }
+
     func testIncarnationAndLedgerEpochSurviveReopen() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }

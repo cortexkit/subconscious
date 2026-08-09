@@ -287,6 +287,25 @@ fi
   fi
 echo
 
+# ------------------------------------------------------------------------ CI
+# A failing default branch blocks everyone working in that repository, and NO
+# OTHER SECTION HERE CAN SEE IT. Module health inspects the running process and
+# the deploy section compares the deployed binary against git; neither reads
+# remote CI, so both stayed correctly green through 22 hours in which this
+# repository failed CI on every push and nothing reported it.
+#
+# Delegated to its own script because it is the only section that uses the
+# network: about 24 API calls, issued in parallel, roughly three seconds. It runs
+# on the cadence rather than on request because the failure it addresses was
+# nobody thinking to check.
+bold "CI"
+if [ -x "$(dirname "$0")/ci-redness.sh" ]; then
+  "$(dirname "$0")/ci-redness.sh" || true
+else
+  echo "  ci-redness.sh missing or not executable -- CI state UNCHECKED"
+fi
+echo
+
 # ------------------------------------------------------------------- daemon log
 # THE SHARED DAEMON LOG IS AN INCIDENT-RESPONSE SURFACE, AND ONE SUBSYSTEM CAN
 # MAKE IT UNREADABLE FOR EVERY OTHER.

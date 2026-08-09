@@ -54,19 +54,54 @@ mismatch, which lands in the `malformed` bucket and points the reader at the
 transport. Three independent ways into one bucket whose diagnosis points away
 from the cause.
 
+An HPKE ciphersuite is a TRIPLE, and it is specified here by RFC 9180 codepoint
+rather than by name:
+
+| parameter | codepoint | value |
+| --- | --- | --- |
+| KEM | `0x0020` | DHKEM(X25519, HKDF-SHA256) |
+| KDF | `0x0001` | HKDF-SHA256 |
+| AEAD | `0x0003` | ChaCha20Poly1305 |
+
 | parameter | value |
 | --- | --- |
-| ciphersuite | `Curve25519_SHA256_ChachaPoly` — X25519-HKDF-SHA256 / ChaCha20-Poly1305 |
 | `info` | empty (`Data()` / `&[]`) |
 | associated data | the 1-byte `version` prefix |
+
+`Curve25519_SHA256_ChachaPoly` is CryptoKit's SPELLING of that triple, not the
+specification. Two implementations agreeing on a name that exists in only one of
+their vocabularies have agreed about a string, not about bytes — and the sealer
+is the side that must reconstruct the value from parts, so it is the side the
+codepoints are for.
+
+**The KDF is the row that would otherwise have been missed, and it is
+load-bearing.** A two-part description — "X25519 + ChaCha20-Poly1305" — pins the
+KEM and the AEAD and leaves the KDF implied; `HKDF-SHA256` appears inside the
+KEM's own name, so it reads as already stated when it is a separate parameter
+with its own codepoint. Measured rather than assumed: sealing with HKDF-SHA256
+and opening with HKDF-SHA512, identical in every other parameter, FAILS TO OPEN,
+with the control (same KDF both sides) succeeding. So a KDF disagreement is a
+hard failure presenting as the same undiagnosable tag mismatch as every other
+cause in this document.
+
+Both libraries almost certainly default to SHA-256, so the two would have agreed
+by luck. **An agreement that holds because both sides guessed identically is
+indistinguishable from a specified one until a default moves** — which is the
+reason to write it down rather than a reason it would have broken.
 
 **This is a choice, not a constraint — and the earlier claim that the opener had
 no alternative was wrong.** CryptoKit ships exactly one X25519 suite as a *preset
 constant* (`Curve25519_SHA256_ChachaPoly`), but it also exposes
 `HPKE.Ciphersuite.init(kem:kdf:aead:)`, and its `AEAD` enum carries `AES_GCM_128`
 and `AES_GCM_256` alongside `chaChaPoly`. So X25519 with AES-GCM is constructible
-on the opener too, and "forced" was a claim about which constants are *named*
-rather than about what the API permits.
+on the opener too — confirmed by building that exact suite, for which CryptoKit
+ships no preset, and round-tripping it. "Forced" was a claim about which
+constants are *named* rather than about what the API permits.
+
+The two errors that produced this table are the same one: **a preset list read as
+a capability, and a suite name read as a complete parameter set.** Both surfaces
+look authoritative, and neither is the type. That is why the rows above are
+codepoints.
 
 The decision is unchanged and the honest reason is narrower: ChaCha20-Poly1305 is
 the combination available as a preset on one side and already present in the

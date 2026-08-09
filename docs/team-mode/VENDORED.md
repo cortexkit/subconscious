@@ -43,3 +43,39 @@ first place anyone looks is the contract rather than the copy.
 
 Re-minting changes every signature, so a re-vendor is a deliberate amendment at
 a named commit rather than a silent refresh.
+
+## Why the provenance lives here and not inside the corpora
+
+Embedding the producing commit *in* each corpus was proposed and withdrawn after
+being tested rather than argued: the producer verifies its corpora by
+regenerating them and requiring byte-identity, and a commit hash is not knowable
+until after the bytes are written, so an artifact carrying its own commit
+permanently disagrees with its own regeneration. Measured on a throwaway branch —
+verification came back stale both at the mint commit and after an unrelated one.
+
+The general form is worth keeping, because two seats hit it the same day from
+different directions: **no value derived from a commit can be embedded in that
+commit's own artifacts** — commit hash, tag, tree signature, build UUID alike.
+It is a fixed point rather than a tooling limitation, so no amount of care makes
+it work.
+
+Referencing the *parent* commit escapes the fixed point and is confusing forever
+after, since the recorded value never matches the commit a reader is standing on.
+Provenance recorded outside the artifact has no fixed point by construction,
+which is why this file can name a commit and a corpus cannot.
+
+## Checking authenticity against the producer
+
+The digests above answer "do these bytes match what we recorded", which is not
+the same as "are these the bytes the producer published". When the producer repo
+is present, compare directly at the recorded commit:
+
+    git -C <account-repo> show <commit>:<path> | shasum -a 256
+
+List the producer's paths with `git show --name-only --format=`. Do **not** use
+`--stat` for this: it truncates long paths with an ellipsis to fit a terminal,
+and a truncated path fed to another git command reports the file as absent from
+the repo — which reads as "this vendoring points at nothing" rather than as a
+formatting artifact. A display-oriented command's output parsed by a machine is
+its own defect class; prefer the machine-readable form even when the human form
+looks identical on the examples in front of you.

@@ -101,6 +101,24 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
             "corpus is missing required negative vectors: \(missing.sorted())"
         )
 
+        // AN UNEXPECTED NAME IS AS INFORMATIVE AS A MISSING ONE, and it is the
+        // half a decoder cannot report: unknown keys are tolerated, so a vector
+        // the generator added and this harness does not know about is silently
+        // never run -- no error, no failure, just quieter coverage.
+        //
+        // Whoever adds a vector here is meant to meet this failure and decide
+        // what the opener should do with it, rather than discover years later
+        // that it was never exercised.
+        let unexpected = present
+            .subtracting(required)
+            .filter { !$0.hasPrefix("valid_") }
+        XCTAssertTrue(
+            unexpected.isEmpty,
+            "corpus carries vectors this harness does not run: \(unexpected.sorted()). "
+                + "Add them to `required` with an assertion, or prefix valid_ if they "
+                + "are positive cases."
+        )
+
         // A negative-only corpus cannot distinguish a correct opener from one
         // that refuses everything -- so the positive controls are required in the
         // same breath as the negatives they guard.

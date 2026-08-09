@@ -82,4 +82,22 @@ done
 printf '\n  %s binary/binaries compared against their running process\n' "$checked"
 [ -f "$CONFIG" ] || printf '  note: %s absent, so nothing cross-checked the configured module set\n' "$CONFIG"
 
+# COMPARING NOTHING IS NOT A CLEAN DEPLOY.
+#
+# `fail` only ever rises from a per-binary mismatch, so a glob matching nothing
+# left it at 0 and this exited SUCCESS having examined no binaries. The count
+# line printed an honest "0", but the EXIT CODE is what any caller reads, and
+# this script's whole job is to be the thing consulted after a placement.
+#
+# Proven by mutation rather than reasoned: pointing the glob at a pattern that
+# matches nothing produced "0 binary/binaries compared" and exit 0. Reachable
+# in practice by a renamed deploy directory, a changed binary prefix, or running
+# on a host where the fleet lives elsewhere -- each of which reports a perfect
+# deploy verification.
+if [ "$checked" -lt 1 ]; then
+  printf '  REFUSING: no binaries matched %s/ck-*\n' "$BIN"
+  printf '  A zero here means this check did not run, not that every image is current.\n'
+  exit 1
+fi
+
 exit $fail

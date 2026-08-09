@@ -704,6 +704,20 @@ This is the already-enrolled defect above reached by a different road: same
 terminal state (an empty registry column, no error, no log line), different cause,
 and the reachability fix does not close it.
 
+**THE REGISTRY HOLDS A SECOND COPY OF EVERY DEVICE-HELD VALUE, AND THE ONLY MOMENT
+BOTH COPIES EXIST IN ONE PROCESS IS REGISTRATION.** The sealing key and the push
+token are each held by the device and stored by the server, and both diverge the
+same silent way: enrollment succeeded weeks ago, notifications never arrive for
+that device, and every component reports healthy.
+
+**So the comparison MUST happen at registration, not at send.** At send time there
+is nothing to compare against, because the device is not in the conversation --
+the server has only its own copy and no way to know it is wrong. This is worth
+stating because the natural build order gets it backwards: **registration feels
+like plumbing and sending feels like the feature**, so the check that can only be
+written at registration is the one written last, by which time the divergence has
+had weeks to happen.
+
 **Prefer a re-entry path that reuses the ceremony's EXISTING rotation affordance**
 (`rotation_sig_hex`, already sent on every enrollment and already specified for
 same-key live re-enrollment) over a bespoke add-a-key endpoint. The rotation path

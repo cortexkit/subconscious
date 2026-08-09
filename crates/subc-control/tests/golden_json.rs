@@ -318,6 +318,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.set_enabled".to_string(),
         "supervisor.health_probe".to_string(),
         "supervisor.health".to_string(),
+        "supervisor.stderr_tail".to_string(),
     ]
 }
 

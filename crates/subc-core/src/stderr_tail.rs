@@ -42,13 +42,6 @@ pub const DEFAULT_MAX_LINES: usize = 200;
 /// holding for fifteen modules.
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 
-/// Marker appended to a line cut at [`StderrTailConfig::max_line_bytes`].
-///
-/// Visible rather than silent: a reader must be able to tell a truncated line
-/// from a short one, or the truncation becomes a second way to read wrong text
-/// confidently.
-pub const TRUNCATION_MARKER: &str = "…[truncated]";
-
 /// Whether a module's stderr is being captured, and if not, why not.
 ///
 /// Typed rather than nullable so `NotCaptured` has to be handled rather than
@@ -187,6 +180,9 @@ impl StderrRing {
         if self.entries.is_empty() && self.dropped_lines == 0 {
             return;
         }
+        if matches!(self.entries.back(), Some(TailEntry::ProcessStart)) {
+            return;
+        }
         self.push_entry(TailEntry::ProcessStart);
     }
 
@@ -206,7 +202,12 @@ impl StderrRing {
     }
 
     fn evict_to_fit(&mut self) {
-        while self.entries.len() > self.config.max_lines
+        while self
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, TailEntry::Line { .. }))
+            .count()
+            > self.config.max_lines
             || (self.bytes > self.config.max_bytes && self.entries.len() > 1)
         {
             let Some(evicted) = self.entries.pop_front() else {
@@ -232,18 +233,26 @@ impl StderrRing {
 
         let mut taken: Vec<TailEntry> = Vec::new();
         let mut bytes = 0usize;
+        let mut lines = 0usize;
         // Walk backwards: a tail is anchored at the newest end, so a caller
         // asking for 20 lines wants the last 20, not the first 20.
         for entry in self.entries.iter().rev() {
-            if taken.len() >= line_limit {
-                break;
+            match entry {
+                TailEntry::Line { .. } => {
+                    if lines >= line_limit {
+                        break;
+                    }
+                    let cost = entry.cost();
+                    if lines > 0 && bytes + cost > byte_limit {
+                        break;
+                    }
+                    bytes += cost;
+                    lines += 1;
+                    taken.push(entry.clone());
+                }
+                TailEntry::ProcessStart if lines > 0 => taken.push(entry.clone()),
+                TailEntry::ProcessStart => {}
             }
-            let cost = entry.cost();
-            if !taken.is_empty() && bytes + cost > byte_limit {
-                break;
-            }
-            bytes += cost;
-            taken.push(entry.clone());
         }
         taken.reverse();
 
@@ -395,7 +404,7 @@ fn lock_ring(ring: &Arc<Mutex<StderrRing>>) -> std::sync::MutexGuard<'_, StderrR
     ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Cut `line` to at most `max_bytes`, appending [`TRUNCATION_MARKER`] when it did.
+/// Cut `line` to at most `max_bytes`, reporting whether it was shortened.
 ///
 /// Cuts on a char boundary: slicing a multi-byte sequence would produce invalid
 /// UTF-8, and a panic while capturing a crash message is the worst possible time
@@ -408,9 +417,7 @@ fn truncate_line(line: &str, max_bytes: usize) -> (String, bool) {
     while end > 0 && !line.is_char_boundary(end) {
         end -= 1;
     }
-    let mut text = line[..end].to_string();
-    text.push_str(TRUNCATION_MARKER);
-    (text, true)
+    (line[..end].to_string(), true)
 }
 
 #[cfg(test)]
@@ -512,11 +519,17 @@ mod tests {
         ring.push_line(&"x".repeat(40_000));
 
         let snapshot = ring.snapshot(None, None);
-        let kept = lines(&snapshot);
-        assert_eq!(kept.len(), 2, "the earlier line was evicted by the big one");
-        assert_eq!(kept[0], "context line that must survive");
-        assert!(kept[1].ends_with(TRUNCATION_MARKER));
-        assert!(kept[1].len() < 200);
+        let kept = &snapshot.entries;
+        assert!(matches!(
+            &kept[0],
+            TailEntry::Line { text, truncated: false }
+                if text == "context line that must survive"
+        ));
+        let TailEntry::Line { text, truncated } = &kept[1] else {
+            panic!("expected a truncated line");
+        };
+        assert_eq!(text, &"x".repeat(64));
+        assert!(*truncated);
     }
 
     #[test]
@@ -599,6 +612,44 @@ mod tests {
         }
         let snapshot = ring.snapshot(Some(3), None);
         assert_eq!(lines(&snapshot), vec!["line7", "line8", "line9"]);
+    }
+
+    #[test]
+    fn a_caller_line_limit_keeps_the_boundary_before_the_selected_line() {
+        let mut ring = ring(100, 100_000, 128);
+        ring.mark_captured();
+        ring.push_line("before restart");
+        ring.push_process_start();
+        ring.push_line("after restart");
+
+        let snapshot = ring.snapshot(Some(1), None);
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                TailEntry::ProcessStart,
+                TailEntry::Line {
+                    text: "after restart".to_string(),
+                    truncated: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_caller_line_limit_omits_a_trailing_boundary_after_the_selected_line() {
+        let mut ring = ring(100, 100_000, 128);
+        ring.mark_captured();
+        ring.push_line("before restart");
+        ring.push_process_start();
+
+        let snapshot = ring.snapshot(Some(1), None);
+        assert_eq!(
+            snapshot.entries,
+            vec![TailEntry::Line {
+                text: "before restart".to_string(),
+                truncated: false,
+            }]
+        );
     }
 
     #[test]
@@ -702,10 +753,7 @@ mod tests {
         ring.push_line("first process said this");
         ring.push_process_start();
         assert!(
-            matches!(
-                ring.snapshot(None, None).entries.last(),
-                Some(TailEntry::ProcessStart)
-            ),
+            matches!(ring.entries.back(), Some(TailEntry::ProcessStart)),
             "a boundary with output before it must be recorded"
         );
     }
@@ -718,11 +766,10 @@ mod tests {
         let mut ring = ring(1, 10_000, 128);
         ring.push_line("evicted");
         ring.push_line("also evicted");
-        let mut ring = ring;
         ring.entries.clear();
         ring.push_process_start();
         assert!(matches!(
-            ring.snapshot(None, None).entries.first(),
+            ring.entries.front(),
             Some(TailEntry::ProcessStart)
         ));
     }

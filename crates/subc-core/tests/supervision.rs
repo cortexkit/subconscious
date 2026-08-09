@@ -630,10 +630,7 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
         .spawn(ModuleSpec {
             module_id: "stderr-tail-looper".to_string(),
             program: PathBuf::from("/bin/sh"),
-            args: vec![
-                "-c".to_string(),
-                "echo \"boot $$\" >&2; exit 1".to_string(),
-            ],
+            args: vec!["-c".to_string(), "echo \"boot $$\" >&2; exit 1".to_string()],
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),

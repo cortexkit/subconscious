@@ -705,11 +705,11 @@ impl Supervisor {
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let child = spawn_child(
-                    &spec,
-                    runtime.connection_file_path.as_deref(),
-                    self.supervisor_handle.as_ref(),
-                    &runtime.stderr_ring,
-                )?;
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+        )?;
         set_running(&snapshot, child.id())?;
         self.process_liveness
             .track(spec.module_id.clone(), Arc::clone(&snapshot));
@@ -737,11 +737,11 @@ impl Supervisor {
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         match spawn_child(
-                    &spec,
-                    runtime.connection_file_path.as_deref(),
-                    self.supervisor_handle.as_ref(),
-                    &runtime.stderr_ring,
-                ) {
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+        ) {
             Ok(child) => {
                 set_running(&snapshot, child.id())?;
                 self.process_liveness
@@ -778,11 +778,11 @@ impl Supervisor {
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         match spawn_child(
-                    &spec,
-                    runtime.connection_file_path.as_deref(),
-                    self.supervisor_handle.as_ref(),
-                    &runtime.stderr_ring,
-                ) {
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+        ) {
             Ok(child) => {
                 set_running(&snapshot, child.id())?;
                 self.process_liveness

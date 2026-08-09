@@ -63,6 +63,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_SET_ENABLED,
     ops::SUPERVISOR_HEALTH_PROBE,
     ops::SUPERVISOR_HEALTH,
+    ops::SUPERVISOR_STDERR_TAIL,
 ];
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[MODULE_TO_SUBC_OP_CATALOG_UPDATE];
@@ -1376,12 +1377,7 @@ impl ControlHandler {
         max_lines: Option<u32>,
         max_bytes: Option<u32>,
     ) -> Result<Vec<Frame>, RouterError> {
-        let Some(module) = self
-            .supervisor
-            .list()
-            .into_iter()
-            .find(|module| module.module_id() == module_id)
-        else {
+        let Some(module) = self.supervisor.get(&module_id) else {
             return Ok(vec![control_error_frame(
                 &frame,
                 "unknown_module",
@@ -2812,7 +2808,7 @@ fn send_goodbye_target_best_effort(target: &GoodbyeTarget, context: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
 
     use serde_json::{json, Value};
     use subc_protocol::{
@@ -2826,8 +2822,17 @@ mod tests {
     };
 
     use super::*;
-    use crate::{registry::ChannelState, router::FrameSink, RouteCtx, Router};
-    use tokio::sync::mpsc;
+    use crate::{
+        registry::ChannelState,
+        router::FrameSink,
+        stderr_tail::DEFAULT_MAX_LINE_BYTES,
+        supervise::{ModuleSpec, RestartPolicy, Supervisor},
+        RouteCtx, Router,
+    };
+    use tokio::{
+        sync::mpsc,
+        time::{sleep, Instant},
+    };
 
     /// The retryable set both SDKs branch on, kept byte-identical to
     /// `is_retryable_route_open_code` in subc-client-rs and subc-client.
@@ -3311,6 +3316,99 @@ mod tests {
         fn process_live(&self, _module_id: &str) -> Option<bool> {
             self.live
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_stderr_tail_converts_a_real_truncated_ring_entry_to_prefix_only_wire_data()
+    {
+        let registry = Arc::new(Registry::default());
+        let supervisor_handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new(
+            Arc::clone(&registry),
+            RestartPolicy::new(1, Duration::from_millis(10)),
+        )
+        .with_handle(supervisor_handle.clone());
+        let source_line = format!("config error: {}", "x".repeat(DEFAULT_MAX_LINE_BYTES));
+        let shell_script = format!("printf '%s\\n' '{source_line}' >&2; exit 1");
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "stderr-tail-wire".to_string(),
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_string(), shell_script],
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let tail = module.stderr_tail(None, None);
+            if tail
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, TailEntry::ProcessStart))
+                && tail.entries.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        TailEntry::Line {
+                            truncated: true,
+                            ..
+                        }
+                    )
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "module did not produce a truncated line and restart boundary: {tail:?}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+        let request = ClientControlRequest::SupervisorStderrTail {
+            module_id: "stderr-tail-wire".to_string(),
+            max_lines: None,
+            max_bytes: None,
+        };
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (ctx, _egress) = route_ctx(ConnectionId::new(1));
+        let responses = handler.handle_control_frame(&ctx, frame).await.unwrap();
+        let ClientControlResponse::SupervisorStderrTail { tail, .. } =
+            serde_json::from_slice(&responses[0].body).unwrap()
+        else {
+            panic!("expected supervisor.stderr_tail response");
+        };
+
+        assert!(
+            tail.entries
+                .iter()
+                .any(|entry| matches!(entry, StderrTailEntry::ProcessStart)),
+            "the control response lost the restart boundary"
+        );
+        let Some(StderrTailEntry::Line { text, truncated }) = tail.entries.iter().find(|entry| {
+            matches!(
+                entry,
+                StderrTailEntry::Line {
+                    truncated: true,
+                    ..
+                }
+            )
+        }) else {
+            panic!("the control response lost the truncated line");
+        };
+        assert_eq!(text, &source_line[..DEFAULT_MAX_LINE_BYTES]);
+        assert!(*truncated);
     }
 
     #[test]

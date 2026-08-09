@@ -41,7 +41,7 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -499,7 +499,11 @@ fn parse_tail_count(tail: &[std::ffi::OsString]) -> Result<Option<u32>, CkError>
     let raw = tail
         .get(position + 1)
         .map(|arg| arg.to_string_lossy().into_owned())
-        .ok_or_else(|| CkError::Usage(format!("ck module stderr -n needs a count\n\n{MODULE_HELP}")))?;
+        .ok_or_else(|| {
+            CkError::Usage(format!(
+                "ck module stderr -n needs a count\n\n{MODULE_HELP}"
+            ))
+        })?;
     raw.parse::<u32>()
         .map(Some)
         .map_err(|_| CkError::Usage(format!("ck module stderr -n needs a number, got '{raw}'")))
@@ -566,7 +570,10 @@ async fn module_stderr_tail(
         match entry.get("kind").and_then(Value::as_str) {
             Some("process_start") => println!("--- process start ---"),
             _ => {
-                let text = entry.get("text").and_then(Value::as_str).unwrap_or_default();
+                let text = entry
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let truncated = entry
                     .get("truncated")
                     .and_then(Value::as_bool)
@@ -2534,7 +2541,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 // discard most of it.
                 "stderr" => ModuleCommand::StderrTail {
                     module_id: id(1)?,
-                    max_lines: parse_tail_count(&tail)?,
+                    max_lines: parse_tail_count(tail)?,
                 },
                 "restart" => ModuleCommand::Restart { module_id: id(1)? },
                 "stop" => ModuleCommand::Stop { module_id: id(1)? },

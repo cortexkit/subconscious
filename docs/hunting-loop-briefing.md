@@ -639,6 +639,7 @@ Before calling a class closed:
 | 552 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
 | 553 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
 | 554 | A negative result from a fixture nobody proved could produce the positive | Mutation cannot see this — break the mechanism and the fixture still reports the same nothing, which reads as the test working. Ask whether this input can exhibit the behaviour AT ALL before believing it does not |
+| 554a | A null argued from a probe where a structural claim was available | Prefer "no shipped path can construct this" over "zero occurrences in the corpus" — a structural null never asked a fixture anything and so cannot be defeated by fixture incapacity, while a census is wrong the moment someone writes a file nobody scanned |
 | 555 | A swept parameter whose outcome does not move | Cutting at 99.9% and 33% giving the identical answer means the sweep is not reaching the mechanism you think it is. Usable by a reader who knows nothing about the format, which is why it beats explaining the collapse |
 | 556 | A zero you are about to report on someone else's behalf | A favour is framed as a lookup and lookups do not get controls, so the skip is never a decision. Plant one positive, confirm the detector fires — the trigger is not "am I testing something" but "am I about to report a number someone will act on" |
 
@@ -714,6 +715,26 @@ So the check that precedes mutation: **before believing a negative result, ask
 whether the fixture can produce the positive.** Not "does my instrument work"
 but *can this input exhibit the behaviour at all.* Refusals are the least
 re-examined result on any team, because they feel conservative.
+
+But that is the fallback, not the first move. **A structural null and a probe
+null are different artefacts, and only the second is exposed to fixture
+incapacity.** "No shipped path can construct this dependency — the one wire
+route is closed at admission" never asked a fixture anything, so a fixture that
+could not exhibit the behaviour cannot defeat it. "Zero occurrences across 3,000
+recent files" is honest, current, and wrong the moment someone writes a file
+nobody scanned.
+
+So the instruction in order of preference: **prefer a structural claim where one
+is available; fall back to a probe only where it is not, and then prove the
+fixture capable.** A census answers about the artefacts that exist; a structural
+argument answers about the artefacts that *can* exist, and only the second
+survives contact with next month.
+
+Three seats arrived at that discriminator independently in one night — on
+cross-file capture guarantees, on a descriptor contract, and on enumerating what
+a named blind spot actually invalidates. A module that cannot make the
+structural claim should say so and take the weaker guarantee **knowingly**,
+which is the whole value: an unknowing weak guarantee is discovered at restore.
 
 ### The rule gets applied where the work is and skipped where the favour is
 

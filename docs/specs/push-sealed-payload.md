@@ -81,6 +81,36 @@ while this is the only purpose.
 and unbound, flipping it would not be detected by the tag — it would silently
 select a different parse. As AAD, a flipped version fails to open.
 
+Both sides have an AAD overload alongside the no-AAD form, so this is
+implementable on the opener rather than a requirement only the sealer can meet.
+Note what that means for the mistake: **the no-AAD call compiles**, and an
+implementation that forgets to pass the version gets a tag mismatch. That is a
+vector-catchable disagreement rather than a silent weakness, which is the whole
+improvement.
+
+## Contexts are stateful — one per envelope, including retries
+
+**A fresh sender/recipient context per envelope. MUST NOT be reused across
+envelopes, or across retries of the same envelope.**
+
+An HPKE context carries a sequence number that each seal or open advances,
+deriving a different nonce — RFC 9180 defines the increment, and the API makes it
+visible: every seal and open is a *mutating* method. Reusing a context to open a
+second blob, or to re-open the same blob after a transient failure, opens at
+sequence 1 against a ciphertext sealed at sequence 0, and fails.
+
+The sealer is safe by construction, since each envelope needs its own `enc`. The
+opener is not, and this is worth a rule rather than trusting it, because **the
+failure arrives through the most innocent-looking code in the feature**: a retry
+wrapper, a loop draining several pending notifications, a cached decryptor. Every
+one is a reasonable thing to add, and every one produces a tag mismatch that
+renders as the generic placeholder — the same bucket as a truncated blob, a wrong
+suite, and a phone that has not been unlocked.
+
+Unlike the access-group failure below, this one IS catchable by a test: open the
+same valid vector twice with a reused context and assert the second fails, then
+with a fresh context and assert it succeeds.
+
 ## The recipient key
 
 **MUST be a dedicated HPKE recipient keypair.** MUST NOT be the device's Noise

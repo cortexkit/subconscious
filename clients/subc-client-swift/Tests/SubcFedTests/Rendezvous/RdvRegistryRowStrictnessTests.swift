@@ -55,6 +55,44 @@ final class RdvRegistryRowStrictnessTests: XCTestCase {
         XCTAssertEqual(decoded.supersessionGeneration, "7")
     }
 
+    /// The sealing key is decoded BEFORE the producer emits it, so the field can
+    /// land server-side without breaking clients already in the field.
+    ///
+    /// The row-level assertion understates the stake: `RdvRegistrySnapshot.decode`
+    /// loops rows with `try` and no per-row recovery, so ONE row carrying an
+    /// unconsumed field fails the WHOLE snapshot -- every peer disappears, not
+    /// just the new device, on the discovery path.
+    func testTheSealingKeyIsUnderstoodBeforeItsProducerEmitsIt() throws {
+        // Absent: rows minted before the column exists, which is every row today.
+        XCTAssertNil(try RdvRegistryRow.decode(row()).hpkePubkeyHex)
+
+        // Present: consumed, so `finish()` is satisfied rather than throwing.
+        let sealing = String(repeating: "ef", count: 32)
+        let decoded = try RdvRegistryRow.decode(row(extra: ["hpke_pubkey_hex": .string(sealing)]))
+        XCTAssertEqual(decoded.hpkePubkeyHex, sealing)
+
+        // DISTINCT FROM THE TRANSPORT IDENTITY. Sealing to the Noise static would
+        // be cross-protocol reuse, and the two keys are adjacent hex strings on
+        // one row -- the confusion is a field lookup away.
+        XCTAssertNotEqual(decoded.hpkePubkeyHex, decoded.x25519PubkeyHex)
+    }
+
+    /// The snapshot-level statement of the same property, because that is the
+    /// blast radius: a row carrying the new field must not fail its NEIGHBOURS.
+    func testOneRowCarryingTheNewFieldDoesNotFailTheWholeSnapshot() throws {
+        let snapshot = try RdvRegistrySnapshot.decode(RdvJSONObject([
+            "type": .string("registry_snapshot"),
+            "server_seq": .string("42"),
+            "devices": .array([
+                .object(row()),
+                .object(row(extra: ["hpke_pubkey_hex": .string(String(repeating: "ef", count: 32))])),
+            ]),
+        ]))
+        XCTAssertEqual(snapshot.devices.count, 2)
+        XCTAssertNil(snapshot.devices[0].hpkePubkeyHex)
+        XCTAssertNotNil(snapshot.devices[1].hpkePubkeyHex)
+    }
+
     /// An unrecognised key must be REFUSED, naming the field. Tolerating it here
     /// would silently drop something the client was never taught to read.
     func testAnUnknownFieldIsRefusedAndNamed() {

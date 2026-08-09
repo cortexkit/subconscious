@@ -140,6 +140,18 @@ public struct RdvRegistryRow: Sendable, Equatable {
     public let enrollmentID: String?
     /// `row_generation` combined with `tombstone_generation`, as a decimal string.
     public let supersessionGeneration: String?
+    /// Dedicated HPKE recipient public key for sealed push payloads.
+    ///
+    /// DELIBERATELY NOT the Noise static in `x25519PubkeyHex`, which is the
+    /// transport identity: sealing to that key would be cross-protocol reuse and
+    /// would tie the sealing key's rotation to the transport identity's.
+    ///
+    /// Decoded ahead of the producer emitting it, because `finish()` REFUSES any
+    /// field no property consumes -- and one undecodable row fails the entire
+    /// registry snapshot, not just that device. So a column added server-side
+    /// before this shipped would stop every current client seeing ANY peer, on the
+    /// peer-discovery path, presenting as a transport fault.
+    public let hpkePubkeyHex: String?
 
     public init(
         x25519PubkeyHex: String,
@@ -151,7 +163,8 @@ public struct RdvRegistryRow: Sendable, Equatable {
         online: Bool,
         reenrolledAfterTombstone: Bool,
         enrollmentID: String? = nil,
-        supersessionGeneration: String? = nil
+        supersessionGeneration: String? = nil,
+        hpkePubkeyHex: String? = nil
     ) {
         self.x25519PubkeyHex = x25519PubkeyHex
         self.ed25519PubkeyHex = ed25519PubkeyHex
@@ -163,6 +176,7 @@ public struct RdvRegistryRow: Sendable, Equatable {
         self.reenrolledAfterTombstone = reenrolledAfterTombstone
         self.enrollmentID = enrollmentID
         self.supersessionGeneration = supersessionGeneration
+        self.hpkePubkeyHex = hpkePubkeyHex
     }
 
     static func decode(_ object: RdvJSONObject) throws -> RdvRegistryRow {
@@ -187,7 +201,8 @@ public struct RdvRegistryRow: Sendable, Equatable {
             // Present on rows from a current worker. Optional so a row minted
             // before these fields existed still decodes.
             enrollmentID: try decoder.optionalString("enrollment_id"),
-            supersessionGeneration: try decoder.optionalDecimalString("supersession_generation")
+            supersessionGeneration: try decoder.optionalDecimalString("supersession_generation"),
+            hpkePubkeyHex: try decoder.optionalString("hpke_pubkey_hex")
         )
         try decoder.finish()
         return row

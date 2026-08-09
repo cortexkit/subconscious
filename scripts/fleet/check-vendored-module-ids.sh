@@ -237,7 +237,14 @@ room2-contract-samples.json:docs/team-mode/appendices/room2-ckcred-fixtures.json
 fail=0
 for pair in $LIST; do
   name=${pair%%:*}; mine=${pair#*:}
-  src=$(cd "$PRODUCER" && git show "$COMMIT" --stat --name-only 2>/dev/null | grep "/$name\$" | head -1)
+  # --name-only WITHOUT --stat. `git show --stat` formats for a terminal and
+  # TRUNCATES LONG PATHS WITH AN ELLIPSIS; a truncated path fed to `git show
+  # <commit>:<path>` reports the file as absent from the repo, which reads as
+  # "this vendoring points at nothing" rather than as a formatting artifact.
+  # Measured: with --stat both corpora resolved to `<absent>`; without it, both
+  # resolve. The two flags currently agree here only because these paths are
+  # short enough to escape truncation, so this is not a cosmetic preference.
+  src=$(cd "$PRODUCER" && git show --name-only --format= "$COMMIT" 2>/dev/null | grep "/$name\$" | head -1)
   if [ -z "$src" ]; then
     echo "AUTHENTICITY: $name not found at $COMMIT in the producer repo"
     fail=1; continue

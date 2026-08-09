@@ -857,6 +857,21 @@ async fn wait_for_catalog_module(path: &Path, module_id: &str, wait: Duration) {
     }
 }
 
+/// Assert the catalog holds `expected` modules matching `module_id`.
+///
+/// WHAT THIS DOES NOT PROVE: that the daemon's `SUBC_MODULE_ID` injection
+/// reached the module. The stub reads its id from its OWN variable
+/// (`FAKE_AFT_MODULE_ID`), so these assertions establish that the stub honours
+/// its own config and are silent on daemon injection. THE INJECTION PROOF LIVES
+/// IN `crates/subc-core/src/control.rs` -- the spawn-attestation tests, where a
+/// mismatched consumer identity must be refused with no route bind.
+///
+/// The pointer is here because this is where a reader forms the wrong
+/// conclusion: someone auditing "is id delivery tested" finds module-id
+/// assertions in the catalog tests and answers yes for the wrong reason.
+/// Coverage that lives somewhere other than where a reader looks for it will
+/// eventually be re-asserted wrongly (CKE2E's clause, from the same exchange
+/// that produced the vacuity note on `DEFAULT_MODULE_ID`).
 async fn assert_catalog_modules(path: &Path, module_id: Option<&str>, corr: u64, expected: usize) {
     let modules = catalog_modules(path, module_id, corr).await;
     assert_eq!(modules.len(), expected, "catalog modules: {modules:?}");

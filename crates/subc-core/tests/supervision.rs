@@ -470,6 +470,27 @@ fn stub_spec<'a>(
     module_id: &str,
     extra_env: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> ModuleSpec {
+    // ASSERT THE SILENT PRECONDITION EVERY CATALOG-REGISTRATION TEST RESTS ON.
+    //
+    // A test that asserts "the module registered as `module_id`" is vacuous if
+    // `module_id` equals the stub's compiled fallback: a stub that never
+    // received its env would register under exactly the string being asserted,
+    // so pass and fail become the same observation. Every id in the suite
+    // differs from the fallback today, which is why those assertions are real --
+    // but that held only because of how they happen to be NAMED, and nothing
+    // stated it. The day someone picks the fallback string, the tests keep
+    // passing and stop proving anything.
+    //
+    // Asserted rather than commented for the reason CKE2E gave when they hit the
+    // live form of this: a property the suite DEPENDS ON but does not state is a
+    // silent precondition, and the day it stops holding is exactly the day
+    // nothing complains.
+    assert_ne!(
+        module_id, "fake-aft",
+        "test module id equals the stub's compiled fallback, so a catalog \
+         assertion on it cannot distinguish a delivered id from an undelivered \
+         one; pick a different id"
+    );
     let mut env = vec![("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())];
     env.extend(
         extra_env

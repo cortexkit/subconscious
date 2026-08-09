@@ -297,6 +297,21 @@ and mutation proofs, rather than a missing integer in a dictionary no document
 mentioned. **All three failures return 200 from APNs**, on a path where the device
 is the only observer.
 
+### What each observation proves, and what it does not
+
+Three checkpoints on this path each look like success and each establishes less
+than a reader will take from it. **All three must be stated at the moment of the
+result rather than remembered**, because they are read at the worst possible time.
+
+| observation | proves | does NOT prove |
+| --- | --- | --- |
+| APNs returns 200 | the request was ACCEPTED | that any device received it. There is no delivery callback; the device is the only observer |
+| notification appears with the generic line | delivery | that the blob DECRYPTED. iOS displays the placeholder anyway if the extension crashes or exceeds its ~30s, so this cannot distinguish decrypt-succeeded from extension-never-ran |
+| tapping opens to the ask | **the whole pipe** | -- |
+
+**Only the tap separates a working extension from one that never ran.** If it opens
+to the app with nothing selected, the blob never opened.
+
 **Hand the blob across seat boundaries in ONE encoding.** Hex from the sealer, with
 base64 applied once by the submit path. A blob re-encoded at each hop is a
 transcription error waiting for a reader.

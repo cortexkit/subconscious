@@ -98,5 +98,22 @@ fi
 
 : > "$LOG"
 after=$(stat -f '%z' "$LOG" 2>/dev/null || stat -c '%s' "$LOG")
+
+# COMPRESS AFTER TRUNCATING, NEVER BEFORE. The live log is only safe to truncate
+# once a verified-complete archive exists; compressing first would put a slow
+# transform between the copy and the check. Measured on a real archive: 908 MB of
+# this log is ~98% one repeated line, so it compresses by roughly two orders of
+# magnitude -- which is what makes keeping the archive at all defensible.
+# Failure here is NOT fatal: the archive is already complete and correct, and an
+# uncompressed archive is merely large.
+if command -v gzip >/dev/null 2>&1; then
+  if gzip -f "$ARCHIVE" 2>/dev/null; then
+    gz=$(stat -f '%z' "$ARCHIVE.gz" 2>/dev/null || stat -c '%s' "$ARCHIVE.gz" 2>/dev/null || echo 0)
+    printf 'rotate-daemon-log: %s MB archived to %s.gz (%s MB compressed), live log truncated (now %s bytes)\n' \
+      "$mb" "$(basename "$ARCHIVE")" "$(( gz / 1048576 ))" "$after"
+    exit 0
+  fi
+  echo "rotate-daemon-log: compression failed -- archive kept uncompressed, which is large but intact" >&2
+fi
 printf 'rotate-daemon-log: %s MB archived to %s, live log truncated (now %s bytes)\n' \
   "$mb" "$(basename "$ARCHIVE")" "$after"

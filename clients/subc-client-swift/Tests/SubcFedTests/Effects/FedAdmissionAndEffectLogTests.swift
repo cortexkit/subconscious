@@ -257,8 +257,33 @@ final class FedAdmissionAndEffectLogTests: XCTestCase {
         )
         XCTAssertNil(internalAfter.disposition)
 
-        // Unknown fed_ control codes never become recorded.
-        let unknown = FedOriginEffectLog.classifyTerminalFrame(
+            // Both spellings of session-ended classify identically.
+            //
+            // THIS PINS THE OUTCOME, NOT THE SET MEMBERSHIP, and the difference
+            // is measured rather than assumed: deleting "fed_session_closed"
+            // from nonSettlingCodes leaves all 308 tests green, because the
+            // fed_-prefix fallback in classify already returns the same
+            // disposition for any unrecognised control code. So this seam is
+            // defended by the fallback, and the set entry is documentation of
+            // intent.
+            //
+            // That is worth keeping anyway. The fallback is a general default
+            // someone may reasonably narrow later; the day it stops covering
+            // unknown codes, every seam relying on it breaks silently and this
+            // assertion breaks loudly instead.
+            for code in ["fed_shutdown", "fed_session_closed"] {
+                let ended = FedOriginEffectLog.classifyTerminalFrame(
+                    kind: "error",
+                    body: Data(),
+                    bodyOmitted: false,
+                    errorCode: code
+                )
+                XCTAssertNil(ended.disposition, "\(code) must not record a disposition")
+                XCTAssertFalse(ended.settle, "\(code) must not settle")
+            }
+
+            // Unknown fed_ control codes never become recorded.
+            let unknown = FedOriginEffectLog.classifyTerminalFrame(
             kind: "error",
             body: Data(),
             bodyOmitted: false,

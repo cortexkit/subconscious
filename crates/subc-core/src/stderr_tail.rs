@@ -86,18 +86,30 @@ impl TailEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StderrTailConfig {
-    pub max_lines: usize,
-    pub max_bytes: usize,
-    pub max_line_bytes: usize,
+    max_lines: usize,
+    max_bytes: usize,
+    max_line_bytes: usize,
+}
+
+impl StderrTailConfig {
+    /// Keeps every retained line within the ring's total byte budget.
+    /// Clamp rather than reject so diagnostics degrade without blocking supervisor startup.
+    pub const fn new(max_lines: usize, max_bytes: usize, max_line_bytes: usize) -> Self {
+        Self {
+            max_lines,
+            max_bytes,
+            max_line_bytes: if max_line_bytes > max_bytes {
+                max_bytes
+            } else {
+                max_line_bytes
+            },
+        }
+    }
 }
 
 impl Default for StderrTailConfig {
     fn default() -> Self {
-        Self {
-            max_lines: DEFAULT_MAX_LINES,
-            max_bytes: DEFAULT_MAX_BYTES,
-            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
-        }
+        Self::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINE_BYTES)
     }
 }
 
@@ -425,11 +437,7 @@ mod tests {
     use super::*;
 
     fn ring(max_lines: usize, max_bytes: usize, max_line_bytes: usize) -> StderrRing {
-        StderrRing::new(StderrTailConfig {
-            max_lines,
-            max_bytes,
-            max_line_bytes,
-        })
+        StderrRing::new(StderrTailConfig::new(max_lines, max_bytes, max_line_bytes))
     }
 
     fn lines(snapshot: &StderrTailSnapshot) -> Vec<String> {
@@ -815,5 +823,27 @@ mod tests {
         ring.push_line("a line considerably longer than the request limit");
         let snapshot = ring.snapshot(None, Some(4));
         assert_eq!(snapshot.entries.len(), 1);
+    }
+
+    #[test]
+    fn an_incoherent_config_clamps_the_line_cap_and_keeps_its_restart_boundary() {
+        let config = StderrTailConfig::new(2, 10, 100);
+        assert_eq!(config.max_line_bytes, config.max_bytes);
+        let mut ring = StderrRing::new(config);
+        ring.mark_captured();
+        ring.push_line("old");
+        ring.push_process_start();
+        ring.push_line("new process line longer than the ring byte cap");
+
+        assert_eq!(
+            ring.snapshot(None, None).entries,
+            vec![
+                TailEntry::ProcessStart,
+                TailEntry::Line {
+                    text: "new proces".to_string(),
+                    truncated: true,
+                },
+            ]
+        );
     }
 }

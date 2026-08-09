@@ -287,6 +287,63 @@ fi
   fi
 echo
 
+# ------------------------------------------------------------------- daemon log
+# THE SHARED DAEMON LOG IS AN INCIDENT-RESPONSE SURFACE, AND ONE SUBSYSTEM CAN
+# MAKE IT UNREADABLE FOR EVERY OTHER.
+#
+# The failure mode: a repeating bind-rejection line can reach tens of percent of
+# the whole file at tens of lines per second. The cost is not disk. It is that
+# EVERY OTHER SUBSYSTEM'S LINES STOP APPEARING IN THE TAIL -- so a routine "is my
+# module alive" check reads the last few hundred lines, sees none of its own, and
+# concludes silence. That reads as a dead module, i.e. a false incident report.
+# The 200 MB flag and the 20k-line window below are both sized against that: big
+# enough not to fire on ordinary volume, small enough to catch a flood early.
+#
+# WHY THE RATE IS NOT THE LINE COUNT ONCE A RATE LIMIT IS IN PLACE. The emitter's
+# fix keeps the message byte-identical and appends "(repeated Nx in last 60s)" to
+# the next emission, so THE LINE COUNT COLLAPSES WHILE THE UNDERLYING LOOP
+# CONTINUES -- the loop itself only dies as hosts restart onto a client-side
+# fix, which is a separate and slower event. Counting lines would report the
+# flood solved on the day the counting changed, which is the same trap as a
+# metric going to zero because something was renamed.
+#
+# So this sums suppressed counts and reports THREE distinguishable states,
+# because absent and zero are not the same observation:
+#   lines, no suffixes   pre-rate-limit; the count IS the rate
+#   lines + suffixes     rate limit live; true rate = lines + suffix sum
+#   no lines at all      loop dead, OR this check has gone blind -- which the
+#                        control below is what separates
+bold "DAEMON LOG"
+DLOG="$HOME/.local/share/cortexkit/run/subc.log"
+if [ ! -f "$DLOG" ]; then
+  echo "  $DLOG absent -- UNCHECKED (not clean)"
+else
+  dl_mb=$(( $(stat -f '%z' "$DLOG" 2>/dev/null || echo 0) / 1048576 ))
+  # POSITIVE CONTROL FIRST. A zero below is only meaningful if this file is being
+  # written at all; without it a rotated, renamed or empty log and a genuinely
+  # quiet one produce the same reassuring zero.
+  dl_total=$(wc -l < "$DLOG" 2>/dev/null | tr -d ' ')
+  if [ "${dl_total:-0}" -eq 0 ]; then
+    echo "  log is EMPTY -- every count below would read zero regardless; UNCHECKED"
+  else
+    dl_win=$(tail -20000 "$DLOG" 2>/dev/null)
+    dl_hits=$(printf '%s\n' "$dl_win" | grep -c 'route bind rejected (config_divergence)' || true)
+    dl_supp=$(printf '%s\n' "$dl_win" | grep -o 'repeated [0-9]*x' | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+    printf '  size %s MB, %s lines total\n' "$dl_mb" "$dl_total"
+    if [ "$dl_hits" -eq 0 ] && [ "$dl_supp" -eq 0 ]; then
+      printf '  bind-rejection flood: none in last 20k lines (control: %s lines exist)\n' "$dl_total"
+    elif [ "$dl_supp" -eq 0 ]; then
+      printf '  bind-rejection flood: %s lines / 20k, NO suppression suffixes\n' "$dl_hits"
+      echo   "    -> rate limit not yet deployed; the line count IS the rate"
+    else
+      printf '  bind-rejection flood: %s lines / 20k + %s suppressed = %s true\n' "$dl_hits" "$dl_supp" "$(( dl_hits + dl_supp ))"
+      echo   "    -> rate limit live; loop still running until hosts roll onto dormancy"
+    fi
+    [ "$dl_mb" -gt 200 ] && echo "  UNROTATED: >200 MB on a shared surface"
+  fi
+fi
+echo
+
 # ------------------------------------------------------------------ backup health
 # Engram is the one subsystem whose failure is silent and expensive: backups stop
 # and nothing else changes, so it needs an explicit line rather than a health dot.

@@ -682,6 +682,28 @@ when the change looks complete, because tests construct the ceremony directly an
 therefore always exercise the after-path. The generation code can be correct,
 tested and mutation-proved while nothing on a shipped device can invoke it.
 
+**A SUCCESSFUL ENROLLMENT DOES NOT PROVE THE KEY WAS CARRIED.** The server stores
+what it is sent and binds what it stored, so a client that sends nothing produces a
+context the server agrees with exactly: **both sides omit the member, the proofs
+verify, the ceremony returns success, and the registry column is NULL.**
+
+That is not a defect in the server and it MUST NOT be fixed by making the field
+mandatory: other principals enroll with no push key at all and must keep working,
+so absent-is-valid is required. **The consequence is that a device whose key
+generation failed is indistinguishable, at the server, from a principal that has
+none** -- and key generation on real hardware has failure modes a simulator does
+not: a keychain unavailable before first unlock, an entitlement that differs on
+device, an error swallowed on a path nothing exercises.
+
+**So the enrollment MUST be followed by reading the key back, and an absent value
+is a STOP rather than a retry.** Re-running the ceremony will fail the same way and
+report success again. When the read-back is empty, the fault is in key generation
+on the device -- not in the server, and not in the seal.
+
+This is the already-enrolled defect above reached by a different road: same
+terminal state (an empty registry column, no error, no log line), different cause,
+and the reachability fix does not close it.
+
 **Prefer a re-entry path that reuses the ceremony's EXISTING rotation affordance**
 (`rotation_sig_hex`, already sent on every enrollment and already specified for
 same-key live re-enrollment) over a bespoke add-a-key endpoint. The rotation path

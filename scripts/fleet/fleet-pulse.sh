@@ -310,9 +310,17 @@ echo
 # So this sums suppressed counts and reports THREE distinguishable states,
 # because absent and zero are not the same observation:
 #   lines, no suffixes   pre-rate-limit; the count IS the rate
-#   lines + suffixes     rate limit live; true rate = lines + suffix sum
+#   lines + suffixes     rate limit live; true rate is AT LEAST lines + suffix sum
 #   no lines at all      loop dead, OR this check has gone blind -- which the
 #                        control below is what separates
+#
+# THE SUM IS A FLOOR, NOT A TOTAL, and the reason is in the emitter's contract:
+# a suppressed count rides on the NEXT emission after its window, so a flood that
+# STOPS mid-window never flushes its final count. Suppression is keyed per
+# distinct message, so the undercount is bounded by one window per distinct
+# message -- with dozens of distinct roots that is not a rounding error. Reported
+# as ">=" because a number labelled as a total, that is not one, is the specific
+# way a correct measurement turns into a wrong claim.
 bold "DAEMON LOG"
 DLOG="$HOME/.local/share/cortexkit/run/subc.log"
 if [ ! -f "$DLOG" ]; then
@@ -336,8 +344,9 @@ else
       printf '  bind-rejection flood: %s lines / 20k, NO suppression suffixes\n' "$dl_hits"
       echo   "    -> rate limit not yet deployed; the line count IS the rate"
     else
-      printf '  bind-rejection flood: %s lines / 20k + %s suppressed = %s true\n' "$dl_hits" "$dl_supp" "$(( dl_hits + dl_supp ))"
+      printf '  bind-rejection flood: %s lines / 20k + %s suppressed = >=%s true\n' "$dl_hits" "$dl_supp" "$(( dl_hits + dl_supp ))"
       echo   "    -> rate limit live; loop still running until hosts roll onto dormancy"
+      echo   "    -> total is a FLOOR: a flood ending mid-window never flushes its last count"
     fi
     [ "$dl_mb" -gt 200 ] && echo "  UNROTATED: >200 MB on a shared surface"
   fi

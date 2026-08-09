@@ -62,11 +62,29 @@ public actor FedOriginEffectLog {
     ]
 
     /// Exhaustive non-settling advisory list per fed-wire §8.8: deadline,
-    /// cancelled, shutdown, dispatch_ambiguous. Any other fed_ control code is
-    /// unknown and classifies as non-settling, never recorded.
+    /// cancelled, session-ended, dispatch_ambiguous. Any other fed_ control code
+    /// is unknown and classifies as non-settling, never recorded.
+    ///
+    /// `fed_session_closed` and `fed_shutdown` are the SAME condition under two
+    /// names, held together for one deploy generation. The serving side is
+    /// renaming it because "shutdown" reads as the daemon restarting when it
+    /// means only that this peer session ended mid-call -- a distinction an
+    /// operator gets wrong precisely during an incident, when it is most
+    /// expensive. Accepting both lets every fielded client learn the new name
+    /// before any producer emits it; the old spelling comes out once no client
+    /// in the field can still receive it.
+    ///
+    /// Listing it here is NOT what makes it safe. An unrecognised `fed_`-
+    /// prefixed code already falls through to the same disposition (see the
+    /// prefix branch in `classify`), so this seam would survive the rename even
+    /// if nobody touched this set -- it is defended by the fallback rather than
+    /// by the name. That is worth stating because it is easy to mistake for a
+    /// guarantee: the day someone narrows the unknown-code default, every seam
+    /// relying on that accident breaks silently and this one does not.
     public static let nonSettlingCodes: Set<String> = [
         "fed_deadline",
         "fed_cancelled",
+        "fed_session_closed",
         "fed_shutdown",
         "fed_dispatch_ambiguous",
     ]

@@ -21,16 +21,50 @@ final class FedStateStoreTests: XCTestCase {
     /// missing a required field entirely -- it failed for that reason and
     /// proved nothing about the removed key. Injection guarantees the fixture
     /// differs from a current file in exactly the one dimension under test.
+    ///
+    /// The document carries a WATERMARK AND POPULATED EFFECTS because ignoring
+    /// an unknown key and PRESERVING ITS SIBLINGS are two properties, and only
+    /// the second protects a mutation a user made before updating: a decoder
+    /// can drop the removed key correctly and still lose a neighbouring field
+    /// while doing it. An empty document cannot tell the two apart.
     func testFedStateDocumentDecodesFilesWrittenBeforeAFieldWasRemoved() throws {
         let responder = Data(repeating: 0xAA, count: 32)
         let key = FedStateDocument.destinationKey(forResponderPublicKey: responder)
+        let watermark = FedConfirmedWatermark(incarnation: "inc", seq: 742)
+        let effects = [
+            FedUnresolvedEffectRecord(
+                effect: FedEffectID(incarnation: "inc", seq: 174),
+                responderStaticPublicKey: responder,
+                phase: .terminal,
+                disposition: .recorded,
+                terminalBody: Data("body-174".utf8),
+                terminalKind: "response"
+            ),
+            FedUnresolvedEffectRecord(
+                effect: FedEffectID(incarnation: "inc", seq: 742),
+                responderStaticPublicKey: responder,
+                phase: .terminal,
+                disposition: .recorded,
+                terminalBody: Data("body-742".utf8),
+                terminalKind: "response"
+            ),
+        ]
         let current = FedStateDocument(
             localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localKey),
             global: FedGlobalReservationState(
                 localIncarnation: "inc",
                 localLedgerEpoch: "epoch"
             ),
-            destinations: [key: FedDestinationState(responderStaticPublicKey: responder)]
+            destinations: [
+                key: FedDestinationState(
+                    responderStaticPublicKey: responder,
+                    observedPeerIncarnation: "peer-inc",
+                    observedPeerLedgerEpoch: "peer-epoch",
+                    confirmedWatermark: watermark,
+                    unresolvedEffects: effects,
+                    poisonedLedgerEpochs: ["bad-epoch"]
+                )
+            ]
         )
         var json = try XCTUnwrap(
             JSONSerialization.jsonObject(with: try JSONEncoder().encode(current))
@@ -53,7 +87,13 @@ final class FedStateStoreTests: XCTestCase {
         let decoded = try JSONDecoder().decode(FedStateDocument.self, from: legacy)
         let restored = try XCTUnwrap(decoded.destinations[key])
         XCTAssertEqual(restored.responderStaticPublicKey, responder)
-        XCTAssertTrue(restored.unresolvedEffects.isEmpty)
+        // Siblings survive the removed key, field by field. Asserting the whole
+        // destination equal would also pass, but names nothing when it fails.
+        XCTAssertEqual(restored.confirmedWatermark, watermark)
+        XCTAssertEqual(restored.unresolvedEffects, effects)
+        XCTAssertEqual(restored.observedPeerIncarnation, "peer-inc")
+        XCTAssertEqual(restored.observedPeerLedgerEpoch, "peer-epoch")
+        XCTAssertEqual(restored.poisonedLedgerEpochs, ["bad-epoch"])
     }
 
     func testIncarnationAndLedgerEpochSurviveReopen() async throws {

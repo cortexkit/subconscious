@@ -276,6 +276,24 @@ pub struct SupervisorEntry {
     /// (often a panic-abort). Survives respawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit_signal: Option<i32>,
+    /// Respawns the supervisor has performed for this module under the current
+    /// restart policy, reset when the module comes up cleanly.
+    ///
+    /// `last_exit_code` says how the previous process died; this says whether it
+    /// keeps happening. A crash LOOP and a single crash present identically on
+    /// every other field -- both read `state: failed` with the same exit code --
+    /// so without a count the operator cannot tell a module that died once from
+    /// one dying four times a second, which is the distinction that decides
+    /// whether to read logs or read config.
+    ///
+    /// Zero is skipped so consumers written against the older shape keep parsing,
+    /// and absent therefore means NO RESTARTS RATHER THAN UNKNOWN.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub restart_count: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

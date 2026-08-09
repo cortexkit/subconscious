@@ -1933,6 +1933,7 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
         .map(|entry| display_field(entry, "last_action"))
         .unwrap_or_else(|| "-".to_string());
     let last_exit = format_last_exit(module);
+    let restarts = format_restart_count(module);
 
     print_table(
         &[
@@ -1944,6 +1945,7 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             "failures",
             "last_action",
             "last_exit",
+            "restarts",
             "detail",
             "metrics",
         ],
@@ -1956,10 +1958,30 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             failures,
             last_action,
             last_exit,
+            restarts,
             detail,
             truncate_cell(&metrics),
         ]],
     );
+}
+
+/// Render the supervisor's respawn count for this module.
+///
+/// `last_exit` says how the previous process died; this says whether it keeps
+/// dying. A module that crashed once and one crash-looping four times a second
+/// are identical on every other column, and they call for opposite next moves --
+/// read the logs, or read the config.
+///
+/// The field is omitted from the wire when zero, so an older daemon and a module
+/// that has never restarted both render `0`. That collapse is deliberate: both
+/// mean "no restarts to report", and a distinct unknown marker would invite the
+/// reader to treat a quiet module as a diagnostic gap.
+fn format_restart_count(module: &Value) -> String {
+    module
+        .get("restart_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .to_string()
 }
 
 /// Render the module's most recent process exit as a compact cell, e.g.

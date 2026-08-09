@@ -321,9 +321,19 @@ result rather than remembered**, because they are read at the worst possible tim
 | APNs returns 200 | the request was ACCEPTED | that any device received it. There is no delivery callback; the device is the only observer |
 | notification appears with the generic line | delivery | that the blob DECRYPTED. iOS displays the placeholder anyway if the extension crashes or exceeds its ~30s, so this cannot distinguish decrypt-succeeded from extension-never-ran |
 | tapping opens to the ask | **the whole pipe** | -- |
+| tapping opens the app and stays put | nothing | it has THREE causes: the ask id was absent, the extension never ran, or the tap routing is broken |
 
-**Only the tap separates a working extension from one that never ran.** If it opens
-to the app with nothing selected, the blob never opened.
+**Only the first case is unambiguous.** An earlier version of this table said a tap
+landing nowhere meant the blob never opened -- that was wrong, and the correction
+is the reason the row above exists.
+
+The tap traverses three hops after the extension: the extension writes the ask id,
+a notification delegate reads it, and the root view routes it. **Each of those
+fails by DOING NOTHING** -- an unset delegate is not an error, an unread state
+value is not a warning -- so a broken hop is indistinguishable from a failed
+decrypt at the only place an operator can observe either. **A diagnostic that
+attributes a multi-cause symptom to one cause sends the investigation at the piece
+with the most tests**, which is the piece least likely to be wrong.
 
 **Hand the blob across seat boundaries in ONE encoding.** Hex from the sealer, with
 base64 applied once by the submit path. A blob re-encoded at each hop is a

@@ -534,6 +534,69 @@ async fn rescan_preview_reports_the_removal_it_would_make_and_makes_none() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_reports_config_sections_it_cannot_apply() {
+    // A section outside `modules` changes, rescan cannot apply it, and until now
+    // the only evidence was a journal warning. Reported by an outside contributor
+    // whose module crash-looped through four respawns because a new top-level
+    // `storage` section was silently not applied: rescan said `added: <module>`,
+    // which was true, and the module could not run.
+    //
+    // Asserted on BOTH the preview and the executed rescan, because the preview
+    // is where a careful operator looks first and is exactly where a missing
+    // warning costs the most.
+    let module_id = "rescan-restart-required";
+    let daemon = RunningDaemon::start(
+        "daemon-rescan-restart-required",
+        Some(config_doc([stub_module(module_id, true, [])])),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+
+    // With only the `modules` section touched, `restart_required` must stay
+    // empty. Without this the test would pass on an implementation that reports a
+    // restart requirement for EVERY rescan, including the ones where no such
+    // section changed -- an alarm that is always on carries no information.
+    let unchanged_sections = supervisor_rescan_with(&daemon.connection_file_path, 940, true).await;
+    assert!(
+        unchanged_sections.restart_required.is_empty(),
+        "no non-modules section changed, so nothing should be reported: {:?}",
+        unchanged_sections.restart_required
+    );
+
+    // Add a top-level storage section, leaving the modules section identical.
+    let mut doc: Value =
+        serde_json::from_str(&config_doc([stub_module(module_id, true, [])])).unwrap();
+    doc["storage"] = json!({
+        "backend": "sqlite",
+        "data_home": daemon.config_path.parent().unwrap().join("store"),
+    });
+    fs::write(
+        &daemon.config_path,
+        serde_json::to_string_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+
+    let preview = supervisor_rescan_with(&daemon.connection_file_path, 941, true).await;
+    assert_eq!(
+        preview.restart_required,
+        vec!["storage".to_string()],
+        "the preview must name the section it cannot apply"
+    );
+    // The module section is genuinely unchanged, so the operator would otherwise
+    // read a completely quiet result for a config edit that does not take effect.
+    assert!(preview.added.is_empty());
+    assert!(preview.changed_pending_reload.is_empty());
+
+    let applied = supervisor_rescan_with(&daemon.connection_file_path, 942, false).await;
+    assert_eq!(
+        applied.restart_required,
+        vec!["storage".to_string()],
+        "an executed rescan must report it too -- it is the run that leaves the \
+         daemon serving stale config"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rescan_preview_reports_an_enabled_flip_it_would_apply() {
     // Rescan calls set_enabled for an enabled-flip, so a preview that omits them
     // under-reports a mutation class it performs. The bucket arithmetic is what

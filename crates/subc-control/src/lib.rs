@@ -231,6 +231,25 @@ pub struct SupervisorRescanResult {
     /// consumers see the shape they already parse.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub preview: bool,
+    /// Config sections that changed but which rescan CANNOT apply, so the
+    /// operator learns a daemon restart is required from the command they just
+    /// ran rather than from the journal.
+    ///
+    /// The daemon has always detected this and logged a warning. A warning in a
+    /// log is addressed to whoever is reading the log, and the person who just
+    /// edited the config is by construction looking at the CLI instead: reported
+    /// by an outside contributor after a module crash-looped through four
+    /// respawns because a new top-level `storage` section was silently not
+    /// applied, diagnosable only by journal archaeology.
+    ///
+    /// Names the SECTIONS rather than a boolean, because "something else
+    /// changed" sends the operator back to diffing their own file -- which is
+    /// the work the message exists to save.
+    ///
+    /// Empty is skipped, so consumers written against the older shape keep
+    /// parsing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_required: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

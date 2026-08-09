@@ -12,5 +12,8 @@
   "removed": [
     "old-tools"
   ],
+  "restart_required": [
+    "storage"
+  ],
   "unchanged": 3
 }

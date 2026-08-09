@@ -244,6 +244,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     enabled_changes: vec!["paused-tools".to_string()],
                     unchanged: 3,
                     preview: false,
+                    restart_required: vec!["storage".to_string()],
                 },
             },
         ),

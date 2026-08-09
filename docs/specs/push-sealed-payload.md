@@ -45,6 +45,42 @@ Two consequences that are load-bearing elsewhere in this design:
   opens successfully. This is accepted for v1 and bounded by the deep-link rule
   below, not by cryptography.
 
+## Ciphersuite, info, and associated data
+
+These three MUST be stated as literals, because each is a value both sides must
+agree on, each has a plausible default on each side, and each disagreement
+produces the SAME symptom: the blob does not open, reported as an AEAD tag
+mismatch, which lands in the `malformed` bucket and points the reader at the
+transport. Three independent ways into one bucket whose diagnosis points away
+from the cause.
+
+| parameter | value |
+| --- | --- |
+| ciphersuite | `Curve25519_SHA256_ChachaPoly` — X25519-HKDF-SHA256 / ChaCha20-Poly1305 |
+| `info` | empty (`Data()` / `&[]`) |
+| associated data | the 1-byte `version` prefix |
+
+**The suite is forced rather than chosen, and the forcing is one-sided.**
+CryptoKit exposes exactly one X25519 suite, so the opener has no alternative;
+the sealer has many. RFC 9180's suite table begins with X25519 + AES-128-GCM,
+which is what an implementation reaches for when nothing says otherwise — so the
+common default and the only available option were about to disagree. Confirmed
+non-empty on both sides: `chacha20poly1305` is already present in the sealer's
+lockfile via Noise, so neither side takes on a new primitive.
+
+**A suite that is never named is satisfiable by any suite**, and both sides pick
+a defensible one.
+
+`info` is empty deliberately rather than by omission. It binds into the key
+schedule, so an unstated value is not "no value" — it is two implementations
+guessing. It is also the domain-separation hook that becomes load-bearing if
+authorship is ever closed by reusing a key for a second purpose; empty is correct
+while this is the only purpose.
+
+**The version byte is the associated data, so it is authenticated.** Cleartext
+and unbound, flipping it would not be detected by the tag — it would silently
+select a different parse. As AAD, a flipped version fails to open.
+
 ## The recipient key
 
 **MUST be a dedicated HPKE recipient keypair.** MUST NOT be the device's Noise
@@ -139,15 +175,42 @@ forged blob therefore produces a notification that opens to nothing.
 Vectors are the contract. Prose is commentary.
 
 Each vector carries the recipient private key, the ephemeral private key, the
-plaintext, and the expected sealed bytes — so both implementations produce
-byte-identical output from fixed inputs rather than merely round-tripping their
-own work.
+plaintext, and the expected sealed bytes.
+
+**The property is that THE OPENER OPENS THE GENERATOR'S BYTES to the expected
+plaintext.** It is deliberately not "both sides produce identical bytes from
+identical inputs": CryptoKit's `HPKE.Sender` accepts no caller-supplied
+ephemeral key on any initializer, so the Swift side CANNOT be made to reproduce a
+given `enc` — not "does not in production", but has no API to. A spec asserting
+byte-identity would be asserting something one implementation structurally cannot
+execute.
+
+This loses less than it appears to, because every disagreement that matters still
+fails: a wrong suite, a wrong `info`, a wrong AAD, a wrong recipient key, or a
+wrong envelope split all make the open FAIL rather than differ. What it stops
+proving is that a hypothetical second SEALER agrees, and there is no second
+sealer.
+
+The asymmetry is in the API rather than in our design, and it generalises:
+`HPKE.Recipient` takes every input as a parameter, so opening is fully
+specifiable from fixed inputs while sealing is not. **A Swift implementation can
+be a conformance CONSUMER and cannot be a conformance PRODUCER.**
 
 **The ephemeral private key is in the corpus deliberately and MUST NOT be removed
 as redundant.** Nothing needs it to *decrypt*, so a later reader regenerating the
-corpus will see an unused field. It is what makes sealing deterministic, and
-without it the only checkable property is that each side can open its own output —
-which is satisfied by two implementations that disagree.
+corpus will see an unused field. It is what makes the GENERATOR'S OWN
+REGENERATION byte-identical — which is the check that stops a hand-edited corpus
+surviving. It is not what makes the cross-language check possible.
+
+That distinction is worth the words: a MUST-NOT-REMOVE justified by something a
+reader can falsify is weaker than one with a narrower true reason, because the
+reader who disproves the stated justification is licensed to conclude the field
+is vestigial — which is the exact removal the annotation exists to prevent.
+
+**The generator's own suite passing is NOT evidence of interoperability.** It
+compares an implementation to itself, so it can only fail if the generator
+changed: stability, not agreement. The conformance signal is the opener's, and
+that sentence belongs at the head of the corpus file rather than only here.
 
 **Every typed open-failure MUST have a negative vector, and each negative MUST
 carry a positive control in the same test.** Not merely the same suite: with them
@@ -190,5 +253,21 @@ device, reading from the extension's identity rather than the app's.
 It matters here because a green vector suite reads as "sealing works" when all it
 establishes is that the bytes are right — and this failure renders as the same
 generic placeholder as `truncated_ct` and as a phone that has not been unlocked.
+
+**Nor does the corpus constrain the sealer's ephemeral randomness.** Base mode's
+confidentiality rests on a fresh ephemeral per message, and a sealer that reused
+one across every message would pass every vector, because each is examined alone
+and all of them open. The pin belongs in the sealer's own tests, where the
+property lives: two seals of identical plaintext to the same recipient MUST
+differ in `enc`. Without it, dropping byte-identity quietly removes the only
+place anyone would have noticed.
+
+**The authenticity of the recipient key is a precondition this document does not
+establish.** Everything above asserts confidentiality TO A KEY; it says nothing
+about whether that key is the device's. If a sealing key can be substituted
+during enrollment, every notification seals to the substituter and EVERY VECTOR
+HERE STILL PASSES. The enrollment ceremony must bind the key into the transcript
+its proofs already cover — carried on the challenge, where the proofs reach it,
+not on the completion, where it would be stored and vouched for by nothing.
 
 Named so a reader does not infer silence means "unconstrained".

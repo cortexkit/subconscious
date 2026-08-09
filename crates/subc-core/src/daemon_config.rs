@@ -44,6 +44,26 @@ impl StorageConfig {
     /// `cortexkit_store_types::StorageDescriptor` (subc constructs it by hand to
     /// avoid a database-library dependency in the thin daemon). The module
     /// deserializes it into that type and hands it to `cortexkit-store`.
+    ///
+    /// THE DESCRIPTOR IS ADVISORY, NOT BINDING, and the daemon has no way to
+    /// tell whether a module consumed it. A module that opens its store BEFORE
+    /// connecting -- building its own descriptor from an environment variable --
+    /// never reads this at all, and nothing on the wire reports that.
+    ///
+    /// Two consequences worth knowing before reasoning from a store path:
+    ///
+    /// * A store at the path below does NOT prove the descriptor arrived or was
+    ///   keyed correctly; a self-keying module can land on the same path by
+    ///   agreeing with the convention rather than by consuming the descriptor.
+    ///   Any test asserting "the store landed under MODULE_ID" proves the
+    ///   daemon's half only for modules that derive the path from the id they
+    ///   claimed.
+    /// * Where a self-keying module disagrees, BOTH paths can exist. Observed on
+    ///   the live box: astrocyte is handed a data dir already ending in
+    ///   `cortexkit/astrocyte` and appends the same suffix again, so its real
+    ///   store sits nested while an empty file remains at the path this function
+    ///   names -- and a reader inspecting that directory would reasonably
+    ///   conclude the module has an empty store.
     pub fn descriptor_for(&self, module_id: &str) -> serde_json::Value {
         match self {
             // Path convention mirrors cortexkit_store_types::sqlite_store_path:

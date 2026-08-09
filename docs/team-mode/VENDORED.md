@@ -17,12 +17,20 @@ requested the re-vendor. That message scrolls away; the corpora do not.
 
 Source: `cortexkit-account` commit `52188788fafc0ab4684282d5d88e58e9a234ffe7`
 
-| file | sha256 (first 16) |
-| --- | --- |
-| `fixtures/room2-ckcred-fixtures.json` | `951428d63b8f2dff` |
-| `appendices/room2-ckcred-fixtures.json` | `951428d63b8f2dff` |
-| `conformance/vectors/ckcred/room1-contract-samples.json` | `39e6b2d4e78e1c8f` |
-| `fixtures/room1-contract-samples.mirror.json` | `39e6b2d4e78e1c8f` |
+The **producer-verified** column records when these bytes were last compared
+against the producer repo at the source commit — not when the digest was
+recorded. The distinction matters because the digest check needs no producer and
+keeps passing after an upstream rename makes that comparison impossible, so
+without a date the table cannot distinguish *anchored to the producer* from
+*consistent with itself*. Verify before you need to, and put the answer here
+rather than in a memory of having checked.
+
+| file | sha256 (first 16) | producer-verified |
+| --- | --- | --- |
+| `fixtures/room2-ckcred-fixtures.json` | `951428d63b8f2dff` | 2026-08-09 |
+| `appendices/room2-ckcred-fixtures.json` | `951428d63b8f2dff` | 2026-08-09 |
+| `conformance/vectors/ckcred/room1-contract-samples.json` | `39e6b2d4e78e1c8f` | 2026-08-09 |
+| `fixtures/room1-contract-samples.mirror.json` | `39e6b2d4e78e1c8f` | 2026-08-09 |
 
 The two identical pairs are deliberate — each corpus is vendored to two
 locations, and they must move together. A digest mismatch *within* a pair means

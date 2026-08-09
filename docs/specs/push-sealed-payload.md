@@ -322,6 +322,7 @@ result rather than remembered**, because they are read at the worst possible tim
 | notification appears with the generic line | delivery | that the blob DECRYPTED. iOS displays the placeholder anyway if the extension crashes or exceeds its ~30s, so this cannot distinguish decrypt-succeeded from extension-never-ran |
 | tapping opens to the ask | **the whole pipe** | -- |
 | tapping opens the app and stays put | nothing | it has THREE causes: the ask id was absent, the extension never ran, or the tap routing is broken |
+| nothing arrives at all | delivery failed | nothing about the seal, the envelope, or the extension -- none of them ran |
 
 **Only the first case is unambiguous.** An earlier version of this table said a tap
 landing nowhere meant the blob never opened -- that was wrong, and the correction

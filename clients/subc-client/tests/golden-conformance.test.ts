@@ -71,6 +71,63 @@ describe("Rust golden fixtures", () => {
     expect(typeof targets.internal_service.service_id).toBe("string");
   });
 
+  test("principal variants keep the tag and payload the provider switches on", () => {
+    // Principal is the DAEMON'S ATTESTATION of who the caller is -- the field a
+    // provider reads to tell a spawn-attested module from anything else that
+    // completed the handshake. provider.ts casts it (`request.principal as
+    // Principal`) rather than parsing it, so a tag rename on the Rust side would
+    // reach an `if (principal.kind === "reserved")` that silently never matches:
+    // an authorization check that stops matching is a check that stops enforcing.
+    const direct = loadGolden("principal_direct");
+    const reserved = loadGolden("principal_reserved");
+    const unverified = loadGolden("principal_unverified");
+
+    expect(direct.kind).toBe("direct");
+    expect(unverified.kind).toBe("unverified");
+    expect(reserved.kind).toBe("reserved");
+    // Only `reserved` carries a module id, and it is the whole content of the
+    // attestation -- without it the variant names no one.
+    expect(typeof reserved.module_id).toBe("string");
+    expect(reserved.module_id).not.toBe("");
+    // The other two must NOT carry one: a variant that grew a module id would be
+    // a different claim wearing the same tag.
+    expect(direct.module_id).toBeUndefined();
+    expect(unverified.module_id).toBeUndefined();
+
+    // Three DISTINCT tags. A fixture set that collapsed to one value would
+    // satisfy every assertion above while proving nothing about discrimination.
+    expect(new Set([direct.kind, reserved.kind, unverified.kind]).size).toBe(3);
+  });
+
+  test("an absent consumer_capabilities stays absent rather than arriving empty", () => {
+    // The provider treats an omitted field as "no reverse-request capability".
+    // Omission and an empty array behave identically today but are different
+    // bytes, and only the omitted form is pinned by a vector -- without one, a
+    // field the daemon stops sending is indistinguishable from a field the
+    // client stops reading. An optional field elsewhere in this protocol was
+    // once misspelled on the wire and parsed cleanly as absent, silently
+    // downgrading the caller's identity; that is the failure this pins against.
+    const without = loadGolden("module_control_request_route_bind_without_consumer_capabilities");
+    const with_ = loadGolden("module_control_request_route_bind");
+
+    expect(without.op).toBe("route.bind");
+    expect(without.consumer_capabilities).toBeUndefined();
+    expect("consumer_capabilities" in without).toBe(false);
+
+    // CONTROL: the sibling fixture proves the field is emitted when present, so
+    // the absence above is a real absence and not a fixture that never carries it.
+    expect(Array.isArray(with_.consumer_capabilities)).toBe(true);
+    expect((with_.consumer_capabilities as string[]).length).toBeGreaterThan(0);
+
+    // Both carry the fields the provider reads unconditionally, so a bind with no
+    // declared capabilities is still a complete bind.
+    for (const bind of [without, with_]) {
+      expect(typeof bind.route_channel).toBe("number");
+      expect(typeof bind.epoch).toBe("number");
+      expect(typeof (bind.principal as Record<string, unknown>).kind).toBe("string");
+    }
+  });
+
   test("bind identity keeps the snake_case field the client sends", () => {
     // The client serializes this object by hand, so a casing change in Rust
     // would be accepted by TypeScript's types and rejected by the daemon.

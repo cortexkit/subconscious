@@ -279,6 +279,16 @@ The realisation is normative and lives here:
 | `mutable-content` | `1` | **the extension NEVER RUNS**; notification displays, blob silently ignored |
 | `aps.alert` | title or body present | notification discarded by iOS |
 
+**The block is MINIMAL, not exhaustive: the table is the requirement set.** A
+sender MAY carry additional `aps` members (`sound`, `apns-collapse-id`, and
+whatever Apple adds next); it MUST NOT omit the three above. Stated because the
+two readings are indistinguishable in the text and they differ for the reader this
+section exists to protect -- a fourth implementer, building from this document
+alone, either copies the block verbatim or treats it as a floor. **The security
+argument here is entirely about what must be PRESENT and says nothing about what
+must be absent**, so an exhaustive reading would forbid harmless additions for no
+reason the rest of this document supports.
+
 **`mutable-content: 1` is the one to check before the first send.** It is a
 SENDER-side key, so it correctly appears nowhere in the client, which is precisely
 why it had no owner. Without it the notification arrives, looks almost right, and

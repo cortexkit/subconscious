@@ -96,7 +96,7 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
         // would be asking the artifact under test what it should contain, which
         // cannot detect an omission -- so the defect to guard is not duplication
         // but SILENT divergence, and the pin is what makes divergence loud.
-        let pinnedVectorSet = 2
+        let pinnedVectorSet = 3
         let declaredSets = vectors.compactMap { $0["vector_set"] as? Int }
         if let declared = declaredSets.first, declared != pinnedVectorSet {
             XCTFail(
@@ -116,6 +116,37 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
             "wrong_recipient",
             "empty_ct",
         ]
+        // EVERY NEGATIVE MUST STATE THE FAILURE IT EXPECTS, and the spec requires
+        // consumers to COMPARE it rather than merely assert that opening failed.
+        // A refusal-only assertion passes against an opener that collapses every
+        // cause into one failure -- which would make "this build is too old" and
+        // "this payload is corrupt" indistinguishable, the exact discrimination
+        // these vectors exist to pin. Measured on a sibling harness: a fully
+        // mislabelled corpus passed green under a refusal-only arm.
+        let expectedFailures: [String: String] = [
+            "unknown_version": "unsupported_version",
+            "truncated_enc": "malformed",
+            "truncated_ct": "malformed",
+            "empty_ct": "malformed",
+            "tampered_ct": "malformed",
+            "tampered_enc": "malformed",
+            // Shares `malformed` with the tampered pair DELIBERATELY: all three are
+            // AEAD tag failures, and an opener able to tell them apart would be
+            // leaking which part of the envelope was wrong.
+            "wrong_recipient": "malformed",
+        ]
+        for vector in vectors {
+            guard let name = vector["name"] as? String, expectedFailures[name] != nil else {
+                continue
+            }
+            XCTAssertEqual(
+                vector["expected_failure"] as? String,
+                expectedFailures[name],
+                "\(name): expected_failure must match the spec's table -- a corpus that "
+                    + "mislabels a cause lets a consumer assert the wrong discrimination"
+            )
+        }
+
         let present = Set(vectors.compactMap { $0["name"] as? String })
         let missing = required.subtracting(present)
         XCTAssertTrue(

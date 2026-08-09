@@ -64,17 +64,17 @@ final class RdvRegistryRowStrictnessTests: XCTestCase {
     /// just the new device, on the discovery path.
     func testTheSealingKeyIsUnderstoodBeforeItsProducerEmitsIt() throws {
         // Absent: rows minted before the column exists, which is every row today.
-        XCTAssertNil(try RdvRegistryRow.decode(row()).hpkePubkeyHex)
+        XCTAssertNil(try RdvRegistryRow.decode(row()).pushSealPubkeyHex)
 
         // Present: consumed, so `finish()` is satisfied rather than throwing.
         let sealing = String(repeating: "ef", count: 32)
-        let decoded = try RdvRegistryRow.decode(row(extra: ["hpke_pubkey_hex": .string(sealing)]))
-        XCTAssertEqual(decoded.hpkePubkeyHex, sealing)
+        let decoded = try RdvRegistryRow.decode(row(extra: ["push_seal_pubkey_hex": .string(sealing)]))
+        XCTAssertEqual(decoded.pushSealPubkeyHex, sealing)
 
         // DISTINCT FROM THE TRANSPORT IDENTITY. Sealing to the Noise static would
         // be cross-protocol reuse, and the two keys are adjacent hex strings on
         // one row -- the confusion is a field lookup away.
-        XCTAssertNotEqual(decoded.hpkePubkeyHex, decoded.x25519PubkeyHex)
+        XCTAssertNotEqual(decoded.pushSealPubkeyHex, decoded.x25519PubkeyHex)
     }
 
     /// The snapshot-level statement of the same property, because that is the
@@ -85,12 +85,12 @@ final class RdvRegistryRowStrictnessTests: XCTestCase {
             "server_seq": .string("42"),
             "devices": .array([
                 .object(row()),
-                .object(row(extra: ["hpke_pubkey_hex": .string(String(repeating: "ef", count: 32))])),
+                .object(row(extra: ["push_seal_pubkey_hex": .string(String(repeating: "ef", count: 32))])),
             ]),
         ]))
         XCTAssertEqual(snapshot.devices.count, 2)
-        XCTAssertNil(snapshot.devices[0].hpkePubkeyHex)
-        XCTAssertNotNil(snapshot.devices[1].hpkePubkeyHex)
+        XCTAssertNil(snapshot.devices[0].pushSealPubkeyHex)
+        XCTAssertNotNil(snapshot.devices[1].pushSealPubkeyHex)
     }
 
     /// An unrecognised key must be REFUSED, naming the field. Tolerating it here

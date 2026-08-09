@@ -40,6 +40,19 @@ document that says "check for X" depends on the reader already suspecting X; a
 document that lists the X's does not. **If you have to bring the suspicion, it
 is a warning, not an instrument.**
 
+**A rule recorded without its position in an ordering will be read as the first
+move**, because it is the only actionable thing on the page. Two seats
+independently wrote down "prove the fixture can produce the positive" — which is
+the *fallback* — within an hour of jointly deriving the preference it falls back
+from, on the same night. That is not two lapses; it is a property of how rules
+get written. A fallback is a **check**: concrete, runnable, obviously
+actionable. A preference is a judgement about which kind of evidence to go
+looking for, and it survives the trip into a document far worse. Documents
+accumulate checks and lose orderings — and the ordering is the half that changes
+behaviour, because a reader who is told to prove a fixture capable will build
+one and prove it, executing the second-best answer diligently. So when a row
+here is a fallback, it says so.
+
 Two things about building one of these, learned by getting both wrong here.
 **A list forces you to enumerate the population, and enumerating the population
 is how you discover a missing member** — building this table is what revealed
@@ -638,7 +651,7 @@ Before calling a class closed:
 | 551 | Closure evidence that is an absence over an uncontrolled window | Prefer an injected test that is falsifiable on demand — "no failures this week" cannot separate a working fix from a week that happened to be easy, and the aggressor removing itself looks identical to the defect being fixed |
 | 552 | A reading that did not move | The recurring tell across every wrong call in the 2026-08-07 rename window — seven errors, not one a wrong VALUE. A constant is what an idempotent path, a rejected write, an undialled caller, and a filter over the wrong population all produce |
 | 553 | An equal-value reading between two counters | Uninterpretable without knowing whether anything was there to change — the same equality is a rejected write in one situation and a successful claim in another |
-| 554 | A negative result from a fixture nobody proved could produce the positive | Mutation cannot see this — break the mechanism and the fixture still reports the same nothing, which reads as the test working. Ask whether this input can exhibit the behaviour AT ALL before believing it does not |
+| 554 | A negative result from a fixture nobody proved could produce the positive | FALLBACK, not the first move — see 554a. Mutation cannot see this: break the mechanism and the fixture still reports the same nothing, which reads as the test working. Ask whether this input can exhibit the behaviour AT ALL before believing it does not |
 | 554a | A null argued from a probe where a structural claim was available | Prefer "no shipped path can construct this" over "zero occurrences in the corpus" — a structural null never asked a fixture anything and so cannot be defeated by fixture incapacity, while a census is wrong the moment someone writes a file nobody scanned |
 | 555 | A swept parameter whose outcome does not move | Cutting at 99.9% and 33% giving the identical answer means the sweep is not reaching the mechanism you think it is. Usable by a reader who knows nothing about the format, which is why it beats explaining the collapse |
 | 556 | A zero you are about to report on someone else's behalf | A favour is framed as a lookup and lookups do not get controls, so the skip is never a decision. Plant one positive, confirm the detector fires — the trigger is not "am I testing something" but "am I about to report a number someone will act on" |

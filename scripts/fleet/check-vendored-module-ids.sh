@@ -273,7 +273,56 @@ for corpus in $CORPORA; do
   esac
 done
 
+# THE MANIFEST'S OWN DIGEST TABLE WAS NEVER CHECKED BY ANYTHING.
+#
+# VENDORED.md records a digest per file; this script read only its commit line,
+# so four recorded digests sat unverified. A value written down and never
+# compared is worse than none, because it reads as evidence.
+#
+# The producer comparison above is STRONGER but needs the producer repo on this
+# machine. On a host without it that check exits early -- and then the manifest
+# was the only claim available and nothing tested it. The two also answer
+# different questions: the producer asks "are these the published bytes", the
+# manifest asks "are these the bytes WE REVIEWED AND RECORDED". A re-vendor that
+# updates files and forgets the table passes the first and fails this one.
+#
+# Rows are COUNTED against what the table declares, so a row in a shape the
+# pattern misses fails by name rather than being skipped while the summary
+# implies full coverage. That is CKCRED's found-something-versus-found-
+# everything gap, which their own manifest checker carried in this exact form:
+# an empty-table refusal catches matching NOTHING and cannot catch matching SOME.
+rows=$(grep -c '^| `' docs/team-mode/VENDORED.md || true)
+parsed=0
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  path=$(printf '%s' "$line" | sed -nE 's/^\| `([^`]+)` *\| `([0-9a-f]+)` *\|.*/\1/p')
+  want=$(printf '%s' "$line" | sed -nE 's/^\| `([^`]+)` *\| `([0-9a-f]+)` *\|.*/\2/p')
+  if [ -z "$path" ] || [ -z "$want" ]; then
+    echo "MANIFEST FAIL: unreadable digest row: $line"
+    fail=1; continue
+  fi
+  parsed=$((parsed + 1))
+  full="docs/team-mode/$path"
+  if [ ! -f "$full" ]; then
+    echo "MANIFEST FAIL: $path recorded in VENDORED.md but absent from disk"
+    fail=1; continue
+  fi
+  got=$(shasum -a 256 "$full" | cut -c1-${#want})
+  if [ "$want" != "$got" ]; then
+    echo "MANIFEST FAIL: $path is $got, VENDORED.md records $want"
+    fail=1
+  fi
+done <<EOF
+$(grep '^| `' docs/team-mode/VENDORED.md)
+EOF
+
+if [ "$parsed" -ne "$rows" ]; then
+  echo "MANIFEST FAIL: table declares $rows rows, parser read $parsed"
+  fail=1
+fi
+
 if [ $fail -ne 0 ]; then
   exit 1
 fi
 echo "OK: $checked mirrors byte-identical to the producer at ${COMMIT:0:8}."
+echo "OK: $parsed of $rows recorded digests match the files on disk."

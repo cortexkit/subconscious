@@ -239,6 +239,8 @@ pub enum StderrCaptureState {
     /// A reader is attached, or was attached and saw clean EOF. An empty
     /// `entries` under this state means the module genuinely wrote nothing.
     Captured,
+    /// Retained entries are valid, but the stderr reader ended before clean EOF.
+    Incomplete { reason: String },
     /// No reader was attached. `entries` says nothing about what the module wrote.
     NotCaptured { reason: String },
 }

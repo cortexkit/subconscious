@@ -302,6 +302,22 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 },
             },
         ),
+        (
+            "client_control_response_supervisor_stderr_tail_incomplete",
+            ClientControlResponse::SupervisorStderrTail {
+                module_id: "aft-tools".to_string(),
+                tail: StderrTail {
+                    capture: StderrCaptureState::Incomplete {
+                        reason: "stderr read failed: reader failed".to_string(),
+                    },
+                    entries: vec![StderrTailEntry::Line {
+                        text: "config error: missing top-level `storage`".to_string(),
+                        truncated: false,
+                    }],
+                    dropped_lines: 0,
+                },
+            },
+        ),
     ]
 }
 

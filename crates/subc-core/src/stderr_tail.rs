@@ -53,6 +53,8 @@ pub const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 pub enum CaptureState {
     /// A reader is attached, or was attached and reached clean EOF.
     Captured,
+    /// Retained entries are valid, but capture ended before clean EOF.
+    Incomplete { reason: String },
     /// No reader was attached. The tail says nothing about what the module wrote.
     NotCaptured { reason: String },
 }
@@ -171,7 +173,15 @@ impl StderrRing {
     }
 
     pub fn mark_captured(&mut self) {
-        self.capture = CaptureState::Captured;
+        if matches!(self.capture, CaptureState::NotCaptured { .. }) {
+            self.capture = CaptureState::Captured;
+        }
+    }
+
+    pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
+        self.capture = CaptureState::Incomplete {
+            reason: reason.into(),
+        };
     }
 
     pub fn mark_not_captured(&mut self, reason: impl Into<String>) {
@@ -373,7 +383,7 @@ where
                 // The tail up to this point stays valid and readable; what changes
                 // is that it is no longer complete, and saying so beats letting a
                 // truncated capture read as a module that stopped talking.
-                guard.mark_not_captured(format!("stderr read failed: {err}"));
+                guard.mark_incomplete(format!("stderr read failed: {err}"));
                 return;
             }
         };
@@ -382,23 +392,28 @@ where
 
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = pending.drain(..=newline).collect();
-            emit_line(&ring, sink, &line[..line.len() - 1]);
+            emit_line(&ring, sink, &line[..line.len() - 1], true);
         }
 
         if pending.len() >= MAX_PENDING_LINE_BYTES {
             let line = std::mem::take(&mut pending);
-            emit_line(&ring, sink, &line);
+            emit_line(&ring, sink, &line, false);
         }
     }
 
     // A process that dies mid-line still wrote the bytes, and on a crash that
     // fragment is disproportionately likely to be the message worth reading.
     if !pending.is_empty() {
-        emit_line(&ring, sink, &pending);
+        emit_line(&ring, sink, &pending, false);
     }
 }
 
-fn emit_line<S: LineSink>(ring: &Arc<Mutex<StderrRing>>, sink: &mut S, raw: &[u8]) {
+fn emit_line<S: LineSink>(
+    ring: &Arc<Mutex<StderrRing>>,
+    sink: &mut S,
+    raw: &[u8],
+    terminated: bool,
+) {
     {
         let mut guard = lock_ring(ring);
         guard.push_line(&String::from_utf8_lossy(raw));
@@ -406,10 +421,14 @@ fn emit_line<S: LineSink>(ring: &Arc<Mutex<StderrRing>>, sink: &mut S, raw: &[u8
 
     // Framed and written in ONE call. Two writes -- body then newline -- would
     // reintroduce exactly the interleaving that inheriting the fd avoided.
-    let mut framed = Vec::with_capacity(raw.len() + 1);
-    framed.extend_from_slice(raw);
-    framed.push(b'\n');
-    sink.write_line(&framed);
+    if terminated {
+        let mut framed = Vec::with_capacity(raw.len() + 1);
+        framed.extend_from_slice(raw);
+        framed.push(b'\n');
+        sink.write_line(&framed);
+    } else {
+        sink.write_line(raw);
+    }
 }
 
 fn lock_ring(ring: &Arc<Mutex<StderrRing>>) -> std::sync::MutexGuard<'_, StderrRing> {
@@ -434,7 +453,14 @@ fn truncate_line(line: &str, max_bytes: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use super::*;
+    use tokio::io::{AsyncRead, ReadBuf};
 
     fn ring(max_lines: usize, max_bytes: usize, max_line_bytes: usize) -> StderrRing {
         StderrRing::new(StderrTailConfig::new(max_lines, max_bytes, max_line_bytes))
@@ -701,6 +727,26 @@ mod tests {
         }
     }
 
+    struct FailingReader {
+        bytes: Vec<u8>,
+        emitted: bool,
+    }
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.emitted {
+                return Poll::Ready(Err(io::Error::other("reader failed")));
+            }
+            self.emitted = true;
+            buf.put_slice(&self.bytes);
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn the_pump_splits_on_newlines_and_keeps_a_trailing_fragment() {
         let ring = shared(10, 10_000, 128);
@@ -713,6 +759,29 @@ mod tests {
         let snapshot = lock_ring(&ring).snapshot(None, None);
         assert_eq!(lines(&snapshot), vec!["one", "two", "three"]);
         assert_eq!(snapshot.capture, CaptureState::Captured);
+        assert_eq!(
+            sink.writes,
+            vec![b"one\n".to_vec(), b"two\n".to_vec(), b"three".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_failure_keeps_prior_lines_and_marks_the_capture_incomplete() {
+        let ring = shared(10, 10_000, 128);
+        let source = FailingReader {
+            bytes: b"crash cause\n".to_vec(),
+            emitted: false,
+        };
+        let mut sink = RecordingSink::default();
+        pump_stderr_into(source, Arc::clone(&ring), &mut sink).await;
+
+        let snapshot = lock_ring(&ring).snapshot(None, None);
+        assert_eq!(lines(&snapshot), vec!["crash cause"]);
+        assert!(matches!(
+            snapshot.capture,
+            CaptureState::Incomplete { ref reason } if reason.contains("reader failed")
+        ));
+        assert_eq!(sink.writes, vec![b"crash cause\n".to_vec()]);
     }
 
     #[tokio::test]
@@ -811,6 +880,11 @@ mod tests {
             lines(&snapshot).len(),
             2,
             "expected a forced flush at the ceiling plus the remainder"
+        );
+        assert_eq!(
+            sink.writes,
+            vec![vec![b'x'; MAX_PENDING_LINE_BYTES], vec![b'x'; 4096],],
+            "forced flushes and EOF fragments must not invent delimiters"
         );
     }
 

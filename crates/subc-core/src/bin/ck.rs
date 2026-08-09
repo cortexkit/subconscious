@@ -544,6 +544,15 @@ async fn module_stderr_tail(
         println!("stderr not captured for {module_id}: {reason}");
         return Ok(());
     }
+    let incomplete_reason = capture
+        .filter(|capture| {
+            capture
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state == "incomplete")
+        })
+        .and_then(|capture| capture.get("reason"))
+        .and_then(Value::as_str);
 
     let dropped = response
         .get("dropped_lines")
@@ -563,28 +572,30 @@ async fn module_stderr_tail(
         .unwrap_or_default();
     if entries.is_empty() {
         println!("(no stderr output captured)");
-        return Ok(());
-    }
-
-    for entry in entries {
-        match entry.get("kind").and_then(Value::as_str) {
-            Some("process_start") => println!("--- process start ---"),
-            _ => {
-                let text = entry
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let truncated = entry
-                    .get("truncated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if truncated {
-                    println!("{text} [truncated]");
-                } else {
-                    println!("{text}");
+    } else {
+        for entry in entries {
+            match entry.get("kind").and_then(Value::as_str) {
+                Some("process_start") => println!("--- process start ---"),
+                _ => {
+                    let text = entry
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let truncated = entry
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if truncated {
+                        println!("{text} [truncated]");
+                    } else {
+                        println!("{text}");
+                    }
                 }
             }
         }
+    }
+    if let Some(reason) = incomplete_reason {
+        println!("stderr capture incomplete for {module_id}: {reason}");
     }
     Ok(())
 }

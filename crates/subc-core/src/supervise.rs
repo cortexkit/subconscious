@@ -44,6 +44,58 @@ const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
+const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+struct SupervisedChild {
+    child: Child,
+    stderr_pump: Option<JoinHandle<()>>,
+    stderr_ring: Arc<Mutex<StderrRing>>,
+}
+
+impl SupervisedChild {
+    fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        self.child.start_kill()
+    }
+
+    async fn drain_stderr(&mut self, module_id: &str) {
+        let Some(mut pump) = self.stderr_pump.take() else {
+            return;
+        };
+        match timeout(STDERR_PUMP_DRAIN_TIMEOUT, &mut pump).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.stderr_ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .mark_incomplete(format!("stderr pump ended unexpectedly: {err}"));
+                warn!(module_id, error = %err, "stderr pump ended before clean EOF");
+            }
+            Err(_) => {
+                pump.abort();
+                self.stderr_ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .mark_incomplete(format!(
+                        "stderr pump did not reach EOF within {:?} before restart",
+                        STDERR_PUMP_DRAIN_TIMEOUT
+                    ));
+                warn!(
+                    module_id,
+                    waited = ?STDERR_PUMP_DRAIN_TIMEOUT,
+                    "stderr pump did not drain before restart; stopped it before marking the new process"
+                );
+            }
+        }
+    }
+}
 
 fn registration_release_events() -> &'static watch::Sender<u64> {
     static EVENTS: OnceLock<watch::Sender<u64>> = OnceLock::new();
@@ -828,7 +880,7 @@ impl Supervisor {
         spec: ModuleSpec,
         runtime: SupervisorRuntimeConfig,
         snapshot: SharedSnapshot,
-        child: Option<Child>,
+        child: Option<SupervisedChild>,
     ) -> SupervisedModule {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
@@ -1487,7 +1539,7 @@ async fn run_health_probe_cycle(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
     match probe_module_health(spec, runtime).await {
@@ -1641,7 +1693,7 @@ async fn handle_health_report(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     report: HealthReport,
     now_ms: u64,
 ) {
@@ -1683,7 +1735,7 @@ async fn handle_health_probe_failure(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     err: HealthProbeError,
     now_ms: u64,
 ) {
@@ -1762,7 +1814,7 @@ async fn apply_l3_health_action(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     status: SupervisorHealthStatus,
     detail: Option<&str>,
     action: HealthAction,
@@ -1813,7 +1865,7 @@ async fn health_restart_child(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     status: SupervisorHealthStatus,
     detail: Option<&str>,
     now_ms: u64,
@@ -2001,7 +2053,7 @@ async fn supervise_loop(
     registry: Arc<Registry>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     snapshot: SharedSnapshot,
-    mut child: Option<Child>,
+    mut child: Option<SupervisedChild>,
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
     let mut health_probe = HealthProbeRuntime::default();
@@ -2024,6 +2076,7 @@ async fn supervise_loop(
                     let exit_report = match wait_result {
                         Ok(status) => classify_exit(&status),
                         Err(err) => {
+                            active_child.drain_stderr(&spec.module_id).await;
                             fail_snapshot(&snapshot, Some(&spec.module_id), None);
                             untrack_if_registration_released(
                                 &process_liveness,
@@ -2036,6 +2089,7 @@ async fn supervise_loop(
                             continue;
                         }
                     };
+                    active_child.drain_stderr(&spec.module_id).await;
 
                     match on_child_exit(
                         &spec,
@@ -2143,7 +2197,7 @@ async fn handle_supervisor_command(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) -> bool {
     match command {
         SupervisorCommand::Drain { reply } => {
@@ -2241,7 +2295,7 @@ async fn restart_child(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) -> Result<(), SuperviseError> {
     // Restart cycles a running module; it must not silently start a disabled one.
     if !lock_snapshot(snapshot)?.enabled {
@@ -2287,7 +2341,7 @@ async fn reload_child(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) -> Result<(), SuperviseError> {
     // Reload cycles a running module; it must not silently start a disabled one.
     if !lock_snapshot(snapshot)?.enabled {
@@ -2354,6 +2408,9 @@ async fn reload_child(
             Ok(())
         }
         RegistrationWaitOutcome::Exited(exit_report) => {
+            if let Some(active_child) = child.as_mut() {
+                active_child.drain_stderr(&spec.module_id).await;
+            }
             *child = None;
             handle_reload_child_registration_failure(
                 spec,
@@ -2386,6 +2443,7 @@ async fn reload_child(
                     module_id: spec.module_id.clone(),
                     source,
                 })?;
+            timed_out_child.drain_stderr(&spec.module_id).await;
             handle_reload_child_registration_failure(
                 spec,
                 runtime,
@@ -2412,7 +2470,7 @@ async fn set_child_enabled(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     enabled: bool,
 ) -> Result<bool, SuperviseError> {
     let (current_enabled, current_state) = {
@@ -2591,7 +2649,7 @@ fn spawn_child(
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
     ring: &Arc<Mutex<StderrRing>>,
-) -> Result<Child, SuperviseError> {
+) -> Result<SupervisedChild, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     if let Some(connection_file_path) = connection_file_path {
@@ -2656,12 +2714,12 @@ fn spawn_child(
         source,
     })?;
 
-    match child.stderr.take() {
+    let stderr_pump = match child.stderr.take() {
         Some(stderr) => {
             ring.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push_process_start();
-            tokio::spawn(pump_stderr(stderr, Arc::clone(ring)));
+            Some(tokio::spawn(pump_stderr(stderr, Arc::clone(ring))))
         }
         None => {
             // Spawning succeeded but the pipe did not materialise. Recording it as
@@ -2674,10 +2732,15 @@ fn spawn_child(
                 module_id = %spec.module_id,
                 "spawned child exposed no stderr pipe; tail will be unavailable"
             );
+            None
         }
-    }
+    };
 
-    Ok(child)
+    Ok(SupervisedChild {
+        child,
+        stderr_pump,
+        stderr_ring: Arc::clone(ring),
+    })
 }
 
 /// A fresh 256-bit CSPRNG launch nonce, lowercase hex. Used to bind a reserved
@@ -2712,7 +2775,7 @@ fn spawn_and_mark_running(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
-) -> Result<Child, SuperviseError> {
+) -> Result<SupervisedChild, SuperviseError> {
     let child = spawn_child(
         spec,
         runtime.connection_file_path.as_deref(),
@@ -2920,7 +2983,7 @@ async fn begin_forwarding_drain_with(
 async fn wait_for_registration_after_reload(
     registry: &Registry,
     module_id: &str,
-    child: &mut Child,
+    child: &mut SupervisedChild,
     wait: Duration,
 ) -> Result<RegistrationWaitOutcome, SuperviseError> {
     let deadline = Instant::now() + wait;
@@ -2966,7 +3029,7 @@ async fn handle_reload_child_registration_failure(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     failure: ReloadRegistrationFailure,
 ) -> Result<(), SuperviseError> {
     let ReloadRegistrationFailure {
@@ -3032,7 +3095,7 @@ async fn handle_reload_spawn_failure(
     runtime: &SupervisorRuntimeConfig,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     reason: String,
 ) -> Result<(), SuperviseError> {
     let mut should_retry = false;
@@ -3084,7 +3147,7 @@ async fn drain_optional_child(
     module_id: &str,
     registry: &Registry,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     drain_timeout: Duration,
     final_state: ModuleState,
     enabled: Option<bool>,
@@ -3117,7 +3180,7 @@ async fn drain_child_to_state(
     module_id: &str,
     registry: &Registry,
     snapshot: &SharedSnapshot,
-    mut child: Child,
+    mut child: SupervisedChild,
     drain_timeout: Duration,
     final_state: ModuleState,
     enabled: Option<bool>,
@@ -3160,6 +3223,7 @@ async fn drain_child_to_state(
         state.pid = None;
         state.last_exit = Some(exit_report);
     })?;
+    child.drain_stderr(module_id).await;
 
     wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
 }

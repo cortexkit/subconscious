@@ -1395,6 +1395,9 @@ impl ControlHandler {
             tail: StderrTail {
                 capture: match snapshot.capture {
                     CaptureState::Captured => StderrCaptureState::Captured,
+                    CaptureState::Incomplete { reason } => {
+                        StderrCaptureState::Incomplete { reason }
+                    }
                     CaptureState::NotCaptured { reason } => {
                         StderrCaptureState::NotCaptured { reason }
                     }

@@ -560,7 +560,13 @@ async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
         "precondition: the module should have exited non-zero"
     );
 
-    let tail = module.stderr_tail(None, None);
+    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        matches!(tail.capture, CaptureState::Captured)
+            && tail.entries.iter().any(
+                |entry| matches!(entry, TailEntry::Line { text, .. } if text.contains("missing top-level `storage`")),
+            )
+    })
+    .await;
     assert!(
         matches!(tail.capture, CaptureState::Captured),
         "a spawned module must report captured, not an empty tail that reads as silence"
@@ -604,7 +610,10 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
     })
     .await;
 
-    let tail = module.stderr_tail(None, None);
+    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        matches!(tail.capture, CaptureState::Captured) && tail.entries.is_empty()
+    })
+    .await;
     assert!(
         matches!(tail.capture, CaptureState::Captured),
         "silence and absence must be distinguishable; got {:?}",
@@ -638,11 +647,20 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
         .unwrap();
 
     let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
-        tail.entries
+        let boots = tail
+            .entries
+            .iter()
+            .filter(
+                |entry| matches!(entry, TailEntry::Line { text, .. } if text.starts_with("boot ")),
+            )
+            .count();
+        let process_starts = tail
+            .entries
             .iter()
             .filter(|entry| matches!(entry, TailEntry::ProcessStart))
             .count()
-            >= 2
+            >= 2;
+        boots >= 2 && process_starts
     })
     .await;
 
@@ -654,6 +672,61 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
     assert!(
         boots >= 2,
         "output from before the restart was lost; got {:?}",
+        tail.entries
+    );
+    assert!(
+        tail.entries
+            .iter()
+            .filter(|entry| matches!(entry, TailEntry::ProcessStart))
+            .count()
+            >= 2,
+        "restart boundaries were lost; got {:?}",
+        tail.entries
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "stderr-tail-wedged-pump".to_string(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "echo old-start >&2; (sleep 1; echo old-trailing >&2) & exit 1".to_string(),
+            ],
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        matches!(tail.capture, CaptureState::Incomplete { .. })
+            && tail
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, TailEntry::ProcessStart))
+    })
+    .await;
+    assert!(
+        tail.entries
+            .iter()
+            .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-start"),),
+        "the initial process output was not retained: {:?}",
+        tail.entries
+    );
+
+    sleep(Duration::from_millis(1200)).await;
+    let tail = module.stderr_tail(None, None);
+    assert!(
+        !tail
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-trailing"),),
+        "old output crossed the restart boundary: {:?}",
         tail.entries
     );
 }

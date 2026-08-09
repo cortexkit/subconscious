@@ -276,7 +276,7 @@ The realisation is normative and lives here:
 | element | value | failure if wrong |
 | --- | --- | --- |
 | blob key | `cks` | extension finds no blob; LOUD only because the reader distinguishes absent from malformed |
-| `mutable-content` | `1` | **the extension NEVER RUNS**; notification displays, blob silently ignored |
+| `mutable-content` | JSON NUMBER `1`, never the string `"1"` | **the extension NEVER RUNS**; notification displays, blob silently ignored |
 | `aps.alert` | title or body present | notification discarded by iOS |
 
 **The block is MINIMAL, not exhaustive: the table is the requirement set.** A
@@ -288,6 +288,19 @@ alone, either copies the block verbatim or treats it as a floor. **The security
 argument here is entirely about what must be PRESENT and says nothing about what
 must be absent**, so an exhaustive reading would forbid harmless additions for no
 reason the rest of this document supports.
+
+**The type is load-bearing and the distinction survives no rendering.** `"1"` is
+valid JSON, reads correctly to a human, and does not run the extension — and every
+payload rendering that quotes values erases the difference, including a dry-run
+line read at 2am. So assert on the PARSED value (`parsed["aps"]["mutable-content"]
+== 1`), never on the text.
+
+This repository has already been bitten by the same family in the other direction:
+a Swift JSON encoder checked `as? Bool` before the number branch, and because
+Foundation bridges `NSNumber(0)`/`NSNumber(1)` to `Bool`, **every numeric 0 and 1
+went onto the wire as `false`/`true`** until it was fixed. **A JSON scalar whose
+type is chosen by a language's coercion rules rather than by the writer is a
+boundary defect waiting for a reader**, and 0 and 1 are where it lands.
 
 **`mutable-content: 1` is the one to check before the first send.** It is a
 SENDER-side key, so it correctly appears nowhere in the client, which is precisely

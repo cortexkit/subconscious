@@ -141,6 +141,37 @@ jobs:
           fi
         shell: bash
 
+      # Seven repos consume this repo's crates BY RELATIVE PATH and float to its
+      # HEAD. A path dependency is recorded in their Cargo.lock as a bare version
+      # string with no source and no checksum, so `--locked` over there cannot see
+      # that the code moved -- only that the version did. Measured when this was
+      # found: subc-protocol had 5 source commits in 30 days and 0 version bumps.
+      #
+      # Linux only: the check reads git history, which is platform-independent,
+      # and running it twice would report the same violation twice.
+      - name: Cross-repo crates moved with their versions
+        if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
+        run: |
+          # A push compares against its own before-state; a PR against its base.
+          # Both are fetched shallow by default, so deepen enough to resolve them.
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          # An all-zero or empty before-sha means a new branch or a force push,
+          # where there is no meaningful base. Skip LOUDLY: silence here would be
+          # indistinguishable from a pass.
+          case "$BASE" in
+            ""|0000000000000000000000000000000000000000)
+              echo "no resolvable base for this event -- version drift NOT checked"
+              exit 0
+              ;;
+          esac
+          git fetch --depth=50 origin "$BASE" 2>/dev/null || git fetch --unshallow 2>/dev/null || true
+          bash scripts/fleet/check-wire-crate-versions.sh "$BASE"
+        shell: bash
+
   # Both TypeScript packages ship from this repo and are wire-compatible with the
   # Rust crates, so their typecheck + tests gate here too — otherwise a TS-only
   # break (e.g. a private-member test-harness type error) stays invisible until a

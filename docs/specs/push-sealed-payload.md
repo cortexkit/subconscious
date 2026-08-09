@@ -60,13 +60,28 @@ from the cause.
 | `info` | empty (`Data()` / `&[]`) |
 | associated data | the 1-byte `version` prefix |
 
-**The suite is forced rather than chosen, and the forcing is one-sided.**
-CryptoKit exposes exactly one X25519 suite, so the opener has no alternative;
-the sealer has many. RFC 9180's suite table begins with X25519 + AES-128-GCM,
-which is what an implementation reaches for when nothing says otherwise — so the
-common default and the only available option were about to disagree. Confirmed
-non-empty on both sides: `chacha20poly1305` is already present in the sealer's
-lockfile via Noise, so neither side takes on a new primitive.
+**This is a choice, not a constraint — and the earlier claim that the opener had
+no alternative was wrong.** CryptoKit ships exactly one X25519 suite as a *preset
+constant* (`Curve25519_SHA256_ChachaPoly`), but it also exposes
+`HPKE.Ciphersuite.init(kem:kdf:aead:)`, and its `AEAD` enum carries `AES_GCM_128`
+and `AES_GCM_256` alongside `chaChaPoly`. So X25519 with AES-GCM is constructible
+on the opener too, and "forced" was a claim about which constants are *named*
+rather than about what the API permits.
+
+The decision is unchanged and the honest reason is narrower: ChaCha20-Poly1305 is
+the combination available as a preset on one side and already present in the
+other's dependency tree via Noise, so it is the option where **neither side adds
+a primitive or reaches past the well-lit path**. RFC 9180's suite table begins
+with X25519 + AES-128-GCM, so the common default and the natural choice here
+still disagree — which is why naming it remains load-bearing regardless of
+whether either side *could* have done otherwise.
+
+The correction matters more than the wording: a decision recorded as FORCED is
+never revisited, because there is nothing to revisit. Recorded as a choice with
+its reason, it can be re-opened when the reason stops holding — and if
+post-quantum or a hardware-accelerated AEAD ever becomes the better answer, the
+true constraint is that both sides must move together, not that one side cannot
+move.
 
 **A suite that is never named is satisfiable by any suite**, and both sides pick
 a defensible one.

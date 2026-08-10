@@ -129,17 +129,31 @@ up as they ship.
   Unwrapping is transport-level protocol decode in plexus (7702590):
   structuredContent preferred, single parseable text block unwrapped,
   anything else served unchanged. Poll shapes address the BARE result.
-- GitHub v1 poll surface on shipped machinery: ISSUES ONLY. PRs, releases,
-  workflow-run conclusions, and comments are all measured-not-promised.
-  Measured at the live vendor: neither `list_pull_requests` nor
-  `list_releases` accepts a timestamp bound, and the ordered-timestamp
-  cursor REQUIRES one -- ordering is not bounding. A poll shape declaring
-  a `since` the vendor ignores would advance its watermark, dedupe-suppress
-  its own re-fetches, and read as a healthy quiet feed while silently blind
-  past page one: internally consistent, no error, wrong, and it would pass
-  the first live call too. Releases likely want a SCALAR-DIFF shape
-  (latest-release vs stored tag), a sibling to the cursor model rather than
-  a bent instance of it.
+- GitHub v1 surface, every line measured (both MCP endpoints, readonly 27
+  tools and full 44): ISSUES work today, end to end, deduplicated. PRs and
+  releases accept NO timestamp bound (`list_releases` not even an ordering),
+  and the ordered-timestamp cursor requires one -- ordering is not bounding.
+  A poll shape declaring a `since` the vendor ignores would advance its
+  watermark, dedupe-suppress its own re-fetches, and read as a healthy
+  quiet feed while silently blind past page one: internally consistent, no
+  error, wrong, and it would pass the first live call too. Comment READS
+  and workflow-run tools DO NOT EXIST on either MCP endpoint (the only
+  comment tools are writes) -- those are REST-transport questions, never
+  MCP cursor questions. "Our endpoint omits it" and "the vendor does not
+  serve it" are different propositions; only the second closes a question,
+  so measure the full surface before concluding from the narrow one.
+- Releases are solved by a SCALAR-DIFF strategy, a first-class SIBLING to
+  the cursor model, not a bent instance of it: fixed args in, ONE value
+  out, compare against stored, emit only on CHANGE, the watermark IS the
+  value. No dedupe (no item identity), no overlap window (no window).
+  Shares scheduler, authority chain, event log, and health surface with
+  the cursors. The same shape serves the local-predicate provider's whole
+  corpus class (mtime moved, file contains string, tag > vX) -- one
+  strategy for the 60% local class and the release slice together. The
+  vendor schema alone would have commissioned an unbounded release pager;
+  the condition corpus showed no condition needs release enumeration at
+  all. The measurement says what is POSSIBLE, the corpus says what is
+  NEEDED, and designs are built where they intersect.
 - A poll shape is a claim about a vendor's REQUEST SCHEMA, and an
   unmeasured claim is unevaluated. Manifest ingestion validates shape
   against the model, not against the vendor; the `drift` check gains

@@ -4,6 +4,7 @@
     "route.status"
   ],
   "module_id": "aft-tools",
+  "module_version": "0.9.3",
   "roles": [
     {
       "concurrency": "module_managed",

@@ -294,6 +294,7 @@ fn bind_identity() -> BindIdentity {
 fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
         module_id: "aft-tools".to_string(),
+        module_version: Some("0.9.3".to_string()),
         roles: provider_roles(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
     }

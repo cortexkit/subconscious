@@ -148,6 +148,21 @@ pub enum ClientControlResponse {
         connected_clients: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         counters: Option<serde_json::Value>,
+        /// Git commit the daemon was built from, or "unavailable" when the
+        /// build could not read it. The crate version cannot discriminate a
+        /// skewed daemon/CLI pair (it moves per release, not per commit), so
+        /// this is the identity a consumer compares against its own embedded
+        /// commit to detect that it is talking to an older build than it was
+        /// compiled with. Absent from daemons predating the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_git_sha: Option<String>,
+        /// sha256 of the workspace Cargo.lock at build time, or "unavailable".
+        /// Answers "which dependency set" where the commit answers "which
+        /// source"; a commit match with a digest mismatch means a rebuild
+        /// against edited dependencies. Absent from daemons predating the
+        /// field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_lock_digest: Option<String>,
     },
     #[serde(rename = "catalog.list")]
     CatalogList {

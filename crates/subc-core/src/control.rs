@@ -926,6 +926,8 @@ impl ControlHandler {
             capabilities: self.subc_capabilities.as_ref().to_vec(),
             connected_clients: self.connected_clients.count(),
             counters: Some(counters),
+            build_git_sha: Some(env!("SUBC_BUILD_GIT_SHA").to_string()),
+            build_lock_digest: Some(env!("SUBC_BUILD_LOCK_DIGEST").to_string()),
         };
         Ok(vec![control_response_body_frame(
             &frame,

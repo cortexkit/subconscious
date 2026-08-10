@@ -768,6 +768,7 @@ async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError>
                 uptime,
             ]],
         );
+        print_build_skew(&connected_clients);
         if let Some(counters) = connected_clients.get("counters").and_then(Value::as_object) {
             let mut rows = counters
                 .iter()
@@ -778,6 +779,50 @@ async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError>
         }
     }
     Ok(())
+}
+
+/// Compare the daemon's embedded build provenance against this CLI's own.
+///
+/// `daemon_ver` cannot catch a skewed pair: both binaries report the crate
+/// version, which moves per release, so a daemon and a `ck` separated by many
+/// wire-touching commits agree exactly when the disagreement matters. The
+/// embedded commit moves per change. A daemon predating the field reports
+/// nothing, and that prints as unverifiable rather than as a match -- absence
+/// of the check must not read as the check passing.
+fn print_build_skew(describe: &Value) {
+    let cli_sha = env!("SUBC_BUILD_GIT_SHA");
+    let daemon_sha = describe.get("build_git_sha").and_then(Value::as_str);
+    match daemon_sha {
+        None => println!(
+            "build skew: daemon predates provenance reporting (CLI {cli_sha:.12}); unverifiable"
+        ),
+        Some("unavailable") => {
+            println!(
+                "build skew: daemon build recorded no commit (CLI {cli_sha:.12}); unverifiable"
+            );
+        }
+        Some(sha) if cli_sha == "unavailable" => {
+            println!(
+                "build skew: this ck build recorded no commit (daemon {sha:.12}); unverifiable"
+            );
+        }
+        // A -dirty build embeds HEAD while running code that differs from it,
+        // so equality of two dirty identities proves the STARTING commit
+        // matched and nothing about the code. Say so instead of staying
+        // silent: silence here is the match signal.
+        Some(sha) if sha == cli_sha && sha.ends_with("-dirty") => {
+            println!("build skew: both built from {sha:.12} with uncommitted changes; commit match only, code match unproven");
+        }
+        Some(sha) if sha == cli_sha => {}
+        Some(sha) => {
+            println!(
+                "BUILD SKEW: daemon {sha:.12} != ck {cli_sha:.12} -- one of the pair is stale;"
+            );
+            println!(
+                "  fields this ck expects may be absent from the daemon (or arrive unrecognized)"
+            );
+        }
+    }
 }
 
 async fn supervisor_list(client: &mut CkClient) -> Result<Value, CkError> {

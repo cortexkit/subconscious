@@ -176,6 +176,11 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 capabilities: vec!["manifest_registration_v1".to_string()],
                 connected_clients: 2,
                 counters: None,
+                // Absent in this fixture: pins that a daemon predating the
+                // provenance fields serializes no key at all, which is what
+                // lets a newer client distinguish "old daemon" from a match.
+                build_git_sha: None,
+                build_lock_digest: None,
             },
         ),
         (
@@ -194,6 +199,12 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     "route_released_epoch_fenced": 6,
                     "route_release_stale_skipped": 7,
                 })),
+                // Distinct values, real shapes: a 40-hex commit and a 64-hex
+                // digest, so the pin would catch the two fields transposed.
+                build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                build_lock_digest: Some(
+                    "9d2c0d69cd82f2151bbb2b32ab9ac9d861063ffde2f8582afe767ec7e1f2145c".to_string(),
+                ),
             },
         ),
         (

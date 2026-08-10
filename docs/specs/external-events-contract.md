@@ -139,6 +139,28 @@ up as they ship.
   `record_version` — that reporting path is load-bearing observability,
   not telemetry.
 
+## Reading the event log: the time dimension lies three ways
+
+Every reading below was internally consistent — fields set, zero failures,
+plausible counts — and wrong. All three occurred during this plane's first
+live day, two of them minutes after their authors wrote the rule they broke.
+
+- STALE-AS-CURRENT: the first post-restart poll reading predated the
+  restart; a zero from the old binary read as the new binary failing. Date
+  any observation against PROCESS START, not against your own restart
+  command.
+- TWO-MOMENTS-AS-ONE: a log line and a health probe minutes apart read as
+  one simultaneous snapshot, manufacturing a state divergence that never
+  existed.
+- ONE-MOMENT-AS-TWO: a single poll cycle's 11-events-11-distinct read as
+  dedupe proof; dedupe is only observable across TWO cycles.
+
+The requirement is a check, not an exhortation — the rule was demonstrably
+broken by someone who had just written it: ANY CLAIM ABOUT A POLL-CYCLE
+PROPERTY NAMES THE `last_polled_at_ms` PAIR THAT BRACKETS IT. A property
+claim without its bracketing timestamps is unevaluated, the same way a rate
+without a distribution is unquoted.
+
 ## Why the operator chain is a standing requirement
 
 Four defects in one evening were invisible to green CI and visible within

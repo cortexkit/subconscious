@@ -234,6 +234,12 @@ pub struct CatalogEntry {
     /// Optional on the wire only because entries serialized by older daemons
     /// lack it: absent means "daemon predates the field", never "module has
     /// no version" (the manifest field is required at registration).
+    ///
+    /// The reading is ARMED BY OBSERVATION, not by this documentation: until
+    /// a consumer has seen at least one populated entry from the daemon it is
+    /// connected to, an all-None catalog is indistinguishable from an old
+    /// daemon, and a client shipping the documented reading against it would
+    /// hold a guarantee it does not have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module_version: Option<String>,
     pub roles: Vec<ProviderRole>,

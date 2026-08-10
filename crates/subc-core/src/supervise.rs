@@ -257,6 +257,11 @@ pub struct ModuleStatus {
     pub registration_active: bool,
     pub live: bool,
     pub restart_count: u32,
+    /// The budget `restart_count` is spent against. Carried alongside the count
+    /// because the count alone does not say how close the module is to being
+    /// disabled, and reporting one without the other is what makes an
+    /// about-to-be-retired module look ordinary.
+    pub max_restarts: u32,
     pub pid: Option<u32>,
     pub last_exit: Option<ExitReport>,
     pub health: ModuleHealthStatus,
@@ -842,6 +847,7 @@ impl Supervisor {
                 configuration,
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
+                max_restarts: self.restart_policy.max_restarts,
             }),
         };
         if let Some(supervisor_handle) = &self.supervisor_handle {
@@ -871,6 +877,10 @@ struct SupervisedModuleInner {
     configuration: Arc<Mutex<SupervisedConfiguration>>,
     commands: mpsc::Sender<SupervisorCommand>,
     monitor: Mutex<Option<JoinHandle<()>>>,
+    /// Copied from the supervisor's runtime config at spawn so `status()` can
+    /// report the restart budget without reaching back into the supervisor. The
+    /// policy is fixed for the process's lifetime, so a copy cannot drift.
+    max_restarts: u32,
 }
 
 impl fmt::Debug for SupervisedModule {
@@ -912,6 +922,7 @@ impl SupervisedModule {
             registration_active,
             live,
             restart_count: snapshot.restart_count,
+            max_restarts: self.inner.max_restarts,
             pid: snapshot.pid,
             last_exit: snapshot.last_exit,
             health: snapshot.health,

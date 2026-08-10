@@ -6,7 +6,9 @@
       "health": "degraded",
       "last_probe_ms": 1700000000000,
       "live": true,
+      "max_restarts": 3,
       "module_id": "aft-tools",
+      "restart_count": 2,
       "state": "running"
     }
   ],

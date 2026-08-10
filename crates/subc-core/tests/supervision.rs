@@ -291,6 +291,44 @@ async fn restart_cap_marks_module_failed_without_infinite_loop() {
     assert!(!status.live);
 }
 
+/// The budget a module is spent against must travel with the count that spends
+/// it, on the same status a reader gets.
+///
+/// Without the pair, an operator reading `restart_count` cannot tell a module
+/// one crash from being disabled apart from one with headroom, and the
+/// neighbouring health counter cannot supply it because that one returns to zero
+/// on any successful probe. The configured value is asserted rather than the
+/// default, so a `status()` hard-coding `DEFAULT_MAX_RESTARTS` would fail here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reports_the_restart_budget_alongside_the_count() {
+    let server = TestServer::start().await;
+    let max_restarts = 2;
+    let supervisor = supervisor(&server, max_restarts, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(stub_spec(
+            &server,
+            "fake-aft-budget",
+            [("FAKE_AFT_CRASH_AFTER_MS", "0")],
+        ))
+        .unwrap();
+
+    let fresh = module.status().unwrap();
+    assert_eq!(
+        fresh.max_restarts, max_restarts,
+        "the configured budget must be reported, not the default"
+    );
+
+    let exhausted = wait_for_status(&module, Duration::from_secs(2), |status| {
+        status.state == ModuleState::Failed
+    })
+    .await;
+
+    // The count moved and the budget did not: a reader can see the module is out
+    // of headroom, which a bare count of 2 cannot express.
+    assert_eq!(exhausted.restart_count, max_restarts);
+    assert_eq!(exhausted.max_restarts, max_restarts);
+}
+
 /// `start` (enable on an already-enabled module) must heal a Failed module: the
 /// budget is exhausted, no in-band retry remains, and the operator's start IS the
 /// recovery act. Regression for the 2026-07-14 aft outage, where set_enabled(true)

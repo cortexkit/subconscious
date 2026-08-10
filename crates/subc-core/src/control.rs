@@ -1348,6 +1348,8 @@ impl ControlHandler {
                     last_probe_ms: status.health.last_probe_ms,
                     last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
                     last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
+                    restart_count: Some(status.restart_count),
+                    max_restarts: Some(status.max_restarts),
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;

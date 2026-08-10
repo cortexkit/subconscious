@@ -3219,21 +3219,25 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
             && event.get("reject") == Some(&Value::Bool(true))
     })
     .await;
-    let bee_channel = bee_attach["route_channel"].as_u64().unwrap();
-    wait_for_stub_event(harness.provider_events_path("bee"), READ_TIMEOUT, |event| {
-        event.get("kind") == Some(&Value::String("detach".to_owned()))
-            && event.get("route_channel") == Some(&Value::from(bee_channel))
-    })
-    .await;
-    wait_for_binding_count(&harness.server.daemon.forwarding, 1, READ_TIMEOUT).await;
-    assert_counter_stays(
+    let _bee_channel = bee_attach["route_channel"].as_u64().unwrap();
+    // The rejecting provider is SKIPPED for this pass; the healthy new
+    // provider is adopted. The old contract rolled the whole reconcile back,
+    // which meant one module's refusal silently discarded every other
+    // module's tools -- the exact shape that once removed the entire Claude
+    // Code tool surface because one connector's policy said no. Two bindings:
+    // aft (kept) and bee (adopted); zed gets none.
+    wait_for_binding_count(&harness.server.daemon.forwarding, 2, READ_TIMEOUT).await;
+    TestMcpClient::wait_for_counter(
         &harness.client_handler.tool_list_changed_count,
         0,
-        "tools/list_changed after failed catalog reconciliation",
-        QUIET_TIMEOUT,
+        "tools/list_changed after partial catalog reconciliation",
     )
     .await;
-    assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
+    assert_eq!(
+        list_tool_names(&harness).await,
+        vec!["aft_read", "bee_memory"],
+        "the healthy new provider must be adopted and the rejecting one absent"
+    );
 
     let result = harness
         .client
@@ -3244,7 +3248,18 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
     assert_eq!(result.is_error, Some(false));
     assert!(
         result_text(&result).contains("fake-aft tool read called"),
-        "existing tool should remain callable after failed reconciliation: {result:?}"
+        "existing tool should remain callable after partial reconciliation: {result:?}"
+    );
+    let result = harness
+        .client
+        .peer()
+        .call_tool(CallToolRequestParams::new("bee_memory"))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.is_error,
+        Some(false),
+        "the adopted provider's tool must actually serve: {result:?}"
     );
 
     harness.shutdown().await;

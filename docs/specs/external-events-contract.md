@@ -173,6 +173,19 @@ up as they ship.
   subscribe baselines silently. Authoring pins the scalar field name at
   compile time from the same drift-checked manifest source, so the
   misdeclaration path dies at the earliest layer that can see it.
+- Seed keys are refused when the cursor kind does not read them, with the
+  accepted spellings named in the error. Each kind reads exactly:
+  scalar_diff -> scalar; ordered_timestamp -> watermark_ms, watermark_id,
+  window_ms; sync_token -> sync_token. Without the refusal, a miskeyed
+  seed is admitted by the handler (which stores any well-formed state) and
+  ignored by the strategy (which reads only its own keys) -- individually
+  correct layers, jointly silent, and the watch behaves as unseeded with
+  no error anywhere. The general check for any keyed hand-off: WHO REFUSES
+  A KEY NOBODY READS? If nobody, the misspelling is admitted somewhere and
+  ignored somewhere else, and both layers pass their own tests. The
+  measurement that retired "operator care" as the answer: the designer of
+  the seed semantics, in the test written to protect them, seeded a key
+  the strategy ignores -- within the hour.
 - A poll shape is a claim about a vendor's REQUEST SCHEMA, and an
   unmeasured claim is unevaluated. Manifest ingestion validates shape
   against the model, not against the vendor; the `drift` check gains

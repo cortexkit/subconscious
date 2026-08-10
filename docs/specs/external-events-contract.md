@@ -154,6 +154,14 @@ up as they ship.
   the condition corpus showed no condition needs release enumeration at
   all. The measurement says what is POSSIBLE, the corpus says what is
   NEEDED, and designs are built where they intersect.
+- That pairing is the DESIGN GATE for every future provider surface: a new
+  poll shape or strategy requires BOTH a measured vendor schema and a
+  demand reading (condition corpus, usage records, or a named consumer).
+  Either alone commissions the wrong work -- schema-only builds strategies
+  nobody wants; demand-only assumes surfaces nobody serves.
+- Naming: a scalar-diff provider's stored state is called `scalar` on the
+  wire, never `cursor`, so the sibling is not read as a cursor variant by
+  the next implementer.
 - A poll shape is a claim about a vendor's REQUEST SCHEMA, and an
   unmeasured claim is unevaluated. Manifest ingestion validates shape
   against the model, not against the vendor; the `drift` check gains

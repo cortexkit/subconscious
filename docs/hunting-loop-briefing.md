@@ -10775,3 +10775,13 @@ Where the default is legitimately optional, the fix is at the only place an
 implementor reads — the doc comment naming what the default asserts and which
 implementors are at risk. Record that as guidance, which is the weakest instrument
 available, rather than as closure.
+
+## Additions, 2026-08-10 (external-events live day)
+
+| Check | Where it fails |
+| --- | --- |
+| A fixture with one element cannot exercise a traversal. A `?`/early-return inside a loop is invisible to every single-element fixture; plant a multi-element fixture where the element under test is NOT first. | The drift validator -- built specifically to catch unmeasured claims -- shipped with a first-element early-return its two single-action fixtures could not see. Only the live run caught it. |
+| A number whose scope is not in its name will be compared against the nearest number that looks compatible. Print `slice_x` beside `total_x`, never a bare `x`. | A cumulative `elapsed_ms` printed beside a per-slice budget invited a 3x-overrun misreading by its own author, in a diagnostic added that morning to make a fix attributable. |
+| The time dimension lies three ways, all with internally consistent readings: stale-as-current (observation predates what it is read against; date against process start), two-moments-as-one (readings minutes apart read as one snapshot), one-moment-as-two (a single cycle read as before-and-after). | First post-restart poll reading predated the restart; run-slot "divergence" from a log line beside a later health probe; dedupe "proven" from one cycle's 11-distinct-11. |
+| A measurement taken after a deploy is not necessarily a measurement of the deploy. Cadenced work's first post-restart artifact may belong to the previous binary and carries no build marker. | A zero read minutes after placement was the OLD binary's poll; it would have been reported as "fix ineffective" with complete confidence. |
+| An offer to defer, restated by a third party, becomes a deferral. Summaries must carry the ANSWER, not the offer one message earlier. | "Tomorrow by their choice" reached the operator after the offer had been overturned with "yes, now" one sequence later. |

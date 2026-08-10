@@ -129,10 +129,22 @@ up as they ship.
   Unwrapping is transport-level protocol decode in plexus (7702590):
   structuredContent preferred, single parseable text block unwrapped,
   anything else served unchanged. Poll shapes address the BARE result.
-- GitHub v1 poll surface: issues, PRs, releases. Comments and
-  workflow-run conclusions are measured-not-promised (comment streams are
-  not expressible by the current cursor model; workflow tools are not in
-  the vendor manifest at all).
+- GitHub v1 poll surface on shipped machinery: ISSUES ONLY. PRs, releases,
+  workflow-run conclusions, and comments are all measured-not-promised.
+  Measured at the live vendor: neither `list_pull_requests` nor
+  `list_releases` accepts a timestamp bound, and the ordered-timestamp
+  cursor REQUIRES one -- ordering is not bounding. A poll shape declaring
+  a `since` the vendor ignores would advance its watermark, dedupe-suppress
+  its own re-fetches, and read as a healthy quiet feed while silently blind
+  past page one: internally consistent, no error, wrong, and it would pass
+  the first live call too. Releases likely want a SCALAR-DIFF shape
+  (latest-release vs stored tag), a sibling to the cursor model rather than
+  a bent instance of it.
+- A poll shape is a claim about a vendor's REQUEST SCHEMA, and an
+  unmeasured claim is unevaluated. Manifest ingestion validates shape
+  against the model, not against the vendor; the `drift` check gains
+  poll-parameter validation against the live inputSchema so a manifest
+  cannot declare a parameter the vendor does not accept.
 - The GitHub credential is a static PAT: the vault cannot probe its
   liveness and will report `active` past its 2027-08-11 expiry. The ONLY
   health signal is consumers reporting auth failures with the SERVED

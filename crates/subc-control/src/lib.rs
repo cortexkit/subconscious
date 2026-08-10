@@ -276,6 +276,28 @@ pub struct SupervisorEntry {
     /// (often a panic-abort). Survives respawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit_signal: Option<i32>,
+    /// Replacement processes spawned for this module so far, against the budget
+    /// that disables it.
+    ///
+    /// THIS IS THE COUNTER THAT ENDS A MODULE, and it is not the one beside it.
+    /// `SupervisorHealthEntry::consecutive_failures` returns to zero on any
+    /// successful probe, so a module can miss probes all day and read zero; this
+    /// one only decreases when an operator restarts, reloads, or re-enables the
+    /// module. Reaching the budget moves it to `Failed` and it stays there until
+    /// somebody intervenes.
+    ///
+    /// So a module one restart from being disabled is indistinguishable from a
+    /// freshly booted one unless this pair is read. Both are reported together
+    /// because the count alone does not say how close it is.
+    ///
+    /// Absent from daemons predating the field, which is why it is optional
+    /// rather than defaulted to zero: zero would assert a full budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<u32>,
+    /// Replacement processes this module is allowed before it is disabled. See
+    /// `restart_count`; absent on daemons predating the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_restarts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

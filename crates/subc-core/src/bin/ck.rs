@@ -1933,6 +1933,7 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
         .map(|entry| display_field(entry, "last_action"))
         .unwrap_or_else(|| "-".to_string());
     let last_exit = format_last_exit(module);
+    let restarts = format_restart_budget(module);
 
     print_table(
         &[
@@ -1942,6 +1943,7 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             "live",
             "health",
             "failures",
+            "restarts",
             "last_action",
             "last_exit",
             "detail",
@@ -1954,12 +1956,33 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             display_field(module, "live"),
             health_status,
             failures,
+            restarts,
             last_action,
             last_exit,
             detail,
             truncate_cell(&metrics),
         ]],
     );
+}
+
+/// Render the restart budget as `used/allowed`, e.g. `2/3`.
+///
+/// Shown next to `failures` because the two counters look interchangeable and
+/// are not: `failures` returns to zero on any successful probe, while this one
+/// only falls when an operator restarts, reloads, or re-enables the module.
+/// A module one restart from being disabled reports `failures 0`, and without
+/// this column nothing on the row says so.
+///
+/// `-` when the daemon predates the field: an older daemon reports nothing here,
+/// and printing `0/0` would assert a spent budget on a healthy module.
+fn format_restart_budget(module: &Value) -> String {
+    match (
+        module.get("restart_count").and_then(Value::as_u64),
+        module.get("max_restarts").and_then(Value::as_u64),
+    ) {
+        (Some(used), Some(allowed)) => format!("{used}/{allowed}"),
+        _ => "-".to_string(),
+    }
 }
 
 /// Render the module's most recent process exit as a compact cell, e.g.

@@ -380,6 +380,21 @@ else
       echo   "    -> total is a FLOOR: a flood ending mid-window never flushes its last count"
     fi
     [ "$dl_mb" -gt 200 ] && echo "  UNROTATED: >200 MB on a shared surface"
+    # A skipped MCP provider is a partial tool surface serving as healthy, and
+    # the skip line is its ONLY witness anywhere in the stack: the harness sees
+    # nothing (the model treats absent tools as normal and works around them
+    # silently -- a whole tool surface once vanished from Claude Code without a
+    # single error), and the shim serves the remaining providers as designed.
+    # Deliberate skips (plexus's first-party-only policy) look identical to a
+    # misconfigured provider being dropped, so every distinct skip is printed
+    # with its reason rather than counted.
+    dl_skips=$(printf '%s\n' "$dl_win" | grep 'skipping provider' | sed 's/.*skipping provider/skipping provider/' | sort -u)
+    if [ -n "$dl_skips" ]; then
+      echo "  MCP providers skipped in recent sessions (partial tool surface):"
+      printf '%s\n' "$dl_skips" | sed 's/^/    /'
+    else
+      printf '  MCP provider skips: none in last 20k lines (control: %s lines exist)\n' "$dl_total"
+    fi
   fi
 fi
 echo

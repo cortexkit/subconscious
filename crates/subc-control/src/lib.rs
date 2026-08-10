@@ -18,14 +18,21 @@ pub struct ConsumerIdentity {
 }
 
 /// Reserved dotted operation prefixes for the v0.4 control vocabulary.
+///
+/// `scheduler.` and `watch.` were reserved here from v0.4 until 2026-08-10 and
+/// were removed deliberately rather than left as placeholders: neither was ever
+/// implemented, and both capabilities are now owned elsewhere by ruling --
+/// scheduled tasks belong to the session runtime (prefrontal) because the
+/// daemon is state-free routing, and external-event watching belongs to the
+/// connectors module (plexus). A reserved name for something that will never be
+/// built here reads as a roadmap commitment to anyone surveying the protocol,
+/// and it recruited exactly that misunderstanding from an outside contributor.
 pub mod ops {
     pub const SERVER: &str = "server.";
     pub const CATALOG: &str = "catalog.";
     pub const ROUTE: &str = "route.";
     pub const SUPERVISOR: &str = "supervisor.";
-    pub const SCHEDULER: &str = "scheduler.";
     pub const CONFIG: &str = "config.";
-    pub const WATCH: &str = "watch.";
 
     pub const SERVER_DESCRIBE: &str = "server.describe";
     pub const CATALOG_LIST: &str = "catalog.list";

@@ -16,7 +16,8 @@ Built and executed:
 - Hand tools over it: `handseal`, `handopen`, `kp` as crate examples. The
   handseal/handopen round trip is the only end-to-end exercise outside the
   crate's own tests.
-- The Swift conformance harness for the vector corpus.
+- The Swift conformance harness for the vector corpus, at
+  `clients/subc-client-swift/Tests/SubcFedTests/Fixtures/PushSealedPayloadConformanceTests.swift`.
 
 Not built anywhere:
 

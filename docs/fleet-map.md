@@ -70,7 +70,13 @@ Shipped and in production (supervised by the personal daemon today):
 - **plexus (plex)** — third-party service connectors (the reuse ladder:
   MCP-direct, OpenAPI-shim, vendor-deep-wrapper). Credentials stay in the
   vault and bearer handles never reach tool arguments; connectors get
-  binding tickets instead. Supervised in prod, read paths first.
+  binding tickets instead. Supervised in prod, read paths first. Also the
+  fleet's external-events observation plane: operator-minted poll
+  subscriptions with finite expiry, a cursored scheduler, and a durable
+  event log served pull-only (`events` facade) — proven against live
+  GitHub. By invariant, no code path lets an event cause an action;
+  delivery to agents is prefrontal's unified waker. Seams:
+  `docs/specs/external-events-contract.md`.
 
 Building / chartered:
 

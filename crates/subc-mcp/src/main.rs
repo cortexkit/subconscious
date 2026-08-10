@@ -2067,6 +2067,15 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
 
     let relay_session = Arc::new(RelaySession::new(identity.session.clone()));
     let mut routes = HashMap::new();
+    let mut desired = desired;
+    // Per-target refusals drop that provider and keep the session; any other
+    // failure is transport-shaped and stays fatal. One module's policy saying
+    // no must not cost the host every other module's tools -- the same
+    // one-bad-entry-erases-the-surface shape as invalid tool names, one layer
+    // down. The provider is removed from `desired` so the tool surface and the
+    // route map stay consistent (a desired provider without a route is a
+    // construction error downstream).
+    let mut refused = Vec::new();
     for provider in &desired.providers {
         match open_provider_route(
             subc,
@@ -2080,6 +2089,13 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
             Ok(route) => {
                 routes.insert(provider.module_id.clone(), route);
             }
+            Err(error) if error.is::<RouteOpenRefused>() => {
+                eprintln!(
+                    "subc-mcp module: skipping provider '{}' for this session: {error}",
+                    provider.module_id
+                );
+                refused.push(provider.module_id.clone());
+            }
             Err(error) => {
                 subc.relay().unregister_session_routes(&relay_session).await;
                 let opened_routes = routes.values().copied().collect::<Vec<_>>();
@@ -2088,6 +2104,9 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
             }
         }
     }
+    desired
+        .providers
+        .retain(|provider| !refused.contains(&provider.module_id));
 
     let opened_routes = routes.values().copied().collect::<Vec<_>>();
     let inner = match session_inner_from_desired(
@@ -2161,6 +2180,35 @@ async fn open_provider_route(
     .await
 }
 
+/// A daemon Error frame answering route.open: the daemon is healthy and said
+/// no for THIS target (policy refusal, unknown module, warming, ...).
+///
+/// Distinguished from transport failures because the two demand opposite
+/// handling at session attach: a refusal is scoped to one target, so the
+/// session must skip that provider and serve the rest -- treating it as fatal
+/// silently removes EVERY provider's tools because one module's policy said
+/// no, which is how a first-party-only refusal from a single connector once
+/// took down the whole Claude Code tool surface. A transport failure dooms
+/// every subsequent open on the same connection, so it stays fatal.
+#[derive(Debug)]
+struct RouteOpenRefused {
+    target: String,
+    code: String,
+    message: String,
+}
+
+impl std::fmt::Display for RouteOpenRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "subc refused route.open for target '{}': {}: {}",
+            self.target, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for RouteOpenRefused {}
+
 async fn open_route(
     subc: &SubcClient,
     target: RouteTarget,
@@ -2195,10 +2243,20 @@ async fn open_route(
                 ))),
             }
         }
-        FrameType::Error => Err(error_response(
-            &format!("subc rejected route.open for target '{target_label}'"),
-            &response.body,
-        )),
+        FrameType::Error => match serde_json::from_slice::<ErrorBody>(&response.body) {
+            // A parsed refusal is typed so callers can scope it to the target;
+            // an unparseable error body stays an opaque (fatal) error because
+            // nothing proves the daemon meant a per-target refusal.
+            Ok(error) => Err(Box::new(RouteOpenRefused {
+                target: target_label.to_string(),
+                code: error.code,
+                message: error.message,
+            })),
+            Err(_) => Err(error_response(
+                &format!("subc rejected route.open for target '{target_label}'"),
+                &response.body,
+            )),
+        },
         ty => Err(other_error(format!(
             "unexpected route.open response frame {ty:?} on channel {} corr {}",
             response.header.channel, response.header.corr
@@ -3373,6 +3431,10 @@ async fn reconcile_session_from_catalog(
 
     let mut routes = HashMap::new();
     let mut opened_routes = Vec::new();
+    // Same refusal scoping as attach_session: a per-target refusal drops that
+    // provider from this reconcile pass rather than failing the whole refresh.
+    let mut refused = Vec::new();
+    let mut desired = desired;
     for provider in &desired.providers {
         if let Some(route) = existing_routes.get(&provider.module_id) {
             routes.insert(provider.module_id.clone(), *route);
@@ -3388,6 +3450,14 @@ async fn reconcile_session_from_catalog(
         .await
         {
             Ok(route) => route,
+            Err(error) if error.is::<RouteOpenRefused>() => {
+                eprintln!(
+                    "subc-mcp module: skipping provider '{}' on policy refresh: {error}",
+                    provider.module_id
+                );
+                refused.push(provider.module_id.clone());
+                continue;
+            }
             Err(error) => {
                 for route in &opened_routes {
                     subc.relay().drop_route(*route).await;
@@ -3399,6 +3469,9 @@ async fn reconcile_session_from_catalog(
         opened_routes.push(route);
         routes.insert(provider.module_id.clone(), route);
     }
+    desired
+        .providers
+        .retain(|provider| !refused.contains(&provider.module_id));
 
     let inner = match session_inner_from_desired(
         subc,
@@ -5281,6 +5354,7 @@ mod tests {
         fn provider(module_id: &str, tool_names: &[&str]) -> CatalogEntry {
             CatalogEntry {
                 module_id: module_id.to_string(),
+                module_version: None,
                 roles: vec![ProviderRole::ToolProvider {
                     tools: tool_names
                         .iter()
@@ -5780,6 +5854,71 @@ mod tests {
             }
             ToolBinding::Forward(_) => panic!("test call expected an ack-only binding"),
         }
+    }
+
+    /// A daemon Error frame on route.open must classify as the typed
+    /// per-target refusal, and an unparseable error body must NOT -- the type
+    /// is what attach_session branches on to skip one provider instead of
+    /// dropping the whole session, so a misclassification in either direction
+    /// recreates the outage this exists to prevent: refusal-as-fatal erases
+    /// every provider's tools over one module's policy; garbage-as-refusal
+    /// silently skips a provider on a transport fault that should abort.
+    #[tokio::test]
+    async fn route_open_error_frame_classifies_as_per_target_refusal() {
+        async fn open_against_error_body(error_body: Vec<u8>) -> BoxError {
+            let (client_stream, mut server_stream) = connected_tcp_stream_pair().await;
+            let subc = SubcClient::start(client_stream);
+            let identity = BindIdentity {
+                project_root: PathBuf::from("/tmp/subc-mcp-refusal"),
+                harness: DEFAULT_HARNESS.to_string(),
+                session: "shim-session".to_string(),
+            };
+            let server = tokio::spawn(async move {
+                let frame = read_frame(&mut server_stream).await.unwrap().unwrap();
+                let response = build_frame(
+                    FrameType::Error,
+                    control_flags(),
+                    0,
+                    0,
+                    frame.header.corr,
+                    error_body,
+                )
+                .unwrap();
+                write_frame(&mut server_stream, &response).await.unwrap();
+                server_stream.flush().await.unwrap();
+                // Hold the socket open until the client finishes classifying,
+                // so the error frame is the observation rather than a race
+                // with connection teardown.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+            let route_session = Arc::new(RelaySession::new("shim-session".to_owned()));
+            let error = open_provider_route(&subc, "plexus", &identity, None, route_session)
+                .await
+                .expect_err("an error frame must not produce a route");
+            server.abort();
+            error
+        }
+
+        let refusal_body = serde_json::to_vec(&ErrorBody {
+            code: "principal_denied".to_string(),
+            message: "plexus connector tools are first-party only".to_string(),
+        })
+        .unwrap();
+        let error = open_against_error_body(refusal_body).await;
+        assert!(
+            error.is::<RouteOpenRefused>(),
+            "a parsed daemon refusal must be the typed per-target error, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("principal_denied"),
+            "the refusal must carry the daemon's code for the log line, got: {error}"
+        );
+
+        let error = open_against_error_body(b"not json at all".to_vec()).await;
+        assert!(
+            !error.is::<RouteOpenRefused>(),
+            "an unparseable error body must stay an opaque fatal error, got: {error}"
+        );
     }
 
     async fn connected_tcp_stream_pair() -> (TcpStream, TcpStream) {

@@ -91,6 +91,18 @@ where
 /// The header's `len` must match the opaque body length; mismatches are reported
 /// as a typed error rather than silently rewriting the header. This function does
 /// not flush buffered writers; callers choose their own flush cadence.
+///
+/// HEADER AND BODY GO OUT AS ONE WRITE. Writing them separately looks harmless
+/// behind a `BufWriter` and is not: `BufWriter` passes any write at or above its
+/// capacity straight through to the socket, and flushes what it holds first to
+/// preserve ordering. A body larger than the buffer therefore emits the 21-byte
+/// header as a segment of its own, followed by the body as a second segment --
+/// the small-leading-segment shape that Nagle holds until an ACK returns. The
+/// boundary sits at the buffer capacity, so the same code path is fast for small
+/// frames and slow for large ones, which is the hardest version to notice.
+///
+/// Joining them also halves the syscalls on the unbuffered path, where every
+/// `write_all` is a syscall of its own.
 pub async fn write_frame<W>(writer: &mut W, frame: &Frame) -> Result<(), FrameIoError>
 where
     W: AsyncWrite + Unpin,
@@ -102,17 +114,15 @@ where
         });
     }
 
-    writer
-        .write_all(&frame.header.encode())
-        .await
-        .map_err(FrameIoError::Io)?;
-    if !frame.body.is_empty() {
-        writer
-            .write_all(&frame.body)
-            .await
-            .map_err(FrameIoError::Io)?;
+    let header = frame.header.encode();
+    if frame.body.is_empty() {
+        return writer.write_all(&header).await.map_err(FrameIoError::Io);
     }
-    Ok(())
+
+    let mut joined = Vec::with_capacity(header.len() + frame.body.len());
+    joined.extend_from_slice(&header);
+    joined.extend_from_slice(&frame.body);
+    writer.write_all(&joined).await.map_err(FrameIoError::Io)
 }
 
 async fn read_exact_or_clean_eof<R>(
@@ -231,6 +241,84 @@ mod tests {
             body.to_vec(),
         )
         .unwrap()
+    }
+
+    /// Counts `poll_write` calls and records what each one carried, which is the
+    /// only way to observe segmentation: every round-trip test passes whether a
+    /// frame goes out as one write or as twenty, because the reader reassembles
+    /// either way. The bytes are identical and the latency is not.
+    #[derive(Default)]
+    struct WriteCounter {
+        writes: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for WriteCounter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.writes.push(buf.len());
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A frame with a body must reach the socket as ONE write.
+    ///
+    /// Writing the header separately is correct and slow: behind a `BufWriter` a
+    /// body at or above the buffer capacity is passed straight through, and the
+    /// buffered header is flushed first to keep ordering -- so the header goes out
+    /// alone as a 21-byte segment, and Nagle holds the body until that segment is
+    /// acknowledged. The reader cannot tell the difference, so nothing else in the
+    /// suite can fail when this regresses.
+    #[tokio::test]
+    async fn a_frame_with_a_body_reaches_the_socket_as_one_write() {
+        let mut writer = WriteCounter::default();
+        let frame = test_frame(3, 11, &vec![0xABu8; 16 * 1024]);
+
+        write_frame(&mut writer, &frame).await.unwrap();
+
+        assert_eq!(
+            writer.writes.len(),
+            1,
+            "header and body must be one write, got segments {:?}",
+            writer.writes
+        );
+        assert_eq!(writer.writes[0], HEADER_LEN + frame.body.len());
+
+        // The joined buffer must still be the header followed by the body, or the
+        // single-write assertion above would be satisfied by writing anything once.
+        let mut expected = frame.header.encode().to_vec();
+        expected.extend_from_slice(&frame.body);
+        assert_eq!(writer.bytes, expected);
+    }
+
+    /// A bodyless frame writes only the header, and must not gain a second empty
+    /// write from the joining path.
+    #[tokio::test]
+    async fn a_bodyless_frame_writes_only_its_header() {
+        let mut writer = WriteCounter::default();
+        let frame = test_frame(4, 12, b"");
+
+        write_frame(&mut writer, &frame).await.unwrap();
+
+        assert_eq!(writer.writes, vec![HEADER_LEN]);
     }
 
     #[tokio::test]

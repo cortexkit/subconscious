@@ -101,6 +101,24 @@ pub async fn serve_listener(
             .accept()
             .await
             .map_err(|source| ServerError::Accept { local_addr, source })?;
+        // Every route frame is a discrete message whose reply the peer is waiting
+        // for, so there is never a later write for Nagle to coalesce with -- it can
+        // only hold a frame back until an ACK arrives.
+        //
+        // MEASURED: no effect on this transport. A 50-sample-per-arm sweep from
+        // 1 to 32 KiB over the full client->daemon->module->client path showed a
+        // flat 0.28-0.38ms p50 with no step at any buffer boundary, because a
+        // loopback ACK returns in microseconds and never reaches the delayed-ACK
+        // timer that makes Nagle expensive on a real network. Kept anyway: it is
+        // one syscall at accept, it removes the mechanism rather than relying on
+        // loopback staying fast, and Windows loopback was not part of that sweep.
+        // Do not cite it as a latency fix -- the measurement says it is not one.
+        //
+        // Failure is not fatal: the connection works, and refusing to serve a
+        // client over a socket option would be worse than anything it saves.
+        if let Err(source) = stream.set_nodelay(true) {
+            warn!(?peer_addr, error = %source, "could not disable Nagle on accepted connection");
+        }
         debug!(?peer_addr, ?local_addr, "accepted subc TCP connection");
         let router = Arc::clone(&router);
         let auth = auth.clone();

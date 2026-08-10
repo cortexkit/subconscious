@@ -2945,6 +2945,14 @@ async fn open_connection(
             endpoint: endpoint_label.clone(),
             source,
         })?;
+    // Consumers send a request and wait for its reply, so there is no following
+    // write for Nagle to coalesce with -- it can only hold the request back until
+    // an ACK returns. Both ends of the hop must disable it for either to help.
+    //
+    // Dropped rather than logged for the same reason as the module path: no logging
+    // dependency here, and a socket too broken to take the option fails the
+    // handshake on the next line with a typed error.
+    let _ = stream.set_nodelay(true);
     authenticate_client(&mut stream, &conn, deadline)
         .await
         .map_err(|source| ConsumerError::Auth {

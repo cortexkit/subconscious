@@ -1241,6 +1241,16 @@ async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, SubcM
             endpoint: endpoint_label.clone(),
             source,
         })?;
+    // This socket carries the module's replies back to the daemon, so Nagle here
+    // delays every response rather than every request -- the same cost on the
+    // return leg. Both ends of the hop have to disable it for either to help.
+    //
+    // The result is deliberately dropped rather than logged: this crate takes no
+    // logging dependency, and the only ways setting a socket option on a
+    // just-connected stream fail leave the socket unusable, which the handshake on
+    // the very next line reports as a typed Auth error. Swallowing it here would
+    // hide nothing that stays hidden.
+    let _ = stream.set_nodelay(true);
     authenticate_client(&mut stream, &conn, AUTH_DEADLINE)
         .await
         .map_err(|source| SubcModuleError::Auth {

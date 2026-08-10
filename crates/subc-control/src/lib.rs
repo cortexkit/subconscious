@@ -205,6 +205,22 @@ pub enum PollKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CatalogEntry {
     pub module_id: String,
+    /// The registered module's self-declared build version, projected from its
+    /// manifest so a consumer can tell WHICH BUILD of a module it is talking
+    /// to at connect time.
+    ///
+    /// Without this, a client compiled against a module's current source reads
+    /// a contract that is true of the repository and false of the running
+    /// process -- the types match, the JSON decodes, and the meaning has
+    /// changed. That failure carries no error to notice; the version in the
+    /// catalog turns a semantic skew into a log line at connect instead of a
+    /// wrong sentence on a user's screen.
+    ///
+    /// Optional on the wire only because entries serialized by older daemons
+    /// lack it: absent means "daemon predates the field", never "module has
+    /// no version" (the manifest field is required at registration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_version: Option<String>,
     pub roles: Vec<ProviderRole>,
     pub control_ops: Vec<String>,
 }

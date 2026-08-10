@@ -954,6 +954,7 @@ impl ControlHandler {
                 let roles = registration.manifest.provides;
                 CatalogEntry {
                     module_id: registration.manifest.module_id,
+                    module_version: Some(registration.manifest.module_version),
                     roles,
                     control_ops: registration.control_ops,
                 }

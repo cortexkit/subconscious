@@ -42,9 +42,73 @@ describe("Rust golden fixtures", () => {
   test("are reachable from the TypeScript package", () => {
     // A path that silently resolves to nothing would make every assertion below
     // vacuous, so the suite proves it found the real directory before using it.
-    const fixtures = readdirSync(GOLDEN_DIR).filter((name) => name.endsWith(".json"));
+    const fixtures = readdirSync(GOLDEN_DIR).filter((name) =>
+      name.endsWith(".json"),
+    );
     expect(fixtures.length).toBeGreaterThan(0);
     expect(fixtures).toContain("error_body.json");
+  });
+
+  test("every fixture this suite relies on still exists under its own name", () => {
+    // The list below is held HERE rather than derived from the directory, and
+    // that is the whole point: a suite that asks the directory what it should
+    // contain can never notice a fixture going missing. Deriving it would make
+    // this test agree with any directory at all, including an empty one.
+    //
+    // Asserted in one direction only. A fixture disappearing or being renamed on
+    // the Rust side breaks a vector this package reads, so it fails here. A
+    // fixture being ADDED is not a failure -- the directory is observed, not
+    // owned, and Rust pinning a new shape should not redden a client that does
+    // not speak it. The unconsumed ones are reported below instead.
+    const relied = [
+      "error_body",
+      "module_control_request_route_bind",
+      "module_control_request_route_bind_without_consumer_capabilities",
+      "module_control_request_health_check",
+      "module_control_response_health_check",
+      "module_control_response_route_bind_ack",
+      "principal_direct",
+      "principal_reserved",
+      "principal_unverified",
+      "route_target_internal_service",
+      "route_target_management_surface",
+      "route_target_tool_provider",
+    ];
+    const present = new Set(
+      readdirSync(GOLDEN_DIR)
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => name.slice(0, -".json".length)),
+    );
+    const absent = relied.filter((name) => !present.has(name));
+    expect(absent).toEqual([]);
+
+    // CONTROL: the comparison is only meaningful if `present` was actually
+    // populated. Two empty sets agree, and that agreement would report a
+    // missing directory as a clean pass.
+    expect(present.size).toBeGreaterThanOrEqual(relied.length);
+  });
+
+  test("reports the fixtures no TypeScript test reads", () => {
+    // Informational by design, and it does not assert a count. A fixture with no
+    // consumer is a shape Rust pins and this package does not check -- worth
+    // seeing when someone adds one, but not worth failing over, since the right
+    // response is sometimes "the client does not speak that".
+    const source = readFileSync(
+      join(import.meta.dir, "golden-conformance.test.ts"),
+      "utf8",
+    );
+    const unconsumed = readdirSync(GOLDEN_DIR)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => name.slice(0, -".json".length))
+      .filter((name) => !source.includes(`"${name}"`));
+    if (unconsumed.length > 0) {
+      console.log(
+        `golden fixtures with no TypeScript consumer: ${unconsumed.join(", ")}`,
+      );
+    }
+    // The scan reads this file, so it must at minimum find the names above. A
+    // read that returned nothing would report perfect coverage.
+    expect(source.length).toBeGreaterThan(0);
   });
 
   test("error bodies carry the fields the client reads off a failed frame", () => {
@@ -99,6 +163,55 @@ describe("Rust golden fixtures", () => {
     expect(new Set([direct.kind, reserved.kind, unverified.kind]).size).toBe(3);
   });
 
+  test("a health report keeps the op and status the daemon dispatches on", () => {
+    // provider.ts builds this response by hand -- it emits `op: "health.check"`
+    // with `status`, and folds `detail`/`metrics` in only when defined. The
+    // daemon reads `status` to decide whether a module is degraded and worth
+    // escalating, so a rename on either side turns every reply into an
+    // unrecognised shape while the module keeps answering promptly: the module
+    // looks alive and its health stops being read.
+    const request = loadGolden("module_control_request_health_check");
+    const response = loadGolden("module_control_response_health_check");
+
+    expect(request.op).toBe("health.check");
+    expect(response.op).toBe("health.check");
+    expect(typeof response.status).toBe("string");
+
+    // `status` is a closed set on both sides -- the provider's HealthStatus union
+    // and the daemon's escalation policy agree on these three, so a fourth value
+    // arriving from Rust would be a policy change wearing a data change's shape.
+    expect(["ok", "degraded", "failing"]).toContain(response.status);
+
+    // The optional pair: the provider omits them when undefined rather than
+    // sending nulls, and this fixture is the one that carries both, so it pins
+    // the present form. The absent form is pinned by the request fixture above,
+    // which carries neither -- two fixtures, opposite states, same field set.
+    expect(typeof response.detail).toBe("string");
+    expect(response.metrics).toBeDefined();
+    expect(request.detail).toBeUndefined();
+    expect(request.metrics).toBeUndefined();
+  });
+
+  test("a route bind ack is the bind op echoed back, not a new shape", () => {
+    // The ACK is deliberately minimal: the daemon correlates it by frame corr and
+    // reads only the op. That makes it the easiest shape to break silently --
+    // there is no payload whose absence would be noticed, so a renamed op reaches
+    // a daemon that treats the reply as unrecognised and the route as unbound,
+    // with the module believing it accepted.
+    const ack = loadGolden("module_control_response_route_bind_ack");
+    const request = loadGolden("module_control_request_route_bind");
+
+    expect(ack.op).toBe("route.bind");
+    // The ack ECHOES the request's op rather than carrying one of its own, which
+    // is the property that keeps them in step: comparing the literal to itself
+    // would pass even if both drifted together.
+    expect(ack.op).toBe(request.op);
+
+    // CONTROL: the ack is the minimal form. If it grew fields, this pins that the
+    // growth was deliberate rather than a fixture picking up the request's body.
+    expect(Object.keys(ack)).toEqual(["op"]);
+  });
+
   test("an absent consumer_capabilities stays absent rather than arriving empty", () => {
     // The provider treats an omitted field as "no reverse-request capability".
     // Omission and an empty array behave identically today but are different
@@ -107,7 +220,9 @@ describe("Rust golden fixtures", () => {
     // client stops reading. An optional field elsewhere in this protocol was
     // once misspelled on the wire and parsed cleanly as absent, silently
     // downgrading the caller's identity; that is the failure this pins against.
-    const without = loadGolden("module_control_request_route_bind_without_consumer_capabilities");
+    const without = loadGolden(
+      "module_control_request_route_bind_without_consumer_capabilities",
+    );
     const with_ = loadGolden("module_control_request_route_bind");
 
     expect(without.op).toBe("route.bind");
@@ -124,7 +239,9 @@ describe("Rust golden fixtures", () => {
     for (const bind of [without, with_]) {
       expect(typeof bind.route_channel).toBe("number");
       expect(typeof bind.epoch).toBe("number");
-      expect(typeof (bind.principal as Record<string, unknown>).kind).toBe("string");
+      expect(typeof (bind.principal as Record<string, unknown>).kind).toBe(
+        "string",
+      );
     }
   });
 

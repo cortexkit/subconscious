@@ -3,6 +3,37 @@
 **Status:** draft for the push-notifications channel. Normative sections are marked
 MUST/MUST NOT. Golden vectors are the authority where prose and vectors disagree.
 
+## What of this runs, as of 2026-08-10
+
+This section exists because the rest of the document is precise enough to
+implement against, and precision reads as existence. A reader has no other signal
+separating what runs from what was written.
+
+Built and executed:
+
+- The sealing primitive, `commons/crates/cortexkit-push-seal`: `seal`, `open`,
+  the ciphersuite pinning, the envelope layout, and the size cap. Ten tests.
+- Hand tools over it: `handseal`, `handopen`, `kp` as crate examples. The
+  handseal/handopen round trip is the only end-to-end exercise outside the
+  crate's own tests.
+- The Swift conformance harness for the vector corpus.
+
+Not built anywhere:
+
+- **The sealer described below as "Rust, in `prefrontal`, in-process".** No call
+  site exists in that repository; verified by search with a control proving the
+  search can return matches there. Sealing is done by hand, by an operator
+  running the example binary.
+- The notification submit endpoint that would carry a sealed blob.
+- The vector corpus itself. The harness that would consume it is written, and
+  skips when the corpus is absent.
+- Any possession proof binding a registered public key to the device holding its
+  private half.
+
+Move items out of the second list as they ship rather than deleting this section.
+A standing disclaimer decays into furniture; a list someone has to edit has a
+maintainer.
+
 ## What this is
 
 A sealed blob carried inside an APNs notification, so a question can appear on a

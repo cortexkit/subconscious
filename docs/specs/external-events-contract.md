@@ -162,6 +162,17 @@ up as they ship.
 - Naming: a scalar-diff provider's stored state is called `scalar` on the
   wire, never `cursor`, so the sibling is not read as a cursor variant by
   the next implementer.
+- Scalar-diff refusal rule: a missing or null scalar field is a REFUSAL,
+  never "unchanged". Downstream the two are indistinguishable -- both leave
+  the log quiet -- so a misdeclared field name would report healthy silence
+  forever while observing nothing. This is alive-means-writing at the
+  extraction layer; one sentence covers both: SILENCE MUST BE EARNED,
+  NEVER DEFAULTED.
+- Threshold watches carry no extra field: a SEEDED scalar is the
+  threshold ("past v0.3.0" seeds {"scalar":"v0.3.0"}), an unseeded
+  subscribe baselines silently. Authoring pins the scalar field name at
+  compile time from the same drift-checked manifest source, so the
+  misdeclaration path dies at the earliest layer that can see it.
 - A poll shape is a claim about a vendor's REQUEST SCHEMA, and an
   unmeasured claim is unevaluated. Manifest ingestion validates shape
   against the model, not against the vendor; the `drift` check gains

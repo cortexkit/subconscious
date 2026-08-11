@@ -411,3 +411,31 @@ Content-addressed state. Search indexes keyed on repository identity rather than
 location survive a directory rename for the cost of one probe. Historical records
 of past events should keep their original spelling — they are records of where
 something went, not live routes.
+
+## Path-keyed stores: the class the compatibility symlink cannot help
+
+(Added 2026-08-11 after the brocatui -> alfonso-tui rename stranded 24 broca
+sessions' WAL history.)
+
+A compatibility symlink preserves PATH RESOLUTION. It does not preserve any
+identity derived from the CANONICALIZED path, because canonicalization
+(realpath at the daemon's route bind) follows the symlink — turning the
+symlink back into a rename for every consumer that hashes the resolved path
+into a durable key. Broca keys session WALs by FNV-1a over
+`{project_root}\u{1f}{harness}\u{1f}{session}`; after the rename, the same
+session hashes to a different WAL and history opens empty with no error —
+the empty-lineage signature, indistinguishable from a new session.
+
+Before any project folder rename, enumerate THREE store classes, not two:
+1. module-id-keyed stores (lease preseed rule, above);
+2. directory-scoped rows (opencode.db, prefrontal-core peers — the rename
+   script rewrites these);
+3. CANONICALIZED-PATH-KEYED stores (broca WALs today; anything hashing a
+   resolved root). The script cannot rewrite these — the owner must either
+   re-key in the window or the stored history becomes unaddressable.
+
+Prefer an explicit journaled remap ceremony (old-root -> new-root, per
+session) over a blanket path rewrite: it preserves the owner's
+identity-never-repointed invariant by making the repoint an audited event,
+and it inverts cleanly if the mapping is wrong. Do NOT rewrite client-side
+indexes first — that destroys the mapping the re-key needs.

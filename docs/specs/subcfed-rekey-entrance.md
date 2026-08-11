@@ -39,10 +39,20 @@ day the exposure was sized rather than the day someone builds it.
    rule (`isReusable`) is an exhaustive switch so a new case is a COMPILE
    ERROR forcing a deliberate liveness classification. "May a draining
    session still serve calls" must never be decided by a default arm.
-   THEREFORE `FedConnectionState` MUST REMAIN A FROZEN ENUM: making it
-   non-frozen for source stability would silently convert the consumer's
-   compile error into a runtime default — the one change to the enum's
-   SHAPE that breaks the consumer invisibly from this side.
+   THEREFORE (mechanism corrected by alfonso-ios 2026-08-11 — the first
+   wording said "frozen enum", which names the WRONG mechanism): the
+   package MUST CONTINUE TO BE CONSUMED AS A SOURCE DEPENDENCY. `@frozen`
+   is not a live concept here (no library evolution, zero @frozen in
+   Sources/); exhaustiveness is enforced today BECAUSE the package ships
+   as source — proof by construction: the consumer's `isReusable` names
+   all nine cases with no default arm and compiles clean. The property
+   ("a new case must break the consumer's build") is lost by enabling
+   library evolution or shipping a prebuilt/binary framework — EITHER IS
+   A BREAKING CHANGE TO THIS CONTRACT. Note the trap the old wording
+   invited: "must remain frozen" read against a package with no @frozen
+   anywhere could be "fixed" by adding @frozen while enabling library
+   evolution — reading as compliance while silently changing nothing
+   about the real hazard.
 3. The old session drains only after the replacement serves: the drain
    phase exists for the overlap, which is the make-before-break property.
 4. Rekey triggers: `fed_rekey_needed` from the peer is the demand-driven

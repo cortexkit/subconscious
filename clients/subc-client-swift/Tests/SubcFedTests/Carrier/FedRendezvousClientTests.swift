@@ -276,6 +276,49 @@ final class FedRendezvousClientTests: XCTestCase {
         XCTAssertEqual(disconnected, .disconnected)
     }
 
+    // Case robustness, both halves. The fixture key MUST contain hex letters:
+    // an all-digit key (like pubkeyA) is unchanged by .uppercased(), which
+    // makes any case test over it vacuous — the first draft of this test had
+    // exactly that defect.
+    //
+    // Insert half: a NON-CONFORMING server sending uppercase pubkey hex (the
+    // wire guarantee says lowercase — the worker's requireHex refuses
+    // uppercase at enrollment; this defends against a server-side regression)
+    // must still produce rows findable by conforming lowercase lookups.
+    // Query half: a caller passing uppercase hex must find a
+    // conformingly-stored row. A miss on either half renders as "0
+    // candidates", byte-identical to a peer publishing nothing — the exact
+    // two-states-one-output confusion that misdirected a live incident.
+    func testMirrorKeyCaseNormalizationBothHalves() async throws {
+        let (identity, edPub) = try makeIdentity()
+        let (client, registry) = makeClient(identity: identity, pin: try signingPin())
+
+        let letteredKey = String(repeating: "ab", count: 32)
+        let row = RdvTestSigning.registryRow(
+            x25519: letteredKey.uppercased(), // non-conforming server case
+            name: "mac",
+            candidates: [
+                RdvTestSigning.candidate(kind: "relay", provenance: "observed"),
+                RdvTestSigning.candidate(kind: "lan", provenance: "observed", addr: "192.168.1.0:7841"),
+            ]
+        )
+        try await connectWithBarrier(
+            client: client, registry: registry, identity: identity, deviceEd25519Pub: edPub,
+            snapshotPayload: snapshot("1", [row])
+        )
+
+        // Insert half: lowercase lookup finds the uppercase-inserted row.
+        let viaLower = await client.candidates(forPubkey: letteredKey)
+        XCTAssertEqual(viaLower?.count, 2, "uppercase server key must normalize on insert")
+        // Query half: uppercase lookup finds the same row.
+        let viaUpper = await client.candidates(forPubkey: letteredKey.uppercased())
+        XCTAssertEqual(viaUpper?.count, 2, "uppercase caller key must normalize at query")
+        // nil vs [] is load-bearing: an absent peer answers nil, never [].
+        let absent = await client.candidates(forPubkey: String(repeating: "cd", count: 32))
+        XCTAssertNil(absent)
+        await client.disconnect()
+    }
+
     func testRegistrySnapshotSupersedesPriorMirror() async throws {
         let (identity, edPub) = try makeIdentity()
         let (client, registry) = makeClient(identity: identity, pin: try signingPin())

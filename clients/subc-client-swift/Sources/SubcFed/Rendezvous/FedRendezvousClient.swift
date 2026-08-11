@@ -612,7 +612,7 @@ public actor FedRendezvousClient {
             return nil
         case .tombstone(let tombstone):
             tombstones.append(tombstone)
-            mirror[tombstone.x25519PubkeyHex] = nil
+            mirror[Self.mirrorKey(tombstone.x25519PubkeyHex)] = nil
             return nil
         case .resyncRequired:
             quarantined = true
@@ -638,11 +638,23 @@ public actor FedRendezvousClient {
 
     // MARK: - Mirror mutation
 
+    // Mirror keys are lowercase hex by WIRE GUARANTEE: the rendezvous worker's
+    // requireHex refuses uppercase at every enrollment route (protocol.ts
+    // HEX_RE = /^[0-9a-f]+$/) and registry rows echo the stored, validated key
+    // verbatim. The lowercasing below is therefore a NO-OP for conforming
+    // servers — it exists so that a future server-side regression (or a
+    // non-conforming test double) degrades to a still-correct lookup instead
+    // of a silent per-consumer key mismatch, which renders as "0 candidates"
+    // and is byte-identical to a peer that publishes nothing.
+    private static func mirrorKey(_ pubkeyHex: String) -> String {
+        pubkeyHex.lowercased()
+    }
+
     /// Apply the barrier snapshot as truth: it supersedes the entire prior mirror.
     private func applySnapshot(_ snapshot: RdvRegistrySnapshot) {
         var next: [String: RdvRegistryRow] = [:]
         for device in snapshot.devices {
-            next[device.x25519PubkeyHex] = device
+            next[Self.mirrorKey(device.x25519PubkeyHex)] = device
         }
         mirror = next
         if let seq = try? RdvDecimalString.parse(snapshot.serverSeq) {
@@ -654,9 +666,9 @@ public actor FedRendezvousClient {
     private func applyDelta(_ delta: RdvRegistryDelta) {
         switch delta.change {
         case .removed:
-            mirror[delta.device.x25519PubkeyHex] = nil
+            mirror[Self.mirrorKey(delta.device.x25519PubkeyHex)] = nil
         case .added, .updated, .online, .offline:
-            mirror[delta.device.x25519PubkeyHex] = delta.device
+            mirror[Self.mirrorKey(delta.device.x25519PubkeyHex)] = delta.device
         }
     }
 
@@ -665,13 +677,20 @@ public actor FedRendezvousClient {
     /// The current candidates for a peer by its X25519 pubkey hex, or nil if the
     /// peer is not in the mirror. This is the query the dial ladder (built on this
     /// client) uses to find a peer's reachability candidates.
+    ///
+    /// nil and `[]` are DIFFERENT answers and callers must not collapse them:
+    /// nil = the peer is not in the mirror at all (unknown key, or no snapshot
+    /// yet) — a lookup/identity problem; `[]` = the peer IS known and its row
+    /// holds zero candidates — a publication problem. Rendering both as
+    /// "0 candidates" sent a live incident to two wrong components before the
+    /// distinction was surfaced.
     public func candidates(forPubkey pubkey: String) -> [RdvCandidate]? {
-        mirror[pubkey]?.candidates
+        mirror[Self.mirrorKey(pubkey)]?.candidates
     }
 
     /// The full registry row for a peer by its X25519 pubkey hex.
     public func deviceRow(forPubkey pubkey: String) -> RdvRegistryRow? {
-        mirror[pubkey]
+        mirror[Self.mirrorKey(pubkey)]
     }
 
     /// A snapshot of the whole mirror (every account device's registry row).

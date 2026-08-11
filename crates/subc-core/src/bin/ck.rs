@@ -1272,9 +1272,20 @@ fn print_quota_account(
         }
     }
 
+    // Money renders beside window rows, not among them: a balance has no
+    // period, so it gets its own line under the account header instead of a
+    // progress bar. An entry with pools and no windows is HEALTHY (deepseek's
+    // balance-only shape) -- "no limits reported" stays only for entries with
+    // neither pools nor windows.
+    let spend_lines = quota_spend_lines_for_entry(entry);
+    for line in &spend_lines {
+        println!("      {line}");
+    }
     let rows = quota_window_rows_for_entry(entry);
     if rows.is_empty() {
-        println!("      {}", dim_text("no limits reported", color_enabled));
+        if spend_lines.is_empty() {
+            println!("      {}", dim_text("no limits reported", color_enabled));
+        }
         return;
     }
     let by_label: HashMap<&str, &Value> = rows
@@ -1580,6 +1591,73 @@ fn color_text(text: &str, code: &str, color_enabled: bool) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Render an entry's `spend` pools as display lines, one per pool.
+///
+/// `spend` is money, not a rate window: a balance has no period, so pools
+/// render as separate lines rather than progress bars (a bar implies a
+/// window that resets; prepaid credit does not). Three wire states are
+/// deliberately distinct and must stay so:
+/// - `spend` ABSENT: the producer has nothing to say -> no lines.
+/// - `spend: []`: the producer asked and the provider has no credit
+///   product on this account -> no lines (NOT "0 credit").
+/// - `spend: [...]`: one line per pool.
+///
+/// Pools are account-scoped; callers must never sum them across sibling
+/// accounts of a provider (credit is bought per account, so a cross-account
+/// total is a figure no credential can draw on). `unit` is a free string,
+/// not necessarily a currency code (MiniMax reports "credit"), so it is
+/// rendered verbatim after the amount.
+fn quota_spend_lines_for_entry(entry: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(pools) = entry.get("spend").and_then(Value::as_array) else {
+        return lines;
+    };
+    for pool in pools {
+        let Some(remaining) = pool.get("remaining").and_then(Value::as_object) else {
+            continue;
+        };
+        let (Some(minor), Some(exponent)) = (
+            remaining.get("minor").and_then(Value::as_i64),
+            remaining.get("exponent").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        let unit = remaining.get("unit").and_then(Value::as_str).unwrap_or("");
+        let amount = format_minor_amount(minor, exponent);
+        let label = pool
+            .get("funding")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|funding| format!(" ({funding})"))
+            .unwrap_or_default();
+        lines.push(
+            format!("credit {amount} {unit}{label}")
+                .trim_end()
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// Render a minor-unit amount at the given decimal exponent without
+/// floating point: 2402 at exponent 2 is "24.02", never "24.019999...".
+/// A negative or zero exponent renders the integer as-is (no known
+/// producer emits one, but a wire value must not panic the renderer).
+fn format_minor_amount(minor: i64, exponent: i64) -> String {
+    if exponent <= 0 {
+        return minor.to_string();
+    }
+    let scale = 10_i64.checked_pow(exponent.min(18) as u32).unwrap_or(1);
+    let sign = if minor < 0 { "-" } else { "" };
+    let magnitude = minor.unsigned_abs();
+    let whole = magnitude / scale as u64;
+    let frac = magnitude % scale as u64;
+    format!(
+        "{sign}{whole}.{frac:0width$}",
+        width = exponent.min(18) as usize
+    )
 }
 
 fn quota_window_rows_for_entry(entry: &Value) -> Vec<(String, Value)> {
@@ -2915,6 +2993,57 @@ mod tests {
             shorten_uuid_label("not-a-uuid-e29b-41d4-a716-446655440000"),
             "not-a-uuid-e29b-41d4-a716-446655440000"
         );
+    }
+
+    #[test]
+    fn spend_pools_render_as_lines_and_the_three_wire_states_stay_distinct() {
+        // The deepseek shape: pools present, usage empty. The account holds
+        // money and must not render as "no limits reported".
+        let with_pools = json!({
+            "usage": {},
+            "spend": [
+                { "id": "granted_balance", "funding": "granted", "basis": "reported",
+                  "remaining": { "minor": 0, "exponent": 2, "unit": "CNY" } },
+                { "id": "topped_up_balance", "funding": "purchased", "basis": "reported",
+                  "remaining": { "minor": 2402, "exponent": 2, "unit": "CNY" } },
+            ],
+        });
+        let lines = quota_spend_lines_for_entry(&with_pools);
+        assert_eq!(
+            lines,
+            vec!["credit 0.00 CNY (granted)", "credit 24.02 CNY (purchased)"],
+            "each pool renders its own line with minor/10^exponent and verbatim unit"
+        );
+
+        // The codex shape: the producer asked, the provider has no credit
+        // product. `[]` must produce zero lines, never a "0 credit" line.
+        let empty_pools = json!({ "usage": {}, "spend": [] });
+        assert!(quota_spend_lines_for_entry(&empty_pools).is_empty());
+
+        // Most providers: spend absent entirely. Also zero lines.
+        let absent = json!({ "usage": {} });
+        assert!(quota_spend_lines_for_entry(&absent).is_empty());
+
+        // A unit that is not a currency code renders verbatim (minimax
+        // reports "credit" when the provider states no currency).
+        let free_unit = json!({
+            "spend": [{ "funding": "granted",
+                "remaining": { "minor": 5, "exponent": 0, "unit": "credit" } }],
+        });
+        assert_eq!(
+            quota_spend_lines_for_entry(&free_unit),
+            vec!["credit 5 credit (granted)"]
+        );
+    }
+
+    #[test]
+    fn minor_amount_formatting_is_integer_math_with_the_exponent_honoured() {
+        assert_eq!(format_minor_amount(2402, 2), "24.02");
+        assert_eq!(format_minor_amount(5, 2), "0.05");
+        assert_eq!(format_minor_amount(-2402, 2), "-24.02");
+        assert_eq!(format_minor_amount(7, 0), "7");
+        // A hostile exponent must not panic the renderer.
+        assert_eq!(format_minor_amount(1, -3), "1");
     }
 
     #[test]

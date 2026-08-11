@@ -61,7 +61,12 @@ worktree to commit directly on local master.
    the fix+merge (fix A, merge, rebase B, re-gate). Disjoint → fix in parallel.
 5. **Fix.** `background_prompt` the SAME mason (keeps worktree + context) with the
    authorized fix instruction: minimal behavior-preserving change + a non-vacuous
-   regression test that fails without the fix.
+   regression test that fails without the fix. A report-turn probe (the script or
+   harness the mason built to demonstrate the finding) should become the fix
+   turn's committed regression where the shapes align — the report artifact is
+   already the finding's executable statement, and reusing it is a quiet economy
+   of the same-mason design (observed on external rounds: probe adopted verbatim
+   as the regression).
 6. **Review diff (gate B).** Alfonso reads the fix diff for correctness AND regression
    before merge. Wrong fix on a right diagnosis gets bounced. For PERF fixes,
    gate B additionally requires a MEASURED before/after on the mechanism's own

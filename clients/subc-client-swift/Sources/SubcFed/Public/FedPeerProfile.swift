@@ -276,6 +276,22 @@ public struct FedObservedNetworkSnapshot: Sendable, Equatable {
         self.subnets = subnets
     }
 
+    /// True when any observed subnet lies in carrier-grade NAT space
+    /// (100.64.0.0/10) — i.e. the dialer itself holds a mesh-VPN (tailnet)
+    /// interface. This is the evidence the CGNAT dial exception keys on: an
+    /// embedding that wants tailnet targets dialable must include the
+    /// dialer's own CGNAT address (typically a /32 on a utun interface) in
+    /// the snapshot; a snapshot filtered to RFC1918 only reads false here
+    /// and the exception never fires.
+    public var holdsCGNATInterface: Bool {
+        subnets.contains { subnet in
+            guard let network = subnet.network else { return false }
+            let bytes = Array(network.rawValue)
+            guard bytes.count == 4 else { return false }
+            return bytes[0] == 100 && (64...127).contains(bytes[1])
+        }
+    }
+
     /// Stable digest used by candidate-suppression invalidation.
     public var digest: Data {
         var bytes = Data()
@@ -507,12 +523,24 @@ public enum FedLANCandidateHygiene {
         guard bytes.count == 4 else { return .invalidAddress }
         let b0 = bytes[0], b1 = bytes[1]
 
-        // Loopback, unspecified, link-local, multicast, CGNAT, documentation,
+        // Loopback, unspecified, link-local, multicast, documentation,
         // benchmarking, and other special-purpose ranges are never LAN-eligible.
         if b0 == 127 || (b0 == 0) { return .addressClassNotAllowed }
         if b0 == 169 && b1 == 254 { return .addressClassNotAllowed }
         if b0 >= 224 { return .addressClassNotAllowed }
-        if b0 == 100 && (b1 >= 64 && b1 <= 127) { return .addressClassNotAllowed }
+        if b0 == 100 && (b1 >= 64 && b1 <= 127) {
+            // CGNAT (100.64.0.0/10) is unroutable on the public internet, so it
+            // is not an SSRF egress — but it is only DIALABLE when the dialer
+            // itself is a mesh-VPN (tailnet) member, which the snapshot
+            // evidences by holding a CGNAT interface address. Membership is the
+            // credential (the mesh's own mutual auth gates delivery); without
+            // it the range stays refused as before. The observed-subnet
+            // containment test below is deliberately NOT applied to CGNAT
+            // targets: mesh peers hold point-to-point /32 addresses, so each
+            // observes only itself and containment is structurally
+            // unsatisfiable between two members of the same tailnet.
+            return snapshot.holdsCGNATInterface ? nil : .addressClassNotAllowed
+        }
         if b0 == 192 && b1 == 0 && bytes[2] == 2 { return .addressClassNotAllowed }
         if b0 == 198 && (b1 == 18 || b1 == 19) { return .addressClassNotAllowed }
         if b0 == 198 && b1 == 51 && bytes[2] == 100 { return .addressClassNotAllowed }

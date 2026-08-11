@@ -300,6 +300,13 @@ echo
 # failing, and the remedy (purge a debug tree) is minutes. target/ sizes are
 # listed only when the floor trips or a single tree exceeds 100 GB -- a quiet
 # disk needs no inventory.
+#
+# HONEST LIMIT (BROCA): the floor catches the STATE; nothing here catches the
+# RATE. A 6 GB tree is one `cargo test --workspace` away from 200 GB, so a green
+# reading means "not currently at risk", never "will not be at risk tomorrow".
+# The 150 GB margin IS the rate allowance -- it buys hours-to-days of even fast
+# accumulation against a 30-minute cadence; a derivative would need history and
+# earn complexity the margin already pays for.
 bold "DISK"
 free_gb=$(df -g / 2>/dev/null | awk 'NR==2{print $4}')
 if [ -n "$free_gb" ]; then

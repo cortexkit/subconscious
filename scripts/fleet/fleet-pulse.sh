@@ -287,6 +287,44 @@ fi
   fi
 echo
 
+# ---------------------------------------------------------------------- DISK
+# The 2026-08-11 incident: the volume reached 12-17 GB free of 3.7 TB while
+# ~1 TB of regenerable Rust target/ caches sat across twelve seats' repos, and
+# NOBODY COULD SEE THE TOTAL -- each seat can measure its own tree and none is
+# responsible for the sum. At that margin a WAL append or SQLite checkpoint can
+# fail, so this is a durability hazard wearing a housekeeping costume.
+#
+# Two numbers, both cheap: free space (df, instant) and the summed target/ dirs
+# (du -d0 per repo, a few seconds against warm metadata). The floor is 150 GB:
+# generous, because the failure mode below it is fleet-wide storage writes
+# failing, and the remedy (purge a debug tree) is minutes. target/ sizes are
+# listed only when the floor trips or a single tree exceeds 100 GB -- a quiet
+# disk needs no inventory.
+bold "DISK"
+free_gb=$(df -g / 2>/dev/null | awk 'NR==2{print $4}')
+if [ -n "$free_gb" ]; then
+  ck_root="$HOME/Work/Projects/CortexKit"
+  tgt_total=0; tgt_lines=""; tgt_count=0
+  for t in "$ck_root"/*/target; do
+    [ -d "$t" ] || continue
+    gb=$(du -sg "$t" 2>/dev/null | awk '{print $1}')
+    [ -n "$gb" ] || continue
+    tgt_total=$((tgt_total + gb)); tgt_count=$((tgt_count + 1))
+    [ "$gb" -ge 100 ] && tgt_lines="${tgt_lines}  target OVER 100GB: ${t} (${gb} GB)\n"
+  done
+  echo "  free ${free_gb} GB · summed repo target/ caches ${tgt_total} GB across ${tgt_count} trees"
+  if [ "$free_gb" -lt 150 ]; then
+    echo "  DISK FLOOR TRIPPED (<150 GB free): WAL appends and checkpoints are at risk fleet-wide"
+    for t in "$ck_root"/*/target; do
+      [ -d "$t" ] && du -sg "$t" 2>/dev/null
+    done | sort -rn | head -8 | awk '{printf "    %s GB  %s\n", $1, $2}'
+  fi
+  [ -n "$tgt_lines" ] && printf "$tgt_lines"
+else
+  echo "  df unavailable -- disk UNCHECKED this cycle"
+fi
+echo
+
 # ------------------------------------------------------------------------ CI
 # A failing default branch blocks everyone working in that repository, and NO
 # OTHER SECTION HERE CAN SEE IT. Module health inspects the running process and

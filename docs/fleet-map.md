@@ -80,6 +80,13 @@ Shipped and in production (supervised by the personal daemon today):
 
 Building / chartered:
 
+- **fusiform** — the AI-model capability catalog: one structured data plane
+  for what models exist, what they can do, and what they cost — every
+  modality (LLM now; image/video/audio schema-ready), every provider.
+  Chartered 2026-08-11 (`cortexkit/fusiform`); first consumer broca
+  (`catalog.refresh` push), second astrocyte (price-snapshot lane
+  consolidation). Replaces three scattered copies of models.dev knowledge.
+  Charter: `fusiform/docs/charter.md`.
 - **cerebellum (cereb)** — computer and browser control: the actuation
   plane for surfaces with no API. Structured interfaces first, GUI
   driving as the fallback. Isolated from aft so browser runtimes and

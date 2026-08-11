@@ -63,7 +63,11 @@ worktree to commit directly on local master.
    authorized fix instruction: minimal behavior-preserving change + a non-vacuous
    regression test that fails without the fix.
 6. **Review diff (gate B).** Alfonso reads the fix diff for correctness AND regression
-   before merge. Wrong fix on a right diagnosis gets bounced.
+   before merge. Wrong fix on a right diagnosis gets bounced. For PERF fixes,
+   gate B additionally requires a MEASURED before/after on the mechanism's own
+   quantity (p50 latency, allocation count, bytes) — a mechanism without a
+   number stays a claim, and the number is what makes the ledger line
+   trustworthy later.
 7. **Merge + gate.** Merge to master. Gate = full workspace tests green + clippy
    native + clippy `x86_64-pc-windows-gnu` + `cargo fmt --check` + `check_comments`
    on the diff, then push (CI confirms ubuntu + windows; there is no macOS runner,

@@ -143,6 +143,17 @@ until someone asks, and "delivered zero frames" is otherwise indistinguishable
 from "peer sent nothing" — two states, one output, and the confusion
 reliably sends an investigation to the wrong component.
 
+Count the two classes SEPARATELY: folding them into one number lets a
+burst of the ordinary kind (replies racing a reconnect — expected during a
+daemon restart) hide the kind that is never expected. Keep them cumulative
+across reconnects, since a reconnect is exactly the event whose evidence
+you want afterwards. And PUBLISHING IS THE HALF THAT IS EASY TO SKIP: a
+counter no surface exposes is the same invisibility this item exists to
+fix, wearing a different coat (one implementation's dead-code lint
+rejected exactly this — the correct verdict for the wrong reason). The
+satisfiable-vacuously form is "counted"; the real requirement is counted
+AND readable from outside the process.
+
 Field-shape rule when surfacing the counters (in a health payload or
 anywhere): EMIT ZERO WHEN ZERO IS A STATE; OMIT WHEN ZERO IS A LIE. A COUNT
 has a meaningful zero ("no drops occurred"), and emitting it always makes

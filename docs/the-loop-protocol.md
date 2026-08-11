@@ -28,6 +28,12 @@ Both masons: `iq=10`, isolated worktree off current `master`, report-first (NO c
 change on the first turn), exact `file:line` citations, and **no subagents** (each
 mason does its own investigation and fix directly, never delegating).
 
+Launch mechanics (learned the hard way): write mason prompts to
+`.cortexkit/alfonso/prompts/<name>.md` and pass `prompt_file` — inline prompts die
+on dirty-parent rejections and the file survives to relaunch. Keep EVERY path in a
+prompt relative to the worktree; an absolute path once sent a mason out of its
+worktree to commit directly on local master.
+
 ---
 
 ## Round protocol
@@ -85,6 +91,17 @@ Do not pause to ask between rounds; run continuously.
   masons' confidence is an input, never the authorization.
 - **Escalate design forks.** Anything that changes observable behavior or a contract
   stops the loop for that item and goes to the user.
+- **Fence instructions carry an escape hatch.** Any instruction that fences behavior
+  ("do not change X", "tests only") MUST state: reporting something as WRONG counts
+  as SUCCESS, and is the default whenever the mason cannot positively justify what it
+  found. Without that clause, a tests-only mason reaching a fail-open defect writes a
+  PASSING test certifying the bug — it happened live, and harm scales with the
+  mason's thoroughness.
+- **Regression tests assert the EFFECT, not the verdict.** Proving a guard says no
+  proves nothing about whether anyone listens; the test must assert the guarded
+  effect did not happen (no attach event, zero rows written, byte-identical output).
+  Three positions exist — guard unasserted, verdict asserted, effect asserted — and
+  only the third fences.
 
 ---
 

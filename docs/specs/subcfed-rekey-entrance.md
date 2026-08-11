@@ -32,6 +32,17 @@ day the exposure was sized rather than the day someone builds it.
    presenting as a fault is the waiting-is-not-failing defect one layer
    down. Invisible is fine. Error-looking is not. If an intermediate state
    is exposed at all it is a distinct `rekeying` value, never `disconnected`.
+   Refinement (alfonso-ios, pinned 2026-08-11): "invisible" applies to
+   PRESENTATION only. The consumer's two mappings deliberately treat a new
+   case oppositely — the status bar falls through to nothing (tested:
+   `anUnnamedStateLeavesTheBarUntouched`, mutation-proved), while the reuse
+   rule (`isReusable`) is an exhaustive switch so a new case is a COMPILE
+   ERROR forcing a deliberate liveness classification. "May a draining
+   session still serve calls" must never be decided by a default arm.
+   THEREFORE `FedConnectionState` MUST REMAIN A FROZEN ENUM: making it
+   non-frozen for source stability would silently convert the consumer's
+   compile error into a runtime default — the one change to the enum's
+   SHAPE that breaks the consumer invisibly from this side.
 3. The old session drains only after the replacement serves: the drain
    phase exists for the overlap, which is the make-before-break property.
 4. Rekey triggers: `fed_rekey_needed` from the peer is the demand-driven

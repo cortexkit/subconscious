@@ -273,6 +273,18 @@ this value and fails in the field at a larger one. Plaintext is normative becaus
 and decides what to drop, and a sealed-byte cap would require it to model HPKE
 overhead and base64 expansion, which it will get wrong silently.
 
+**A consuming surface that caps sealed bytes as a proxy for this rule must
+MEASURE its cap against the shipped sealer — seal a 2048-byte plaintext and
+record what comes out — never derive it from a primitive table.** A paper
+derivation reproduces its own assumptions (the first one in the field assumed
+the version byte occupies ciphertext space when it is authenticated as AAD, and
+was 15 bytes too PERMISSIVE — the invisible direction: a too-strict cap refuses
+visibly at the sender, a too-loose one accepts a payload the platform then drops
+silently at the device). The derived cap belongs to the consuming surface, is
+re-measured there at every version bump of this layout, and today measures
+**2097 sealed bytes for 2048 plaintext (49-byte constant overhead: 1 version +
+32 encapsulated key + 16 AEAD tag; the version byte rides as AAD)**.
+
 Over-size MUST be **rejected, naming the limit and the observed size in plaintext
 terms**. MUST NOT truncate: a truncated blob does not decrypt to a fragment, it
 fails to decrypt entirely, and renders as the generic pre-decrypt placeholder —

@@ -19,9 +19,7 @@
 
 set -l ROOT "$HOME/Work/Projects/CortexKit"
 set -l RENAMES \
-    "cortexkit-credentials:claustrum" \
-    "ai-provider-quota:insula" \
-    "ck-projects:entorhinal"
+    "brocatui:alfonso-tui"
 
 set -l OCDB "$HOME/.local/share/opencode/opencode.db"
 set -l MCDB "$HOME/.local/share/cortexkit/magic-context/store.db"

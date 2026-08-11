@@ -392,6 +392,80 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         )
     }
 
+    // CGNAT (100.64.0.0/10) dial eligibility is keyed on MEMBERSHIP EVIDENCE:
+    // the dialer's snapshot holding a CGNAT interface address (a mesh-VPN
+    // member's own /32). Without it the range stays refused — a non-member's
+    // dial into carrier NAT space is the class the refusal exists for. With
+    // it, the target is eligible WITHOUT observed-subnet containment, because
+    // mesh peers hold point-to-point /32s and each observes only itself —
+    // containment between two members of one tailnet is structurally
+    // unsatisfiable, which is how the working feature was dead code until
+    // this arm existed.
+    func testCGNATDialRequiresMeshMembershipEvidence() throws {
+        let target = IPv4Address("100.80.194.111")!
+
+        // No CGNAT interface in the snapshot: refused, same as always.
+        let rfc1918Only = try FedPublicTestSupport.observedHomeLAN()
+        XCTAssertEqual(
+            FedLANCandidateHygiene.classify(
+                address: target, peerVerified: true, snapshot: rfc1918Only
+            ),
+            .addressClassNotAllowed
+        )
+
+        // Dialer holds its own tailnet /32 (different address than the
+        // target — containment must NOT be required): eligible.
+        let meshMember = FedObservedNetworkSnapshot(subnets: [
+            try FedObservedPrivateSubnet(
+                ipv4: IPv4Address("100.99.1.2")!, prefixLength: 32
+            ),
+        ])
+        XCTAssertTrue(meshMember.holdsCGNATInterface)
+        XCTAssertNil(
+            FedLANCandidateHygiene.classify(
+                address: target, peerVerified: true, snapshot: meshMember
+            )
+        )
+
+        // Membership evidence must be CGNAT-specific: an RFC1918 subnet is
+        // not evidence (holdsCGNATInterface is the discriminating predicate,
+        // not subnet presence).
+        XCTAssertFalse(rfc1918Only.holdsCGNATInterface)
+
+        // The exception must not leak outside 100.64.0.0/10: a public
+        // address stays refused even for a mesh member.
+        XCTAssertEqual(
+            FedLANCandidateHygiene.classify(
+                address: IPv4Address("8.8.8.8")!, peerVerified: true,
+                snapshot: meshMember
+            ),
+            .addressClassNotAllowed
+        )
+        // 100.63.x and 100.128.x sit just OUTSIDE the /10 and stay refused
+        // (boundary bytes: the b1 range is 64...127 inclusive).
+        XCTAssertEqual(
+            FedLANCandidateHygiene.classify(
+                address: IPv4Address("100.63.0.1")!, peerVerified: true,
+                snapshot: meshMember
+            ),
+            .addressClassNotAllowed
+        )
+        XCTAssertEqual(
+            FedLANCandidateHygiene.classify(
+                address: IPv4Address("100.128.0.1")!, peerVerified: true,
+                snapshot: meshMember
+            ),
+            .addressClassNotAllowed
+        )
+        // Unverified peers stay refused regardless of membership.
+        XCTAssertEqual(
+            FedLANCandidateHygiene.classify(
+                address: target, peerVerified: false, snapshot: meshMember
+            ),
+            .unverifiedPeerLAN
+        )
+    }
+
     /// The connection-state vocabulary is a closed public contract: a consumer
     /// switching over it exhaustively must be forced to consider any new case
     /// rather than silently falling into a default.

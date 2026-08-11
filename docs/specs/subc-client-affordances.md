@@ -41,12 +41,18 @@ performs one RPC and does not retry.
 Without the bound: `unknown_module` is AMBIGUOUS between "restarting, will
 return" and "never registered / wrong id". An unbounded retry loop converts a
 typo'd module id into an eternal quiet retry — the caller waits forever while
-every gauge reads healthy. Without the failure naming the module id: no log
-line anywhere records which id was dialed, so a wrong-id configuration is
-undiagnosable after the fact. Rust's deadline expiry today reports
-`"retry deadline elapsed"` as a `NotSent` error and does NOT always carry the
-module id — a hand-rolled client should do better than the SDK here, not
-merely match it: bound the retry AND name the target in the terminal error.
+every gauge reads healthy.
+
+On the naming half, the precise failure mode: THE DAEMON'S REJECTION PAYLOAD
+ALREADY NAMES THE MODULE ID. A client that WRAPS the daemon's message inherits
+the naming for free and is compliant; the failure mode is specifically a
+client that BUILDS ITS OWN TERMINAL MESSAGE and drops the payload. Testable
+by asking whether the daemon's own bytes survive to the caller. (One
+hand-rolled owner audited this item, wrote an id-injection fix, and the
+mutation test showed the fix redundant — the propagated payload already
+carried it. Wrap, don't substitute.) Rust's deadline expiry today reports
+`"retry deadline elapsed"` without re-stating the id at the outermost layer —
+if you substitute messages anywhere, re-attach the target.
 
 Note `module_warming` appears in `docs/ARCHITECTURE.md` as a distinct
 post-respawn state; as of this writing NO shipped code emits or matches it —
@@ -166,6 +172,30 @@ reconnect, invalidate every held route handle and re-open. Reusing a numeric
 unrelated route — the failure is rare, delayed, and looks like data
 corruption.
 
+## 11. Bind-root identity is canonicalized, and a directory rename silently re-partitions it
+
+Route binding canonicalizes the project root (realpath at the daemon), and
+anything a client DERIVES from that root — storage keys, WAL hashes, session
+identity — is keyed by the canonical path, not the spelled one. Two traps:
+
+- A compatibility symlink does NOT preserve derived identity: canonicalization
+  is precisely the step that follows the symlink, so a folder rename
+  re-partitions every path-derived key even when the old path still resolves.
+  The failure has NO signal: valid root, successful bind, empty history —
+  indistinguishable from a genuinely new session. (A census after one rename
+  found 65 sessions stranded across two stores, 41 of them unnoticed by their
+  own client.)
+- When computing any path-derived key, resolve the root the way the daemon
+  will FIRST (realpath, then derive) — `/tmp` is a symlink on macOS, and a
+  path that looks canonical to a human is not necessarily canonical to the
+  resolver.
+
+Discovery predicate for the stranded case: compare `realpath(embedded_root)`
+against the embedded root in stored records — valid ONLY while the old path
+still resolves, so the audit window closes when someone tidies the symlink.
+Recovery is a journaled re-key (see `docs/module-rename-runbook.md`, third
+store class).
+
 ## The checklist form
 
 A hand-rolled client audits itself by answering these; every "no" is a latent
@@ -188,3 +218,5 @@ incident with the failure mode attached above.
 9. Are channel/epoch (and the connection file) parsed strictly as in-range
    integers?
 10. Are route handles invalidated across reconnects?
+11. Are path-derived keys computed from the realpath'd root, and is there a
+    plan for what a project-root rename does to them?

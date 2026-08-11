@@ -439,3 +439,21 @@ session) over a blanket path rewrite: it preserves the owner's
 identity-never-repointed invariant by making the repoint an audited event,
 and it inverts cleanly if the mapping is wrong. Do NOT rewrite client-side
 indexes first — that destroys the mapping the re-key needs.
+
+Outcome of the 2026-08-11 instance: all 24 WALs re-keyed and verified
+(reversal manifest at backups/wal-rekey-20260811T144418Z.json written
+BEFORE the first rename; live open served the previously-empty session).
+Broca proved by experiment that the WAL is addressed by the key hash alone
+— the bind triple embedded in run_started is forensic provenance and must
+NOT be rewritten to match, since it is the only surviving record of the
+original root.
+
+Checklist sharpening from a near-miss during the recovery: when computing
+a path-derived key, RESOLVE THE ROOT THE WAY THE DAEMON WILL, THEN HASH —
+realpath first, always (`/tmp` is a symlink to `/private/tmp` on macOS; a
+path that looks canonical to a human is not necessarily canonical to the
+resolver). And after recovery, repoint consumers to the canonical path so
+nothing depends on the compatibility symlink surviving: deleting the
+symlink later would re-resolve the old path via its missing-leaf fallback
+and mint a THIRD identity. The general class: deriving a durable key from
+a mutable, aliasable path — a folder rename is its loudest instance.

@@ -143,6 +143,16 @@ until someone asks, and "delivered zero frames" is otherwise indistinguishable
 from "peer sent nothing" — two states, one output, and the confusion
 reliably sends an investigation to the wrong component.
 
+Field-shape rule when surfacing the counters (in a health payload or
+anywhere): EMIT ZERO WHEN ZERO IS A STATE; OMIT WHEN ZERO IS A LIE. A COUNT
+has a meaningful zero ("no drops occurred"), and emitting it always makes
+closure a positive observation — an absent field then unambiguously means
+the instrument is gone rather than idle. An AGE has no meaningful zero
+(`vault_ok_age_s: 0` reads "succeeded just now", the opposite of "never
+succeeded") and must be omitted until it has a value. Copying one
+convention across both field kinds gets one of them wrong, silently, in
+both directions.
+
 ## 8. Consumer identity comes from the environment, not from configuration
 
 `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` are injected by the supervisor at

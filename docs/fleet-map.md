@@ -80,6 +80,11 @@ Shipped and in production (supervised by the personal daemon today):
 
 Building / chartered:
 
+- **avatar** — generated visual identities for Alfonso agents: deterministic
+  DNA-driven creatures with live mood (board status, asks, health readable
+  from the face). Descended from Ufuk's pre-LLM TOG project (on-chain
+  procedural SVG PFPs); reference material in `~/Work/Projects/Ssbd/tog-monorepo`.
+  Chartered 2026-08-11 (`cortexkit/avatar`); charter: `avatar/docs/charter.md`.
 - **fusiform** — the AI-model capability catalog: one structured data plane
   for what models exist, what they can do, and what they cost — every
   modality (LLM now; image/video/audio schema-ready), every provider.

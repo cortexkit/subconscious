@@ -109,7 +109,7 @@ Building / chartered:
 - **cortexkit-e2e + chaos suite (cke2e)** — cross-module E2E rigs and the
   k8s chaos suite. E2E shipped and load-bearing in CI; chaos suite in
   implementation under an approved design.
-- **brocatui (cktui)** — Ratatui TUI harness driving broca over subc.
+- **alfonso-tui (CKTUI)** — Ratatui TUI harness driving broca over subc. (Renamed from brocatui 2026-08-11 for app-repo naming consistency: alfonso-ios, alfonso-desktop, alfonso-tui. Folder/DB rename staged for the next OpenCode restart window; repo has no GitHub remote yet — push step rides the same window.)
   Building; full-transcript virtualization is a hard requirement.
 - **Cortex app** — the native desktop/mobile app (design repo `cortex`):
   Board-first agentic interface (Board/Chat/Show lanes), bundles the

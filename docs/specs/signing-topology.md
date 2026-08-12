@@ -65,7 +65,17 @@ environments.
    with the exact signing command that produced it; any re-sign invalidates
    previously published hashes and requires republication to every verifier.
 
-7. ROLLOUT AND THE TRANSITION COST, STATED HONESTLY.
+7. FIRST-EXEC ASSESSMENT IS PER FILE, NOT PER BUILD (measured at v2
+   adoption): Gatekeeper assesses a newly-signed binary on ITS first exec —
+   staged ck-models cost 22.5s then 3ms; the byte-identical PLACED copy of
+   ck-fusiform cost 15.4s on its own first exec even though the staged copy
+   had been warmed. A copy at a new inode pays the toll again. Therefore the
+   warm-exec ladder step runs ON THE DEPLOY PATH after placement — warming
+   the staged artifact buys the placed file nothing — and a multi-second
+   first exec inside a supervisor health window reads as a failed start (a
+   deployment failure that never recurs, the worst kind to debug).
+
+8. ROLLOUT AND THE TRANSITION COST, STATED HONESTLY.
    Each binary moves to the identity at its NEXT NATURAL PLACEMENT — no
    fleet-wide re-sign wave (a re-sign wave would orphan every TCC grant at
    once and invalidate every published hash for no operational win). The
@@ -76,7 +86,7 @@ environments.
    v2 and checks the certificate authority in `codesign -dv` output, not just
    the identifier.
 
-8. VERIFICATION INSTRUMENTS.
+9. VERIFICATION INSTRUMENTS.
    LC_UUID (`dwarfdump --uuid`) identifies a (commit, path, toolchain) triple
    — invariant under signing, so it proves two artifacts are the same BUILD
    across a re-sign; it can NOT name a commit from a binary alone. Whole-file

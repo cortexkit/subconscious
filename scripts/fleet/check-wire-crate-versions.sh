@@ -47,6 +47,15 @@ CRATES=(
 examined=0
 violations=0
 
+# This check compares COMMITS ($BASE...HEAD). Uncommitted working-tree edits
+# are invisible to it, so "clean" here answers a narrower question than "is
+# the tree consistent". Say so instead of letting the narrow answer read as
+# the broad one (a wire-crate edit sitting unstaged would pass silently).
+if ! git diff --quiet -- crates/ 2>/dev/null; then
+  echo "  note: uncommitted changes exist under crates/ -- this check reads" >&2
+  echo "  committed history only ($BASE...HEAD) and does not see them." >&2
+fi
+
 for crate in "${CRATES[@]}"; do
   src="crates/$crate/src"
   manifest="crates/$crate/Cargo.toml"

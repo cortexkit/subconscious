@@ -217,6 +217,28 @@ still resolves, so the audit window closes when someone tidies the symlink.
 Recovery is a journaled re-key (see `docs/module-rename-runbook.md`, third
 store class).
 
+## 12. Evidence sinks under one config root count as one evidence leg
+
+The fleet convention co-locates a module's durable state under
+`~/.local/share/cortexkit/<module>/` — correct for custody, and it silently
+sets every module's forensic redundancy to ONE: a wrong state root (bad env,
+bad config, wrong HOME) silences every sink under it simultaneously, so three
+file legs plus a database under one root are one evidence leg with four views.
+Independence is counted in distinct CONFIG ROOTS and distinct FAILURE MODES,
+not distinct sinks. Nobody chooses this correlation structure; it falls out of
+path resolution, and the instinctive fix (add another sink under the same
+root) buys nothing.
+
+Not a mandate for a second root — the failure is rare and the cost real. The
+rule is cheaper: when adding a durable evidence sink, ask whether it shares a
+root with the existing ones, and if a wrong-root failure would take the whole
+set, prefer a sink whose failure differs IN KIND (a database that fails loud
+and atomically beats a fourth file that fails silent and partial). And if a
+startup root assertion exists, it must verify the SERVING path: the marker
+must be written by the same writer that writes the evidence — a marker written
+by the check proves only that the checking code can reach the path, and an
+existence check passes against a perfectly good directory nothing reads.
+
 ## The checklist form
 
 A hand-rolled client audits itself by answering these; every "no" is a latent
@@ -241,3 +263,7 @@ incident with the failure mode attached above.
 10. Are route handles invalidated across reconnects?
 11. Are path-derived keys computed from the realpath'd root, and is there a
     plan for what a project-root rename does to them?
+12. If the module keeps more than one durable evidence sink, does at least one
+    differ from the others in config root or failure mode — and does any
+    startup root check verify the path the real writer serves, not merely one
+    the checker can reach?

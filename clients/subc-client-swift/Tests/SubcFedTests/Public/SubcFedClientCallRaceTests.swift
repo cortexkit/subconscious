@@ -143,6 +143,97 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         XCTAssertEqual(inFlight, 0)
     }
 
+    /// Cancellation after a call has registered must take the continuation out of
+    /// the client and release its pure-query admission permit.
+    func testCancellationAfterRegistrationRemovesPendingCallAndReleasesPermit() async throws {
+        let transport = GatedMgmtTransport()
+        let engine = try makeEngine(transport: transport)
+        let client = try await makeReadyClient(transport: transport, engine: engine)
+        defer { Task { await client.disconnect() } }
+
+        await transport.armGate()
+        let target = try FedManagementTarget(moduleID: "alfonso-core")
+        let callTask = Task {
+            try await client.callManagement(
+                target: target,
+                method: "board.state",
+                params: FedJSONObject()
+            )
+        }
+
+        // Wait for the actor-visible registration before cancelling. Cancelling a
+        // task based only on its creation could observe the initial empty map and
+        // pass without exercising cancellation of an installed continuation.
+        try await waitForCondition { await client.pendingCallCount == 1 }
+        try await waitForCondition { await transport.requestSent }
+        callTask.cancel()
+
+        let completion = CallCompletion()
+        Task {
+            do {
+                _ = try await callTask.value
+                await completion.record(.succeeded)
+            } catch is CancellationError {
+                await completion.record(.cancelled)
+            } catch {
+                await completion.record(.failed)
+            }
+        }
+        do {
+            try await waitForCondition(timeoutNanoseconds: 3_000_000_000) {
+                await completion.isSettled
+            }
+        } catch {
+            await client.disconnect()
+            XCTFail("cancelled call did not settle")
+            return
+        }
+        guard await completion.state == .cancelled else {
+            XCTFail("expected the cancelled call to throw CancellationError")
+            return
+        }
+
+        let pendingCallCount = await client.pendingCallCount
+        XCTAssertEqual(pendingCallCount, 0)
+        let inFlight = await engine.admissionController?.inFlightCount ?? 0
+        XCTAssertEqual(inFlight, 0)
+        await transport.releaseGate()
+    }
+
+    /// Once a reply has claimed the continuation, a later cancellation must be a
+    /// no-op rather than a double resume, and the caller still receives the reply.
+    func testReplyThenCancellationSettlesWithReplyWithoutDoubleResume() async throws {
+        let transport = GatedMgmtTransport()
+        let engine = try makeEngine(transport: transport)
+        let client = try await makeReadyClient(transport: transport, engine: engine)
+        defer { Task { await client.disconnect() } }
+
+        await transport.armGate()
+        let target = try FedManagementTarget(moduleID: "alfonso-core")
+        let callTask = Task {
+            try await client.callManagement(
+                target: target,
+                method: "board.state",
+                params: FedJSONObject()
+            )
+        }
+
+        try await waitForCondition { await client.pendingCallCount == 1 }
+        try await waitForCondition { await transport.requestSent }
+        let responseBytes = try await terminalResponseBytes(transport: transport, body: Data("reply-body".utf8))
+        await transport.enqueueInbound(responseBytes)
+
+        // The inbound path removes the entry before its async terminal bookkeeping,
+        // which makes the following cancellation race observe no continuation to
+        // resume a second time.
+        try await waitForCondition { await client.pendingCallCount == 0 }
+        callTask.cancel()
+        await transport.releaseGate()
+
+        let body = try await withTimeout(3_000_000_000) { try await callTask.value }
+        XCTAssertEqual(body, Data("reply-body".utf8))
+    }
+
     // MARK: - Dial-cycle reentrancy
 
     /// A disconnect that lands while a dial is suspended must not be resurrected
@@ -519,6 +610,23 @@ final class SubcFedClientCallRaceTests: XCTestCase {
 }
 
 private struct TimeoutFailure: Error {}
+
+private actor CallCompletion {
+    enum State: Equatable {
+        case pending
+        case cancelled
+        case failed
+        case succeeded
+    }
+
+    private(set) var state: State = .pending
+
+    var isSettled: Bool { state != .pending }
+
+    func record(_ state: State) {
+        self.state = state
+    }
+}
 
 /// Runs an operation with a hard timeout; throws TimeoutFailure if it does not
 /// complete in time. Used to turn a would-be permanent hang into a test failure.

@@ -106,10 +106,13 @@ public actor SubcFedClient {
     public private(set) var lastAttemptID: String?
 
     private struct PendingCall {
+        let effect: FedEffectID
         let isMutation: Bool
         let permit: FedAdmissionPermit
         let continuation: CheckedContinuation<Data, Error>
     }
+
+    var pendingCallCount: Int { pendingCalls.count }
 
     public init(
         profile: FedPeerProfile,
@@ -253,20 +256,38 @@ public actor SubcFedClient {
         // pure / retain ledgered), and abortInstalledCall is idempotent with a
         // concurrent drain, so the continuation resumes exactly once with no leak.
         let seq = prepared.effect.seq
-        return try await withCheckedThrowingContinuation { continuation in
-            pendingCalls[seq] = PendingCall(
-                isMutation: prepared.isMutation,
-                permit: prepared.permit,
-                continuation: continuation
-            )
-            Task { [weak self] in
-                do {
-                    try await session.engine.dispatchPreparedCall(prepared)
-                } catch {
-                    await self?.abortInstalledCall(seq: seq, error: error)
+        return try await withTaskCancellationHandler(
+            operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    pendingCalls[seq] = PendingCall(
+                        effect: prepared.effect,
+                        isMutation: prepared.isMutation,
+                        permit: prepared.permit,
+                        continuation: continuation
+                    )
+                    Task { [weak self] in
+                        do {
+                            try await session.engine.dispatchPreparedCall(prepared)
+                        } catch {
+                            await self?.abortInstalledCall(seq: seq, error: error)
+                        }
+                    }
+                }
+            },
+            onCancel: { [weak self] in
+                Task { [weak self] in
+                    await self?.resolvePendingCall(seq: seq) { pending in
+                        if pending.isMutation {
+                            await session.engine.originEffectLog?.noteIndeterminateLoss(pending.effect)
+                            await session.engine.admissionController?.retainLedgeredForRecovery(pending.permit)
+                        } else {
+                            await session.engine.releasePermit(pending.permit)
+                        }
+                        return .failure(CancellationError())
+                    }
                 }
             }
-        }
+        )
     }
 
     // MARK: - Dial cycle
@@ -601,8 +622,7 @@ public actor SubcFedClient {
         for frame in frames {
             guard frame.knownType == .callFrame else { continue }
             guard let effectValue = frame.header["effect"],
-                  let effect = FedEffectID.fromJSON(effectValue),
-                  let pending = pendingCalls.removeValue(forKey: effect.seq)
+                  let effect = FedEffectID.fromJSON(effectValue)
             else {
                 continue
             }
@@ -614,27 +634,29 @@ public actor SubcFedClient {
             let kind = frame.terminalKind ?? "error"
             let code = frame.terminalCode
             let message = frame.terminalMessage
-            do {
-                let body = try await session.engine.handleInboundTerminal(
-                    effect: effect,
-                    kind: kind,
-                    body: frame.body,
-                    bodyOmitted: frame.body.isEmpty,
-                    errorCode: code,
-                    errorMessage: message,
-                    isMutation: pending.isMutation,
-                    permit: pending.permit
-                )
-                pending.continuation.resume(returning: body)
-            } catch {
-                pending.continuation.resume(throwing: error)
+            await resolvePendingCall(seq: effect.seq) { pending in
+                do {
+                    let body = try await session.engine.handleInboundTerminal(
+                        effect: effect,
+                        kind: kind,
+                        body: frame.body,
+                        bodyOmitted: frame.body.isEmpty,
+                        errorCode: code,
+                        errorMessage: message,
+                        isMutation: pending.isMutation,
+                        permit: pending.permit
+                    )
+                    return .success(body)
+                } catch {
+                    return .failure(error)
+                }
             }
         }
     }
 
     private func handleSessionLoss(_ error: Error) async {
         let failure = (error as? FedFailure) ?? .disconnected
-        completePendingCalls(with: failure)
+        await completePendingCalls(with: failure)
         await tearDownSession(reason: failure)
         if explicitlyDisconnected {
             publish(.idle)
@@ -648,21 +670,34 @@ public actor SubcFedClient {
         scheduleReconnectIfNeeded(after: failure)
     }
 
-    private func completePendingCalls(with failure: FedFailure) {
-        let pending = pendingCalls
-        pendingCalls.removeAll()
-        for (_, call) in pending {
-            call.continuation.resume(throwing: failure)
+    private func completePendingCalls(with failure: FedFailure) async {
+        await resolvePendingCall { _ in .failure(failure) }
+    }
+
+    /// Takes selected pending calls out of the actor-isolated map before running
+    /// resolution work, so no competing path can resume a continuation twice.
+    private func resolvePendingCall(
+        seq: UInt64? = nil,
+        producing result: (PendingCall) async -> Result<Data, Error>
+    ) async {
+        let pending: [PendingCall]
+        if let seq {
+            guard let call = pendingCalls.removeValue(forKey: seq) else { return }
+            pending = [call]
+        } else {
+            pending = Array(pendingCalls.values)
+            pendingCalls.removeAll()
+        }
+        for call in pending {
+            let result = await result(call)
+            call.continuation.resume(with: result)
         }
     }
 
-    /// Removes a registered pending call and resumes it with an error after a
-    /// dispatch failure. removeValue makes this idempotent with a concurrent
-    /// session-loss drain (completePendingCalls), which may already have removed
-    /// and resumed the same continuation; exactly one site resumes it.
-    private func abortInstalledCall(seq: UInt64, error: Error) {
-        guard let removed = pendingCalls.removeValue(forKey: seq) else { return }
-        removed.continuation.resume(throwing: error)
+    /// Resumes a registered call after dispatch failure. dispatchPreparedCall has
+    /// already released a pure permit or retained a mutation for recovery.
+    private func abortInstalledCall(seq: UInt64, error: Error) async {
+        await resolvePendingCall(seq: seq) { _ in .failure(error) }
     }
 
     // MARK: - State helpers
@@ -792,7 +827,7 @@ public actor SubcFedClient {
     private func tearDownSession(reason: FedFailure) async {
         receiveTask?.cancel()
         receiveTask = nil
-        completePendingCalls(with: reason)
+        await completePendingCalls(with: reason)
         if let session = activeSession {
             await session.engine.disconnect(reason: reason)
             await session.transport.close()

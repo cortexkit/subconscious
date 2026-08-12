@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     task::{Context, Poll},
@@ -48,6 +48,7 @@ const DEFAULT_RESTORED_DEBOUNCE: Duration = Duration::from_millis(250);
 const EGRESS_BUFFER: usize = 128;
 const DEFAULT_ROUTE_WINDOW: usize = 1024;
 const DEFAULT_SUBSCRIPTION_EVENT_BUFFER: usize = 128;
+const DEFAULT_PUSH_EVENT_BUFFER: usize = 128;
 
 /// Capped exponential backoff used for reconnects and transient route-open retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +232,15 @@ pub struct CatalogList {
     pub modules: Vec<CatalogEntry>,
     #[serde(default)]
     pub subc_ops: Vec<String>,
+}
+
+/// A provider-originated push delivered on one live route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushEvent {
+    /// The connection-fenced route identity on which the push arrived.
+    pub handle: RouteHandle,
+    /// Opaque payload bytes sent by the provider.
+    pub body: Vec<u8>,
 }
 
 /// Managed Rust consumer for subc route calls.
@@ -607,6 +617,29 @@ impl SubcConsumer {
     /// Locally observed count of unknown or stale route frames dropped by layer-2 validation.
     pub fn dropped_route_frames(&self) -> u64 {
         self.shared.lock_inner().dropped_route_frames
+    }
+
+    /// Register a receiver for provider-originated Push frames on exactly one live route.
+    ///
+    /// Registering another receiver for the same route replaces and closes the prior receiver.
+    /// The receiver closes when its route closes, the connection drops, or its bounded buffer
+    /// fills; the reader never waits for an application that is not draining pushes.
+    pub fn push_events(
+        &self,
+        handle: &RouteHandle,
+    ) -> Result<mpsc::Receiver<PushEvent>, CallError> {
+        self.shared.register_push_events(*handle)
+    }
+
+    /// Number of Push frames dropped because their live route has no active receiver.
+    ///
+    /// Push is a one-way latency optimization, not a durable feed: the client does not
+    /// acknowledge it, and callers retain polling as their correctness backstop. Counting
+    /// intentional default-path drops makes an application that has not opted in observable.
+    pub fn pushes_dropped_no_receiver(&self) -> u64 {
+        self.shared
+            .pushes_dropped_no_receiver
+            .load(Ordering::Relaxed)
     }
 
     /// Managed unary call. Route-open failures happen before the body is sent and are
@@ -1029,6 +1062,7 @@ struct Shared {
     inner: Mutex<Inner>,
     notify: Notify,
     close_token: CancellationToken,
+    pushes_dropped_no_receiver: AtomicU64,
 }
 
 struct Inner {
@@ -1041,6 +1075,7 @@ struct Inner {
     route_by_channel: HashMap<u16, RouteKey>,
     one_shot_routes: HashMap<u16, RouteState>,
     route_epochs: HashMap<u16, RouteHandle>,
+    push_event_receivers: HashMap<RouteHandle, mpsc::Sender<PushEvent>>,
     dropped_route_frames: u64,
     openings: HashMap<RouteKey, Opening>,
     callbacks: Vec<Callback>,
@@ -1098,6 +1133,7 @@ impl Inner {
     }
 
     fn close_routes(&mut self) {
+        self.push_event_receivers.clear();
         for route in self.drain_routes() {
             route.sem.close();
         }
@@ -1119,6 +1155,7 @@ impl Shared {
                 route_by_channel: HashMap::new(),
                 one_shot_routes: HashMap::new(),
                 route_epochs: HashMap::new(),
+                push_event_receivers: HashMap::new(),
                 dropped_route_frames: 0,
                 openings: HashMap::new(),
                 callbacks: Vec::new(),
@@ -1130,6 +1167,7 @@ impl Shared {
             }),
             notify: Notify::new(),
             close_token: CancellationToken::new(),
+            pushes_dropped_no_receiver: AtomicU64::new(0),
         }
     }
 
@@ -2014,6 +2052,53 @@ impl Shared {
         }
     }
 
+    fn register_push_events(
+        &self,
+        handle: RouteHandle,
+    ) -> Result<mpsc::Receiver<PushEvent>, CallError> {
+        let (events_tx, events_rx) = mpsc::channel(DEFAULT_PUSH_EVENT_BUFFER);
+        let mut inner = self.lock_inner();
+        if inner.closed
+            || inner.generation != handle.connection_token()
+            || inner.writer.is_none()
+            || inner.route_epochs.get(&handle.channel) != Some(&handle)
+        {
+            return Err(CallError::StaleRouteHandle(handle));
+        }
+        inner.push_event_receivers.insert(handle, events_tx);
+        Ok(events_rx)
+    }
+
+    fn route_push(&self, handle: RouteHandle, body: Vec<u8>) {
+        let should_count_drop = {
+            let mut inner = self.lock_inner();
+            if inner.closed
+                || inner.generation != handle.connection_token()
+                || inner.route_epochs.get(&handle.channel) != Some(&handle)
+            {
+                return;
+            }
+            match inner.push_event_receivers.get(&handle) {
+                None => true,
+                Some(events) => match events.try_send(PushEvent { handle, body }) {
+                    Ok(()) => false,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        inner.push_event_receivers.remove(&handle);
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        inner.push_event_receivers.remove(&handle);
+                        false
+                    }
+                },
+            }
+        };
+        if should_count_drop {
+            self.pushes_dropped_no_receiver
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn send_cancel(&self, handle: RouteHandle, corr: u64, priority: Priority) {
         let writer = {
             let inner = self.lock_inner();
@@ -2119,6 +2204,7 @@ impl Shared {
             inner.closed = true;
             inner.writer = None;
             inner.route_epochs.clear();
+            inner.push_event_receivers.clear();
             self.close_token.cancel();
             let reconnect = match std::mem::replace(&mut inner.reconnect, ReconnectState::Idle) {
                 ReconnectState::Background { task, .. } => Some(task),
@@ -2216,6 +2302,7 @@ impl Shared {
                         if inner.route_epochs.get(&route.handle.channel) == Some(&route.handle) {
                             inner.route_epochs.remove(&route.handle.channel);
                         }
+                        inner.push_event_receivers.remove(&route.handle);
                     }
                     removed
                 }
@@ -2300,6 +2387,7 @@ impl Shared {
         let mut inner = self.lock_inner();
         if inner.route_epochs.get(&handle.channel) == Some(&handle) {
             inner.route_epochs.remove(&handle.channel);
+            inner.push_event_receivers.remove(&handle);
         }
     }
 
@@ -3050,7 +3138,10 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
         }
         FrameType::StreamEnd => shared.settle_pending(key, PendingTerminal::StreamEnd),
         FrameType::StreamData => shared.route_stream_data(key, frame.body),
-        FrameType::Push => {}
+        FrameType::Push => shared.route_push(
+            RouteHandle::new(frame.header.channel, frame.header.epoch, generation),
+            frame.body,
+        ),
         FrameType::Goodbye if frame.header.channel == 0 => {
             shared.handle_generation_drop(generation, "subc sent GOODBYE".to_string());
             return false;
@@ -3141,6 +3232,7 @@ impl Shared {
                 return;
             }
             inner.route_epochs.remove(&handle.channel);
+            inner.push_event_receivers.remove(&handle);
             inner
                 .remove_route_by_handle(handle)
                 .into_iter()
@@ -3791,6 +3883,35 @@ mod tests {
             assert!(inner.route_by_channel.is_empty());
             assert!(inner.route_epochs.is_empty());
         }
+        shared.close_sync("test complete");
+    }
+
+    #[tokio::test]
+    async fn stale_push_is_not_delivered_after_connection_generation_changes() {
+        let shared = writer_test_shared();
+        let old_handle = RouteHandle::new(7, 1, 1);
+        let (writer, _writer_rx) = mpsc::channel(1);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(old_handle.channel, old_handle);
+        }
+        let mut pushes = shared
+            .register_push_events(old_handle)
+            .expect("the old live route should accept a receiver");
+
+        {
+            let mut inner = shared.lock_inner();
+            inner.generation = 2;
+            inner.close_routes();
+            inner.route_epochs.clear();
+        }
+        shared.route_push(old_handle, b"stale".to_vec());
+
+        assert!(
+            pushes.recv().await.is_none(),
+            "connection teardown must end the old receiver before a stale Push can arrive"
+        );
         shared.close_sync("test complete");
     }
 

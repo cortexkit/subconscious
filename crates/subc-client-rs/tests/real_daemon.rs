@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use subc_client_rs::{
     async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
     ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler, RequestCtx, RetryBackoff,
-    SubcConsumer, SubcModuleError, SubscribeOptions,
+    RouteHandle, SubcConsumer, SubcModuleError, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -43,6 +43,7 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONSUMER_MODULE_A: &str = "subc-client-rs-consumer-a";
 const CONSUMER_MODULE_B: &str = "subc-client-rs-consumer-b";
 const CATALOG_FAKE_AFT_MODULE_ID: &str = "subc-client-rs-catalog-fake-aft";
+const PUSH_MODULE_ID: &str = "subc-client-rs-push";
 
 struct LiveDaemon {
     child: Child,
@@ -89,6 +90,45 @@ struct EchoModuleHandler;
 impl ModuleHandler for EchoModuleHandler {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         HandlerOutcome::Response(body)
+    }
+}
+
+#[derive(Clone, Default)]
+struct PushModuleHandler {
+    routes: Arc<Mutex<HashMap<u16, RouteHandle>>>,
+}
+
+impl PushModuleHandler {
+    fn route(&self, channel: u16) -> Option<RouteHandle> {
+        self.routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&channel)
+            .copied()
+    }
+}
+
+#[async_trait]
+impl ModuleHandler for PushModuleHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_bound(&self, handle: &RouteHandle) {
+        self.routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(handle.channel, *handle);
+    }
+
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        let mut routes = self
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if routes.get(&handle.channel) == Some(handle) {
+            routes.remove(&handle.channel);
+        }
     }
 }
 
@@ -869,6 +909,184 @@ async fn subc_consumer_close_route_releases_the_route_and_reopens_fresh() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_push_events_delivers_registered_push() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-push-delivery");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = PushModuleHandler::default();
+    let (module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(PUSH_MODULE_ID, &["push"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, PUSH_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let route = consumer
+        .open_route(
+            tool_target(PUSH_MODULE_ID),
+            consumer_identity("push-delivery"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    let module_route = wait_for_module_route(&handler, route.channel).await;
+    let mut events = consumer.push_events(&route).unwrap();
+
+    module
+        .push(&module_route, b"registered-push".to_vec(), None)
+        .await
+        .unwrap();
+    let event = timeout(EVENT_TIMEOUT, events.recv())
+        .await
+        .expect("registered push should arrive")
+        .expect("registered push receiver should remain open");
+    assert_eq!(event.handle, route);
+    assert_eq!(event.body, b"registered-push");
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_counts_pushes_dropped_without_receiver() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-push-drop");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = PushModuleHandler::default();
+    let (module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(PUSH_MODULE_ID, &["push"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, PUSH_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let route = consumer
+        .open_route(
+            tool_target(PUSH_MODULE_ID),
+            consumer_identity("push-drop"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    let module_route = wait_for_module_route(&handler, route.channel).await;
+    let before = consumer.pushes_dropped_no_receiver();
+
+    module
+        .push(&module_route, b"unregistered-push".to_vec(), None)
+        .await
+        .unwrap();
+    wait_for_push_drop_count(&consumer, before + 1).await;
+    assert!(
+        consumer.pushes_dropped_no_receiver() > before,
+        "an unregistered Push must increment pushes_dropped_no_receiver"
+    );
+
+    let mut events = consumer.push_events(&route).unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err(),
+        "a Push dropped before registration must not be delivered later"
+    );
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_push_events_end_when_route_closes() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-push-teardown");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = PushModuleHandler::default();
+    let (module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(PUSH_MODULE_ID, &["push"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, PUSH_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let route = consumer
+        .open_route(
+            tool_target(PUSH_MODULE_ID),
+            consumer_identity("push-teardown"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    let module_route = wait_for_module_route(&handler, route.channel).await;
+    let mut events = consumer.push_events(&route).unwrap();
+
+    consumer
+        .close_handle(&route, CloseRouteOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        timeout(EVENT_TIMEOUT, events.recv())
+            .await
+            .expect("route close should settle the push receiver")
+            .is_none(),
+        "route close must end the push receiver"
+    );
+    wait_for_module_route_gone(&handler, route.channel).await;
+    let push_after_close = module
+        .push(&module_route, b"dead-route-push".to_vec(), None)
+        .await;
+    assert!(
+        matches!(push_after_close, Err(SubcModuleError::StaleRouteHandle(_))),
+        "the module-side handle must reject Push after route teardown, got {push_after_close:?}"
+    );
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subc_consumer_subscribe_streaming_contract() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
@@ -1050,7 +1268,21 @@ async fn spawn_inline_module(
     ModuleHandle,
     tokio::task::JoinHandle<Result<(), SubcModuleError>>,
 ) {
-    let (handle, serve_future) = serve_with_handle(connection_file, manifest, EchoModuleHandler)
+    spawn_inline_module_with_handler(connection_file, manifest, EchoModuleHandler).await
+}
+
+async fn spawn_inline_module_with_handler<H>(
+    connection_file: &Path,
+    manifest: ModuleManifest,
+    handler: H,
+) -> (
+    ModuleHandle,
+    tokio::task::JoinHandle<Result<(), SubcModuleError>>,
+)
+where
+    H: ModuleHandler,
+{
+    let (handle, serve_future) = serve_with_handle(connection_file, manifest, handler)
         .await
         .unwrap();
     (handle, tokio::spawn(serve_future))
@@ -1078,6 +1310,15 @@ fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifes
             },
         },
     }
+}
+
+fn inline_push_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifest {
+    let mut manifest = inline_module_manifest(module_id, tool_names);
+    let Some(ProviderRole::ToolProvider { emits_push, .. }) = manifest.provides.first_mut() else {
+        unreachable!("push test manifest must have a tool provider role");
+    };
+    *emits_push = true;
+    manifest
 }
 
 fn tool_provider_role(tool_names: &[&str]) -> ProviderRole {
@@ -1282,6 +1523,48 @@ fn tool_target(module_id: &str) -> RouteTarget {
 
 fn json_body(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).unwrap()
+}
+
+async fn wait_for_module_route(handler: &PushModuleHandler, channel: u16) -> RouteHandle {
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if let Some(handle) = handler.route(channel) {
+            return handle;
+        }
+        if Instant::now() >= deadline {
+            panic!("push module did not bind route channel {channel} within {EVENT_TIMEOUT:?}");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_module_route_gone(handler: &PushModuleHandler, channel: u16) {
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if handler.route(channel).is_none() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("push module did not release route channel {channel} within {EVENT_TIMEOUT:?}");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_push_drop_count(consumer: &SubcConsumer, minimum: u64) {
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if consumer.pushes_dropped_no_receiver() >= minimum {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "pushes_dropped_no_receiver did not reach {minimum}; got {}",
+                consumer.pushes_dropped_no_receiver()
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn wait_for_connection_file(path: &Path, wait: Duration) {

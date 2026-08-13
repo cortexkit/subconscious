@@ -76,4 +76,71 @@ final class FedFailureDescriptionTests: XCTestCase {
             )
         }
     }
+
+    /// The two authority bye codes have OPPOSITE subjects: `fed_tombstoned`
+    /// means THIS device was revoked; `fed_local_membership_fenced` means the
+    /// SENDER fenced itself and this device is healthy. The strings are pinned
+    /// by the producer (callosum test-vectors/fed-wire, vendored in
+    /// Fixtures/fed-terminal-bye-codes.jsonl); these tests assert each renders
+    /// its own subject and can never borrow the other's text — rendering
+    /// "revoked" for a self-fenced sender sends an operator to re-enroll a
+    /// device that has no problem.
+    func testTombstonedByeRendersTheRecipientAsRevoked() throws {
+        let codes = try Self.vendoredByeCodes()
+        let code = try XCTUnwrap(codes["bye_recipient_tombstoned"])
+        let text = FedFailure.protocolViolation(byeCode: code).description
+        XCTAssertTrue(text.contains("revoked"), "lost the revocation subject: \(text)")
+        XCTAssertTrue(text.contains("re-enroll"), "lost the remedy: \(text)")
+        XCTAssertFalse(text.contains("No action"), "borrowed the fenced-sender text: \(text)")
+        XCTAssertFalse(text.contains("protocol error"), "fell through to the generic arm: \(text)")
+    }
+
+    func testMembershipFencedByeRendersTheSenderAsTheSubject() throws {
+        let codes = try Self.vendoredByeCodes()
+        let code = try XCTUnwrap(codes["bye_sender_membership_fenced"])
+        let text = FedFailure.protocolViolation(byeCode: code).description
+        XCTAssertTrue(text.contains("its own account membership"), "lost the sender subject: \(text)")
+        XCTAssertTrue(text.contains("No action is needed on this device"), "lost the reassurance: \(text)")
+        XCTAssertFalse(text.contains("revoked by the remote peer"), "borrowed the tombstoned text \u{2014} the inversion this split exists to prevent: \(text)")
+        XCTAssertFalse(text.contains("protocol error"), "fell through to the generic arm: \(text)")
+    }
+
+    /// Unknown bye codes must keep the generic terminal rendering — the
+    /// tolerant-classification property that makes new producer codes
+    /// transport-safe before a rendering ships.
+    func testUnknownByeCodeKeepsTheGenericTerminalRendering() {
+        let text = FedFailure.protocolViolation(byeCode: "fed_some_future_code").description
+        XCTAssertTrue(text.contains("fed_some_future_code"), "lost the code: \(text)")
+        XCTAssertTrue(text.contains("protocol error"), "generic arm changed shape: \(text)")
+    }
+
+    /// Reads the code strings from the vendored producer-minted fixture rather
+    /// than repeating the literals: if callosum renames a code, the fixture
+    /// refresh changes these tests' inputs and the rendering switch goes red
+    /// here instead of silently falling through to the generic arm in
+    /// production.
+    private static func vendoredByeCodes() throws -> [String: String] {
+        // Source-tree resolution, matching the target's other fixture readers
+        // (this test target declares no bundle resources).
+        let packageRoot = ProcessInfo.processInfo.environment["SUBC_FED_PACKAGE_PATH"]
+            ?? FileManager.default.currentDirectoryPath
+        let url = URL(fileURLWithPath: packageRoot)
+            .appendingPathComponent("Tests/SubcFedTests/Fixtures/fed-terminal-bye-codes.jsonl")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: url.path),
+            "vendored fixture missing: \(url.path)"
+        )
+        let lines = try String(contentsOf: url, encoding: .utf8)
+            .split(separator: "\n").filter { !$0.isEmpty }
+        XCTAssertEqual(lines.count, 2, "fixture must carry exactly the two split codes")
+        var codes: [String: String] = [:]
+        for line in lines {
+            let obj = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            let name = try XCTUnwrap(obj["name"] as? String)
+            let header = try XCTUnwrap(obj["header"] as? [String: Any])
+            codes[name] = try XCTUnwrap(header["code"] as? String)
+        }
+        return codes
+    }
 }

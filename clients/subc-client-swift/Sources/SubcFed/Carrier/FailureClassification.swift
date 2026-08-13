@@ -389,7 +389,24 @@ extension FedFailure: CustomStringConvertible {
         case .framingViolation:
             return "The remote device sent data this version cannot read."
         case let .protocolViolation(byeCode):
-            return "The connection was closed for a protocol error (\(byeCode))."
+            // Two bye codes are authority terminals, not protocol errors, and
+            // their SUBJECTS are opposite: `fed_tombstoned` is about the
+            // RECIPIENT (this device was revoked by the sender), while
+            // `fed_local_membership_fenced` is about the SENDER (its own
+            // membership was fenced; this device is healthy). Rendering either
+            // with the generic protocol-error text — or worse, each other's
+            // text — tells the operator the opposite of the truth and invites
+            // re-enrolling a device that has no problem. The strings are
+            // pinned producer-side in callosum's test-vectors/fed-wire and
+            // vendored in Fixtures/fed-terminal-bye-codes.jsonl.
+            switch byeCode {
+            case "fed_tombstoned":
+                return "This device's access was revoked by the remote peer. Reconnecting will not help; re-enroll this device if access should be restored."
+            case "fed_local_membership_fenced":
+                return "The remote peer ended the session because its own account membership was fenced. No action is needed on this device."
+            default:
+                return "The connection was closed for a protocol error (\(byeCode))."
+            }
         case .catalogTargetUnavailable:
             return "That service is not currently offered by the remote device."
         case .fedBodyTooLarge:

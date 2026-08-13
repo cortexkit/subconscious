@@ -1,0 +1,2 @@
+{"name":"bye_recipient_tombstoned","note":"sender revoked the recipient peer; the recipient is the tombstoned subject","header":{"code":"fed_tombstoned","message":"","type":"bye"}}
+{"name":"bye_sender_membership_fenced","note":"sender's own organization membership was compromised; the recipient remains healthy","header":{"code":"fed_local_membership_fenced","message":"","type":"bye"}}

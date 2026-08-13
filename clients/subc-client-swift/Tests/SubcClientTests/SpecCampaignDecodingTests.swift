@@ -89,6 +89,40 @@ final class SpecCampaignDecodingTests: XCTestCase {
         XCTAssertEqual(d.scores?.codeQuality, 25)
     }
 
+    func testWorkQualityScoreDecodesFromTheCurrentWireShape() throws {
+        // The producer emits exactly {"workQuality": N} (manager_runtime
+        // folds legacy code_quality into that key), so this pins the CURRENT
+        // axis. Before workQuality existed on SpecScores, this payload
+        // decoded as an empty object and a coalescing renderer drew "0/0" --
+        // a confident false failing grade -- for every scored slice.
+        let campaigns = try decodeCampaigns(
+            """
+            [{ "consultId": "ct_wq", "phase": "dispatch", "round": 2,
+               "updatedAtMs": 1786700000000,
+               "epic": { "id": "e", "title": "T", "status": "open" },
+               "slices": [
+                 { "id": "s1", "title": "scored", "status": "done",
+                   "updatedAtMs": 1786700000000,
+                   "dispatch": { "backgroundTaskId": "bg_a", "taskState": "settled",
+                                "scores": { "workQuality": 88 } } },
+                 { "id": "s2", "title": "running", "status": "open",
+                   "updatedAtMs": 1786700000000,
+                   "dispatch": { "backgroundTaskId": "bg_b", "taskState": "running" } }
+               ] }]
+            """)
+        let slices = try XCTUnwrap(campaigns[0].slices)
+        // Scored slice: the current axis carries the value; legacy columns
+        // are genuinely absent, not zero.
+        let scored = try XCTUnwrap(slices[0].dispatch?.scores)
+        XCTAssertEqual(scored.workQuality, 88)
+        XCTAssertNil(scored.correctness)
+        XCTAssertNil(scored.codeQuality)
+        // Running slice: the producer omits the scores OBJECT entirely --
+        // "not scored yet" must decode as absent, never as a default.
+        XCTAssertNotNil(slices[1].dispatch)
+        XCTAssertNil(slices[1].dispatch?.scores)
+    }
+
     func testSnakeCaseWireDecodesViaNormalizer() throws {
         // The live wire may arrive snake_case; JSONKeyNormalizer camelizes
         // before decode, matching the Observe tab's existing path.

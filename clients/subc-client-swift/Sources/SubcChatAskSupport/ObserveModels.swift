@@ -354,7 +354,19 @@ public struct SpecDispatch: Codable, Equatable {
     public var failureReason: String?
 }
 
+/// Slice evaluation scores. The producer (prefrontal `spec_status`) omits
+/// the whole object while a slice is unscored, so `SpecDispatch.scores`
+/// staying optional is load-bearing: "not scored yet" must remain
+/// distinguishable from "scored", and absence must never flow into
+/// arithmetic (an absent score coalesced to 0 renders a confident false
+/// failing grade in the same style as a real one).
 public struct SpecScores: Codable, Equatable {
+    /// The current scoring axis, 0...100. The producer folds legacy
+    /// `code_quality` into this key, so historical evaluations arrive
+    /// here too.
+    public var workQuality: Int?
+    /// Readable legacy columns only; current producer code leaves them
+    /// NULL. Kept for decoding old snapshots, superseded by `workQuality`.
     public var correctness: Int?
     public var codeQuality: Int?
 }

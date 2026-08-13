@@ -1501,7 +1501,44 @@ fn quota_account_header_extras(entry: &Value) -> Vec<String> {
             ));
         }
     }
+    if let Some(segment) = quota_stale_segment(entry) {
+        extras.push(segment);
+    }
     extras
+}
+
+/// Render a `stale` disclosure: this entry is a preserved last-known-good
+/// reading served through an ongoing refresh failure.
+///
+/// The rendered duration is the BLIND time (now - stale.since: how long the
+/// producer has been unable to look), deliberately not the reading's age
+/// (now - fetchedAt, rendered separately above). The reading was taken, then
+/// the failure began; conflating the two is the confusion the wire field
+/// exists to prevent, so the renderer must not reintroduce it.
+fn quota_stale_segment(entry: &Value) -> Option<String> {
+    let stale = entry.get("stale")?;
+    let class = stale
+        .get("class")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        // The producer may preserve a reading for a reason it cannot
+        // classify; the state is still worth disclosing.
+        .unwrap_or("cause unstated");
+    let since_raw = stale.get("since").and_then(Value::as_str);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let duration = match since_raw.and_then(parse_rfc3339_to_utc_secs) {
+        // `since` is always at or after the reading was taken, so a future
+        // `since` means a producer or clock defect: show the raw value
+        // instead of a fabricated duration.
+        Some(since) if since <= now => format_duration_two_units(now - since),
+        _ => format!("since {}", since_raw.unwrap_or("unknown")),
+    };
+    Some(format!(
+        "\u{26a0} last good reading \u{b7} refresh failing for {duration} ({class})"
+    ))
 }
 
 /// Distinct window labels across a provider's accounts, in first-seen order,
@@ -2928,6 +2965,96 @@ mod tests {
         assert_eq!(extras.len(), 2, "extras: {extras:?}");
         assert_eq!(extras[0], "plan: pro");
         assert!(extras[1].starts_with("✦ 4 saved resets"));
+    }
+
+    /// A `stale` disclosure renders the BLIND duration (now - since), never
+    /// the reading's age (now - fetchedAt): the two answer different
+    /// questions, and the renderer must not reintroduce the conflation the
+    /// wire field exists to prevent.
+    #[test]
+    fn stale_disclosure_renders_blind_duration_not_reading_age() {
+        // No disclosure -> no segment; the fresh path is unchanged.
+        let fresh = serde_json::json!({ "provider": "codex" });
+        assert!(quota_stale_segment(&fresh).is_none());
+
+        // A reading fetched ~2h ago whose refresh began failing ~5m ago: the
+        // segment must carry the minutes, not the hours. If the renderer
+        // read fetchedAt instead of stale.since, this asserts red.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let iso = |secs: u64| {
+            // Render an RFC3339 UTC timestamp without pulling a date crate
+            // into the test: reuse the parser as the round-trip oracle.
+            let days = secs / 86_400;
+            let (mut y, mut rem) = (1970u64, days);
+            loop {
+                let len = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                    366
+                } else {
+                    365
+                };
+                if rem < len {
+                    break;
+                }
+                rem -= len;
+                y += 1;
+            }
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let lens = [
+                31,
+                if leap { 29 } else { 28 },
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ];
+            let mut m = 0;
+            while rem >= lens[m] {
+                rem -= lens[m];
+                m += 1;
+            }
+            format!(
+                "{y:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                m + 1,
+                rem + 1,
+                (secs % 86_400) / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            )
+        };
+        let fetched_at = iso(now - 7_200);
+        let since = iso(now - 300);
+        // The oracle: the hand-rolled formatter must agree with the parser
+        // the renderer uses, or the assertions below test nothing.
+        assert_eq!(parse_rfc3339_to_utc_secs(&since), Some(now - 300));
+
+        let entry = serde_json::json!({
+            "provider": "codex",
+            "fetchedAt": fetched_at,
+            "stale": { "since": since, "class": "upstream_failed" }
+        });
+        let segment = quota_stale_segment(&entry).expect("disclosure renders");
+        assert!(
+            segment.contains("5m") && !segment.contains("2h"),
+            "must render blind time, not reading age: {segment}"
+        );
+        assert!(segment.contains("upstream_failed"), "{segment}");
+
+        // A classless disclosure still renders, with the cause named absent.
+        let unclassified = serde_json::json!({
+            "provider": "codex",
+            "stale": { "since": since }
+        });
+        let segment = quota_stale_segment(&unclassified).expect("renders");
+        assert!(segment.contains("cause unstated"), "{segment}");
     }
 
     #[test]

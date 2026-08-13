@@ -56,7 +56,12 @@ elif [ "$found" -eq 0 ]; then
   echo "No file would truncate below ${threshold}% (${scanned} file(s) examined)."
 else
   echo "$found of ${scanned} file(s) would truncate at or below ${threshold}%."
-  echo "Anchor on '#[cfg(test)]' immediately followed by a module instead."
+  # The anchor advice must not swap one marker-offset defect for its mirror:
+  # cutting AT the tests module assumes the module is terminal, and top-level
+  # code appended after it (where the least careful edit lands) would read as
+  # test code. The safe shape skips the module's brace-balanced extent.
+  echo "Anchor on '#[cfg(test)] mod tests' and skip its brace-balanced extent;"
+  echo "code after the module is production, so a cut-at-marker is still wrong."
 fi
 
 # The recommended anchor is better than the naive cut and still incomplete, in

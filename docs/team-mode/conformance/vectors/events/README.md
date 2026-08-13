@@ -30,8 +30,14 @@ identical op with a grant succeeds — same route, same principal). The
 validate-params-first ordering is deliberate: the op is public (its
 schema is in the tool manifest), so there is nothing for ordering to
 leak; surface-first ordering applies only when the op's EXISTENCE is
-the secret. Owed vector: `poll_grant_required` refusal — capture from
-a live grantless connection, producer-run.
+the secret. The grant-gate vectors landed producer-run in
+`subscribe_refusal_ladder.json`: THREE distinct refusal codes from one
+op on one surface (a lone refusal capture cannot show the gate
+distinguishes anything — a constant reject would satisfy it), with the
+refusal ORDER pinned as contract: connection liveness, then cursor
+shape, then poll grant. Test-authoring trap recorded: a revoked
+connection can never emit `poll_grant_required`; producing the grant
+vector required a fresh connection.
 
 Also newer than these captures (2026-08-13 late): `sorted_head`
 strategy shipped (plexus c252d4b, migration 12), PR watches live, and

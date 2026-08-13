@@ -1,0 +1,24 @@
+{
+  "comment": "Producer-run captures (PLEX, 2026-08-13, deployed build c252d4b, agent-facing tool route, principal=direct). Three distinct codes from ONE op on ONE surface prove the gate is a function of state, not a constant refusal. The order IS part of the contract: connection liveness, then cursor shape, then poll grant. A revoked connection can NEVER emit poll_grant_required regardless of grants -- it is refused two gates earlier. Store verified: zero subscriptions committed for all three. The accept arm (well-formed subscribe with a covering grant succeeds) exists in production (conn-github-prs -> list_pull_requests) and is what stops a constant-reject implementation passing this set.",
+  "refusal_order": ["connection_inactive", "cursor_shape_missing", "poll_grant_required"],
+  "vectors": {
+    "no_poll_grant": {
+      "error": {
+        "code": "poll_grant_required",
+        "message": "a poll grant permitting this action is required"
+      }
+    },
+    "action_without_poll_shape": {
+      "error": {
+        "code": "cursor_shape_missing",
+        "message": "action has no usable polling cursor shape"
+      }
+    },
+    "revoked_connection": {
+      "error": {
+        "code": "connection_inactive",
+        "message": "connection is not active (status: revoked)"
+      }
+    }
+  }
+}

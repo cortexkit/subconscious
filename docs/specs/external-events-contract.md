@@ -37,10 +37,16 @@ up as they ship.
 
 ## Pinned rules, each with its reason
 
-1. SUBSCRIBE IS OPERATOR-MINTED, LIST/ACK ARE NOT. Poll grants carry
-   mandatory finite expiry and are minted on the ManagementSurface, which
-   agent-facing routes cannot reach. Consumption never extends a lease —
-   reading an event log must not be the act that authorizes more polling.
+1. THE POLL GRANT IS OPERATOR-MINTED; SUBSCRIBE SPENDS IT. The
+   ManagementSurface carries exactly issue_ticket/grant/revoke_grant
+   (a manifest test asserts nothing else leaks there); subscribe itself
+   is an agent-facing tool op refused with `poll_grant_required` when no
+   grant covers the action (behaviourally proven 2026-08-13: same route,
+   same principal, opposite outcomes, grant as the discriminator). An
+   agent may CREATE a watch; it cannot create the AUTHORITY a watch
+   needs. Poll grants carry mandatory finite expiry. Consumption never
+   extends a lease — reading an event log must not be the act that
+   authorizes more polling.
    Renewal is a human act; the ask queue is the request path (approval
    hands the operator a card; it does NOT auto-run the ceremony, because
    composition would make the ask tool a subscription minter).

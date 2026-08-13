@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_operation",
+    "message": "unsupported events operation"
+  }
+}

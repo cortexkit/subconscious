@@ -1,0 +1,22 @@
+{
+  "comment": "Field manifest of one events.list row as served live 2026-08-13 (payload body elided: vendor content varies per poll; the FIELD SET is the pin). Nullable-but-present: acked_at_ms, gap_from_ms, gap_reason, gap_to_ms, vendor_event_id.",
+  "row_fields": [
+    "acked_at_ms",
+    "connection_id",
+    "created_at_ms",
+    "event_id",
+    "gap_from_ms",
+    "gap_reason",
+    "gap_to_ms",
+    "kind",
+    "observed_at_ms",
+    "payload",
+    "payload_hash",
+    "principal",
+    "subscription_id",
+    "vendor_event_id"
+  ],
+  "envelope": "{\"result\": {\"events\": [ ...rows... ]}}",
+  "payload_hash_format": "sha256:<hex>",
+  "principal_observed": "direct"
+}

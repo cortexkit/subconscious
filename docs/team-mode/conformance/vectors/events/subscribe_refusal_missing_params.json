@@ -1,0 +1,19 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "example": {
+      "action": "web_search_exa",
+      "cadence_s": 300,
+      "connection": "conn-exa",
+      "fixed_args": {},
+      "op": "subscribe"
+    },
+    "invalid": [],
+    "message": "subscribe requires connection and action and cadence_s",
+    "missing": [
+      "connection",
+      "action",
+      "cadence_s"
+    ]
+  }
+}

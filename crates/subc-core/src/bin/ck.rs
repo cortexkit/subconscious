@@ -45,21 +45,19 @@ const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--su
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
-/// Top-level help with the externally-dispatched domains discovered from PATH
-/// (any executable named ck-<domain>), so 'ck' shows the REAL command surface
-/// of this machine, not just the built-ins.
+/// Top-level help: ONE domains list. Built-ins carry descriptions; the rest
+/// are discovered from PATH (any executable named ck-<domain>) and listed in
+/// the same block. Whether a domain is compiled in or dispatched to a
+/// ck-<domain> binary is an implementation detail an operator has no use for
+/// -- the earlier two-section rendering (\"domains\" vs \"installed domains\")
+/// made users learn it anyway.
 fn top_help() -> String {
     let external = discover_external_domains();
     let mut out = String::from(TOP_HELP_BASE);
-    if external.is_empty() {
-        out.push_str("\n\nany other domain dispatches to a ck-<domain> binary on PATH\n\n");
-    } else {
-        out.push_str("\n\ninstalled domains (dispatched to ck-<domain>):\n");
-        for domain in &external {
-            out.push_str(&format!("  {domain}\n"));
-        }
-        out.push('\n');
+    for domain in &external {
+        out.push_str(&format!("\n  {domain}"));
     }
+    out.push_str("\n\n");
     out.push_str(TOP_HELP_TAIL);
     out
 }

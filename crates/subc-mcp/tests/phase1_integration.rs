@@ -63,7 +63,15 @@ const TEST_DAEMON_VER: &str = "test-subc-mcp";
 // injected, nonce seeded into the supervisor handle for route.open verification.
 const TEST_MCP_MODULE_ID: &str = "subc-mcp";
 const TEST_MCP_LAUNCH_NONCE: &str = "test-mcp-launch-nonce";
-const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+// 30s, raised from 10s (2026-08-14): each test in the reverse-elicitation
+// family spawns a real daemon + shim + module stub, and the default test
+// parallelism runs eight such spawns at once. On a loaded host or CI runner the
+// 10s budget expired inside wait_for_atomic_at_least while the chain was still
+// warming -- 1-4 of the family failing per run, none under filtered single-test
+// runs, and a code-identical CI flip from green to red as runner load moved.
+// The budget prices the HOST, not the code under test; the waits settle in
+// well under a second once the processes exist.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = SETUP_TIMEOUT;
 const QUIET_TIMEOUT: Duration = Duration::from_millis(750);
 const NO_HANG_TIMEOUT: Duration = Duration::from_secs(2);
@@ -932,10 +940,17 @@ fn accepted_elicitation(content: Value) -> CreateElicitationResult {
 async fn wait_for_atomic_at_least(counter: &AtomicUsize, expected: usize, label: &str) {
     let deadline = Instant::now() + READ_TIMEOUT;
     loop {
-        if counter.load(Ordering::SeqCst) >= expected {
+        let observed = counter.load(Ordering::SeqCst);
+        if observed >= expected {
             return;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        // The counts are in the message because a bare timeout cannot be
+        // triaged: zero-observed means the chain never warmed, while
+        // observed-one-short means it works and lost a race.
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {label}: observed {observed}, expected at least {expected}"
+        );
         sleep(Duration::from_millis(20)).await;
     }
 }

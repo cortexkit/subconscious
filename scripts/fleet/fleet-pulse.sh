@@ -854,6 +854,38 @@ print("|".join(f"^{d}/" for d in dirs))
 done <<EOF
 $modmap
 EOF
+# Version-tagged repos get two PRECISE legs the mtime heuristics above cannot
+# provide, and the legs catch DIFFERENT failures (BROCA's correction, 2026-08-14,
+# after I claimed coverage this section did not have):
+#   manifest > newest tag   = CUT BUT NEVER TAGGED  -- the repo is self-consistent
+#       (deployed==tag, CI green) and the only moved surface is Cargo.toml, so
+#       tag-vs-deployed reads clean through the whole gap. Proof case: broca
+#       0.3.45 sat cut-and-verified for hours while prod served 0.3.44.
+#   newest tag > deployed   = TAGGED BUT NEVER PLACED -- the release finished and
+#       the binary swap did not happen.
+# Either leg alone reports clean on the other's failure. Repos without v-tags or
+# without a --version self-report are SKIPPED AND SAY SO (a skipped scope that
+# prints nothing reads as a clean scope).
+section "release ledger (manifest vs tag vs deployed)"
+for spec in "broca:ck-broca" "engram:ck-engram" "fusiform:ck-fusiform"; do
+  repo="${spec%%:*}"; bin="${spec##*:}"
+  rdir="$HOME/Work/Projects/CortexKit/$repo"
+  [ -d "$rdir/.git" ] && [ -x "$BIN/$bin" ] || { echo "  $repo: skipped (no repo or binary)"; continue; }
+  tag=$(cd "$rdir" && git tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -1)
+  [ -n "$tag" ] || { echo "  $repo: skipped (no v-tags)"; continue; }
+  tagv="${tag#v}"
+  manifest=$(cd "$rdir" && grep -m1 '^version *= *"' "$(git ls-files '*Cargo.toml' | head -1)" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')
+  deployed=$("$BIN/$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  line="  $bin: manifest ${manifest:-?} tag ${tagv} deployed ${deployed:-?}"
+  if [ -n "$manifest" ] && [ "$manifest" != "$tagv" ]; then
+    echo "$line -- CUT BUT NEVER TAGGED (release finished nowhere)"
+  elif [ -n "$deployed" ] && [ "$deployed" != "$tagv" ]; then
+    echo "$line -- TAGGED BUT NEVER PLACED (binary swap missing)"
+  else
+    dim "$line -- consistent"
+  fi
+done
+
 # The daemon is not a module, so a module-derived list structurally cannot reach
 # it -- and it is the one binary whose staleness affects every other. Checked
 # separately for that reason, against the subc-core crates only: a commit to the

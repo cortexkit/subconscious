@@ -593,6 +593,14 @@ impl SupervisorHandle {
         update_snapshot(&module.inner.snapshot, Some(module_id), |state| {
             state.health.late_answer_count = state.health.late_answer_count.saturating_add(1);
             state.health.last_late_answer_latency_ms = Some(latency_ms);
+            // A late answer is an answer: the module served the probe, just past
+            // the deadline. Leaving the miss streak in place while logging
+            // "proves the module is alive" is how a CPU-starved module that
+            // answers every probe a few seconds late still marches to the
+            // threshold and gets killed — the exact kill class `NoAnswer` is
+            // excluded from `is_proof_of_death` to prevent. Slow-but-answering
+            // is degradation, and degradation reports; it does not restart.
+            state.health.consecutive_failures = 0;
         })?;
         Ok(true)
     }
@@ -895,6 +903,20 @@ impl fmt::Debug for SupervisedModule {
 impl SupervisedModule {
     pub fn module_id(&self) -> &str {
         &self.inner.module_id
+    }
+
+    /// Test-only: put one probe miss on the streak, the way
+    /// `handle_health_probe_failure` does, so tests can assert what a later
+    /// event does to the streak without driving the whole probe loop.
+    #[cfg(test)]
+    pub(crate) fn record_health_probe_failure_for_test(
+        &self,
+        detail: &str,
+    ) -> Result<(), SuperviseError> {
+        update_snapshot(&self.inner.snapshot, Some(&self.inner.module_id), |state| {
+            state.health.consecutive_failures = state.health.consecutive_failures.saturating_add(1);
+            state.health.detail = Some(detail.to_string());
+        })
     }
 
     pub fn state(&self) -> Result<ModuleState, SuperviseError> {
@@ -3429,6 +3451,45 @@ mod health_tombstone_tests {
         let health = harness.module.status().unwrap().health;
         assert_eq!(health.late_answer_count, 2);
         assert_eq!(health.last_late_answer_latency_ms, Some(11_000));
+    }
+
+    /// A module that answers every probe late must never march to the kill
+    /// threshold: the late answer proves it is alive, so it must clear the miss
+    /// streak the timeout recorded. Without the reset, a CPU-starved module
+    /// that serves every probe seconds past the deadline accumulates
+    /// `consecutive_failures` to the threshold and is killed — the exact
+    /// sequence from the 2026-08-14 aft disable, where the daemon logged
+    /// "proves the module is alive" five times while counting five misses.
+    #[tokio::test(start_paused = true)]
+    async fn late_answer_clears_the_consecutive_failure_streak() {
+        let mut harness = probe_harness();
+
+        // Timeout recorded first: the probe path saw no answer in time.
+        time_out_without_answer(&mut harness).await;
+        harness
+            .module
+            .record_health_probe_failure_for_test("[no-answer] test miss")
+            .unwrap();
+        assert_eq!(
+            harness.module.status().unwrap().health.consecutive_failures,
+            1,
+            "precondition: the miss must be on the streak before the late answer"
+        );
+
+        // The stalled reply then lands: proof of life.
+        let late = finish_after(&mut harness, Duration::from_secs(9)).await;
+        assert!(matches!(
+            late,
+            ModuleControlRpcCompletion::LateHealthAnswer { .. }
+        ));
+        assert!(harness.handler.observe_module_control_completion(late));
+
+        let health = harness.module.status().unwrap().health;
+        assert_eq!(
+            health.consecutive_failures, 0,
+            "a late answer is an answer: the streak must reset"
+        );
+        assert_eq!(health.late_answer_count, 1);
     }
 
     #[tokio::test(start_paused = true)]

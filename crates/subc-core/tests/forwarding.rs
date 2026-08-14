@@ -1485,7 +1485,14 @@ async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
         &server,
         &supervisor,
         module_id,
-        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+        [
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+            // Receipt evidence for the drain race below: the stub PUSHes on the
+            // request channel BEFORE its delay, so reading that push proves the
+            // slow request crossed client -> daemon -> module and is genuinely
+            // in flight before the reload is issued.
+            ("FAKE_AFT_PUSH_ON_REQUEST", "1"),
+        ],
     )
     .await;
     let generation_before = server.registry.generation().unwrap();
@@ -1511,6 +1518,17 @@ async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
     .await
     .unwrap();
     route_client.flush().await.unwrap();
+
+    // Wait for the module's receipt push before reloading. Without it the test
+    // writes the request on one connection and the reload on another, and the
+    // daemon's two reader tasks race: ~half the time the drain's phase one lands
+    // before the request frame is even read, the request is never in flight, the
+    // drain settles on an empty route, and the client's first frame is the
+    // teardown GOODBYE instead of the Response (issue #11, 10/20 on master).
+    // The drain contract is "drain what is in flight at drain start" -- the test
+    // must establish in-flightness, not assume its own write raced ahead.
+    let receipt = read_push(&mut route_client, ack.route_channel).await;
+    assert_eq!(receipt.header.epoch, ack.route_epoch);
 
     let mut control_client = connect_authed_client(&server.connection_file_path)
         .await
@@ -1563,6 +1581,9 @@ async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
     .await
     .unwrap();
     fresh_client.flush().await.unwrap();
+    // The respawned stub runs with the same env, so this request also gets a
+    // receipt push ahead of its response.
+    let _fresh_receipt = read_push(&mut fresh_client, fresh_ack.route_channel).await;
     let fresh_response = read_frame_timeout(&mut fresh_client).await;
     assert_response(&fresh_response, fresh_ack.route_channel, 405, fresh_payload);
 

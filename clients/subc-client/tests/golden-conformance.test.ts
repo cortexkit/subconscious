@@ -180,7 +180,9 @@ describe("Rust golden fixtures", () => {
     // `status` is a closed set on both sides -- the provider's HealthStatus union
     // and the daemon's escalation policy agree on these three, so a fourth value
     // arriving from Rust would be a policy change wearing a data change's shape.
-    expect(["ok", "degraded", "failing"]).toContain(response.status);
+    // `String(...)` narrows the `unknown` for toContain's string overload; the
+    // line above already proved the runtime type.
+    expect(["ok", "degraded", "failing"]).toContain(String(response.status));
 
     // The optional pair: the provider omits them when undefined rather than
     // sending nulls, and this fixture is the one that carries both, so it pins

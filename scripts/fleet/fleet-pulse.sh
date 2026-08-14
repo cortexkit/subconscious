@@ -867,6 +867,7 @@ EOF
 # without a --version self-report are SKIPPED AND SAY SO (a skipped scope that
 # prints nothing reads as a clean scope).
 section "release ledger (manifest vs tag vs deployed)"
+NOW_EPOCH=$(date +%s)
 for spec in "broca:ck-broca" "engram:ck-engram" "fusiform:ck-fusiform"; do
   repo="${spec%%:*}"; bin="${spec##*:}"
   rdir="$HOME/Work/Projects/CortexKit/$repo"
@@ -878,7 +879,20 @@ for spec in "broca:ck-broca" "engram:ck-engram" "fusiform:ck-fusiform"; do
   deployed=$("$BIN/$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
   line="  $bin: manifest ${manifest:-?} tag ${tagv} deployed ${deployed:-?}"
   if [ -n "$manifest" ] && [ "$manifest" != "$tagv" ]; then
-    echo "$line -- CUT BUT NEVER TAGGED (release finished nowhere)"
+    # GRACE FLOOR (BROCA's measurement): the NORMAL release spends 36-57 min with
+    # manifest ahead of newest tag -- bump, push, wait out 3-platform CI, tag on
+    # green. An instant alarm fires on every correct release and trains its
+    # reader to dismiss it, which is how it gets dismissed the one time it
+    # matters. 90 min clears a green CI run comfortably and catches the 341-min
+    # hole this leg was built for. Age from the BUMP COMMIT of the manifest
+    # version (the moment the ledger went ahead), not from tag or mtime.
+    bump_epoch=$(cd "$rdir" && git log -1 --format='%ct' -S"version = \"$manifest\"" -- "$(git ls-files '*Cargo.toml' | head -1)" 2>/dev/null)
+    age_min=$(( (NOW_EPOCH - ${bump_epoch:-NOW_EPOCH}) / 60 ))
+    if [ "$age_min" -ge 90 ]; then
+      echo "$line -- CUT BUT NEVER TAGGED for ${age_min}m (release finished nowhere)"
+    else
+      dim "$line -- mid-release (bump ${age_min}m old, grace 90m)"
+    fi
   elif [ -n "$deployed" ] && [ "$deployed" != "$tagv" ]; then
     echo "$line -- TAGGED BUT NEVER PLACED (binary swap missing)"
   else

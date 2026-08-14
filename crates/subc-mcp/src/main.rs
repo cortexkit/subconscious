@@ -29,9 +29,9 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
         ClientResult, CustomRequest, ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult,
-        Implementation, JsonObject, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
-        ProgressNotificationParam, ProgressToken, RequestId, ServerCapabilities, ServerInfo,
-        ServerRequest, Tool as McpTool, ToolAnnotations,
+        Implementation, InitializeRequestParams, InitializeResult, JsonObject, ListPromptsResult,
+        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+        RequestId, ServerCapabilities, ServerInfo, ServerRequest, Tool as McpTool, ToolAnnotations,
     },
     service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError},
     transport::async_rw::AsyncRwTransport,
@@ -191,7 +191,7 @@ impl RelaySession {
         &self.id
     }
 
-    fn record_initialized_peer(&self, peer: Peer<RoleServer>) {
+    fn record_peer(&self, peer: Peer<RoleServer>) {
         let capabilities = peer
             .peer_info()
             .map(|info| ReverseCapabilities::from_client(&info.capabilities))
@@ -441,10 +441,13 @@ impl ReverseRelay {
         self.routes.lock().await.get(&handle).cloned()
     }
 
-    async fn validate_ingress(&self, channel: u16, epoch: u32) -> bool {
+    async fn validate_ingress(&self, channel: u16, epoch: u32, frame_type: FrameType) -> bool {
         let valid = self.live_epochs.lock().await.get(&channel) == Some(&epoch);
         if !valid {
             self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "subc-mcp module: dropping subc frame type={frame_type:?} for uninstalled or stale route handle=({channel}, {epoch})"
+            );
         }
         valid
     }
@@ -4170,6 +4173,21 @@ struct ToolsSearchMatch {
 }
 
 impl ServerHandler for SubcMcpServer {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<InitializeResult, ErrorData> {
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        // Provider routes exist before the MCP initialized notification arrives. Publish the peer
+        // as part of the initialize request so a reverse request cannot observe an open provider
+        // route while the corresponding host relay is still absent.
+        self.relay_session.record_peer(context.peer.clone());
+        Ok(self.get_info())
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -4261,7 +4279,7 @@ impl ServerHandler for SubcMcpServer {
         let relay_session = Arc::clone(&self.relay_session);
         let events = self.subc.subscribe_events();
         let peer = context.peer.clone();
-        self.relay_session.record_initialized_peer(peer.clone());
+        self.relay_session.record_peer(peer.clone());
         let shutdown = self.shutdown.clone();
         let reconcile_gate = Arc::clone(&self.reconcile_gate);
         tokio::spawn(session_lifecycle(
@@ -4729,7 +4747,7 @@ async fn subc_reader_loop<R>(
             Ok(Some(frame)) => {
                 if frame.header.channel != 0
                     && !relay
-                        .validate_ingress(frame.header.channel, frame.header.epoch)
+                        .validate_ingress(frame.header.channel, frame.header.epoch, frame.header.ty)
                         .await
                 {
                     continue;

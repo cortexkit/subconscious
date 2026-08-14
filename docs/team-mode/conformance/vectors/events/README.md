@@ -43,3 +43,18 @@ Also newer than these captures (2026-08-13 late): `sorted_head`
 strategy shipped (plexus c252d4b, migration 12), PR watches live, and
 gap rows gained a third reason `sorted_head_page_saturated` — the one
 most likely to appear first in the wild.
+
+## Gap-row semantics (producer-verified 2026-08-14)
+
+`dedupe_payload_conflict` means **"the stored body was BEHIND the vendor at
+that moment"** — an accurate staleness report, not a suppressed duplicate.
+(PLEX verified at source: pre-fix code discarded the incoming payload on
+conflict, so these gaps correctly reported stale stored content; the fix at
+ee5e321 now advances the payload. 750 such rows exist, all pre-fix-era
+accurate.) Do not bulk-ack them as noise, and do not phrase them as
+duplicates in digests.
+
+`sorted_head_page_saturated`: ZERO rows exist fleet-wide — the 100-item
+guard has never fired (no watched repo changes >100 items in one 300s
+cadence). The fixture specimen arrives when a genuinely busy repo produces
+one; it will not be manufactured.

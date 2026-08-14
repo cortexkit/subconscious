@@ -78,7 +78,6 @@ describe("managementSurfaceManifest", () => {
         },
       ],
       consumes: [],
-      scheduled_tasks: [],
       bindings: {
         storage: { kind: "sqlite", scope: "project", owns_schema: false },
         vault_grants: [],

@@ -417,7 +417,6 @@ fn supervision_only_manifest(module_id: &str) -> ModuleManifest {
         trust_tier: TrustTier::FirstParty,
         provides: Vec::new(),
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,

@@ -2761,9 +2761,8 @@ mod tests {
     use serde_json::{json, Value};
     use subc_protocol::{
         manifest::{
-            Bindings, CircuitBreaker, Concurrency, ExecutionMode, IdentityBinding, IdentityScope,
-            ModelPolicy, ProviderRole, ScheduledTask, StorageBinding, StorageKind, StorageScope,
-            TaskEligibility, Tool,
+            Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ProviderRole,
+            StorageBinding, StorageKind, StorageScope, Tool,
         },
         session::HealthStatus,
         FrameType,
@@ -2963,24 +2962,6 @@ mod tests {
                 sub_supervises: true,
             }],
             consumes: Vec::new(),
-            scheduled_tasks: vec![ScheduledTask {
-                task_id: "aft.dreamer".to_string(),
-                eligibility: TaskEligibility {
-                    cooldown: "1h".to_string(),
-                    window: "always".to_string(),
-                },
-                lease_scope: subc_protocol::manifest::LeaseScope::Project,
-                renews_during_calls: true,
-                toolset: vec!["read".to_string()],
-                model_policy: ModelPolicy {
-                    tier: "cheap".to_string(),
-                    fallback_chain: vec!["fallback".to_string()],
-                },
-                step_cap: 10,
-                circuit_breaker: CircuitBreaker {
-                    identical_failures: 3,
-                },
-            }],
             bindings: Bindings {
                 storage: StorageBinding {
                     kind: StorageKind::Sqlite,

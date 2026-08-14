@@ -539,12 +539,15 @@ async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
     let module = supervisor
         .spawn(ModuleSpec {
             module_id: "stderr-tail-crasher".to_string(),
-            program: PathBuf::from("/bin/sh"),
-            args: vec![
-                "-c".to_string(),
-                "echo 'config error: missing top-level `storage`' >&2; exit 1".to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env: vec![
+                (
+                    "FAKE_AFT_STDERR_LINE".to_string(),
+                    "config error: missing top-level `storage`".to_string(),
+                ),
+                ("FAKE_AFT_EXIT_CODE".to_string(), "1".to_string()),
             ],
-            env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
         })
@@ -597,9 +600,9 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
     let module = supervisor
         .spawn(ModuleSpec {
             module_id: "stderr-tail-silent".to_string(),
-            program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".to_string(), "exit 3".to_string()],
-            env: Vec::new(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "3".to_string())],
             reserved: false,
             reserved_prefixes: Vec::new(),
         })
@@ -638,9 +641,12 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
     let module = supervisor
         .spawn(ModuleSpec {
             module_id: "stderr-tail-looper".to_string(),
-            program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".to_string(), "echo \"boot $$\" >&2; exit 1".to_string()],
-            env: Vec::new(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env: vec![
+                ("FAKE_AFT_STDERR_LINE".to_string(), "boot {pid}".to_string()),
+                ("FAKE_AFT_EXIT_CODE".to_string(), "1".to_string()),
+            ],
             reserved: false,
             reserved_prefixes: Vec::new(),
         })
@@ -692,12 +698,20 @@ async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() 
     let module = supervisor
         .spawn(ModuleSpec {
             module_id: "stderr-tail-wedged-pump".to_string(),
-            program: PathBuf::from("/bin/sh"),
-            args: vec![
-                "-c".to_string(),
-                "echo old-start >&2; (sleep 1; echo old-trailing >&2) & exit 1".to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env: vec![
+                ("FAKE_AFT_STDERR_LINE".to_string(), "old-start".to_string()),
+                ("FAKE_AFT_EXIT_CODE".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_ORPHAN_WRITER_DELAY_MS".to_string(),
+                    "1000".to_string(),
+                ),
+                (
+                    "FAKE_AFT_ORPHAN_WRITER_LINE".to_string(),
+                    "old-trailing".to_string(),
+                ),
             ],
-            env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
         })

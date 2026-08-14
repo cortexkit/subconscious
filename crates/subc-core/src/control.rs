@@ -2837,6 +2837,27 @@ mod tests {
         time::{sleep, Instant},
     };
 
+    /// Locates the `fake-aft-stub` binary from a `src/lib.rs` unit test.
+    ///
+    /// `CARGO_BIN_EXE_*` (compile-time `env!` and runtime `std::env::var` alike)
+    /// is only populated for `tests/*.rs` integration test binaries -- this file
+    /// compiles as part of the library target, which gets neither. Cargo still
+    /// builds every `[[bin]]` target before running the library's tests, so the
+    /// binary is on disk; this test's own executable path is
+    /// `<target-dir>/<profile>/deps/subc_core-<hash>`, and the sibling binary
+    /// lives two directories up at `<target-dir>/<profile>/fake-aft-stub`.
+    fn fake_aft_stub_path() -> PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe available in tests");
+        path.pop(); // .../deps/
+        path.pop(); // .../<profile>/
+        path.push(if cfg!(windows) {
+            "fake-aft-stub.exe"
+        } else {
+            "fake-aft-stub"
+        });
+        path
+    }
+
     /// The retryable set both SDKs branch on, kept byte-identical to
     /// `is_retryable_route_open_code` in subc-client-rs and subc-client.
     const CLIENT_RETRYABLE: &[&str] = &[
@@ -3332,13 +3353,15 @@ mod tests {
         )
         .with_handle(supervisor_handle.clone());
         let source_line = format!("config error: {}", "x".repeat(DEFAULT_MAX_LINE_BYTES));
-        let shell_script = format!("printf '%s\\n' '{source_line}' >&2; exit 1");
         let module = supervisor
             .spawn(ModuleSpec {
                 module_id: "stderr-tail-wire".to_string(),
-                program: PathBuf::from("/bin/sh"),
-                args: vec!["-c".to_string(), shell_script],
-                env: Vec::new(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: vec![
+                    ("FAKE_AFT_STDERR_LINE".to_string(), source_line.clone()),
+                    ("FAKE_AFT_EXIT_CODE".to_string(), "1".to_string()),
+                ],
                 reserved: false,
                 reserved_prefixes: Vec::new(),
             })

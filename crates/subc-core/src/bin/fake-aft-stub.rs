@@ -9,6 +9,7 @@ use std::{
     io::{self, Write as _},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -71,6 +72,29 @@ const FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH_ENV: &str = "FAKE_AFT_HEALTH_NEVER_
 const FAKE_AFT_HEALTH_STATUS_ENV: &str = "FAKE_AFT_HEALTH_STATUS";
 const FAKE_AFT_HEALTH_DETAIL_ENV: &str = "FAKE_AFT_HEALTH_DETAIL";
 const FAKE_AFT_HEALTH_METRICS_ENV: &str = "FAKE_AFT_HEALTH_METRICS";
+/// Presence (not value) is the trigger: when set, the stub writes
+/// `FAKE_AFT_STDERR_LINE` (if any) to stderr and exits with this code before
+/// ever touching the connection file. Lets a portable spawn stand in for a
+/// freestanding `/bin/sh -c '...; exit N'` script, which never dialled subc
+/// either -- a normal stub run would connect, HELLO, and register, and any
+/// noise from that path would land in the very stderr ring these tests
+/// assert on.
+const FAKE_AFT_EXIT_CODE_ENV: &str = "FAKE_AFT_EXIT_CODE";
+/// Text written to stderr before the `FAKE_AFT_EXIT_CODE` exit. Supports a
+/// `{pid}` token, substituted with this process's pid, for tests that must
+/// distinguish which generation across a restart produced a line.
+const FAKE_AFT_STDERR_LINE_ENV: &str = "FAKE_AFT_STDERR_LINE";
+/// Milliseconds the detached orphan writer (below) sleeps before writing
+/// `FAKE_AFT_ORPHAN_WRITER_LINE` to stderr. Set alongside `FAKE_AFT_EXIT_CODE`
+/// to reproduce a wedged pump: a child that inherits this process's stderr
+/// pipe and keeps its write end open after the parent has already exited.
+const FAKE_AFT_ORPHAN_WRITER_DELAY_MS_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_DELAY_MS";
+/// Text the detached orphan writer emits after its delay.
+const FAKE_AFT_ORPHAN_WRITER_LINE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_LINE";
+/// Internal marker set only on the re-exec'd orphan child, never by a test.
+/// Distinguishes "I am the orphan, sleep then write" from "spawn an orphan"
+/// on the same binary.
+const FAKE_AFT_ORPHAN_WRITER_MODE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_MODE";
 /// Id used when `FAKE_AFT_MODULE_ID` is absent.
 ///
 /// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
@@ -94,8 +118,59 @@ type InFlightRegistry = Arc<Mutex<HashMap<InFlightKey, oneshot::Sender<()>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), StubError> {
+    // Checked before StubConfig::from_env(), which requires a `--subc
+    // <connection-file-path>` argument neither of these paths receives: the
+    // orphan re-exec is spawned by `spawn_orphan_writer` with no args at all,
+    // and a caller using FAKE_AFT_EXIT_CODE as a portable stand-in for
+    // `/bin/sh -c '...; exit N'` may spawn this binary the same way a raw
+    // shell script would -- with no `--subc` argument, because a shell script
+    // never dialled subc either. Checking first also means a connect/HELLO
+    // failure can never land its own noise in the very stderr ring this knob
+    // is configured to control.
+    if env_flag(FAKE_AFT_ORPHAN_WRITER_MODE_ENV) {
+        return run_detached_orphan_writer().await;
+    }
+    if let Some(exit_code) = exit_code_from_env()? {
+        run_exit_only(exit_code).await?;
+        unreachable!("run_exit_only always exits the process");
+    }
+
     let config = StubConfig::from_env()?;
     run(config).await
+}
+
+/// Writes the configured stderr line (if any), optionally spawns the orphan
+/// writer, then exits with `exit_code`. Never touches `--subc`, the
+/// connection file, or the network.
+async fn run_exit_only(exit_code: i32) -> Result<(), StubError> {
+    if let Ok(line) = env::var(FAKE_AFT_STDERR_LINE_ENV) {
+        if !line.is_empty() {
+            eprintln!("{}", substitute_pid_token(&line));
+        }
+    }
+    if let Some(delay) = env::var(FAKE_AFT_ORPHAN_WRITER_DELAY_MS_ENV)
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>()
+                .map(Duration::from_millis)
+                .map_err(|source| StubError::InvalidOrphanWriterDelay { raw, source })
+        })
+        .transpose()?
+    {
+        let line = env::var(FAKE_AFT_ORPHAN_WRITER_LINE_ENV).ok();
+        spawn_orphan_writer(delay, line)?;
+    }
+    std::process::exit(exit_code);
+}
+
+fn exit_code_from_env() -> Result<Option<i32>, StubError> {
+    env::var(FAKE_AFT_EXIT_CODE_ENV)
+        .ok()
+        .map(|raw| {
+            raw.parse::<i32>()
+                .map_err(|source| StubError::InvalidExitCode { raw, source })
+        })
+        .transpose()
 }
 
 async fn run(config: StubConfig) -> Result<(), StubError> {
@@ -118,6 +193,57 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
         (Ok(()), Ok(Err(writer_err))) => Err(StubError::FrameIo(writer_err)),
         (Ok(()), Err(join_err)) => Err(join_err),
     }
+}
+
+/// Entry point for the re-exec'd orphan: sleep, then write one line to
+/// (inherited) stderr and exit. Never dials subc, never reads `--subc`.
+async fn run_detached_orphan_writer() -> Result<(), StubError> {
+    let delay = env::var(FAKE_AFT_ORPHAN_WRITER_DELAY_MS_ENV)
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>()
+                .map(Duration::from_millis)
+                .map_err(|source| StubError::InvalidOrphanWriterDelay { raw, source })
+        })
+        .transpose()?
+        .unwrap_or(Duration::ZERO);
+    sleep(delay).await;
+    if let Ok(line) = env::var(FAKE_AFT_ORPHAN_WRITER_LINE_ENV) {
+        eprintln!("{line}");
+    }
+    Ok(())
+}
+
+/// Spawns a copy of this binary in orphan-writer mode with `Stdio::inherit()`
+/// on stderr, so the child holds a duplicate of THIS process's stderr write
+/// end -- the same handle the supervisor's stderr pump is reading from the
+/// other side of. The child is spawned and dropped without a wait: dropping a
+/// `std::process::Child` does not kill it, so it keeps that handle open past
+/// this process's own exit, reproducing a wedged pump on both Unix and
+/// Windows without a shell.
+fn spawn_orphan_writer(delay: Duration, line: Option<String>) -> Result<(), StubError> {
+    let exe = env::current_exe().map_err(StubError::Io)?;
+    let mut command = Command::new(exe);
+    command
+        .env(FAKE_AFT_ORPHAN_WRITER_MODE_ENV, "1")
+        .env(
+            FAKE_AFT_ORPHAN_WRITER_DELAY_MS_ENV,
+            delay.as_millis().to_string(),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if let Some(line) = line {
+        command.env(FAKE_AFT_ORPHAN_WRITER_LINE_ENV, line);
+    }
+    command.spawn().map_err(StubError::Io)?;
+    Ok(())
+}
+
+/// Substitutes a `{pid}` token in a configured stderr line with this
+/// process's real pid, so successive restart generations are distinguishable.
+fn substitute_pid_token(line: &str) -> String {
+    line.replace("{pid}", &std::process::id().to_string())
 }
 
 async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, StubError> {
@@ -1517,6 +1643,14 @@ enum StubError {
         raw: String,
         source: std::num::ParseIntError,
     },
+    InvalidExitCode {
+        raw: String,
+        source: std::num::ParseIntError,
+    },
+    InvalidOrphanWriterDelay {
+        raw: String,
+        source: std::num::ParseIntError,
+    },
     InvalidHealthStatus(String),
     InvalidConcurrency {
         raw: String,
@@ -1577,6 +1711,14 @@ impl fmt::Display for StubError {
             Self::InvalidToolcallDelay { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_TOOLCALL_DELAY_MS_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidExitCode { raw, source } => write!(
+                f,
+                "invalid {FAKE_AFT_EXIT_CODE_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidOrphanWriterDelay { raw, source } => write!(
+                f,
+                "invalid {FAKE_AFT_ORPHAN_WRITER_DELAY_MS_ENV} value '{raw}': {source}"
             ),
             Self::InvalidHealthStatus(raw) => write!(
                 f,
@@ -1644,6 +1786,8 @@ impl Error for StubError {
         match self {
             Self::InvalidCrashAfter { source, .. } => Some(source),
             Self::InvalidToolcallDelay { source, .. } => Some(source),
+            Self::InvalidExitCode { source, .. } => Some(source),
+            Self::InvalidOrphanWriterDelay { source, .. } => Some(source),
             Self::ConnectionFile { source, .. } => Some(source),
             Self::Connect { source, .. } => Some(source),
             Self::Auth { source, .. } => Some(source),

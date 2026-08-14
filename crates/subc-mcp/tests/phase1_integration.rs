@@ -937,6 +937,34 @@ fn accepted_elicitation(content: Value) -> CreateElicitationResult {
     CreateElicitationResult::new(ElicitationAction::Accept).with_content(content)
 }
 
+async fn write_raw_mcp_message(writer: &mut ChildStdin, message: &Value) {
+    let mut encoded = serde_json::to_vec(message).expect("raw MCP message should encode");
+    encoded.push(b'\n');
+    writer
+        .write_all(&encoded)
+        .await
+        .expect("raw MCP message should write");
+    writer.flush().await.expect("raw MCP message should flush");
+}
+
+async fn read_raw_mcp_message(reader: &mut ChildStdout) -> Value {
+    let encoded = timeout(READ_TIMEOUT, async {
+        let mut encoded = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            reader.read_exact(&mut byte).await?;
+            if byte[0] == b'\n' {
+                return Ok::<_, std::io::Error>(encoded);
+            }
+            encoded.push(byte[0]);
+        }
+    })
+    .await
+    .expect("timed out waiting for raw MCP message")
+    .expect("raw MCP message should read");
+    serde_json::from_slice(&encoded).expect("raw MCP message should decode")
+}
+
 async fn wait_for_atomic_at_least(counter: &AtomicUsize, expected: usize, label: &str) {
     let deadline = Instant::now() + READ_TIMEOUT;
     loop {
@@ -981,6 +1009,102 @@ async fn mcp_reverse_elicitation_declared_host_round_trips() {
         Some(&Value::Bool(true))
     );
 
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_initialize_publishes_reverse_peer_before_initialized_notification() {
+    let mut harness = ReverseHarness::start_attach_window("mcp-reverse-initialize-boundary").await;
+    let route = harness.provider.wait_bound().await;
+
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": { "elicitation": {} },
+            "clientInfo": { "name": "subc-mcp-raw-initialize-test", "version": "0" }
+        }
+    });
+    write_raw_mcp_message(
+        harness
+            .shim
+            .stdin
+            .as_mut()
+            .expect("shim stdin should remain available"),
+        &initialize,
+    )
+    .await;
+    let initialize_response = read_raw_mcp_message(
+        harness
+            .shim
+            .stdout
+            .as_mut()
+            .expect("shim stdout should remain available"),
+    )
+    .await;
+    assert_eq!(initialize_response.get("id"), Some(&json!(1)));
+    assert!(initialize_response.get("result").is_some());
+
+    let mut raw_stdin = harness
+        .shim
+        .stdin
+        .take()
+        .expect("shim stdin should remain available");
+    let mut raw_stdout = harness
+        .shim
+        .stdout
+        .take()
+        .expect("shim stdout should remain available");
+    let prompt_count = Arc::new(AtomicUsize::new(0));
+    let client_prompt_count = Arc::clone(&prompt_count);
+    let raw_client = tokio::spawn(async move {
+        let prompt = read_raw_mcp_message(&mut raw_stdout).await;
+        assert_eq!(prompt.get("method"), Some(&json!("elicitation/create")));
+        client_prompt_count.fetch_add(1, Ordering::SeqCst);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": prompt.get("id").expect("elicitation request should carry an id"),
+            "result": {
+                "action": "accept",
+                "content": { "initializeBoundary": true }
+            }
+        });
+        write_raw_mcp_message(&mut raw_stdin, &response).await;
+        (raw_stdin, raw_stdout)
+    });
+
+    harness
+        .provider
+        .send_reverse_request(route, 907, elicitation_body("initialize-boundary"))
+        .await;
+    let (raw_stdin, raw_stdout) = tokio::select! {
+        result = raw_client => result.expect("raw MCP client should handle elicitation"),
+        error = harness.provider.wait_reverse_error(907) => {
+            panic!("reverse request was rejected after initialize instead of reaching the host: {error}")
+        }
+    };
+    wait_for_atomic_at_least(&prompt_count, 1, "pre-initialized elicitation prompts").await;
+    harness.shim.stdin = Some(raw_stdin);
+    harness.shim.stdout = Some(raw_stdout);
+
+    let provider_response = harness.provider.wait_reverse_response(907).await;
+    assert_eq!(
+        provider_response.pointer("/content/initializeBoundary"),
+        Some(&Value::Bool(true))
+    );
+
+    write_raw_mcp_message(
+        harness
+            .shim
+            .stdin
+            .as_mut()
+            .expect("shim stdin should remain available"),
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )
+    .await;
+    drop(harness.shim.stdin.take());
     harness.shutdown().await;
 }
 

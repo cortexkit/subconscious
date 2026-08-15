@@ -41,7 +41,7 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -105,7 +105,8 @@ fn discover_external_domains() -> Vec<String> {
     domains
 }
 
-const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
+const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
 
 const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
@@ -146,6 +147,10 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Module(ModuleCommand::Status { module_id }) => {
             module_status(&mut client, &module_id, args.json).await
         }
+        Command::Module(ModuleCommand::StderrTail {
+            module_id,
+            max_lines,
+        }) => module_stderr_tail(&mut client, &module_id, max_lines, args.json).await,
         Command::Module(ModuleCommand::Restart { module_id }) => {
             module_restart(&mut client, &module_id, args.json).await
         }
@@ -217,11 +222,25 @@ enum Command {
 
 enum ModuleCommand {
     List,
-    Status { module_id: String },
-    Restart { module_id: String },
-    Rescan { preview: bool },
-    Stop { module_id: String },
-    Start { module_id: String },
+    Status {
+        module_id: String,
+    },
+    Restart {
+        module_id: String,
+    },
+    Rescan {
+        preview: bool,
+    },
+    Stop {
+        module_id: String,
+    },
+    Start {
+        module_id: String,
+    },
+    StderrTail {
+        module_id: String,
+        max_lines: Option<u32>,
+    },
 }
 
 struct ResolvedConnection {
@@ -463,6 +482,118 @@ async fn module_status(
         print_json(&json!({ "module": module, "health": health_entry }))?;
     } else {
         print_status_table(&module, health_entry.as_ref());
+    }
+    Ok(())
+}
+
+/// Read `-n <count>` from a verb's own tail.
+///
+/// Scoped to the verb rather than the global argument set, like `--dry-run` on
+/// rescan, so it cannot silently apply somewhere else.
+fn parse_tail_count(tail: &[std::ffi::OsString]) -> Result<Option<u32>, CkError> {
+    let Some(position) = tail.iter().position(|arg| arg == "-n") else {
+        return Ok(None);
+    };
+    let raw = tail
+        .get(position + 1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            CkError::Usage(format!(
+                "ck module stderr -n needs a count\n\n{MODULE_HELP}"
+            ))
+        })?;
+    raw.parse::<u32>()
+        .map(Some)
+        .map_err(|_| CkError::Usage(format!("ck module stderr -n needs a number, got '{raw}'")))
+}
+
+async fn module_stderr_tail(
+    client: &mut CkClient,
+    module_id: &str,
+    max_lines: Option<u32>,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let response = client
+        .rpc_value(ClientControlRequest::SupervisorStderrTail {
+            module_id: module_id.to_string(),
+            max_lines,
+            max_bytes: None,
+        })
+        .await?;
+
+    if json_output {
+        print_json(&response)?;
+        return Ok(());
+    }
+
+    // An uncaptured tail is reported instead of the lines, never alongside them:
+    // the entries under that state carry no information about what the module
+    // wrote, and printing them under a warning invites reading them as complete.
+    let capture = response.get("capture");
+    if capture
+        .and_then(|capture| capture.get("state"))
+        .and_then(Value::as_str)
+        .is_some_and(|state| state == "not_captured")
+    {
+        let reason = capture
+            .and_then(|capture| capture.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        println!("stderr not captured for {module_id}: {reason}");
+        return Ok(());
+    }
+    let incomplete_reason = capture
+        .filter(|capture| {
+            capture
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state == "incomplete")
+        })
+        .and_then(|capture| capture.get("reason"))
+        .and_then(Value::as_str);
+
+    let dropped = response
+        .get("dropped_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if dropped > 0 {
+        // Printed BEFORE the lines: a reader scanning for a cause needs to know
+        // the first line shown is not the first line written, and a footer after
+        // a long tail is read too late to change how the tail is read.
+        println!("... {dropped} earlier line(s) dropped");
+    }
+
+    let entries = response
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if entries.is_empty() {
+        println!("(no stderr output captured)");
+    } else {
+        for entry in entries {
+            match entry.get("kind").and_then(Value::as_str) {
+                Some("process_start") => println!("--- process start ---"),
+                _ => {
+                    let text = entry
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let truncated = entry
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if truncated {
+                        println!("{text} [truncated]");
+                    } else {
+                        println!("{text}");
+                    }
+                }
+            }
+        }
+    }
+    if let Some(reason) = incomplete_reason {
+        println!("stderr capture incomplete for {module_id}: {reason}");
     }
     Ok(())
 }
@@ -2597,6 +2728,13 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                     preview: tail.iter().any(|t| t == "--dry-run"),
                 },
                 "status" => ModuleCommand::Status { module_id: id(1)? },
+                // `-n <count>` narrows the tail daemon-side rather than here, so
+                // a caller asking for 20 lines is not shipped the whole ring to
+                // discard most of it.
+                "stderr" => ModuleCommand::StderrTail {
+                    module_id: id(1)?,
+                    max_lines: parse_tail_count(tail)?,
+                },
                 "restart" => ModuleCommand::Restart { module_id: id(1)? },
                 "stop" => ModuleCommand::Stop { module_id: id(1)? },
                 "start" => ModuleCommand::Start { module_id: id(1)? },

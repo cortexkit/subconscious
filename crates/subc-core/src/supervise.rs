@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt, io,
     path::PathBuf,
-    process::ExitStatus,
+    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +28,7 @@ use crate::{
         ModuleDrainTarget, PendingModuleControlRpc,
     },
     registry::RegistryError,
+    stderr_tail::{pump_stderr, StderrRing, StderrTailConfig, StderrTailSnapshot},
     Frame, Registry,
 };
 
@@ -43,6 +44,58 @@ const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
+const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+struct SupervisedChild {
+    child: Child,
+    stderr_pump: Option<JoinHandle<()>>,
+    stderr_ring: Arc<Mutex<StderrRing>>,
+}
+
+impl SupervisedChild {
+    fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        self.child.start_kill()
+    }
+
+    async fn drain_stderr(&mut self, module_id: &str) {
+        let Some(mut pump) = self.stderr_pump.take() else {
+            return;
+        };
+        match timeout(STDERR_PUMP_DRAIN_TIMEOUT, &mut pump).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.stderr_ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .mark_incomplete(format!("stderr pump ended unexpectedly: {err}"));
+                warn!(module_id, error = %err, "stderr pump ended before clean EOF");
+            }
+            Err(_) => {
+                pump.abort();
+                self.stderr_ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .mark_incomplete(format!(
+                        "stderr pump did not reach EOF within {:?} before restart",
+                        STDERR_PUMP_DRAIN_TIMEOUT
+                    ));
+                warn!(
+                    module_id,
+                    waited = ?STDERR_PUMP_DRAIN_TIMEOUT,
+                    "stderr pump did not drain before restart; stopped it before marking the new process"
+                );
+            }
+        }
+    }
+}
 
 fn registration_release_events() -> &'static watch::Sender<u64> {
     static EVENTS: OnceLock<watch::Sender<u64>> = OnceLock::new();
@@ -371,6 +424,13 @@ struct SupervisorRuntimeConfig {
     /// The shared handle, so every spawn path (initial, restart, reload) records the
     /// reserved-module launch nonce the HELLO verifier checks against.
     supervisor_handle: Option<SupervisorHandle>,
+    /// This module's stderr tail, shared with the [`SupervisedModule`] that answers
+    /// status queries.
+    ///
+    /// One ring per module, held across every respawn. The lines explaining an exit
+    /// are written BEFORE that exit, so a ring recreated per process would be empty
+    /// exactly when it is asked for.
+    stderr_ring: Arc<Mutex<StderrRing>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -713,6 +773,7 @@ impl Supervisor {
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
         )?;
         set_running(&snapshot, child.id())?;
         self.process_liveness
@@ -744,6 +805,7 @@ impl Supervisor {
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
         ) {
             Ok(child) => {
                 set_running(&snapshot, child.id())?;
@@ -784,6 +846,7 @@ impl Supervisor {
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
         ) {
             Ok(child) => {
                 set_running(&snapshot, child.id())?;
@@ -821,6 +884,7 @@ impl Supervisor {
             connection_file_path: self.connection_file_path.clone(),
             forwarding: self.forwarding.clone(),
             supervisor_handle: self.supervisor_handle.clone(),
+            stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
         }
     }
 
@@ -829,12 +893,13 @@ impl Supervisor {
         spec: ModuleSpec,
         runtime: SupervisorRuntimeConfig,
         snapshot: SharedSnapshot,
-        child: Option<Child>,
+        child: Option<SupervisedChild>,
     ) -> SupervisedModule {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
             health: runtime.health,
         }));
+        let stderr_ring = Arc::clone(&runtime.stderr_ring);
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
@@ -853,6 +918,7 @@ impl Supervisor {
                 registry: Arc::clone(&self.registry),
                 snapshot,
                 configuration,
+                stderr_ring,
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
                 max_restarts: self.restart_policy.max_restarts,
@@ -883,6 +949,7 @@ struct SupervisedModuleInner {
     registry: Arc<Registry>,
     snapshot: SharedSnapshot,
     configuration: Arc<Mutex<SupervisedConfiguration>>,
+    stderr_ring: Arc<Mutex<StderrRing>>,
     commands: mpsc::Sender<SupervisorCommand>,
     monitor: Mutex<Option<JoinHandle<()>>>,
     /// Copied from the supervisor's runtime config at spawn so `status()` can
@@ -921,6 +988,24 @@ impl SupervisedModule {
 
     pub fn state(&self) -> Result<ModuleState, SuperviseError> {
         Ok(lock_snapshot(&self.inner.snapshot)?.state)
+    }
+
+    /// The module's retained stderr, newest lines last.
+    ///
+    /// Deliberately NOT on [`Self::status`]: a bounded tail is kilobytes per
+    /// module, `supervisor.list` renders every module, and putting it in the
+    /// shared snapshot would make each status read carry a payload almost nobody
+    /// asked for. Callers that want the text ask for it.
+    pub fn stderr_tail(
+        &self,
+        max_lines: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> StderrTailSnapshot {
+        self.inner
+            .stderr_ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot(max_lines, max_bytes)
     }
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
@@ -1487,7 +1572,7 @@ async fn run_health_probe_cycle(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
     match probe_module_health(spec, runtime).await {
@@ -1641,7 +1726,7 @@ async fn handle_health_report(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     report: HealthReport,
     now_ms: u64,
 ) {
@@ -1683,7 +1768,7 @@ async fn handle_health_probe_failure(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     err: HealthProbeError,
     now_ms: u64,
 ) {
@@ -1762,7 +1847,7 @@ async fn apply_l3_health_action(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     status: SupervisorHealthStatus,
     detail: Option<&str>,
     action: HealthAction,
@@ -1813,7 +1898,7 @@ async fn health_restart_child(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     status: SupervisorHealthStatus,
     detail: Option<&str>,
     now_ms: u64,
@@ -2001,7 +2086,7 @@ async fn supervise_loop(
     registry: Arc<Registry>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     snapshot: SharedSnapshot,
-    mut child: Option<Child>,
+    mut child: Option<SupervisedChild>,
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
     let mut health_probe = HealthProbeRuntime::default();
@@ -2024,6 +2109,7 @@ async fn supervise_loop(
                     let exit_report = match wait_result {
                         Ok(status) => classify_exit(&status),
                         Err(err) => {
+                            active_child.drain_stderr(&spec.module_id).await;
                             fail_snapshot(&snapshot, Some(&spec.module_id), None);
                             untrack_if_registration_released(
                                 &process_liveness,
@@ -2036,6 +2122,7 @@ async fn supervise_loop(
                             continue;
                         }
                     };
+                    active_child.drain_stderr(&spec.module_id).await;
 
                     match on_child_exit(
                         &spec,
@@ -2143,7 +2230,7 @@ async fn handle_supervisor_command(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) -> bool {
     match command {
         SupervisorCommand::Drain { reply } => {
@@ -2241,7 +2328,7 @@ async fn restart_child(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) -> Result<(), SuperviseError> {
     // Restart cycles a running module; it must not silently start a disabled one.
     if !lock_snapshot(snapshot)?.enabled {
@@ -2287,7 +2374,7 @@ async fn reload_child(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
 ) -> Result<(), SuperviseError> {
     // Reload cycles a running module; it must not silently start a disabled one.
     if !lock_snapshot(snapshot)?.enabled {
@@ -2354,6 +2441,9 @@ async fn reload_child(
             Ok(())
         }
         RegistrationWaitOutcome::Exited(exit_report) => {
+            if let Some(active_child) = child.as_mut() {
+                active_child.drain_stderr(&spec.module_id).await;
+            }
             *child = None;
             handle_reload_child_registration_failure(
                 spec,
@@ -2386,6 +2476,7 @@ async fn reload_child(
                     module_id: spec.module_id.clone(),
                     source,
                 })?;
+            timed_out_child.drain_stderr(&spec.module_id).await;
             handle_reload_child_registration_failure(
                 spec,
                 runtime,
@@ -2412,7 +2503,7 @@ async fn set_child_enabled(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     enabled: bool,
 ) -> Result<bool, SuperviseError> {
     let (current_enabled, current_state) = {
@@ -2590,7 +2681,8 @@ fn spawn_child(
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
-) -> Result<Child, SuperviseError> {
+    ring: &Arc<Mutex<StderrRing>>,
+) -> Result<SupervisedChild, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     if let Some(connection_file_path) = connection_file_path {
@@ -2613,35 +2705,74 @@ fn spawn_child(
     }
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
 
-    // STDIO IS DELIBERATELY LEFT INHERITED, which is a decision no line of this
-    // function states and therefore worth stating here: every supervised child
-    // gets the daemon's own stdout/stderr, so all of them share ONE file
-    // descriptor and one file offset. That is what puts every module's output in
-    // a single daemon log without a per-child reader task.
+    // STDOUT STAYS INHERITED; STDERR IS PIPED. The asymmetry is the whole design,
+    // so it is worth saying why rather than leaving it to be inferred.
     //
-    // THE COST IS INTERLEAVING, and the mechanism is finer than a shared fd. A
-    // module owner measured it: an emitter that formats INCREMENTALLY issues one
-    // write syscall per format fragment, and while a process-local lock serialises
-    // those within one process, nothing serialises them ACROSS processes. Two
-    // processes on one inherited fd, 1500 lines each: 212 of 3000 lines came out
-    // spliced with an incremental emitter, 0 of 3000 when each line was formatted
-    // first and written in a single call. So the inheritance is the exposure and
-    // the multi-syscall write is what converts it into damage.
+    // Inheriting both was the original choice: every child wrote to the daemon's
+    // own descriptors, which put all module output in one log with no per-child
+    // reader task. That was correct about interleaving and silent about DURABILITY,
+    // and durability is the axis that decides whether a crash can be diagnosed.
+    // A module's stderr is the only diagnostic input with no in-memory path --
+    // `last_exit` survives a respawn because the supervisor holds it, while the
+    // text explaining that exit went to a sink that rotates or fills. Measured on
+    // two hosts: a systemd journal at its size cap retaining ~3.2 hours, and a
+    // plain log file reaching 908 MB with one module accounting for 98% of it. In
+    // both, the noisiest module sets everyone else's retention and the victim has
+    // no way to know its window shrank.
     //
-    // CONSEQUENCE FOR ANYONE SCRAPING THE DAEMON LOG: do not anchor patterns at
-    // line start. A single-write emitter guarantees its line is WHOLE, not that it
-    // begins a line -- another process mid-write can still land a fragment ahead of
-    // it, measured at ~8% of lines. An unanchored match found 1500 of 1500 where
-    // `^`-anchored found 1382. Strip escape sequences too.
+    // So stderr is piped into a bounded in-memory ring the supervisor owns, and
+    // every line is forwarded on so the daemon log keeps its current content. That
+    // forwarding is MANDATORY rather than courteous: the log is overwhelmingly
+    // module output (4727 of 5000 sampled lines carried a module tag), so a tap
+    // that captured without forwarding would leave it nearly empty and every
+    // existing reader would report clean on nothing -- an absence that reads as
+    // calm, which is worse than the interleaving it replaces.
     //
-    // The structural fix is a per-child pipe with a line-atomic writer here, which
-    // would make the property hold for modules this daemon does not own. Not done:
-    // it adds a reader task per child and moves where logs land, and the mitigation
-    // above is free for any module that adopts it.
+    // THE TAP MAKES LINE ATOMICITY THIS DAEMON'S PROBLEM. Previously a module's
+    // own write reached the fd in one syscall and the splicing came from emitters
+    // that formatted incrementally: two processes on one inherited fd, 1500 lines
+    // each, produced 212 spliced lines of 3000 with an incremental emitter and 0
+    // of 3000 when each line was formatted first and written once. Reading a pipe
+    // and re-emitting can split a line that WAS atomic, so the reader reassembles
+    // to a complete line and writes it in a single call -- otherwise this change
+    // introduces a defect the previous design did not have.
+    //
+    // Stdout is left inherited: modules use it for ordinary output rather than
+    // diagnostics, and piping it would double the reader tasks for no diagnostic
+    // gain.
+    command.stderr(Stdio::piped());
     command.kill_on_drop(true);
-    command.spawn().map_err(|source| SuperviseError::Spawn {
+    let mut child = command.spawn().map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),
         source,
+    })?;
+
+    let stderr_pump = match child.stderr.take() {
+        Some(stderr) => {
+            ring.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_process_start();
+            Some(tokio::spawn(pump_stderr(stderr, Arc::clone(ring))))
+        }
+        None => {
+            // Spawning succeeded but the pipe did not materialise. Recording it as
+            // uncaptured keeps the tail honest: the alternative is an empty tail
+            // that reads as a module which printed nothing.
+            ring.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mark_not_captured("stderr pipe was not available on spawn");
+            warn!(
+                module_id = %spec.module_id,
+                "spawned child exposed no stderr pipe; tail will be unavailable"
+            );
+            None
+        }
+    };
+
+    Ok(SupervisedChild {
+        child,
+        stderr_pump,
+        stderr_ring: Arc::clone(ring),
     })
 }
 
@@ -2677,11 +2808,12 @@ fn spawn_and_mark_running(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
-) -> Result<Child, SuperviseError> {
+) -> Result<SupervisedChild, SuperviseError> {
     let child = spawn_child(
         spec,
         runtime.connection_file_path.as_deref(),
         runtime.supervisor_handle.as_ref(),
+        &runtime.stderr_ring,
     )?;
     set_running(snapshot, child.id())?;
     Ok(child)
@@ -2884,7 +3016,7 @@ async fn begin_forwarding_drain_with(
 async fn wait_for_registration_after_reload(
     registry: &Registry,
     module_id: &str,
-    child: &mut Child,
+    child: &mut SupervisedChild,
     wait: Duration,
 ) -> Result<RegistrationWaitOutcome, SuperviseError> {
     let deadline = Instant::now() + wait;
@@ -2930,7 +3062,7 @@ async fn handle_reload_child_registration_failure(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     failure: ReloadRegistrationFailure,
 ) -> Result<(), SuperviseError> {
     let ReloadRegistrationFailure {
@@ -2996,7 +3128,7 @@ async fn handle_reload_spawn_failure(
     runtime: &SupervisorRuntimeConfig,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     reason: String,
 ) -> Result<(), SuperviseError> {
     let mut should_retry = false;
@@ -3048,7 +3180,7 @@ async fn drain_optional_child(
     module_id: &str,
     registry: &Registry,
     snapshot: &SharedSnapshot,
-    child: &mut Option<Child>,
+    child: &mut Option<SupervisedChild>,
     drain_timeout: Duration,
     final_state: ModuleState,
     enabled: Option<bool>,
@@ -3081,7 +3213,7 @@ async fn drain_child_to_state(
     module_id: &str,
     registry: &Registry,
     snapshot: &SharedSnapshot,
-    mut child: Child,
+    mut child: SupervisedChild,
     drain_timeout: Duration,
     final_state: ModuleState,
     enabled: Option<bool>,
@@ -3124,6 +3256,7 @@ async fn drain_child_to_state(
         state.pid = None;
         state.last_exit = Some(exit_report);
     })?;
+    child.drain_stderr(module_id).await;
 
     wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
 }

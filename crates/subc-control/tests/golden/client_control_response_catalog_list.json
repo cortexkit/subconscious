@@ -90,6 +90,7 @@
     "supervisor.rescan",
     "supervisor.set_enabled",
     "supervisor.health_probe",
-    "supervisor.health"
+    "supervisor.health",
+    "supervisor.stderr_tail"
   ]
 }

@@ -4597,7 +4597,6 @@ fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
             sub_supervises: true,
         }],
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,

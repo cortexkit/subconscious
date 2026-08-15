@@ -1235,7 +1235,6 @@ fn manifest(
         trust_tier: TrustTier::FirstParty,
         provides: vec![provider_role(role, concurrency, tools)],
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,

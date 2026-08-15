@@ -250,7 +250,6 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
         trust_tier: TrustTier::FirstParty,
         provides: provider_roles(),
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,

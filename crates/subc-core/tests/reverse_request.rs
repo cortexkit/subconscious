@@ -1028,7 +1028,6 @@ fn tool_provider_manifest(module_id: &str, concurrency: Concurrency) -> ModuleMa
             sub_supervises: true,
         }],
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,

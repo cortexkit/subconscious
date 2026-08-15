@@ -45,6 +45,7 @@ pub mod ops {
     pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
     pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
     pub const SUPERVISOR_HEALTH: &str = "supervisor.health";
+    pub const SUPERVISOR_STDERR_TAIL: &str = "supervisor.stderr_tail";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -134,6 +135,21 @@ pub enum ClientControlRequest {
     SupervisorHealthProbe { module_id: String },
     #[serde(rename = "supervisor.health")]
     SupervisorHealth {},
+    /// Retained stderr for one module.
+    ///
+    /// A separate op rather than a field on `supervisor.list`: the tail is
+    /// kilobytes per module and `list` renders every module, so carrying it in
+    /// the snapshot would charge every status read for a payload almost no
+    /// caller wants. Caps ride on the REQUEST so a caller wanting twenty lines
+    /// and one wanting the whole ring need no separate fields anywhere.
+    #[serde(rename = "supervisor.stderr_tail")]
+    SupervisorStderrTail {
+        module_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_lines: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u32>,
+    },
 }
 
 /// subc's channel-0 response body for client control RPCs.
@@ -208,6 +224,70 @@ pub enum ClientControlResponse {
         generation: u64,
         modules: Vec<SupervisorHealthEntry>,
     },
+    #[serde(rename = "supervisor.stderr_tail")]
+    SupervisorStderrTail {
+        module_id: String,
+        #[serde(flatten)]
+        tail: StderrTail,
+    },
+}
+
+/// A module's retained stderr, oldest entry first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StderrTail {
+    pub capture: StderrCaptureState,
+    pub entries: Vec<StderrTailEntry>,
+    /// Lines not present above: evicted by the ring, or held back by this
+    /// request's own caps.
+    ///
+    /// Non-zero means the first entry is not the first line the module wrote. A
+    /// reader hunting a cause needs that, or an absent explanation reads as a
+    /// module that never gave one.
+    ///
+    /// Zero is skipped so the common complete-tail case stays compact.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dropped_lines: u64,
+}
+
+/// Whether stderr is being captured for a module, and if not, why not.
+///
+/// A typed state rather than an empty-tail convention. "The module printed
+/// nothing before dying" and "nobody was capturing" send an operator in opposite
+/// directions, and rendering them alike is the defect this op exists to fix --
+/// the same shape as a `detail -` that means both no-detail and never-probed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum StderrCaptureState {
+    /// A reader is attached, or was attached and saw clean EOF. An empty
+    /// `entries` under this state means the module genuinely wrote nothing.
+    Captured,
+    /// Retained entries are valid, but the stderr reader ended before clean EOF.
+    Incomplete { reason: String },
+    /// No reader was attached. `entries` says nothing about what the module wrote.
+    NotCaptured { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StderrTailEntry {
+    Line {
+        text: String,
+        /// The line was cut at the per-line cap and `text` is a prefix.
+        ///
+        /// Carried as a field rather than left to a marker in `text` so a
+        /// consumer can branch on it without string matching.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// The supervisor spawned a new process. Entries after this came from it.
+    ///
+    /// In-band because position is the information: which side of the restart a
+    /// line falls on is unanswerable from a count.
+    ProcessStart,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

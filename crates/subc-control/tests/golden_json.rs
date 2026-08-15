@@ -4,7 +4,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorRescanResult,
+    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry,
+    SupervisorHealthStatus, SupervisorRescanResult,
 };
 use subc_protocol::{
     manifest::{
@@ -275,6 +276,59 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 modules: vec![supervisor_health_entry()],
             },
         ),
+        (
+            "client_control_response_supervisor_stderr_tail",
+            ClientControlResponse::SupervisorStderrTail {
+                module_id: "aft-tools".to_string(),
+                tail: StderrTail {
+                    capture: StderrCaptureState::Captured,
+                    entries: vec![
+                        StderrTailEntry::Line {
+                            text: "config error: missing top-level `storage`".to_string(),
+                            truncated: false,
+                        },
+                        StderrTailEntry::ProcessStart,
+                        StderrTailEntry::Line {
+                            text: "config error: missing top-level `stor".to_string(),
+                            truncated: true,
+                        },
+                    ],
+                    dropped_lines: 12,
+                },
+            },
+        ),
+        (
+            // Pinned separately because it is the state the empty-tail convention
+            // could not express, and a fixture is the only thing that keeps the
+            // distinction from being collapsed back into an empty list later.
+            "client_control_response_supervisor_stderr_tail_not_captured",
+            ClientControlResponse::SupervisorStderrTail {
+                module_id: "aft-tools".to_string(),
+                tail: StderrTail {
+                    capture: StderrCaptureState::NotCaptured {
+                        reason: "stderr pipe was not available on spawn".to_string(),
+                    },
+                    entries: Vec::new(),
+                    dropped_lines: 0,
+                },
+            },
+        ),
+        (
+            "client_control_response_supervisor_stderr_tail_incomplete",
+            ClientControlResponse::SupervisorStderrTail {
+                module_id: "aft-tools".to_string(),
+                tail: StderrTail {
+                    capture: StderrCaptureState::Incomplete {
+                        reason: "stderr read failed: reader failed".to_string(),
+                    },
+                    entries: vec![StderrTailEntry::Line {
+                        text: "config error: missing top-level `storage`".to_string(),
+                        truncated: false,
+                    }],
+                    dropped_lines: 0,
+                },
+            },
+        ),
     ]
 }
 
@@ -291,6 +345,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.set_enabled".to_string(),
         "supervisor.health_probe".to_string(),
         "supervisor.health".to_string(),
+        "supervisor.stderr_tail".to_string(),
     ]
 }
 

@@ -1,0 +1,14 @@
+{
+  "capture": {
+    "reason": "stderr read failed: reader failed",
+    "state": "incomplete"
+  },
+  "entries": [
+    {
+      "kind": "line",
+      "text": "config error: missing top-level `storage`"
+    }
+  ],
+  "module_id": "aft-tools",
+  "op": "supervisor.stderr_tail"
+}

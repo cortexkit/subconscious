@@ -79,6 +79,17 @@ ALF (agent scope, app management surface), entorhinal owner (policy store custod
   (subc-mcp at attach, as today, extending the existing global+project
   resolver) and what the wire op for "resolve effective surface for scope S"
   looks like — the app needs it for preview ("what would this Alfonso see").
+  PINNED from #scheduled-wakes (CKIOS): the op emits, beside each effective
+  value and its winning scope, a RESOLUTION-KIND discriminator
+  (`resolution: "ceiling"` here; the wakes ladder emits
+  `resolution: "most_specific"`). Same field name in both contracts. Two
+  ladders share the four scope names with deliberately different rules —
+  wake policy is preference (a narrower scope may quiet what the workspace
+  wanted loud), tool exposure is security (a narrower scope may never see
+  what the workspace denied) — and most rows agree most of the time, so a
+  renderer teaching the wrong mental model ships invisibly. The typed
+  discriminator makes that failure a type error instead of a user-education
+  problem.
 - **Manifest-at-HELLO vs lazy enumeration** for adapters whose children are
   expensive to boot-spawn even once.
 - **Registry provenance (PLEX finding 1).** plexus's catalog is file-driven:

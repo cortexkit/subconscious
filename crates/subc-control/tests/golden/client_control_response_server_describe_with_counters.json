@@ -28,6 +28,7 @@
     "supervisor.set_enabled",
     "supervisor.health_probe",
     "supervisor.health",
-    "supervisor.stderr_tail"
+    "supervisor.stderr_tail",
+    "supervisor.terminals"
   ]
 }

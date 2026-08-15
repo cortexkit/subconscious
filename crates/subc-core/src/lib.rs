@@ -19,6 +19,7 @@ pub mod router;
 pub mod server;
 pub mod stderr_tail;
 pub mod supervise;
+pub mod terminal_ring;
 pub mod watchdog;
 
 #[cfg(feature = "bench-harness")]

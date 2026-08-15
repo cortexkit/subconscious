@@ -1,6 +1,7 @@
 {
   "enabled": true,
   "health": "degraded",
+  "last_exit_ms": 1700000000123,
   "last_probe_ms": 1700000000000,
   "live": true,
   "max_restarts": 3,

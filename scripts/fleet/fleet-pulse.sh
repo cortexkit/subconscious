@@ -866,7 +866,10 @@ EOF
 # Either leg alone reports clean on the other's failure. Repos without v-tags or
 # without a --version self-report are SKIPPED AND SAY SO (a skipped scope that
 # prints nothing reads as a clean scope).
-section "release ledger (manifest vs tag vs deployed)"
+# The header follows the file's comment-rule convention; there is no section()
+# helper in this script (the first run of this leg proved that with a
+# command-not-found that the loop survived -- fail-open on a missing header).
+echo "-- release ledger (manifest vs tag vs deployed)"
 NOW_EPOCH=$(date +%s)
 for spec in "broca:ck-broca" "engram:ck-engram" "fusiform:ck-fusiform"; do
   repo="${spec%%:*}"; bin="${spec##*:}"
@@ -977,7 +980,11 @@ for f in "$BIN"/*; do
   b=$(basename "$f")
   # Skip the backup copies the deploy ritual leaves behind: dated snapshots and
   # pre-/staged- prefixes are deliberate history, not deployed surface.
-  case "$b" in *.bak|*pre-*|*staged-*|*rollback*|*reclamation*|*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T*) skipped=$((skipped + 1)); continue ;; esac
+  # *.bak-<anything> and *.broken-* joined the list after the first full run
+  # printed 27 backup copies as "NO REPO DECLARES IT" -- drowning the two real
+  # husks the line exists to surface. The husk report only means something when
+  # deliberate deploy-ritual residue cannot reach it.
+  case "$b" in *.bak|*.bak-*|*.broken-*|*pre-*|*staged-*|*rollback*|*reclamation*|*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T*) skipped=$((skipped + 1)); continue ;; esac
   printf '%s\n' "$checked" | grep -qx "$b" && continue
   extra=$((extra + 1))
   owner=$(printf '%s\n' "$bin_owner" | awk -v b="$b" '$1==b {print $2; exit}')

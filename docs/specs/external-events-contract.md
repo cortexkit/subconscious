@@ -238,6 +238,53 @@ validation step. The empty-store operator chain (memory #9883) plus one
 live-vendor call per poll shape is the acceptance bar for anything that
 joins this plane.
 
+## Delivery half: scheduled wakes (folded 2026-08-15 from #scheduled-wakes)
+
+The delivery design this contract deferred is now specified. SINGLE SOURCE:
+`prefrontal/.cortexkit/alfonso/plans/scheduled-wake-v1.md` (ALF's repo; the
+room-fold section cites the seat posts). This section records only what
+binds ACROSS repos — the pins each seat co-signed — by citation, not
+paraphrase; on any divergence the plan doc governs.
+
+One WAKE concept: SOURCE (timer | PLEX event | condition script | idleness)
+→ POLICY (per-source store rows on prefrontal; scope ladder
+Global > Workspace > Project > Alfonso, MOST-SPECIFIC-WINS) → DELIVERY (one
+composer, existing wake-effect machinery over this contract's transport —
+nothing new rides subc).
+
+Cross-repo pins, verbatim from the room (seq cites in the plan doc's fold):
+
+1. A PROBE RETURNS A VALUE, NOT A MESSAGE — AND THE VALUE NEVER REACHES AN
+   ALERT. Probes declare a return schema at registration (scalar | closed
+   struct; free-text refused); the composer interpolates typed values into
+   composer-owned prose; nothing script-derived appears in an APNs alert
+   (lock screens carry identifiers and attested names only — the payload
+   shape is an anti-spoofing property).
+2. TWO PROVENANCE FIELDS, NEVER A TAGGED SHARED FIELD: `user_prose`
+   (inline, unchanged, may render as markdown) and `machine_value`
+   (interpolated, renders as data with a visible source). Required
+   independently by security and by rendering.
+3. QUIET HOURS AND URGENCY REMAP GATE EVERY USER-REACHING PLANE. A policy
+   the user set gates agent wakes AND pushes; the push producer consults
+   the same policy rows. Quiet windows carry an IANA zone.
+4. EFFECTIVE-VALUE OPS EMIT `{value, winning_scope, resolution}`. The
+   wakes ladder emits `resolution: "most_specific"`; the MCP-router ladder
+   emits `resolution: "ceiling"` (same field name, both contracts — see
+   docs/specs/mcp-router.md). Clients render provenance; they never
+   recompute the ladder.
+5. LADDER SEMANTICS CROSS-CITE: the two ladders share scope names with
+   deliberately different resolution rules — wake policy is preference (a
+   narrower scope may quiet what the workspace wanted loud); tool exposure
+   is security (a narrower scope may never see what the workspace denied).
+   Neither doc's rule may be imported into the other.
+
+Local-fs/git condition probes run in a STANDALONE KEYLESS MODULE (prefrontal
+repo; @cortexkit/retina-local-fs + QuickJS-WASM runner), supervised by subc
+with reserved attestation — never inside plexus (a file-reading probe beside
+the binding key is a credential oracle) and never as daemon shell. SUBC owns
+the module's carriage: subc.jsonc entry, spawn attestation, health contract
+per Health-Path-Rule v3.
+
 ## Conformance fixtures (owed, SUBC)
 
 Golden vectors for the events facade (subscribe refusals, list/ack shapes,

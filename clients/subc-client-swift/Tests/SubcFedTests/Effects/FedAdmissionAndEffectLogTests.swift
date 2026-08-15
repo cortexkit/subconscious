@@ -220,13 +220,27 @@ final class FedAdmissionAndEffectLogTests: XCTestCase {
         XCTAssertEqual(busy.disposition, .notSent)
         XCTAssertTrue(busy.settle)
 
-        let fenced = FedOriginEffectLog.classifyTerminalFrame(
-            kind: "error",
-            body: Data(),
-            bodyOmitted: false,
-            errorCode: "fed_seq_fenced"
-        )
-        XCTAssertEqual(fenced.disposition, .ambiguous)
+            let fenced = FedOriginEffectLog.classifyTerminalFrame(
+                kind: "error",
+                body: Data(),
+                bodyOmitted: false,
+                errorCode: "fed_seq_fenced"
+            )
+            XCTAssertEqual(fenced.disposition, .ambiguous)
+
+            // fed-wire §8.8 mutability fence (CALLO 7298c3e): zero-dispatch by
+            // contract, so it proves non-execution. Ordinarily arrives on pure
+            // calls (no settlement path); this pins the defensive arm — if it
+            // ever reaches a mutating-declared call, the intent settles not_sent
+            // rather than indeterminate.
+            let mutabilityStale = FedOriginEffectLog.classifyTerminalFrame(
+                kind: "error",
+                body: Data(),
+                bodyOmitted: false,
+                errorCode: "fed_mutability_stale"
+            )
+            XCTAssertEqual(mutabilityStale.disposition, .notSent)
+            XCTAssertTrue(mutabilityStale.settle)
 
         // fed_target_unavailable is not_sent only when provably before dispatch.
         let before = FedOriginEffectLog.classifyTerminalFrame(

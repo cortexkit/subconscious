@@ -54,7 +54,12 @@ ALF (agent scope, app management surface), entorhinal owner (policy store custod
 - **Secrets never ride `subc.jsonc` env.** Credential-needing servers get
   resolution at child-spawn through the claustrum seam; adapters are
   spawn-attested reserved modules, so the vault sees `reserved:mcp-<name>`,
-  not an anonymous env blob.
+  not an anonymous env blob. Stated precisely (PLEX's correction, adopted):
+  a third-party server that expects its key in the environment WILL receive
+  it in its own child environment -- no seam changes what the child speaks.
+  The keepable property is: no at-rest storage in supervisor config,
+  resolution at spawn time, and each child receives only its own secret.
+  Claiming "no bearer material in argv/env" publicly would be an overclaim.
 - **Surface changes apply at session boundaries** where possible. Mid-session
   churn busts prompt caches; tombstones cover the racing edge and must not
   become the normal path.
@@ -76,6 +81,17 @@ ALF (agent scope, app management surface), entorhinal owner (policy store custod
   looks like — the app needs it for preview ("what would this Alfonso see").
 - **Manifest-at-HELLO vs lazy enumeration** for adapters whose children are
   expensive to boot-spawn even once.
+- **Registry provenance (PLEX finding 1).** plexus's catalog is file-driven:
+  `retire_absent_manifests` retires anything active in the store but absent
+  from `catalog/*.jsonc` -- correct for a deleted manifest, and it would
+  silently withdraw a wizard-added server on the next boot. The registry
+  needs a provenance distinction (file-reviewed vs operator-added) before
+  the sweep can tell a withdrawal from an addition it has never seen.
+- **Wizard entries are unreviewed vendors (PLEX finding 2).** The settled
+  propose-vs-classify rule applies unchanged: pasting `npx -y @foo/mcp` is
+  not a review, so wizard-added servers enter capability-restricted with
+  undeclared actions quarantined, and only a review promotes them. The
+  registry extends plexus's model iff wizard entries land unreviewed.
 - **Migration**: current global/project config files become the Global and
   Project layers of the store; no coexistence period (clean cutover per house
   preference).

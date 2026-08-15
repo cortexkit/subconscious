@@ -1296,7 +1296,6 @@ fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifes
         trust_tier: TrustTier::FirstParty,
         provides: vec![tool_provider_role(tool_names)],
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,

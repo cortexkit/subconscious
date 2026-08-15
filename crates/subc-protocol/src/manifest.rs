@@ -18,7 +18,6 @@ pub struct ModuleManifest {
     pub trust_tier: TrustTier,
     pub provides: Vec<ProviderRole>,
     pub consumes: Vec<ConsumerRole>,
-    pub scheduled_tasks: Vec<ScheduledTask>,
     pub bindings: Bindings,
 }
 
@@ -185,60 +184,6 @@ pub enum ConsumerRole {
     ServiceClient { of: Vec<String> },
 }
 
-/// Scheduler-owned task declaration. The runner module executes the loop; subc
-/// owns eligibility checks and the lease.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ScheduledTask {
-    pub task_id: String,
-    pub eligibility: TaskEligibility,
-    pub lease_scope: LeaseScope,
-    pub renews_during_calls: bool,
-    pub toolset: Vec<String>,
-    pub model_policy: ModelPolicy,
-    pub step_cap: u32,
-    pub circuit_breaker: CircuitBreaker,
-}
-
-/// Time/window gates for a scheduled task. Values are serialized policy strings
-/// (for example, durations or cron/window expressions) owned by the scheduler.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct TaskEligibility {
-    pub cooldown: String,
-    pub window: String,
-}
-
-/// Scope at which subc enforces one active scheduler lease.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum LeaseScope {
-    Project,
-}
-
-/// Model selection policy for the LLM-runner that executes a scheduled task.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ModelPolicy {
-    pub tier: String,
-    pub fallback_chain: Vec<String>,
-}
-
-/// Declared trip threshold for a scheduled task's circuit breaker: stop after this
-/// many IDENTICAL consecutive failures.
-///
-/// SCOPE, because the name invites a wider reading than the field supports. The
-/// alarm condition here is "this failure looks like the last one", so it detects a
-/// task stuck failing the SAME way and is silent on a task failing MANY DIFFERENT
-/// ways -- and it goes quieter the more varied the failures become, which is often
-/// the more alarming case. A module treating this as its only stop condition will
-/// find it mutest during the messiest outage. Pair it with a signal that counts
-/// failures regardless of their kind.
-///
-/// The daemon carries this field and does not act on it: enforcement belongs to the
-/// module running the task, since only it can compare two failures for identity.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct CircuitBreaker {
-    pub identical_failures: u32,
-}
-
 /// External storage, vault, and identity bindings supplied through subc.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Bindings {
@@ -343,7 +288,6 @@ mod tests {
             consumes: vec![ConsumerRole::ServiceClient {
                 of: vec!["embedding.v2".to_string()],
             }],
-            scheduled_tasks: vec![],
             bindings: Bindings {
                 storage: StorageBinding {
                     kind: StorageKind::Sqlite,

@@ -1921,7 +1921,6 @@ fn supervision_manifest(module_id: String) -> ModuleManifest {
         trust_tier: TrustTier::FirstParty,
         provides: Vec::new(),
         consumes: vec![ConsumerRole::ToolClient { of: Vec::new() }],
-        scheduled_tasks: Vec::new(),
         bindings: supervision_bindings(),
     }
 }

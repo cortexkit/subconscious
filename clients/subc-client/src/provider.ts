@@ -54,7 +54,6 @@ export type ObservabilityKind = "snapshot" | "stream";
 export type InternalTransport = "bulk";
 export type StorageKind = "sqlite";
 export type StorageScope = "project";
-export type LeaseScope = "project";
 export type HealthStatus = "ok" | "degraded" | "failing";
 
 export interface HealthReport {
@@ -70,7 +69,6 @@ export interface ManifestInput {
   trust_tier: TrustTier;
   provides: ProviderRoleInput[];
   consumes: ConsumerRoleInput[];
-  scheduled_tasks: ScheduledTaskInput[];
   bindings: BindingsInput;
 }
 
@@ -133,31 +131,6 @@ export type ConsumerRoleInput =
   | { role: "tool_client"; of: string[] }
   | { role: "llm_client"; via: string; auth: string }
   | { role: "service_client"; of: string[] };
-
-export interface ScheduledTaskInput {
-  task_id: string;
-  eligibility: TaskEligibilityInput;
-  lease_scope: LeaseScope;
-  renews_during_calls: boolean;
-  toolset: string[];
-  model_policy: ModelPolicyInput;
-  step_cap: number;
-  circuit_breaker: CircuitBreakerInput;
-}
-
-export interface TaskEligibilityInput {
-  cooldown: string;
-  window: string;
-}
-
-export interface ModelPolicyInput {
-  tier: string;
-  fallback_chain: string[];
-}
-
-export interface CircuitBreakerInput {
-  identical_failures: number;
-}
 
 export interface BindingsInput {
   storage: StorageBindingInput;
@@ -402,7 +375,6 @@ export function managementSurfaceManifest(opts: ManagementSurfaceManifestOptions
       },
     ],
     consumes: [],
-    scheduled_tasks: [],
     bindings: {
       storage: {
         kind: "sqlite",
@@ -1403,7 +1375,6 @@ function normalizeManifest(manifest: ManifestInput): ManifestInput {
     trust_tier: manifest.trust_tier,
     provides: manifest.provides.map(normalizeProviderRole),
     consumes: manifest.consumes.map(normalizeConsumerRole),
-    scheduled_tasks: manifest.scheduled_tasks.map(normalizeScheduledTask),
     bindings: {
       storage: {
         kind: manifest.bindings.storage.kind,
@@ -1487,23 +1458,3 @@ function normalizeConsumerRole(role: ConsumerRoleInput): ConsumerRoleInput {
   }
 }
 
-function normalizeScheduledTask(task: ScheduledTaskInput): ScheduledTaskInput {
-  return {
-    task_id: task.task_id,
-    eligibility: {
-      cooldown: task.eligibility.cooldown,
-      window: task.eligibility.window,
-    },
-    lease_scope: task.lease_scope,
-    renews_during_calls: task.renews_during_calls,
-    toolset: [...task.toolset],
-    model_policy: {
-      tier: task.model_policy.tier,
-      fallback_chain: [...task.model_policy.fallback_chain],
-    },
-    step_cap: task.step_cap,
-    circuit_breaker: {
-      identical_failures: task.circuit_breaker.identical_failures,
-    },
-  };
-}

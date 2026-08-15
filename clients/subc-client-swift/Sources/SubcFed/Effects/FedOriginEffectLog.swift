@@ -47,6 +47,13 @@ public actor FedOriginEffectLog {
         "fed_busy",
         "fed_ledger_full",
         "fed_duplicate_effect",
+        // fed-wire §8.8 mutability fence: the serving side refuses, before
+        // dispatch, a declared-pure call whose current surface is mutating.
+        // Zero-dispatch by contract (no permit, no admitted row), so it proves
+        // non-execution. Ordinarily it arrives on pure calls (no settlement
+        // path); it is in this set so that if it ever reaches a mutating-
+        // declared call, the intent settles not_sent instead of indeterminate.
+        "fed_mutability_stale",
     ]
 
     /// Codes that settle as not_sent only when provenance is provably-before-dispatch.

@@ -100,4 +100,28 @@ if [ "$checked" -lt 1 ]; then
   exit 1
 fi
 
+# Ad-hoc signature sweep. An ad-hoc-signed supervised binary has no stable
+# designated requirement, so any TCC grant it (or its daemon) holds is keyed to
+# the code hash and dies on the next placement -- the user's re-grant toggle
+# then flips a bit on a record keyed to the dead hash and appears to do
+# nothing. This regressed live on 2026-08-15 (ck-subc ad-hoc signed in a
+# restart window; accessibility denied fleet-wide until an identity re-sign
+# plus one remove-and-re-add). A refusing gate beats the written doctrine that
+# failed to defend it: the placement ritual is manual, this script is not.
+# Scoped to the binaries TCC actually keys on: grants attribute to the
+# RESPONSIBLE PROCESS, which for every supervised module is the daemon --
+# flagging all ~12 ad-hoc module binaries every run would fire on healthy
+# state and train dismissal (the gate would be ceremony by the third run).
+# Widen this list only when a binary demonstrably holds its own grant.
+adhoc=0
+for name in ck-subc ckdev-subc; do
+  f="$BIN/$name"
+  [ -x "$f" ] || continue
+  if codesign -dv "$f" 2>&1 | grep -q '^Signature=adhoc'; then
+    printf '  %s: AD-HOC SIGNED -- TCC-responsible binary with no stable DR; grants die on next placement (sign with the identity, identifier pinned)\n' "$name"
+    adhoc=1
+  fi
+done
+[ "$adhoc" -eq 1 ] && fail=1
+
 exit $fail

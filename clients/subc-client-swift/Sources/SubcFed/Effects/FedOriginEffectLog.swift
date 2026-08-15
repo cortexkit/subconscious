@@ -53,6 +53,11 @@ public actor FedOriginEffectLog {
         // non-execution. Ordinarily it arrives on pure calls (no settlement
         // path); it is in this set so that if it ever reaches a mutating-
         // declared call, the intent settles not_sent instead of indeterminate.
+        // Today that arm is unreachable by construction: the serving gate is
+        // guarded on declared-pure (forwarder declared_pure && current-surface
+        // check), so there is NO deploy-order constraint for this code. If the
+        // fence is ever widened past declared-pure, the constraint switches on
+        // and this entry becomes load-bearing rather than defence-in-depth.
         "fed_mutability_stale",
     ]
 

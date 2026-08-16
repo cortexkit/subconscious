@@ -550,12 +550,18 @@ pub trait ModuleHandler: Send + Sync + 'static {
 }
 
 /// The terminal result of a module request handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HandlerOutcome {
     /// Send a Response frame carrying these bytes.
     Response(Vec<u8>),
     /// Send an Error frame carrying an [`ErrorBody`] with this code and message.
     Error { code: String, message: String },
+    /// Send an Error frame with stable machine-readable detail.
+    ErrorWithDetail {
+        code: String,
+        message: String,
+        detail: serde_json::Value,
+    },
     /// The handler emitted stream data with [`RequestCtx::emit`]; the serve code
     /// sends the StreamEnd terminal frame.
     Streamed,
@@ -1017,6 +1023,19 @@ async fn send_handler_outcome(
                 serde_json::to_vec(&ErrorBody { code, message }).map_err(SubcModuleError::Json)?;
             ctx.send_frame(FrameType::Error, data_flags(), body).await
         }
+        HandlerOutcome::ErrorWithDetail {
+            code,
+            message,
+            detail,
+        } => {
+            let body = serde_json::to_vec(&DetailedErrorBody {
+                code,
+                message,
+                detail,
+            })
+            .map_err(SubcModuleError::Json)?;
+            ctx.send_frame(FrameType::Error, data_flags(), body).await
+        }
         HandlerOutcome::Streamed => {
             ctx.send_frame(FrameType::StreamEnd, data_flags(), Vec::new())
                 .await
@@ -1184,6 +1203,13 @@ where
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct DetailedErrorBody {
+    code: String,
+    message: String,
+    detail: serde_json::Value,
+}
+
 async fn send_hello(
     egress: &mpsc::Sender<Frame>,
     manifest: ModuleManifest,
@@ -1192,9 +1218,11 @@ async fn send_hello(
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        launch_nonce: env::var(SUBC_LAUNCH_NONCE_ENV)
-            .ok()
-            .filter(|value| !value.is_empty()),
+        launch_nonce: retained_launch_nonce().or_else(|| {
+            env::var(SUBC_LAUNCH_NONCE_ENV)
+                .ok()
+                .filter(|value| !value.is_empty())
+        }),
     })
     .map_err(SubcModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
@@ -2171,4 +2199,45 @@ mod tests {
         assert_eq!(next_module_control_corr(&mut inner), Some(u64::MAX));
         assert_eq!(next_module_control_corr(&mut inner), None);
     }
+}
+
+#[cfg(test)]
+mod detailed_error_body_tests {
+    use serde_json::json;
+
+    use super::DetailedErrorBody;
+
+    #[test]
+    fn detailed_error_body_keeps_code_message_and_detail() {
+        let body = DetailedErrorBody {
+            code: "bad_request".to_string(),
+            message: "invalid envelope".to_string(),
+            detail: json!({"reason": "missing_server"}),
+        };
+
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            json!({
+                "code": "bad_request",
+                "message": "invalid envelope",
+                "detail": {"reason": "missing_server"},
+            })
+        );
+    }
+}
+
+// A reserved module may scrub its launch nonce before it opens a daemon
+// connection. The retained copy exists only for encoding that module's HELLO.
+static RETAINED_LAUNCH_NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Retain a reserved module's launch nonce for its HELLO after the module has
+/// scrubbed the nonce from the process environment.
+pub fn retain_launch_nonce_for_hello(launch_nonce: String) -> Result<(), String> {
+    RETAINED_LAUNCH_NONCE
+        .set(launch_nonce)
+        .map_err(|_| "launch nonce was already retained for this process".to_string())
+}
+
+fn retained_launch_nonce() -> Option<String> {
+    RETAINED_LAUNCH_NONCE.get().cloned()
 }

@@ -56,6 +56,7 @@ pub enum ProviderRole {
         config_schema: Value,
         observability: Vec<ObservabilitySurface>,
         identity_scope: Vec<IdentityScope>,
+        concurrency: Concurrency,
     },
     InternalService {
         service_id: String,

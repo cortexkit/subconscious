@@ -387,6 +387,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-stdio-adapter"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-client-rs",
+ "subc-jsonc",
+ "subc-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

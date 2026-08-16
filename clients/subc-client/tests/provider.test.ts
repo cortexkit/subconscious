@@ -75,6 +75,7 @@ describe("managementSurfaceManifest", () => {
           config_schema: { type: "object" },
           observability: [],
           identity_scope: [],
+          concurrency: "module_managed",
         },
       ],
       consumes: [],

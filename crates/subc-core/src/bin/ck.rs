@@ -41,7 +41,7 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -106,7 +106,7 @@ fn discover_external_domains() -> Vec<String> {
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
-  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
 
 const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
@@ -151,6 +151,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             module_id,
             max_lines,
         }) => module_stderr_tail(&mut client, &module_id, max_lines, args.json).await,
+        Command::Module(ModuleCommand::Terminals { module_id }) => {
+            module_terminals(&mut client, &module_id, args.json).await
+        }
         Command::Module(ModuleCommand::Restart { module_id }) => {
             module_restart(&mut client, &module_id, args.json).await
         }
@@ -240,6 +243,9 @@ enum ModuleCommand {
     StderrTail {
         module_id: String,
         max_lines: Option<u32>,
+    },
+    Terminals {
+        module_id: String,
     },
 }
 
@@ -594,6 +600,56 @@ async fn module_stderr_tail(
     }
     if let Some(reason) = incomplete_reason {
         println!("stderr capture incomplete for {module_id}: {reason}");
+    }
+    Ok(())
+}
+
+async fn module_terminals(
+    client: &mut CkClient,
+    module_id: &str,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let response = client
+        .rpc_value(ClientControlRequest::SupervisorTerminals {
+            module_id: module_id.to_string(),
+        })
+        .await?;
+
+    if json_output {
+        print_json(&response)?;
+        return Ok(());
+    }
+
+    let daemon_started_at_ms = response
+        .get("daemon_started_at_ms")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let dropped = response.get("dropped").and_then(Value::as_u64).unwrap_or(0);
+    let entries = response
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    println!(
+        "daemon_started_at_ms={daemon_started_at_ms} · {} terminal record(s) · {dropped} dropped",
+        entries.len()
+    );
+    for entry in entries {
+        let at_ms = entry.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
+        let disposition = entry
+            .get("disposition")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let exit = match (
+            entry.get("exit_signal").and_then(Value::as_i64),
+            entry.get("exit_code").and_then(Value::as_i64),
+        ) {
+            (Some(signal), _) => format!("signal {signal}"),
+            (None, Some(code)) => format!("code {code}"),
+            (None, None) => "unknown exit".to_string(),
+        };
+        println!("{at_ms} {exit} → {disposition}");
     }
     Ok(())
 }
@@ -2735,6 +2791,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                     module_id: id(1)?,
                     max_lines: parse_tail_count(tail)?,
                 },
+                "terminals" => ModuleCommand::Terminals { module_id: id(1)? },
                 "restart" => ModuleCommand::Restart { module_id: id(1)? },
                 "stop" => ModuleCommand::Stop { module_id: id(1)? },
                 "start" => ModuleCommand::Start { module_id: id(1)? },
@@ -3572,5 +3629,19 @@ mod tests {
             } if provider_id == "anthropic"
         ));
         assert!(QUOTA_HELP.contains("--verbose"));
+    }
+
+    #[test]
+    fn module_terminals_is_parsed_and_documented() {
+        let command = parse_command(
+            "module",
+            &[OsString::from("terminals"), OsString::from("aft")],
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::Module(ModuleCommand::Terminals { module_id }) if module_id == "aft"
+        ));
+        assert!(MODULE_HELP.contains("ck module terminals <id>"));
     }
 }

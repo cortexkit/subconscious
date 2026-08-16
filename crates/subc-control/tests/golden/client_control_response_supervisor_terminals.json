@@ -1,0 +1,17 @@
+{
+  "daemon_started_at_ms": 1700000000000,
+  "entries": [
+    {
+      "at_ms": 1700000000001,
+      "disposition": "restarting",
+      "exit_code": 23
+    },
+    {
+      "at_ms": 1700000000002,
+      "disposition": "failed",
+      "exit_code": 23
+    }
+  ],
+  "module_id": "terminal-golden",
+  "op": "supervisor.terminals"
+}

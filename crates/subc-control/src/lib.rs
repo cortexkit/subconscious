@@ -46,6 +46,7 @@ pub mod ops {
     pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
     pub const SUPERVISOR_HEALTH: &str = "supervisor.health";
     pub const SUPERVISOR_STDERR_TAIL: &str = "supervisor.stderr_tail";
+    pub const SUPERVISOR_TERMINALS: &str = "supervisor.terminals";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -150,6 +151,20 @@ pub enum ClientControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u32>,
     },
+    /// Retained terminal exits for one module.
+    ///
+    /// This stays separate from `supervisor.list`: a history grows with every
+    /// incident, while the list is a current-state read most callers issue often.
+    ///
+    /// The read MUST stay off the supervisor command channel — it reads the
+    /// module's shared ring directly. This is a requirement, not an
+    /// optimisation: when the supervision task itself dies, every
+    /// command-channel op returns `CommandClosed`, and that is precisely the
+    /// moment an operator needs the exit history most. A history reachable only
+    /// through the machinery whose death you are diagnosing is unreachable when
+    /// it matters. Proven failure mode, not a hypothetical.
+    #[serde(rename = "supervisor.terminals")]
+    SupervisorTerminals { module_id: String },
 }
 
 /// subc's channel-0 response body for client control RPCs.
@@ -230,6 +245,12 @@ pub enum ClientControlResponse {
         #[serde(flatten)]
         tail: StderrTail,
     },
+    #[serde(rename = "supervisor.terminals")]
+    SupervisorTerminals {
+        module_id: String,
+        #[serde(flatten)]
+        terminals: TerminalHistory,
+    },
 }
 
 /// A module's retained stderr, oldest entry first.
@@ -288,6 +309,39 @@ pub enum StderrTailEntry {
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+/// Bounded terminal history for one module, oldest retained record first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalHistory {
+    /// Unix milliseconds at daemon start. The history is in-memory and resets with
+    /// the daemon, so an empty list only means "no exits during this incarnation".
+    pub daemon_started_at_ms: u64,
+    pub entries: Vec<TerminalEntry>,
+    /// Earlier terminal exits evicted by the bounded ring.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dropped: u64,
+}
+
+/// One terminal child exit and the supervisor action it selected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    pub at_ms: u64,
+    pub disposition: TerminalDisposition,
+}
+
+/// The supervisor disposition selected after observing a terminal exit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalDisposition {
+    Stopped,
+    Disabled,
+    Failed,
+    Restarting,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -400,6 +454,11 @@ pub struct SupervisorEntry {
     /// (often a panic-abort). Survives respawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit_signal: Option<i32>,
+    /// Unix milliseconds when the most recent child exit was observed. Present
+    /// even when the terminal ring is not queried, so existing list readers can
+    /// order their latest observed exit against events they already received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_ms: Option<u64>,
     /// Replacement processes spawned for this module so far, against the budget
     /// that disables it.
     ///

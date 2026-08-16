@@ -9,7 +9,7 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_control::SupervisorHealthStatus;
+use subc_control::{SupervisorHealthStatus, TerminalDisposition};
 use subc_protocol::{
     session::{HealthReport, HealthStatus, ModuleControlRequest, MODULE_CONTROL_OP_HEALTH_CHECK},
     Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
@@ -29,6 +29,7 @@ use crate::{
     },
     registry::RegistryError,
     stderr_tail::{pump_stderr, StderrRing, StderrTailConfig, StderrTailSnapshot},
+    terminal_ring::{TerminalHistorySnapshot, TerminalRecord, TerminalRing, TerminalRingConfig},
     Frame, Registry,
 };
 
@@ -297,6 +298,7 @@ pub struct ExitReport {
     pub kind: ExitKind,
     pub code: Option<i32>,
     pub signal: Option<i32>,
+    pub at_ms: u64,
 }
 
 /// Point-in-time module status answerable by subc without forwarding to the
@@ -431,6 +433,7 @@ struct SupervisorRuntimeConfig {
     /// are written BEFORE that exit, so a ring recreated per process would be empty
     /// exactly when it is asked for.
     stderr_ring: Arc<Mutex<StderrRing>>,
+    terminal_ring: Arc<Mutex<TerminalRing>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,6 +713,7 @@ pub struct Supervisor {
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: Option<SupervisorHandle>,
     health: HealthConfig,
+    daemon_started_at_ms: u64,
 }
 
 impl Supervisor {
@@ -723,6 +727,7 @@ impl Supervisor {
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
             supervisor_handle: None,
             health: HealthConfig::default(),
+            daemon_started_at_ms: unix_ms_now(),
         }
     }
 
@@ -885,6 +890,10 @@ impl Supervisor {
             forwarding: self.forwarding.clone(),
             supervisor_handle: self.supervisor_handle.clone(),
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
+            terminal_ring: Arc::new(Mutex::new(TerminalRing::new(
+                TerminalRingConfig::default(),
+                self.daemon_started_at_ms,
+            ))),
         }
     }
 
@@ -900,6 +909,7 @@ impl Supervisor {
             health: runtime.health,
         }));
         let stderr_ring = Arc::clone(&runtime.stderr_ring);
+        let terminal_ring = Arc::clone(&runtime.terminal_ring);
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
@@ -919,6 +929,7 @@ impl Supervisor {
                 snapshot,
                 configuration,
                 stderr_ring,
+                terminal_ring,
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
                 max_restarts: self.restart_policy.max_restarts,
@@ -950,6 +961,7 @@ struct SupervisedModuleInner {
     snapshot: SharedSnapshot,
     configuration: Arc<Mutex<SupervisedConfiguration>>,
     stderr_ring: Arc<Mutex<StderrRing>>,
+    terminal_ring: Arc<Mutex<TerminalRing>>,
     commands: mpsc::Sender<SupervisorCommand>,
     monitor: Mutex<Option<JoinHandle<()>>>,
     /// Copied from the supervisor's runtime config at spawn so `status()` can
@@ -1006,6 +1018,18 @@ impl SupervisedModule {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot(max_lines, max_bytes)
+    }
+
+    /// The module's bounded terminal history, oldest retained exit first.
+    ///
+    /// The daemon-start stamp distinguishes a quiet supervisor from a replacement
+    /// daemon whose in-memory history was necessarily reset.
+    pub fn terminal_history(&self) -> TerminalHistorySnapshot {
+        self.inner
+            .terminal_ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot()
     }
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
@@ -1930,6 +1954,7 @@ async fn health_restart_child(
             &spec.module_id,
             registry,
             snapshot,
+            &runtime.terminal_ring,
             child,
             runtime.drain_timeout,
             ModuleState::Disabled,
@@ -1961,6 +1986,7 @@ async fn health_restart_child(
         &spec.module_id,
         registry,
         snapshot,
+        &runtime.terminal_ring,
         child,
         runtime.drain_timeout,
         ModuleState::Restarting,
@@ -2129,6 +2155,7 @@ async fn supervise_loop(
                         runtime.restart_policy,
                         &registry,
                         &snapshot,
+                        &runtime.terminal_ring,
                         exit_report,
                     ).await {
                         NextAction::Stop { registration_released } => {
@@ -2238,6 +2265,7 @@ async fn handle_supervisor_command(
                 &spec.module_id,
                 registry,
                 snapshot,
+                &runtime.terminal_ring,
                 child,
                 runtime.drain_timeout,
                 ModuleState::Stopped,
@@ -2265,6 +2293,7 @@ async fn handle_supervisor_command(
                     &spec.module_id,
                     registry,
                     snapshot,
+                    &runtime.terminal_ring,
                     child,
                     runtime.drain_timeout,
                     ModuleState::Stopped,
@@ -2343,6 +2372,7 @@ async fn restart_child(
             &spec.module_id,
             registry,
             snapshot,
+            &runtime.terminal_ring,
             child,
             runtime.drain_timeout,
             ModuleState::Restarting,
@@ -2389,6 +2419,7 @@ async fn reload_child(
             &spec.module_id,
             registry,
             snapshot,
+            &runtime.terminal_ring,
             child,
             runtime.drain_timeout,
             ModuleState::Restarting,
@@ -2559,6 +2590,7 @@ async fn set_child_enabled(
             &spec.module_id,
             registry,
             snapshot,
+            &runtime.terminal_ring,
             child,
             runtime.drain_timeout,
             ModuleState::Disabled,
@@ -2575,6 +2607,7 @@ async fn on_child_exit(
     policy: RestartPolicy,
     registry: &Registry,
     snapshot: &SharedSnapshot,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
     exit_report: ExitReport,
 ) -> NextAction {
     match exit_report.kind {
@@ -2589,10 +2622,11 @@ async fn on_child_exit(
                 state.state = ModuleState::Stopped;
                 state.process_alive = false;
                 state.pid = None;
-                state.last_exit = Some(exit_report);
+                state.last_exit = Some(exit_report.clone());
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record clean module exit");
             }
+            record_terminal(terminal_ring, &exit_report, TerminalDisposition::Stopped);
             let registration_released = match wait_for_registration_release(
                 registry,
                 &spec.module_id,
@@ -2618,18 +2652,22 @@ async fn on_child_exit(
                 "supervised module exited abnormally (crash)"
             );
             let mut should_restart = false;
+            let mut disposition = TerminalDisposition::Disabled;
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.process_alive = false;
                 state.pid = None;
-                state.last_exit = Some(exit_report);
+                state.last_exit = Some(exit_report.clone());
                 if !state.enabled {
                     state.state = ModuleState::Disabled;
+                    disposition = TerminalDisposition::Disabled;
                 } else if state.restart_count >= policy.max_restarts {
                     state.state = ModuleState::Failed;
+                    disposition = TerminalDisposition::Failed;
                 } else {
                     state.restart_count += 1;
                     state.state = ModuleState::Restarting;
                     should_restart = true;
+                    disposition = TerminalDisposition::Restarting;
                 }
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record crashed module exit");
@@ -2637,6 +2675,7 @@ async fn on_child_exit(
                     registration_released: false,
                 };
             }
+            record_terminal(terminal_ring, &exit_report, disposition);
 
             if should_restart {
                 NextAction::Restart
@@ -2660,6 +2699,22 @@ async fn on_child_exit(
             }
         }
     }
+}
+
+fn record_terminal(
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
+    exit_report: &ExitReport,
+    disposition: TerminalDisposition,
+) {
+    terminal_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(TerminalRecord {
+            exit_code: exit_report.code,
+            exit_signal: exit_report.signal,
+            at_ms: exit_report.at_ms,
+            disposition,
+        });
 }
 
 fn untrack_if_registration_released(
@@ -3074,6 +3129,7 @@ async fn handle_reload_child_registration_failure(
         runtime.restart_policy,
         registry,
         snapshot,
+        &runtime.terminal_ring,
         exit_report,
     )
     .await
@@ -3176,10 +3232,12 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_optional_child(
     module_id: &str,
     registry: &Registry,
     snapshot: &SharedSnapshot,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
     child: &mut Option<SupervisedChild>,
     drain_timeout: Duration,
     final_state: ModuleState,
@@ -3190,6 +3248,7 @@ async fn drain_optional_child(
             module_id,
             registry,
             snapshot,
+            terminal_ring,
             child,
             drain_timeout,
             final_state,
@@ -3209,10 +3268,12 @@ async fn drain_optional_child(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_child_to_state(
     module_id: &str,
     registry: &Registry,
     snapshot: &SharedSnapshot,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
     mut child: SupervisedChild,
     drain_timeout: Duration,
     final_state: ModuleState,
@@ -3254,11 +3315,31 @@ async fn drain_child_to_state(
         }
         state.process_alive = false;
         state.pid = None;
-        state.last_exit = Some(exit_report);
+        state.last_exit = Some(exit_report.clone());
     })?;
+    record_terminal(
+        terminal_ring,
+        &exit_report,
+        terminal_disposition(final_state),
+    );
     child.drain_stderr(module_id).await;
 
     wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
+}
+
+fn terminal_disposition(final_state: ModuleState) -> TerminalDisposition {
+    match final_state {
+        ModuleState::Stopped => TerminalDisposition::Stopped,
+        ModuleState::Disabled => TerminalDisposition::Disabled,
+        ModuleState::Restarting => TerminalDisposition::Restarting,
+        ModuleState::Failed => TerminalDisposition::Failed,
+        ModuleState::Starting
+        | ModuleState::Running
+        | ModuleState::Unresponsive
+        | ModuleState::Draining => {
+            unreachable!("terminal exits only finish in terminal or restarting states")
+        }
+    }
 }
 
 async fn wait_for_registration_release(
@@ -3308,6 +3389,7 @@ fn classify_exit(status: &ExitStatus) -> ExitReport {
         },
         code: status.code(),
         signal: exit_signal(status),
+        at_ms: unix_ms_now(),
     }
 }
 
@@ -3373,6 +3455,83 @@ fn lock_snapshot(
     snapshot
         .lock()
         .map_err(|_| SuperviseError::StatePoisoned { module_id: None })
+}
+
+#[cfg(test)]
+mod terminal_history_tests {
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use tokio::time::sleep;
+
+    use super::{ModuleSpec, ModuleState, RestartPolicy, Supervisor};
+    use crate::registry::Registry;
+
+    /// See the twin in `control.rs` for why this derives the path from
+    /// `current_exe()` and why the existence check is here: `--lib` alone does
+    /// not build `[[bin]]` targets, and a bare spawn then fails with a raw
+    /// `NotFound` that reads as a broken test rather than an unbuilt dependency.
+    fn fake_aft_stub_path() -> PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe available in tests");
+        path.pop();
+        path.pop();
+        path.push(if cfg!(windows) {
+            "fake-aft-stub.exe"
+        } else {
+            "fake-aft-stub"
+        });
+        assert!(
+            path.exists(),
+            "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \
+             [[bin]] targets) rather than `cargo test -p subc-core --lib` (which does not)",
+            path.display()
+        );
+        path
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_history_survives_respawn_and_keeps_both_crashes_in_order() {
+        let registry = Arc::new(Registry::default());
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO));
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "terminal-history".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let history = module.terminal_history();
+            if history.entries.len() == 2 {
+                assert_eq!(module.status().unwrap().state, ModuleState::Failed);
+                assert_eq!(history.dropped, 0);
+                assert_eq!(
+                    history
+                        .entries
+                        .iter()
+                        .map(|entry| entry.exit_code)
+                        .collect::<Vec<_>>(),
+                    vec![Some(23), Some(23)]
+                );
+                assert!(history.entries[0].at_ms <= history.entries[1].at_ms);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "module did not retain two terminal exits: {history:?}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 #[cfg(test)]

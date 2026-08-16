@@ -701,6 +701,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_HEALTH_PROBE,
         ops::SUPERVISOR_HEALTH,
         ops::SUPERVISOR_STDERR_TAIL,
+        ops::SUPERVISOR_TERMINALS,
     ])
 }
 

@@ -23,7 +23,7 @@ This is the COMPLETE 4-phase wire contract (client↔subc + module↔subc). It i
   - Shared primitives: `ConfigTier`, `ErrorBody`, `BindIdentity`, `RouteTarget`, `ModuleManifest` (+ `ProviderRole`, `ConsumerRole`).
   - Module-facing control: `ModuleHelloBody`/`ModuleHelloAckBody`, `ModuleControlRequest`, `ModuleControlResponse`, `ModuleControlPush`.
 - **`subc-control`** (NEW, published, serde-only) = the client↔SUBC wire. What subc-mcp / TS client / CK-app / CLI depend on WITHOUT pulling the daemon. Depends on `subc-protocol` for shared primitives.
-  - `ClientControlRequest` / `ClientControlResponse`. (`ClientControlPush` direction RESERVED — see §6, not defined in v1.)
+  - `ClientControlRequest` / `ClientControlResponse` / `ClientControlPush` (daemon-originated only — see §6).
 - **`subc-core`** = implementation only. Holds NO source-of-truth wire structs.
 
 Layering: `subc-protocol` (base) ← `subc-control` ← clients (subc-mcp, TS, CK-app); `subc-protocol` ← AFT/provider modules; both ← `subc-core`.
@@ -180,6 +180,7 @@ pub enum ModuleControlRequest {
 - **subc does NO `RouteStatus` fan-out** (AFT pin #5). When a module has N routes open for one project, the MODULE emits `route.status` per `route_channel` itself; subc only caches per route_channel (it never replicates one status across routes).
 - v1 ships AFT as the single registered tool-provider; the registry is exercised in tests against a SECOND stub provider so multi-provider is proven, not hypothetical.
 - **Daemon-originated-only channel-0 pushes.** `ClientControlPush` is emitted only by subc directly to client connection sinks. Modules have no module→client push relay and cannot express this enum on their control channel, so this direction cannot be forged through a module. **Clients MUST ignore unrecognized channel-0 Push ops (never error)**; this keeps future pushes additive.
+  - **How to obey that without swallowing corruption.** The enum is deliberately strict — no catch-all variant — because a fallback variant would make an unknown op and a MALFORMED body for a KNOWN op decode alike, and those two warrant opposite responses. Decode in two steps, mirroring what subc already does for `ModuleControlPush` (`is_known_module_push_op`): on a decode failure, read just the `op` string; if it is one this peer knows, the body is malformed and that is a real error worth surfacing; if it is not, ignore the frame. Unknown-op and malformed-known-op stay distinguishable.
 - **Route lifecycle pushes are ephemeral.** `route.closing` and `route.closed` are emitted from teardown state and retained nowhere; a client that misses one is in the same position as before this family existed. A crash has no drain: subc emits `route.closed { reason: crash, drained: false, abandoned: 0 }` with no preceding `route.closing`. That asymmetry is normative: a `route.closed` without `route.closing` means nobody planned the closure.
 - **Enqueue-order is the ONLY claim.** `FrameSink::send` enqueues; it does not complete the write. So “pushed before the GOODBYE” can only ever mean “enqueued before”.
 

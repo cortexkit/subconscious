@@ -2632,21 +2632,17 @@ fn manifest_provides_routable_role(manifest: &ModuleManifest) -> bool {
 
 /// Returns the routable-provider concurrency subc should enforce for this manifest.
 ///
-/// Today only `ProviderRole::ToolProvider` carries an explicit manifest
-/// concurrency. `ManagementSurface` and `InternalService` modules therefore
-/// still fall back to `Concurrency::ModuleManaged`, which maps to subc's
-/// current default 32-credit per-route window, and there is no manifest-level
-/// override for those roles yet. A per-role concurrency field is deferred until
-/// such a module exists.
+/// ToolProvider and ManagementSurface store their delivery concurrency directly.
+/// InternalService has no role-specific concurrency field, so it retains the
+/// existing ModuleManaged default for backward compatibility.
 fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {
     manifest
         .provides
         .iter()
         .find_map(|provider| match provider {
-            ProviderRole::ToolProvider { concurrency, .. } => Some(concurrency.clone()),
-            ProviderRole::PipelineStage { .. }
-            | ProviderRole::ManagementSurface { .. }
-            | ProviderRole::InternalService { .. } => None,
+            ProviderRole::ToolProvider { concurrency, .. }
+            | ProviderRole::ManagementSurface { concurrency, .. } => Some(concurrency.clone()),
+            ProviderRole::PipelineStage { .. } | ProviderRole::InternalService { .. } => None,
         })
         .unwrap_or(Concurrency::ModuleManaged)
 }

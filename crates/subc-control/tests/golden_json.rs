@@ -434,6 +434,7 @@ fn provider_roles() -> Vec<ProviderRole> {
                 kind: ObservabilityKind::Snapshot,
             }],
             identity_scope: vec![IdentityScope::Project],
+            concurrency: Concurrency::ModuleManaged,
         },
         ProviderRole::InternalService {
             service_id: "llm".to_string(),

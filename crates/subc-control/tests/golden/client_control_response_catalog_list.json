@@ -93,6 +93,7 @@
     "supervisor.health_probe",
     "supervisor.health",
     "supervisor.stderr_tail",
-    "supervisor.terminals"
+    "supervisor.terminals",
+    "supervisor.routes"
   ]
 }

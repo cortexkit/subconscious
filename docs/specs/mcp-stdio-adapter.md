@@ -4,9 +4,9 @@ Status: Not Built (spec settled 2026-08-16; slices dispatch against this documen
 Design provenance: subconscious issue #20, plexus#4, spec campaigns ct_...9327c2ca2c38 / ct_...95068b13a9f0
 (both round-capped; their panels' blocking findings are folded here, and this document supersedes both drafts),
 plus six recorded rulings (env map, TTL policy, capability cache, deadline coherence, frame ceiling, base env).
-This document SUPERSEDES the adapter bullet in `docs/specs/mcp-router.md` (one-module-per-server,
-manifest-projected tools, `catalog.update` drift re-advertisement): the settled architecture is one
-singleton adapter consumed by plexus over the route plane; plexus owns discovery and governance.
+This document SUPERSEDES the adapter bullet in `docs/specs/mcp-router.md` — and that bullet was
+EDITED in the same commit that landed this spec (412ab265), not superseded by declaration alone:
+the router doc now describes the singleton architecture and points here.
 
 ## Intent
 
@@ -23,7 +23,12 @@ down.
 - Crate `crates/mcp-stdio-adapter/`, binary `ck-mcp-stdio-adapter`, module id `mcp-stdio-adapter`
   (singleton; a second instance's HELLO is refused by the daemon as `DuplicateModuleId` and the
   adapter treats that as FATAL — exit, no retry; the supervisor owns resurrection).
-- Registers as **`ManagementSurface`** — route-reachable by module id, no facade-advertised tools.
+- Registers as **`ManagementSurface`** with declared concurrency **`ModuleManaged`** (the adapter
+  multiplexes many callers over per-server children and owns its own queueing; the daemon
+  dispatcher acts on this field, and a registration slice must not infer it). The health
+  capability is advertised and `ModuleHandler::health()` is explicitly OVERRIDDEN — the default
+  asserts health on behalf of a module that measured nothing. Route-reachable by module id, no
+  facade-advertised tools.
   This is representable in the frozen manifest vocabulary today (no protocol change), and it is the
   same shape plexus already consumes for claustrum. PLEX discovery rule: bind by well-known module
   id `mcp-stdio-adapter`; server names come from the operator registry, out of band. The facade
@@ -38,22 +43,43 @@ down.
 
 Request envelope: `{"server": "<configured-name>", "op": "tools/list" | "tools/call", "payload": <MCP-shaped request>}`.
 
-Response envelope: `{"served_from": "live" | "cache", "observed_at_ms": <u64>, "payload": <the child's MCP-shaped result or error, byte-preserved>}`.
+Response envelope: `{"served_from": "live" | "cache", "observed_at_ms": <u64>, "payload": <the child's MCP-shaped result or error>}`.
 `served_from`/`observed_at_ms` are the adapter's only additions and are ALWAYS present (a live serve
-says `"live"` with the serve time), so consumers never branch on field absence. The MCP payload is
-never merged into, rewritten, or annotated — pass-through is byte-preserving.
+says `"live"` with the serve time), so consumers never branch on field absence. `observed_at_ms`
+is epoch milliseconds wall clock (the domain plexus computes staleness in). The child payload is
+CONTENT-PRESERVED: parsed and re-emitted with no field added, removed, or rewritten (embedding
+JSON in JSON makes byte identity unclaimable; key order is not guaranteed, content is).
 
-Adapter refusals replace the envelope with a typed error. The vocabulary is CLOSED and COMPLETE —
-one code per caller-branchable outcome:
+JSON-RPC authority on the child pipe is the ADAPTER'S: the adapter constructs every child-side
+frame, owns the JSON-RPC `id` space (mapping child ids to route correlation — caller-supplied ids
+from concurrent routes multiplexed onto one stdio would collide and cross-deliver replies), and
+validates that `payload.method` agrees with `op` (mismatch ⇒ `bad_request`; `op` drives cache and
+lifecycle routing, so a disagreeing method would be a route-reachable way to make the child execute
+something the envelope did not declare).
+
+Adapter refusals are route-plane ERROR frames with body `{"code": "<table code>", "message":
+"<human line>", "detail": {<machine-parsable, fields named per code>}}` — the standard subc
+ErrorBody shape, so plexus discriminates success from refusal by FRAME TYPE, never by sniffing
+body fields (the always-present provenance fields exist only on success envelopes). `detail` is a
+stable machine surface: `child_framing_error` carries `observed_bytes`/`ceiling_bytes`;
+credential failures carry `server`/`env_var`. The vocabulary is CLOSED and COMPLETE — one code per
+caller-branchable outcome:
 
 | code | meaning | caller posture |
 |---|---|---|
+| `bad_request` | envelope invalid: unknown/unsupported `op`, missing/non-string `server`, non-object `payload`, `payload.method` disagreeing with `op`, request over size ceiling, or spawn/command/argv-shaped fields anywhere in the request (the no-wire-spawn boundary's carrier) | fix the request; terminal |
 | `server_unknown` | name not in registry (reply never enumerates the registry) | terminal |
 | `server_disabled` | configured but disabled | terminal |
-| `spawn_failed` | child could not start within the spawn budget (below) | terminal (adapter already retried) |
+| `spawn_failed` | child could not start within the spawn budget (below); `detail.cause` names the category (`exec`, `initialize_timeout`, `credential_resolution`) so the operator remedy is addressable | terminal until the cooldown probe (below) |
 | `initialize_failed` | child started, MCP initialize failed/stalled; NO tool request was written (provably not-sent) | terminal for this call |
 | `child_framing_error` | child bytes violated JSON-RPC framing or the frame ceiling; child torn down; detail NAMES observed size and configured ceiling | terminal for this call |
 | `call_outcome_unknown` | child died after a `tools/call` was written, before a reply | outcome-unknown; never auto-retried |
+
+Discovery is the one internally-retried op: `tools/list` is read-only by MCP contract, so a child
+dying after a `tools/list` was written is retried ONCE internally against a fresh child before any
+refusal surfaces — callers never see an outcome-unknown for discovery. Framing violations DURING
+initialize surface as `initialize_failed` (the provably-not-sent posture), never
+`child_framing_error`.
 | `child_unresponsive` | per-server deadline elapsed with the child alive; call abandoned, child torn down | outcome-unknown semantics |
 | `child_capacity` | global cap reached and every live child busy | transient |
 
@@ -102,8 +128,14 @@ Per server: `command`, `args`, `cwd`, `env` (map, below), `idle_ttl_ms` (absent/
   written; concurrent first-calls single-flight the spawn (N callers, one child, proven by counter).
 - **Spawn budget (named constants):** `SPAWN_INITIALIZE_BUDGET_MS = 30_000` wall per attempt,
   `SPAWN_ATTEMPT_BUDGET = 3` consecutive failed attempts per server; the counter resets on a
-  successful initialize or adapter restart. Budget exhaustion surfaces `spawn_failed` to callers
-  until reset. These are the spawn machinery's internals, not caller-facing timeouts — the closed
+  successful initialize or adapter restart. Budget exhaustion surfaces `spawn_failed` — but the
+  latch is time-bounded, not permanent: after `SPAWN_RETRY_COOLDOWN_MS = 60_000` the next call is
+  admitted as ONE probe attempt (success resets the budget; failure re-arms the cooldown). Without
+  this, exhaustion suppresses attempts while the only reset requires an attempt — a permanently
+  dead server until adapter restart even after the operator fixes an external cause (reinstalled
+  package, repaired vault entry). An acceptance arm proves recovery WITHOUT restart. A child that
+  exits within `CHILD_EARLY_EXIT_MS = 10_000` of a successful initialize also counts toward the
+  attempt budget (bounds respawn churn from initialize-then-die children). These are the spawn machinery's internals, not caller-facing timeouts — the closed
   caller-facing set remains exactly two (spawn/initialize path collapsed into `spawn_failed` /
   `initialize_failed`; forwarded-call `deadline_ms`), and a slice adding a third timeout stops and
   reports.
@@ -125,11 +157,21 @@ Per server: `command`, `args`, `cwd`, `env` (map, below), `idle_ttl_ms` (absent/
   any value.
 - Idle eviction after per-server TTL: stdin close, `EVICTION_GRACE_MS = 5_000`, then process-TREE
   kill (orphan prevention, not confinement; Windows via job objects, cfg-split like supervise.rs).
-  Invisible to callers.
+  Invisible to callers — and the state machine that makes the invisibility TRUE rather than
+  asserted: a child with in-flight calls is NEVER idle-eligible (the idle timer starts when
+  in-flight reaches 0, not at spawn — so a TTL below spawn+initialize cannot evict a child before
+  its first serve); entering eviction is TERMINAL for that child (a call arriving mid-grace is
+  never written to the closing stdin — it queues behind a fresh respawn and serves normally); the
+  cap slot stays RESERVED for the full grace (a dying child counts against `max_children` until
+  reaped, as does an initializing one — the census property is over spawned-and-unreaped, so the
+  cap test cannot be satisfied by miscounting either edge state).
 - Crash respawn on next call (not eagerly), within the spawn budget above.
-- Concurrency: `max_children` global cap (default 8). At cap: idle children may be evicted early to
-  make room (adapter-internal policy, consistent with eviction invisibility); all-busy ⇒
-  `child_capacity`. Live children never exceed the cap (property test).
+- Concurrency: `max_children` global cap (default 8). At cap: the least-recently-used IDLE child
+  may be evicted to make room, and make-room is ATOMIC with the replacement spawn (the freed slot
+  is claimed by the waiting spawn before any other request can take it — two-slot races refuse
+  rather than overshoot); all-busy ⇒ `child_capacity`. Spawned-and-unreaped children never exceed
+  the cap (property test over eviction, initialization, and steady arms). No cross-server fairness
+  is claimed in v1 (a hot server can monopolize slots; stated honestly rather than implied away).
 
 ## Capability cache (ruled)
 
@@ -147,6 +189,21 @@ Per server: `command`, `args`, `cwd`, `env` (map, below), `idle_ttl_ms` (absent/
   CHILD's own MCP error verbatim. (This sentence appears in the module docs.)
 
 ## Robustness, isolation, and disclosure boundaries
+
+- **Threat model, stated plainly (panel-forced narrowing):** the constructed-environment rule
+  guarantees NON-PROPAGATION — the child's environment contains no daemon material. It does not
+  and cannot guarantee SECRECY from an actively hostile same-UID child: v1 has no sandboxing, so
+  such a child can read the adapter's `/proc/<pid>/environ`, cmdline, or any same-user file.
+  Nonce/connection-material compromise by a hostile same-UID child is OUT OF SCOPE for v1 and the
+  README says so. The cheap fences that ARE in scope: the adapter SCRUBS `SUBC_LAUNCH_NONCE` from
+  its own environment after startup (retaining it only in memory for route identity); the daemon
+  socket and connection-file descriptors are opened/kept CLOEXEC so no child inherits an FD
+  (acceptance covers FD inheritance); the child env map parse-REFUSES any `SUBC_*` key; and
+  `command` values are recommended absolute — a bare name resolves against the frozen base PATH
+  once at spawn with the resolved absolute path logged.
+- Server names match `[a-z0-9-]{1,64}` (pinned charset: case-sensitive matching over a
+  case-insensitive-filesystem OS invites Windows case-folding ambiguity, so the charset simply has
+  no case).
 
 - One child's garbage stdout never wedges the adapter: framing violations produce
   `child_framing_error` for that server only; other servers serve concurrently; the adapter never
@@ -176,7 +233,21 @@ Per server: `command`, `args`, `cwd`, `env` (map, below), `idle_ttl_ms` (absent/
   cache-warm `tools/list` spawns nothing; cache-disabled `tools/list` spawns.
 - CACHE PINS: provenance fields present and correct on both arms (mutation: drop the field, named
   test reddens); restart-with-edited-config re-enumerates live (fixture-side initialize count);
-  vanished-tool call returns the child's error byte-matched.
+  vanished-tool call returns the child's error content-matched.
+- BAD-REQUEST ARMS: unknown op, missing server, non-object payload, method/op mismatch, and
+  spawn-shaped fields each refuse `bad_request` with census unchanged (the spawn-shaped arm is the
+  mutation-proved no-wire-spawn fence, now carried by a nameable code).
+- SPAWN-BUDGET RECOVERY: after exhaustion, a call within the cooldown refuses `spawn_failed`
+  WITHOUT a spawn attempt; a call after the cooldown makes exactly one probe attempt; a fixed
+  fixture then serves — recovery proven WITHOUT adapter restart.
+- FD/SCRUB FENCES: fixture child enumerates its open descriptors — no daemon socket, no connection
+  file (CLOEXEC proven by effect); adapter's own /proc environ (or platform equivalent) carries no
+  SUBC_LAUNCH_NONCE after startup while route identity still serves.
+- MID-GRACE CALL: a call arriving during an eviction grace serves normally from a fresh child
+  (never touches the dying child's stdin; asserted via fixture frame log) — the invisibility
+  premise proven at its hardest arm.
+- DISCOVERY RETRY: child killed after a tools/list write → caller still receives a successful
+  list (one internal retry, fixture spawn count = 2, no refusal surfaced).
 - HANDSHAKE ORDERING: stalled/failed initialize ⇒ `initialize_failed` AND the fixture's
   received-frame log proves no tool request was written.
 - ADDRESSING: unknown ⇒ `server_unknown`, disabled ⇒ `server_disabled`, census unchanged, replies

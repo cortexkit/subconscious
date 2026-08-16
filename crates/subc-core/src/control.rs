@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
     StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorRescanResult,
+    SupervisorRescanResult, TerminalEntry, TerminalHistory,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
@@ -64,6 +64,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_HEALTH_PROBE,
     ops::SUPERVISOR_HEALTH,
     ops::SUPERVISOR_STDERR_TAIL,
+    ops::SUPERVISOR_TERMINALS,
 ];
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[MODULE_TO_SUBC_OP_CATALOG_UPDATE];
@@ -846,6 +847,9 @@ impl ControlHandler {
                 max_lines,
                 max_bytes,
             } => self.handle_supervisor_stderr_tail(frame, module_id, max_lines, max_bytes),
+            ClientControlRequest::SupervisorTerminals { module_id } => {
+                self.handle_supervisor_terminals(frame, module_id)
+            }
         }
     }
 
@@ -1359,6 +1363,7 @@ impl ControlHandler {
                     last_probe_ms: status.health.last_probe_ms,
                     last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
                     last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
+                    last_exit_ms: status.last_exit.as_ref().map(|e| e.at_ms),
                     restart_count: Some(status.restart_count),
                     max_restarts: Some(status.max_restarts),
                 })
@@ -1424,6 +1429,44 @@ impl ControlHandler {
             &frame,
             &response,
             "ClientControlResponse::SupervisorStderrTail",
+        )?])
+    }
+
+    fn handle_supervisor_terminals(
+        &self,
+        frame: Frame,
+        module_id: String,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(module) = self.supervisor.get(&module_id) else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{module_id}' is not supervised"),
+            )?]);
+        };
+
+        let snapshot = module.terminal_history();
+        let response = ClientControlResponse::SupervisorTerminals {
+            module_id,
+            terminals: TerminalHistory {
+                daemon_started_at_ms: snapshot.daemon_started_at_ms,
+                entries: snapshot
+                    .entries
+                    .into_iter()
+                    .map(|entry| TerminalEntry {
+                        exit_code: entry.exit_code,
+                        exit_signal: entry.exit_signal,
+                        at_ms: entry.at_ms,
+                        disposition: entry.disposition,
+                    })
+                    .collect(),
+                dropped: snapshot.dropped,
+            },
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorTerminals",
         )?])
     }
 
@@ -2842,11 +2885,20 @@ mod tests {
     ///
     /// `CARGO_BIN_EXE_*` (compile-time `env!` and runtime `std::env::var` alike)
     /// is only populated for `tests/*.rs` integration test binaries -- this file
-    /// compiles as part of the library target, which gets neither. Cargo still
-    /// builds every `[[bin]]` target before running the library's tests, so the
-    /// binary is on disk; this test's own executable path is
-    /// `<target-dir>/<profile>/deps/subc_core-<hash>`, and the sibling binary
-    /// lives two directories up at `<target-dir>/<profile>/fake-aft-stub`.
+    /// compiles as part of the library target, which gets neither. This test's
+    /// own executable path is `<target-dir>/<profile>/deps/subc_core-<hash>`,
+    /// and the sibling binary lives two directories up at
+    /// `<target-dir>/<profile>/fake-aft-stub`.
+    ///
+    /// THE BINARY IS NOT ALWAYS THERE, and the existence check below is why.
+    /// `cargo test -p subc-core` builds every target including `[[bin]]`, so the
+    /// stub is on disk; `cargo test -p subc-core --lib` builds ONLY the library
+    /// test and leaves the stub unbuilt. A bare spawn then fails with a raw
+    /// `NotFound`, which reads as a broken test rather than an unbuilt
+    /// dependency -- so state the cause and the remedy instead. Deliberately a
+    /// panic and not a silent skip: a test that quietly passes when it could not
+    /// run is worse than one that fails, because it reports health it never
+    /// verified.
     fn fake_aft_stub_path() -> PathBuf {
         let mut path = std::env::current_exe().expect("current_exe available in tests");
         path.pop(); // .../deps/
@@ -2856,6 +2908,12 @@ mod tests {
         } else {
             "fake-aft-stub"
         });
+        assert!(
+            path.exists(),
+            "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \
+             [[bin]] targets) rather than `cargo test -p subc-core --lib` (which does not)",
+            path.display()
+        );
         path
     }
 
@@ -3418,6 +3476,80 @@ mod tests {
         };
         assert_eq!(text, &source_line[..DEFAULT_MAX_LINE_BYTES]);
         assert!(*truncated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_terminals_golden_is_generated_through_the_real_handler() {
+        let registry = Arc::new(Registry::default());
+        let supervisor_handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
+                .with_handle(supervisor_handle.clone());
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "terminal-golden".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while module.terminal_history().entries.len() != 2 {
+            assert!(
+                Instant::now() < deadline,
+                "module did not retain two terminal exits: {:?}",
+                module.terminal_history()
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+        let request = ClientControlRequest::SupervisorTerminals {
+            module_id: "terminal-golden".to_string(),
+        };
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (ctx, _egress) = route_ctx(ConnectionId::new(1));
+        let responses = handler.handle_control_frame(&ctx, frame).await.unwrap();
+        let response: ClientControlResponse = serde_json::from_slice(&responses[0].body).unwrap();
+        let ClientControlResponse::SupervisorTerminals { terminals, .. } = &response else {
+            panic!("expected supervisor.terminals response");
+        };
+        assert_eq!(terminals.entries.len(), 2);
+        assert_eq!(terminals.dropped, 0);
+
+        let mut rendered = serde_json::to_value(response).unwrap();
+        // Wall-clock fields are the observation contract, but not stable fixture
+        // bytes; normalize only them after the real handler has shaped the response.
+        rendered["daemon_started_at_ms"] = json!(1_700_000_000_000u64);
+        for (index, entry) in rendered["entries"]
+            .as_array_mut()
+            .expect("terminal response entries array")
+            .iter_mut()
+            .enumerate()
+        {
+            entry["at_ms"] = json!(1_700_000_000_001u64 + index as u64);
+        }
+
+        let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../subc-control/tests/golden/client_control_response_supervisor_terminals.json");
+        let serialized = serde_json::to_string_pretty(&rendered).unwrap() + "\n";
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(&golden_path, &serialized).unwrap();
+        }
+        let expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(&golden_path).unwrap()).unwrap();
+        assert_eq!(rendered, expected);
     }
 
     #[test]

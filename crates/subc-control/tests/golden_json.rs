@@ -346,6 +346,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.health_probe".to_string(),
         "supervisor.health".to_string(),
         "supervisor.stderr_tail".to_string(),
+        "supervisor.terminals".to_string(),
     ]
 }
 
@@ -376,6 +377,7 @@ fn supervisor_entry() -> SupervisorEntry {
         last_probe_ms: Some(1_700_000_000_000),
         last_exit_code: None,
         last_exit_signal: None,
+        last_exit_ms: Some(1_700_000_000_123),
         // Non-equal and non-zero so the pin would catch the two fields being
         // swapped, which equal values or a zeroed count could not.
         restart_count: Some(2),

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     net::Shutdown,
     ops::Deref,
@@ -1608,6 +1609,108 @@ async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() 
     let fresh_response = read_frame_timeout(&mut fresh_client).await;
     assert_response(&fresh_response, fresh_ack.route_channel, 405, fresh_payload);
 
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(250),
+    );
+    let module_id = "fake-aft-supervisor-reload-dedup";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let first = attach_on_stream(
+        &mut route_client,
+        &project,
+        406,
+        "ses-reload-dedup-first",
+        module_id,
+    )
+    .await;
+    let second = attach_on_stream(
+        &mut route_client,
+        &project,
+        407,
+        "ses-reload-dedup-second",
+        module_id,
+    )
+    .await;
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 2);
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            408,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+
+    let mut closing_count = 0;
+    let mut closed_count = 0;
+    let mut goodbye_channels = BTreeSet::new();
+    for _ in 0..4 {
+        let frame = read_frame_timeout(&mut route_client).await;
+        match frame.header.ty {
+            FrameType::Push => {
+                match serde_json::from_slice::<Value>(&frame.body).unwrap()["op"].as_str() {
+                    Some("route.closing") => {
+                        assert_route_lifecycle_push(
+                            &frame,
+                            "route.closing",
+                            module_id,
+                            "reload",
+                            None,
+                            None,
+                        );
+                        closing_count += 1;
+                    }
+                    Some("route.closed") => {
+                        assert_route_lifecycle_push(
+                            &frame,
+                            "route.closed",
+                            module_id,
+                            "reload",
+                            Some(true),
+                            Some(0),
+                        );
+                        closed_count += 1;
+                    }
+                    op => panic!("unexpected channel-0 PUSH op: {op:?}"),
+                }
+            }
+            FrameType::Goodbye => {
+                goodbye_channels.insert(frame.header.channel);
+            }
+            ty => panic!("unexpected frame during route lifecycle teardown: {ty:?}"),
+        }
+    }
+    assert_eq!(closing_count, 1, "one route.closing per client connection");
+    assert_eq!(closed_count, 1, "one route.closed per client connection");
+    assert_eq!(
+        goodbye_channels,
+        BTreeSet::from([first.route_channel, second.route_channel])
+    );
+    assert_no_frame_within(&mut route_client, Duration::from_millis(100)).await;
+
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 408, module_id).await;
+    assert!(applied);
     module.stop().await.unwrap();
 }
 

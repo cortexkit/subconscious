@@ -2940,8 +2940,22 @@ pub(crate) fn send_route_control_pushes(
             return;
         }
     };
+    let mut targets = Vec::new();
     for route in routes {
         let target = route.goodbye_target;
+        if let Some(existing) = targets
+            .iter()
+            .find(|existing: &&GoodbyeTarget| existing.connection_id == target.connection_id)
+        {
+            debug_assert_eq!(
+                existing.negotiated_ver, target.negotiated_ver,
+                "one connection cannot negotiate multiple frame versions"
+            );
+            continue;
+        }
+        targets.push(target);
+    }
+    for target in targets {
         let frame = match Frame::build_with_version(
             target.negotiated_ver,
             FrameType::Push,

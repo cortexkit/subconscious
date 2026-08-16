@@ -13,16 +13,18 @@ ALF (agent scope, app management surface), entorhinal owner (policy store custod
   (tools_search/tools_invoke meta-tools), reverse-request relay, spawn
   attestation. Per-server AND per-tool granularity already works — for
   CortexKit's own modules, driven by config files.
-- **ck-mcp-stdio-adapter** (subconscious#20, ruled in plexus#4): each
-  third-party stdio MCP server becomes a subc module via a resident few-MB
-  adapter — subc-module face (manifest projects the child's tools, insulated
-  health, routes) and MCP-stdio client face. Child lifecycle is
-  adapter-internal: spawn on first call, shed on idle (configurable, 300s
-  reference), respawn on demand, child crash budget distinct from the
-  module's. Tool enumeration: spawn once at boot, `tools/list`, project into
-  the manifest, shed; drift re-advertised via `catalog.update` on respawn.
-  The moment an adapter registers, the existing policy engine governs its
-  tools exactly like AFT's.
+- **ck-mcp-stdio-adapter** (subconscious#20, ruled in plexus#4; full contract
+  in `docs/specs/mcp-stdio-adapter.md`, which supersedes earlier text here):
+  ONE singleton resident adapter module (`mcp-stdio-adapter`, a
+  ManagementSurface) owns child lifecycle for ALL configured stdio servers —
+  lazy spawn on first call, idle shed (300s default), respawn on demand,
+  constructed child environments, claustrum-resolved credentials. It presents
+  MCP semantics verbatim (tools/list, tools/call) namespaced by configured
+  server name; plexus dispatches by module id over the route plane, owns
+  discovery/reconciliation, and governs exposure through its connector
+  surface. Child tools are NOT projected into the manifest and subc-mcp does
+  not advertise them; the earlier one-module-per-server / manifest-projection
+  / catalog.update sketch is retired.
 
 ## Settled by Ufuk (2026-08-15)
 

@@ -5,7 +5,8 @@ use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
     StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorHealthStatus, SupervisorRescanResult,
+    SupervisorHealthStatus, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
+    SupervisorRouteModule,
 };
 use subc_protocol::{
     manifest::{
@@ -277,6 +278,28 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             },
         ),
         (
+            "client_control_response_supervisor_routes",
+            ClientControlResponse::SupervisorRoutes {
+                modules: vec![SupervisorRouteModule {
+                    module_id: "target".to_string(),
+                    routes: vec![
+                        SupervisorRoute {
+                            consumer: SupervisorRouteConsumer::Direct { connection_id: 102 },
+                            age_ms: 0,
+                            draining: true,
+                        },
+                        SupervisorRoute {
+                            consumer: SupervisorRouteConsumer::Reserved {
+                                module_id: "fed".to_string(),
+                            },
+                            age_ms: 0,
+                            draining: true,
+                        },
+                    ],
+                }],
+            },
+        ),
+        (
             "client_control_response_supervisor_stderr_tail",
             ClientControlResponse::SupervisorStderrTail {
                 module_id: "aft-tools".to_string(),
@@ -347,6 +370,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.health".to_string(),
         "supervisor.stderr_tail".to_string(),
         "supervisor.terminals".to_string(),
+        "supervisor.routes".to_string(),
     ]
 }
 

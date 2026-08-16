@@ -121,6 +121,14 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     public var canceledAt: Int64?
     public var autoProceededAt: Int64?
 
+    // Ask-UX evidence (additive wire fields, prefrontal contract 35346fa0). Both are
+    // optional because absence is THE PRODUCER NEVER EMITTING THE KEY -- Codable
+    // collapses missing and null to nil, so the absent/null distinction lives on
+    // the producer side, which its fixture pins. Declared here so the hand-written
+    // decode cannot silently drop them the way statusText was once lost.
+    public var attachments: [AskAttachment]?
+    public var thread: [AskThreadEntry]?
+
     public var id: String { requestID }
 
     /// Converts the wire's epoch-millisecond timestamp for SwiftUI date formatting.
@@ -153,6 +161,42 @@ public struct AskRequest: Codable, Equatable, Identifiable {
 // JSONValue-bearing fields and matches Identifiable semantics.
 extension AskRequest: Hashable {
     public func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+/// One attachment descriptor on an ask. Pointer-only: content is fetched on demand
+/// via ask.attachment_content, never carried on the ask record or in pushes.
+public struct AskAttachment: Codable, Equatable, Hashable {
+    public var index: Int
+    public var title: String
+    public var mime: String
+    public var byteCount: Int
+
+    public init(index: Int, title: String, mime: String, byteCount: Int) {
+        self.index = index
+        self.title = title
+        self.mime = mime
+        self.byteCount = byteCount
+    }
+}
+
+/// One clarification-thread entry on an ask.
+///
+/// `who` is deliberately a String, not an enum: the producer contract keeps it an
+/// open set, and an enum's decode throw on an unrecognised speaker would take the
+/// WHOLE ask down with it -- the same one-malformed-block-fails-the-board class
+/// the board decoder already had to fix.
+public struct AskThreadEntry: Codable, Equatable, Hashable {
+    public var who: String
+    public var text: String
+    public var atMs: Int64
+    public var attachmentIndexes: [Int]?
+
+    public init(who: String, text: String, atMs: Int64, attachmentIndexes: [Int]? = nil) {
+        self.who = who
+        self.text = text
+        self.atMs = atMs
+        self.attachmentIndexes = attachmentIndexes
+    }
 }
 
 /// A parsed answer reply. Conflict and cancellation are normal server outcomes, not

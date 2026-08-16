@@ -1,0 +1,30 @@
+{
+  "module_id": "deployed-management-surface",
+  "module_version": "1.0.0",
+  "protocol_ver": 2,
+  "trust_tier": "first_party",
+  "provides": [
+    {
+      "role": "management_surface",
+      "operations": [],
+      "config_schema": {
+        "type": "object"
+      },
+      "observability": [],
+      "identity_scope": []
+    }
+  ],
+  "consumes": [],
+  "bindings": {
+    "storage": {
+      "kind": "sqlite",
+      "scope": "project",
+      "owns_schema": false
+    },
+    "vault_grants": [],
+    "identity": {
+      "requires": [],
+      "optional": []
+    }
+  }
+}

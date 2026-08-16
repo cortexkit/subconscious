@@ -56,6 +56,8 @@ pub enum ProviderRole {
         config_schema: Value,
         observability: Vec<ObservabilitySurface>,
         identity_scope: Vec<IdentityScope>,
+        #[serde(default)]
+        concurrency: Concurrency,
     },
     InternalService {
         service_id: String,
@@ -115,6 +117,13 @@ pub enum Concurrency {
     /// Fully parallel delivery with no ordering guarantee across or within
     /// channels.
     StatelessParallel,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for Concurrency {
+    fn default() -> Self {
+        Self::ModuleManaged
+    }
 }
 
 /// Identity keys that route or scope a call.

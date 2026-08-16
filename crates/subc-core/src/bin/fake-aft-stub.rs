@@ -1288,6 +1288,7 @@ fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> 
                 kind: ObservabilityKind::Snapshot,
             }],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency,
         },
         StubRole::InternalService { service_id } => ProviderRole::InternalService {
             service_id,

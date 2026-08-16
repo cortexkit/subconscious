@@ -96,6 +96,7 @@ export type ProviderRoleInput =
       config_schema: unknown;
       observability: ObservabilitySurfaceInput[];
       identity_scope: IdentityScope[];
+      concurrency: Concurrency;
     }
   | {
       role: "internal_service";
@@ -159,6 +160,7 @@ export interface ManagementSurfaceManifestOptions {
   moduleId: string;
   operations: Array<string | ManagementOperationInput>;
   moduleVersion?: string;
+  concurrency?: Concurrency;
 }
 
 /**
@@ -372,6 +374,7 @@ export function managementSurfaceManifest(opts: ManagementSurfaceManifestOptions
         config_schema: { type: "object" },
         observability: [],
         identity_scope: [],
+        concurrency: opts.concurrency ?? "module_managed",
       },
     ],
     consumes: [],
@@ -1435,6 +1438,7 @@ function normalizeProviderRole(role: ProviderRoleInput): ProviderRoleInput {
           kind: surface.kind,
         })),
         identity_scope: [...role.identity_scope],
+        concurrency: role.concurrency,
       };
     case "internal_service":
       return {

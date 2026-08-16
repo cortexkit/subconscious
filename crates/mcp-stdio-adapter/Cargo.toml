@@ -1,0 +1,18 @@
+[package]
+name = "mcp-stdio-adapter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Resident subc module for configured third-party stdio MCP servers."
+
+[[bin]]
+name = "ck-mcp-stdio-adapter"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subc-client-rs = { path = "../subc-client-rs" }
+subc-jsonc = { path = "../subc-jsonc" }
+subc-protocol = { path = "../subc-protocol" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

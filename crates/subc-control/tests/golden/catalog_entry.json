@@ -43,6 +43,7 @@
       "stage": "transform"
     },
     {
+      "concurrency": "module_managed",
       "config_schema": {
         "type": "object"
       },

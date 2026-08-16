@@ -363,6 +363,9 @@ public final class FedNoiseIKResponder {
 }
 
 enum FedNoiseChaChaPoly {
+    /// ChaChaPoly.seal appends this tag to every Noise transport ciphertext.
+    static let authenticationTagLength = 16
+
     static func seal(_ plaintext: Data, key: Data, nonce: UInt64, authenticatedData: Data) throws -> Data {
         let symmetricKey = SymmetricKey(data: key)
         let box = try ChaChaPoly.seal(
@@ -378,11 +381,13 @@ enum FedNoiseChaChaPoly {
     }
 
     static func open(_ ciphertextAndTag: Data, key: Data, nonce: UInt64, authenticatedData: Data) throws -> Data {
-        guard ciphertextAndTag.count >= 16 else { throw FedNoiseError.authenticationFailed }
+        guard ciphertextAndTag.count >= authenticationTagLength else {
+            throw FedNoiseError.authenticationFailed
+        }
         // Data slices can retain a non-zero start index. CryptoKit's
         // SealedBox initializer requires fresh, zero-based Data values.
-        let ciphertext = Data(ciphertextAndTag.dropLast(16))
-        let tag = Data(ciphertextAndTag.suffix(16))
+        let ciphertext = Data(ciphertextAndTag.dropLast(authenticationTagLength))
+        let tag = Data(ciphertextAndTag.suffix(authenticationTagLength))
         do {
             let box = try ChaChaPoly.SealedBox(
                 nonce: ChaChaPoly.Nonce(data: noiseNonce(nonce)),

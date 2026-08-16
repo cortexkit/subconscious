@@ -2679,6 +2679,7 @@ fn control_error_frame(
         ErrorBody {
             code: code.to_string(),
             message: message.into(),
+            detail: None,
         },
     )
 }

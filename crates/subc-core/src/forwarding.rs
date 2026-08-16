@@ -842,6 +842,7 @@ impl ForwardingTable {
                 .send(RouteBindRelayOutcome::Rejected(ErrorBody {
                     code: "module_timeout".to_string(),
                     message: "route.bind response arrived after its daemon deadline".to_string(),
+                    detail: None,
                 }));
             return Ok(PendingRelayCompletion {
                 settled: true,
@@ -1237,10 +1238,10 @@ impl ForwardingTable {
             }
             let _ = pending
                 .sender
-                .send(RouteBindRelayOutcome::Rejected(ErrorBody {
-                    code: "module_reloading".to_string(),
-                    message: format!("module_id '{module_id}' is reloading"),
-                }));
+                .send(RouteBindRelayOutcome::Rejected(ErrorBody::new(
+                    "module_reloading",
+                    format!("module_id '{module_id}' is reloading"),
+                )));
         }
 
         let pending_control_keys = inner
@@ -2709,6 +2710,7 @@ mod tests {
                 RouteBindRelayOutcome::Rejected(ErrorBody {
                     code: "no".into(),
                     message: "rejected".into(),
+                    detail: None,
                 }),
             )
             .unwrap();

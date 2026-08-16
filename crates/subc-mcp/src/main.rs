@@ -1899,6 +1899,7 @@ fn supervision_error_frame(
     let body = serde_json::to_vec(&ErrorBody {
         code: code.to_owned(),
         message: message.into(),
+        detail: None,
     })
     .map_err(|source| other_error(format!("failed to encode supervision ERROR: {source}")))?;
     SubcFrame::build_with_version(
@@ -4875,6 +4876,7 @@ async fn fail_pending_on_route(
         let body = match serde_json::to_vec(&ErrorBody {
             code: "target_unavailable".to_owned(),
             message: message.to_owned(),
+            detail: None,
         }) {
             Ok(body) => body,
             Err(error) => {
@@ -5919,6 +5921,7 @@ mod tests {
         let refusal_body = serde_json::to_vec(&ErrorBody {
             code: "principal_denied".to_string(),
             message: "plexus connector tools are first-party only".to_string(),
+            detail: None,
         })
         .unwrap();
         let error = open_against_error_body(refusal_body).await;

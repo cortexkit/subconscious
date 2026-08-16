@@ -3133,6 +3133,7 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
                 serde_json::from_slice::<ErrorBody>(&frame.body).unwrap_or_else(|err| ErrorBody {
                     code: "invalid_error_body".to_string(),
                     message: err.to_string(),
+                    detail: None,
                 });
             shared.settle_pending(key, PendingTerminal::Error { body });
         }
@@ -4416,6 +4417,7 @@ mod tests {
         let error_body = serde_json::to_vec(&ErrorBody {
             code: "admission_facts_not_permitted".to_string(),
             message: "not permitted".to_string(),
+            detail: None,
         })
         .unwrap();
         assert!(

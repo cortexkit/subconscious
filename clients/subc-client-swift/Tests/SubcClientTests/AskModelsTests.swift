@@ -257,3 +257,64 @@ final class AskModelsTests: XCTestCase {
         return request
     }
 }
+
+// MARK: - Ask evidence (attachments + clarification thread, contract 35346fa0)
+
+extension AskModelsTests {
+    /// Decoded from wire-shaped bytes rather than constructed, because the rule under
+    /// test is that the hand-written decode path DOES NOT DROP these keys — a
+    /// constructed value cannot fail that way.
+    func testDecodesAttachmentsAndThread() throws {
+        let ask = try decodeAsk([
+            "requestID": "ask-evidence",
+            "question": "Approve the diff?",
+            "askedAt": 1_755_300_000_000,
+            "attachments": [
+                ["index": 0, "title": "diff.patch", "mime": "text/x-patch", "byteCount": 8_192],
+                ["index": 1, "title": "screenshot.png", "mime": "image/png", "byteCount": 204_800],
+            ],
+            "thread": [
+                [
+                    "who": "user", "text": "What does the second hunk change?",
+                    "atMs": 1_755_300_100_000,
+                ],
+                [
+                    "who": "agent", "text": "It renames the flag; see the attachment.",
+                    "atMs": 1_755_300_160_000, "attachmentIndexes": [0],
+                ],
+            ],
+        ])
+        XCTAssertEqual(ask.attachments?.count, 2)
+        XCTAssertEqual(ask.attachments?[1].mime, "image/png")
+        XCTAssertEqual(ask.attachments?[1].byteCount, 204_800)
+        XCTAssertEqual(ask.thread?.count, 2)
+        XCTAssertEqual(ask.thread?[0].who, "user")
+        XCTAssertEqual(ask.thread?[1].attachmentIndexes, [0])
+        XCTAssertNil(ask.thread?[0].attachmentIndexes)
+    }
+
+    /// `who` is an open string by producer contract. A speaker value no current
+    /// client knows must decode, not throw — an enum here would take the whole
+    /// ask down with the first new speaker kind.
+    func testUnknownThreadSpeakerDecodesAsPlainString() throws {
+        let ask = try decodeAsk([
+            "requestID": "ask-open-speaker",
+            "question": "q",
+            "askedAt": 1,
+            "thread": [["who": "supervisor_bot", "text": "escalated", "atMs": 2]],
+        ])
+        XCTAssertEqual(ask.thread?.first?.who, "supervisor_bot")
+    }
+
+    /// Absence semantics: the producer never emits the keys on evidence-less asks,
+    /// and both properties must read nil (not empty arrays) so the UI can
+    /// distinguish "no evidence" from "evidence with zero entries" if a producer
+    /// ever emits [].
+    func testAbsentEvidenceKeysDecodeNil() throws {
+        let ask = try decodeAsk([
+            "requestID": "ask-bare", "question": "q", "askedAt": 1,
+        ])
+        XCTAssertNil(ask.attachments)
+        XCTAssertNil(ask.thread)
+    }
+}

@@ -107,6 +107,53 @@ async fn daemon_reports_and_renders_route_counters() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_ck_renders_live_dashboard_and_navigation_footer() {
+    let server = TestServer::start().await;
+    let output = ck_with_subc(&server.connection_file_path, []);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("ck — CortexKit operator CLI"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("daemon: "), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("modules: 0 running, 0 ok"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("alerts: none"), "stdout:\n{stdout}");
+    assert!(stdout.contains("domains:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("help[2]:"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn bare_ck_degrades_to_domains_when_daemon_is_unreachable() {
+    let missing = unique_temp_dir("ck-bare-missing").join("subc-connection.json");
+    let output = ck_command()
+        .args(["--subc"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("ck — CortexKit operator CLI"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("bin:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("daemon: unreachable"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains(&missing.display().to_string()),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("domains:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("module"), "stdout:\n{stdout}");
+    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_list_json_uses_subc_override_and_shows_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
@@ -126,6 +173,7 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
         .env("TEMP", hidden_tmp.path())
         .output()
         .unwrap();
+    let json_stdout = text(&output.stdout);
     let value = assert_json_success(output);
     let modules = value["modules"].as_array().unwrap();
     assert!(
@@ -133,6 +181,19 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
             .iter()
             .any(|module| module["module_id"] == module_id),
         "ck module list --json should include the supervised stub: {value}"
+    );
+
+    let text_output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
+    assert_exit(&text_output, 0);
+    let text_stdout = text(&text_output.stdout);
+    assert!(text_stdout.contains("help[1]:"), "stdout:\n{text_stdout}");
+    assert!(
+        text_stdout.contains("ck module status <id> --subc <connection-file>"),
+        "stdout:\n{text_stdout}"
+    );
+    assert!(
+        !json_stdout.contains("help["),
+        "JSON output must not gain human footer: {json_stdout}"
     );
 
     module.stop().await.unwrap();
@@ -177,6 +238,111 @@ async fn module_restart_stop_start_json_drive_supervisor() {
         entry.state == "running" && entry.enabled && entry.live
     })
     .await;
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_list_empty_result_has_a_next_step_and_json_has_no_footer() {
+    let server = TestServer::start().await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("(no supervised modules)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("ck module rescan"), "stdout:\n{stdout}");
+
+    let json_output = ck_with_subc(&server.connection_file_path, ["module", "list", "--json"]);
+    let json_stdout = text(&json_output.stdout);
+    let _ = assert_json_success(json_output);
+    assert!(
+        !json_stdout.contains("help["),
+        "JSON output must not gain human footer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_empty_result_has_a_next_step_and_json_has_no_footer() {
+    let server = TestServer::start().await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["routes"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("(no live routes)"), "stdout:\n{stdout}");
+    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+
+    let json_output = ck_with_subc(&server.connection_file_path, ["routes", "--json"]);
+    let json_stdout = text(&json_output.stdout);
+    let _ = assert_json_success(json_output);
+    assert!(
+        !json_stdout.contains("help["),
+        "JSON output must not gain human footer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_module_error_has_a_next_step_and_json_has_no_footer() {
+    let server = TestServer::start().await;
+
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "missing-module"],
+    );
+    assert_exit(&output, 1);
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("module_id 'missing-module'"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("help[1]:"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("ck module list --subc <connection-file>"),
+        "stderr:\n{stderr}"
+    );
+
+    let json_output = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "missing-module", "--json"],
+    );
+    let json_stderr = text(&json_output.stderr);
+    assert_exit(&json_output, 1);
+    assert!(
+        !json_stderr.contains("help["),
+        "JSON error gained footer: {json_stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_empty_result_has_a_next_step_and_json_has_no_footer() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let fixture = serde_json::json!([]);
+    let module = spawn_quota_stub(&server, &supervisor, "insula", &fixture).await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["quota"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("no providers reported"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("ck module status <module-id> --subc <connection-file>"),
+        "stdout:\n{stdout}"
+    );
+
+    let json_output = ck_with_subc(&server.connection_file_path, ["quota", "--json"]);
+    let json_stdout = text(&json_output.stdout);
+    let _ = assert_json_success(json_output);
+    assert!(
+        !json_stdout.contains("help["),
+        "JSON output must not gain human footer"
+    );
 
     module.stop().await.unwrap();
 }
@@ -265,7 +431,10 @@ async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
     let fixture = quota_wire_fixture();
     let module = spawn_quota_stub(&server, &supervisor, module_id, &fixture).await;
 
-    let output = ck_with_subc(&server.connection_file_path, ["quota", "unknown-id"]);
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["quota", "unknown-id", "--verbose"],
+    );
     assert_exit(&output, 1);
     let stderr = text(&output.stderr);
     assert!(
@@ -275,6 +444,8 @@ async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
     assert!(stderr.contains("anthropic"), "stderr:\n{stderr}");
     assert!(stderr.contains("openai"), "stderr:\n{stderr}");
     assert!(stderr.contains("grok"), "stderr:\n{stderr}");
+    assert!(stderr.contains("help[1]:"), "stderr:\n{stderr}");
+    assert!(stderr.contains("ck quota --verbose"), "stderr:\n{stderr}");
 
     module.stop().await.unwrap();
 }
@@ -338,6 +509,23 @@ fn discovery_failure_lists_tried_paths_and_exits_2() {
     ));
     assert!(stderr.contains(&home_connection_file(home.path()).display().to_string()));
     assert!(stderr.contains(&tmp.path().display().to_string()));
+
+    let text_output = ck_command()
+        .args(["module", "list"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HOME", home.path())
+        .env("TMPDIR", tmp.path())
+        .env("TMP", tmp.path())
+        .env("TEMP", tmp.path())
+        .output()
+        .unwrap();
+    assert_exit(&text_output, 2);
+    let text_stderr = text(&text_output.stderr);
+    assert!(text_stderr.contains("help[1]:"), "stderr:\n{text_stderr}");
+    assert!(
+        text_stderr.contains("ck daemon --subc <connection-file>"),
+        "stderr:\n{text_stderr}"
+    );
 }
 
 fn ck_command() -> Command {

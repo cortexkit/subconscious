@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
     StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorRescanResult, TerminalEntry, TerminalHistory,
+    SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
+    TerminalEntry, TerminalHistory,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
@@ -65,6 +66,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_HEALTH,
     ops::SUPERVISOR_STDERR_TAIL,
     ops::SUPERVISOR_TERMINALS,
+    ops::SUPERVISOR_ROUTES,
 ];
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[MODULE_TO_SUBC_OP_CATALOG_UPDATE];
@@ -842,6 +844,9 @@ impl ControlHandler {
                 self.handle_supervisor_health_probe(frame, module_id).await
             }
             ClientControlRequest::SupervisorHealth {} => self.handle_supervisor_health(frame),
+            ClientControlRequest::SupervisorRoutes { module_id } => {
+                self.handle_supervisor_routes(frame, module_id)
+            }
             ClientControlRequest::SupervisorStderrTail {
                 module_id,
                 max_lines,
@@ -1214,6 +1219,7 @@ impl ControlHandler {
                 response_version(&frame),
                 frame.header.corr,
                 &target_module_id,
+                principal.clone(),
                 relay_deadline,
             )
             .await
@@ -1467,6 +1473,49 @@ impl ControlHandler {
             &frame,
             &response,
             "ClientControlResponse::SupervisorTerminals",
+        )?])
+    }
+
+    fn handle_supervisor_routes(
+        &self,
+        frame: Frame,
+        module_id: Option<String>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let modules = self
+            .forwarding
+            .route_census(module_id.as_deref())
+            .map_err(RouterError::Forwarding)?
+            .into_iter()
+            .map(|(module_id, routes)| SupervisorRouteModule {
+                module_id,
+                routes: routes
+                    .into_iter()
+                    .map(|route| SupervisorRoute {
+                        consumer: match route.principal {
+                            Principal::Reserved { module_id } => {
+                                SupervisorRouteConsumer::Reserved { module_id }
+                            }
+                            Principal::Direct | Principal::Unverified => {
+                                SupervisorRouteConsumer::Direct {
+                                    connection_id: route.goodbye_target.connection_id.get(),
+                                }
+                            }
+                        },
+                        age_ms: Instant::now()
+                            .saturating_duration_since(route.bound_at)
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        draining: route.draining,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let response = ClientControlResponse::SupervisorRoutes { modules };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorRoutes",
         )?])
     }
 
@@ -3995,6 +4044,118 @@ mod tests {
             ),
             "the route must actually open, not merely avoid an error"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_routes_serializes_live_draining_bindings_from_the_real_handler() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("fed", "fed-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(101));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+
+        let (direct_ctx, mut direct_rx) = route_ctx(ConnectionId::new(102));
+        let direct_handler = handler.clone();
+        let direct_open = tokio::spawn(async move {
+            direct_handler
+                .handle_control_frame(
+                    &direct_ctx,
+                    route_open_frame(2, "target", unique_project_root("route-census-direct")),
+                )
+                .await
+                .unwrap()
+        });
+        let direct_bind = tokio::time::timeout(Duration::from_secs(5), target_rx.recv())
+            .await
+            .expect("no direct route.bind within 5s")
+            .expect("target control channel closed before direct route.bind");
+        handler
+            .handle_control_frame(&target_ctx, route_bind_ack(direct_bind.header.corr))
+            .await
+            .unwrap();
+        assert!(direct_open.await.unwrap().is_empty());
+        let _ = direct_rx.recv().await.unwrap();
+
+        let (reserved_ctx, mut reserved_rx) = route_ctx(ConnectionId::new(103));
+        let reserved_handler = handler.clone();
+        let reserved_open = tokio::spawn(async move {
+            reserved_handler
+                .handle_control_frame(
+                    &reserved_ctx,
+                    route_open_frame_with_admission_facts(
+                        3,
+                        "target",
+                        Some(ConsumerIdentity {
+                            module_id: "fed".to_string(),
+                            launch_nonce: "fed-nonce".to_string(),
+                        }),
+                        None,
+                    ),
+                )
+                .await
+                .unwrap()
+        });
+        let reserved_bind = tokio::time::timeout(Duration::from_secs(5), target_rx.recv())
+            .await
+            .expect("no reserved route.bind within 5s")
+            .expect("target control channel closed before reserved route.bind");
+        handler
+            .handle_control_frame(&target_ctx, route_bind_ack(reserved_bind.header.corr))
+            .await
+            .unwrap();
+        assert!(reserved_open.await.unwrap().is_empty());
+        let _ = reserved_rx.recv().await.unwrap();
+
+        forwarding.begin_module_drain("target").unwrap();
+        let (census_ctx, _census_rx) = route_ctx(ConnectionId::new(104));
+        let census_body = serde_json::to_vec(&ClientControlRequest::SupervisorRoutes {
+            module_id: Some("target".to_string()),
+        })
+        .unwrap();
+        let census_frame =
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 4, census_body).unwrap();
+        let response = handler
+            .handle_control_frame(&census_ctx, census_frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let actual: Value = serde_json::from_slice(&response.body).unwrap();
+        let decoded: ClientControlResponse = serde_json::from_value(actual.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            ClientControlResponse::SupervisorRoutes { .. }
+        ));
+        let routes = actual["modules"][0]["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route["draining"] == true));
+        assert!(routes.iter().any(|route| {
+            route["consumer"] == serde_json::json!({"kind": "direct", "connection_id": 102})
+        }));
+        assert!(routes.iter().any(|route| {
+            route["consumer"] == serde_json::json!({"kind": "reserved", "module_id": "fed"})
+        }));
+
+        let golden_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../subc-control/tests/golden/client_control_response_supervisor_routes.json");
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(
+                &golden_path,
+                format!("{}\n", serde_json::to_string_pretty(&actual).unwrap()),
+            )
+            .unwrap();
+        }
+        let expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(golden_path).unwrap()).unwrap();
+        assert_eq!(actual, expected);
     }
 
     /// Read the vendored fed corpus rather than hand-building a package.

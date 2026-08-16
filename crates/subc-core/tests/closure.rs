@@ -82,6 +82,8 @@ async fn foreseeable_modules_close_over_existing_control_primitives() {
     let mut observed_frame_types = Vec::new();
 
     assert_server_describe_uses_only_thin_core_ops(&server, &mut used_channel0_ops).await;
+    assert_supervisor_routes_reads_the_empty_forwarding_table(&server, &mut used_channel0_ops)
+        .await;
     let embedding_payload = embedding_payload();
 
     modules.push(
@@ -363,6 +365,27 @@ async fn assert_server_describe_uses_only_thin_core_ops(
             );
         }
         other => panic!("unexpected server.describe response: {other:?}"),
+    }
+}
+
+async fn assert_supervisor_routes_reads_the_empty_forwarding_table(
+    server: &TestServer,
+    used_channel0_ops: &mut BTreeSet<&'static str>,
+) {
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let response = control_round_trip(
+        &mut client,
+        11,
+        ClientControlRequest::SupervisorRoutes { module_id: None },
+        ops::SUPERVISOR_ROUTES,
+        used_channel0_ops,
+    )
+    .await;
+    match response {
+        ClientControlResponse::SupervisorRoutes { modules } => assert!(modules.is_empty()),
+        other => panic!("unexpected supervisor.routes response: {other:?}"),
     }
 }
 
@@ -701,6 +724,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_HEALTH_PROBE,
         ops::SUPERVISOR_HEALTH,
         ops::SUPERVISOR_STDERR_TAIL,
+        ops::SUPERVISOR_ROUTES,
     ])
 }
 

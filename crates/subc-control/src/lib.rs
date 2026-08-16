@@ -46,6 +46,7 @@ pub mod ops {
     pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
     pub const SUPERVISOR_HEALTH: &str = "supervisor.health";
     pub const SUPERVISOR_STDERR_TAIL: &str = "supervisor.stderr_tail";
+    pub const SUPERVISOR_ROUTES: &str = "supervisor.routes";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -135,6 +136,23 @@ pub enum ClientControlRequest {
     SupervisorHealthProbe { module_id: String },
     #[serde(rename = "supervisor.health")]
     SupervisorHealth {},
+    /// Enumerate the routes currently served by one supervised module, or every
+    /// module when omitted.
+    ///
+    /// This privileged census is control-plane-only. It is deliberately not an
+    /// MCP facade or agent-tool operation: callers holding the daemon control
+    /// connection may inspect live route ownership, while agent-facing modules
+    /// must not be able to address that surface at all.
+    ///
+    /// The daemon answers from its forwarding table under a read lock and never
+    /// consults a module. That makes the read safe during a drain, when a module
+    /// cannot be queried without recreating the hang/restart hazard that route
+    /// status reads avoid.
+    #[serde(rename = "supervisor.routes")]
+    SupervisorRoutes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module_id: Option<String>,
+    },
     /// Retained stderr for one module.
     ///
     /// A separate op rather than a field on `supervisor.list`: the tail is
@@ -224,6 +242,8 @@ pub enum ClientControlResponse {
         generation: u64,
         modules: Vec<SupervisorHealthEntry>,
     },
+    #[serde(rename = "supervisor.routes")]
+    SupervisorRoutes { modules: Vec<SupervisorRouteModule> },
     #[serde(rename = "supervisor.stderr_tail")]
     SupervisorStderrTail {
         module_id: String,
@@ -247,6 +267,36 @@ pub struct StderrTail {
     /// Zero is skipped so the common complete-tail case stays compact.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub dropped_lines: u64,
+}
+
+/// Live routes served by one module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorRouteModule {
+    pub module_id: String,
+    pub routes: Vec<SupervisorRoute>,
+}
+
+/// One live consumer route in a [`SupervisorRouteModule`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorRoute {
+    pub consumer: SupervisorRouteConsumer,
+    /// Milliseconds since the daemon bound this route.
+    pub age_ms: u64,
+    /// True once the endpoint began draining. Draining routes remain visible so
+    /// a census does not misreport an already-closing route as live.
+    pub draining: bool,
+}
+
+/// The identity tier the daemon can honestly report for a route consumer.
+///
+/// A caller that proved a live daemon-issued launch nonce is named `reserved`.
+/// A direct key-holder has no such attestation, so it is reported as `direct`
+/// with its connection counter instead of an invented module name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SupervisorRouteConsumer {
+    Reserved { module_id: String },
+    Direct { connection_id: u64 },
 }
 
 /// Whether stderr is being captured for a module, and if not, why not.
@@ -553,5 +603,16 @@ mod tests {
         assert_eq!(consumer_identity, None);
         assert_eq!(consumer_capabilities, None);
         assert_eq!(admission_facts, None);
+    }
+
+    #[test]
+    fn supervisor_routes_is_a_control_plane_request() {
+        let body = serde_json::json!({
+            "op": "supervisor.routes",
+            "module_id": "aft"
+        });
+
+        let request: ClientControlRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), body);
     }
 }

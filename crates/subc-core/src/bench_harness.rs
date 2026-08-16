@@ -7,7 +7,7 @@ use subc_protocol::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
-    Flags, FrameType, Priority, PROTOCOL_VERSION,
+    Flags, FrameType, Principal, Priority, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -177,6 +177,7 @@ pub async fn build_bench_forwarding_setup(
                     PROTOCOL_VERSION,
                     route_index as u64 + 1,
                     &module_id,
+                    Principal::Direct,
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                 )
                 .await

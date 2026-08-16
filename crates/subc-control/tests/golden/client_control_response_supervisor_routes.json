@@ -1,0 +1,26 @@
+{
+  "modules": [
+    {
+      "module_id": "target",
+      "routes": [
+        {
+          "age_ms": 0,
+          "consumer": {
+            "connection_id": 102,
+            "kind": "direct"
+          },
+          "draining": true
+        },
+        {
+          "age_ms": 0,
+          "consumer": {
+            "kind": "reserved",
+            "module_id": "fed"
+          },
+          "draining": true
+        }
+      ]
+    }
+  ],
+  "op": "supervisor.routes"
+}

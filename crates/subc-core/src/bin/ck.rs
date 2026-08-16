@@ -41,7 +41,7 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, restart, stop, start, rescan\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, restart, stop, start, rescan\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -108,6 +108,8 @@ fn discover_external_domains() -> Vec<String> {
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
   ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
 
+const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
+
 const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
 const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with FULL metrics — bypasses\n                       the supervisor cache and its size truncation";
@@ -163,6 +165,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Module(ModuleCommand::Start { module_id }) => {
             module_set_enabled(&mut client, &module_id, true, args.json).await
         }
+        Command::Routes { module_id } => {
+            supervisor_routes(&mut client, module_id.as_deref(), args.json).await
+        }
         Command::Health => health(&mut client, args.json).await,
         Command::HealthDetail { module_id } => {
             health_detail(&mut client, &module_id, args.json).await
@@ -200,6 +205,9 @@ struct CkArgs {
 
 enum Command {
     Module(ModuleCommand),
+    Routes {
+        module_id: Option<String>,
+    },
     Health,
     HealthDetail {
         module_id: String,
@@ -666,6 +674,76 @@ async fn module_set_enabled(
         .await?;
     let verb = if enabled { "start" } else { "stop" };
     print_ack_with_state(client, module_id, ack, verb, json_output).await
+}
+
+async fn supervisor_routes(
+    client: &mut CkClient,
+    module_id: Option<&str>,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let response = client
+        .rpc_value(ClientControlRequest::SupervisorRoutes {
+            module_id: module_id.map(str::to_owned),
+        })
+        .await?;
+    if json_output {
+        print_json(&response)?;
+        return Ok(());
+    }
+
+    let mut rows = Vec::new();
+    for module in modules_array(&response) {
+        let module_id = display_field(module, "module_id");
+        for route in module
+            .get("routes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let consumer = match route.get("consumer").and_then(Value::as_object) {
+                Some(consumer)
+                    if consumer.get("kind").and_then(Value::as_str) == Some("reserved") =>
+                {
+                    consumer
+                        .get("module_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("reserved")
+                        .to_string()
+                }
+                Some(consumer) => format!(
+                    "direct ({})",
+                    consumer
+                        .get("connection_id")
+                        .and_then(Value::as_u64)
+                        .map(|id| format!("connection {id}"))
+                        .unwrap_or_else(|| "connection unavailable".to_string())
+                ),
+                None => "direct (connection unavailable)".to_string(),
+            };
+            let age = route
+                .get("age_ms")
+                .and_then(Value::as_u64)
+                .map(|age| format_duration(Duration::from_millis(age)))
+                .unwrap_or_else(|| "?".to_string());
+            let state = if route
+                .get("draining")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "draining"
+            } else {
+                "live"
+            };
+            rows.push(vec![module_id.clone(), consumer, age, state.to_string()]);
+        }
+    }
+
+    if rows.is_empty() {
+        println!("(no live routes)");
+    } else {
+        print_table(&["MODULE", "CONSUMER", "AGE", "STATE"], rows);
+    }
+    Ok(())
 }
 
 async fn print_ack_with_state(
@@ -2672,7 +2750,10 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
 }
 
 fn is_builtin_domain(domain: &str) -> bool {
-    matches!(domain, "module" | "health" | "daemon" | "quota" | "help")
+    matches!(
+        domain,
+        "module" | "routes" | "health" | "daemon" | "quota" | "help"
+    )
 }
 
 fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
@@ -2683,6 +2764,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             let topic = tail.first().map(|t| t.to_string_lossy());
             Ok(Command::Help(match topic.as_deref() {
                 Some("module") => MODULE_HELP.into(),
+                Some("routes") => ROUTES_HELP.into(),
                 Some("quota") => QUOTA_HELP.into(),
                 Some("health") => HEALTH_HELP.into(),
                 Some("daemon") => DAEMON_HELP.into(),
@@ -2746,6 +2828,15 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             };
             Ok(Command::Module(command))
         }
+        "routes" => match tail {
+            [] => Ok(Command::Routes { module_id: None }),
+            [module_id] if module_id != "-h" && module_id != "--help" && module_id != "help" => {
+                Ok(Command::Routes {
+                    module_id: Some(module_id.to_string_lossy().into_owned()),
+                })
+            }
+            _ => Ok(Command::Help(ROUTES_HELP.into())),
+        },
         "health" => match tail.first() {
             None => Ok(Command::Health),
             Some(argument) => {
@@ -3572,5 +3663,19 @@ mod tests {
             } if provider_id == "anthropic"
         ));
         assert!(QUOTA_HELP.contains("--verbose"));
+    }
+
+    #[test]
+    fn routes_command_accepts_an_optional_module_id() {
+        let all = parse_command("routes", &[]).unwrap();
+        assert!(matches!(all, Command::Routes { module_id: None }));
+
+        let one = parse_command("routes", &[OsString::from("aft")]).unwrap();
+        assert!(matches!(
+            one,
+            Command::Routes {
+                module_id: Some(module_id)
+            } if module_id == "aft"
+        ));
     }
 }

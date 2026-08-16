@@ -11,7 +11,8 @@ use std::{
 
 use subc_control::ClientControlResponse;
 use subc_protocol::{
-    manifest::Concurrency, session::ModuleControlResponse, ErrorBody, Flags, FrameType, Priority,
+    manifest::Concurrency, session::ModuleControlResponse, ErrorBody, Flags, FrameType, Principal,
+    Priority,
 };
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::Instant;
@@ -67,6 +68,8 @@ pub(crate) struct RouteBinding {
     pub module_negotiated_ver: u8,
     pub module_channel: u16,
     pub module_epoch: u32,
+    pub principal: Principal,
+    pub bound_at: Instant,
     pub flow: Arc<ChannelFlow>,
 }
 
@@ -132,6 +135,19 @@ impl GoodbyeTarget {
     pub(crate) fn close_on_delivery_failure(&self) -> bool {
         matches!(self.kind, GoodbyeTargetKind::Client)
     }
+}
+
+/// One route currently served by a module endpoint.
+///
+/// `goodbye_target` is deliberately retained alongside the census projection so
+/// a draining caller can address exactly the same route set that this read
+/// reports, without a second forwarding-table pass.
+#[derive(Debug, Clone)]
+pub(crate) struct EndpointRoute {
+    pub goodbye_target: GoodbyeTarget,
+    pub principal: Principal,
+    pub bound_at: Instant,
+    pub draining: bool,
 }
 
 #[derive(Debug)]
@@ -228,6 +244,7 @@ struct PendingRouteBindRelayEntry {
     client_negotiated_ver: u8,
     client_permit: mpsc::OwnedPermit<Frame>,
     route_open_frame: Frame,
+    principal: Principal,
     deadline: Instant,
     relay_enqueued: bool,
     sender: oneshot::Sender<RouteBindRelayOutcome>,
@@ -400,6 +417,7 @@ impl ForwardingTable {
         Ok(endpoint)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn begin_route_bind_relay_for(
         &self,
         client_connection_id: ConnectionId,
@@ -407,6 +425,7 @@ impl ForwardingTable {
         client_negotiated_ver: u8,
         client_corr: u64,
         module_id: &str,
+        principal: Principal,
         deadline: Instant,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         // Reserve egress capacity before taking the forwarding lock. The permit is
@@ -425,6 +444,7 @@ impl ForwardingTable {
             client_negotiated_ver,
             client_corr,
             module_id,
+            principal,
             deadline,
             client_permit,
         )
@@ -450,6 +470,7 @@ impl ForwardingTable {
             subc_protocol::PROTOCOL_VERSION,
             client_corr,
             module_id,
+            Principal::Direct,
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
         )
@@ -555,6 +576,7 @@ impl ForwardingTable {
         client_negotiated_ver: u8,
         client_corr: u64,
         expected_module_id: &str,
+        principal: Principal,
         deadline: Instant,
         client_permit: mpsc::OwnedPermit<Frame>,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
@@ -639,6 +661,7 @@ impl ForwardingTable {
                 client_negotiated_ver,
                 client_permit,
                 route_open_frame,
+                principal,
                 deadline,
                 relay_enqueued: false,
                 sender,
@@ -1317,6 +1340,39 @@ impl ForwardingTable {
         Ok(released)
     }
 
+    /// Enumerate one endpoint's current routes without contacting the module.
+    ///
+    /// The read lock makes this safe while the endpoint drains: the returned
+    /// `draining` marker describes the same table state that owns the route,
+    /// rather than inferring liveness from a module that may be stopping.
+    #[allow(dead_code)] // Reserved for route.closing, which needs these exact goodbye targets.
+    pub(crate) fn endpoint_routes(
+        &self,
+        endpoint: ModuleEndpointId,
+    ) -> Result<Vec<EndpointRoute>, ForwardingError> {
+        let inner = self.read_inner()?;
+        Ok(endpoint_routes_locked(&inner, endpoint))
+    }
+
+    /// Snapshot all live endpoint route sets under one forwarding-table read lock.
+    pub(crate) fn route_census(
+        &self,
+        module_id: Option<&str>,
+    ) -> Result<Vec<(String, Vec<EndpointRoute>)>, ForwardingError> {
+        let inner = self.read_inner()?;
+        let mut endpoints = inner
+            .modules_by_id
+            .iter()
+            .filter(|(id, _)| module_id.is_none_or(|requested| requested == id.as_str()))
+            .map(|(id, module)| (id.clone(), module.endpoint))
+            .collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(endpoints
+            .into_iter()
+            .map(|(id, endpoint)| (id, endpoint_routes_locked(&inner, endpoint)))
+            .collect())
+    }
+
     /// True if this connection already owns committed or reserved CLIENT routes.
     /// A module registers (HELLO) before serving and never opens client routes, so
     /// a connection that has client routes must not also become a module endpoint
@@ -1565,6 +1621,39 @@ fn next_channel(channel: u16) -> u16 {
     }
 }
 
+fn endpoint_routes_locked(
+    inner: &ForwardingInner,
+    endpoint: ModuleEndpointId,
+) -> Vec<EndpointRoute> {
+    let draining = inner.draining_endpoints.contains(&endpoint);
+    let mut routes = inner
+        .module_to_client
+        .iter()
+        .filter(|(module_key, _)| module_key.endpoint == endpoint)
+        .map(|(_, route)| EndpointRoute {
+            goodbye_target: GoodbyeTarget {
+                connection_id: route.client_connection_id,
+                sink: route.client_sink.clone(),
+                negotiated_ver: route.client_negotiated_ver,
+                channel: route.client_channel,
+                epoch: route.client_epoch,
+                kind: GoodbyeTargetKind::Client,
+            },
+            principal: route.principal.clone(),
+            bound_at: route.bound_at,
+            draining,
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by_key(|route| {
+        (
+            route.goodbye_target.connection_id.get(),
+            route.goodbye_target.channel,
+            route.goodbye_target.epoch,
+        )
+    });
+    routes
+}
+
 fn release_reserved_route_locked(
     inner: &mut ForwardingInner,
     client_key: ClientRouteKey,
@@ -1692,6 +1781,8 @@ fn commit_route_locked(
         module_negotiated_ver: module.negotiated_ver,
         module_channel: reservation.module_key.channel,
         module_epoch: reservation.module_epoch,
+        principal: pending.principal,
+        bound_at: Instant::now(),
         flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
     });
     inner
@@ -2256,6 +2347,33 @@ mod tests {
         forwarding
             .begin_route_bind_relay_for_test(client_connection, client_sink, corr, module_id)
             .unwrap()
+    }
+
+    #[test]
+    fn endpoint_routes_keep_goodbye_targets_and_mark_draining_routes() {
+        let (forwarding, module_connection, endpoint, client, sink, _client_rx) =
+            route_fixture("census");
+        let pending = begin_test_route(&forwarding, client, sink, 1, "census");
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+
+        let routes = forwarding.endpoint_routes(endpoint).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0].principal, Principal::Direct));
+        assert_eq!(routes[0].goodbye_target.connection_id, client);
+        assert_eq!(routes[0].goodbye_target.channel, pending.client_channel);
+        assert_eq!(routes[0].goodbye_target.epoch, pending.client_epoch);
+        assert!(!routes[0].draining);
+
+        forwarding.begin_module_drain("census").unwrap();
+        let draining_routes = forwarding.endpoint_routes(endpoint).unwrap();
+        assert_eq!(draining_routes.len(), 1);
+        assert!(draining_routes[0].draining);
     }
 
     #[test]

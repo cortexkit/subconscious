@@ -1,0 +1,12 @@
+[package]
+name = "agent-token-vectors"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Golden conformance vectors for prefrontal-signed agent assertion tokens."
+
+[dependencies]
+ed25519-dalek = "2"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

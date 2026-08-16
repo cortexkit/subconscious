@@ -33,11 +33,13 @@ most of it; this is a composition change, not new data. Their detail worth copyi
 home view names the executable path (`bin: ~/.local/bin/ck`) — self-identifying output kills the
 stale-PATH-copy class we have hit twice.
 
-**(9) `help[]` next-step footers.** `ck health`'s footer (`ck health <id> — full metrics`) is
-already this pattern; the borrow is doing it consistently: every `ck` list/table output ends with
-1-2 concrete next-step command templates with `<placeholders>` (their pin: carry disambiguating
-flags forward, never guess runtime values). Cheap, and it eliminates the agent's
-tool-discovery turn — which their trajectory analysis shows is where MCP conditions bleed cost.
+**(9) `help[]` footers — AMENDED after AFT's production correction.** AFT measured blanket
+footers as a real token tax in their June cost arc and trimmed them; what survived their
+measurement is ERROR-PATH steering (nearest-miss candidates, unknown-id redirection, zero-result
+escalation) — which is where the tool-discovery bleed actually lives in axi's own trajectory data.
+The `ck` borrow narrows accordingly: footers on error and empty arms plus the two navigational
+surfaces (bare `ck`, `module list`), NOT on routine success outputs — blanket success-path footers
+re-inflate a measured cut.
 
 **(3) Truncation hints.** Where we cap (stderr tail, transcript pages), append the size fact:
 `(truncated, N lines total — use -n <count>)`. We cap correctly; we do not consistently SAY we
@@ -51,7 +53,9 @@ parse, familiar raw formats over denser abstractions — TOON is a denser abstra
 caveat concedes format sensitivity is single-model-evaluated. (b) Their runner-up (dev-browser,
 plain output) was within 5% on cost — the wins came mostly from combined ops and aggregates, not
 the serialization. (c) Our biggest token surfaces (AFT tool outputs, MC transforms) already have
-owners optimizing them with production trace evidence rather than benchmark priors.
+owners optimizing them with production trace evidence rather than benchmark priors — and AFT's
+evidence runs the OTHER way: 84k-call telemetry showed weak-model format brittleness at ~100x the
+auto rate on a format-steering parameter, which they removed in August.
 REVERSAL CONDITION: a multi-model measurement on OUR traces showing >15% end-to-end savings on a
 top-cost surface.
 

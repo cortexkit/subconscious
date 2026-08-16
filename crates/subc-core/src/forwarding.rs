@@ -1346,7 +1346,6 @@ impl ForwardingTable {
     /// The read lock makes this safe while the endpoint drains: the returned
     /// `draining` marker describes the same table state that owns the route,
     /// rather than inferring liveness from a module that may be stopping.
-    #[allow(dead_code)] // Reserved for route.closing, which needs these exact goodbye targets.
     pub(crate) fn endpoint_routes(
         &self,
         endpoint: ModuleEndpointId,

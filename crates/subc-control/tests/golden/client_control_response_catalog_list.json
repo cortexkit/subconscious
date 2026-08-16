@@ -85,6 +85,8 @@
     "catalog.list",
     "route.open",
     "route.poll",
+    "route.closing",
+    "route.closed",
     "supervisor.list",
     "supervisor.restart",
     "supervisor.reload",

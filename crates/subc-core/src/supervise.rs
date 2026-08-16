@@ -9,7 +9,9 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_control::{SupervisorHealthStatus, TerminalDisposition};
+use subc_control::{
+    ClientControlPush, RouteCloseReason, SupervisorHealthStatus, TerminalDisposition,
+};
 use subc_protocol::{
     session::{HealthReport, HealthStatus, ModuleControlRequest, MODULE_CONTROL_OP_HEALTH_CHECK},
     Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
@@ -1947,7 +1949,7 @@ async fn health_restart_child(
             runtime,
             snapshot,
             Some(false),
-            "health-disable",
+            RouteCloseReason::Disable,
         )
         .await?;
         drain_optional_child(
@@ -1980,8 +1982,14 @@ async fn health_restart_child(
         "health-triggered module restart"
     );
 
-    begin_forwarding_drain_if_configured(spec, runtime, snapshot, Some(true), "health-restart")
-        .await?;
+    begin_forwarding_drain_if_configured(
+        spec,
+        runtime,
+        snapshot,
+        Some(true),
+        RouteCloseReason::Restart,
+    )
+    .await?;
     drain_optional_child(
         &spec.module_id,
         registry,
@@ -2286,7 +2294,7 @@ async fn handle_supervisor_command(
                     runtime,
                     snapshot,
                     None,
-                    "supervisor retire",
+                    RouteCloseReason::Disable,
                 )
                 .await?;
                 drain_optional_child(
@@ -2365,7 +2373,8 @@ async fn restart_child(
             module_id: spec.module_id.clone(),
         });
     }
-    begin_forwarding_drain_if_configured(spec, runtime, snapshot, None, "restart").await?;
+    begin_forwarding_drain_if_configured(spec, runtime, snapshot, None, RouteCloseReason::Restart)
+        .await?;
 
     if child.is_some() {
         drain_optional_child(
@@ -2412,7 +2421,14 @@ async fn reload_child(
             module_id: spec.module_id.clone(),
         });
     }
-    begin_forwarding_drain(spec, runtime, snapshot, Some(true), "reload").await?;
+    begin_forwarding_drain(
+        spec,
+        runtime,
+        snapshot,
+        Some(true),
+        RouteCloseReason::Reload,
+    )
+    .await?;
 
     if child.is_some() {
         drain_optional_child(
@@ -2584,8 +2600,14 @@ async fn set_child_enabled(
         debug!(module_id = %spec.module_id, "supervised module enabled");
         Ok(true)
     } else {
-        begin_forwarding_drain_if_configured(spec, runtime, snapshot, Some(false), "disable")
-            .await?;
+        begin_forwarding_drain_if_configured(
+            spec,
+            runtime,
+            snapshot,
+            Some(false),
+            RouteCloseReason::Disable,
+        )
+        .await?;
         drain_optional_child(
             &spec.module_id,
             registry,
@@ -3000,7 +3022,7 @@ async fn begin_forwarding_drain(
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
-    operation: &'static str,
+    reason: RouteCloseReason,
 ) -> Result<(), SuperviseError> {
     let Some(forwarding) = runtime.forwarding.as_ref() else {
         return Err(SuperviseError::ReloadUnavailable {
@@ -3009,7 +3031,7 @@ async fn begin_forwarding_drain(
         });
     };
 
-    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, operation).await
+    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, reason).await
 }
 
 async fn begin_forwarding_drain_if_configured(
@@ -3017,13 +3039,13 @@ async fn begin_forwarding_drain_if_configured(
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
-    operation: &'static str,
+    reason: RouteCloseReason,
 ) -> Result<(), SuperviseError> {
     let Some(forwarding) = runtime.forwarding.as_ref() else {
         return Ok(());
     };
 
-    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, operation).await
+    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, reason).await
 }
 
 async fn begin_forwarding_drain_with(
@@ -3032,7 +3054,7 @@ async fn begin_forwarding_drain_with(
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
-    operation: &'static str,
+    reason: RouteCloseReason,
 ) -> Result<(), SuperviseError> {
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
@@ -3047,16 +3069,39 @@ async fn begin_forwarding_drain_with(
     })?;
 
     if let Some(target) = drain_target.as_ref() {
+        let routes = forwarding
+            .endpoint_routes(target.endpoint)
+            .map_err(SuperviseError::Forwarding)?;
+        crate::control::send_route_control_pushes(
+            forwarding,
+            routes.clone(),
+            ClientControlPush::RouteClosing {
+                module_id: spec.module_id.clone(),
+                reason,
+            },
+        );
         send_route_goodbyes(forwarding, target.abandoned_bindings.clone());
-        if !wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
-            .await?
-        {
+        let drained =
+            wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
+                .await?;
+        if !drained {
             warn!(
                 module_id = %spec.module_id,
                 waited = ?runtime.drain_timeout,
-                "{operation} drain timed out before request quiescence; forcing teardown"
+                ?reason,
+                "route drain timed out before request quiescence; forcing teardown"
             );
         }
+        crate::control::send_route_control_pushes(
+            forwarding,
+            routes,
+            ClientControlPush::RouteClosed {
+                module_id: spec.module_id.clone(),
+                reason,
+                drained,
+                abandoned: target.abandoned_bindings.len() as u32,
+            },
+        );
 
         let released_routes = forwarding
             .release_module_endpoint_routes(target.endpoint)

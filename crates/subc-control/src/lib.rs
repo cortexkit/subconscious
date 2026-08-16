@@ -38,6 +38,8 @@ pub mod ops {
     pub const CATALOG_LIST: &str = "catalog.list";
     pub const ROUTE_OPEN: &str = "route.open";
     pub const ROUTE_POLL: &str = "route.poll";
+    pub const ROUTE_CLOSING: &str = "route.closing";
+    pub const ROUTE_CLOSED: &str = "route.closed";
     pub const SUPERVISOR_LIST: &str = "supervisor.list";
     pub const SUPERVISOR_RESTART: &str = "supervisor.restart";
     pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
@@ -271,6 +273,40 @@ pub enum ClientControlResponse {
         #[serde(flatten)]
         terminals: TerminalHistory,
     },
+}
+
+/// Daemon-originated channel-0 control push body.
+///
+/// A module cannot originate these pushes: subc creates them from its own
+/// forwarding state and enqueues them directly to client connection sinks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op")]
+pub enum ClientControlPush {
+    #[serde(rename = "route.closing")]
+    RouteClosing {
+        module_id: String,
+        reason: RouteCloseReason,
+    },
+    #[serde(rename = "route.closed")]
+    RouteClosed {
+        module_id: String,
+        reason: RouteCloseReason,
+        /// The exact result of the forwarding-quiescence wait for live routes.
+        drained: bool,
+        /// Pending route.bind relays forced down before that wait. They are not
+        /// covered by `drained`, even when live routes quiesced.
+        abandoned: u32,
+    },
+}
+
+/// Why subc is closing a module's client routes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteCloseReason {
+    Reload,
+    Restart,
+    Disable,
+    Crash,
 }
 
 /// A module's retained stderr, oldest entry first.

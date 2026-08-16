@@ -112,6 +112,16 @@ pub enum ClientControlResponse {
     #[serde(rename = "supervisor.rescan")] SupervisorRescan { #[serde(flatten)] result: SupervisorRescanResult },
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum ClientControlPush {
+    #[serde(rename = "route.closing")] RouteClosing { module_id: String, reason: RouteCloseReason },
+    #[serde(rename = "route.closed")]  RouteClosed { module_id: String, reason: RouteCloseReason,
+                                                       drained: bool, abandoned: u32 },
+}
+
+#[serde(rename_all="snake_case")] pub enum RouteCloseReason { Reload, Restart, Disable, Crash }
+
 #[serde(rename_all="snake_case")] pub enum PollKind { Status, Liveness }
 pub struct ConsumerIdentity { pub module_id: String, pub launch_nonce: String }
 pub struct CatalogEntry { pub module_id: String, pub roles: Vec<ProviderRole>, pub control_ops: Vec<String> }
@@ -122,6 +132,8 @@ pub struct SupervisorRescanResult { pub added: Vec<String>, pub removed: Vec<Str
 Notes:
 - `catalog.list` SUBSUMES `manifest_list`; returns modules + roles + per-module control ops; client filters by plane/role itself (subc owns no role→plane mapping). The `generation` counter lets a future `catalog.changed` push reconcile missed events with no reshape.
 - No client HELLO in v1 — `server.describe` is the client's discovery handshake. Client capability negotiation is discovery-only; `op_not_allowed` enforcement applies to MODULE ops in v1.
+- `route.closing { module_id, reason }` is enqueued before a planned drain starts. `reason` is `reload`, `restart`, or `disable`; it makes no completion claim.
+- `route.closed { module_id, reason, drained, abandoned }` is enqueued after the forwarding-quiescence wait and before the released-route GOODBYEs. `drained` is the exact boolean returned by that wait, not a later route-state inference. `abandoned` counts pending `route.bind` relays forced down before the wait; they are never covered by `drained`.
 
 ## 5. Module ↔ subc wire (`subc-protocol`) — the AFT co-sign surface
 ```rust
@@ -167,10 +179,12 @@ pub enum ModuleControlRequest {
 - **Principal extension:** `route.open.consumer_identity` is optional. When absent, subc stamps `RouteBind.principal = {"kind":"direct"}`. When present, subc verifies `module_id` + `launch_nonce` against the supervisor's current spawn-nonce state and stamps `{"kind":"reserved","module_id":...}` only on a match. Unknown module ids, empty nonces, and mismatches reject `route.open` with `bad_consumer_identity`; subc never downgrades a failed reserved claim to direct. `{"kind":"unverified"}` is reserved vocabulary and is not emitted today.
 - **subc does NO `RouteStatus` fan-out** (AFT pin #5). When a module has N routes open for one project, the MODULE emits `route.status` per `route_channel` itself; subc only caches per route_channel (it never replicates one status across routes).
 - v1 ships AFT as the single registered tool-provider; the registry is exercised in tests against a SECOND stub provider so multi-provider is proven, not hypothetical.
-- **RESERVED: the subc→client Push direction.** v1 defines NO `ClientControlPush` enum, but the direction is reserved: **clients MUST ignore unrecognized channel-0 Push ops (never error)**. This makes `route.*`/`catalog.*` client pushes (e.g. `catalog.changed{generation}`) additive-later with no re-bump. **Route death is already expressed by GOODBYE:** on module crash/disable, subc emits a route `GOODBYE` to each affected client AND tears down its own forwarding state (this BEHAVIOR is required in v1; the new push family is not).
+- **Daemon-originated-only channel-0 pushes.** `ClientControlPush` is emitted only by subc directly to client connection sinks. Modules have no module→client push relay and cannot express this enum on their control channel, so this direction cannot be forged through a module. **Clients MUST ignore unrecognized channel-0 Push ops (never error)**; this keeps future pushes additive.
+- **Route lifecycle pushes are ephemeral.** `route.closing` and `route.closed` are emitted from teardown state and retained nowhere; a client that misses one is in the same position as before this family existed. A crash has no drain: subc emits `route.closed { reason: crash, drained: false, abandoned: 0 }` with no preceding `route.closing`. That asymmetry is normative: a `route.closed` without `route.closing` means nobody planned the closure.
+- **Enqueue-order is the ONLY claim.** `FrameSink::send` enqueues; it does not complete the write. So “pushed before the GOODBYE” can only ever mean “enqueued before”.
 
 ## 7. Thin-core ops table
-**subc UNDERSTANDS (closed set):** `hello`/`hello_ack`; `PING`/`PONG`/`GOODBYE`/`CANCEL` (frames); `server.describe`; `catalog.list`; `route.open`→`route.bind`; `route.poll`(status|liveness); `supervisor.*`; (future) `config.*` as RAW tier get/put/changed transport ONLY; module `route.status` push (opaque string, cached verbatim). (`lease.*` retired 2026-08-14 with `scheduler.*`: cross-module single-writer arbitration ships at the store layer via `cortexkit-lease` — advisory lock + persisted epoch CAS per store — so a daemon lease op family would duplicate an invariant the storage substrate already enforces.)
+**subc UNDERSTANDS (closed set):** `hello`/`hello_ack`; `PING`/`PONG`/`GOODBYE`/`CANCEL` (frames); `server.describe`; `catalog.list`; `route.open`→`route.bind`; `route.poll`(status|liveness); daemon `route.closing`/`route.closed` pushes; `supervisor.*`; (future) `config.*` as RAW tier get/put/changed transport ONLY; module `route.status` push (opaque string, cached verbatim). (`lease.*` retired 2026-08-14 with `scheduler.*`: cross-module single-writer arbitration ships at the store layer via `cortexkit-lease` — advisory lock + persisted epoch CAS per store — so a daemon lease op family would duplicate an invariant the storage substrate already enforces.)
 
 **`route.poll` is answered LOCALLY ONLY — NEVER forwarded to the module (AFT pin #1, load-bearing):** subc caches the latest `route.status` push per `route_channel` verbatim and answers `route.poll{kind:status}` from that cache; `route.poll{kind:liveness}` is answered from subc's own supervision state. **A `route.poll` MUST produce ZERO frames to the module** — synchronous forwarding of a poll to the module is forbidden. (This is why the module PUSHes `route.status`: to stay off the synchronous poll path. AFT issue #117 was a passive status poll that hit the bridge mid-scan and tripped a hang-restart; this rule prevents that class by construction.)
 **OPAQUE-FORWARDED on route channels (open set, subc never parses):** all MCP/tool-call semantics; `llm.complete` + selection objectives; management operation BODIES (`memory.*`, dashboard reads — subc resolves the provider, body opaque); `bus.subscribe`/`publish`/`invite`/DM/fan-out; embedding ops + vector streams; federation/WAN payloads; generic-router policy; pipeline transforms.
@@ -184,7 +198,7 @@ pub enum ModuleControlRequest {
 - **Versioning:** NO per-body version field. Envelope `ver` (negotiated at HELLO) for binary/structural; additive `op` values (new variant + new dotted string; old peers reject unknown with a typed error, EXCEPT pushes which are ignored); reserved op PREFIXES (`server.* catalog.* route.* supervisor.* config.*`). Breaking body change = new op name, capability-gated.
 
 ## 9. Behavior the contract pins (no wire break — implement per this text)
-- **Module death/disable → client notification + subc cleanup:** subc translates module loss/disable into a route `GOODBYE` to each affected client and runs the route-release path on its own forwarding state (fixes the current bug where `cleanup_connection` returns empty on module loss and bindings go stale).
+- **Module death/disable → client notification + subc cleanup:** subc translates module loss/disable into `route.closed` as specified in §6, then a route `GOODBYE` to each affected client, and runs the route-release path on its own forwarding state.
 - **GOODBYE-on-route drain:** per §2.1 (terminal, idempotent, credit release, late-frame drop, pending-corr failure).
 - **supervisor.restart/set_enabled side-effects:** restart bumps generation → already-open routes to that module go stale → liveness reports false → subc GOODBYEs the affected client routes. `SupervisorAck.applied` = true (action taken) / false (no-op / already in state); not-found → `unknown_module`.
 - **supervisor.reload drain-to-quiescence hot-swap:** `supervisor.reload { module_id }` is distinct from restart. subc first marks the current module endpoint reloading in the forwarding table (before checking quiescence), rejects new `route.open` and new route `REQUEST`s with retryable `module_reloading`, lets already-admitted requests drain by header-level `ChannelFlow` credit accounting, then route-GOODBYEs clients, sends channel-0 GOODBYE to the old module, respawns `spec.program`, and returns `supervisor.ack` only after the replacement registers. If the replacement cannot spawn/register, the request returns `reload_failed`; the old generation is not overlapped or rolled back, and only replacement failures consume restart-policy crash budget.

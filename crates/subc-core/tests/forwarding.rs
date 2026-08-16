@@ -1293,6 +1293,15 @@ async fn liveness_poll_returns_false_after_module_connection_is_gone() {
     module.stop().await.unwrap();
     wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+    );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, ack.route_channel);
@@ -1453,7 +1462,8 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
     client.flush().await.unwrap();
 
     let applied =
-        read_supervisor_ack_and_goodbye(&mut client, 312, module_id, ack.route_channel).await;
+        read_supervisor_ack_and_goodbye(&mut client, 312, module_id, ack.route_channel, "restart")
+            .await;
     assert!(applied);
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
@@ -1472,7 +1482,7 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
+async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() {
     let server = TestServer::start().await;
     let supervisor = supervisor_with_drain_timeout(
         &server,
@@ -1546,8 +1556,19 @@ async fn supervisor_reload_drains_inflight_then_respawns_and_serves() {
     .unwrap();
     control_client.flush().await.unwrap();
 
+    let closing = read_frame_timeout(&mut route_client).await;
+    assert_route_lifecycle_push(&closing, "route.closing", module_id, "reload", None, None);
     let response = read_frame_timeout(&mut route_client).await;
     assert_response(&response, ack.route_channel, slow_corr, slow_payload);
+    let closed = read_frame_timeout(&mut route_client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "reload",
+        Some(true),
+        Some(0),
+    );
     let goodbye = read_frame_timeout(&mut route_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, ack.route_channel);
@@ -1682,17 +1703,43 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     .await
     .unwrap();
     route_client.flush().await.unwrap();
-    // Three frames arrive on the route in a NON-deterministic relative order: the
+    // Five frames arrive: two channel-0 lifecycle pushes plus the
     // in-flight slow Response (slow_corr, ~150ms) and the rejection ERROR
     // (rejected_corr) race — the slow call was already in flight when drain began,
     // so on a slow/oversubscribed runner its Response can land before the
-    // rejection. The GOODBYE follows once the route drains. Classify by
+    // rejection. The GOODBYE follows route.closed once the route drains. Classify by
     // corr/type instead of assuming arrival order (which flaked on Windows CI).
     let mut saw_rejected = false;
     let mut saw_slow_response = false;
     let mut saw_goodbye = false;
-    for _ in 0..3 {
+    let mut saw_closing = false;
+    let mut saw_closed = false;
+    for _ in 0..5 {
         let frame = read_frame_timeout(&mut route_client).await;
+        if frame.header.channel == 0 && frame.header.ty == FrameType::Push {
+            if !saw_closing {
+                assert_route_lifecycle_push(
+                    &frame,
+                    "route.closing",
+                    module_id,
+                    "reload",
+                    None,
+                    None,
+                );
+                saw_closing = true;
+            } else {
+                assert_route_lifecycle_push(
+                    &frame,
+                    "route.closed",
+                    module_id,
+                    "reload",
+                    Some(true),
+                    Some(0),
+                );
+                saw_closed = true;
+            }
+            continue;
+        }
         assert_eq!(frame.header.channel, ack.route_channel);
         match frame.header.ty {
             FrameType::Error if frame.header.corr == rejected_corr => {
@@ -1706,8 +1753,8 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
             FrameType::Goodbye => {
                 // GOODBYE only after the in-flight slow call drained.
                 assert!(
-                    saw_slow_response,
-                    "route GOODBYE arrived before the in-flight slow response drained"
+                    saw_slow_response && saw_closed,
+                    "route GOODBYE arrived before route.closed or the in-flight slow response drained"
                 );
                 saw_goodbye = true;
             }
@@ -1718,8 +1765,8 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
         }
     }
     assert!(
-        saw_rejected && saw_slow_response && saw_goodbye,
-        "expected rejection ERROR ({rejected_corr}), slow Response ({slow_corr}), and route GOODBYE; got rejected={saw_rejected} slow={saw_slow_response} goodbye={saw_goodbye}"
+        saw_closing && saw_rejected && saw_slow_response && saw_closed && saw_goodbye,
+        "expected route lifecycle pushes, rejection ERROR ({rejected_corr}), slow Response ({slow_corr}), and route GOODBYE; got closing={saw_closing} rejected={saw_rejected} slow={saw_slow_response} closed={saw_closed} goodbye={saw_goodbye}"
     );
     let applied = read_supervisor_ack_on_stream(&mut control_client, 413, module_id).await;
     assert!(applied);
@@ -1871,11 +1918,29 @@ async fn concurrent_supervisor_ops_remain_coherent() {
 
     let mut saw_route_terminal = false;
     let mut saw_goodbye = false;
-    for _ in 0..3 {
-        if saw_route_terminal && saw_goodbye {
+    let mut closing_reason = None;
+    let mut saw_closed = false;
+    for _ in 0..5 {
+        if saw_route_terminal && saw_closed && saw_goodbye {
             break;
         }
         let frame = read_frame_timeout_for(&mut route_client, SETUP_TIMEOUT).await;
+        if frame.header.channel == 0 && frame.header.ty == FrameType::Push {
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            let reason = body["reason"].as_str().expect("route lifecycle reason");
+            assert!(matches!(reason, "reload" | "restart" | "disable"));
+            match body["op"].as_str() {
+                Some("route.closing") => closing_reason = Some(reason.to_string()),
+                Some("route.closed") => {
+                    assert_eq!(closing_reason.as_deref(), Some(reason));
+                    assert_eq!(body["drained"], Value::Bool(true));
+                    assert_eq!(body["abandoned"], Value::from(0));
+                    saw_closed = true;
+                }
+                op => panic!("unexpected route lifecycle op: {op:?}"),
+            }
+            continue;
+        }
         assert_eq!(frame.header.channel, ack.route_channel);
         match frame.header.ty {
             FrameType::Response if frame.header.corr == slow_corr => {
@@ -1894,6 +1959,7 @@ async fn concurrent_supervisor_ops_remain_coherent() {
                 saw_route_terminal = true;
             }
             FrameType::Goodbye => {
+                assert!(saw_closed, "route GOODBYE arrived before route.closed");
                 saw_goodbye = true;
             }
             other => panic!(
@@ -1903,8 +1969,8 @@ async fn concurrent_supervisor_ops_remain_coherent() {
         }
     }
     assert!(
-        saw_route_terminal && saw_goodbye,
-        "route client should observe a terminal response/error and GOODBYE; terminal={saw_route_terminal} goodbye={saw_goodbye}"
+        closing_reason.is_some() && saw_route_terminal && saw_closed && saw_goodbye,
+        "route client should observe lifecycle pushes, a terminal response/error, and GOODBYE; closing={closing_reason:?} terminal={saw_route_terminal} closed={saw_closed} goodbye={saw_goodbye}"
     );
 
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
@@ -1981,6 +2047,17 @@ async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
     .unwrap();
     control_client.flush().await.unwrap();
 
+    let closing = read_frame_timeout(&mut route_client).await;
+    assert_route_lifecycle_push(&closing, "route.closing", module_id, "reload", None, None);
+    let closed = read_frame_timeout(&mut route_client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "reload",
+        Some(false),
+        Some(0),
+    );
     let goodbye = read_frame_timeout(&mut route_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, ack.route_channel);
@@ -1988,6 +2065,97 @@ async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
     assert!(applied);
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
 
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiesced_drain_reports_abandoned_bindings_without_claiming_they_drained() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(250),
+    );
+    let module_id = "fake-aft-supervisor-reload-abandoned";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "reload-abandoned",
+        [("FAKE_AFT_BIND_NEVER_REPLY_AFTER", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut live_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let live_ack = attach_on_stream(
+        &mut live_client,
+        &project,
+        431,
+        "ses-reload-abandoned-live",
+        module_id,
+    )
+    .await;
+
+    let mut pending_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut pending_client,
+        &attach_frame(
+            432,
+            attach_request(&project, "ses-reload-abandoned-pending", module_id),
+        ),
+    )
+    .await
+    .unwrap();
+    pending_client.flush().await.unwrap();
+    wait_for_stub_event_count(
+        &events_path,
+        SETUP_TIMEOUT,
+        |event| event["kind"] == "attach",
+        2,
+    )
+    .await;
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            433,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+
+    let closing = read_frame_timeout(&mut live_client).await;
+    assert_route_lifecycle_push(&closing, "route.closing", module_id, "reload", None, None);
+    let closed = read_frame_timeout(&mut live_client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "reload",
+        Some(true),
+        Some(1),
+    );
+    let goodbye = read_frame_timeout(&mut live_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, live_ack.route_channel);
+    let pending_error = read_frame_timeout(&mut pending_client).await;
+    assert_error(&pending_error, 0, 432, "module_reloading");
+
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 433, module_id).await;
+    assert!(applied);
     module.stop().await.unwrap();
 }
 
@@ -2096,7 +2264,8 @@ async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns()
     client.flush().await.unwrap();
 
     let applied =
-        read_supervisor_ack_and_goodbye(&mut client, 322, module_id, ack.route_channel).await;
+        read_supervisor_ack_and_goodbye(&mut client, 322, module_id, ack.route_channel, "disable")
+            .await;
     assert!(applied);
     wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
@@ -3966,7 +4135,24 @@ async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
     module.stop().await.unwrap();
     let outcome = read_frame_or_close_timeout(&mut client, Duration::from_secs(2)).await;
     if let Some(frame) = outcome {
-        if frame.header.ty == FrameType::Goodbye {
+        if frame.header.ty == FrameType::Push {
+            assert_route_lifecycle_push(
+                &frame,
+                "route.closed",
+                module_id,
+                "crash",
+                Some(false),
+                Some(0),
+            );
+            let terminal = read_frame_or_close_timeout(&mut client, Duration::from_secs(2)).await;
+            if let Some(terminal) = terminal {
+                if terminal.header.ty == FrameType::Goodbye {
+                    assert_eq!(terminal.header.channel, ack.route_channel);
+                } else {
+                    assert_error(&terminal, ack.route_channel, blocked_corr, "backend_error");
+                }
+            }
+        } else if frame.header.ty == FrameType::Goodbye {
             assert_eq!(frame.header.channel, ack.route_channel);
         } else {
             assert_error(&frame, ack.route_channel, blocked_corr, "backend_error");
@@ -3997,6 +4183,15 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
     .await;
     assert!(status.restart_count >= 1);
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+    );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, old_ack.route_channel);
@@ -4305,6 +4500,15 @@ async fn multi_provider_generation_invalidation_goodbyes_restarted_provider_only
         status.restart_count >= 1 && status.state == ModuleState::Running && status.live
     })
     .await;
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_b,
+        "crash",
+        Some(false),
+        Some(0),
+    );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, old_ack_b.route_channel);
@@ -4336,21 +4540,46 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-mp-death";
-    let module = spawn_stub(&server, &supervisor, module_id).await;
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "250")],
+    )
+    .await;
 
     let project = TestProject::new();
     let (mut first, first_ack) = attach_client(&server, &project, 1051, "ses-death-one").await;
     let (mut second, second_ack) = attach_client(&server, &project, 1052, "ses-death-two").await;
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 2);
 
-    module.stop().await.unwrap();
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    let first_closed = read_frame_timeout(&mut first).await;
+    let second_closed = read_frame_timeout(&mut second).await;
+    assert_route_lifecycle_push(
+        &first_closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+    );
+    assert_route_lifecycle_push(
+        &second_closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+    );
     let first_goodbye = read_frame_timeout(&mut first).await;
     let second_goodbye = read_frame_timeout(&mut second).await;
     assert_eq!(first_goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(first_goodbye.header.channel, first_ack.route_channel);
     assert_eq!(second_goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(second_goodbye.header.channel, second_ack.route_channel);
+
+    module.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4752,17 +4981,36 @@ async fn read_supervisor_ack_and_goodbye<S>(
     corr: u64,
     module_id: &str,
     route_channel: u16,
+    reason: &str,
 ) -> bool
 where
     S: AsyncRead + Unpin,
 {
     let mut applied = None;
+    let mut closing_seen = false;
+    let mut closed_seen = false;
     let mut goodbye_seen = false;
-    for _ in 0..2 {
+    for _ in 0..4 {
         let frame = read_frame_timeout(stream).await;
         if frame.header.channel == 0 && frame.header.corr == corr {
             applied = Some(assert_supervisor_ack(&frame, corr, module_id));
+        } else if frame.header.channel == 0 && frame.header.ty == FrameType::Push {
+            if !closing_seen {
+                assert_route_lifecycle_push(&frame, "route.closing", module_id, reason, None, None);
+                closing_seen = true;
+            } else {
+                assert_route_lifecycle_push(
+                    &frame,
+                    "route.closed",
+                    module_id,
+                    reason,
+                    Some(true),
+                    Some(0),
+                );
+                closed_seen = true;
+            }
         } else if frame.header.ty == FrameType::Goodbye && frame.header.channel == route_channel {
+            assert!(closed_seen, "route GOODBYE arrived before route.closed");
             assert_eq!(frame.header.corr, 0);
             assert!(frame.body.is_empty());
             goodbye_seen = true;
@@ -4772,6 +5020,10 @@ where
             );
         }
     }
+    assert!(
+        closing_seen && closed_seen,
+        "supervisor side-effect should emit route.closing and route.closed"
+    );
     assert!(
         goodbye_seen,
         "supervisor side-effect should emit route GOODBYE"
@@ -4868,6 +5120,36 @@ where
     let frame = read_frame_timeout(stream).await;
     assert_push(&frame, route_channel);
     frame
+}
+
+fn assert_route_lifecycle_push(
+    frame: &Frame,
+    op: &str,
+    module_id: &str,
+    reason: &str,
+    drained: Option<bool>,
+    abandoned: Option<u32>,
+) {
+    assert_eq!(frame.header.ty, FrameType::Push);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.epoch, 0);
+    assert_eq!(frame.header.corr, 0);
+
+    let mut expected = serde_json::json!({
+        "op": op,
+        "module_id": module_id,
+        "reason": reason,
+    });
+    if let Some(drained) = drained {
+        expected["drained"] = Value::Bool(drained);
+    }
+    if let Some(abandoned) = abandoned {
+        expected["abandoned"] = serde_json::json!(abandoned);
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&frame.body).unwrap(),
+        expected
+    );
 }
 
 fn assert_push(frame: &Frame, route_channel: u16) {
@@ -5276,6 +5558,30 @@ where
         if Instant::now() >= deadline {
             panic!(
                 "stub event did not appear within {wait:?}; events: {:?}",
+                stub_events(path)
+            );
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_stub_event_count<F>(path: &Path, wait: Duration, matches: F, expected: usize)
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + wait;
+    loop {
+        if stub_events(path)
+            .iter()
+            .filter(|event| matches(event))
+            .count()
+            >= expected
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "stub event count did not reach {expected} within {wait:?}; events: {:?}",
                 stub_events(path)
             );
         }

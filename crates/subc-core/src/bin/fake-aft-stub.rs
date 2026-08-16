@@ -45,6 +45,7 @@ const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
 const FAKE_AFT_CLEAN_EXIT_AFTER_MS_ENV: &str = "FAKE_AFT_CLEAN_EXIT_AFTER_MS";
 const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
 const FAKE_AFT_BIND_NEVER_REPLY_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY";
+const FAKE_AFT_BIND_NEVER_REPLY_AFTER_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY_AFTER";
 const FAKE_AFT_MALFORMED_BIND_REPLY_ENV: &str = "FAKE_AFT_MALFORMED_BIND_REPLY";
 const FAKE_AFT_FAIL_REGISTRATION_ENV: &str = "FAKE_AFT_FAIL_REGISTRATION";
 const FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH_ENV: &str =
@@ -798,7 +799,12 @@ async fn handle_control_request(
                     "admission_facts": admission_facts,
                 }),
             )?;
-            if config.bind_never_reply {
+            state.route_bind_count += 1;
+            let bind_never_reply = config.bind_never_reply
+                || config
+                    .bind_never_reply_after
+                    .is_some_and(|after| state.route_bind_count > after);
+            if bind_never_reply {
                 record_event(
                     config,
                     json!({
@@ -1352,6 +1358,7 @@ struct StubConfig {
     clean_exit_after: Option<Duration>,
     reject_attach: bool,
     bind_never_reply: bool,
+    bind_never_reply_after: Option<usize>,
     malformed_bind_reply: Option<MalformedBindReply>,
     fail_registration: bool,
     events_path: Option<PathBuf>,
@@ -1383,6 +1390,7 @@ struct StubConfig {
 struct StubState {
     bound_channels: BTreeMap<u16, u32>,
     tentative_channels: BTreeMap<u16, u32>,
+    route_bind_count: usize,
     in_flight: InFlightRegistry,
 }
 
@@ -1391,6 +1399,7 @@ impl Default for StubState {
         Self {
             bound_channels: BTreeMap::new(),
             tentative_channels: BTreeMap::new(),
+            route_bind_count: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1420,6 +1429,13 @@ impl StubConfig {
             })
             .transpose()?;
         let events_path = env::var_os(FAKE_AFT_EVENTS_PATH_ENV).map(PathBuf::from);
+        let bind_never_reply_after = env::var(FAKE_AFT_BIND_NEVER_REPLY_AFTER_ENV)
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .map_err(|source| StubError::InvalidBindNeverReplyAfter { raw, source })
+            })
+            .transpose()?;
         let concurrency = concurrency_from_env()?;
         let role = role_from_env()?;
         let status = env::var(FAKE_AFT_STATUS_ENV).ok().map(|raw| {
@@ -1459,6 +1475,7 @@ impl StubConfig {
             clean_exit_after,
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
             bind_never_reply: env_flag(FAKE_AFT_BIND_NEVER_REPLY_ENV),
+            bind_never_reply_after,
             malformed_bind_reply: malformed_bind_reply_from_env()?,
             fail_registration,
             events_path,
@@ -1642,6 +1659,10 @@ enum StubError {
         raw: String,
         source: std::num::ParseIntError,
     },
+    InvalidBindNeverReplyAfter {
+        raw: String,
+        source: std::num::ParseIntError,
+    },
     InvalidToolcallDelay {
         raw: String,
         source: std::num::ParseIntError,
@@ -1710,6 +1731,10 @@ impl fmt::Display for StubError {
             Self::InvalidCrashAfter { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_CRASH_AFTER_MS_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidBindNeverReplyAfter { raw, source } => write!(
+                f,
+                "invalid {FAKE_AFT_BIND_NEVER_REPLY_AFTER_ENV} value '{raw}': {source}"
             ),
             Self::InvalidToolcallDelay { raw, source } => write!(
                 f,
@@ -1788,6 +1813,7 @@ impl Error for StubError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidCrashAfter { source, .. } => Some(source),
+            Self::InvalidBindNeverReplyAfter { source, .. } => Some(source),
             Self::InvalidToolcallDelay { source, .. } => Some(source),
             Self::InvalidExitCode { source, .. } => Some(source),
             Self::InvalidOrphanWriterDelay { source, .. } => Some(source),

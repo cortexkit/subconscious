@@ -8,10 +8,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use subc_control::{
-    ops, CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
-    TerminalEntry, TerminalHistory,
+    ops, CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse,
+    ConsumerIdentity, PollKind, RouteCloseReason, StderrCaptureState, StderrTail, StderrTailEntry,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorRescanResult, SupervisorRoute,
+    SupervisorRouteConsumer, SupervisorRouteModule, TerminalEntry, TerminalHistory,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
@@ -28,9 +28,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     forwarding::{
-        CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcCompletion,
-        ModuleControlRpcOutcome, ModuleEndpointId, PendingModuleControlRpc, RouteBindRelayOutcome,
-        RoutePollSnapshot, RouteRelease,
+        CloseReason, EndpointRoute, ForwardingError, ForwardingTable, GoodbyeTarget,
+        ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
+        PendingModuleControlRpc, RouteBindRelayOutcome, RoutePollSnapshot, RouteRelease,
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
@@ -57,6 +57,8 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::CATALOG_LIST,
     ops::ROUTE_OPEN,
     ops::ROUTE_POLL,
+    ops::ROUTE_CLOSING,
+    ops::ROUTE_CLOSED,
     ops::SUPERVISOR_LIST,
     ops::SUPERVISOR_RESTART,
     ops::SUPERVISOR_RELOAD,
@@ -460,6 +462,29 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        let crash_closed = self
+            .registry
+            .get_module_by_connection(connection_id)?
+            .and_then(|registration| {
+                self.forwarding
+                    .module_endpoint_for_connection(connection_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|endpoint| self.forwarding.endpoint_routes(endpoint).ok())
+                    .map(|routes| (registration.manifest.module_id, routes))
+            });
+        if let Some((module_id, routes)) = crash_closed {
+            send_route_control_pushes(
+                &self.forwarding,
+                routes,
+                ClientControlPush::RouteClosed {
+                    module_id,
+                    reason: RouteCloseReason::Crash,
+                    drained: false,
+                    abandoned: 0,
+                },
+            );
+        }
         let registrations = self.deregister_connection(connection_id);
         if let Ok(released_routes) = self.forwarding.cleanup_connection(connection_id) {
             self.emit_route_goodbyes(released_routes);
@@ -2900,6 +2925,64 @@ fn send_goodbye_target_best_effort(target: &GoodbyeTarget, context: &str) {
             %context,
             "route GOODBYE dropped under backpressure"
         );
+    }
+}
+
+pub(crate) fn send_route_control_pushes(
+    forwarding: &ForwardingTable,
+    routes: Vec<EndpointRoute>,
+    push: ClientControlPush,
+) {
+    let body = match serde_json::to_vec(&push) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(error = %err, "failed to serialize route lifecycle control PUSH");
+            return;
+        }
+    };
+    for route in routes {
+        let target = route.goodbye_target;
+        let frame = match Frame::build_with_version(
+            target.negotiated_ver,
+            FrameType::Push,
+            control_flags(),
+            0,
+            0,
+            0,
+            body.clone(),
+        ) {
+            Ok(frame) => frame,
+            Err(err) => {
+                warn!(
+                    route_channel = target.channel,
+                    error = %err,
+                    "failed to build route lifecycle control PUSH frame"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = target.sink.try_send(frame) {
+            if target.close_on_delivery_failure() {
+                warn!(
+                    target_connection_id = target.connection_id.get(),
+                    route_channel = target.channel,
+                    error = %err,
+                    "route lifecycle control PUSH was not delivered to client; closing target connection"
+                );
+                let _ = forwarding.escalate_client_delivery_failure(
+                    target.connection_id,
+                    target.channel,
+                    target.epoch,
+                    CloseReason::new(
+                        "route_lifecycle_push_delivery_failed",
+                        format!(
+                            "failed to enqueue route lifecycle control PUSH for channel {}: {err}",
+                            target.channel
+                        ),
+                    ),
+                );
+            }
+        }
     }
 }
 

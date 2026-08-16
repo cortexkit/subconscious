@@ -361,6 +361,8 @@ fn thin_core_ops() -> Vec<String> {
         "catalog.list".to_string(),
         "route.open".to_string(),
         "route.poll".to_string(),
+        "route.closing".to_string(),
+        "route.closed".to_string(),
         "supervisor.list".to_string(),
         "supervisor.restart".to_string(),
         "supervisor.reload".to_string(),

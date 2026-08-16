@@ -101,6 +101,28 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     );
 }
 
+#[test]
+fn deployed_management_surface_manifest_without_concurrency_defaults_to_module_managed() {
+    let fixture = fs::read_to_string(golden_path(
+        "management_surface_manifest_without_concurrency",
+    ))
+    .unwrap();
+    let raw: Value = serde_json::from_str(&fixture).unwrap();
+    assert!(raw["provides"][0].get("concurrency").is_none());
+
+    let manifest: ModuleManifest = serde_json::from_value(raw).unwrap();
+    let ProviderRole::ManagementSurface { concurrency, .. } = &manifest.provides[0] else {
+        panic!("compatibility fixture must contain a management surface");
+    };
+    assert_eq!(*concurrency, Concurrency::ModuleManaged);
+
+    let reserialized = serde_json::to_value(manifest).unwrap();
+    assert_eq!(
+        reserialized["provides"][0]["concurrency"],
+        Value::String("module_managed".to_string())
+    );
+}
+
 /// The wire constants are transcribed into all three client languages, and only
 /// three of the four are protected by anything.
 ///

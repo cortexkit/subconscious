@@ -724,6 +724,7 @@ async fn emit_cancelled_error(
     let body = serde_json::to_vec(&ErrorBody {
         code: "cancelled".to_string(),
         message: "request cancelled by client".to_string(),
+        detail: None,
     })
     .map_err(StubError::Json)?;
     let frame = Frame::build_with_version(
@@ -838,6 +839,7 @@ async fn handle_control_request(
                 let body = serde_json::to_vec(&ErrorBody {
                     code: "config_divergence".to_string(),
                     message: "fake AFT rejected route.bind by FAKE_AFT_REJECT_ATTACH".to_string(),
+                    detail: None,
                 })
                 .map_err(StubError::Json)?;
                 let response = Frame::build_with_version(
@@ -1012,6 +1014,7 @@ async fn emit_tool_call_subc_error(
     let body = serde_json::to_vec(&ErrorBody {
         code: "target_unavailable".to_string(),
         message: "fake AFT injected subc-level tool-call failure".to_string(),
+        detail: None,
     })
     .map_err(StubError::Json)?;
     let frame = Frame::build_with_version(

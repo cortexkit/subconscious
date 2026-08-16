@@ -138,10 +138,36 @@ pub const FROZEN_PREFIX_LEN: usize = 5;
 pub const MAX_FRAME_BODY_LEN: u32 = 64 * 1024 * 1024;
 
 /// Canonical JSON body for all subc-generated `ERROR` frames.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `detail` is an optional machine-parsable surface for refusals whose remedy
+/// needs more than a code (e.g. a producer-published backoff number, an
+/// observed-vs-configured size pair). Absent detail serializes to nothing, so
+/// bodies without it are byte-identical to the pre-detail wire and older
+/// readers simply never see the field. Producers document each code's detail
+/// fields where the code is defined; `detail` must never carry secrets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+impl ErrorBody {
+    /// A detail-less error body; the common case.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// Attach a machine-parsable detail object to this error.
+    pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
+        self.detail = Some(detail);
+        self
+    }
 }
 
 /// Module-to-subc `HELLO` body used during module registration.
@@ -566,6 +592,7 @@ mod tests {
         let body = ErrorBody {
             code: "config_divergence".to_string(),
             message: "active config differs".to_string(),
+            detail: None,
         };
 
         let encoded = serde_json::to_vec(&body).unwrap();

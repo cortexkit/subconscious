@@ -40,6 +40,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         },
     );
     assert_golden("error_body", &error_body());
+    assert_golden("error_body_with_detail", &error_body_with_detail());
     assert_golden("principal_reserved", &principal_reserved());
     assert_golden("principal_direct", &Principal::Direct);
     assert_golden("principal_unverified", &Principal::Unverified);
@@ -208,10 +209,21 @@ fn bind_identity() -> BindIdentity {
 }
 
 fn error_body() -> ErrorBody {
+    // Deliberately detail-less: this golden pins that the absent field
+    // serializes to NOTHING, keeping detail-less bodies byte-identical to the
+    // pre-detail wire every deployed reader parses.
     ErrorBody {
         code: "config_divergence".to_string(),
         message: "active config differs".to_string(),
+        detail: None,
     }
+}
+
+fn error_body_with_detail() -> ErrorBody {
+    ErrorBody::new("spawn_failed", "child could not start").with_detail(serde_json::json!({
+        "cause": "credential_resolution",
+        "retry_after_ms": 60000,
+    }))
 }
 
 fn principal_reserved() -> Principal {

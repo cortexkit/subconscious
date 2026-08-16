@@ -1019,8 +1019,8 @@ async fn send_handler_outcome(
                 .await
         }
         HandlerOutcome::Error { code, message } => {
-            let body =
-                serde_json::to_vec(&ErrorBody { code, message }).map_err(SubcModuleError::Json)?;
+            let body = serde_json::to_vec(&ErrorBody::new(code, message))
+                .map_err(SubcModuleError::Json)?;
             ctx.send_frame(FrameType::Error, data_flags(), body).await
         }
         HandlerOutcome::ErrorWithDetail {
@@ -1028,12 +1028,8 @@ async fn send_handler_outcome(
             message,
             detail,
         } => {
-            let body = serde_json::to_vec(&DetailedErrorBody {
-                code,
-                message,
-                detail,
-            })
-            .map_err(SubcModuleError::Json)?;
+            let body = serde_json::to_vec(&ErrorBody::new(code, message).with_detail(detail))
+                .map_err(SubcModuleError::Json)?;
             ctx.send_frame(FrameType::Error, data_flags(), body).await
         }
         HandlerOutcome::Streamed => {
@@ -1104,13 +1100,13 @@ where
             // protocol violation the daemon cannot produce: reject the bind.
             if let Some(stale) = module_handle.installed_route(route_channel)? {
                 if epoch <= stale.epoch {
-                    let body = serde_json::to_vec(&ErrorBody {
-                        code: "route_rejected".to_string(),
-                        message: format!(
+                    let body = serde_json::to_vec(&ErrorBody::new(
+                        "route_rejected",
+                        format!(
                             "route.bind epoch {epoch} does not supersede installed epoch {} on channel {route_channel}",
                             stale.epoch
                         ),
-                    })
+                    ))
                     .map_err(SubcModuleError::Json)?;
                     let reject = Frame::build_with_version(
                         frame.header.ver,
@@ -1173,7 +1169,7 @@ where
                     handler.on_bound(&handle).await;
                 }
                 BindDecisionKind::Reject { code, message } => {
-                    let result = serde_json::to_vec(&ErrorBody { code, message })
+                    let result = serde_json::to_vec(&ErrorBody::new(code, message))
                         .map_err(SubcModuleError::Json)
                         .and_then(|body| {
                             Frame::build_with_version(
@@ -1201,13 +1197,6 @@ where
         }
     }
     Ok(())
-}
-
-#[derive(serde::Serialize)]
-struct DetailedErrorBody {
-    code: String,
-    message: String,
-    detail: serde_json::Value,
 }
 
 async fn send_hello(
@@ -1846,6 +1835,7 @@ mod tests {
             ErrorBody {
                 code: "cancelled".to_string(),
                 message: "request cancelled".to_string(),
+                detail: None,
             }
         );
         assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
@@ -2205,15 +2195,15 @@ mod tests {
 mod detailed_error_body_tests {
     use serde_json::json;
 
-    use super::DetailedErrorBody;
+    use subc_protocol::ErrorBody;
 
+    /// The wire bytes a detail-carrying module error serializes to are pinned
+    /// here because subc-mcp and route consumers parse them; the shape predates
+    /// ErrorBody.detail and must not drift now that ErrorBody subsumes it.
     #[test]
     fn detailed_error_body_keeps_code_message_and_detail() {
-        let body = DetailedErrorBody {
-            code: "bad_request".to_string(),
-            message: "invalid envelope".to_string(),
-            detail: json!({"reason": "missing_server"}),
-        };
+        let body = ErrorBody::new("bad_request", "invalid envelope")
+            .with_detail(json!({"reason": "missing_server"}));
 
         assert_eq!(
             serde_json::to_value(body).unwrap(),
@@ -2223,6 +2213,16 @@ mod detailed_error_body_tests {
                 "detail": {"reason": "missing_server"},
             })
         );
+    }
+
+    /// A detail-less body serializes byte-identically to the pre-detail wire:
+    /// deserializing the old two-field shape and re-serializing adds nothing.
+    #[test]
+    fn detail_less_error_body_is_byte_identical_to_the_pre_detail_wire() {
+        let old_wire = r#"{"code":"cancelled","message":"caller cancelled"}"#;
+        let parsed: ErrorBody = serde_json::from_str(old_wire).unwrap();
+        assert_eq!(parsed.detail, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old_wire);
     }
 }
 

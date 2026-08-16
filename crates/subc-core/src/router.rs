@@ -631,6 +631,7 @@ fn error_frame(channel: u16, epoch: u32, corr: u64, code: &str, message: String)
     let body = serde_json::to_vec(&ErrorBody {
         code: code.to_string(),
         message,
+        detail: None,
     })
     .ok()?;
 

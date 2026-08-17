@@ -2927,6 +2927,20 @@ async fn wait_for_forwarding_quiescence(
     }
 }
 
+/// The `route.closed` `drained` value implied by a quiescence-wait outcome.
+///
+/// `Ok` is always honest and passed straight through -- the wait actually measured
+/// in-flight state. `Err` means the wait produced no measurement at all (the
+/// forwarding table's lock was poisoned), so `false` is reported as the one honest
+/// constant: the drain did not complete. Never recomputed from route state, never a
+/// third "unknown" value -- the caller must still send a well-formed `route.closed`.
+fn drained_after_quiescence_wait(wait_result: &Result<bool, SuperviseError>) -> bool {
+    match wait_result {
+        Ok(drained) => *drained,
+        Err(_) => false,
+    }
+}
+
 fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<GoodbyeTarget>) {
     for released in released_routes {
         let frame = match Frame::build_with_version(
@@ -3081,10 +3095,24 @@ async fn begin_forwarding_drain_with(
             },
         );
         send_route_goodbyes(forwarding, target.abandoned_bindings.clone());
-        let drained =
+
+        // `route.closing` was just sent above: from here on every return path,
+        // including an early one, MUST send `route.closed` before propagating
+        // anything else. A client holds `closing` as a promise that a verdict is
+        // coming; leaving early without `closed` strands it waiting forever, since
+        // `closing` carries no timeout of its own.
+        let wait_result =
             wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
-                .await?;
-        if !drained {
+                .await;
+        let drained = drained_after_quiescence_wait(&wait_result);
+        if let Err(err) = &wait_result {
+            error!(
+                module_id = %spec.module_id,
+                ?reason,
+                error = %err,
+                "forwarding quiescence wait failed after route.closing; forcing route.closed(drained: false) so the client is not left waiting on an unfulfilled promise"
+            );
+        } else if !drained {
             warn!(
                 module_id = %spec.module_id,
                 waited = ?runtime.drain_timeout,
@@ -3102,10 +3130,26 @@ async fn begin_forwarding_drain_with(
                 abandoned: target.abandoned_bindings.len() as u32,
             },
         );
+        wait_result?;
 
-        let released_routes = forwarding
-            .release_module_endpoint_routes(target.endpoint)
-            .map_err(SuperviseError::Forwarding)?;
+        // `route.closed` has now been sent unconditionally above. From here the
+        // remaining steps are cleanup (route + module GOODBYE) rather than a
+        // promise the client is waiting on, but a lock-poisoned
+        // `release_module_endpoint_routes` would otherwise skip the module
+        // GOODBYE silently too -- send it before propagating the error.
+        let released_routes = match forwarding.release_module_endpoint_routes(target.endpoint) {
+            Ok(routes) => routes,
+            Err(err) => {
+                warn!(
+                    module_id = %spec.module_id,
+                    ?reason,
+                    error = %err,
+                    "failed to release module endpoint routes after route.closed; module GOODBYE will still be sent"
+                );
+                send_module_goodbye(&spec.module_id, forwarding, target);
+                return Err(SuperviseError::Forwarding(err));
+            }
+        };
         send_route_goodbyes(forwarding, released_routes);
         send_module_goodbye(&spec.module_id, forwarding, target);
     }
@@ -3512,7 +3556,10 @@ mod terminal_history_tests {
 
     use tokio::time::sleep;
 
-    use super::{ModuleSpec, ModuleState, RestartPolicy, Supervisor};
+    use super::{
+        drained_after_quiescence_wait, ModuleSpec, ModuleState, RestartPolicy, SuperviseError,
+        Supervisor,
+    };
     use crate::registry::Registry;
 
     /// See the twin in `control.rs` for why this derives the path from
@@ -3576,6 +3623,21 @@ mod terminal_history_tests {
             );
             sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// The `route.closed` `drained` value must be the quiescence wait's own
+    /// measurement (`Ok`), never invented -- except on `Err`, where there is no
+    /// measurement at all and `false` is the one honest constant. This is the exact
+    /// logic `begin_forwarding_drain_with` now applies before sending `route.closed`
+    /// on every return path, including the one that used to return early via `?`
+    /// with `route.closing` already sent and no `route.closed` ever following.
+    #[test]
+    fn drained_after_quiescence_wait_passes_ok_through_and_forces_false_on_err() {
+        assert!(drained_after_quiescence_wait(&Ok(true)));
+        assert!(!drained_after_quiescence_wait(&Ok(false)));
+        assert!(!drained_after_quiescence_wait(&Err(
+            SuperviseError::StatePoisoned { module_id: None }
+        )));
     }
 }
 

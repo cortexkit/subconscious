@@ -1,0 +1,5 @@
+{
+  "module_id": "aft-tools",
+  "op": "route.closing",
+  "reason": "disable"
+}

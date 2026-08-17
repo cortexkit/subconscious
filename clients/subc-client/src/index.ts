@@ -16,6 +16,7 @@ export {
   type RequestOptions,
   type ManagedCallOptions,
   type ConnectOptions,
+  type ControlPush,
   type ReconnectBackoff,
   type SubcCallErrorKind,
   type SubscribeOptions,

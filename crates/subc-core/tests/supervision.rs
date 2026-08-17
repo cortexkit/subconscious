@@ -268,6 +268,80 @@ async fn operator_restart_resets_restart_count() {
     module.stop().await.unwrap();
 }
 
+/// Issue #34, arm 2: a spawn failure on OPERATOR restart must land the module
+/// in `Failed` -- the observable, revivable terminal -- not strand it in
+/// `Restarting` with no child. The spawn is made to fail for real (the program
+/// is a per-test copy of the stub, deleted before the restart), not by mocking:
+/// the discriminator is the STATE the failure leaves behind, and before the fix
+/// this test reads `Restarting` forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_millis(10));
+    let module_id = "fake-aft-restart-spawn-fail";
+
+    // Per-test copy of the stub so deleting it cannot affect parallel tests
+    // (pid+nonce naming per the house temp convention; no tempfile dep here).
+    let stub_copy = std::env::temp_dir().join(format!(
+        "fake-aft-stub-copy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &stub_copy).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub_copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut spec = stub_spec(&server, module_id, []);
+    spec.program = stub_copy.clone();
+    let module = supervisor.spawn(spec).unwrap();
+    // 30s: the per-test copy is a FRESH INODE, so its first exec pays the macOS
+    // assessment toll (0.5-22s observed); the usual 5s bound flakes here.
+    wait_for_status(&module, Duration::from_secs(30), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+
+    // The respawn half of the restart must fail: the program is gone.
+    std::fs::remove_file(&stub_copy).unwrap();
+    // The restart command acks at initiation; the failure lands in state.
+    module.restart(None).await.unwrap();
+
+    let failed = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state != ModuleState::Restarting && !status.process_alive
+    })
+    .await;
+    assert_eq!(
+        failed.state,
+        ModuleState::Failed,
+        "spawn failure on operator restart must be visible as Failed, not stranded in a transient state"
+    );
+
+    // And Failed is the revivable state: restoring the program and re-enabling
+    // heals it, which is the property Restarting-stranding denied the operator.
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &stub_copy).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub_copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let applied = module.set_enabled(true).await.unwrap();
+    assert!(applied);
+    // Fresh inode again after the re-copy: same assessment-toll bound.
+    let revived = wait_for_status(&module, Duration::from_secs(30), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+    assert!(revived.process_alive);
+
+    module.stop().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_cap_marks_module_failed_without_infinite_loop() {
     let server = TestServer::start().await;

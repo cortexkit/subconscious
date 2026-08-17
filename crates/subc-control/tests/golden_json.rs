@@ -286,10 +286,17 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 modules: vec![SupervisorRouteModule {
                     module_id: "target".to_string(),
                     routes: vec![
+                        // Mirrors the REAL-HANDLER-generated golden exactly (the
+                        // census golden's authoritative producer is the handler
+                        // test in subc-core control.rs; this fixture must agree
+                        // byte-for-byte or the two tests fight over the file).
+                        // The old-daemon absent-reason wire is pinned separately
+                        // below in a decode-tolerance test, not in this golden.
                         SupervisorRoute {
                             consumer: SupervisorRouteConsumer::Direct { connection_id: 102 },
                             age_ms: 0,
                             draining: true,
+                            drain_reason: Some(RouteCloseReason::Reload),
                         },
                         SupervisorRoute {
                             consumer: SupervisorRouteConsumer::Reserved {
@@ -297,6 +304,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                             },
                             age_ms: 0,
                             draining: true,
+                            drain_reason: Some(RouteCloseReason::Reload),
                         },
                     ],
                 }],
@@ -529,4 +537,23 @@ fn provider_roles() -> Vec<ProviderRole> {
             operations: vec!["llm.complete".to_string()],
         },
     ]
+}
+
+/// The pre-reason census wire stays decodable: an older daemon omits
+/// `drain_reason` entirely, and the field resolves to None rather than failing
+/// the row. Pinned as a JSON literal because the shared golden file mirrors the
+/// NEW handler's output — this is the arm that file can no longer carry.
+#[test]
+fn a_census_route_without_a_drain_reason_still_decodes() {
+    let old_wire = r#"{"consumer":{"kind":"direct","connection_id":7},"age_ms":12,"draining":true}"#;
+    let route: SupervisorRoute = serde_json::from_str(old_wire).expect("old census wire decodes");
+    assert!(route.draining);
+    assert_eq!(route.drain_reason, None);
+    // And absence round-trips: a None reason must not appear on the wire, so a
+    // new consumer relaying an old daemon's census cannot invent the field.
+    let reserialized = serde_json::to_string(&route).expect("serializes");
+    assert!(
+        !reserialized.contains("drain_reason"),
+        "absent reason must stay absent: {reserialized}"
+    );
 }

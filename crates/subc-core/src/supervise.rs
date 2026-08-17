@@ -3116,7 +3116,7 @@ async fn begin_forwarding_drain_with(
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
     let drain_target = forwarding
-        .begin_module_drain(&spec.module_id)
+        .begin_module_drain(&spec.module_id, reason)
         .map_err(SuperviseError::Forwarding)?;
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.state = ModuleState::Draining;

@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use subc_control::ClientControlResponse;
+use subc_control::{ClientControlResponse, RouteCloseReason};
 use subc_protocol::{
     manifest::Concurrency, session::ModuleControlResponse, ErrorBody, Flags, FrameType, Principal,
     Priority,
@@ -148,6 +148,10 @@ pub(crate) struct EndpointRoute {
     pub principal: Principal,
     pub bound_at: Instant,
     pub draining: bool,
+    /// WHY the endpoint is draining, when it is. Carried per-route so the
+    /// census can answer "closing because of what" without a second lookup;
+    /// `None` exactly when `draining` is false (one source: the drain map).
+    pub drain_reason: Option<RouteCloseReason>,
 }
 
 #[derive(Debug)]
@@ -279,7 +283,10 @@ struct ForwardingInner {
     modules_by_id: HashMap<String, ModuleConnection>,
     endpoint_by_connection: HashMap<ConnectionId, ModuleEndpointId>,
     module_id_by_endpoint: HashMap<ModuleEndpointId, String>,
-    draining_endpoints: HashSet<ModuleEndpointId>,
+    /// Endpoints mid-drain, keyed to the reason the drain was begun with. The
+    /// value serves the census ("draining because restart"); membership alone
+    /// still answers every admission-gate check.
+    draining_endpoints: HashMap<ModuleEndpointId, RouteCloseReason>,
     closing_connections: HashSet<ConnectionId>,
     next_generation: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
@@ -513,7 +520,7 @@ impl ForwardingTable {
             .get(module_id)
             .cloned()
             .ok_or(ForwardingError::NoModuleConnection)?;
-        if inner.draining_endpoints.contains(&module.endpoint) {
+        if inner.draining_endpoints.contains_key(&module.endpoint) {
             return Err(ForwardingError::ModuleReloading {
                 module_id: module_id.to_string(),
             });
@@ -591,7 +598,7 @@ impl ForwardingTable {
             .get(expected_module_id)
             .cloned()
             .ok_or(ForwardingError::NoModuleConnection)?;
-        if inner.draining_endpoints.contains(&module.endpoint) {
+        if inner.draining_endpoints.contains_key(&module.endpoint) {
             return Err(ForwardingError::ModuleReloading {
                 module_id: expected_module_id.to_string(),
             });
@@ -1220,13 +1227,14 @@ impl ForwardingTable {
     pub(crate) fn begin_module_drain(
         &self,
         module_id: &str,
+        reason: RouteCloseReason,
     ) -> Result<Option<ModuleDrainTarget>, ForwardingError> {
         let mut inner = self.write_inner()?;
         let Some(module) = inner.modules_by_id.get(module_id).cloned() else {
             return Ok(None);
         };
         let endpoint = module.endpoint;
-        inner.draining_endpoints.insert(endpoint);
+        inner.draining_endpoints.insert(endpoint, reason);
 
         let flows = inner
             .client_to_module
@@ -1308,7 +1316,10 @@ impl ForwardingTable {
         &self,
         endpoint: ModuleEndpointId,
     ) -> Result<bool, ForwardingError> {
-        Ok(self.read_inner()?.draining_endpoints.contains(&endpoint))
+        Ok(self
+            .read_inner()?
+            .draining_endpoints
+            .contains_key(&endpoint))
     }
 
     pub(crate) fn module_is_draining(&self, module_id: &str) -> Result<bool, ForwardingError> {
@@ -1316,7 +1327,7 @@ impl ForwardingTable {
         Ok(inner
             .modules_by_id
             .get(module_id)
-            .is_some_and(|module| inner.draining_endpoints.contains(&module.endpoint)))
+            .is_some_and(|module| inner.draining_endpoints.contains_key(&module.endpoint)))
     }
 
     pub(crate) fn release_module_endpoint_routes(
@@ -1625,7 +1636,8 @@ fn endpoint_routes_locked(
     inner: &ForwardingInner,
     endpoint: ModuleEndpointId,
 ) -> Vec<EndpointRoute> {
-    let draining = inner.draining_endpoints.contains(&endpoint);
+    let drain_reason = inner.draining_endpoints.get(&endpoint).copied();
+    let draining = drain_reason.is_some();
     let mut routes = inner
         .module_to_client
         .iter()
@@ -1642,6 +1654,7 @@ fn endpoint_routes_locked(
             principal: route.principal.clone(),
             bound_at: route.bound_at,
             draining,
+            drain_reason,
         })
         .collect::<Vec<_>>();
     routes.sort_by_key(|route| {
@@ -1751,7 +1764,7 @@ fn commit_route_locked(
         .ok_or(ForwardingError::StaleModuleEndpoint)?;
     if inner
         .draining_endpoints
-        .contains(&reservation.module_key.endpoint)
+        .contains_key(&reservation.module_key.endpoint)
     {
         return Err(ForwardingError::ModuleReloading { module_id });
     }
@@ -2370,7 +2383,9 @@ mod tests {
         assert_eq!(routes[0].goodbye_target.epoch, pending.client_epoch);
         assert!(!routes[0].draining);
 
-        forwarding.begin_module_drain("census").unwrap();
+        forwarding
+            .begin_module_drain("census", RouteCloseReason::Restart)
+            .unwrap();
         let draining_routes = forwarding.endpoint_routes(endpoint).unwrap();
         assert_eq!(draining_routes.len(), 1);
         assert!(draining_routes[0].draining);
@@ -2773,7 +2788,10 @@ mod tests {
                 Instant::now() + Duration::from_secs(1),
             )
             .unwrap();
-        let target = forwarding.begin_module_drain("drain-gap").unwrap().unwrap();
+        let target = forwarding
+            .begin_module_drain("drain-gap", RouteCloseReason::Reload)
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             control_rpc.receiver.blocking_recv().unwrap(),
             ModuleControlRpcOutcome::ModuleGone(_)

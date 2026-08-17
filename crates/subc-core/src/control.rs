@@ -752,6 +752,21 @@ impl ControlHandler {
             }
         }
 
+        // Exposure over assumption: Concurrency's serde default is pinned to the
+        // pre-field behavior (ModuleManaged), so a management surface that is
+        // genuinely Serial and just never declared it inherits concurrent
+        // delivery silently. Logging which registrations RESOLVED BY DEFAULT
+        // turns "no module has been bitten yet" into the checkable claim "no
+        // module is exposed" -- one read of the boot log instead of a fleet
+        // audit. Detected from the raw HELLO bytes because the serde default
+        // deliberately erases the absent/declared distinction from the type.
+        if manifest_concurrency_was_defaulted(&frame.body, &registration.manifest) {
+            info!(
+                module_id = %registration.manifest.module_id,
+                "management surface registered with DEFAULTED concurrency=module_managed (manifest predates the field; declare the real lane)"
+            );
+        }
+
         info!(
             module_id = %registration.manifest.module_id,
             module_version = %registration.manifest.module_version,
@@ -2737,6 +2752,40 @@ fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {
             ProviderRole::PipelineStage { .. } | ProviderRole::InternalService { .. } => None,
         })
         .unwrap_or(Concurrency::ModuleManaged)
+}
+
+/// True when the manifest carries a ManagementSurface role whose concurrency
+/// was RESOLVED BY SERDE DEFAULT rather than declared. Reads the raw HELLO
+/// bytes because the typed manifest deliberately erases that distinction: the
+/// default exists for wire compatibility, and this probe exists so the default
+/// stays observable. Any parse irregularity returns false -- the caller only
+/// logs, and a malformed body already failed registration upstream.
+fn manifest_concurrency_was_defaulted(raw_hello: &[u8], manifest: &ModuleManifest) -> bool {
+    let has_management_surface = manifest
+        .provides
+        .iter()
+        .any(|provider| matches!(provider, ProviderRole::ManagementSurface { .. }));
+    if !has_management_surface {
+        return false;
+    }
+    let Ok(raw) = serde_json::from_slice::<serde_json::Value>(raw_hello) else {
+        return false;
+    };
+    let Some(provides) = raw
+        .get("manifest")
+        .and_then(|manifest| manifest.get("provides"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    // ProviderRole is internally tagged (`tag = "role"`), so the wire shape is
+    // flat: {"role": "management_surface", ..., "concurrency": ...} -- verified
+    // against the management_surface_manifest_without_concurrency golden, not
+    // recalled (the externally-tagged guess was this function's first bug).
+    provides.iter().any(|role| {
+        role.get("role").and_then(serde_json::Value::as_str) == Some("management_surface")
+            && role.get("concurrency").is_none()
+    })
 }
 
 fn negotiate_version(peer_version: u8) -> Result<u8, String> {
@@ -5301,5 +5350,56 @@ mod tests {
             parse_error(&response[0])["code"],
             "unsupported_control_frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod concurrency_default_exposure_tests {
+    use super::*;
+
+    fn hello_body(role_json: &str) -> Vec<u8> {
+        format!(
+            r#"{{"protocol_ver":2,"module_id":"m","manifest":{{"module_id":"m","module_version":"1.0.0","protocol_ver":2,"trust_tier":"first_party","provides":[{role_json}],"consumes":[],"bindings":{{"storage":{{"kind":"sqlite","scope":"project","owns_schema":false}},"vault_grants":[],"identity":{{"requires":[],"optional":[]}}}}}}}}"#
+        )
+        .into_bytes()
+    }
+
+    fn manifest_from(body: &[u8]) -> ModuleManifest {
+        let value: serde_json::Value = serde_json::from_slice(body).expect("hello parses");
+        serde_json::from_value(value.get("manifest").expect("manifest key").clone())
+            .expect("manifest parses")
+    }
+
+    const SURFACE_TAIL: &str = r#""operations":[],"config_schema":{"type":"object"},"observability":[],"identity_scope":[]"#;
+
+    #[test]
+    fn absent_concurrency_on_management_surface_is_reported_as_defaulted() {
+        let body = hello_body(&format!(
+            r#"{{"role":"management_surface",{SURFACE_TAIL}}}"#
+        ));
+        let manifest = manifest_from(&body);
+        // Precondition: serde really resolved it to the default, so the typed
+        // manifest alone cannot answer the question this probe exists for.
+        assert_eq!(manifest_concurrency(&manifest), Concurrency::ModuleManaged);
+        assert!(manifest_concurrency_was_defaulted(&body, &manifest));
+    }
+
+    #[test]
+    fn declared_concurrency_is_not_reported_even_when_it_equals_the_default() {
+        let body = hello_body(&format!(
+            r#"{{"role":"management_surface",{SURFACE_TAIL},"concurrency":"module_managed"}}"#
+        ));
+        let manifest = manifest_from(&body);
+        assert_eq!(manifest_concurrency(&manifest), Concurrency::ModuleManaged);
+        assert!(!manifest_concurrency_was_defaulted(&body, &manifest));
+    }
+
+    #[test]
+    fn non_management_roles_are_never_reported() {
+        let body = hello_body(
+            r#"{"role":"internal_service","service_id":"s","transport":"bulk","agent_facing":false,"operations":[]}"#,
+        );
+        let manifest = manifest_from(&body);
+        assert!(!manifest_concurrency_was_defaulted(&body, &manifest));
     }
 }

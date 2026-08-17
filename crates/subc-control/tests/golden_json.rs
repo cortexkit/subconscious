@@ -129,9 +129,22 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             ClientControlRequest::SupervisorList {},
         ),
         (
+            // drain_timeout_ms: None is skipped on the wire, so this vector's
+            // bytes are unchanged by the field's addition -- an old client's
+            // restart request and a new flag-less one are byte-identical.
             "client_control_request_supervisor_restart",
             ClientControlRequest::SupervisorRestart {
                 module_id: "aft-tools".to_string(),
+                drain_timeout_ms: None,
+            },
+        ),
+        (
+            // The wedge-bounce form: an explicit 0 must SERIALIZE (it is the
+            // override, not the default), so it gets its own golden.
+            "client_control_request_supervisor_restart_drain_now",
+            ClientControlRequest::SupervisorRestart {
+                module_id: "aft-tools".to_string(),
+                drain_timeout_ms: Some(0),
             },
         ),
         (

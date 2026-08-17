@@ -867,8 +867,12 @@ impl ControlHandler {
                 kind,
             } => self.handle_route_poll(ctx, frame, route_channel, route_epoch, kind),
             ClientControlRequest::SupervisorList {} => self.handle_supervisor_list(frame),
-            ClientControlRequest::SupervisorRestart { module_id } => {
-                self.handle_supervisor_restart(frame, module_id).await
+            ClientControlRequest::SupervisorRestart {
+                module_id,
+                drain_timeout_ms,
+            } => {
+                self.handle_supervisor_restart(frame, module_id, drain_timeout_ms)
+                    .await
             }
             ClientControlRequest::SupervisorReload { module_id } => {
                 self.handle_supervisor_reload(frame, module_id).await
@@ -1606,6 +1610,7 @@ impl ControlHandler {
         &self,
         frame: Frame,
         module_id: String,
+        drain_timeout_ms: Option<u64>,
     ) -> Result<Vec<Frame>, RouterError> {
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
@@ -1617,7 +1622,7 @@ impl ControlHandler {
             )?]);
         };
 
-        if let Err(err) = module.restart().await {
+        if let Err(err) = module.restart(drain_timeout_ms).await {
             let (code, message) = match err {
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
@@ -1914,6 +1919,7 @@ impl ControlHandler {
                     .update_configuration(
                         configured_module.module_spec(),
                         configured_module.health,
+                        configured_module.drain_timeout_ms,
                     )
                     .await
                     .map_err(|err| {
@@ -1944,6 +1950,7 @@ impl ControlHandler {
                     configured_module.module_spec(),
                     configured_module.enabled,
                     configured_module.health,
+                    configured_module.drain_timeout_ms,
                 )
                 .map_err(|err| {
                     format!("failed to add module_id '{module_id}' during rescan: {err}")

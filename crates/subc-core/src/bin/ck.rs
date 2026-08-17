@@ -107,7 +107,7 @@ fn discover_external_domains() -> Vec<String> {
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
-  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
 
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
 
@@ -166,9 +166,10 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Module(ModuleCommand::Terminals { module_id }) => {
             module_terminals(&mut client, &module_id, args.json).await
         }
-        Command::Module(ModuleCommand::Restart { module_id }) => {
-            module_restart(&mut client, &module_id, args.json).await
-        }
+        Command::Module(ModuleCommand::Restart {
+            module_id,
+            drain_timeout_ms,
+        }) => module_restart(&mut client, &module_id, drain_timeout_ms, args.json).await,
         Command::Module(ModuleCommand::Rescan { preview }) => {
             module_rescan(&mut client, args.json, preview).await
         }
@@ -504,6 +505,9 @@ enum ModuleCommand {
     },
     Restart {
         module_id: String,
+        /// `Some(ms)` overrides the module's configured drain budget for this
+        /// one restart; `Some(0)` (from --now) skips the drain entirely.
+        drain_timeout_ms: Option<u64>,
     },
     Rescan {
         preview: bool,
@@ -791,6 +795,43 @@ async fn module_status(
 ///
 /// Scoped to the verb rather than the global argument set, like `--dry-run` on
 /// rescan, so it cannot silently apply somewhere else.
+/// `--now` and `--drain-ms <N>` on `ck module restart`: one restart's drain
+/// override. Returns `None` when neither flag is present so the wire request
+/// omits the field entirely (older daemons reject unknown channel-0 fields).
+/// `--now` is exactly `--drain-ms 0`; passing both is refused as ambiguous
+/// rather than silently picking one.
+fn parse_drain_override(tail: &[std::ffi::OsString]) -> Result<Option<u64>, CkError> {
+    let now = tail.iter().any(|t| t == "--now");
+    let mut drain_ms: Option<u64> = None;
+    let mut iter = tail.iter();
+    while let Some(token) = iter.next() {
+        if token == "--drain-ms" {
+            let value = iter.next().ok_or_else(|| {
+                CkError::Usage(format!(
+                    "--drain-ms needs a millisecond count\n\n{MODULE_HELP}"
+                ))
+            })?;
+            let parsed = value
+                .to_str()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    CkError::Usage(format!(
+                        "--drain-ms '{}' is not a millisecond count\n\n{MODULE_HELP}",
+                        value.to_string_lossy()
+                    ))
+                })?;
+            drain_ms = Some(parsed);
+        }
+    }
+    match (now, drain_ms) {
+        (true, Some(_)) => Err(CkError::Usage(format!(
+            "--now and --drain-ms are two answers to the same question; pass one\n\n{MODULE_HELP}"
+        ))),
+        (true, None) => Ok(Some(0)),
+        (false, value) => Ok(value),
+    }
+}
+
 fn parse_tail_count(tail: &[std::ffi::OsString]) -> Result<Option<u32>, CkError> {
     let Some(position) = tail.iter().position(|arg| arg == "-n") else {
         return Ok(None);
@@ -983,11 +1024,13 @@ async fn module_terminals(
 async fn module_restart(
     client: &mut CkClient,
     module_id: &str,
+    drain_timeout_ms: Option<u64>,
     json_output: bool,
 ) -> Result<(), CkError> {
     let ack = client
         .rpc_value(ClientControlRequest::SupervisorRestart {
             module_id: module_id.to_string(),
+            drain_timeout_ms,
         })
         .await?;
     print_ack_with_state(client, module_id, ack, "restart", json_output).await?;
@@ -3280,7 +3323,14 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                     max_lines: parse_tail_count(tail)?,
                 },
                 "terminals" => ModuleCommand::Terminals { module_id: id(1)? },
-                "restart" => ModuleCommand::Restart { module_id: id(1)? },
+                // --now = don't wait for in-flight requests (a wedged request
+                // never settles, so waiting only delays recovery); --drain-ms N
+                // widens/narrows the wait for this one restart. Flag-less form
+                // sends no override so older daemons keep accepting the request.
+                "restart" => ModuleCommand::Restart {
+                    module_id: id(1)?,
+                    drain_timeout_ms: parse_drain_override(tail)?,
+                },
                 "stop" => ModuleCommand::Stop { module_id: id(1)? },
                 "start" => ModuleCommand::Start { module_id: id(1)? },
                 other => {
@@ -3549,6 +3599,41 @@ impl From<serde_json::Error> for CkError {
 
 #[cfg(test)]
 mod tests {
+    mod drain_override {
+        use super::super::parse_drain_override;
+        use std::ffi::OsString;
+
+        fn tail(tokens: &[&str]) -> Vec<OsString> {
+            tokens.iter().map(OsString::from).collect()
+        }
+
+        #[test]
+        fn absent_flags_send_no_override() {
+            // None keeps the wire request byte-identical to pre-field clients,
+            // which is what lets older daemons keep accepting it.
+            assert_eq!(parse_drain_override(&tail(&["aft"])).unwrap(), None);
+        }
+
+        #[test]
+        fn now_is_zero_and_drain_ms_parses() {
+            assert_eq!(
+                parse_drain_override(&tail(&["aft", "--now"])).unwrap(),
+                Some(0)
+            );
+            assert_eq!(
+                parse_drain_override(&tail(&["aft", "--drain-ms", "120000"])).unwrap(),
+                Some(120_000)
+            );
+        }
+
+        #[test]
+        fn conflicting_flags_and_bad_counts_are_refused() {
+            assert!(parse_drain_override(&tail(&["aft", "--now", "--drain-ms", "5"])).is_err());
+            assert!(parse_drain_override(&tail(&["aft", "--drain-ms"])).is_err());
+            assert!(parse_drain_override(&tail(&["aft", "--drain-ms", "soon"])).is_err());
+        }
+    }
+
     use super::*;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
 

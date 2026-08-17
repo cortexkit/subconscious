@@ -19,6 +19,10 @@ const SUPPORTED_CONFIG_VERSION: u32 = 1;
 pub struct DaemonConfig {
     pub path: PathBuf,
     pub port: Option<u16>,
+    /// Daemon-wide default drain budget (ms) for module teardown: how long a
+    /// drain waits for already-dispatched requests to finalize. `None` uses
+    /// the built-in default (30s). Per-module `drain_timeout_ms` overrides.
+    pub drain_timeout_ms: Option<u64>,
     pub modules: Vec<ConfiguredModule>,
     /// Central storage policy: the single backend choice all managed modules use.
     /// `None` when the config has no `storage` section (no managed storage).
@@ -109,6 +113,9 @@ pub struct ConfiguredModule {
     /// spawn nonce.
     pub reserved_prefixes: Vec<String>,
     pub health: HealthConfig,
+    /// Effective drain budget (ms) for this module's teardown, already resolved
+    /// against the daemon-wide default at parse time. `None` = built-in default.
+    pub drain_timeout_ms: Option<u64>,
 }
 
 impl ConfiguredModule {
@@ -154,6 +161,8 @@ struct RawDaemonConfig {
     #[serde(default)]
     port: Option<u16>,
     #[serde(default)]
+    drain_timeout_ms: Option<u64>,
+    #[serde(default)]
     modules: BTreeMap<String, RawModuleConfig>,
     #[serde(default)]
     storage: Option<RawStorageConfig>,
@@ -189,6 +198,8 @@ struct RawModuleConfig {
     reserved_prefixes: Vec<String>,
     #[serde(default)]
     health: Option<RawHealthConfig>,
+    #[serde(default)]
+    drain_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +288,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         });
     }
 
+    let default_drain_timeout_ms = raw.drain_timeout_ms;
     let modules = raw
         .modules
         .into_iter()
@@ -295,6 +307,9 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 reserved: module.reserved,
                 reserved_prefixes: module.reserved_prefixes,
                 health,
+                // Per-module wins; the daemon-wide value is the fallback. `0` is
+                // legitimate ("never wait"), so this is `.or`, not `filter+or`.
+                drain_timeout_ms: module.drain_timeout_ms.or(default_drain_timeout_ms),
             })
         })
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
@@ -316,6 +331,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
     Ok(DaemonConfig {
         path: path.to_path_buf(),
         port: raw.port,
+        drain_timeout_ms: default_drain_timeout_ms,
         modules,
         storage,
         admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
@@ -676,6 +692,56 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn drain_timeout_resolves_module_over_daemon_over_absent() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "drain_timeout_ms": 45000,
+              "modules": {
+                "fast": { "program": "fast", "drain_timeout_ms": 0 },
+                "slow": { "program": "slow", "drain_timeout_ms": 120000 },
+                "inherits": { "program": "inherits" }
+              }
+            }
+            "#,
+            path,
+        )
+        .unwrap();
+        let by_id = |id: &str| {
+            config
+                .modules
+                .iter()
+                .find(|m| m.module_id == id)
+                .unwrap()
+                .drain_timeout_ms
+        };
+        // Per-module wins, INCLUDING an explicit 0 ("never wait") -- the case a
+        // truthiness-shaped resolution would silently replace with the default.
+        assert_eq!(by_id("fast"), Some(0));
+        assert_eq!(by_id("slow"), Some(120_000));
+        // No per-module value: the daemon-wide default flows in at parse time.
+        assert_eq!(by_id("inherits"), Some(45_000));
+        assert_eq!(config.drain_timeout_ms, Some(45_000));
+    }
+
+    #[test]
+    fn drain_timeout_absent_everywhere_stays_none_for_builtin_default() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m" } } }"#,
+            path,
+        )
+        .unwrap();
+        // None here is load-bearing: it means "use the compiled default", so a
+        // future default bump reaches every unconfigured module without a
+        // config migration.
+        assert_eq!(config.modules[0].drain_timeout_ms, None);
+        assert_eq!(config.drain_timeout_ms, None);
     }
 
     #[test]

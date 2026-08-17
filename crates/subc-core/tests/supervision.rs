@@ -204,7 +204,7 @@ async fn restart_and_reload_are_rejected_for_a_disabled_module() {
     .await;
 
     let restart_err = module
-        .restart()
+        .restart(None)
         .await
         .expect_err("restart on a disabled module must be rejected");
     assert!(
@@ -255,7 +255,7 @@ async fn operator_restart_resets_restart_count() {
     .await;
     assert!(crashed.restart_count >= 1);
 
-    module.restart().await.unwrap();
+    module.restart(None).await.unwrap();
 
     let restarted = wait_for_status(&module, Duration::from_secs(3), |status| {
         status.restart_count == 0 && status.state == ModuleState::Running && status.live
@@ -404,7 +404,7 @@ async fn clean_exit_keeps_supervision_task_alive_for_operator_restart() {
     // The load-bearing assertion: the supervision task must still answer
     // commands after the clean exit, and restart must fully revive the module.
     module
-        .restart()
+        .restart(None)
         .await
         .expect("restart after clean exit must reach a live supervision task");
 

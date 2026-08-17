@@ -1,0 +1,5 @@
+{
+  "drain_timeout_ms": 0,
+  "module_id": "aft-tools",
+  "op": "supervisor.restart"
+}

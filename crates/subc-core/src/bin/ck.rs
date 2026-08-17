@@ -3682,8 +3682,8 @@ mod tests {
         // Enriched entry per QTA's committed additive contract.
         let enriched = serde_json::json!({
             "provider": "codex",
-            "account": "ufukaltinok@gmail.com",
-            "accountInfo": { "email": "ufukaltinok@gmail.com", "planType": "pro" },
+            "account": "operator@example.com",
+            "accountInfo": { "email": "operator@example.com", "planType": "pro" },
             "savedResets": { "availableCount": 4 }
         });
         let extras = quota_account_header_extras(&enriched);

@@ -2145,6 +2145,16 @@ async fn supervise_loop(
                         Err(err) => {
                             active_child.drain_stderr(&spec.module_id).await;
                             fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                            // Every other exit path (on_child_exit's Clean/Crash arms,
+                            // the reload-registration-failure path) records a terminal
+                            // before moving on. Without one here, a module whose wait()
+                            // itself errored (e.g. already reaped) leaves no terminal
+                            // record at all -- an empty ring reads as "nothing died".
+                            record_terminal(
+                                &runtime.terminal_ring,
+                                &wait_error_exit_report(),
+                                TerminalDisposition::Failed,
+                            );
                             untrack_if_registration_released(
                                 &process_liveness,
                                 &registry,
@@ -3482,6 +3492,20 @@ fn classify_exit(status: &ExitStatus) -> ExitReport {
     }
 }
 
+/// The terminal record for a module whose `wait()` call itself errored (e.g. the
+/// child was already reaped out-of-band). There is no `ExitStatus` to read a code
+/// or signal from -- `None`/`None` is the honest shape, not a guess -- but the
+/// disposition still must be `Failed` so the terminal ring is not silently missing
+/// an entry, matching what `fail_snapshot` records for this same arm.
+fn wait_error_exit_report() -> ExitReport {
+    ExitReport {
+        kind: ExitKind::Crash,
+        code: None,
+        signal: None,
+        at_ms: unix_ms_now(),
+    }
+}
+
 #[cfg(unix)]
 fn exit_signal(status: &ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
@@ -3557,10 +3581,15 @@ mod terminal_history_tests {
     use tokio::time::sleep;
 
     use super::{
-        drained_after_quiescence_wait, ModuleSpec, ModuleState, RestartPolicy, SuperviseError,
-        Supervisor,
+        drained_after_quiescence_wait, record_terminal, wait_error_exit_report, ExitKind,
+        ModuleSpec, ModuleState, RestartPolicy, SuperviseError, Supervisor,
     };
-    use crate::registry::Registry;
+    use crate::{
+        registry::Registry,
+        terminal_ring::{TerminalRing, TerminalRingConfig},
+    };
+    use std::sync::Mutex;
+    use subc_control::TerminalDisposition;
 
     /// See the twin in `control.rs` for why this derives the path from
     /// `current_exe()` and why the existence check is here: `--lib` alone does
@@ -3638,6 +3667,42 @@ mod terminal_history_tests {
         assert!(!drained_after_quiescence_wait(&Err(
             SuperviseError::StatePoisoned { module_id: None }
         )));
+    }
+
+    /// `supervise_loop`'s `wait()`-error arm now calls `record_terminal` like every
+    /// other exit path does, so a module whose child `wait()` itself errored (e.g.
+    /// already reaped out-of-band) still leaves a terminal record rather than none
+    /// at all. Triggering the real `wait()` I/O error from an integration test would
+    /// need a genuine already-reaped-child race, which is OS-specific and not
+    /// something this suite attempts elsewhere; this test instead verifies the
+    /// record produced for that arm end-to-end through the real `TerminalRing`, and
+    /// the call site itself is verified by inspection to sit in that exact arm.
+    #[test]
+    fn wait_error_exit_report_records_a_failed_terminal_with_no_code_or_signal() {
+        let ring = Arc::new(Mutex::new(TerminalRing::new(
+            TerminalRingConfig::default(),
+            0,
+        )));
+        record_terminal(
+            &ring,
+            &wait_error_exit_report(),
+            TerminalDisposition::Failed,
+        );
+
+        let snapshot = ring.lock().unwrap().snapshot();
+        assert_eq!(snapshot.entries.len(), 1);
+        let entry = &snapshot.entries[0];
+        assert_eq!(entry.exit_code, None);
+        assert_eq!(entry.exit_signal, None);
+        assert_eq!(entry.disposition, TerminalDisposition::Failed);
+    }
+
+    /// Pins the report's `kind` too: the wait-error arm treats an unwaitable child
+    /// as a crash (matching `fail_snapshot`'s `Failed` disposition for this arm),
+    /// not a clean exit it never actually observed.
+    #[test]
+    fn wait_error_exit_report_is_classified_as_a_crash() {
+        assert_eq!(wait_error_exit_report().kind, ExitKind::Crash);
     }
 }
 

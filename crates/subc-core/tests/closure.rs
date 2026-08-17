@@ -716,6 +716,8 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::CATALOG_LIST,
         ops::ROUTE_OPEN,
         ops::ROUTE_POLL,
+        ops::ROUTE_CLOSING,
+        ops::ROUTE_CLOSED,
         ops::SUPERVISOR_LIST,
         ops::SUPERVISOR_RESTART,
         ops::SUPERVISOR_RELOAD,

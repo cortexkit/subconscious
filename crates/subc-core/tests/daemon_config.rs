@@ -276,6 +276,26 @@ async fn rescan_removes_module_and_leaves_other_open_route_undisturbed() {
     wait_for_supervisor_absent(&daemon.connection_file_path, removed_id, STATE_TIMEOUT).await;
     wait_for_catalog_absent(&daemon.connection_file_path, removed_id, STATE_TIMEOUT).await;
 
+    let closing = read_frame_timeout(&mut removed_client).await;
+    assert_eq!(closing.header.ty, FrameType::Push);
+    assert_eq!(closing.header.channel, 0);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&closing.body).unwrap(),
+        json!({"op": "route.closing", "module_id": removed_id, "reason": "disable"})
+    );
+    let closed = read_frame_timeout(&mut removed_client).await;
+    assert_eq!(closed.header.ty, FrameType::Push);
+    assert_eq!(closed.header.channel, 0);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&closed.body).unwrap(),
+        json!({
+            "op": "route.closed",
+            "module_id": removed_id,
+            "reason": "disable",
+            "drained": true,
+            "abandoned": 0,
+        })
+    );
     let goodbye = read_frame_timeout(&mut removed_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, removed_route.channel);

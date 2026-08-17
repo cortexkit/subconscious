@@ -386,15 +386,28 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             },
         ),
         (
-            // The forced-teardown case: drained:false with a non-zero abandoned
-            // count is the combination carrying the most semantic weight, since
+            // The forced-teardown case: a planned drain (reload) that timed out
+            // with binds abandoned. drained:false with a non-zero abandoned count
+            // is the combination carrying the most semantic weight, since
             // drained:true must never appear over abandoned routes.
             "client_control_push_route_closed_abandoned",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
-                reason: RouteCloseReason::Crash,
+                reason: RouteCloseReason::Reload,
                 drained: false,
                 abandoned: 3,
+            },
+        ),
+        (
+            // Matches cleanup_connection's crash-teardown shape exactly: a crash
+            // has no drain, so abandoned is always 0 -- unlike the planned-drain
+            // reasons above, crash + abandoned>0 is unreachable on the wire.
+            "client_control_push_route_closed_crash",
+            ClientControlPush::RouteClosed {
+                module_id: "aft-tools".to_string(),
+                reason: RouteCloseReason::Crash,
+                drained: false,
+                abandoned: 0,
             },
         ),
     ]

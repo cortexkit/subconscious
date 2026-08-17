@@ -737,6 +737,13 @@ impl ControlHandler {
                     ),
                 )?])
             }
+            Err(err @ RegistryError::PathHazardModuleId { .. }) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_module_id",
+                    err.to_string(),
+                )?])
+            }
             Err(err) => {
                 return Ok(vec![control_error_frame(
                     &frame,

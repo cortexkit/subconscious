@@ -84,3 +84,36 @@ describe("parseStorageDescriptor", () => {
     ).toThrow(/storage descriptor\.backend must be an object/);
   });
 });
+
+describe("sqliteStorePath path-hazard refusal (issue #32)", () => {
+  // The derivation REFUSES ids unusable as a path component instead of
+  // sanitizing them: sanitizing would silently re-path deployed stores and
+  // diverge from the daemon's Rust derivation. Each case asserts the REASON so
+  // a broken predicate cannot pass by throwing the wrong refusal.
+  test("refuses traversal, collision-class, and unprintable ids by name", () => {
+    const cases: Array<[string, RegExp]> = [
+      ["../escape", /path separator/],
+      ["a/b", /path separator/],
+      ["a\\b", /path separator/],
+      ["..", /dot path component/],
+      [".", /dot path component/],
+      ["", /empty/],
+      ["evil\u0000id", /control character/],
+    ];
+    for (const [moduleId, reason] of cases) {
+      expect(() => sqliteStorePath("/data", moduleId)).toThrow(reason);
+    }
+  });
+
+  test("every working fleet id shape passes byte-identically", () => {
+    // The refusal must not move a single deployed path: hyphens, dots inside
+    // names, and reserved-namespace colons all pass through verbatim.
+    expect(sqliteStorePath("/data", "magic-context")).toBe(
+      "/data/cortexkit/magic-context/store.db",
+    );
+    expect(sqliteStorePath("/data", "mcp:everything")).toBe(
+      "/data/cortexkit/mcp:everything/store.db",
+    );
+    expect(sqliteStorePath("/data", "v1.2-module")).toBe("/data/cortexkit/v1.2-module/store.db");
+  });
+});

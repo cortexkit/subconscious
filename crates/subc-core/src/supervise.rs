@@ -2505,10 +2505,24 @@ async fn restart_child(
     reset_restart_count(snapshot, &spec.module_id)?;
     sleep(runtime.restart_policy.backoff).await;
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-    let next_child = spawn_and_mark_running(spec, runtime, snapshot)?;
-    *child = Some(next_child);
-    debug!(module_id = %spec.module_id, "supervised module restarted by operator request");
-    Ok(())
+    // Mirror health_restart_child's spawn-failure handling: of the four
+    // spawn-failure sites this was the only one that propagated with the
+    // snapshot still reading `Restarting` -- neither running nor failed, and
+    // unrevivable by `set_enabled(true)` (issue #34). `Failed` is the state the
+    // operator can see and heal.
+    match spawn_and_mark_running(spec, runtime, snapshot) {
+        Ok(next_child) => {
+            *child = Some(next_child);
+            debug!(module_id = %spec.module_id, "supervised module restarted by operator request");
+            Ok(())
+        }
+        Err(err) => {
+            fail_snapshot(snapshot, Some(&spec.module_id), None);
+            process_liveness.untrack_if_current(&spec.module_id, snapshot);
+            *child = None;
+            Err(err)
+        }
+    }
 }
 
 async fn reload_child(
@@ -3518,13 +3532,27 @@ async fn drain_child_to_state(
             });
         }
         Err(_) => {
-            child.start_kill().map_err(|source| SuperviseError::Kill {
-                module_id: module_id.to_string(),
-                source,
+            // Mirror the sibling arm above: state is already `Draining`, and an
+            // error propagated from here would strand it there -- a state
+            // `set_enabled(true)` cannot heal (`revive_terminal` matches only
+            // `Failed | Stopped`), leaving an operator Restart as the only exit.
+            // `Failed` before `?` keeps the module operator-visible and
+            // revivable. Trigger is an ESRCH race (process exits between the
+            // drain timeout firing and the kill) or a post-kill wait failure
+            // (issue #34).
+            child.start_kill().map_err(|source| {
+                fail_snapshot(snapshot, Some(module_id), None);
+                SuperviseError::Kill {
+                    module_id: module_id.to_string(),
+                    source,
+                }
             })?;
-            let status = child.wait().await.map_err(|source| SuperviseError::Wait {
-                module_id: module_id.to_string(),
-                source,
+            let status = child.wait().await.map_err(|source| {
+                fail_snapshot(snapshot, Some(module_id), None);
+                SuperviseError::Wait {
+                    module_id: module_id.to_string(),
+                    source,
+                }
             })?;
             classify_exit(&status)
         }

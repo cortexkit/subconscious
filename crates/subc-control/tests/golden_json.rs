@@ -3,10 +3,10 @@ use std::{fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
-    CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
-    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorHealthStatus, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
-    SupervisorRouteModule,
+    CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse, ConsumerIdentity,
+    PollKind, RouteCloseReason, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry,
+    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorRescanResult, SupervisorRoute,
+    SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
     manifest::{
@@ -27,6 +27,9 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     }
     for (name, response) in client_control_responses() {
         assert_golden(name, &response);
+    }
+    for (name, push) in client_control_pushes() {
+        assert_golden(name, &push);
     }
     assert_golden("catalog_entry", &catalog_entry());
     assert_golden("supervisor_entry", &supervisor_entry());
@@ -350,6 +353,48 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     }],
                     dropped_lines: 0,
                 },
+            },
+        ),
+    ]
+}
+
+fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
+    vec![
+        (
+            "client_control_push_route_closing",
+            ClientControlPush::RouteClosing {
+                module_id: "aft-tools".to_string(),
+                reason: RouteCloseReason::Reload,
+            },
+        ),
+        (
+            // Disable pinned on RouteClosing so the reason enum's full range is
+            // covered without a fifth combination of drained/abandoned.
+            "client_control_push_route_closing_disable",
+            ClientControlPush::RouteClosing {
+                module_id: "aft-tools".to_string(),
+                reason: RouteCloseReason::Disable,
+            },
+        ),
+        (
+            "client_control_push_route_closed_drained",
+            ClientControlPush::RouteClosed {
+                module_id: "aft-tools".to_string(),
+                reason: RouteCloseReason::Restart,
+                drained: true,
+                abandoned: 0,
+            },
+        ),
+        (
+            // The forced-teardown case: drained:false with a non-zero abandoned
+            // count is the combination carrying the most semantic weight, since
+            // drained:true must never appear over abandoned routes.
+            "client_control_push_route_closed_abandoned",
+            ClientControlPush::RouteClosed {
+                module_id: "aft-tools".to_string(),
+                reason: RouteCloseReason::Crash,
+                drained: false,
+                abandoned: 3,
             },
         ),
     ]

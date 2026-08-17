@@ -1,0 +1,7 @@
+{
+  "abandoned": 3,
+  "drained": false,
+  "module_id": "aft-tools",
+  "op": "route.closed",
+  "reason": "crash"
+}

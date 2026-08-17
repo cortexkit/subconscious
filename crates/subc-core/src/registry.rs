@@ -69,8 +69,11 @@ impl Registry {
         connection_id: ConnectionId,
         control_ops: Vec<String>,
     ) -> Result<ModuleRegistration, RegistryError> {
-        let mut inner = self.lock_inner()?;
         let module_id = manifest.module_id.clone();
+        if let Err(reason) = module_id_path_hazard(&module_id) {
+            return Err(RegistryError::PathHazardModuleId { module_id, reason });
+        }
+        let mut inner = self.lock_inner()?;
         if inner.modules.contains_key(&module_id) {
             return Err(RegistryError::DuplicateModuleId { module_id });
         }
@@ -184,7 +187,21 @@ impl RegistryInner {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
-    DuplicateModuleId { module_id: String },
+    DuplicateModuleId {
+        module_id: String,
+    },
+    /// The id is unusable as a single path component. Enforced at
+    /// registration because the daemon MINTS A STORAGE DESCRIPTOR from the
+    /// self-claimed id verbatim (`<data_home>/cortexkit/<module_id>/store.db`),
+    /// so an id carrying separators or dot components is a path-traversal or
+    /// store-collision primitive handed to whoever claims it (issue #32). The
+    /// derivations deliberately do NOT sanitize instead: sanitizing here would
+    /// silently re-path every deployed store and desynchronize the Rust and TS
+    /// derivations, while refusal changes nothing for any id that ever worked.
+    PathHazardModuleId {
+        module_id: String,
+        reason: String,
+    },
     Poisoned,
 }
 
@@ -194,9 +211,120 @@ impl fmt::Display for RegistryError {
             Self::DuplicateModuleId { module_id } => {
                 write!(f, "module_id '{module_id}' is already registered")
             }
+            Self::PathHazardModuleId { module_id, reason } => {
+                write!(
+                    f,
+                    "module_id '{}' is not usable as a path component: {reason}",
+                    module_id.escape_debug()
+                )
+            }
             Self::Poisoned => write!(f, "registry lock was poisoned"),
         }
     }
 }
 
 impl Error for RegistryError {}
+
+/// Why `module_id` cannot serve as a single path component, or `Ok(())`.
+///
+/// This is a REFUSAL predicate, not a sanitizer: every currently-working fleet
+/// id passes untouched, and anything refused here never worked meaningfully --
+/// it either escaped `<data_home>/cortexkit/` (separators, dot components) or
+/// aliased another module's store (`a/b` vs `a//b` collapsing on POSIX).
+/// Colons are allowed: reserved-namespace children (`mcp:...`) register today
+/// and a colon cannot traverse. Windows path legality is the store library's
+/// concern, not an identity rule.
+pub fn module_id_path_hazard(module_id: &str) -> Result<(), String> {
+    if module_id.is_empty() {
+        return Err("empty".to_string());
+    }
+    if module_id.contains('/') || module_id.contains('\\') {
+        return Err("contains a path separator".to_string());
+    }
+    if module_id == "." || module_id == ".." {
+        return Err("is a dot path component".to_string());
+    }
+    if module_id.chars().any(|c| c.is_control()) {
+        return Err("contains a control character".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod path_hazard_tests {
+    use super::*;
+    use crate::ConnectionId;
+    use subc_protocol::manifest::{
+        Bindings, IdentityBinding, IdentityScope, ModuleManifest, StorageBinding, StorageKind,
+        StorageScope, TrustTier,
+    };
+
+    fn manifest(module_id: &str) -> ModuleManifest {
+        ModuleManifest {
+            module_id: module_id.to_string(),
+            module_version: "0.1.0".to_string(),
+            protocol_ver: 1,
+            trust_tier: TrustTier::FirstParty,
+            provides: Vec::new(),
+            consumes: Vec::new(),
+            bindings: Bindings {
+                storage: StorageBinding {
+                    kind: StorageKind::Sqlite,
+                    scope: StorageScope::Project,
+                    owns_schema: true,
+                },
+                vault_grants: Vec::new(),
+                identity: IdentityBinding {
+                    requires: vec![IdentityScope::Project],
+                    optional: Vec::new(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn path_hazard_ids_are_refused_and_nothing_registers() {
+        let registry = Registry::default();
+        for (bad, reason_fragment) in [
+            ("../escape", "path separator"),
+            ("a/b", "path separator"),
+            ("a\\b", "path separator"),
+            ("..", "dot path component"),
+            (".", "dot path component"),
+            ("", "empty"),
+            ("evil\u{0}id", "control character"),
+        ] {
+            let err = registry
+                .register_with_control_ops(manifest(bad), 1, ConnectionId::new(7), Vec::new())
+                .expect_err("path-hazard id must refuse");
+            // Reason asserted so a predicate throwing the WRONG refusal fails.
+            assert!(
+                err.to_string().contains(reason_fragment),
+                "id {bad:?}: expected {reason_fragment:?} in {err}"
+            );
+        }
+        // THE EFFECT, not just the verdicts: no refusal left a registration
+        // behind, and the generation never moved.
+        assert_eq!(registry.active_registration_count().unwrap(), 0);
+        assert_eq!(registry.generation().unwrap(), 0);
+    }
+
+    #[test]
+    fn working_id_shapes_register_including_namespace_colons() {
+        let registry = Registry::default();
+        for (i, good) in ["magic-context", "mcp:everything", "v1.2-module"]
+            .iter()
+            .enumerate()
+        {
+            registry
+                .register_with_control_ops(
+                    manifest(good),
+                    1,
+                    ConnectionId::new(10 + i as u64),
+                    Vec::new(),
+                )
+                .unwrap_or_else(|err| panic!("id {good:?} must register: {err}"));
+        }
+        assert_eq!(registry.active_registration_count().unwrap(), 3);
+    }
+}

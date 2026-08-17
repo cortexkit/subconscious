@@ -298,6 +298,16 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 .map(|health| parse_health_config(health, path, &module_id))
                 .transpose()?
                 .unwrap_or_default();
+            if let Err(reason) = crate::registry::module_id_path_hazard(&module_id) {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module id '{}' is not usable as a path component ({reason}): \
+                         the daemon derives each module's store path from its id",
+                        module_id.escape_debug()
+                    ),
+                });
+            }
             Ok(ConfiguredModule {
                 module_id,
                 program: module.program,
@@ -691,6 +701,21 @@ mod tests {
                     "path": "/data/cortexkit/alfonso-routing/store.db"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn path_hazard_module_id_refuses_config_parse() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let err = parse_doc(
+            r#"{ "version": 1, "modules": { "../escape": { "program": "x" } } }"#,
+            path,
+        )
+        .expect_err("separator-bearing module id must refuse");
+        let text = format!("{err}");
+        assert!(
+            text.contains("not usable as a path component"),
+            "refusal must name the hazard: {text}"
         );
     }
 

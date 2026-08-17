@@ -9,7 +9,31 @@ export function postgresDatabaseName(moduleId: string): string {
 }
 
 export function sqliteStorePath(dataHome: string, moduleId: string): string {
+  // REFUSE rather than sanitize (issue #32): this derivation must stay
+  // byte-identical to the daemon's Rust derivation (subc-core
+  // `StorageConfig::descriptor_for`) and to every store already on disk, so
+  // mapping unsafe characters the way `postgresDatabaseName` does would
+  // silently re-path deployed stores and desynchronize the two languages.
+  // Refusal changes nothing for any id that ever worked; what it removes is
+  // the id-as-path primitive: `../` escaping `${dataHome}/cortexkit/`, and
+  // `a/b` vs `a//b` -- distinct ids, one POSIX file -- silently sharing a
+  // store. The daemon enforces the same predicate at registration; this is
+  // the standalone-consumer half of the same boundary.
+  assertPathSafeModuleId(moduleId);
   return `${dataHome.replace(/\/+$/, "")}/cortexkit/${moduleId}/store.db`;
+}
+
+function assertPathSafeModuleId(moduleId: string): void {
+  const refuse = (reason: string) => {
+    throw new TypeError(
+      `module_id ${JSON.stringify(moduleId)} is not usable as a path component: ${reason}`,
+    );
+  };
+  if (moduleId.length === 0) refuse("empty");
+  if (moduleId.includes("/") || moduleId.includes("\\")) refuse("contains a path separator");
+  if (moduleId === "." || moduleId === "..") refuse("is a dot path component");
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(moduleId)) refuse("contains a control character");
 }
 
 function postgresSlug(moduleId: string): string {

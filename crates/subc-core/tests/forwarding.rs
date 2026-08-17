@@ -1571,10 +1571,25 @@ async fn supervisor_restart_acks_at_initiation_and_still_drains_the_inflight_req
     let applied = read_supervisor_ack_on_stream(&mut control_client, 423, module_id).await;
     assert!(applied);
 
-    // And the drain still does its job for the initiator: the slow request
-    // SETTLES with its real response (never cut), then the teardown GOODBYE.
+    // And the drain still does its job for the initiator, with the #31 lifecycle
+    // pushes bracketing it: route.closing lands first (enqueued before the drain
+    // starts -- i.e. before the slow request settles, which pins the ACK-before-
+    // drain ordering from the route client's own stream), then the slow request
+    // SETTLES with its real response (never cut), then route.closed with
+    // drained=true, then the teardown GOODBYE.
+    let closing = read_frame_timeout_for(&mut route_client, Duration::from_secs(20)).await;
+    assert_route_lifecycle_push(&closing, "route.closing", module_id, "restart", None, None);
     let response = read_frame_timeout_for(&mut route_client, Duration::from_secs(20)).await;
     assert_response(&response, ack.route_channel, slow_corr, slow_payload);
+    let closed = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "restart",
+        Some(true),
+        Some(0),
+    );
     let goodbye = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, ack.route_channel);

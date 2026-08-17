@@ -34,6 +34,7 @@ use tokio::{net::TcpStream, time};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DASHBOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_FILE_NAME: &str = "subc-connection.json";
 const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
@@ -133,19 +134,28 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
 
     // Help and external dispatch resolve without a daemon connection: help is
     // static text, and an external ck-<domain> tool discovers its own connection.
-    if let Command::Help(text) = args.command {
+    if let Command::Help(text) = &args.command {
         println!("{text}");
         return Ok(());
     }
-    if let Command::External { domain, tail } = args.command {
-        return dispatch_external(&domain, &tail);
+    if let Command::External { domain, tail } = &args.command {
+        return dispatch_external(domain, tail);
+    }
+    if matches!(&args.command, Command::Dashboard) {
+        return dashboard(&args).await;
     }
 
-    let resolved = discover_connection_file(args.subc.as_deref())?;
-    let mut client = CkClient::connect(resolved).await?;
+    let resolved = discover_connection_file(args.subc.as_deref())
+        .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
+    let mut client = CkClient::connect(resolved)
+        .await
+        .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
 
-    match args.command {
-        Command::Module(ModuleCommand::List) => module_list(&mut client, args.json).await,
+    let result = match args.command {
+        Command::Dashboard => unreachable!("handled before connecting"),
+        Command::Module(ModuleCommand::List) => {
+            module_list(&mut client, args.json, args.subc.as_deref()).await
+        }
         Command::Module(ModuleCommand::Status { module_id }) => {
             module_status(&mut client, &module_id, args.json).await
         }
@@ -169,9 +179,15 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             module_set_enabled(&mut client, &module_id, true, args.json).await
         }
         Command::Routes { module_id } => {
-            supervisor_routes(&mut client, module_id.as_deref(), args.json).await
+            supervisor_routes(
+                &mut client,
+                module_id.as_deref(),
+                args.json,
+                args.subc.as_deref(),
+            )
+            .await
         }
-        Command::Health => health(&mut client, args.json).await,
+        Command::Health => health(&mut client, args.json, args.subc.as_deref()).await,
         Command::HealthDetail { module_id } => {
             health_detail(&mut client, &module_id, args.json).await
         }
@@ -179,8 +195,255 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Quota {
             provider_id,
             verbose,
-        } => quota(&mut client, provider_id.as_deref(), args.json, verbose).await,
+        } => {
+            quota(
+                &mut client,
+                provider_id.as_deref(),
+                args.json,
+                verbose,
+                args.subc.as_deref(),
+            )
+            .await
+        }
         Command::Help(_) | Command::External { .. } => unreachable!("handled before connect"),
+    };
+    result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
+}
+
+/// Data collected by the bare-command probe. The module list supplies process
+/// state, while the health response is the same stored health surface rendered by
+/// `ck health`.
+struct DashboardSnapshot {
+    daemon_ver: String,
+    pid: u32,
+    path: PathBuf,
+    describe: Value,
+    modules: Value,
+    health: Value,
+}
+
+async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
+    let resolved = match discover_connection_file(args.subc.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            print_degraded_dashboard(&args.program, &error);
+            return Ok(());
+        }
+    };
+    let path = resolved.path.clone();
+    let result = match time::timeout(DASHBOARD_PROBE_TIMEOUT, dashboard_probe(resolved)).await {
+        Ok(result) => result,
+        Err(_) => Err(CkError::Connection {
+            path,
+            source: format!("dashboard probe timed out after {DASHBOARD_PROBE_TIMEOUT:?}"),
+        }),
+    };
+
+    match result {
+        Ok(snapshot) => print_dashboard(&args.program, &snapshot, args.subc.as_deref()),
+        Err(error) => print_degraded_dashboard(&args.program, &error),
+    }
+    Ok(())
+}
+
+async fn dashboard_probe(resolved: ResolvedConnection) -> Result<DashboardSnapshot, CkError> {
+    let mut client = CkClient::connect(resolved).await?;
+    let path = client.path.clone();
+    let describe = client
+        .rpc_value(ClientControlRequest::ServerDescribe {})
+        .await
+        .map_err(|error| dashboard_connection_error(&path, error))?;
+    let modules = supervisor_list(&mut client)
+        .await
+        .map_err(|error| dashboard_connection_error(&path, error))?;
+    let health = supervisor_health(&mut client)
+        .await
+        .map_err(|error| dashboard_connection_error(&path, error))?;
+    Ok(DashboardSnapshot {
+        daemon_ver: client.info.daemon_ver.clone(),
+        pid: client.info.pid,
+        path: client.path.clone(),
+        describe,
+        modules,
+        health,
+    })
+}
+
+fn print_dashboard(program: &Path, snapshot: &DashboardSnapshot, subc: Option<&Path>) {
+    print_dashboard_identity(program);
+    let build = snapshot
+        .describe
+        .get("build_git_sha")
+        .and_then(Value::as_str)
+        .filter(|sha| !sha.is_empty() && *sha != "unavailable")
+        .map(short_build_sha)
+        .unwrap_or_else(|| "build unknown".to_string());
+    let clients = display_field(&snapshot.describe, "connected_clients");
+    let uptime = connection_file_age(&snapshot.path)
+        .map(format_duration)
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "daemon: {} ({build}) · pid {} · up {uptime} · {clients} clients",
+        snapshot.daemon_ver, snapshot.pid
+    );
+    print_dashboard_module_summary(&snapshot.modules, &snapshot.health);
+    print_static_domains();
+    let footer = [
+        next_step("ck health <id>", "for one module's metrics", subc),
+        next_step("ck module status <id>", "for supervision state", subc),
+    ];
+    print_help_footer(&footer);
+}
+
+fn print_degraded_dashboard(program: &Path, error: &CkError) {
+    print_dashboard_identity(program);
+    println!("daemon: unreachable — {}", dashboard_error_text(error));
+    print_static_domains();
+    print_help_footer(&[
+        "Check the connection file path above, then run `ck daemon --subc <connection-file>`",
+    ]);
+}
+
+fn dashboard_connection_error(path: &Path, error: CkError) -> CkError {
+    CkError::Connection {
+        path: path.to_path_buf(),
+        source: error.to_string(),
+    }
+}
+
+fn dashboard_error_text(error: &CkError) -> String {
+    match error {
+        CkError::Discovery { .. } | CkError::Connection { .. } => error.to_string(),
+        other => format!("subc daemon did not answer: {other}"),
+    }
+}
+
+fn print_dashboard_identity(program: &Path) {
+    let (path, real_path) = executable_identity(program);
+    let path = display_home_path(&path);
+    match real_path {
+        Some(real_path) => println!(
+            "ck — CortexKit operator CLI\nbin: {path} ({})",
+            display_home_path(&real_path)
+        ),
+        None => println!("ck — CortexKit operator CLI\nbin: {path}"),
+    }
+}
+
+fn print_dashboard_module_summary(modules: &Value, health: &Value) {
+    let module_entries = modules_array(modules);
+    let health_entries = modules_array(health);
+    let running = module_entries
+        .iter()
+        .filter(|module| display_field(module, "state") == "running")
+        .count();
+    let ok = module_entries
+        .iter()
+        .filter(|module| dashboard_health_status(health_entries, module) == "ok")
+        .count();
+    let mut alerts = Vec::new();
+    for module in module_entries {
+        let status = dashboard_health_status(health_entries, module);
+        if status != "ok" {
+            alerts.push(display_field(module, "module_id"));
+        }
+    }
+    for entry in health_entries {
+        let module_id = display_field(entry, "module_id");
+        if !module_entries
+            .iter()
+            .any(|module| display_field(module, "module_id") == module_id)
+            && display_field(entry, "status") != "ok"
+        {
+            alerts.push(module_id);
+        }
+    }
+    println!("modules: {running} running, {ok} ok");
+    if alerts.is_empty() {
+        println!("alerts: none");
+    } else {
+        println!("alerts: {}", alerts.join(", "));
+    }
+}
+
+fn dashboard_health_status(health_entries: &[Value], module: &Value) -> String {
+    let module_id = display_field(module, "module_id");
+    health_entries
+        .iter()
+        .find(|entry| display_field(entry, "module_id") == module_id)
+        .map(|entry| display_field(entry, "status"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn print_static_domains() {
+    const BUILTIN_DOMAINS: [&str; 5] = ["module", "routes", "health", "quota", "daemon"];
+    let mut domains = BUILTIN_DOMAINS
+        .iter()
+        .map(|domain| (*domain).to_string())
+        .collect::<Vec<_>>();
+    for external in discover_external_domains() {
+        if !domains.iter().any(|domain| domain == &external) {
+            domains.push(external);
+        }
+    }
+    println!("\ndomains:\n  {}", domains.join("  "));
+}
+
+fn short_build_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+fn executable_identity(argv0: &Path) -> (PathBuf, Option<PathBuf>) {
+    let candidate = locate_executable(argv0).or_else(|| env::current_exe().ok());
+    let Some(candidate) = candidate else {
+        return (argv0.to_path_buf(), None);
+    };
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        env::current_dir()
+            .map(|cwd| cwd.join(candidate))
+            .unwrap_or_else(|_| argv0.to_path_buf())
+    };
+    let is_symlink = fs::symlink_metadata(&absolute)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    let real = fs::canonicalize(&absolute).ok();
+    let real_path = real.filter(|real| is_symlink && real != &absolute);
+    (absolute, real_path)
+}
+
+fn locate_executable(argv0: &Path) -> Option<PathBuf> {
+    if argv0.is_absolute() || argv0.components().count() > 1 || argv0.exists() {
+        return Some(argv0.to_path_buf());
+    }
+    let path_var = env::var_os("PATH")?;
+    for directory in env::split_paths(&path_var) {
+        let candidate = directory.join(argv0);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn display_home_path(path: &Path) -> String {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    if path == home {
+        "~".to_string()
+    } else if let Ok(relative) = path.strip_prefix(&home) {
+        format!(
+            "~{}",
+            if relative.as_os_str().is_empty() {
+                String::new()
+            } else {
+                format!("/{}", relative.display())
+            }
+        )
+    } else {
+        path.display().to_string()
     }
 }
 
@@ -201,12 +464,14 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
 }
 
 struct CkArgs {
+    program: PathBuf,
     subc: Option<PathBuf>,
     json: bool,
     command: Command,
 }
 
 enum Command {
+    Dashboard,
     Module(ModuleCommand),
     Routes {
         module_id: Option<String>,
@@ -220,8 +485,9 @@ enum Command {
         provider_id: Option<String>,
         verbose: bool,
     },
-    /// Explicit help request (bare `ck`, `ck <domain>` with no verb, `ck help …`,
-    /// `-h/--help`): prints to stdout and exits 0 without touching the daemon.
+    /// Explicit help request (`ck <domain>` with no verb, `ck help …`,
+    /// `-h/--help`, or bare `ck --json`): prints to stdout and exits 0 without
+    /// touching the daemon.
     Help(String),
     /// Unknown domain: git-style external dispatch to a `ck-<domain>` binary on
     /// PATH with the remaining args passed through verbatim.
@@ -470,12 +736,33 @@ impl CkClient {
     }
 }
 
-async fn module_list(client: &mut CkClient, json_output: bool) -> Result<(), CkError> {
+async fn module_list(
+    client: &mut CkClient,
+    json_output: bool,
+    subc: Option<&Path>,
+) -> Result<(), CkError> {
     let value = supervisor_list(client).await?;
     if json_output {
         print_json(&value)?;
     } else {
-        print_module_table(modules_array(&value));
+        let modules = modules_array(&value);
+        if modules.is_empty() {
+            println!("(no supervised modules)");
+            let footer = [next_step(
+                "ck module rescan",
+                "to reconcile configured modules",
+                subc,
+            )];
+            print_help_footer(&footer);
+        } else {
+            print_module_table(modules);
+            let footer = [next_step(
+                "ck module status <id>",
+                "for one module's supervision state",
+                subc,
+            )];
+            print_help_footer(&footer);
+        }
     }
     Ok(())
 }
@@ -609,7 +896,38 @@ async fn module_stderr_tail(
     if let Some(reason) = incomplete_reason {
         println!("stderr capture incomplete for {module_id}: {reason}");
     }
+    if let Some(hint) = stderr_truncation_hint(&response) {
+        println!("{hint}");
+    }
     Ok(())
+}
+
+fn stderr_truncation_hint(response: &Value) -> Option<String> {
+    let dropped = response
+        .get("dropped_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if dropped == 0 {
+        return None;
+    }
+    let shown = response
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry.get("kind").and_then(Value::as_str) == Some("line"))
+                .count() as u64
+        })
+        .unwrap_or(0);
+    let total = response
+        .get("total_lines")
+        .or_else(|| response.get("line_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| shown.saturating_add(dropped));
+    Some(format!(
+        "(showing {shown} of {total} lines · dropped {dropped} — use -n <count> for more)"
+    ))
 }
 
 async fn module_terminals(
@@ -736,6 +1054,7 @@ async fn supervisor_routes(
     client: &mut CkClient,
     module_id: Option<&str>,
     json_output: bool,
+    subc: Option<&Path>,
 ) -> Result<(), CkError> {
     let response = client
         .rpc_value(ClientControlRequest::SupervisorRoutes {
@@ -796,6 +1115,12 @@ async fn supervisor_routes(
 
     if rows.is_empty() {
         println!("(no live routes)");
+        let footer = [next_step(
+            "ck module list",
+            "to check which modules can own routes",
+            subc,
+        )];
+        print_help_footer(&footer);
     } else {
         print_table(&["MODULE", "CONSUMER", "AGE", "STATE"], rows);
     }
@@ -854,12 +1179,16 @@ async fn print_ack_with_state(
     Ok(())
 }
 
-async fn health(client: &mut CkClient, json_output: bool) -> Result<(), CkError> {
+async fn health(
+    client: &mut CkClient,
+    json_output: bool,
+    subc: Option<&Path>,
+) -> Result<(), CkError> {
     let value = supervisor_health(client).await?;
     if json_output {
         print_json(&value)?;
     } else {
-        print_health_table(modules_array(&value));
+        print_health_table(modules_array(&value), subc);
     }
     Ok(())
 }
@@ -1105,6 +1434,7 @@ async fn quota(
     provider_filter: Option<&str>,
     json_output: bool,
     verbose: bool,
+    subc: Option<&Path>,
 ) -> Result<(), CkError> {
     ensure_quota_module_registered(client).await?;
     let project_root = env::current_dir()
@@ -1121,17 +1451,29 @@ async fn quota(
     if let Some(filter) = provider_filter {
         if !providers.iter().any(|p| provider_id(p) == filter) {
             let ids = provider_ids_sorted(&providers);
-            return Err(CkError::Rejected(format!(
+            let error = CkError::Rejected(format!(
                 "unknown provider '{filter}'; valid ids: {}",
                 ids.join(", ")
-            )));
+            ));
+            if json_output {
+                return Err(error);
+            }
+            let command = if verbose {
+                "ck quota --verbose"
+            } else {
+                "ck quota"
+            };
+            return Err(CkError::WithFooter {
+                error: Box::new(error),
+                footer: next_step(command, "to list connected providers", subc),
+            });
         }
     }
 
     if json_output {
         print_json(&body)?;
     } else {
-        print_quota_table(&providers, provider_filter, verbose);
+        print_quota_table(&providers, provider_filter, verbose, subc);
     }
     Ok(())
 }
@@ -1289,7 +1631,12 @@ fn quota_entries_for_table<'a>(
         .collect()
 }
 
-fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
+fn print_quota_table(
+    providers: &[Value],
+    filter: Option<&str>,
+    verbose: bool,
+    subc: Option<&Path>,
+) {
     let color_enabled = ansi_color_enabled();
     let entries = quota_entries_for_table(providers, filter, verbose);
 
@@ -1317,6 +1664,22 @@ fn print_quota_table(providers: &[Value], filter: Option<&str>, verbose: bool) {
         println!();
         let reason = quota_empty_reason(providers.is_empty(), filter.is_some());
         println!("{}", dim_text(reason, color_enabled));
+        let next_step = if providers.is_empty() {
+            next_step(
+                "ck module status <module-id>",
+                "to check the quota module",
+                subc,
+            )
+        } else if filter.is_some() {
+            next_step(
+                "ck quota --verbose <provider-id>",
+                "to list unavailable accounts",
+                subc,
+            )
+        } else {
+            next_step("ck quota --verbose", "to list unavailable providers", subc)
+        };
+        print_help_footer(&[next_step]);
         return;
     }
 
@@ -2423,7 +2786,17 @@ fn format_last_exit(module: &Value) -> String {
     }
 }
 
-fn print_health_table(modules: &[Value]) {
+fn print_health_table(modules: &[Value], subc: Option<&Path>) {
+    if modules.is_empty() {
+        println!("(no supervised modules)");
+        let footer = [next_step(
+            "ck module rescan",
+            "to reconcile configured modules",
+            subc,
+        )];
+        print_help_footer(&footer);
+        return;
+    }
     let color = ansi_color_enabled();
     let width = terminal_width();
 
@@ -2498,14 +2871,6 @@ fn print_health_table(modules: &[Value]) {
             println!("{:detail_col$}{line}", "");
         }
     }
-
-    println!(
-        "{}",
-        dim_text(
-            "ck health <id> — full metrics for one module · --json — raw",
-            color
-        )
-    );
 }
 
 /// Best-effort terminal width: $COLUMNS, then the tty query, then 100.
@@ -2589,6 +2954,22 @@ fn truncate_cell(cell: &str) -> String {
     }
     let head: String = cell.chars().take(MAX).collect();
     format!("{head}… (--json for full)")
+}
+
+fn next_step(command: &str, explanation: &str, subc: Option<&Path>) -> String {
+    let connection_flag = subc.map_or("", |_| " --subc <connection-file>");
+    format!("Run `{command}{connection_flag}` {explanation}")
+}
+
+fn print_help_footer<S: AsRef<str>>(lines: &[S]) {
+    let count = lines.len().min(2);
+    if count == 0 {
+        return;
+    }
+    println!("\nhelp[{count}]:");
+    for line in lines.iter().take(count) {
+        println!("  {}", line.as_ref());
+    }
 }
 
 fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
@@ -2723,7 +3104,11 @@ fn format_duration(duration: Duration) -> String {
 
 fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkError> {
     let mut args = argv.into_iter();
-    let _program = args.next();
+    let program = args
+        .next()
+        .map(PathBuf::from)
+        .or_else(|| env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("ck"));
     let mut subc = None;
     let mut json = false;
 
@@ -2734,9 +3119,14 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
         match args.next() {
             None => {
                 return Ok(CkArgs {
+                    program,
                     subc,
                     json,
-                    command: Command::Help(top_help()),
+                    command: if json {
+                        Command::Help(top_help())
+                    } else {
+                        Command::Dashboard
+                    },
                 })
             }
             Some(arg) if arg == OsStr::new("--subc") => {
@@ -2745,6 +3135,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
             Some(arg) if arg == OsStr::new("--json") => json = true,
             Some(arg) if arg == OsStr::new("-h") || arg == OsStr::new("--help") => {
                 return Ok(CkArgs {
+                    program: program.clone(),
                     subc,
                     json,
                     command: Command::Help(top_help()),
@@ -2752,6 +3143,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
             }
             Some(arg) if arg == OsStr::new("--version") || arg == OsStr::new("-V") => {
                 return Ok(CkArgs {
+                    program: program.clone(),
                     subc,
                     json,
                     command: Command::Help(format!("ck {}", env!("CARGO_PKG_VERSION"))),
@@ -2799,6 +3191,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
 
     let command = parse_command(&domain, &tail)?;
     Ok(CkArgs {
+        program,
         subc,
         json,
         command,
@@ -3048,6 +3441,34 @@ fn decode_error_body(body: &[u8]) -> String {
     }
 }
 
+fn decorate_error(error: CkError, json_output: bool, subc: Option<&Path>) -> CkError {
+    if json_output {
+        return error;
+    }
+    let footer = match &error {
+        CkError::Discovery { .. } | CkError::Connection { .. } => Some(
+            "Check the connection file path above, then run `ck daemon --subc <connection-file>`"
+                .to_string(),
+        ),
+        CkError::Rejected(message)
+            if message.contains("module_id '") && message.contains("not supervised") =>
+        {
+            Some(next_step("ck module list", "to see valid module ids", subc))
+        }
+        CkError::Rejected(message) if message.contains("unknown provider '") => {
+            Some(next_step("ck quota", "to list connected providers", subc))
+        }
+        _ => None,
+    };
+    match footer {
+        Some(footer) => CkError::WithFooter {
+            error: Box::new(error),
+            footer,
+        },
+        None => error,
+    }
+}
+
 #[derive(Debug)]
 struct TriedConnectionFile {
     path: PathBuf,
@@ -3060,6 +3481,7 @@ enum CkError {
     Discovery { tried: Vec<TriedConnectionFile> },
     Connection { path: PathBuf, source: String },
     Rejected(String),
+    WithFooter { error: Box<CkError>, footer: String },
     Message(String),
     Json(serde_json::Error),
 }
@@ -3070,6 +3492,7 @@ impl CkError {
             Self::Usage(_) | Self::Discovery { .. } => 2,
             Self::Connection { .. } => 3,
             Self::Rejected(_) | Self::Message(_) | Self::Json(_) => 1,
+            Self::WithFooter { error, .. } => error.exit_code(),
         }
     }
 }
@@ -3096,6 +3519,9 @@ impl fmt::Display for CkError {
             Self::Rejected(message) => write!(f, "{message}"),
             Self::Message(message) => write!(f, "{message}"),
             Self::Json(source) => write!(f, "json: {source}"),
+            Self::WithFooter { error, footer } => {
+                write!(f, "{error}\n\nhelp[1]:\n  {footer}")
+            }
         }
     }
 }
@@ -3111,6 +3537,7 @@ impl From<serde_json::Error> for CkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
 
     #[test]
     fn quota_progress_bars_have_fixed_width_at_thresholds() {
@@ -3528,8 +3955,10 @@ mod tests {
         );
     }
 
+    /// This fixture pins the bytes emitted by the `--json` renderer. Human-only
+    /// dashboard and footer changes must not alter machine-consumed output.
     #[test]
-    fn quota_json_output_preserves_the_raw_reply_format() {
+    fn quota_json_output_is_byte_stable_against_fixture() {
         let reply = serde_json::json!({
             "result": [{
                 "provider": "codex",
@@ -3720,6 +4149,62 @@ mod tests {
             } if provider_id == "anthropic"
         ));
         assert!(QUOTA_HELP.contains("--verbose"));
+    }
+
+    #[test]
+    fn bare_ck_is_dashboard_but_bare_json_stays_byte_compatible_help() {
+        let bare = parse_args([OsString::from("ck")]).unwrap();
+        assert!(matches!(bare.command, Command::Dashboard));
+
+        let json = parse_args([OsString::from("ck"), OsString::from("--json")]).unwrap();
+        assert!(matches!(json.command, Command::Help(text) if text == top_help()));
+    }
+
+    #[test]
+    fn stderr_truncation_hint_reports_shown_total_and_dropped_lines() {
+        let response = serde_json::to_value(StderrTail {
+            capture: StderrCaptureState::Captured,
+            entries: vec![
+                StderrTailEntry::Line {
+                    text: "first".to_string(),
+                    truncated: false,
+                },
+                StderrTailEntry::ProcessStart,
+                StderrTailEntry::Line {
+                    text: "last".to_string(),
+                    truncated: false,
+                },
+            ],
+            dropped_lines: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            stderr_truncation_hint(&response).as_deref(),
+            Some("(showing 2 of 5 lines · dropped 3 — use -n <count> for more)")
+        );
+        assert_eq!(
+            stderr_truncation_hint(&serde_json::json!({
+                "entries": [{ "kind": "line", "text": "complete" }]
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn error_footers_are_scoped_and_absent_for_json() {
+        let unknown_module = decorate_error(
+            CkError::Rejected("module_id 'm' is not supervised".to_string()),
+            false,
+            None,
+        );
+        assert!(unknown_module.to_string().contains("ck module list"));
+
+        let unknown_provider = decorate_error(
+            CkError::Rejected("unknown provider 'p'".to_string()),
+            true,
+            None,
+        );
+        assert!(!unknown_provider.to_string().contains("help["));
     }
 
     #[test]

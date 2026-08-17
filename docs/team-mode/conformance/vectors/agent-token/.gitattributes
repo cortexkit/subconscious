@@ -1,0 +1,5 @@
+# Golden vector bytes are the contract: byte-compared against generator output
+# by checked_in_corpus_is_current_generator_output. EOL conversion on checkout
+# (Windows autocrlf) rewrites them and fails the comparison against freshly
+# generated LF output -- these files are content, not text.
+*.json -text

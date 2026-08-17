@@ -1482,6 +1482,123 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
     module.stop().await.unwrap();
 }
 
+/// THE SELF-LANE RESTART DEADLOCK, held dead: `supervisor.restart` must ACK AT
+/// INITIATION, while the module still has a request in flight.
+///
+/// The blocking form replied only after drain + kill + respawn. A caller whose
+/// own tool lane rides the target module (an agent bouncing the module its bash
+/// runs on) then deadlocks the drain BY CONSTRUCTION: its in-flight request
+/// cannot settle until the restart RPC replies, and the reply waits on the
+/// drain that is waiting on the request. The drain always timed out and cut the
+/// initiator with a GOODBYE -- on a HEALTHY module (incident 2026-08-17).
+///
+/// TIMING JUSTIFICATION (this test is deliberately timing-shaped, which #6838's
+/// no-latency-bounds rule otherwise forbids): the contract under test IS reply
+/// timing. The discriminator is tied to the test's own controlled delay, not to
+/// machine speed -- the in-flight request holds a 6_000ms delay while the ACK
+/// must arrive within the 2s helper window. Old semantics structurally cannot
+/// reply before its own drain settles the 6s request, so this test fails by
+/// ACK-read timeout under the blocking form (verified by mutation); new
+/// semantics reply in one control round trip regardless of load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_restart_acks_at_initiation_and_still_drains_the_inflight_request() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_secs(8),
+    );
+    let module_id = "fake-aft-restart-initiation-ack";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+            // Receipt push proves the slow request is genuinely in flight before
+            // the restart is issued (same in-flightness discipline as the reload
+            // drain test above; issue #11).
+            ("FAKE_AFT_PUSH_ON_REQUEST", "1"),
+        ],
+    )
+    .await;
+    let generation_before = server.registry.generation().unwrap();
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        421,
+        "ses-restart-initiation",
+        module_id,
+    )
+    .await;
+    let slow_corr = 422;
+    let slow_payload = br#"{"delay_ms":6000,"jsonrpc":"2.0","id":"restart-initiation"}"#;
+    write_frame(
+        &mut route_client,
+        &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    let receipt = read_push(&mut route_client, ack.route_channel).await;
+    assert_eq!(receipt.header.epoch, ack.route_epoch);
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            423,
+            ClientControlRequest::SupervisorRestart {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+
+    // The load-bearing read: the ACK lands inside the 2s helper window while the
+    // in-flight request still holds ~6s of delay. Under completion semantics
+    // this read times out -- that is the deadlock class, observed.
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 423, module_id).await;
+    assert!(applied);
+
+    // And the drain still does its job for the initiator: the slow request
+    // SETTLES with its real response (never cut), then the teardown GOODBYE.
+    let response = read_frame_timeout_for(&mut route_client, Duration::from_secs(20)).await;
+    assert_response(&response, ack.route_channel, slow_corr, slow_payload);
+    let goodbye = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    // Completion is observable state, not a reply. With an initiation-shaped
+    // ACK the respawn is genuinely async, so registration alone is not enough:
+    // the OLD entry can still be registered at first sample. Poll the
+    // generation itself -- it advances only when the NEW process re-registers.
+    let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
+    loop {
+        if server.registry.generation().unwrap() > generation_before {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "module did not re-register with a new generation after initiation-acked restart"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+
+    module.stop().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() {
     let server = TestServer::start().await;

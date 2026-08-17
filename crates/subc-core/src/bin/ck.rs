@@ -1113,11 +1113,16 @@ async fn supervisor_routes(
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                "draining"
+                // Name the WHY when the daemon serves it. An older daemon omits
+                // the reason; bare "draining" stays honest rather than guessing.
+                match route.get("drain_reason").and_then(Value::as_str) {
+                    Some(reason) => format!("draining({reason})"),
+                    None => "draining".to_string(),
+                }
             } else {
-                "live"
+                "live".to_string()
             };
-            rows.push(vec![module_id.clone(), consumer, age, state.to_string()]);
+            rows.push(vec![module_id.clone(), consumer, age, state]);
         }
     }
 

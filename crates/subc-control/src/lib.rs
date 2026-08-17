@@ -342,6 +342,13 @@ pub struct SupervisorRoute {
     /// True once the endpoint began draining. Draining routes remain visible so
     /// a census does not misreport an already-closing route as live.
     pub draining: bool,
+    /// WHY the endpoint is draining — the same reason vocabulary the
+    /// route.closing push carries — present exactly when `draining` is true.
+    /// Additive: older daemons omit it, and a census consumer must treat a
+    /// draining route without a reason as draining-for-an-unstated-reason,
+    /// never as not-draining.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_reason: Option<RouteCloseReason>,
 }
 
 /// The identity tier the daemon can honestly report for a route consumer.

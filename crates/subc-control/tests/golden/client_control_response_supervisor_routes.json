@@ -9,6 +9,7 @@
             "connection_id": 102,
             "kind": "direct"
           },
+          "drain_reason": "reload",
           "draining": true
         },
         {
@@ -17,6 +18,7 @@
             "kind": "reserved",
             "module_id": "fed"
           },
+          "drain_reason": "reload",
           "draining": true
         }
       ]

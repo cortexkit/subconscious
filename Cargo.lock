@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "cortexkit-paths",
  "fs4",

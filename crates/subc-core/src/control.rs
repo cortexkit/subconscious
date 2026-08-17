@@ -1547,6 +1547,7 @@ impl ControlHandler {
                             .try_into()
                             .unwrap_or(u64::MAX),
                         draining: route.draining,
+                        drain_reason: route.drain_reason,
                     })
                     .collect(),
             })
@@ -4260,7 +4261,9 @@ mod tests {
         assert!(reserved_open.await.unwrap().is_empty());
         let _ = reserved_rx.recv().await.unwrap();
 
-        forwarding.begin_module_drain("target").unwrap();
+        forwarding
+            .begin_module_drain("target", subc_control::RouteCloseReason::Reload)
+            .unwrap();
         let (census_ctx, _census_rx) = route_ctx(ConnectionId::new(104));
         let census_body = serde_json::to_vec(&ClientControlRequest::SupervisorRoutes {
             module_id: Some("target".to_string()),
@@ -4283,6 +4286,12 @@ mod tests {
         let routes = actual["modules"][0]["routes"].as_array().unwrap();
         assert_eq!(routes.len(), 2);
         assert!(routes.iter().all(|route| route["draining"] == true));
+        // The census carries WHY: the reason the drain was begun with, in the
+        // route.closing vocabulary, on every draining route this drain marked.
+        assert!(
+            routes.iter().all(|route| route["drain_reason"] == "reload"),
+            "draining routes must name the drain's reason: {routes:?}"
+        );
         assert!(routes.iter().any(|route| {
             route["consumer"] == serde_json::json!({"kind": "direct", "connection_id": 102})
         }));

@@ -1454,6 +1454,7 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
         &control_request_frame(
             312,
             ClientControlRequest::SupervisorRestart {
+                drain_timeout_ms: None,
                 module_id: module_id.to_string(),
             },
         ),
@@ -1557,6 +1558,7 @@ async fn supervisor_restart_acks_at_initiation_and_still_drains_the_inflight_req
         &control_request_frame(
             423,
             ClientControlRequest::SupervisorRestart {
+                drain_timeout_ms: None,
                 module_id: module_id.to_string(),
             },
         ),
@@ -1611,6 +1613,102 @@ async fn supervisor_restart_acks_at_initiation_and_still_drains_the_inflight_req
     }
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
 
+    module.stop().await.unwrap();
+}
+
+/// The wedge-bounce escape: `supervisor.restart{drain_timeout_ms: 0}` must CUT
+/// the in-flight request instead of waiting the module's configured budget.
+///
+/// Discriminates the override's REACHABILITY by construction: the supervisor is
+/// configured with an 8s drain and the stub holds a 6s request, so ignoring the
+/// override would settle the request and a Response frame would appear where
+/// this stream asserts `route.closed` -- the frame-by-frame read fails on the
+/// frame TYPE, not on a latency bound (#6838). The paired default-path test
+/// above proves the same 6s request SETTLES when no override is sent; together
+/// they fence both polarities of the override plumbing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_restart_with_zero_drain_override_cuts_the_inflight_request() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_secs(8),
+    );
+    let module_id = "fake-aft-restart-drain-now";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+            ("FAKE_AFT_PUSH_ON_REQUEST", "1"),
+        ],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        431,
+        "ses-restart-drain-now",
+        module_id,
+    )
+    .await;
+    let slow_corr = 432;
+    let slow_payload = br#"{"delay_ms":6000,"jsonrpc":"2.0","id":"restart-drain-now"}"#;
+    write_frame(
+        &mut route_client,
+        &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    let receipt = read_push(&mut route_client, ack.route_channel).await;
+    assert_eq!(receipt.header.epoch, ack.route_epoch);
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            433,
+            ClientControlRequest::SupervisorRestart {
+                drain_timeout_ms: Some(0),
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 433, module_id).await;
+    assert!(applied);
+
+    // closing, then IMMEDIATELY closed{drained:false} -- the 6s request is
+    // still pending, so any Response here means the override never reached the
+    // drain and the configured 8s budget ran instead.
+    let closing = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
+    assert_route_lifecycle_push(&closing, "route.closing", module_id, "restart", None, None);
+    let closed = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "restart",
+        Some(false),
+        Some(0),
+    );
+    let goodbye = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
     module.stop().await.unwrap();
 }
 
@@ -2101,6 +2199,7 @@ async fn concurrent_supervisor_ops_remain_coherent() {
             &control_request_frame(
                 435,
                 ClientControlRequest::SupervisorRestart {
+                    drain_timeout_ms: None,
                     module_id: module_id.to_string(),
                 },
             ),
@@ -2573,6 +2672,7 @@ async fn disabled_supervisor_restart_reload_return_module_disabled_on_wire() {
         &control_request_frame(
             342,
             ClientControlRequest::SupervisorRestart {
+                drain_timeout_ms: None,
                 module_id: module_id.to_string(),
             },
         ),
@@ -2639,6 +2739,7 @@ async fn supervisor_ops_unknown_module_returns_unknown_module() {
         &control_request_frame(
             331,
             ClientControlRequest::SupervisorRestart {
+                drain_timeout_ms: None,
                 module_id: "missing-supervised-module".to_string(),
             },
         ),

@@ -44,7 +44,17 @@ pub const SUBC_ARG: &str = "--subc";
 
 const DEFAULT_MAX_RESTARTS: u32 = 3;
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
-const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a drain waits for already-dispatched requests to finalize before
+/// the child is torn down. Sized for TOOL-SCALE work (bash, inspect, builds),
+/// not RPC-scale: the original 2s value silently cut nearly every real tool
+/// call at the fence, making the wait-for-finalize design decorative for the
+/// workloads it existed for. Quiescence short-circuits, so an idle module
+/// restarts immediately regardless of this value; the budget is spent only
+/// when a genuine in-flight request is worth finishing. Per-module override:
+/// `drain_timeout_ms` in subc.jsonc; per-restart override: the operator's
+/// `supervisor.restart{drain_timeout_ms}` (0 = cut now, for wedge bounces
+/// where a stuck request will never settle).
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -421,7 +431,12 @@ impl ModuleProcessLiveness for SupervisorProcessLiveness {
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
     restart_policy: RestartPolicy,
+    /// This module's RESOLVED drain budget: per-module config when present,
+    /// else `default_drain_timeout`.
     drain_timeout: Duration,
+    /// The supervisor-wide fallback, kept so a configuration update that
+    /// REMOVES the per-module override can re-resolve to it.
+    default_drain_timeout: Duration,
     health: HealthConfig,
     connection_file_path: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
@@ -838,11 +853,15 @@ impl Supervisor {
         spec: ModuleSpec,
         enabled: bool,
         health: HealthConfig,
+        drain_timeout_ms: Option<u64>,
     ) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
 
         let mut runtime = self.runtime_config();
         runtime.health = health;
+        if let Some(ms) = drain_timeout_ms {
+            runtime.drain_timeout = Duration::from_millis(ms);
+        }
         if !enabled {
             let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
             return Ok(self.supervised_module(spec, runtime, snapshot, None));
@@ -887,6 +906,7 @@ impl Supervisor {
         SupervisorRuntimeConfig {
             restart_policy: self.restart_policy,
             drain_timeout: self.drain_timeout,
+            default_drain_timeout: self.drain_timeout,
             health: self.health,
             connection_file_path: self.connection_file_path.clone(),
             forwarding: self.forwarding.clone(),
@@ -1115,11 +1135,14 @@ impl SupervisedModule {
         })?
     }
 
-    pub async fn restart(&self) -> Result<(), SuperviseError> {
+    pub async fn restart(&self, drain_timeout_ms: Option<u64>) -> Result<(), SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Restart { reply: reply_tx })
+            .send(SupervisorCommand::Restart {
+                drain_timeout_ms,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -1175,6 +1198,7 @@ impl SupervisedModule {
         &self,
         spec: ModuleSpec,
         health: HealthConfig,
+        drain_timeout_ms: Option<u64>,
     ) -> Result<(), SuperviseError> {
         if spec.module_id != self.inner.module_id {
             return Err(SuperviseError::InvalidSpec {
@@ -1188,6 +1212,7 @@ impl SupervisedModule {
             .send(SupervisorCommand::UpdateConfiguration {
                 spec: spec.clone(),
                 health,
+                drain_timeout_ms,
                 reply: reply_tx,
             })
             .await
@@ -1236,6 +1261,11 @@ enum SupervisorCommand {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Restart {
+        /// Operator override for this one restart's drain budget, in ms. `None`
+        /// uses the module's configured/default budget; `Some(0)` cuts
+        /// immediately (wedge bounce: a stuck request never settles, so
+        /// waiting only delays recovery).
+        drain_timeout_ms: Option<u64>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Reload {
@@ -1248,6 +1278,9 @@ enum SupervisorCommand {
     UpdateConfiguration {
         spec: ModuleSpec,
         health: HealthConfig,
+        /// Per-module drain override from the new config; `None` re-resolves to
+        /// the supervisor-wide default.
+        drain_timeout_ms: Option<u64>,
         reply: oneshot::Sender<()>,
     },
 }
@@ -2327,7 +2360,10 @@ async fn handle_supervisor_command(
             }
             false
         }
-        SupervisorCommand::Restart { reply } => {
+        SupervisorCommand::Restart {
+            drain_timeout_ms,
+            reply,
+        } => {
             // ACK AT INITIATION, not completion. The blocking form deadlocked any
             // caller whose own request lane rides the module being restarted: the
             // caller's in-flight request keeps the drain from quiescing, the drain
@@ -2349,8 +2385,21 @@ async fn handle_supervisor_command(
             let initiated = validation.is_ok();
             let _ = reply.send(validation);
             if initiated {
-                if let Err(err) =
-                    restart_child(spec, runtime, registry, process_liveness, snapshot, child).await
+                // Precedence: this restart's operator override, else the module's
+                // configured budget (already resolved into the runtime).
+                let drain_timeout = drain_timeout_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or(runtime.drain_timeout);
+                if let Err(err) = restart_child(
+                    spec,
+                    runtime,
+                    registry,
+                    process_liveness,
+                    snapshot,
+                    child,
+                    drain_timeout,
+                )
+                .await
                 {
                     warn!(
                         module_id = %spec.module_id,
@@ -2389,6 +2438,7 @@ async fn handle_supervisor_command(
         SupervisorCommand::UpdateConfiguration {
             spec: next_spec,
             health,
+            drain_timeout_ms,
             reply,
         } => {
             if let Some(handle) = &runtime.supervisor_handle {
@@ -2396,6 +2446,9 @@ async fn handle_supervisor_command(
             }
             *spec = next_spec;
             runtime.health = health;
+            runtime.drain_timeout = drain_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(runtime.default_drain_timeout);
             let _ = reply.send(());
             true
         }
@@ -2409,6 +2462,7 @@ async fn restart_child(
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
+    drain_timeout: Duration,
 ) -> Result<(), SuperviseError> {
     // Restart cycles a running module; it must not silently start a disabled one.
     if !lock_snapshot(snapshot)?.enabled {
@@ -2416,8 +2470,15 @@ async fn restart_child(
             module_id: spec.module_id.clone(),
         });
     }
-    begin_forwarding_drain_if_configured(spec, runtime, snapshot, None, RouteCloseReason::Restart)
-        .await?;
+    begin_forwarding_drain_with_timeout(
+        spec,
+        runtime,
+        snapshot,
+        None,
+        RouteCloseReason::Restart,
+        drain_timeout,
+    )
+    .await?;
 
     if child.is_some() {
         drain_optional_child(
@@ -2426,7 +2487,7 @@ async fn restart_child(
             snapshot,
             &runtime.terminal_ring,
             child,
-            runtime.drain_timeout,
+            drain_timeout,
             ModuleState::Restarting,
             Some(true),
         )
@@ -3088,7 +3149,15 @@ async fn begin_forwarding_drain(
         });
     };
 
-    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, reason).await
+    begin_forwarding_drain_with(
+        forwarding,
+        spec,
+        snapshot,
+        enabled,
+        reason,
+        runtime.drain_timeout,
+    )
+    .await
 }
 
 async fn begin_forwarding_drain_if_configured(
@@ -3098,20 +3167,42 @@ async fn begin_forwarding_drain_if_configured(
     enabled: Option<bool>,
     reason: RouteCloseReason,
 ) -> Result<(), SuperviseError> {
-    let Some(forwarding) = runtime.forwarding.as_ref() else {
-        return Ok(());
-    };
-
-    begin_forwarding_drain_with(forwarding, spec, runtime, snapshot, enabled, reason).await
+    begin_forwarding_drain_with_timeout(
+        spec,
+        runtime,
+        snapshot,
+        enabled,
+        reason,
+        runtime.drain_timeout,
+    )
+    .await
 }
 
-async fn begin_forwarding_drain_with(
-    forwarding: &ForwardingTable,
+/// Like [`begin_forwarding_drain_if_configured`] but with an explicit drain
+/// budget, for paths where the operator overrides the module's configured one
+/// (`supervisor.restart{drain_timeout_ms}`).
+async fn begin_forwarding_drain_with_timeout(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
     reason: RouteCloseReason,
+    drain_timeout: Duration,
+) -> Result<(), SuperviseError> {
+    let Some(forwarding) = runtime.forwarding.as_ref() else {
+        return Ok(());
+    };
+
+    begin_forwarding_drain_with(forwarding, spec, snapshot, enabled, reason, drain_timeout).await
+}
+
+async fn begin_forwarding_drain_with(
+    forwarding: &ForwardingTable,
+    spec: &ModuleSpec,
+    snapshot: &SharedSnapshot,
+    enabled: Option<bool>,
+    reason: RouteCloseReason,
+    drain_timeout: Duration,
 ) -> Result<(), SuperviseError> {
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
@@ -3145,8 +3236,7 @@ async fn begin_forwarding_drain_with(
         // coming; leaving early without `closed` strands it waiting forever, since
         // `closing` carries no timeout of its own.
         let wait_result =
-            wait_for_forwarding_quiescence(forwarding, target.endpoint, runtime.drain_timeout)
-                .await;
+            wait_for_forwarding_quiescence(forwarding, target.endpoint, drain_timeout).await;
         let drained = drained_after_quiescence_wait(&wait_result);
         if let Err(err) = &wait_result {
             error!(
@@ -3158,7 +3248,7 @@ async fn begin_forwarding_drain_with(
         } else if !drained {
             warn!(
                 module_id = %spec.module_id,
-                waited = ?runtime.drain_timeout,
+                waited = ?drain_timeout,
                 ?reason,
                 "route drain timed out before request quiescence; forcing teardown"
             );

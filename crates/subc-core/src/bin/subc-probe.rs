@@ -257,6 +257,7 @@ async fn catalog_list(stream: &mut TcpStream) -> Result<Vec<CatalogEntry>, Probe
 
 async fn supervisor_restart(stream: &mut TcpStream, module_id: &str) -> Result<bool, ProbeError> {
     let request = ClientControlRequest::SupervisorRestart {
+        drain_timeout_ms: None,
         module_id: module_id.to_string(),
     };
     let response = control_rpc(stream, serde_json::to_vec(&request)?).await?;

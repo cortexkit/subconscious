@@ -106,7 +106,18 @@ pub enum ClientControlRequest {
     #[serde(rename = "supervisor.list")]
     SupervisorList {},
     #[serde(rename = "supervisor.restart")]
-    SupervisorRestart { module_id: String },
+    SupervisorRestart {
+        module_id: String,
+        /// Optional per-restart override of the module's drain budget, in ms.
+        /// Absent: the module's configured `drain_timeout_ms` (or the daemon
+        /// default) applies. `0` tears down without waiting — the wedge-bounce
+        /// escape, where a stuck in-flight request would never settle anyway.
+        /// Additive; older daemons that predate this field reject unknown
+        /// fields on channel-0 requests, so senders must omit it unless asked
+        /// for (the CLI only sends it when a flag is passed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drain_timeout_ms: Option<u64>,
+    },
     #[serde(rename = "supervisor.reload")]
     SupervisorReload { module_id: String },
     #[serde(rename = "supervisor.rescan")]

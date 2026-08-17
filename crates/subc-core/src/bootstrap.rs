@@ -408,8 +408,12 @@ async fn serve_bound_daemon(
         let enabled = configured.enabled;
         let health = configured.health;
         let module_id = configured.module_id.clone();
-        match supervisor.supervise_configured_with_health(configured.module_spec(), enabled, health)
-        {
+        match supervisor.supervise_configured_with_health(
+            configured.module_spec(),
+            enabled,
+            health,
+            configured.drain_timeout_ms,
+        ) {
             Ok(_) => {
                 // A raised failure threshold is normally a temporary allowance for a
                 // drive that deliberately stops a module, and it widens the window in

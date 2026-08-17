@@ -63,6 +63,11 @@ interface FakeDaemonOptions {
   // simulation), then serve subsequent ones normally.
   routeOpenFailFirst?: { count: number; code: string; message: string };
   closeAfterDataResponses?: number;
+  // Before answering catalog.list, emit daemon-originated channel-0 control
+  // pushes: first a well-formed route.closing, then one with an UNPARSEABLE
+  // body. Models the #31 push family arriving interleaved with control traffic,
+  // including the garbage arm the MUST-ignore clause exists for.
+  controlPushesBeforeCatalogList?: boolean;
 }
 
 interface FakeDaemon {
@@ -84,6 +89,62 @@ function newStats(): FakeStats {
 afterEach(async () => {
   for (const daemon of daemons.splice(0)) await daemon.stop();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("daemon-originated control pushes", () => {
+  test("route.closing reaches the observer parsed; a garbage push is ignored and the stream survives", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, controlPushesBeforeCatalogList: true });
+    writeConnectionFile(connFile, daemon.port);
+
+    const seen: { op: string; body: Record<string, unknown> }[] = [];
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      onControlPush: (push) => seen.push(push),
+    });
+    try {
+      // The fake daemon writes BOTH pushes (one well-formed, one unparseable)
+      // ahead of the catalog.list response on the same stream, so the resolved
+      // reply proves the read loop dispatched past both.
+      const modules = await client.catalogList();
+      expect(modules).toEqual([]);
+
+      expect(seen.length).toBe(1);
+      expect(seen[0]!.op).toBe("route.closing");
+      expect(seen[0]!.body.module_id).toBe("fake-aft");
+      expect(seen[0]!.body.reason).toBe("restart");
+
+      // Aliveness after the garbage push: a further control roundtrip works on
+      // the same connection (the MUST-ignore clause held, nothing failed).
+      await expect(client.catalogList()).resolves.toEqual([]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("an observer throw cannot fail the read loop or the in-flight control call", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, controlPushesBeforeCatalogList: true });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      onControlPush: () => {
+        throw new Error("observer bug");
+      },
+    });
+    try {
+      // The push (and the observer throw) land before this response on the same
+      // stream; a resolved reply means the throw was contained.
+      await expect(client.catalogList()).resolves.toEqual([]);
+    } finally {
+      client.close();
+    }
+  });
 });
 
 describe("SubcClient managed call", () => {
@@ -609,6 +670,20 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       const request = parseJson(frame.body) as { op?: string };
       requestFrame.controlOp = request.op;
       if (request.op === "catalog.list") {
+        if (options.controlPushesBeforeCatalogList) {
+          await writeFrame(
+            socket,
+            controlPushFrame(
+              encodeJson({ op: "route.closing", module_id: "fake-aft", reason: "restart" }),
+            ),
+            deadline,
+          );
+          await writeFrame(
+            socket,
+            controlPushFrame(new TextEncoder().encode("not json {")),
+            deadline,
+          );
+        }
         await writeFrame(socket, responseFrame(frame, { op: "catalog.list", modules: [] }), deadline);
       } else if (request.op === "route.open") {
         options.stats.routeOpens += 1;
@@ -680,6 +755,12 @@ function responseFrame(request: Frame, body: unknown): Frame {
 
 function errorFrame(request: Frame, body: { code: string; message: string }): Frame {
   return buildFrame(FrameType.Error, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
+}
+
+function controlPushFrame(body: Uint8Array): Frame {
+  // Channel 0, epoch 0, daemon-chosen corr 0 -- the exact shape
+  // send_route_control_pushes emits.
+  return buildFrame(FrameType.Push, buildFlags(false, Priority.Interactive, false), 0, 0, 0n, body);
 }
 
 async function authenticateFakeServer(

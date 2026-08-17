@@ -268,6 +268,26 @@ export interface ConnectOptions {
    * exposed mainly so tests can prove the arbitration deterministically.
    */
   timeoutArbitrationGraceMs?: number;
+  /**
+   * Observer for daemon-originated channel-0 control pushes (`route.closing`,
+   * `route.closed`, and any op added later). Purely advisory: the daemon's
+   * load-bearing route-death signal remains the GOODBYE frame, and nothing in
+   * the client's own route lifecycle consumes these. The contract is the wire
+   * contract verbatim -- unrecognized ops still arrive here (callers ignore
+   * what they don't know, per the MUST-ignore clause), a push that fails to
+   * parse as JSON is dropped without surfacing, and an observer throw is
+   * swallowed like every other caller callback so it cannot fail the read loop
+   * or unrelated requests.
+   */
+  onControlPush?: (push: ControlPush) => void;
+}
+
+/** A parsed daemon-originated channel-0 control push. */
+export interface ControlPush {
+  /** The push discriminator, e.g. "route.closing" | "route.closed". */
+  op: string;
+  /** The full parsed body, `op` included, for op-specific fields. */
+  body: Record<string, unknown>;
 }
 
 interface NormalizedConnectOptions {
@@ -278,6 +298,7 @@ interface NormalizedConnectOptions {
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   timeoutArbitrationGraceMs: number;
+  onControlPush?: (push: ControlPush) => void;
 }
 
 interface OpenedConnection {
@@ -1034,6 +1055,32 @@ export class SubcClient {
   }
 
   private dispatch(frame: Frame): void {
+    if (frame.header.channel === 0 && frame.header.ty === FrameType.Push) {
+      // Daemon-originated control push (route.closing / route.closed / future
+      // ops). Never matches a pending (corr is daemon-chosen), never an error
+      // path: unparseable bodies and absent observers both drop silently per
+      // the wire contract's MUST-ignore clause, and an observer throw is
+      // swallowed for the same reason as onProgress below -- a caller callback
+      // must not fail the read loop.
+      const observer = this.opts.onControlPush;
+      if (observer) {
+        let parsed: ControlPush | null = null;
+        try {
+          const body = this.parseJson(frame) as Record<string, unknown>;
+          if (body && typeof body.op === "string") parsed = { op: body.op, body };
+        } catch {
+          // Unparseable control push: ignored by contract.
+        }
+        if (parsed) {
+          try {
+            observer(parsed);
+          } catch {
+            // Observer's own throw, on its own stack; the stream must survive.
+          }
+        }
+      }
+      return;
+    }
     let handle: RouteHandle | null = null;
     if (frame.header.channel !== 0) {
       handle = this.liveRoutes.get(frame.header.channel) ?? null;
@@ -1309,6 +1356,7 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS,
+    onControlPush: opts.onControlPush,
   };
 }
 

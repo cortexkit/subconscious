@@ -2328,9 +2328,42 @@ async fn handle_supervisor_command(
             false
         }
         SupervisorCommand::Restart { reply } => {
-            let result =
-                restart_child(spec, runtime, registry, process_liveness, snapshot, child).await;
-            let _ = reply.send(result);
+            // ACK AT INITIATION, not completion. The blocking form deadlocked any
+            // caller whose own request lane rides the module being restarted: the
+            // caller's in-flight request keeps the drain from quiescing, the drain
+            // keeps the restart from completing, and the completion keeps the reply
+            // from releasing the caller — so the drain always timed out and cut the
+            // initiator with a GOODBYE, even on a healthy module. Replying once the
+            // restart is validated lets a self-lane caller settle, which is exactly
+            // what makes the drain succeed. Completion is observable via
+            // supervisor.list / module status; a post-ack failure lands the module
+            // in a visible terminal state below rather than in a reply nobody can
+            // receive.
+            let validation = match lock_snapshot(snapshot) {
+                Ok(state) if !state.enabled => Err(SuperviseError::Disabled {
+                    module_id: spec.module_id.clone(),
+                }),
+                Ok(_) => Ok(()),
+                Err(err) => Err(err),
+            };
+            let initiated = validation.is_ok();
+            let _ = reply.send(validation);
+            if initiated {
+                if let Err(err) =
+                    restart_child(spec, runtime, registry, process_liveness, snapshot, child).await
+                {
+                    warn!(
+                        module_id = %spec.module_id,
+                        error = %err,
+                        "operator restart failed after initiation ack; module state carries the outcome"
+                    );
+                    let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = ModuleState::Failed;
+                        state.process_alive = false;
+                        state.pid = None;
+                    });
+                }
+            }
             true
         }
         SupervisorCommand::Reload { reply } => {

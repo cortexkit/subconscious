@@ -990,7 +990,15 @@ async fn module_restart(
             module_id: module_id.to_string(),
         })
         .await?;
-    print_ack_with_state(client, module_id, ack, "restart", json_output).await
+    print_ack_with_state(client, module_id, ack, "restart", json_output).await?;
+    if !json_output {
+        // The ack means INITIATED, not completed: the daemon drains and respawns
+        // asynchronously precisely so a caller whose own tool lane rides this
+        // module can settle instead of deadlocking the drain. The state column
+        // above is therefore usually "restarting"; completion is a status read.
+        println!("restart initiated; verify: ck module status {module_id}");
+    }
+    Ok(())
 }
 
 async fn module_rescan(

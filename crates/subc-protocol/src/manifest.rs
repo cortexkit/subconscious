@@ -120,6 +120,16 @@ pub enum Concurrency {
 }
 
 #[allow(clippy::derivable_impls)]
+// The default is PINNED BY HISTORY, not chosen as the best value. Before this
+// field existed, every ManagementSurface received ModuleManaged delivery (32
+// concurrent credits) unconditionally, so an absent-field manifest must resolve
+// to exactly that behavior -- any other default (including the fail-closed
+// Serial) would convert a daemon upgrade into a silent delivery-semantics
+// change for every deployed module. A genuinely-Serial module was ALREADY
+// receiving concurrent delivery under pre-field daemons; the field's addition
+// is what makes declaring Serial possible at all, so the fix for such a module
+// is an explicit declaration, and the daemon logs defaulted registrations so
+// the fleet's exposure is readable rather than assumed.
 impl Default for Concurrency {
     fn default() -> Self {
         Self::ModuleManaged

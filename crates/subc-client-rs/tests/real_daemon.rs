@@ -1937,3 +1937,110 @@ async fn subc_consumer_counts_control_pushes_dropped_without_receiver() {
 
     daemon.kill_and_wait();
 }
+
+/// Issue #40: a burst that overflows the push receiver's bounded buffer must
+/// DROP-AND-COUNT, not destroy the subscription. Before the fix, the Full arm
+/// removed the receiver (uncounted), so the burst's worst moment left no trace
+/// and every later push was lost to a consumer that believed itself subscribed.
+/// The discriminating pair: the overflow lands on pushes_dropped_receiver_full,
+/// and a push sent AFTER the burst still arrives on the SAME receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_push_burst_counts_overflow_and_keeps_the_subscription() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-push-burst");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = PushModuleHandler::default();
+    let (module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(PUSH_MODULE_ID, &["push"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, PUSH_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let route = consumer
+        .open_route(
+            tool_target(PUSH_MODULE_ID),
+            consumer_identity("push-burst"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    let module_route = wait_for_module_route(&handler, route.channel).await;
+    let mut events = consumer.push_events(&route).unwrap();
+
+    // Overflow the bounded buffer WITHOUT draining: the receiver holds
+    // DEFAULT_PUSH_EVENT_BUFFER events; everything beyond it must drop onto the
+    // full-counter while the subscription survives.
+    // Mirrors DEFAULT_PUSH_EVENT_BUFFER (128) in consumer.rs: 160 undrained
+    // pushes overflow the mpsc by a margin. PACED (yield every 16) so the
+    // client reader keeps consuming the socket -- an unpaced tight loop outruns
+    // the reader task and trips the DAEMON's slow-client egress policy instead
+    // (failed try_send closes the whole connection), which is a different
+    // backpressure layer than the one under test and reads as StaleRouteHandle
+    // at the module.
+    let burst = 160;
+    for i in 0..burst {
+        module
+            .push(&module_route, format!("burst-{i}").into_bytes(), None)
+            .await
+            .unwrap();
+        if i % 16 == 15 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+    while consumer.pushes_dropped_receiver_full() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "an overflowing burst must count on pushes_dropped_receiver_full"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The no-receiver counter must NOT absorb the burst: the receiver exists.
+    assert_eq!(
+        consumer.pushes_dropped_no_receiver(),
+        0,
+        "a full buffer is not 'no receiver'; the counters must not conflate"
+    );
+
+    // Drain what the buffer held, then prove the subscription SURVIVED: a
+    // fresh push after the burst arrives on the same receiver. recv()->None
+    // here would mean the channel CLOSED, which is exactly the pre-fix defect,
+    // so it panics rather than ending the drain quietly.
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                panic!("push receiver closed during drain: the burst destroyed the subscription")
+            }
+            Err(_) => break,
+        }
+    }
+    module
+        .push(&module_route, b"after-burst".to_vec(), None)
+        .await
+        .unwrap();
+    let event = timeout(EVENT_TIMEOUT, events.recv())
+        .await
+        .expect("a push after the burst should arrive")
+        .expect("the subscription must survive the burst");
+    assert_eq!(event.body, b"after-burst");
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}

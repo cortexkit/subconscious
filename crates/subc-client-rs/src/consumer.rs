@@ -243,6 +243,14 @@ pub struct PushEvent {
     pub body: Vec<u8>,
 }
 
+/// Disposition of one provider push at delivery time, so the two drop causes
+/// land on their own counters (issue #40): the remedies differ.
+enum DroppedPush {
+    Delivered,
+    NoReceiver,
+    ReceiverFull,
+}
+
 /// A parsed daemon-originated channel-0 control push.
 #[derive(Debug, Clone)]
 pub struct ControlPush {
@@ -631,8 +639,11 @@ impl SubcConsumer {
     /// Register a receiver for provider-originated Push frames on exactly one live route.
     ///
     /// Registering another receiver for the same route replaces and closes the prior receiver.
-    /// The receiver closes when its route closes, the connection drops, or its bounded buffer
-    /// fills; the reader never waits for an application that is not draining pushes.
+    /// The receiver closes when its route closes or the connection drops. A FULL buffer drops
+    /// the overflowing push and counts it on `pushes_dropped_receiver_full` while the
+    /// subscription survives (issue #40; push is a lossy latency optimization and polling
+    /// remains the correctness backstop). The reader never waits for an application that is
+    /// not draining pushes.
     pub fn push_events(
         &self,
         handle: &RouteHandle,
@@ -648,6 +659,18 @@ impl SubcConsumer {
     pub fn pushes_dropped_no_receiver(&self) -> u64 {
         self.shared
             .pushes_dropped_no_receiver
+            .load(Ordering::Relaxed)
+    }
+
+    /// Pushes dropped because the registered receiver's bounded buffer was full.
+    /// The subscription SURVIVES a burst (the receiver stays registered); this
+    /// counter is the trace the burst leaves. Distinct from
+    /// `pushes_dropped_no_receiver` because the remedies differ: full means
+    /// drain faster or register with more capacity, no-receiver means nobody
+    /// subscribed.
+    pub fn pushes_dropped_receiver_full(&self) -> u64 {
+        self.shared
+            .pushes_dropped_receiver_full
             .load(Ordering::Relaxed)
     }
 
@@ -1100,6 +1123,11 @@ struct Shared {
     /// the drop was SILENT -- not even a counter -- which is how #31's push
     /// family shipped unreachable to every Rust consumer (issue #35).
     control_pushes_dropped: AtomicU64,
+    /// Pushes dropped because a registered receiver's bounded buffer was full
+    /// at delivery time. Distinct from `pushes_dropped_no_receiver` because the
+    /// operator remedies differ: full means the consumer is too slow (widen the
+    /// buffer or drain faster), no-receiver means it never subscribed.
+    pushes_dropped_receiver_full: AtomicU64,
 }
 
 struct Inner {
@@ -1212,6 +1240,7 @@ impl Shared {
             close_token: CancellationToken::new(),
             pushes_dropped_no_receiver: AtomicU64::new(0),
             control_pushes_dropped: AtomicU64::new(0),
+            pushes_dropped_receiver_full: AtomicU64::new(0),
         }
     }
 
@@ -2120,26 +2149,42 @@ impl Shared {
                 || inner.generation != handle.connection_token()
                 || inner.route_epochs.get(&handle.channel) != Some(&handle)
             {
+                // Deliberately uncounted: a push against a stale epoch or dead
+                // generation has no live subscriber by definition, and the
+                // counters below claim delivery loss on LIVE routes only.
                 return;
             }
             match inner.push_event_receivers.get(&handle) {
-                None => true,
+                None => DroppedPush::NoReceiver,
                 Some(events) => match events.try_send(PushEvent { handle, body }) {
-                    Ok(()) => false,
+                    Ok(()) => DroppedPush::Delivered,
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         inner.push_event_receivers.remove(&handle);
-                        true
+                        DroppedPush::NoReceiver
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        inner.push_event_receivers.remove(&handle);
-                        false
-                    }
+                    // A burst KEEPS the subscription (issue #40). This used to
+                    // remove the receiver -- documented as loss-signaling via
+                    // recv()->None -- but the fleet's real push consumers are
+                    // idempotent wake nudges, where one missed event costs a
+                    // poll cycle and a lost subscription costs every later wake
+                    // until a re-register path that history says is where bugs
+                    // live. Matches control_push below; the drop is counted on
+                    // its own counter so a too-slow consumer is diagnosable as
+                    // such rather than filed under "never subscribed".
+                    Err(mpsc::error::TrySendError::Full(_)) => DroppedPush::ReceiverFull,
                 },
             }
         };
-        if should_count_drop {
-            self.pushes_dropped_no_receiver
-                .fetch_add(1, Ordering::Relaxed);
+        match should_count_drop {
+            DroppedPush::Delivered => {}
+            DroppedPush::NoReceiver => {
+                self.pushes_dropped_no_receiver
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DroppedPush::ReceiverFull => {
+                self.pushes_dropped_receiver_full
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 

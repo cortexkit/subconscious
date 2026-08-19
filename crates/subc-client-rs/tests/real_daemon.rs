@@ -1816,3 +1816,124 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("{name}-{}-{nonce}", std::process::id()))
 }
+
+/// Issue #35: the #31 push family must be OBSERVABLE by a Rust consumer. The
+/// daemon emits `route.closed { reason: crash }` when a module connection dies
+/// with live routes -- before this surface existed, dispatch_frame returned on
+/// the route-epoch guard for channel 0 and the push vanished without even a
+/// counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_control_pushes_deliver_route_closed_on_module_death() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-control-push");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = PushModuleHandler::default();
+    let (module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(PUSH_MODULE_ID, &["push"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, PUSH_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let route = consumer
+        .open_route(
+            tool_target(PUSH_MODULE_ID),
+            consumer_identity("control-push"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    wait_for_module_route(&handler, route.channel).await;
+    let mut control = consumer.control_pushes(8);
+
+    // Kill the module's connection: the daemon cleans up its live routes and
+    // emits the crash-close push to every client holding one.
+    serve_task.abort();
+    drop(module);
+
+    let push = timeout(EVENT_TIMEOUT, control.recv())
+        .await
+        .expect("route.closed should arrive after module death")
+        .expect("control push receiver should remain open");
+    assert_eq!(push.op, "route.closed");
+    assert_eq!(push.body["module_id"], PUSH_MODULE_ID);
+    assert_eq!(push.body["reason"], "crash");
+    // The crash arm is normative from #31: no prior route.closing, drained
+    // false -- a cut, not a drain.
+    assert_eq!(push.body["drained"], false);
+
+    daemon.kill_and_wait();
+}
+
+/// The no-receiver arm: the same event with no registered receiver must COUNT,
+/// not vanish -- the silent-drop shape is the defect #35 named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_counts_control_pushes_dropped_without_receiver() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-control-push-drop");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = PushModuleHandler::default();
+    let (module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(PUSH_MODULE_ID, &["push"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, PUSH_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let _route = consumer
+        .open_route(
+            tool_target(PUSH_MODULE_ID),
+            consumer_identity("control-push-drop"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    let before = consumer.control_pushes_dropped();
+
+    serve_task.abort();
+    drop(module);
+
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if consumer.control_pushes_dropped() > before {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "an unobserved control push must increment control_pushes_dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    daemon.kill_and_wait();
+}

@@ -3,8 +3,8 @@
 pub mod consumer;
 pub use consumer::{
     CallError, CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerError,
-    ConsumerOptions, PushEvent, RetryBackoff, RoutePollResult, SubcConsumer, SubscribeOptions,
-    Subscription, SubscriptionClosed,
+    ConsumerOptions, ControlPush, PushEvent, RetryBackoff, RoutePollResult, SubcConsumer,
+    SubscribeOptions, Subscription, SubscriptionClosed,
 };
 
 use std::{

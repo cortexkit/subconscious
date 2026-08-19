@@ -243,6 +243,15 @@ pub struct PushEvent {
     pub body: Vec<u8>,
 }
 
+/// A parsed daemon-originated channel-0 control push.
+#[derive(Debug, Clone)]
+pub struct ControlPush {
+    /// The push discriminator, e.g. `route.closing` / `route.closed`.
+    pub op: String,
+    /// The full parsed body, `op` included, for op-specific fields.
+    pub body: serde_json::Value,
+}
+
 /// Managed Rust consumer for subc route calls.
 pub struct SubcConsumer {
     shared: Arc<Shared>,
@@ -640,6 +649,29 @@ impl SubcConsumer {
         self.shared
             .pushes_dropped_no_receiver
             .load(Ordering::Relaxed)
+    }
+
+    /// Register the consumer-level receiver for daemon-originated channel-0
+    /// control pushes (`route.closing`, `route.closed`, and any op added
+    /// later). Advisory by contract: GOODBYE remains the load-bearing
+    /// route-death signal and nothing in the client's own lifecycle consumes
+    /// these. Unrecognized ops are DELIVERED (the must-ignore choice belongs
+    /// to the consumer); unparseable bodies are dropped and counted. The
+    /// receiver survives reconnects. Registering again replaces the prior
+    /// receiver; a full or closed receiver drops the push and counts it
+    /// rather than blocking the reader.
+    pub fn control_pushes(&self, capacity: usize) -> mpsc::Receiver<ControlPush> {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        self.shared.lock_inner().control_push_receiver = Some(sender);
+        receiver
+    }
+
+    /// Always-present count of dropped channel-0 control pushes (no receiver
+    /// registered, receiver full or closed, or unparseable body). Emitted as a
+    /// counter rather than silence so an application that has not opted in is
+    /// observable, mirroring `pushes_dropped_no_receiver`.
+    pub fn control_pushes_dropped(&self) -> u64 {
+        self.shared.control_pushes_dropped.load(Ordering::Relaxed)
     }
 
     /// Managed unary call. Route-open failures happen before the body is sent and are
@@ -1063,6 +1095,11 @@ struct Shared {
     notify: Notify,
     close_token: CancellationToken,
     pushes_dropped_no_receiver: AtomicU64,
+    /// Always-present drop counter for channel-0 control pushes (no receiver,
+    /// receiver full/closed, or unparseable body). Before this surface existed
+    /// the drop was SILENT -- not even a counter -- which is how #31's push
+    /// family shipped unreachable to every Rust consumer (issue #35).
+    control_pushes_dropped: AtomicU64,
 }
 
 struct Inner {
@@ -1076,6 +1113,11 @@ struct Inner {
     one_shot_routes: HashMap<u16, RouteState>,
     route_epochs: HashMap<u16, RouteHandle>,
     push_event_receivers: HashMap<RouteHandle, mpsc::Sender<PushEvent>>,
+    /// Consumer-level receiver for daemon-originated channel-0 control pushes
+    /// (`route.closing`, `route.closed`, future ops). Connection-independent:
+    /// control pushes are advisory daemon events, so the receiver survives
+    /// reconnects rather than being keyed by generation.
+    control_push_receiver: Option<mpsc::Sender<ControlPush>>,
     dropped_route_frames: u64,
     openings: HashMap<RouteKey, Opening>,
     callbacks: Vec<Callback>,
@@ -1156,6 +1198,7 @@ impl Shared {
                 one_shot_routes: HashMap::new(),
                 route_epochs: HashMap::new(),
                 push_event_receivers: HashMap::new(),
+                control_push_receiver: None,
                 dropped_route_frames: 0,
                 openings: HashMap::new(),
                 callbacks: Vec::new(),
@@ -1168,6 +1211,7 @@ impl Shared {
             notify: Notify::new(),
             close_token: CancellationToken::new(),
             pushes_dropped_no_receiver: AtomicU64::new(0),
+            control_pushes_dropped: AtomicU64::new(0),
         }
     }
 
@@ -2096,6 +2140,37 @@ impl Shared {
         if should_count_drop {
             self.pushes_dropped_no_receiver
                 .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Deliver a daemon-originated channel-0 control push to the registered
+    /// consumer receiver, or count the drop. Never blocks the reader.
+    fn control_push(&self, body: &[u8]) {
+        let parsed = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                let op = value.get("op")?.as_str()?.to_string();
+                Some(ControlPush { op, body: value })
+            });
+        let delivered = match parsed {
+            None => false,
+            Some(push) => {
+                let mut inner = self.lock_inner();
+                match inner.control_push_receiver.as_ref() {
+                    None => false,
+                    Some(sender) => match sender.try_send(push) {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            inner.control_push_receiver = None;
+                            false
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => false,
+                    },
+                }
+            }
+        };
+        if !delivered {
+            self.control_pushes_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -3139,6 +3214,9 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
         }
         FrameType::StreamEnd => shared.settle_pending(key, PendingTerminal::StreamEnd),
         FrameType::StreamData => shared.route_stream_data(key, frame.body),
+        FrameType::Push if frame.header.channel == 0 => {
+            shared.control_push(&frame.body);
+        }
         FrameType::Push => shared.route_push(
             RouteHandle::new(frame.header.channel, frame.header.epoch, generation),
             frame.body,

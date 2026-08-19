@@ -1682,7 +1682,20 @@ fn quota_entries_for_table<'a>(
         .filter(|entry| {
             let matches_filter =
                 filter.is_none() || filter.is_some_and(|wanted| provider_id(entry) == wanted);
-            matches_filter && (filter.is_some() || verbose || quota_entry_is_connected(entry))
+            // The default view shows connected providers PLUS classified
+            // degraded ones. A provider whose every account is degraded used to
+            // vanish here entirely, and its absence read as UNCONFIGURED -- the
+            // one meaning it definitely is not, and the reading that sends the
+            // operator to re-check bindings instead of the credential (QTA,
+            // from insula#8: an Anthropic lane went credential_unusable and the
+            // whole Claude section disappeared). Inert entries -- never
+            // configured, or a producer predating errorClass -- stay summary-
+            // only so an idle fleet does not render as a wall of alarms.
+            matches_filter
+                && (filter.is_some()
+                    || verbose
+                    || quota_entry_is_connected(entry)
+                    || quota_disconnect_kind(entry) != QuotaDisconnectKind::Inert)
         })
         .collect()
 }
@@ -1797,42 +1810,25 @@ fn print_quota_table(
     }
 
     if filter.is_none() && !verbose {
-        let disconnected = providers
+        // Only Inert entries are summary-only now: classified degraded entries
+        // render as named sections above, so counting them here again would
+        // double-report and re-bury the named line under a number.
+        let inert = providers
             .iter()
-            .filter(|entry| !quota_entry_is_connected(entry))
+            .filter(|entry| {
+                !quota_entry_is_connected(entry)
+                    && quota_disconnect_kind(entry) == QuotaDisconnectKind::Inert
+            })
             .count();
-        if disconnected > 0 {
-            // Split the count only where the producer gives us the reason. A
-            // producer predating `errorClass` classifies everything as inert and
-            // renders the single line it always did.
-            let kinds: Vec<_> = providers
-                .iter()
-                .filter(|entry| !quota_entry_is_connected(entry))
-                .map(quota_disconnect_kind)
-                .collect();
-            let count = |kind| kinds.iter().filter(|k| **k == kind).count();
-            let failing = count(QuotaDisconnectKind::UserFixable);
-            let broken = count(QuotaDisconnectKind::ModuleDefect);
-
+        if inert > 0 {
             println!();
-            let mut parts = vec![format!(
-                "{} not connected",
-                count(QuotaDisconnectKind::Inert)
-            )];
-            if failing > 0 {
-                parts.push(format!("{failing} configured but failing"));
-            }
-            // Named for the culprit rather than the symptom: a reader who tries
-            // to fix their own credential here is being sent to the wrong place.
-            if broken > 0 {
-                parts.push(format!("{broken} quota-module defect"));
-            }
-            let summary = if failing == 0 && broken == 0 {
-                format!("{disconnected} providers not connected (--verbose to list)")
-            } else {
-                format!("{} (--verbose to list)", parts.join(" · "))
-            };
-            println!("{}", dim_text(&summary, color_enabled));
+            println!(
+                "{}",
+                dim_text(
+                    &format!("{inert} providers not connected (--verbose to list)"),
+                    color_enabled
+                )
+            );
         }
     }
 }
@@ -4218,6 +4214,33 @@ mod tests {
         assert_eq!(
             quota_disconnect_kind(&entry),
             QuotaDisconnectKind::UserFixable
+        );
+    }
+
+    /// The incident QTA relayed from insula#8: a provider whose EVERY account is
+    /// degraded must stay a named entry in the DEFAULT view. Its absence reads
+    /// as unconfigured -- the one meaning it is not -- and sends the operator
+    /// to re-check provider bindings instead of the credential. Asserted at the
+    /// table-selection layer (the layer that dropped it), with the inert
+    /// neighbour proving the filter still excludes what it should.
+    #[test]
+    fn a_fully_degraded_provider_stays_in_the_default_table() {
+        let providers = vec![
+            serde_json::json!({
+                "provider": "claude", "error": "credential requires authentication",
+                "errorClass": "credential_unusable"
+            }),
+            serde_json::json!({ "provider": "idle", "error": "x", "errorClass": "credential_absent" }),
+        ];
+        let entries = quota_entries_for_table(&providers, None, false);
+        let ids: Vec<_> = entries.iter().map(|e| provider_id(e)).collect();
+        assert!(
+            ids.contains(&"claude".to_string()),
+            "a classified degraded provider must render as a named section, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"idle".to_string()),
+            "an inert never-configured provider stays summary-only, got {ids:?}"
         );
     }
 

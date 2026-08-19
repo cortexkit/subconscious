@@ -307,8 +307,12 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
     })
     .await;
 
-    // The respawn half of the restart must fail: the program is gone.
-    std::fs::remove_file(&stub_copy).unwrap();
+    // The respawn half of the restart must fail: the program is gone. RENAME
+    // rather than delete -- the old child is still executing from this path,
+    // and Windows refuses to delete a running executable (the lock is on the
+    // object, so renaming the name away is permitted on every platform).
+    let stub_moved = stub_copy.with_extension("moved");
+    std::fs::rename(&stub_copy, &stub_moved).unwrap();
     // The restart command acks at initiation; the failure lands in state.
     module.restart(None).await.unwrap();
 

@@ -3234,6 +3234,9 @@ async fn begin_forwarding_drain_with(
     reason: RouteCloseReason,
     drain_timeout: Duration,
 ) -> Result<(), SuperviseError> {
+    debug_assert_ne!(reason, RouteCloseReason::Crash);
+    let terminal = matches!(reason, RouteCloseReason::Disable);
+
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
     let drain_target = forwarding
@@ -3291,7 +3294,7 @@ async fn begin_forwarding_drain_with(
                 reason,
                 drained,
                 abandoned: target.abandoned_bindings.len() as u32,
-                terminal: None,
+                terminal: Some(terminal),
             },
         );
         wait_result?;

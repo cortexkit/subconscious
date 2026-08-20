@@ -91,21 +91,34 @@ if health=$(ck health 2>/dev/null); then
   # section already learned this and prints MISSING against an expected roster; the
   # config is the equivalent authority here, and it is the same file the daemon
   # spawns from rather than a list maintained beside it.
-  cfg_count=$(python3 -c "import json,re,os,sys
-p=os.path.expanduser('~/.config/cortexkit/subc.jsonc')
+  # NAME-DIFF, not count-diff: counts cancel (one configured module missing plus
+  # one unconfigured registrant reads as equal counts and says nothing), and a
+  # count cannot tell an operator WHICH module to look for. The names are the
+  # signal. This absence gauge is load-bearing for the reserved-name residual:
+  # boot-time spawn failure is non-fatal by design, so its only native evidence
+  # is a log line nobody reads -- this line is the one that gets read.
+  # FLEET_PULSE_SUBC_CONFIG exists so a control run can prove the ABSENT arm
+  # fires (point it at a config naming a module that cannot be running).
+  cfg_ids=$(python3 -c "import json,re,os
+p=os.environ.get('FLEET_PULSE_SUBC_CONFIG') or os.path.expanduser('~/.config/cortexkit/subc.jsonc')
 try:
     s=re.sub(r'//.*','',open(p).read())
-    print(len(json.loads(s).get('modules',[])))
+    m=json.loads(s).get('modules',{})
+    ids=list(m.keys()) if isinstance(m,dict) else [x.get('id','') for x in m]
+    print('\n'.join(i for i in ids if i))
 except Exception:
     pass" 2>/dev/null)
-  reported=$(printf '%s\n' "$health" | grep -c '●')
-  if [ -n "$cfg_count" ] && [ "$reported" -lt "$cfg_count" ] 2>/dev/null; then
-    printf '  %s ok  (%s of %s configured modules reporting -- %s ABSENT from health)\n' \
-      "$ok_count" "$reported" "$cfg_count" "$((cfg_count - reported))"
-  elif [ -z "$cfg_count" ]; then
-    printf '  %s ok  (config unreadable -- cannot say whether any module is ABSENT)\n' "$ok_count"
+  if [ -n "$cfg_ids" ]; then
+    absent=$(printf '%s\n' "$cfg_ids" | while IFS= read -r mid; do
+      printf '%s\n' "$health" | grep -q "[[:space:]●]$mid[[:space:]]\|^$mid[[:space:]]\|● $mid\b" || printf '%s ' "$mid"
+    done)
+    if [ -n "$absent" ]; then
+      printf '  %s ok  -- CONFIGURED BUT ABSENT FROM HEALTH: %s(daemon never spawned it, or it died unregistered -- check ck module status <id>)\n' "$ok_count" "$absent"
+    else
+      printf '  %s ok  (all %s configured modules reporting)\n' "$ok_count" "$(printf '%s\n' "$cfg_ids" | grep -c .)"
+    fi
   else
-    printf '  %s ok\n' "$ok_count"
+    printf '  %s ok  (config unreadable -- cannot say whether any module is ABSENT)\n' "$ok_count"
   fi
     # COMPARE THE MODULE AND ITS STATUS, NOT THE WHOLE LINE. Byte-identity of the
     # rendered text is a PROXY for "the same condition is still present", and it

@@ -21,6 +21,14 @@ const moduleId = process.argv[2] ?? "prefrontal-core";
 const connPath = `${process.env.HOME}/.local/share/cortexkit/run/subc-connection.json`;
 const conn = await readConnectionFile(connPath);
 const endpoint = conn.endpoints[0];
+if (endpoint === undefined) {
+  // A connection file with zero endpoints has nothing to probe against;
+  // refuse loudly rather than letting strict-null narrowing hide the case.
+  throw new Error(`connection file ${connPath} lists no endpoints`);
+}
+// Top-level narrowing does not cross into function bodies (TS cannot prove
+// call order), so hand the probe an already-narrowed binding.
+const probeTarget: { host: string; port: number } = endpoint;
 
 function helloBody(launchNonce: string | undefined): Uint8Array {
   const manifest = {
@@ -43,7 +51,7 @@ function helloBody(launchNonce: string | undefined): Uint8Array {
 
 async function probe(label: string, nonce: string | undefined): Promise<void> {
   const deadline = Date.now() + 5000;
-  const socket = await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
+  const socket = await SubcSocket.connect(probeTarget.host, probeTarget.port, deadline);
   await authenticateClient(socket, conn, deadline);
   const hello = buildFrame(
     FrameType.Hello,

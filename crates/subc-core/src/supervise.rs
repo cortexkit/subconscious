@@ -172,6 +172,10 @@ impl Default for RestartPolicy {
     }
 }
 
+pub(crate) fn daemon_will_restart(enabled: bool, restart_count: u32, max_restarts: u32) -> bool {
+    enabled && restart_count < max_restarts
+}
+
 const DEFAULT_HEALTH_CADENCE: Duration = Duration::from_secs(30);
 const DEFAULT_HEALTH_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_FAILURE_THRESHOLD: u32 = 3;
@@ -1962,13 +1966,25 @@ async fn health_restart_child(
     detail: Option<&str>,
     now_ms: u64,
 ) -> Result<(), SuperviseError> {
-    if !lock_snapshot(snapshot)?.enabled {
+    let (enabled, will_restart) = {
+        let state = lock_snapshot(snapshot)?;
+        (
+            state.enabled,
+            daemon_will_restart(
+                state.enabled,
+                state.restart_count,
+                runtime.restart_policy.max_restarts,
+            ),
+        )
+    };
+
+    if !enabled {
         return Err(SuperviseError::Disabled {
             module_id: spec.module_id.clone(),
         });
     }
 
-    if lock_snapshot(snapshot)?.restart_count >= runtime.restart_policy.max_restarts {
+    if !will_restart {
         record_health_action(snapshot, &spec.module_id, "disabled".to_string(), now_ms);
         error!(
             module_id = %spec.module_id,
@@ -2797,17 +2813,17 @@ async fn on_child_exit(
                 state.process_alive = false;
                 state.pid = None;
                 state.last_exit = Some(exit_report.clone());
-                if !state.enabled {
-                    state.state = ModuleState::Disabled;
-                    disposition = TerminalDisposition::Disabled;
-                } else if state.restart_count >= policy.max_restarts {
-                    state.state = ModuleState::Failed;
-                    disposition = TerminalDisposition::Failed;
-                } else {
+                if daemon_will_restart(state.enabled, state.restart_count, policy.max_restarts) {
                     state.restart_count += 1;
                     state.state = ModuleState::Restarting;
                     should_restart = true;
                     disposition = TerminalDisposition::Restarting;
+                } else if state.enabled {
+                    state.state = ModuleState::Failed;
+                    disposition = TerminalDisposition::Failed;
+                } else {
+                    state.state = ModuleState::Disabled;
+                    disposition = TerminalDisposition::Disabled;
                 }
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record crashed module exit");
@@ -3427,14 +3443,18 @@ async fn handle_reload_spawn_failure(
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.process_alive = false;
         state.pid = None;
-        if !state.enabled {
-            state.state = ModuleState::Disabled;
-        } else if state.restart_count >= runtime.restart_policy.max_restarts {
-            state.state = ModuleState::Failed;
-        } else {
+        if daemon_will_restart(
+            state.enabled,
+            state.restart_count,
+            runtime.restart_policy.max_restarts,
+        ) {
             state.restart_count += 1;
             state.state = ModuleState::Restarting;
             should_retry = true;
+        } else if state.enabled {
+            state.state = ModuleState::Failed;
+        } else {
+            state.state = ModuleState::Disabled;
         }
     })?;
 
@@ -3732,8 +3752,9 @@ mod terminal_history_tests {
     use tokio::time::sleep;
 
     use super::{
-        drained_after_quiescence_wait, record_terminal, wait_error_exit_report, ExitKind,
-        ModuleSpec, ModuleState, RestartPolicy, SuperviseError, Supervisor,
+        daemon_will_restart, drained_after_quiescence_wait, record_terminal,
+        wait_error_exit_report, ExitKind, ModuleSpec, ModuleState, RestartPolicy, SuperviseError,
+        Supervisor,
     };
     use crate::{
         registry::Registry,
@@ -3762,6 +3783,13 @@ mod terminal_history_tests {
             path.display()
         );
         path
+    }
+
+    #[test]
+    fn daemon_owned_recovery_predicate_uses_the_pre_increment_budget() {
+        assert!(daemon_will_restart(true, 2, 3));
+        assert!(!daemon_will_restart(true, 3, 3));
+        assert!(!daemon_will_restart(false, 0, 3));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

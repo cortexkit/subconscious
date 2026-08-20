@@ -220,6 +220,18 @@ public struct FedGlobalReservationState: Sendable, Equatable, Codable {
     }
 }
 
+/// Durable audit record that an embedding completed device re-enrollment after
+/// local federation state was lost.
+public struct FedReenrollmentAcknowledgment: Sendable, Equatable, Codable {
+    public let enrollmentID: String
+    public let atMs: UInt64
+
+    public init(enrollmentID: String, atMs: UInt64) {
+        self.enrollmentID = enrollmentID
+        self.atMs = atMs
+    }
+}
+
 /// Complete on-disk document for one local Noise identity.
 public struct FedStateDocument: Sendable, Equatable, Codable {
     public static let currentSchemaVersion: Int = 1
@@ -231,6 +243,9 @@ public struct FedStateDocument: Sendable, Equatable, Codable {
     public var localPublicKey: Data?
     public var revision: UInt64
     public var global: FedGlobalReservationState
+    /// Records that the embedding completed the store-loss re-enrollment ceremony.
+    /// Documents written before this field existed decode with `nil`.
+    public var reenrollmentAcknowledgment: FedReenrollmentAcknowledgment?
     /// Destination records keyed by hex of responder static public key.
     public var destinations: [String: FedDestinationState]
 
@@ -240,6 +255,7 @@ public struct FedStateDocument: Sendable, Equatable, Codable {
         localPublicKey: Data? = nil,
         revision: UInt64 = 1,
         global: FedGlobalReservationState,
+        reenrollmentAcknowledgment: FedReenrollmentAcknowledgment? = nil,
         destinations: [String: FedDestinationState] = [:]
     ) {
         self.schemaVersion = schemaVersion
@@ -247,6 +263,7 @@ public struct FedStateDocument: Sendable, Equatable, Codable {
         self.localPublicKey = localPublicKey
         self.revision = revision
         self.global = global
+        self.reenrollmentAcknowledgment = reenrollmentAcknowledgment
         self.destinations = destinations
     }
 

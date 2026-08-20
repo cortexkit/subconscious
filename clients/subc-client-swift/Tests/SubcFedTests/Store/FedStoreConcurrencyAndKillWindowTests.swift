@@ -78,7 +78,7 @@ final class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
         // Committed first reservation survives; aborted second does not advance.
         let next = try await reopened.reserveEffectSequence()
         XCTAssertGreaterThan(next.value, first.value)
-        XCTAssertEqual(doc.global.localIncarnation.isEmpty, false)
+        XCTAssertEqual(doc.document.global.localIncarnation.isEmpty, false)
     }
 
     func testKillWindowAfterTempFsyncAndAfterRename() async throws {

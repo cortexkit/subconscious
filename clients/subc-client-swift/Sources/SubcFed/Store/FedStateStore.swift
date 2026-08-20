@@ -1,12 +1,28 @@
 import Foundation
 
+/// Result of opening one identity-bound state document.
+public struct FedStateOpenResult: Sendable, Equatable {
+    public let document: FedStateDocument
+    /// True only when this open minted and durably committed a fresh document.
+    public let created: Bool
+
+    public init(document: FedStateDocument, created: Bool) {
+        self.document = document
+        self.created = created
+    }
+}
+
 /// Durable origin store for incarnation, reservations, unresolved effects, and
 /// confirmed watermarks. Private keys, Noise material, and call correlations are
 /// never stored here.
 public protocol FedStateStore: Sendable {
     /// Opens or creates the identity-bound document. Fails closed on identity
-    /// mismatch, corruption, or unsupported schema.
-    func open(localPublicKey: Data) async throws -> FedStateDocument
+    /// mismatch, corruption, or unsupported schema. `created` is true only when
+    /// this invocation minted the document.
+    func open(localPublicKey: Data) async throws -> FedStateOpenResult
+
+    /// Durably records the embedding's completed device re-enrollment ceremony.
+    func acknowledgeReenrollment(_ acknowledgment: FedReenrollmentAcknowledgment) async throws
 
     /// Atomically reserves the next catalog generation. The generation is not
     /// emitted on the wire until this transaction commits.
@@ -64,6 +80,7 @@ public protocol FedStateStore: Sendable {
 public actor FedFaultInjectingStateStore: FedStateStore {
     public enum FaultPoint: Sendable, Equatable {
         case open
+        case acknowledgeReenrollment
         case reserveCatalog
         case reserveEffect
         case commitIntent
@@ -96,9 +113,14 @@ public actor FedFaultInjectingStateStore: FedStateStore {
         }
     }
 
-    public func open(localPublicKey: Data) async throws -> FedStateDocument {
+    public func open(localPublicKey: Data) async throws -> FedStateOpenResult {
         try check(.open)
         return try await inner.open(localPublicKey: localPublicKey)
+    }
+
+    public func acknowledgeReenrollment(_ acknowledgment: FedReenrollmentAcknowledgment) async throws {
+        try check(.acknowledgeReenrollment)
+        try await inner.acknowledgeReenrollment(acknowledgment)
     }
 
     public func reserveCatalogGeneration() async throws -> FedReservation {

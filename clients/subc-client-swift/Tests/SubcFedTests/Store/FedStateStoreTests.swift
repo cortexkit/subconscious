@@ -96,20 +96,50 @@ final class FedStateStoreTests: XCTestCase {
         XCTAssertEqual(restored.poisonedLedgerEpochs, ["bad-epoch"])
     }
 
+    func testFedStateDocumentDecodesWithAndWithoutReenrollmentAcknowledgment() throws {
+        let current = FedStateDocument(
+            localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localKey),
+            global: FedGlobalReservationState(localIncarnation: "inc", localLedgerEpoch: "epoch")
+        )
+        let withoutMarker = try JSONEncoder().encode(current)
+        // This is a real current document with the optional field omitted, which
+        // pins decode compatibility for stores written before the marker existed.
+        XCTAssertFalse(String(decoding: withoutMarker, as: UTF8.self).contains("reenrollmentAcknowledgment"))
+        XCTAssertNil(try JSONDecoder().decode(FedStateDocument.self, from: withoutMarker).reenrollmentAcknowledgment)
+
+        var withMarker = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: withoutMarker) as? [String: Any]
+        )
+        withMarker["reenrollmentAcknowledgment"] = [
+            "enrollmentID": "enroll-2026-08",
+            "atMs": 1_723_456_789_000,
+        ]
+        let injected = try JSONSerialization.data(withJSONObject: withMarker)
+        // Injection into the encoded fixture proves the decoder accepts the new
+        // field without hand-writing an otherwise incomplete state document.
+        let decoded = try JSONDecoder().decode(FedStateDocument.self, from: injected)
+        XCTAssertEqual(
+            decoded.reenrollmentAcknowledgment,
+            FedReenrollmentAcknowledgment(enrollmentID: "enroll-2026-08", atMs: 1_723_456_789_000)
+        )
+    }
+
     func testIncarnationAndLedgerEpochSurviveReopen() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let store1 = FedAtomicFileStateStore(directoryURL: dir)
         let first = try await store1.open(localPublicKey: localKey)
-        let incarnation = first.global.localIncarnation
-        let epoch = first.global.localLedgerEpoch
+        XCTAssertTrue(first.created)
+        let incarnation = first.document.global.localIncarnation
+        let epoch = first.document.global.localLedgerEpoch
         let reserved = try await store1.reserveEffectSequence()
 
         let store2 = FedAtomicFileStateStore(directoryURL: dir)
         let second = try await store2.open(localPublicKey: localKey)
-        XCTAssertEqual(second.global.localIncarnation, incarnation)
-        XCTAssertEqual(second.global.localLedgerEpoch, epoch)
+        XCTAssertFalse(second.created)
+        XCTAssertEqual(second.document.global.localIncarnation, incarnation)
+        XCTAssertEqual(second.document.global.localLedgerEpoch, epoch)
         // Reserved values may be skipped but never reused.
         let next = try await store2.reserveEffectSequence()
         XCTAssertGreaterThan(next.value, reserved.value)
@@ -242,7 +272,7 @@ final class FedStateStoreTests: XCTestCase {
 
         let store2 = FedAtomicFileStateStore(directoryURL: dir)
         let second = try await store2.open(localPublicKey: localKey)
-        XCTAssertEqual(second.global.localIncarnation, first.global.localIncarnation)
+        XCTAssertEqual(second.document.global.localIncarnation, first.document.global.localIncarnation)
         XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path))
     }
 

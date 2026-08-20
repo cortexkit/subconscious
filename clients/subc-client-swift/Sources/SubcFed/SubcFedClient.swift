@@ -72,6 +72,11 @@ public actor SubcFedClient {
     private let entropy: any FedNoiseEntropy
     private let dialFactory: any FedCandidateDialFactory
     private var defaultManagementTarget: FedManagementTarget?
+    /// The single authority for whether this client observed its state document
+    /// minted fresh. Do not re-derive this from a later snapshot or revision:
+    /// only `FedStateStore.open` can distinguish a mint from a loaded document.
+    private var stateDocumentCreatedInClientLifetime: Bool?
+    private var reenrollmentAcknowledgment: FedReenrollmentAcknowledgment?
 
     private var activeProfile: FedPeerProfile
     private var pendingProfile: FedPeerProfile?
@@ -159,6 +164,26 @@ public actor SubcFedClient {
     public func connect() async throws {
         explicitlyDisconnected = false
         try await beginDialCycle(reason: .explicitConnect)
+    }
+
+    /// Records that the embedding completed device re-enrollment after local
+    /// federation state was lost. The enrollment identifier is retained for audit;
+    /// it is not matched against a remote value by this client.
+    public func acknowledgeReenrollment(enrollmentID: String) async throws {
+        guard !enrollmentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw FedFailure.invalidProfile(field: "enrollmentID")
+        }
+        let localPublicKey = try await keyStore.staticPublicKey()
+        guard localPublicKey.count == 32 else {
+            throw FedFailure.invalidProfile(field: "localPublicKey")
+        }
+        try await openStateDocumentIfNeeded(localPublicKey: localPublicKey)
+        let acknowledgment = FedReenrollmentAcknowledgment(
+            enrollmentID: enrollmentID,
+            atMs: UInt64(Date().timeIntervalSince1970 * 1_000)
+        )
+        try await stateStore.acknowledgeReenrollment(acknowledgment)
+        reenrollmentAcknowledgment = acknowledgment
     }
 
     public func disconnect() async {
@@ -348,6 +373,21 @@ public actor SubcFedClient {
             throw finishPreCarrier(with: .unsupportedEnrollmentClass)
         }
 
+        try await openStateDocumentIfNeeded(localPublicKey: localPublicKey)
+        if isDialStale(generation) { throw FedFailure.cancelled }
+        // This fence protects configurations whose key store reports provenance.
+        // An embedder that cannot report it yields `.unknown`, which must not fence
+        // every fresh install. A fresh device can crash after key creation but before
+        // its first store commit, then relaunch as preexisting-key plus fresh-store;
+        // fencing that benign case is intentional because enrollment is exactly the
+        // ceremony a fresh device still needs, and a completed enrollment clears it.
+        if await keyStore.noiseKeyProvenance() == .preexisting,
+           stateDocumentCreatedInClientLifetime == true,
+           reenrollmentAcknowledgment == nil
+        {
+            throw finishPreCarrier(with: .storeLossReenrollmentRequired)
+        }
+
         let snapshot = await observedNetworkProvider()
         if isDialStale(generation) { throw FedFailure.cancelled }
 
@@ -367,6 +407,13 @@ public actor SubcFedClient {
                 generation: generation
             )
         }
+    }
+
+    private func openStateDocumentIfNeeded(localPublicKey: Data) async throws {
+        guard stateDocumentCreatedInClientLifetime == nil else { return }
+        let result = try await stateStore.open(localPublicKey: localPublicKey)
+        stateDocumentCreatedInClientLifetime = result.created
+        reenrollmentAcknowledgment = result.document.reenrollmentAcknowledgment
     }
 
     private func evaluateEligibility(

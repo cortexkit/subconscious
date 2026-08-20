@@ -9,6 +9,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         let failures: [FedFailure] = [
             .notDialOwner,
             .unsupportedEnrollmentClass,
+            .storeLossReenrollmentRequired,
             .invalidProfile(field: "default_deadline_ms"),
             .candidateRejected(reason: .unverifiedPeerLAN),
             .candidateTimedOut(stage: .noiseHandshake),
@@ -35,7 +36,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             .noEligibleCandidates([]),
             .allCandidatesFailed([]),
         ]
-        XCTAssertEqual(failures.count, 27)
+        XCTAssertEqual(failures.count, 28)
         XCTAssertEqual(Self.candidateStages.count, 5)
         XCTAssertEqual(Self.rejectionReasons.count, 6)
     }
@@ -122,6 +123,114 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         let carriers = await client.carrierOperationsStarted
         XCTAssertNil(attempt)
         XCTAssertEqual(carriers, 0)
+    }
+
+    func testCreatedThisProcessKeyWithFreshStoreDoesNotFenceDial() async throws {
+        let dialCounter = DialCounter()
+        let client = SubcFedClient(
+            profile: try FedPublicTestSupport.humanProfile(),
+            keyStore: try ProvenanceReportingPrivateKeyStore(
+                privateKey: FedPublicTestSupport.localPrivateKey,
+                provenance: .createdThisProcess
+            ),
+            stateStore: FedMemoryStateStore(),
+            observedNetwork: { try! FedPublicTestSupport.observedHomeLAN() },
+            dialFactory: RecordingDialFactory { _, _ in
+                await dialCounter.increment()
+                throw FedFailure.disconnected
+            }
+        )
+
+        do {
+            try await client.connect()
+            XCTFail("expected the recording factory's ordinary dial refusal")
+        } catch let failure as FedFailure {
+            XCTAssertNotEqual(failure, .storeLossReenrollmentRequired)
+        }
+
+        let attempt = await client.lastAttemptID
+        let carriers = await client.carrierOperationsStarted
+        let dials = await dialCounter.value
+        XCTAssertNotNil(attempt)
+        XCTAssertEqual(carriers, 1)
+        XCTAssertEqual(dials, 1)
+    }
+
+    /// Fences the mutation that changes the store-loss gate's `.preexisting`
+    /// provenance check to `.createdThisProcess` or removes its provenance guard.
+    func testPreexistingKeyWithFreshStoreRequiresReenrollmentBeforeDial() async throws {
+        let dialCounter = DialCounter()
+        let client = SubcFedClient(
+            profile: try FedPublicTestSupport.humanProfile(),
+            keyStore: try ProvenanceReportingPrivateKeyStore(
+                privateKey: FedPublicTestSupport.localPrivateKey,
+                provenance: .preexisting
+            ),
+            stateStore: FedMemoryStateStore(),
+            observedNetwork: { try! FedPublicTestSupport.observedHomeLAN() },
+            dialFactory: RecordingDialFactory { _, _ in
+                await dialCounter.increment()
+                throw FedFailure.disconnected
+            }
+        )
+
+        do {
+            try await client.connect()
+            XCTFail("expected store-loss re-enrollment fence")
+        } catch let failure as FedFailure {
+            XCTAssertEqual(failure, .storeLossReenrollmentRequired)
+        }
+
+        let state = await client.state
+        let attempt = await client.lastAttemptID
+        let carriers = await client.carrierOperationsStarted
+        let dials = await dialCounter.value
+        XCTAssertEqual(state, .disconnected(reason: .storeLossReenrollmentRequired))
+        XCTAssertNil(attempt)
+        XCTAssertEqual(carriers, 0)
+        XCTAssertEqual(dials, 0)
+    }
+
+    func testAcknowledgedReenrollmentPersistsAndClearsStoreLossFence() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let localPublicKey = try FedPublicTestSupport.localPublicKey()
+        let stateStore = FedAtomicFileStateStore(directoryURL: directory)
+        let dialCounter = DialCounter()
+        let client = SubcFedClient(
+            profile: try FedPublicTestSupport.humanProfile(),
+            keyStore: try ProvenanceReportingPrivateKeyStore(
+                privateKey: FedPublicTestSupport.localPrivateKey,
+                provenance: .preexisting
+            ),
+            stateStore: stateStore,
+            observedNetwork: { try! FedPublicTestSupport.observedHomeLAN() },
+            dialFactory: RecordingDialFactory { _, _ in
+                await dialCounter.increment()
+                throw FedFailure.disconnected
+            }
+        )
+
+        try await client.acknowledgeReenrollment(enrollmentID: "enroll-2026-08")
+
+        let reopened = FedAtomicFileStateStore(directoryURL: directory)
+        let reopenedDocument = try await reopened.open(localPublicKey: localPublicKey).document
+        let marker = try XCTUnwrap(reopenedDocument.reenrollmentAcknowledgment)
+        XCTAssertEqual(marker.enrollmentID, "enroll-2026-08")
+        XCTAssertGreaterThan(marker.atMs, 0)
+
+        do {
+            try await client.connect()
+            XCTFail("expected the recording factory's ordinary dial refusal")
+        } catch let failure as FedFailure {
+            XCTAssertNotEqual(failure, .storeLossReenrollmentRequired)
+        }
+        let attempt = await client.lastAttemptID
+        let carriers = await client.carrierOperationsStarted
+        let dials = await dialCounter.value
+        XCTAssertNotNil(attempt)
+        XCTAssertEqual(carriers, 1)
+        XCTAssertEqual(dials, 1)
     }
 
     func testUnverifiedLANRejectedWithoutCarrierAndAttemptID() async throws {
@@ -537,4 +646,32 @@ private actor AttemptBox {
 private actor DialCounter {
     private(set) var value = 0
     func increment() { value += 1 }
+}
+
+private struct ProvenanceReportingPrivateKeyStore: FedPrivateKeyStore, Sendable {
+    let privateKey: Data
+    let provenance: FedKeyProvenance
+
+    init(privateKey: Data, provenance: FedKeyProvenance) throws {
+        _ = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey)
+        self.privateKey = privateKey
+        self.provenance = provenance
+    }
+
+    func staticPublicKey() async throws -> Data {
+        try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey).publicKey.rawRepresentation
+    }
+
+    func staticPrivateKey() async throws -> Data { privateKey }
+
+    func companionSigningPrivateKey() async throws -> Data? { nil }
+
+    func noiseKeyProvenance() async -> FedKeyProvenance { provenance }
+}
+
+private func temporaryDirectory() throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("subcfed-client-store-loss-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
 }

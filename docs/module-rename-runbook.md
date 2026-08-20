@@ -502,6 +502,22 @@ a crash-respawn between the early config edit and the planned restart spawns
 the OLD binary without its var, which resolves a different path than the store
 it was just holding.
 
+Verify the post-move store by INODE, never by path: `lsof` prints the path
+RECORDED AT OPEN TIME, so a process writing to files your `mv` replaced still
+displays the correct path while every write lands in orphaned inodes -- the
+path check reports success in exactly the failure it exists to detect
+(astrocyte's second restart). Compare `lsof -p <pid> -Fin` (the `i` field --
+use the field output, not awk column arithmetic on the table form) against
+`stat -f %i <store path>`; equal or the daemon is writing to an orphan. Same
+rule as binary deploys, carried to data files.
+
+And the window must be SPAWN-FREE BY CONFIG, not just stopped: `ck module
+stop` disables at RUNTIME only, and a `rescan` reconciles against the CONFIG
+-- config `enabled:true` over runtime-disabled SPAWNS THE MODULE (this is how
+astrocyte's fresh store appeared mid-move: the var-drop rescan undid the
+stop). During a store move, carry `enabled:false` in the config itself through
+the move, rescan (now spawn-free), move, then flip enabled back and start.
+
 And do not read a green `--check-config` preflight as clearance for the move:
 preflight validates the CONFIG FILE, while this hazard lives between the config
 and the STORE (the var/resolver disagreement is invisible to any check that

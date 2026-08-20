@@ -65,6 +65,10 @@ pub struct BootstrapConfig {
     admission_facts: AdmissionFactsConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
+    /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
+    /// any module without a per-module override). `None` = built-in default
+    /// (12s — see `control::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT`).
+    route_bind_relay_default_ms: Option<u64>,
     watchdog_config: DaemonSelfWatchdogConfig,
 }
 
@@ -79,6 +83,7 @@ impl BootstrapConfig {
             admission_facts: AdmissionFactsConfig::default(),
             daemon_config_path: None,
             configured_port: None,
+            route_bind_relay_default_ms: None,
             watchdog_config: DaemonSelfWatchdogConfig::default(),
         }
     }
@@ -103,6 +108,9 @@ impl BootstrapConfig {
         let admission_facts_targets = daemon_config
             .as_ref()
             .and_then(|config| config.admission_facts_targets.clone());
+        let route_bind_relay_default_ms = daemon_config
+            .as_ref()
+            .and_then(|config| config.route_bind_relay_timeout_ms);
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
@@ -129,6 +137,7 @@ impl BootstrapConfig {
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
+            .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_daemon_config_source(daemon_config_path, config_port))
     }
 
@@ -149,6 +158,9 @@ impl BootstrapConfig {
         let admission_facts_targets = daemon_config
             .as_ref()
             .and_then(|config| config.admission_facts_targets.clone());
+        let route_bind_relay_default_ms = daemon_config
+            .as_ref()
+            .and_then(|config| config.route_bind_relay_timeout_ms);
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
@@ -156,6 +168,7 @@ impl BootstrapConfig {
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
+            .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_daemon_config_source(daemon_config_path, configured_port))
     }
 
@@ -186,6 +199,15 @@ impl BootstrapConfig {
             carrier_module_id,
             targets,
         };
+        self
+    }
+
+    /// Set the daemon-wide route.bind relay default (the fallback for any
+    /// module without a per-module override). `None` preserves the built-in
+    /// default (12s). `serve_bound_daemon` reads this at startup and threads
+    /// it into the control handler's daemon-wide field.
+    pub fn with_route_bind_relay_default_ms(mut self, ms: Option<u64>) -> Self {
+        self.route_bind_relay_default_ms = ms;
         self
     }
 
@@ -251,6 +273,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let admission_facts = config.admission_facts.clone();
     let daemon_config_path = config.daemon_config_path.clone();
     let configured_port = config.configured_port;
+    let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
     let watchdog_config = config.watchdog_config.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
@@ -265,6 +288,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 admission_facts,
                 daemon_config_path,
                 configured_port,
+                route_bind_relay_default_ms,
                 watchdog_config,
             )
             .await
@@ -347,6 +371,7 @@ pub async fn run_with_daemon_config_path(
     run_with_config(config.with_daemon_config_path(daemon_config_path)?).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_bound_daemon(
     bound: BoundDaemon,
     configured_modules: Vec<ConfiguredModule>,
@@ -354,6 +379,7 @@ async fn serve_bound_daemon(
     admission_facts: AdmissionFactsConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
+    route_bind_relay_default_ms: Option<u64>,
     watchdog_config: DaemonSelfWatchdogConfig,
 ) -> Result<(), BootstrapError> {
     raise_nofile_limit();
@@ -375,12 +401,31 @@ async fn serve_bound_daemon(
         .with_forwarding(Arc::clone(&forwarding))
         .with_handle(supervisor_handle.clone())
         .with_connection_file_path(bound.connection_file_path.clone());
+    // Collect per-module route.bind relay overrides BEFORE handing the
+    // `configured_modules` vector to the supervisor (which only needs each
+    // module's `drain_timeout_ms`). Each entry was filled in by parse-time
+    // resolution (per-module > daemon-wide > absent), so modules with no
+    // override are absent from this map and the daemon-wide default applies.
+    let route_bind_relay_timeouts = configured_modules
+        .iter()
+        .filter_map(|module| {
+            module
+                .route_bind_relay_timeout_ms
+                .map(|ms| (module.module_id.clone(), Duration::from_millis(ms)))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_process_liveness(process_liveness)
         .with_supervisor(supervisor_handle)
         .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config)
-        .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets);
+        .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
+        .with_route_bind_relay_timeouts(route_bind_relay_timeouts);
+    if let Some(ms) = route_bind_relay_default_ms {
+        // A daemon-wide config value overrides the built-in default; a
+        // `None` here leaves the ControlHandler's 12s default in place.
+        control = control.with_route_bind_relay_timeout(Duration::from_millis(ms));
+    }
     if let Some(config_path) = daemon_config_path {
         control = control.with_supervisor_rescan(supervisor.clone(), config_path, configured_port);
     }

@@ -23,6 +23,14 @@ pub struct DaemonConfig {
     /// drain waits for already-dispatched requests to finalize. `None` uses
     /// the built-in default (30s). Per-module `drain_timeout_ms` overrides.
     pub drain_timeout_ms: Option<u64>,
+    /// Daemon-wide default route.bind relay budget (ms): how long the daemon
+    /// waits for the target module to acknowledge a relayed `route.bind` before
+    /// reporting `module_timeout`. `None` uses the built-in default (12s, set
+    /// in `control::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT`). Per-module
+    /// `route_bind_relay_timeout_ms` overrides. An explicit `0` is honored and
+    /// means "never wait" — every bind to a slow module fails immediately,
+    /// symmetric with `drain_timeout_ms = 0`.
+    pub route_bind_relay_timeout_ms: Option<u64>,
     pub modules: Vec<ConfiguredModule>,
     /// Central storage policy: the single backend choice all managed modules use.
     /// `None` when the config has no `storage` section (no managed storage).
@@ -116,6 +124,10 @@ pub struct ConfiguredModule {
     /// Effective drain budget (ms) for this module's teardown, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default.
     pub drain_timeout_ms: Option<u64>,
+    /// Effective route.bind relay budget (ms) for this module, already resolved
+    /// against the daemon-wide default at parse time. `None` = built-in default
+    /// (12s). An explicit `0` is honored — see `DaemonConfig::route_bind_relay_timeout_ms`.
+    pub route_bind_relay_timeout_ms: Option<u64>,
 }
 
 impl ConfiguredModule {
@@ -163,6 +175,8 @@ struct RawDaemonConfig {
     #[serde(default)]
     drain_timeout_ms: Option<u64>,
     #[serde(default)]
+    route_bind_relay_timeout_ms: Option<u64>,
+    #[serde(default)]
     modules: BTreeMap<String, RawModuleConfig>,
     #[serde(default)]
     storage: Option<RawStorageConfig>,
@@ -200,6 +214,8 @@ struct RawModuleConfig {
     health: Option<RawHealthConfig>,
     #[serde(default)]
     drain_timeout_ms: Option<u64>,
+    #[serde(default)]
+    route_bind_relay_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +305,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
     }
 
     let default_drain_timeout_ms = raw.drain_timeout_ms;
+    let default_route_bind_relay_timeout_ms = raw.route_bind_relay_timeout_ms;
     let modules = raw
         .modules
         .into_iter()
@@ -320,6 +337,12 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 // Per-module wins; the daemon-wide value is the fallback. `0` is
                 // legitimate ("never wait"), so this is `.or`, not `filter+or`.
                 drain_timeout_ms: module.drain_timeout_ms.or(default_drain_timeout_ms),
+                // Same shape as drain: an explicit per-module value (including
+                // `0`) survives; the daemon-wide default fills in only when no
+                // per-module value is set.
+                route_bind_relay_timeout_ms: module
+                    .route_bind_relay_timeout_ms
+                    .or(default_route_bind_relay_timeout_ms),
             })
         })
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
@@ -342,6 +365,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         path: path.to_path_buf(),
         port: raw.port,
         drain_timeout_ms: default_drain_timeout_ms,
+        route_bind_relay_timeout_ms: default_route_bind_relay_timeout_ms,
         modules,
         storage,
         admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
@@ -767,6 +791,57 @@ mod tests {
         // config migration.
         assert_eq!(config.modules[0].drain_timeout_ms, None);
         assert_eq!(config.drain_timeout_ms, None);
+    }
+
+    #[test]
+    fn route_bind_relay_timeout_resolves_module_over_daemon_over_absent() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "route_bind_relay_timeout_ms": 30000,
+              "modules": {
+                "fast": { "program": "fast", "route_bind_relay_timeout_ms": 0 },
+                "slow": { "program": "slow", "route_bind_relay_timeout_ms": 60000 },
+                "inherits": { "program": "inherits" }
+              }
+            }
+            "#,
+            path,
+        )
+        .unwrap();
+        let by_id = |id: &str| {
+            config
+                .modules
+                .iter()
+                .find(|m| m.module_id == id)
+                .unwrap()
+                .route_bind_relay_timeout_ms
+        };
+        // Per-module wins, INCLUDING an explicit 0 -- the case a truthiness-
+        // shaped resolution would silently replace with the daemon-wide value.
+        assert_eq!(by_id("fast"), Some(0));
+        assert_eq!(by_id("slow"), Some(60_000));
+        // No per-module value: the daemon-wide default flows in at parse time.
+        assert_eq!(by_id("inherits"), Some(30_000));
+        assert_eq!(config.route_bind_relay_timeout_ms, Some(30_000));
+    }
+
+    #[test]
+    fn route_bind_relay_timeout_absent_everywhere_stays_none_for_builtin_default() {
+        // Backward-compatibility guard: a config that does not mention
+        // `route_bind_relay_timeout_ms` at all (the shape every pre-#38 daemon
+        // shipped) parses to `None` on both layers, so the bind path keeps
+        // its compiled 12s default.
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m" } } }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(config.modules[0].route_bind_relay_timeout_ms, None);
+        assert_eq!(config.route_bind_relay_timeout_ms, None);
     }
 
     #[test]

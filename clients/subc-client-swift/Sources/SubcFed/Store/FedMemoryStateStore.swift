@@ -10,7 +10,7 @@ public actor FedMemoryStateStore: FedStateStore {
         self.expectedPublicKey = expectedPublicKey
     }
 
-    public func open(localPublicKey: Data) async throws -> FedStateDocument {
+    public func open(localPublicKey: Data) async throws -> FedStateOpenResult {
         if let expectedPublicKey, expectedPublicKey != localPublicKey {
             throw FedFailure.storeCorrupt
         }
@@ -19,16 +19,23 @@ public actor FedMemoryStateStore: FedStateStore {
             guard document.localIdentityDigest == digest else {
                 throw FedFailure.storeCorrupt
             }
-            return document
+            return FedStateOpenResult(document: document, created: false)
         }
-        let created = FedStateDocument(
+        let document = FedStateDocument(
             localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localPublicKey),
             localPublicKey: localPublicKey,
             revision: 1,
             global: .mintFresh()
         )
-        document = created
-        return created
+        self.document = document
+        return FedStateOpenResult(document: document, created: true)
+    }
+
+    public func acknowledgeReenrollment(_ acknowledgment: FedReenrollmentAcknowledgment) async throws {
+        var document = try requireDocument()
+        document.reenrollmentAcknowledgment = acknowledgment
+        document.revision += 1
+        self.document = document
     }
 
     public func reserveCatalogGeneration() async throws -> FedReservation {

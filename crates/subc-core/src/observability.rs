@@ -61,6 +61,7 @@ impl Drop for ConnectedClientGuard {
 #[derive(Debug, Clone, Default)]
 pub struct DaemonCounters {
     module_frames_dropped_no_route: Arc<AtomicU64>,
+    module_requests_dropped_stale_route: Arc<AtomicU64>,
     client_frames_dropped_stale_route: Arc<AtomicU64>,
     client_egress_close_delivery_failed: Arc<AtomicU64>,
     goodbye_relay_client_failed: Arc<AtomicU64>,
@@ -79,6 +80,7 @@ impl DaemonCounters {
     pub fn snapshot(&self) -> Value {
         json!({
             "module_frames_dropped_no_route": self.module_frames_dropped_no_route.load(Ordering::Relaxed),
+            "module_requests_dropped_stale_route": self.module_requests_dropped_stale_route.load(Ordering::Relaxed),
             "client_frames_dropped_stale_route": self.client_frames_dropped_stale_route.load(Ordering::Relaxed),
             "client_egress_close_delivery_failed": self.client_egress_close_delivery_failed.load(Ordering::Relaxed),
             "goodbye_relay_client_failed": self.goodbye_relay_client_failed.load(Ordering::Relaxed),
@@ -90,6 +92,11 @@ impl DaemonCounters {
 
     pub(crate) fn increment_module_frames_dropped_no_route(&self) {
         self.module_frames_dropped_no_route
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn increment_module_requests_dropped_stale_route(&self) {
+        self.module_requests_dropped_stale_route
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -132,12 +139,14 @@ mod tests {
     fn counter_snapshot_uses_stable_keys() {
         let counters = DaemonCounters::new();
         counters.increment_module_frames_dropped_no_route();
+        counters.increment_module_requests_dropped_stale_route();
         counters.increment_route_release_stale_skipped();
 
         assert_eq!(
             counters.snapshot(),
             json!({
                 "module_frames_dropped_no_route": 1,
+                "module_requests_dropped_stale_route": 1,
                 "client_frames_dropped_stale_route": 0,
                 "client_egress_close_delivery_failed": 0,
                 "goodbye_relay_client_failed": 0,

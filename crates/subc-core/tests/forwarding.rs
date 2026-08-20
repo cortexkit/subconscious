@@ -4986,6 +4986,81 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_closed_crash_at_max_minus_one_is_non_terminal() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-crash-one-restart";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "750")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 1061, "ses-crash-one-restart").await;
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+        Some(false),
+    );
+    let goodbye = read_frame_timeout(&mut client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Running && status.restart_count == 1 && status.live
+    })
+    .await;
+    assert_eq!(status.restart_count, 1);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_closed_crash_at_max_is_terminal() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 0, Duration::from_millis(10));
+    let module_id = "fake-aft-crash-no-restarts";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "750")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 1062, "ses-crash-no-restarts").await;
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+        Some(true),
+    );
+    let goodbye = read_frame_timeout(&mut client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Failed && !status.registration_active && !status.live
+    })
+    .await;
+    assert_eq!(status.restart_count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_provider_route_open_error_mapping_unknown_unavailable_and_verbatim_rejection() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));

@@ -474,6 +474,20 @@ impl ControlHandler {
                     .map(|routes| (registration.manifest.module_id, routes))
             });
         if let Some((module_id, routes)) = crash_closed {
+            let terminal = match self.supervisor.get(&module_id) {
+                None => false,
+                Some(module) => match module.will_recover_after_connection_loss() {
+                    Ok(will_recover) => !will_recover,
+                    Err(err) => {
+                        warn!(
+                            %module_id,
+                            error = %err,
+                            "failed to read crash recovery verdict; reporting non-terminal conservatively"
+                        );
+                        false
+                    }
+                },
+            };
             send_route_control_pushes(
                 &self.forwarding,
                 routes,
@@ -482,7 +496,7 @@ impl ControlHandler {
                     reason: RouteCloseReason::Crash,
                     drained: false,
                     abandoned: 0,
-                    terminal: None,
+                    terminal: Some(terminal),
                 },
             );
         }

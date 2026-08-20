@@ -1086,6 +1086,19 @@ impl SupervisedModule {
         })
     }
 
+    pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
+        let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
+        Ok(match snapshot.state {
+            ModuleState::Restarting => true,
+            ModuleState::Failed | ModuleState::Disabled => false,
+            _ => daemon_will_restart(
+                snapshot.enabled,
+                snapshot.restart_count,
+                self.inner.max_restarts,
+            ),
+        })
+    }
+
     /// Drain the module and stop monitoring it.
     pub async fn drain(&self) -> Result<(), SuperviseError> {
         self.stop().await
@@ -3756,9 +3769,9 @@ mod terminal_history_tests {
     use tokio::time::sleep;
 
     use super::{
-        daemon_will_restart, drained_after_quiescence_wait, record_terminal,
+        daemon_will_restart, drained_after_quiescence_wait, record_terminal, update_snapshot,
         wait_error_exit_report, ExitKind, ModuleSpec, ModuleState, RestartPolicy, SuperviseError,
-        Supervisor,
+        SupervisedModule, Supervisor,
     };
     use crate::{
         registry::Registry,
@@ -3794,6 +3807,70 @@ mod terminal_history_tests {
         assert!(daemon_will_restart(true, 2, 3));
         assert!(!daemon_will_restart(true, 3, 3));
         assert!(!daemon_will_restart(false, 0, 3));
+    }
+
+    fn module_with_recovery_snapshot(
+        state: ModuleState,
+        enabled: bool,
+        restart_count: u32,
+    ) -> SupervisedModule {
+        let registry = Arc::new(Registry::default());
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "recovery-snapshot".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            })
+            .unwrap();
+        update_snapshot(
+            &module.inner.snapshot,
+            Some("recovery-snapshot"),
+            |snapshot| {
+                snapshot.state = state;
+                snapshot.enabled = enabled;
+                snapshot.restart_count = restart_count;
+            },
+        )
+        .unwrap();
+        module
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undecided_snapshot_uses_shared_restart_predicate() {
+        assert!(module_with_recovery_snapshot(ModuleState::Running, true, 2)
+            .will_recover_after_connection_loss()
+            .unwrap());
+        assert!(
+            !module_with_recovery_snapshot(ModuleState::Running, true, 3)
+                .will_recover_after_connection_loss()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarting_snapshot_is_non_terminal_at_exhausted_budget() {
+        assert!(
+            module_with_recovery_snapshot(ModuleState::Restarting, true, 3)
+                .will_recover_after_connection_loss()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_and_disabled_snapshots_are_terminal() {
+        assert!(!module_with_recovery_snapshot(ModuleState::Failed, true, 0)
+            .will_recover_after_connection_loss()
+            .unwrap());
+        assert!(
+            !module_with_recovery_snapshot(ModuleState::Disabled, false, 0)
+                .will_recover_after_connection_loss()
+                .unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

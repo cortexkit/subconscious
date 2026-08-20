@@ -457,3 +457,33 @@ nothing depends on the compatibility symlink surviving: deleting the
 symlink later would re-resolve the old path via its missing-leaf fallback
 and mint a THIRD identity. The general class: deriving a durable key from
 a mutable, aliasable path — a folder rename is its loudest instance.
+
+## Data-layout convention (referenced by fleet-pulse's LAYOUT ANOMALY line)
+
+One rule: module data lives at `<data home>/cortexkit/<module_id>/` where the
+data home is `$XDG_DATA_HOME` (absolute) else `~/.local/share`. The resolution
+is OWNED BY THE SHARED CRATES — Rust `cortexkit-store-types::module_store_path`
+/ `module_data_dir` (0.2.0+), TS `@cortexkit/store` `moduleStorePath` /
+`moduleDataDir`. Modules do not hand-assemble the home and do not invent
+private `*_DATA_DIR` env conventions; rigs relocate the whole tree via
+`XDG_DATA_HOME` in the module's env block.
+
+The two anomaly signatures fleet-pulse scans for, and what they mean:
+
+- `<module>/cortexkit/<module>/...` (doubled nesting): an already-qualified
+  module directory was fed to the two-argument `sqlite_store_path` as a data
+  home (the astrocyte 2026-08 defect — both halves honored their own contract
+  with the boundary drawn twice). Fix: adopt `module_store_path`, then one
+  stop-move-restart, moving the nested contents UP.
+- 0-byte `store.db` beside real state (decoy): every tool that opens it reads
+  "empty store" when the fact is "wrong location" — an empty database and an
+  absent one are different facts that look identical at the only place anyone
+  checks. Delete the decoy FIRST during any migration (it must not win a race
+  as the target), and if something recreates it, the creator is the defect.
+
+Migration invariants, both learned the expensive way: the single-writer lease
+is keyed by DIRECTORY (basename stable), so the lease file must travel WITH
+the store or the fence fails closed as `Fenced{holder:1, db:N}` (pre-seed per
+the rename steps above if the file cannot travel); and the move order is
+API-first — adopt the resolver in the binary, then move the store once, so
+the data never sits at a path the running code disagrees with.

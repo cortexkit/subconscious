@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 
 import {
+  moduleStorePath,
   parseStorageDescriptor,
   postgresDatabaseName,
   sqliteStorePath,
@@ -115,5 +116,34 @@ describe("sqliteStorePath path-hazard refusal (issue #32)", () => {
       "/data/cortexkit/mcp:everything/store.db",
     );
     expect(sqliteStorePath("/data", "v1.2-module")).toBe("/data/cortexkit/v1.2-module/store.db");
+  });
+});
+
+describe("data-home resolver (parity with cortexkit-store-types 0.2.0)", () => {
+  test("moduleStorePath honours absolute XDG_DATA_HOME", () => {
+    expect(moduleStorePath("astrocyte", { XDG_DATA_HOME: "/tmp/xdg-test" })).toBe(
+      "/tmp/xdg-test/cortexkit/astrocyte/store.db",
+    );
+  });
+
+  test("moduleStorePath defaults to HOME/.local/share", () => {
+    expect(moduleStorePath("astrocyte", { HOME: "/tmp/home-test" })).toBe(
+      "/tmp/home-test/.local/share/cortexkit/astrocyte/store.db",
+    );
+  });
+
+  test("relative XDG_DATA_HOME is ignored per the basedir spec", () => {
+    expect(moduleStorePath("m", { XDG_DATA_HOME: "relative/path", HOME: "/tmp/home-test" })).toBe(
+      "/tmp/home-test/.local/share/cortexkit/m/store.db",
+    );
+  });
+
+  test("feeding a module dir as a data home doubles the nesting (the astrocyte defect, pinned)", () => {
+    // Negative example kept as a fence on the low-level contract: this is what
+    // the two-argument form does when handed an already-qualified module
+    // directory, and why moduleStorePath exists.
+    expect(sqliteStorePath("/x/.local/share/cortexkit/astrocyte", "astrocyte")).toBe(
+      "/x/.local/share/cortexkit/astrocyte/cortexkit/astrocyte/store.db",
+    );
   });
 });

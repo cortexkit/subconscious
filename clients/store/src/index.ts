@@ -6,4 +6,10 @@ export {
   type StorageBackend,
   type StorageDescriptor,
 } from "./descriptor.js";
-export { postgresDatabaseName, sqliteStorePath } from "./derivation.js";
+export {
+  postgresDatabaseName,
+  sqliteStorePath,
+  resolveDataHome,
+  moduleDataDir,
+  moduleStorePath,
+} from "./derivation.js";

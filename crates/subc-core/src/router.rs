@@ -237,19 +237,63 @@ impl Router {
             .map_err(RouterError::Forwarding)?;
 
         match data_route {
-            DataRoute::Module(DataRouteState::EpochMismatch | DataRouteState::Reserved) => {
-                self.counters.increment_module_frames_dropped_no_route();
+            DataRoute::Module(DataRouteState::EpochMismatch) => {
+                if frame.header.ty == FrameType::Request {
+                    self.counters
+                        .increment_module_requests_dropped_stale_route();
+                    let err = RouterError::StaleRouteEpoch {
+                        channel,
+                        epoch,
+                        corr,
+                    };
+                    if let Some(error_frame) = err.to_error_frame() {
+                        ctx.egress.send(error_frame).await?;
+                    }
+                } else {
+                    self.counters.increment_module_frames_dropped_no_route();
+                }
                 debug!(
                     connection_id = ctx.connection_id.get(),
-                    channel,
-                    epoch,
-                    corr,
-                    "dropping module frame for stale or reserved route handle"
+                    channel, epoch, corr, "dropping module frame for stale route epoch"
+                );
+                return Ok(());
+            }
+            DataRoute::Module(DataRouteState::Reserved) => {
+                if frame.header.ty == FrameType::Request {
+                    self.counters
+                        .increment_module_requests_dropped_stale_route();
+                    let err = RouterError::UnknownChannel {
+                        channel,
+                        epoch,
+                        corr,
+                    };
+                    if let Some(error_frame) = err.to_error_frame() {
+                        ctx.egress.send(error_frame).await?;
+                    }
+                } else {
+                    self.counters.increment_module_frames_dropped_no_route();
+                }
+                debug!(
+                    connection_id = ctx.connection_id.get(),
+                    channel, epoch, corr, "dropping module frame for reserved route handle"
                 );
                 return Ok(());
             }
             DataRoute::Module(DataRouteState::Absent) => {
-                self.counters.increment_module_frames_dropped_no_route();
+                if frame.header.ty == FrameType::Request {
+                    self.counters
+                        .increment_module_requests_dropped_stale_route();
+                    let err = RouterError::UnknownChannel {
+                        channel,
+                        epoch,
+                        corr,
+                    };
+                    if let Some(error_frame) = err.to_error_frame() {
+                        ctx.egress.send(error_frame).await?;
+                    }
+                } else {
+                    self.counters.increment_module_frames_dropped_no_route();
+                }
                 debug!(
                     connection_id = ctx.connection_id.get(),
                     channel, epoch, corr, "dropping module frame for absent route handle"
@@ -983,17 +1027,18 @@ mod tests {
         .unwrap()
     }
 
-    fn dynamic_route_fixture(
-        commit: bool,
-    ) -> (
+    type DynamicRouteFixture = (
         Router,
         Arc<ForwardingTable>,
         RouteCtx,
         mpsc::Receiver<Frame>,
         RouteCtx,
         mpsc::Receiver<Frame>,
+        mpsc::Receiver<Frame>,
         crate::forwarding::PendingRouteBindRelay,
-    ) {
+    );
+
+    fn dynamic_route_fixture(commit: bool) -> DynamicRouteFixture {
         let forwarding = Arc::new(ForwardingTable::default());
         let control = Arc::new(crate::ControlHandler::with_forwarding(
             Arc::new(crate::Registry::default()),
@@ -1031,6 +1076,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        let (module_egress_tx, module_egress_rx) = mpsc::channel(8);
         (
             router,
             forwarding,
@@ -1041,8 +1087,9 @@ mod tests {
             client_rx,
             RouteCtx {
                 connection_id: module_connection,
-                egress: FrameSink::new(mpsc::channel(1).0),
+                egress: FrameSink::new(module_egress_tx),
             },
+            module_egress_rx,
             module_rx,
             pending,
         )
@@ -1050,8 +1097,16 @@ mod tests {
 
     #[tokio::test]
     async fn route_epochs_validate_both_directions_and_rewrite_to_peer_handle() {
-        let (router, _forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
-            dynamic_route_fixture(true);
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            module_ctx,
+            _module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
         let route_open = client_rx.recv().await.unwrap();
         assert_eq!(route_open.header.corr, 700);
 
@@ -1127,8 +1182,16 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_route_publishes_route_open_before_immediate_reverse_request() {
-        let (router, _, _client_ctx, mut client_rx, module_ctx, _module_rx, pending) =
-            dynamic_route_fixture(true);
+        let (
+            router,
+            _,
+            _client_ctx,
+            mut client_rx,
+            module_ctx,
+            _module_egress_rx,
+            _module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
         router
             .route_for_connection(
                 &module_ctx,
@@ -1153,8 +1216,16 @@ mod tests {
 
     #[tokio::test]
     async fn reserved_slot_ingress_errors_only_matching_client_requests() {
-        let (router, _forwarding, client_ctx, mut client_rx, module_ctx, mut module_rx, pending) =
-            dynamic_route_fixture(false);
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            _module_ctx,
+            _module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(false);
         router
             .route_for_connection(
                 &client_ctx,
@@ -1204,31 +1275,24 @@ mod tests {
         assert_eq!(stale_error.header.corr, 902);
         let body: ErrorBody = serde_json::from_slice(&stale_error.body).unwrap();
         assert_eq!(body.code, "stale_route_epoch");
-        router
-            .route_for_connection(
-                &module_ctx,
-                route_frame(
-                    FrameType::Request,
-                    pending.module_channel,
-                    pending.module_epoch,
-                    903,
-                ),
-            )
-            .await
-            .unwrap();
-        if let Ok(frame) = client_rx.try_recv() {
-            panic!("reserved non-request unexpectedly produced {frame:?}");
-        }
         assert!(module_rx.try_recv().is_err());
         let counters = router.counters.snapshot();
         assert_eq!(counters["client_frames_dropped_stale_route"], 1);
-        assert_eq!(counters["module_frames_dropped_no_route"], 1);
+        assert_eq!(counters["module_frames_dropped_no_route"], 0);
     }
 
     #[tokio::test]
     async fn dropped_module_route_goodbye_increments_counter() {
-        let (router, _forwarding, client_ctx, mut client_rx, _module_ctx, mut module_rx, pending) =
-            dynamic_route_fixture(true);
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            _module_ctx,
+            _module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
         let _ = client_rx.recv().await;
         module_rx.close();
 
@@ -1248,6 +1312,163 @@ mod tests {
         let counters = router.counters.snapshot();
         assert_eq!(counters["goodbye_relay_module_dropped"], 1);
         assert_eq!(counters["route_released_epoch_fenced"], 1);
+    }
+
+    #[tokio::test]
+    async fn module_request_on_stale_epoch_receives_stale_route_epoch() {
+        let (
+            router,
+            _forwarding,
+            _client_ctx,
+            _client_rx,
+            module_ctx,
+            mut module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+
+        router
+            .route_for_connection(
+                &module_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.module_channel,
+                    pending.module_epoch + 1,
+                    1_000,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let error = module_egress_rx.try_recv().unwrap();
+        assert_eq!(error.header.ty, FrameType::Error);
+        assert_eq!(error.header.channel, pending.module_channel);
+        assert_eq!(error.header.epoch, pending.module_epoch + 1);
+        assert_eq!(error.header.corr, 1_000);
+        let body: ErrorBody = serde_json::from_slice(&error.body).unwrap();
+        assert_eq!(body.code, "stale_route_epoch");
+        assert!(module_rx.try_recv().is_err());
+        let counters = router.counters.snapshot();
+        assert_eq!(counters["module_requests_dropped_stale_route"], 1);
+        assert_eq!(counters["module_frames_dropped_no_route"], 0);
+    }
+
+    #[tokio::test]
+    async fn module_request_on_reserved_or_absent_route_receives_unknown_channel() {
+        let (
+            reserved_router,
+            _forwarding,
+            _client_ctx,
+            _client_rx,
+            reserved_module_ctx,
+            mut reserved_module_egress_rx,
+            _module_rx,
+            reserved,
+        ) = dynamic_route_fixture(false);
+        reserved_router
+            .route_for_connection(
+                &reserved_module_ctx,
+                route_frame(
+                    FrameType::Request,
+                    reserved.module_channel,
+                    reserved.module_epoch,
+                    1_001,
+                ),
+            )
+            .await
+            .unwrap();
+        let reserved_error = reserved_module_egress_rx.try_recv().unwrap();
+        let reserved_body: ErrorBody = serde_json::from_slice(&reserved_error.body).unwrap();
+        assert_eq!(reserved_error.header.ty, FrameType::Error);
+        assert_eq!(reserved_error.header.channel, reserved.module_channel);
+        assert_eq!(reserved_error.header.epoch, reserved.module_epoch);
+        assert_eq!(reserved_error.header.corr, 1_001);
+        assert_eq!(reserved_body.code, "unknown_channel");
+        assert_eq!(
+            reserved_router.counters.snapshot()["module_requests_dropped_stale_route"],
+            1
+        );
+
+        let (
+            absent_router,
+            _forwarding,
+            _client_ctx,
+            _client_rx,
+            absent_module_ctx,
+            mut absent_module_egress_rx,
+            _module_rx,
+            absent,
+        ) = dynamic_route_fixture(false);
+        absent_router
+            .route_for_connection(
+                &absent_module_ctx,
+                route_frame(
+                    FrameType::Request,
+                    absent.module_channel + 1,
+                    absent.module_epoch,
+                    1_002,
+                ),
+            )
+            .await
+            .unwrap();
+        let absent_error = absent_module_egress_rx.try_recv().unwrap();
+        let absent_body: ErrorBody = serde_json::from_slice(&absent_error.body).unwrap();
+        assert_eq!(absent_error.header.ty, FrameType::Error);
+        assert_eq!(absent_error.header.channel, absent.module_channel + 1);
+        assert_eq!(absent_error.header.epoch, absent.module_epoch);
+        assert_eq!(absent_error.header.corr, 1_002);
+        assert_eq!(absent_body.code, "unknown_channel");
+        assert_eq!(
+            absent_router.counters.snapshot()["module_requests_dropped_stale_route"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn non_request_module_frame_on_dead_route_is_counted_without_error() {
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            module_ctx,
+            mut module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await.unwrap();
+
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Goodbye,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    1_003,
+                ),
+            )
+            .await
+            .unwrap();
+        let _ = module_rx.recv().await.unwrap();
+
+        router
+            .route_for_connection(
+                &module_ctx,
+                route_frame(
+                    FrameType::StreamData,
+                    pending.module_channel,
+                    pending.module_epoch,
+                    1_004,
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(module_egress_rx.try_recv().is_err());
+        let counters = router.counters.snapshot();
+        assert_eq!(counters["module_frames_dropped_no_route"], 1);
+        assert_eq!(counters["module_requests_dropped_stale_route"], 0);
     }
 
     #[test]

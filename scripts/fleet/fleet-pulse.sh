@@ -108,6 +108,21 @@ try:
     print('\n'.join(i for i in ids if i))
 except Exception:
     pass" 2>/dev/null)
+  # LAYOUT ANOMALY SCAN (astrocyte 2026-08): a 0-byte store.db at the
+  # conventional path with a real store nested deeper reads as "empty store"
+  # to every tool that opens it -- an empty database and a wrongly-located one
+  # are different facts that look identical at the only place anyone checks.
+  # Two signatures, both cheap: doubled cortexkit/ nesting inside a module
+  # dir, and a 0-byte store.db beside a non-trivial sibling tree.
+  layout_bad=""
+  for md in "$HOME/.local/share/cortexkit"/*/; do
+    case "$md" in */run/|*/backups/|*/staging/|*/dev-rig/|*/ckdev-rig/|*/u1-evidence-rig/|*/seam-drive-evidence/) continue;; esac
+    [ -d "${md}cortexkit" ] && layout_bad="$layout_bad $(basename "$md")(nested)"
+    if [ -f "${md}store.db" ] && [ ! -s "${md}store.db" ]; then
+      layout_bad="$layout_bad $(basename "$md")(0-byte-store)"
+    fi
+  done
+  [ -n "$layout_bad" ] && printf '  LAYOUT ANOMALY:%s -- see docs/module-rename-runbook.md data-layout section\n' "$layout_bad"
   if [ -n "$cfg_ids" ]; then
     absent=$(printf '%s\n' "$cfg_ids" | while IFS= read -r mid; do
       printf '%s\n' "$health" | grep -q "[[:space:]●]$mid[[:space:]]\|^$mid[[:space:]]\|● $mid\b" || printf '%s ' "$mid"

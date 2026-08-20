@@ -541,6 +541,50 @@ describe("SubcProvider serve loop", () => {
       corr: 0n,
     });
   });
+
+  test("settles stale_route_epoch reverse requests as provably not forwarded", async () => {
+    const { request, provider, sock, handle } = await reverseRequestHarness();
+
+    await provider.dispatch(routeErrorFrame(handle, "stale_route_epoch"), sock, 1);
+
+    await expect(request).rejects.toMatchObject({
+      kind: "not_sent",
+      code: "stale_route_epoch",
+    });
+  });
+
+  test("settles unknown_channel reverse requests as provably not forwarded", async () => {
+    const { request, provider, sock, handle } = await reverseRequestHarness();
+
+    await provider.dispatch(routeErrorFrame(handle, "unknown_channel"), sock, 1);
+
+    await expect(request).rejects.toMatchObject({
+      kind: "not_sent",
+      code: "unknown_channel",
+    });
+  });
+
+  for (const code of ["stale_route_epoch", "unknown_channel"] as const) {
+    test(`does not resend or reopen after ${code} refuses a reverse request`, async () => {
+      const { request, provider, sock, handle, writes, internals } = await reverseRequestHarness();
+
+      await provider.dispatch(routeErrorFrame(handle, code), sock, 1);
+      await expect(request).rejects.toMatchObject({ kind: "not_sent", code });
+      await Promise.resolve();
+
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.header).toMatchObject({
+        ty: FrameType.Request,
+        channel: handle.channel,
+        epoch: handle.epoch,
+      });
+      expect(internals.generation).toBe(1);
+      expect(internals.connectionEpoch).toBe(1);
+      expect(internals.reconnecting).toBeNull();
+      expect(internals.liveRoutes.get(handle.channel)).toBe(handle);
+      expect(internals.pending).toHaveLength(0);
+    });
+  }
 });
 
 describe("SubcProvider managed reconnect", () => {
@@ -1246,6 +1290,50 @@ function providerControlHarness(
     liveRoutes: new Map([[channel, handle]]),
   });
   return { provider, handle };
+}
+
+type ProviderReverseRequestInternals = {
+  sock: unknown;
+  generation: number;
+  connectionEpoch: number;
+  reconnecting: unknown;
+  nextCorr: bigint;
+  pending: Map<string, unknown>;
+  liveRoutes: Map<number, RouteHandle>;
+  dispatch(frame: Frame, sock: unknown, generation: number): Promise<boolean>;
+};
+
+async function reverseRequestHarness(): Promise<{
+  request: Promise<Uint8Array>;
+  provider: ProviderReverseRequestInternals;
+  sock: unknown;
+  handle: RouteHandle;
+  writes: Frame[];
+  internals: ProviderReverseRequestInternals;
+}> {
+  const writes: Frame[] = [];
+  const sock = fakeWritableSocket(writes);
+  const { provider: rawProvider, handle } = providerControlHarness(sock);
+  const provider = rawProvider as unknown as ProviderReverseRequestInternals;
+  provider.connectionEpoch = 1;
+  provider.reconnecting = null;
+  provider.nextCorr = 1n;
+  const request = (rawProvider as SubcProvider).request(handle, encodeJson({ method: "elicitation/create" }));
+  await waitForCondition(() => writes.length === 1, "reverse request write");
+
+  return { request, provider, sock, handle, writes, internals: provider };
+}
+
+function routeErrorFrame(handle: RouteHandle, code: "stale_route_epoch" | "unknown_channel"): Frame {
+  return buildFrameWithVersion(
+    PROTOCOL_VERSION,
+    FrameType.Error,
+    buildFlags(false, Priority.Interactive, false),
+    handle.channel,
+    handle.epoch,
+    1n,
+    encodeJson({ code, message: `${code} refused before relay` }),
+  );
 }
 
 async function recordUnhandledRejections(run: () => void): Promise<unknown[]> {

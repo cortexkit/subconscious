@@ -103,7 +103,14 @@ pub struct ControlHandler {
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
     subc_capabilities: Arc<[String]>,
+    /// Daemon-wide route.bind relay budget. Used as the fallback when the
+    /// target module has no per-module override in
+    /// `route_bind_relay_timeouts`.
     route_bind_relay_timeout: Duration,
+    /// Per-module route.bind relay budget overrides, keyed by module id. When
+    /// `handle_route_open` resolves the deadline for a target module, a
+    /// per-module entry wins over the daemon-wide value above.
+    route_bind_relay_timeouts: BTreeMap<String, Duration>,
     health_probe_timeout: Duration,
     /// Central storage policy. When set, each registering module receives its
     /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
@@ -229,6 +236,7 @@ impl ControlHandler {
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
+            route_bind_relay_timeouts: BTreeMap::new(),
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             storage_config: None,
             admission_facts_carrier_module_id: None,
@@ -267,6 +275,31 @@ impl ControlHandler {
     pub fn with_route_bind_relay_timeout(mut self, timeout: Duration) -> Self {
         self.route_bind_relay_timeout = timeout;
         self
+    }
+
+    /// Install per-module route.bind relay budget overrides. A module id
+    /// listed here wins over the daemon-wide default set via
+    /// `with_route_bind_relay_timeout`. Values are pre-resolved at parse time
+    /// from `subc.jsonc` (per-module > daemon-wide > absent), so callers pass
+    /// the same `Duration` the bind path will use.
+    pub fn with_route_bind_relay_timeouts(
+        mut self,
+        timeouts: impl IntoIterator<Item = (String, Duration)>,
+    ) -> Self {
+        self.route_bind_relay_timeouts = timeouts.into_iter().collect();
+        self
+    }
+
+    /// Resolve the route.bind relay budget for a specific target module id.
+    /// Per-module overrides win; the daemon-wide value (set via
+    /// `with_route_bind_relay_timeout` or the built-in default) is the
+    /// fallback. Exposed so config-aware callers (bootstrap, tests) can audit
+    /// the same resolution `handle_route_open` will use.
+    pub fn route_bind_relay_timeout_for(&self, module_id: &str) -> Duration {
+        self.route_bind_relay_timeouts
+            .get(module_id)
+            .copied()
+            .unwrap_or(self.route_bind_relay_timeout)
     }
 
     #[cfg(test)]
@@ -1276,7 +1309,12 @@ impl ControlHandler {
         };
         identity.project_root = project_root.as_path().to_path_buf();
 
-        let relay_deadline = Instant::now() + self.route_bind_relay_timeout;
+        // Resolve the per-module budget here so the wait matches the operator's
+        // intent for this specific target. A per-module override in
+        // `subc.jsonc` (or `with_route_bind_relay_timeouts` for embedded
+        // daemons) wins over the daemon-wide default.
+        let route_bind_relay_timeout = self.route_bind_relay_timeout_for(&target_module_id);
+        let relay_deadline = Instant::now() + route_bind_relay_timeout;
         let pending = match self
             .forwarding
             .begin_route_bind_relay_for(
@@ -1402,7 +1440,7 @@ impl ControlHandler {
                     "module_timeout",
                     format!(
                         "module_id '{target_module_id}' did not answer route.bind within {:?}",
-                        self.route_bind_relay_timeout
+                        route_bind_relay_timeout
                     ),
                 )?])
             }

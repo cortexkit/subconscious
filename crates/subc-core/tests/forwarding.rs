@@ -39,7 +39,8 @@ use tokio::{
 mod common;
 use common::{
     connect_authed_client, start_test_daemon_with_bind_timeout,
-    start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
+    start_test_daemon_with_process_liveness_and_supervisor,
+    start_test_daemon_with_route_bind_relay_overrides, TestDaemon,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3357,6 +3358,86 @@ async fn route_open_timeout_releases_reservation_and_later_open_succeeds() {
     wait_for_binding_count(&server.forwarding, 1, SETUP_TIMEOUT).await;
 
     healthy.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_uses_per_module_timeout_override() {
+    // The per-module budget is the load-bearing part of #38: with a long
+    // daemon-wide default and a tight per-module override, the bind path MUST
+    // honor the per-module value rather than the daemon-wide one. Failure
+    // here is the exact regression this change is supposed to fix -- a fast
+    // daemon-wide default would mask it. Pair with `route_bind_relay_timeout_for`
+    // in the unit suite for the resolver itself.
+    //
+    // Daemon-wide: 30s. Per-module for the target: 100ms. Stub never replies.
+    // Bind must time out inside ~2s and the error body must name the per-
+    // module budget (100ms), not the daemon-wide 30s.
+    let module_id = "fake-aft-per-module-bind-timeout";
+    let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+    let supervisor_handle = SupervisorHandle::new();
+    let daemon = start_test_daemon_with_route_bind_relay_overrides(
+        "forwarding-per-module-bind-timeout",
+        process_liveness.clone(),
+        supervisor_handle.clone(),
+        Duration::from_secs(30),
+        vec![(module_id.to_string(), Duration::from_millis(100))],
+    )
+    .await;
+    let server = TestServer {
+        daemon,
+        process_liveness,
+        supervisor_handle,
+    };
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let timing_out = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let error = attach_error_on_stream_with_wait(
+        &mut client,
+        &project,
+        471,
+        "ses-per-module-bind-timeout",
+        module_id,
+        Duration::from_secs(3),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(error.code, "module_timeout");
+    // The bind path must have used the 100ms per-module budget, not the 30s
+    // daemon-wide fallback. 2s is a generous ceiling (100ms + RTT + slack)
+    // that still fails loudly if the per-module override is ignored -- a
+    // daemon-wide path would hang near 30s and the test would time out the
+    // outer `attach_error_on_stream_with_wait` first, surfaced as a hang.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "bind should have honored the per-module 100ms budget, took {elapsed:?}"
+    );
+    // The error body must name the per-module budget, not the daemon-wide one.
+    // `Duration::from_millis(100)` formats as `100ms`; `30s` is the daemon-wide
+    // value. Asserting on substring avoids coupling to exact punctuation.
+    assert!(
+        error.message.contains("100ms"),
+        "error message must name the per-module budget (100ms), got: {}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("30s"),
+        "error message must NOT name the daemon-wide budget (30s), got: {}",
+        error.message
+    );
+
+    wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
+    timing_out.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

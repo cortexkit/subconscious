@@ -15,6 +15,18 @@ use crate::{HealthAction, HealthConfig, ModuleSpec};
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
+/// Refused at parse time by both layers (daemon-wide and per-module) — `0`
+/// would turn every affected bind into an instant failure, which is not a
+/// posture anyone deliberately configures. The asymmetry with
+/// `drain_timeout_ms` (which accepts `0` as a legitimate "tear down now")
+/// is intentional: drain `0` is an *action* an operator takes during a
+/// wedge bounce; bind `0` is a typo wearing a config key. Operators who
+/// want a module unreachable should use `enabled: false` instead.
+///
+/// The per-module variant prefixes the offending module id before this
+/// message — see `parse_doc`.
+const ROUTE_BIND_RELAY_ZERO_MESSAGE: &str = "route_bind_relay_timeout_ms must be greater than 0 (a zero budget fails every bind to the module; to make a module unreachable use enabled: false)";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub path: PathBuf,
@@ -27,9 +39,10 @@ pub struct DaemonConfig {
     /// waits for the target module to acknowledge a relayed `route.bind` before
     /// reporting `module_timeout`. `None` uses the built-in default (12s, set
     /// in `control::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT`). Per-module
-    /// `route_bind_relay_timeout_ms` overrides. An explicit `0` is honored and
-    /// means "never wait" — every bind to a slow module fails immediately,
-    /// symmetric with `drain_timeout_ms = 0`.
+    /// `route_bind_relay_timeout_ms` overrides. `0` is refused at parse time
+    /// (a zero budget fails every bind; use `enabled: false` to make a
+    /// module unreachable) — this is deliberately asymmetric with
+    /// `drain_timeout_ms`, where `0` is the sanctioned "tear down now".
     pub route_bind_relay_timeout_ms: Option<u64>,
     pub modules: Vec<ConfiguredModule>,
     /// Central storage policy: the single backend choice all managed modules use.
@@ -126,7 +139,8 @@ pub struct ConfiguredModule {
     pub drain_timeout_ms: Option<u64>,
     /// Effective route.bind relay budget (ms) for this module, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default
-    /// (12s). An explicit `0` is honored — see `DaemonConfig::route_bind_relay_timeout_ms`.
+    /// (12s). A `0` is refused at parse time at both layers — see
+    /// `DaemonConfig::route_bind_relay_timeout_ms` and `ROUTE_BIND_RELAY_ZERO_MESSAGE`.
     pub route_bind_relay_timeout_ms: Option<u64>,
 }
 
@@ -305,7 +319,21 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
     }
 
     let default_drain_timeout_ms = raw.drain_timeout_ms;
-    let default_route_bind_relay_timeout_ms = raw.route_bind_relay_timeout_ms;
+    // `0` here would turn every bind to a slow module into an instant failure;
+    // "off is not a budget" so refuse the key at parse time. Operators who
+    // want a module unreachable should use `enabled: false` instead. The
+    // check is per-layer (daemon-wide + per-module) because either alone
+    // poisons every affected bind.
+    let default_route_bind_relay_timeout_ms = match raw.route_bind_relay_timeout_ms {
+        Some(0) => {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: ROUTE_BIND_RELAY_ZERO_MESSAGE.to_string(),
+            });
+        }
+        Some(value) => Some(value),
+        None => None,
+    };
     let modules = raw
         .modules
         .into_iter()
@@ -325,6 +353,23 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                     ),
                 });
             }
+            // Same rejection at the per-module layer. `Some(0)` from a module
+            // is refused even when the daemon-wide value is also Some(0): the
+            // failure must name the offending module id so the operator can
+            // locate it in the file.
+            let per_module_route_bind_relay_timeout_ms = match module.route_bind_relay_timeout_ms {
+                Some(0) => {
+                    return Err(DaemonConfigError::InvalidValue {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "module '{module_id}' {ROUTE_BIND_RELAY_ZERO_MESSAGE}",
+                            module_id = module_id.escape_debug()
+                        ),
+                    });
+                }
+                Some(value) => Some(value),
+                None => default_route_bind_relay_timeout_ms,
+            };
             Ok(ConfiguredModule {
                 module_id,
                 program: module.program,
@@ -337,12 +382,11 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 // Per-module wins; the daemon-wide value is the fallback. `0` is
                 // legitimate ("never wait"), so this is `.or`, not `filter+or`.
                 drain_timeout_ms: module.drain_timeout_ms.or(default_drain_timeout_ms),
-                // Same shape as drain: an explicit per-module value (including
-                // `0`) survives; the daemon-wide default fills in only when no
-                // per-module value is set.
-                route_bind_relay_timeout_ms: module
-                    .route_bind_relay_timeout_ms
-                    .or(default_route_bind_relay_timeout_ms),
+                // Same shape as drain: an explicit per-module value wins over
+                // the daemon-wide default. A `0` here is rejected above
+                // (see "off is not a budget"), so `None` means "use the
+                // daemon-wide value" and `Some(value > 0)` means "use this".
+                route_bind_relay_timeout_ms: per_module_route_bind_relay_timeout_ms,
             })
         })
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
@@ -795,6 +839,11 @@ mod tests {
 
     #[test]
     fn route_bind_relay_timeout_resolves_module_over_daemon_over_absent() {
+        // Precedence still holds for valid non-zero values. `0` at either
+        // layer is rejected by `route_bind_relay_timeout_zero_at_daemon_layer_is_refused`
+        // and `route_bind_relay_timeout_zero_at_module_layer_is_refused` below
+        // — the asymmetry is deliberate (drain `0` is still accepted; see
+        // `drain_timeout_zero_still_parses_for_wedge_bounces`).
         let path = Path::new("/tmp/subc.jsonc");
         let config = parse_doc(
             r#"
@@ -802,8 +851,8 @@ mod tests {
               "version": 1,
               "route_bind_relay_timeout_ms": 30000,
               "modules": {
-                "fast": { "program": "fast", "route_bind_relay_timeout_ms": 0 },
-                "slow": { "program": "slow", "route_bind_relay_timeout_ms": 60000 },
+                "tight": { "program": "tight", "route_bind_relay_timeout_ms": 5000 },
+                "loose": { "program": "loose", "route_bind_relay_timeout_ms": 60000 },
                 "inherits": { "program": "inherits" }
               }
             }
@@ -819,13 +868,98 @@ mod tests {
                 .unwrap()
                 .route_bind_relay_timeout_ms
         };
-        // Per-module wins, INCLUDING an explicit 0 -- the case a truthiness-
-        // shaped resolution would silently replace with the daemon-wide value.
-        assert_eq!(by_id("fast"), Some(0));
-        assert_eq!(by_id("slow"), Some(60_000));
+        // Per-module wins for every non-zero value.
+        assert_eq!(by_id("tight"), Some(5_000));
+        assert_eq!(by_id("loose"), Some(60_000));
         // No per-module value: the daemon-wide default flows in at parse time.
         assert_eq!(by_id("inherits"), Some(30_000));
         assert_eq!(config.route_bind_relay_timeout_ms, Some(30_000));
+    }
+
+    #[test]
+    fn route_bind_relay_timeout_zero_at_daemon_layer_is_refused() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let err = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "route_bind_relay_timeout_ms": 0,
+              "modules": { "m": { "program": "m" } }
+            }
+            "#,
+            path,
+        )
+        .expect_err("a daemon-wide zero budget must refuse parse");
+        let text = format!("{err}");
+        assert!(
+            text.contains("route_bind_relay_timeout_ms"),
+            "error must name the offending key: {text}"
+        );
+        assert!(
+            text.contains("enabled: false"),
+            "error must name the remedy (enable false): {text}"
+        );
+    }
+
+    #[test]
+    fn route_bind_relay_timeout_zero_at_module_layer_is_refused() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let err = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "modules": {
+                "good": { "program": "good" },
+                "broken": { "program": "broken", "route_bind_relay_timeout_ms": 0 }
+              }
+            }
+            "#,
+            path,
+        )
+        .expect_err("a per-module zero budget must refuse parse");
+        let text = format!("{err}");
+        assert!(
+            text.contains("route_bind_relay_timeout_ms"),
+            "error must name the offending key: {text}"
+        );
+        assert!(
+            text.contains("broken"),
+            "error must name the offending module id: {text}"
+        );
+        assert!(
+            text.contains("enabled: false"),
+            "error must name the remedy (enable false): {text}"
+        );
+    }
+
+    #[test]
+    fn drain_timeout_zero_still_parses_for_wedge_bounces() {
+        // The asymmetry guard: `drain_timeout_ms: 0` is the sanctioned "tear
+        // down now" used during a wedge bounce and MUST keep parsing. Anyone
+        // later tempted to "fix the inconsistency" between drain and bind by
+        // rejecting drain `0` too will break the wedge-bounce path; this
+        // test names that contract explicitly.
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "drain_timeout_ms": 0,
+              "modules": {
+                "wedge": { "program": "wedge", "drain_timeout_ms": 0 }
+              }
+            }
+            "#,
+            path,
+        )
+        .expect("drain_timeout_ms: 0 must still parse; wedge-bounce uses it");
+        let wedge = config
+            .modules
+            .iter()
+            .find(|m| m.module_id == "wedge")
+            .unwrap();
+        assert_eq!(wedge.drain_timeout_ms, Some(0));
+        assert_eq!(config.drain_timeout_ms, Some(0));
     }
 
     #[test]

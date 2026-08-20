@@ -1,6 +1,17 @@
 import Foundation
 import CryptoKit
 
+/// How the local Noise private key first resolved during this process.
+public enum FedKeyProvenance: Sendable, Equatable {
+    /// The first successful read found a key that predated this process.
+    case preexisting
+    /// This process created the key, including when another same-launch writer won
+    /// the initial add race after this loader first observed no key.
+    case createdThisProcess
+    /// The key store cannot report provenance, so store-loss fencing stays disabled.
+    case unknown
+}
+
 /// Abstraction over the local Noise static identity and optional relay companion
 /// signing key. Production embeddings back this with the platform Keychain;
 /// tests inject an in-memory store. Private key bytes must never appear in logs,
@@ -15,6 +26,15 @@ public protocol FedPrivateKeyStore: Sendable {
     /// Optional 32-byte Ed25519 companion private key used for relay proofs.
     /// Returns `nil` when the embedding has not enrolled a companion key.
     func companionSigningPrivateKey() async throws -> Data?
+
+    /// Reports whether the Noise key first read as pre-existing or was created in
+    /// this process. Embedders that cannot provide this fact use the default
+    /// `.unknown`, which intentionally disables the store-loss dial fence.
+    func noiseKeyProvenance() async -> FedKeyProvenance
+}
+
+public extension FedPrivateKeyStore {
+    func noiseKeyProvenance() async -> FedKeyProvenance { .unknown }
 }
 
 /// In-memory key store for deterministic tests. Production construction must
@@ -64,6 +84,33 @@ public struct FedMemoryPrivateKeyStore: FedPrivateKeyStore, Sendable {
 protocol FedKeychainBacking: Sendable {
     func readItem(service: String, account: String) async throws -> Data?
     func addItemIfAbsent(_ data: Data, service: String, account: String) async throws -> Bool
+}
+
+/// Tracks only first-load provenance. Key reads remain concurrent so the
+/// Keychain's add-if-absent race stays covered by the persisted-winner rule.
+private actor FedNoiseKeyLoadState {
+    private var provenance: FedKeyProvenance = .unknown
+    /// Once any first read saw absence, a later read that sees the just-created
+    /// item must not relabel this launch's key as pre-existing.
+    private var observedInitialAbsence = false
+
+    func noteInitialRead(itemExists: Bool) {
+        if itemExists {
+            if !observedInitialAbsence, provenance == .unknown {
+                provenance = .preexisting
+            }
+        } else {
+            observedInitialAbsence = true
+        }
+    }
+
+    func noteCreatedThisProcess() {
+        if provenance == .unknown {
+            provenance = .createdThisProcess
+        }
+    }
+
+    func currentProvenance() -> FedKeyProvenance { provenance }
 }
 
 /// Security-framework backing. Queries opt into the data-protection keychain so
@@ -127,6 +174,7 @@ public struct FedKeychainPrivateKeyStore: FedPrivateKeyStore, Sendable {
     public let noiseAccount: String
     public let companionAccount: String?
     private let backing: any FedKeychainBacking
+    private let noiseKeyLoadState: FedNoiseKeyLoadState
 
     public init(
         service: String = "io.cortexkit.subc.fed",
@@ -137,6 +185,7 @@ public struct FedKeychainPrivateKeyStore: FedPrivateKeyStore, Sendable {
         self.noiseAccount = noiseAccount
         self.companionAccount = companionAccount
         self.backing = SecurityFrameworkKeychainBacking()
+        self.noiseKeyLoadState = FedNoiseKeyLoadState()
     }
 
     /// Test seam: inject a controllable backing to exercise the first-load race.
@@ -150,6 +199,7 @@ public struct FedKeychainPrivateKeyStore: FedPrivateKeyStore, Sendable {
         self.noiseAccount = noiseAccount
         self.companionAccount = companionAccount
         self.backing = backing
+        self.noiseKeyLoadState = FedNoiseKeyLoadState()
     }
 
     public func staticPublicKey() async throws -> Data {
@@ -166,10 +216,16 @@ public struct FedKeychainPrivateKeyStore: FedPrivateKeyStore, Sendable {
         return try await backing.readItem(service: service, account: companionAccount)
     }
 
+    public func noiseKeyProvenance() async -> FedKeyProvenance {
+        await noiseKeyLoadState.currentProvenance()
+    }
+
     private func loadNoisePrivateKey() async throws -> Curve25519.KeyAgreement.PrivateKey {
         if let existing = try await backing.readItem(service: service, account: noiseAccount) {
+            await noiseKeyLoadState.noteInitialRead(itemExists: true)
             return try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: existing)
         }
+        await noiseKeyLoadState.noteInitialRead(itemExists: false)
         // First load. Creation must be linearizable: two concurrent first-loaders
         // (two awaits in one dial cycle, or two processes) can both observe
         // absence and both generate DIFFERENT candidate keys, but only one
@@ -185,15 +241,18 @@ public struct FedKeychainPrivateKeyStore: FedPrivateKeyStore, Sendable {
             account: noiseAccount
         )
         if added {
+            await noiseKeyLoadState.noteCreatedThisProcess()
             return generated
         }
-        // Lost the add race: the winner's key is the persisted one. Re-read and
-        // return it rather than diverging with our un-persisted generated key.
+        // The initial read saw no key, so a duplicate was created by another
+        // same-launch writer. Re-read its persisted winner without treating it
+        // as pre-existing provenance for the store-loss fence.
         guard let winner = try await backing.readItem(service: service, account: noiseAccount) else {
             // A duplicate was reported yet no item is readable. Fail closed
             // instead of returning a key that is not the persisted identity.
             throw FedFailure.storeUnavailable
         }
+        await noiseKeyLoadState.noteCreatedThisProcess()
         return try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: winner)
     }
 }

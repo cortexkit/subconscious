@@ -158,6 +158,7 @@ public struct CandidateFailure: Codable, Sendable, Equatable {
 public enum FedFailure: Error, Codable, Sendable, Equatable {
     case notDialOwner
     case unsupportedEnrollmentClass
+    case storeLossReenrollmentRequired
     case invalidProfile(field: String)
     case candidateRejected(reason: CandidateRejectionReason)
     case candidateTimedOut(stage: FedCandidateStage)
@@ -197,7 +198,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey { case kind, field, code, message, stage, failures }
     private enum Kind: String, Codable {
-        case notDialOwner, unsupportedEnrollmentClass, invalidProfile, candidateRejected,
+        case notDialOwner, unsupportedEnrollmentClass, storeLossReenrollmentRequired, invalidProfile, candidateRejected,
              candidateTimedOut, relayAuthenticationFailed, responderKeyMismatch,
              accountKeyMismatch, noiseAuthenticationFailed, framingViolation,
              protocolViolation, catalogTargetUnavailable, fedBodyTooLarge,
@@ -212,6 +213,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         switch try c.decode(Kind.self, forKey: .kind) {
         case .notDialOwner: self = .notDialOwner
         case .unsupportedEnrollmentClass: self = .unsupportedEnrollmentClass
+        case .storeLossReenrollmentRequired: self = .storeLossReenrollmentRequired
         case .invalidProfile: self = .invalidProfile(field: try c.decode(String.self, forKey: .field))
         case .candidateRejected: self = .candidateRejected(reason: try c.decode(CandidateRejectionReason.self, forKey: .code))
         case .candidateTimedOut: self = .candidateTimedOut(stage: try c.decode(FedCandidateStage.self, forKey: .stage))
@@ -250,6 +252,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         switch self {
         case .notDialOwner: try c.encode(Kind.notDialOwner, forKey: .kind)
         case .unsupportedEnrollmentClass: try c.encode(Kind.unsupportedEnrollmentClass, forKey: .kind)
+        case .storeLossReenrollmentRequired: try c.encode(Kind.storeLossReenrollmentRequired, forKey: .kind)
         case .invalidProfile(let field):
             try c.encode(Kind.invalidProfile, forKey: .kind); try c.encode(field, forKey: .field)
         case .candidateRejected(let reason):
@@ -291,7 +294,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
 
     public var isTerminalProfileFailure: Bool {
         switch self {
-        case .notDialOwner, .unsupportedEnrollmentClass, .invalidProfile, .accountKeyMismatch,
+        case .notDialOwner, .unsupportedEnrollmentClass, .storeLossReenrollmentRequired, .invalidProfile, .accountKeyMismatch,
              .protocolViolation, .storeCorrupt, .storeUnavailable, .storeMigrationFailed,
              .reservationFailed, .persistenceFailed, .cancelled, .suspended:
             return true
@@ -372,6 +375,8 @@ extension FedFailure: CustomStringConvertible {
             return "This device is not the one responsible for opening the connection."
         case .unsupportedEnrollmentClass:
             return "This device's enrollment is not a kind this connection accepts."
+        case .storeLossReenrollmentRequired:
+            return "Local federation state was reset while this device's key survived; complete device re-enrollment before dialing. The serving side cannot distinguish this from a rollback replay until re-enrollment bumps the device's registry generation."
         case let .invalidProfile(field):
             return "The connection profile is not usable: '\(field)' is missing or malformed."
         case let .candidateRejected(reason):

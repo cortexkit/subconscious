@@ -1302,7 +1302,7 @@ async fn liveness_poll_returns_false_after_module_connection_is_gone() {
         "crash",
         Some(false),
         Some(0),
-        None,
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -4541,7 +4541,7 @@ async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
                 "crash",
                 Some(false),
                 Some(0),
-                None,
+                Some(false),
             );
             let terminal = read_frame_or_close_timeout(&mut client, Duration::from_secs(2)).await;
             if let Some(terminal) = terminal {
@@ -4590,7 +4590,7 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
         "crash",
         Some(false),
         Some(0),
-        None,
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -4908,7 +4908,7 @@ async fn multi_provider_generation_invalidation_goodbyes_restarted_provider_only
         "crash",
         Some(false),
         Some(0),
-        None,
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -4964,7 +4964,7 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
         "crash",
         Some(false),
         Some(0),
-        None,
+        Some(false),
     );
     assert_route_lifecycle_push(
         &second_closed,
@@ -4973,7 +4973,7 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
         "crash",
         Some(false),
         Some(0),
-        None,
+        Some(false),
     );
     let first_goodbye = read_frame_timeout(&mut first).await;
     let second_goodbye = read_frame_timeout(&mut second).await;

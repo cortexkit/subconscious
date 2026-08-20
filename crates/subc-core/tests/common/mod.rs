@@ -52,14 +52,14 @@ impl Drop for TestDaemon {
 }
 
 pub async fn start_test_daemon(name: &str) -> TestDaemon {
-    start_test_daemon_inner(name, None, None, None).await
+    start_test_daemon_inner(name, None, None, None, Vec::new()).await
 }
 
 pub async fn start_test_daemon_with_process_liveness(
     name: &str,
     process_liveness: Arc<dyn ModuleProcessLiveness>,
 ) -> TestDaemon {
-    start_test_daemon_inner(name, Some(process_liveness), None, None).await
+    start_test_daemon_inner(name, Some(process_liveness), None, None, Vec::new()).await
 }
 
 pub async fn start_test_daemon_with_process_liveness_and_supervisor(
@@ -67,7 +67,14 @@ pub async fn start_test_daemon_with_process_liveness_and_supervisor(
     process_liveness: Arc<dyn ModuleProcessLiveness>,
     supervisor_handle: SupervisorHandle,
 ) -> TestDaemon {
-    start_test_daemon_inner(name, Some(process_liveness), Some(supervisor_handle), None).await
+    start_test_daemon_inner(
+        name,
+        Some(process_liveness),
+        Some(supervisor_handle),
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 /// Start a test daemon with an explicit route.bind relay timeout, so the
@@ -83,6 +90,28 @@ pub async fn start_test_daemon_with_bind_timeout(
         Some(process_liveness),
         Some(supervisor_handle),
         Some(bind_timeout),
+        Vec::new(),
+    )
+    .await
+}
+
+/// Start a test daemon with both a daemon-wide route.bind relay timeout AND
+/// per-module overrides — mirrors how a live daemon reads `subc.jsonc`. Use
+/// when a test needs to prove that a per-module override is what the bind
+/// path actually uses (not the daemon-wide default).
+pub async fn start_test_daemon_with_route_bind_relay_overrides(
+    name: &str,
+    process_liveness: Arc<dyn ModuleProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
+    daemon_wide: Duration,
+    per_module: Vec<(String, Duration)>,
+) -> TestDaemon {
+    start_test_daemon_inner(
+        name,
+        Some(process_liveness),
+        Some(supervisor_handle),
+        Some(daemon_wide),
+        per_module,
     )
     .await
 }
@@ -92,6 +121,7 @@ async fn start_test_daemon_inner(
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor_handle: Option<SupervisorHandle>,
     bind_timeout: Option<Duration>,
+    per_module_bind_timeouts: Vec<(String, Duration)>,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     fs::create_dir_all(&temp_dir).unwrap();
@@ -115,7 +145,8 @@ async fn start_test_daemon_inner(
     let registry = Arc::new(Registry::default());
     let connected_clients = ConnectedClients::new();
     let mut handler = ControlHandler::new(Arc::clone(&registry))
-        .with_connected_clients(connected_clients.clone());
+        .with_connected_clients(connected_clients.clone())
+        .with_route_bind_relay_timeouts(per_module_bind_timeouts);
     if let Some(process_liveness) = process_liveness {
         handler = handler.with_process_liveness(process_liveness);
     }

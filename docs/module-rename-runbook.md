@@ -492,3 +492,12 @@ the store or the fence fails closed as `Fenced{holder:1, db:N}` (pre-seed per
 the rename steps above if the file cannot travel); and the move order is
 API-first — adopt the resolver in the binary, then move the store once, so
 the data never sits at a path the running code disagrees with.
+
+One more ordering pin from the first migration under this section (astrocyte):
+THE OLD BINARY AND THE NEW CONFIG DISAGREE FOR AS LONG AS THEY COEXIST. Land
+the resolver binary, the restart, and the private-var removal in ONE window --
+never fix the config first. The config edit is the tempting half because it
+looks like a one-line change, and it is the half that breaks a running daemon:
+a crash-respawn between the early config edit and the planned restart spawns
+the OLD binary without its var, which resolves a different path than the store
+it was just holding.

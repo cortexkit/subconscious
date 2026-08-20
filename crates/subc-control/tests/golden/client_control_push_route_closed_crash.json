@@ -3,5 +3,6 @@
   "drained": false,
   "module_id": "aft-tools",
   "op": "route.closed",
-  "reason": "crash"
+  "reason": "crash",
+  "terminal": false
 }

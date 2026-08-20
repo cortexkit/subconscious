@@ -33,12 +33,54 @@ const GOLDEN_DIR = join(
   "golden",
 );
 
+const CONTROL_GOLDEN_DIR = join(
+  import.meta.dir,
+  "..",
+  "..",
+  "..",
+  "crates",
+  "subc-control",
+  "tests",
+  "golden",
+);
+
 function loadGolden(name: string): Record<string, unknown> {
   const raw = readFileSync(join(GOLDEN_DIR, `${name}.json`), "utf8");
   return JSON.parse(raw) as Record<string, unknown>;
 }
 
+function loadControlGolden(name: string): Record<string, unknown> {
+  return JSON.parse(
+    readFileSync(join(CONTROL_GOLDEN_DIR, `${name}.json`), "utf8"),
+  ) as Record<string, unknown>;
+}
+
 describe("Rust golden fixtures", () => {
+  test("route.closed fixtures carry reachable terminal verdicts", () => {
+    const fixtures = {
+      drained: loadControlGolden("client_control_push_route_closed_drained"),
+      abandoned: loadControlGolden("client_control_push_route_closed_abandoned"),
+      disable: loadControlGolden("client_control_push_route_closed_disable"),
+      crash: loadControlGolden("client_control_push_route_closed_crash"),
+      crashTerminal: loadControlGolden(
+        "client_control_push_route_closed_crash_terminal",
+      ),
+    };
+
+    for (const fixture of Object.values(fixtures)) {
+      expect(typeof fixture.terminal).toBe("boolean");
+    }
+    expect(fixtures.drained.terminal).toBe(false);
+    expect(fixtures.abandoned.terminal).toBe(false);
+    expect(fixtures.disable.terminal).toBe(true);
+    expect(fixtures.crash.terminal).toBe(false);
+    expect(fixtures.crashTerminal.terminal).toBe(true);
+    for (const crash of [fixtures.crash, fixtures.crashTerminal]) {
+      expect(crash.drained).toBe(false);
+      expect(crash.abandoned).toBe(0);
+    }
+  });
+
   test("are reachable from the TypeScript package", () => {
     // A path that silently resolves to nothing would make every assertion below
     // vacuous, so the suite proves it found the real directory before using it.

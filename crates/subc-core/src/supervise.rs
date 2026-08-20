@@ -172,6 +172,10 @@ impl Default for RestartPolicy {
     }
 }
 
+pub(crate) fn daemon_will_restart(enabled: bool, restart_count: u32, max_restarts: u32) -> bool {
+    enabled && restart_count < max_restarts
+}
+
 const DEFAULT_HEALTH_CADENCE: Duration = Duration::from_secs(30);
 const DEFAULT_HEALTH_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_FAILURE_THRESHOLD: u32 = 3;
@@ -1082,6 +1086,19 @@ impl SupervisedModule {
         })
     }
 
+    pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
+        let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
+        Ok(match snapshot.state {
+            ModuleState::Restarting => true,
+            ModuleState::Failed | ModuleState::Disabled => false,
+            _ => daemon_will_restart(
+                snapshot.enabled,
+                snapshot.restart_count,
+                self.inner.max_restarts,
+            ),
+        })
+    }
+
     /// Drain the module and stop monitoring it.
     pub async fn drain(&self) -> Result<(), SuperviseError> {
         self.stop().await
@@ -1962,13 +1979,25 @@ async fn health_restart_child(
     detail: Option<&str>,
     now_ms: u64,
 ) -> Result<(), SuperviseError> {
-    if !lock_snapshot(snapshot)?.enabled {
+    let (enabled, will_restart) = {
+        let state = lock_snapshot(snapshot)?;
+        (
+            state.enabled,
+            daemon_will_restart(
+                state.enabled,
+                state.restart_count,
+                runtime.restart_policy.max_restarts,
+            ),
+        )
+    };
+
+    if !enabled {
         return Err(SuperviseError::Disabled {
             module_id: spec.module_id.clone(),
         });
     }
 
-    if lock_snapshot(snapshot)?.restart_count >= runtime.restart_policy.max_restarts {
+    if !will_restart {
         record_health_action(snapshot, &spec.module_id, "disabled".to_string(), now_ms);
         error!(
             module_id = %spec.module_id,
@@ -2797,17 +2826,17 @@ async fn on_child_exit(
                 state.process_alive = false;
                 state.pid = None;
                 state.last_exit = Some(exit_report.clone());
-                if !state.enabled {
-                    state.state = ModuleState::Disabled;
-                    disposition = TerminalDisposition::Disabled;
-                } else if state.restart_count >= policy.max_restarts {
-                    state.state = ModuleState::Failed;
-                    disposition = TerminalDisposition::Failed;
-                } else {
+                if daemon_will_restart(state.enabled, state.restart_count, policy.max_restarts) {
                     state.restart_count += 1;
                     state.state = ModuleState::Restarting;
                     should_restart = true;
                     disposition = TerminalDisposition::Restarting;
+                } else if state.enabled {
+                    state.state = ModuleState::Failed;
+                    disposition = TerminalDisposition::Failed;
+                } else {
+                    state.state = ModuleState::Disabled;
+                    disposition = TerminalDisposition::Disabled;
                 }
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record crashed module exit");
@@ -3218,6 +3247,9 @@ async fn begin_forwarding_drain_with(
     reason: RouteCloseReason,
     drain_timeout: Duration,
 ) -> Result<(), SuperviseError> {
+    debug_assert_ne!(reason, RouteCloseReason::Crash);
+    let terminal = matches!(reason, RouteCloseReason::Disable);
+
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
     let drain_target = forwarding
@@ -3275,6 +3307,7 @@ async fn begin_forwarding_drain_with(
                 reason,
                 drained,
                 abandoned: target.abandoned_bindings.len() as u32,
+                terminal: Some(terminal),
             },
         );
         wait_result?;
@@ -3427,14 +3460,18 @@ async fn handle_reload_spawn_failure(
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.process_alive = false;
         state.pid = None;
-        if !state.enabled {
-            state.state = ModuleState::Disabled;
-        } else if state.restart_count >= runtime.restart_policy.max_restarts {
-            state.state = ModuleState::Failed;
-        } else {
+        if daemon_will_restart(
+            state.enabled,
+            state.restart_count,
+            runtime.restart_policy.max_restarts,
+        ) {
             state.restart_count += 1;
             state.state = ModuleState::Restarting;
             should_retry = true;
+        } else if state.enabled {
+            state.state = ModuleState::Failed;
+        } else {
+            state.state = ModuleState::Disabled;
         }
     })?;
 
@@ -3732,8 +3769,9 @@ mod terminal_history_tests {
     use tokio::time::sleep;
 
     use super::{
-        drained_after_quiescence_wait, record_terminal, wait_error_exit_report, ExitKind,
-        ModuleSpec, ModuleState, RestartPolicy, SuperviseError, Supervisor,
+        daemon_will_restart, drained_after_quiescence_wait, record_terminal, update_snapshot,
+        wait_error_exit_report, ExitKind, ModuleSpec, ModuleState, RestartPolicy, SuperviseError,
+        SupervisedModule, Supervisor,
     };
     use crate::{
         registry::Registry,
@@ -3762,6 +3800,77 @@ mod terminal_history_tests {
             path.display()
         );
         path
+    }
+
+    #[test]
+    fn daemon_owned_recovery_predicate_uses_the_pre_increment_budget() {
+        assert!(daemon_will_restart(true, 2, 3));
+        assert!(!daemon_will_restart(true, 3, 3));
+        assert!(!daemon_will_restart(false, 0, 3));
+    }
+
+    fn module_with_recovery_snapshot(
+        state: ModuleState,
+        enabled: bool,
+        restart_count: u32,
+    ) -> SupervisedModule {
+        let registry = Arc::new(Registry::default());
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "recovery-snapshot".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            })
+            .unwrap();
+        update_snapshot(
+            &module.inner.snapshot,
+            Some("recovery-snapshot"),
+            |snapshot| {
+                snapshot.state = state;
+                snapshot.enabled = enabled;
+                snapshot.restart_count = restart_count;
+            },
+        )
+        .unwrap();
+        module
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undecided_snapshot_uses_shared_restart_predicate() {
+        assert!(module_with_recovery_snapshot(ModuleState::Running, true, 2)
+            .will_recover_after_connection_loss()
+            .unwrap());
+        assert!(
+            !module_with_recovery_snapshot(ModuleState::Running, true, 3)
+                .will_recover_after_connection_loss()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarting_snapshot_at_exhausted_budget_is_non_terminal() {
+        assert!(
+            module_with_recovery_snapshot(ModuleState::Restarting, true, 3)
+                .will_recover_after_connection_loss()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_phase_snapshots_are_terminal_before_budget_exhaustion() {
+        assert!(!module_with_recovery_snapshot(ModuleState::Failed, true, 0)
+            .will_recover_after_connection_loss()
+            .unwrap());
+        assert!(
+            !module_with_recovery_snapshot(ModuleState::Disabled, true, 0)
+                .will_recover_after_connection_loss()
+                .unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

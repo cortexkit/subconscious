@@ -3,6 +3,6 @@
   "drained": true,
   "module_id": "aft-tools",
   "op": "route.closed",
-  "reason": "restart",
-  "terminal": false
+  "reason": "disable",
+  "terminal": true
 }

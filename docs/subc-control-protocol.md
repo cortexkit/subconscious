@@ -117,7 +117,7 @@ pub enum ClientControlResponse {
 pub enum ClientControlPush {
     #[serde(rename = "route.closing")] RouteClosing { module_id: String, reason: RouteCloseReason },
     #[serde(rename = "route.closed")]  RouteClosed { module_id: String, reason: RouteCloseReason,
-                                                       drained: bool, abandoned: u32 },
+                                                        drained: bool, abandoned: u32, terminal: bool },
 }
 
 #[serde(rename_all="snake_case")] pub enum RouteCloseReason { Reload, Restart, Disable, Crash }
@@ -133,7 +133,8 @@ Notes:
 - `catalog.list` SUBSUMES `manifest_list`; returns modules + roles + per-module control ops; client filters by plane/role itself (subc owns no role→plane mapping). The `generation` counter lets a future `catalog.changed` push reconcile missed events with no reshape.
 - No client HELLO in v1 — `server.describe` is the client's discovery handshake. Client capability negotiation is discovery-only; `op_not_allowed` enforcement applies to MODULE ops in v1.
 - `route.closing { module_id, reason }` is enqueued before a planned drain starts. `reason` is `reload`, `restart`, or `disable`; it makes no completion claim.
-- `route.closed { module_id, reason, drained, abandoned }` is enqueued after the forwarding-quiescence wait and before the released-route GOODBYEs. `drained` is the exact boolean returned by that wait, not a later route-state inference. `abandoned` counts pending `route.bind` relays forced down before the wait; they are never covered by `drained`.
+- `route.closed { module_id, reason, drained, abandoned, terminal }` is enqueued after the forwarding-quiescence wait and before the released-route GOODBYEs. `drained` is the exact boolean returned by that wait, not a later route-state inference. `abandoned` counts pending `route.bind` relays forced down before the wait; they are never covered by `drained`.
+- `terminal` answers one question on every `route.closed`: will subc bring this module back without operator action? It is a claim about the module's future, not the connection that died. `disable` is `true`; `reload` and `restart` are `false`; `crash` is `!(enabled && restart_count < max_restarts)` for the crash being reported before that crash consumes a restart. At `max_restarts - 1`, crash is `terminal:false` and subc respawns; at `max_restarts`, crash is the first `terminal:true` close. Clients key on `terminal` alone: they must not recreate policy from reason strings or correlate a close with `supervisor.list` counters/config presence.
 
 ## 5. Module ↔ subc wire (`subc-protocol`) — the AFT co-sign surface
 ```rust
@@ -181,7 +182,7 @@ pub enum ModuleControlRequest {
 - v1 ships AFT as the single registered tool-provider; the registry is exercised in tests against a SECOND stub provider so multi-provider is proven, not hypothetical.
 - **Daemon-originated-only channel-0 pushes.** `ClientControlPush` is emitted only by subc directly to client connection sinks. Modules have no module→client push relay and cannot express this enum on their control channel, so this direction cannot be forged through a module. **Clients MUST ignore unrecognized channel-0 Push ops (never error)**; this keeps future pushes additive.
   - **How to obey that without swallowing corruption.** The enum is deliberately strict — no catch-all variant — because a fallback variant would make an unknown op and a MALFORMED body for a KNOWN op decode alike, and those two warrant opposite responses. Decode in two steps, mirroring what subc already does for `ModuleControlPush` (`is_known_module_push_op`): on a decode failure, read just the `op` string; if it is one this peer knows, the body is malformed and that is a real error worth surfacing; if it is not, ignore the frame. Unknown-op and malformed-known-op stay distinguishable.
-- **Route lifecycle pushes are ephemeral.** `route.closing` and `route.closed` are emitted from teardown state and retained nowhere; a client that misses one is in the same position as before this family existed. A crash has no drain: subc emits `route.closed { reason: crash, drained: false, abandoned: 0 }` with no preceding `route.closing`. That asymmetry is normative: a `route.closed` without `route.closing` means nobody planned the closure.
+- **Route lifecycle pushes are ephemeral.** `route.closing` and `route.closed` are emitted from teardown state and retained nowhere; a client that misses one is in the same position as before this family existed. A crash has no drain: subc emits `route.closed { reason: crash, drained: false, abandoned: 0, terminal }` with no preceding `route.closing`. That asymmetry is normative: a `route.closed` without `route.closing` means nobody planned the closure. The claim covers daemon-owned recovery only. For an unsupervised/self-connecting module subc reports `terminal:false`: it owns no respawn policy and cannot claim that an external process will not reconnect. Router cleanup and supervisor exit handling are independent tasks, so the daemon uses the shared recovery policy for an undecided snapshot and quotes an already-recorded `Restarting` decision as non-terminal or `Failed`/`Disabled` decision as terminal; it does not promise that the restart decision always happens later.
 - **Enqueue-order is the ONLY claim.** `FrameSink::send` enqueues; it does not complete the write. So “pushed before the GOODBYE” can only ever mean “enqueued before”.
 
 ## 7. Thin-core ops table

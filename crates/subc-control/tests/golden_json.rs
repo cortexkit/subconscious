@@ -404,6 +404,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
                 reason: RouteCloseReason::Restart,
                 drained: true,
                 abandoned: 0,
+                terminal: Some(false),
             },
         ),
         (
@@ -417,6 +418,19 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
                 reason: RouteCloseReason::Reload,
                 drained: false,
                 abandoned: 3,
+                terminal: Some(false),
+            },
+        ),
+        (
+            // Planned disable closures also come from begin_forwarding_drain_with,
+            // but only this reason leaves the module down until operator action.
+            "client_control_push_route_closed_disable",
+            ClientControlPush::RouteClosed {
+                module_id: "aft-tools".to_string(),
+                reason: RouteCloseReason::Disable,
+                drained: true,
+                abandoned: 0,
+                terminal: Some(true),
             },
         ),
         (
@@ -429,6 +443,19 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
                 reason: RouteCloseReason::Crash,
                 drained: false,
                 abandoned: 0,
+                terminal: Some(false),
+            },
+        ),
+        (
+            // cleanup_connection emits the same reachable crash shape when the
+            // supervisor has exhausted its restart budget.
+            "client_control_push_route_closed_crash_terminal",
+            ClientControlPush::RouteClosed {
+                module_id: "aft-tools".to_string(),
+                reason: RouteCloseReason::Crash,
+                drained: false,
+                abandoned: 0,
+                terminal: Some(true),
             },
         ),
     ]

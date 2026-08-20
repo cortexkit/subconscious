@@ -501,3 +501,9 @@ looks like a one-line change, and it is the half that breaks a running daemon:
 a crash-respawn between the early config edit and the planned restart spawns
 the OLD binary without its var, which resolves a different path than the store
 it was just holding.
+
+And do not read a green `--check-config` preflight as clearance for the move:
+preflight validates the CONFIG FILE, while this hazard lives between the config
+and the STORE (the var/resolver disagreement is invisible to any check that
+never opens the data directory). A preflight that cannot fail on the hazard
+being managed says nothing about it (astrocyte migration, 2026-08).

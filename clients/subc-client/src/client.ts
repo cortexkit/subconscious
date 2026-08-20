@@ -447,12 +447,18 @@ export class SubcClient {
         // double-execute anything. The cached bind is dead (module restarted and
         // its route-gone GOODBYE raced or was missed); evict it so the retry
         // re-opens the route instead of resending into the same dead channel.
-        if (err.code === "unknown_channel" && !retriedUnknownChannel && !this.closeStarted) {
+        // stale_route_epoch is the same class with a sharper cause (subconscious
+        // issue #39): the channel is known but its epoch was released while this
+        // request was in flight. The daemon's contract for the code is
+        // NOT-FORWARDED — dropped before delivery — so the retry is safe by
+        // construction, and the remedy is identical: evict, re-open, resend once.
+        const deadBindCode = err.code === "unknown_channel" || err.code === "stale_route_epoch";
+        if (deadBindCode && !retriedUnknownChannel && !this.closeStarted) {
           retriedUnknownChannel = true;
           this.evictRouteHandle(routeHandle);
           continue;
         }
-        if (err.code === "unknown_channel" && retriedUnknownChannel) {
+        if (deadBindCode && retriedUnknownChannel) {
           this.evictRouteHandle(routeHandle);
         }
         if (err.kind === "not_sent") {

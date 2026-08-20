@@ -474,7 +474,14 @@ pub struct SupervisorHandle {
     /// The current expected launch nonce for each reserved module_id. Set when the
     /// supervisor spawns the reserved module; checked when a HELLO claims that id. A
     /// non-reserved module never has an entry here and is never nonce-checked.
-    reserved_nonces: Arc<Mutex<HashMap<String, String>>>,
+    /// Reserved module ids and the nonce that authorizes their next HELLO.
+    /// `None` means RESERVED WITH NO LEGITIMATE HOLDER — a reserved module that
+    /// has never been spawned (e.g. configured `enabled: false`) — and refuses
+    /// every HELLO. Before this was expressible, a reserved-but-never-spawned id
+    /// had NO entry and admitted anyone: the reservation protected the nonce
+    /// holder, not the NAME (found live by CKCRED's canary probe registering
+    /// against a reserved scratch id).
+    reserved_nonces: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// The current launch nonce for every supervised spawn. This is separate from
     /// reserved_nonces because consumer route.open attestation applies to all spawned
     /// modules, while HELLO id-squatting protection remains opt-in via `reserved`.
@@ -524,7 +531,7 @@ impl SupervisorHandle {
         self.reserved_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(module_id.to_string(), nonce);
+            .insert(module_id.to_string(), Some(nonce));
     }
 
     /// Record namespace prefixes owned by a supervised module.
@@ -552,9 +559,11 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if spec.reserved {
-            if let Some(nonce) = spawn_nonce {
-                reserved_nonces.insert(spec.module_id.clone(), nonce);
-            }
+            // `None` (no spawn nonce minted) is INSERTED, not skipped: a
+            // reserved name whose module has never spawned has no legitimate
+            // holder, and the entry's absence is what used to leave the name
+            // open to the first claimant.
+            reserved_nonces.insert(spec.module_id.clone(), spawn_nonce);
         } else {
             reserved_nonces.remove(&spec.module_id);
         }
@@ -579,7 +588,16 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(expected) = nonces.get(module_id) {
-            if presented.is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes())) {
+            // `None` = reserved with no legitimate holder: refuse every
+            // presentation, because no process can hold a nonce that was never
+            // minted. Only a real minted nonce admits, in constant time.
+            let authorized = match expected {
+                Some(expected) => {
+                    presented.is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes()))
+                }
+                None => false,
+            };
+            if authorized {
                 return None;
             }
             return Some(ReservedHelloRejection::Exact {
@@ -648,6 +666,7 @@ impl SupervisorHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(module_id)
             .cloned()
+            .flatten()
     }
 
     pub fn insert(&self, module: SupervisedModule) -> Option<SupervisedModule> {
@@ -3771,7 +3790,7 @@ mod terminal_history_tests {
     use super::{
         daemon_will_restart, drained_after_quiescence_wait, record_terminal, update_snapshot,
         wait_error_exit_report, ExitKind, ModuleSpec, ModuleState, RestartPolicy, SuperviseError,
-        SupervisedModule, Supervisor,
+        SupervisedModule, Supervisor, SupervisorHandle,
     };
     use crate::{
         registry::Registry,
@@ -3800,6 +3819,51 @@ mod terminal_history_tests {
             path.display()
         );
         path
+    }
+
+    #[test]
+    fn reserved_never_spawned_refuses_every_hello() {
+        // The canary hole: a reserved id whose module has never spawned had NO
+        // gate entry and admitted anyone -- the reservation protected the nonce
+        // holder, not the NAME. Now the entry is present with no legitimate
+        // holder and refuses all comers.
+        let supervisor = SupervisorHandle::default();
+        supervisor.apply_identity_configuration(&ModuleSpec {
+            module_id: "never-spawned".to_string(),
+            program: PathBuf::from("/usr/bin/false"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: true,
+            reserved_prefixes: Vec::new(),
+        });
+        assert!(
+            supervisor
+                .reserved_hello_rejection("never-spawned", Some("any-forged-nonce"))
+                .is_some(),
+            "forged nonce must refuse on a reserved never-spawned id"
+        );
+        assert!(
+            supervisor
+                .reserved_hello_rejection("never-spawned", None)
+                .is_some(),
+            "absent nonce must refuse on a reserved never-spawned id"
+        );
+        // And a real spawn nonce minted later admits exactly that nonce.
+        supervisor.set_spawn_nonce("never-spawned", "minted".to_string());
+        supervisor.apply_identity_configuration(&ModuleSpec {
+            module_id: "never-spawned".to_string(),
+            program: PathBuf::from("/usr/bin/false"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: true,
+            reserved_prefixes: Vec::new(),
+        });
+        assert!(supervisor
+            .reserved_hello_rejection("never-spawned", Some("minted"))
+            .is_none());
+        assert!(supervisor
+            .reserved_hello_rejection("never-spawned", Some("forged"))
+            .is_some());
     }
 
     #[test]

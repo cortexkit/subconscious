@@ -480,6 +480,11 @@ The two anomaly signatures fleet-pulse scans for, and what they mean:
   absent one are different facts that look identical at the only place anyone
   checks. Delete the decoy FIRST during any migration (it must not win a race
   as the target), and if something recreates it, the creator is the defect.
+  Known creator class (AFT forensics, 2026-08): OPERATOR PROBES -- a bare
+  `sqlite3 <guessed-path>` CLI invocation creates exactly this 0-byte decoy on
+  a path miss, silently. Probe with `sqlite3 'file:<path>?mode=ro'` (URI
+  read-only refuses to create) or stat the path first; every seat that mines
+  its own telemetry by CLI has this exposure.
 
 Migration invariants, both learned the expensive way: the single-writer lease
 is keyed by DIRECTORY (basename stable), so the lease file must travel WITH

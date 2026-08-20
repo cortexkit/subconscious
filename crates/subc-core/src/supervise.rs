@@ -3853,7 +3853,7 @@ mod terminal_history_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restarting_snapshot_is_non_terminal_at_exhausted_budget() {
+    async fn restarting_snapshot_at_exhausted_budget_is_non_terminal() {
         assert!(
             module_with_recovery_snapshot(ModuleState::Restarting, true, 3)
                 .will_recover_after_connection_loss()
@@ -3862,12 +3862,12 @@ mod terminal_history_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failed_and_disabled_snapshots_are_terminal() {
+    async fn terminal_phase_snapshots_are_terminal_before_budget_exhaustion() {
         assert!(!module_with_recovery_snapshot(ModuleState::Failed, true, 0)
             .will_recover_after_connection_loss()
             .unwrap());
         assert!(
-            !module_with_recovery_snapshot(ModuleState::Disabled, false, 0)
+            !module_with_recovery_snapshot(ModuleState::Disabled, true, 0)
                 .will_recover_after_connection_loss()
                 .unwrap()
         );

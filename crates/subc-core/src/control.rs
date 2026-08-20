@@ -482,6 +482,7 @@ impl ControlHandler {
                     reason: RouteCloseReason::Crash,
                     drained: false,
                     abandoned: 0,
+                    terminal: None,
                 },
             );
         }

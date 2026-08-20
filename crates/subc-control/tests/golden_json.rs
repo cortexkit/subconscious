@@ -404,6 +404,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
                 reason: RouteCloseReason::Restart,
                 drained: true,
                 abandoned: 0,
+                terminal: None,
             },
         ),
         (
@@ -417,6 +418,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
                 reason: RouteCloseReason::Reload,
                 drained: false,
                 abandoned: 3,
+                terminal: None,
             },
         ),
         (
@@ -429,6 +431,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
                 reason: RouteCloseReason::Crash,
                 drained: false,
                 abandoned: 0,
+                terminal: None,
             },
         ),
     ]

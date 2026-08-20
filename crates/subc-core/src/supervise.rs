@@ -3291,6 +3291,7 @@ async fn begin_forwarding_drain_with(
                 reason,
                 drained,
                 abandoned: target.abandoned_bindings.len() as u32,
+                terminal: None,
             },
         );
         wait_result?;

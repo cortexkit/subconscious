@@ -307,6 +307,13 @@ pub enum ClientControlPush {
         /// Pending route.bind relays forced down before that wait. They are not
         /// covered by `drained`, even when live routes quiesced.
         abandoned: u32,
+        /// Whether subc will leave this module down until operator action.
+        ///
+        /// The claim covers daemon-owned recovery only. `None` is accepted only
+        /// from daemons that predate this field; every current daemon emission is
+        /// `Some`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<bool>,
     },
 }
 
@@ -716,6 +723,50 @@ mod tests {
         assert_eq!(consumer_identity, None);
         assert_eq!(consumer_capabilities, None);
         assert_eq!(admission_facts, None);
+    }
+
+    #[test]
+    fn new_route_closed_decoder_accepts_old_daemon_without_terminal() {
+        let old_wire = r#"{"op":"route.closed","module_id":"aft-tools","reason":"crash","drained":false,"abandoned":0}"#;
+        let decoded: ClientControlPush = serde_json::from_str(old_wire).unwrap();
+        match decoded {
+            ClientControlPush::RouteClosed { terminal, .. } => assert_eq!(terminal, None),
+            other => panic!("unexpected push: {other:?}"),
+        }
+        assert!(!serde_json::to_string(&decoded)
+            .unwrap()
+            .contains("terminal"));
+    }
+
+    #[test]
+    fn old_route_closed_decoder_ignores_new_terminal_field() {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "op")]
+        enum LegacyClientControlPush {
+            #[serde(rename = "route.closed")]
+            RouteClosed {
+                module_id: String,
+                reason: RouteCloseReason,
+                drained: bool,
+                abandoned: u32,
+            },
+        }
+
+        let wire = r#"{"op":"route.closed","module_id":"aft-tools","reason":"crash","drained":false,"abandoned":0,"terminal":true}"#;
+        let decoded: LegacyClientControlPush = serde_json::from_str(wire).unwrap();
+        match decoded {
+            LegacyClientControlPush::RouteClosed {
+                module_id,
+                reason,
+                drained,
+                abandoned,
+            } => {
+                assert_eq!(module_id, "aft-tools");
+                assert_eq!(reason, RouteCloseReason::Crash);
+                assert!(!drained);
+                assert_eq!(abandoned, 0);
+            }
+        }
     }
 
     #[test]

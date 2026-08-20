@@ -1302,6 +1302,7 @@ async fn liveness_poll_returns_false_after_module_connection_is_gone() {
         "crash",
         Some(false),
         Some(0),
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -1463,9 +1464,15 @@ async fn supervisor_restart_bumps_generation_and_goodbyes_open_routes() {
     .unwrap();
     client.flush().await.unwrap();
 
-    let applied =
-        read_supervisor_ack_and_goodbye(&mut client, 312, module_id, ack.route_channel, "restart")
-            .await;
+    let applied = read_supervisor_ack_and_goodbye(
+        &mut client,
+        312,
+        module_id,
+        ack.route_channel,
+        "restart",
+        false,
+    )
+    .await;
     assert!(applied);
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
@@ -1580,7 +1587,15 @@ async fn supervisor_restart_acks_at_initiation_and_still_drains_the_inflight_req
     // SETTLES with its real response (never cut), then route.closed with
     // drained=true, then the teardown GOODBYE.
     let closing = read_frame_timeout_for(&mut route_client, Duration::from_secs(20)).await;
-    assert_route_lifecycle_push(&closing, "route.closing", module_id, "restart", None, None);
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "restart",
+        None,
+        None,
+        None,
+    );
     let response = read_frame_timeout_for(&mut route_client, Duration::from_secs(20)).await;
     assert_response(&response, ack.route_channel, slow_corr, slow_payload);
     let closed = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
@@ -1591,6 +1606,7 @@ async fn supervisor_restart_acks_at_initiation_and_still_drains_the_inflight_req
         "restart",
         Some(true),
         Some(0),
+        Some(false),
     );
     let goodbye = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -1694,7 +1710,15 @@ async fn supervisor_restart_with_zero_drain_override_cuts_the_inflight_request()
     // still pending, so any Response here means the override never reached the
     // drain and the configured 8s budget ran instead.
     let closing = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
-    assert_route_lifecycle_push(&closing, "route.closing", module_id, "restart", None, None);
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "restart",
+        None,
+        None,
+        None,
+    );
     let closed = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
     assert_route_lifecycle_push(
         &closed,
@@ -1703,6 +1727,7 @@ async fn supervisor_restart_with_zero_drain_override_cuts_the_inflight_request()
         "restart",
         Some(false),
         Some(0),
+        Some(false),
     );
     let goodbye = read_frame_timeout_for(&mut route_client, Duration::from_secs(10)).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -1788,7 +1813,15 @@ async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() 
     control_client.flush().await.unwrap();
 
     let closing = read_frame_timeout(&mut route_client).await;
-    assert_route_lifecycle_push(&closing, "route.closing", module_id, "reload", None, None);
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "reload",
+        None,
+        None,
+        None,
+    );
     let response = read_frame_timeout(&mut route_client).await;
     assert_response(&response, ack.route_channel, slow_corr, slow_payload);
     let closed = read_frame_timeout(&mut route_client).await;
@@ -1799,6 +1832,7 @@ async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() 
         "reload",
         Some(true),
         Some(0),
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut route_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -1908,6 +1942,7 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
                             "reload",
                             None,
                             None,
+                            None,
                         );
                         closing_count += 1;
                     }
@@ -1919,6 +1954,7 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
                             "reload",
                             Some(true),
                             Some(0),
+                            Some(false),
                         );
                         closed_count += 1;
                     }
@@ -2058,6 +2094,7 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
                     "reload",
                     None,
                     None,
+                    None,
                 );
                 saw_closing = true;
             } else {
@@ -2068,6 +2105,7 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
                     "reload",
                     Some(true),
                     Some(0),
+                    Some(false),
                 );
                 saw_closed = true;
             }
@@ -2382,7 +2420,15 @@ async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
     control_client.flush().await.unwrap();
 
     let closing = read_frame_timeout(&mut route_client).await;
-    assert_route_lifecycle_push(&closing, "route.closing", module_id, "reload", None, None);
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "reload",
+        None,
+        None,
+        None,
+    );
     let closed = read_frame_timeout(&mut route_client).await;
     assert_route_lifecycle_push(
         &closed,
@@ -2391,6 +2437,7 @@ async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
         "reload",
         Some(false),
         Some(0),
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut route_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -2472,7 +2519,15 @@ async fn quiesced_drain_reports_abandoned_bindings_without_claiming_they_drained
     control_client.flush().await.unwrap();
 
     let closing = read_frame_timeout(&mut live_client).await;
-    assert_route_lifecycle_push(&closing, "route.closing", module_id, "reload", None, None);
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "reload",
+        None,
+        None,
+        None,
+    );
     let closed = read_frame_timeout(&mut live_client).await;
     assert_route_lifecycle_push(
         &closed,
@@ -2481,6 +2536,7 @@ async fn quiesced_drain_reports_abandoned_bindings_without_claiming_they_drained
         "reload",
         Some(true),
         Some(1),
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut live_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -2597,9 +2653,15 @@ async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns()
     .unwrap();
     client.flush().await.unwrap();
 
-    let applied =
-        read_supervisor_ack_and_goodbye(&mut client, 322, module_id, ack.route_channel, "disable")
-            .await;
+    let applied = read_supervisor_ack_and_goodbye(
+        &mut client,
+        322,
+        module_id,
+        ack.route_channel,
+        "disable",
+        true,
+    )
+    .await;
     assert!(applied);
     wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
     wait_for_binding_count(&server.forwarding, 0, SETUP_TIMEOUT).await;
@@ -4525,6 +4587,7 @@ async fn blocked_flow_control_acquire_wakes_when_module_tears_down() {
                 "crash",
                 Some(false),
                 Some(0),
+                Some(false),
             );
             let terminal = read_frame_or_close_timeout(&mut client, Duration::from_secs(2)).await;
             if let Some(terminal) = terminal {
@@ -4573,6 +4636,7 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
         "crash",
         Some(false),
         Some(0),
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -4890,6 +4954,7 @@ async fn multi_provider_generation_invalidation_goodbyes_restarted_provider_only
         "crash",
         Some(false),
         Some(0),
+        Some(false),
     );
     let goodbye = read_frame_timeout(&mut client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
@@ -4945,6 +5010,7 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
         "crash",
         Some(false),
         Some(0),
+        Some(false),
     );
     assert_route_lifecycle_push(
         &second_closed,
@@ -4953,6 +5019,7 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
         "crash",
         Some(false),
         Some(0),
+        Some(false),
     );
     let first_goodbye = read_frame_timeout(&mut first).await;
     let second_goodbye = read_frame_timeout(&mut second).await;
@@ -4962,6 +5029,81 @@ async fn multi_provider_module_death_sends_goodbye_to_each_affected_client() {
     assert_eq!(second_goodbye.header.channel, second_ack.route_channel);
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_closed_crash_at_max_minus_one_is_non_terminal() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-crash-one-restart";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "750")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 1061, "ses-crash-one-restart").await;
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+        Some(false),
+    );
+    let goodbye = read_frame_timeout(&mut client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Running && status.restart_count == 1 && status.live
+    })
+    .await;
+    assert_eq!(status.restart_count, 1);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_closed_crash_at_max_is_terminal() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 0, Duration::from_millis(10));
+    let module_id = "fake-aft-crash-no-restarts";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [("FAKE_AFT_CRASH_AFTER_MS", "750")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 1062, "ses-crash-no-restarts").await;
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+        Some(true),
+    );
+    let goodbye = read_frame_timeout(&mut client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Failed && !status.registration_active && !status.live
+    })
+    .await;
+    assert_eq!(status.restart_count, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5364,6 +5506,7 @@ async fn read_supervisor_ack_and_goodbye<S>(
     module_id: &str,
     route_channel: u16,
     reason: &str,
+    terminal: bool,
 ) -> bool
 where
     S: AsyncRead + Unpin,
@@ -5378,7 +5521,15 @@ where
             applied = Some(assert_supervisor_ack(&frame, corr, module_id));
         } else if frame.header.channel == 0 && frame.header.ty == FrameType::Push {
             if !closing_seen {
-                assert_route_lifecycle_push(&frame, "route.closing", module_id, reason, None, None);
+                assert_route_lifecycle_push(
+                    &frame,
+                    "route.closing",
+                    module_id,
+                    reason,
+                    None,
+                    None,
+                    None,
+                );
                 closing_seen = true;
             } else {
                 assert_route_lifecycle_push(
@@ -5388,6 +5539,7 @@ where
                     reason,
                     Some(true),
                     Some(0),
+                    Some(terminal),
                 );
                 closed_seen = true;
             }
@@ -5511,6 +5663,7 @@ fn assert_route_lifecycle_push(
     reason: &str,
     drained: Option<bool>,
     abandoned: Option<u32>,
+    terminal: Option<bool>,
 ) {
     assert_eq!(frame.header.ty, FrameType::Push);
     assert_eq!(frame.header.channel, 0);
@@ -5527,6 +5680,9 @@ fn assert_route_lifecycle_push(
     }
     if let Some(abandoned) = abandoned {
         expected["abandoned"] = serde_json::json!(abandoned);
+    }
+    if let Some(terminal) = terminal {
+        expected["terminal"] = Value::Bool(terminal);
     }
     assert_eq!(
         serde_json::from_slice::<Value>(&frame.body).unwrap(),

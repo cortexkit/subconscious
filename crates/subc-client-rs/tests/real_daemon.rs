@@ -1876,6 +1876,7 @@ async fn subc_consumer_control_pushes_deliver_route_closed_on_module_death() {
     // The crash arm is normative from #31: no prior route.closing, drained
     // false -- a cut, not a drain.
     assert_eq!(push.body["drained"], false);
+    assert_eq!(push.body["terminal"], false);
 
     daemon.kill_and_wait();
 }

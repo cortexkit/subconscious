@@ -115,8 +115,14 @@ fn sha256_hex(data: &[u8]) -> String {
     }
     message.extend_from_slice(&bit_len.to_be_bytes());
 
+    // `chunks_exact` over `as_chunks`: this build script must compile on the
+    // oldest toolchain the workspace supports, and `[T]::as_chunks` is newer
+    // than that floor. The lint arrived with a toolchain update; the code is
+    // correct either way.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     for chunk in message.chunks_exact(64) {
         let mut w = [0u32; 64];
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         for (i, word) in chunk.chunks_exact(4).enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }

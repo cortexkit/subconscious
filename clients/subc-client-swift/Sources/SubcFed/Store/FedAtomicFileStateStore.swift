@@ -55,7 +55,7 @@ public actor FedAtomicFileStateStore: FedStateStore {
         commitBarrier = barrier
     }
 
-    public func open(localPublicKey: Data) async throws -> FedStateDocument {
+    public func open(localPublicKey: Data) async throws -> FedStateOpenResult {
         self.localPublicKey = localPublicKey
         return try withExclusiveLock {
             try ensureDirectory()
@@ -74,7 +74,7 @@ public actor FedAtomicFileStateStore: FedStateStore {
                     try commitDocumentUnlocked(migrated)
                 }
                 document = migrated
-                return migrated
+                return FedStateOpenResult(document: migrated, created: false)
             }
 
             let created = FedStateDocument(
@@ -85,7 +85,14 @@ public actor FedAtomicFileStateStore: FedStateStore {
             )
             try commitDocumentUnlocked(created)
             document = created
-            return created
+            return FedStateOpenResult(document: created, created: true)
+        }
+    }
+
+    public func acknowledgeReenrollment(_ acknowledgment: FedReenrollmentAcknowledgment) async throws {
+        _ = try mutate { document in
+            document.reenrollmentAcknowledgment = acknowledgment
+            return 0
         }
     }
 

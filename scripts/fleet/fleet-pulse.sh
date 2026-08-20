@@ -116,7 +116,7 @@ except Exception:
   # dir, and a 0-byte store.db beside a non-trivial sibling tree.
   layout_bad=""
   for md in "$HOME/.local/share/cortexkit"/*/; do
-    case "$md" in */run/|*/backups/|*/staging/|*/dev-rig/|*/ckdev-rig/|*/u1-evidence-rig/|*/seam-drive-evidence/) continue;; esac
+    case "$md" in */run/|*/backups/|*/staging/|*/dev-rig/|*/ckdev-rig/|*/u1-evidence-rig/|*/seam-drive-evidence/|*backup*/) continue;; esac
     [ -d "${md}cortexkit" ] && layout_bad="$layout_bad $(basename "$md")(nested)"
     if [ -f "${md}store.db" ] && [ ! -s "${md}store.db" ]; then
       layout_bad="$layout_bad $(basename "$md")(0-byte-store)"

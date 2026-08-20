@@ -56,7 +56,7 @@ interface FakeDaemonOptions {
   // "unknown-channel-once": reject the FIRST data request with the daemon
   //   router's unknown_channel ERROR (a stale bind after a module restart), then
   //   serve subsequent requests normally — the re-opened route works.
-  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "unknown-channel-once" | "unknown-channel-always";
+  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "unknown-channel-once" | "unknown-channel-always" | "stale-epoch-once";
   delayBodyMs?: number;
   routeOpenError?: { code: string; message: string };
   // Reject the first N route.open requests with this code (a booting-target
@@ -388,6 +388,32 @@ describe("SubcClient managed call", () => {
       });
       // Two route.opens (initial + post-eviction reopen), two data requests
       // (rejected + retried), all on ONE connection (no reconnect).
+      expect(stats.routeOpens).toBe(2);
+      expect(stats.dataRequests).toBe(2);
+      expect(stats.connections).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("evicts the cached route and retries once in place on stale_route_epoch", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    // Issue #39's code: the daemon dropped the request BEFORE delivery (the
+    // route's epoch was released mid-flight), so it is provably not-forwarded
+    // and joins unknown_channel's evict-reopen-retry-once class. Same remedy,
+    // sharper cause.
+    const daemon = await startFakeDaemon({ stats, dataMode: "stale-epoch-once" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+        method: "echo",
+        params: { n: 1 },
+      });
+      // Two route.opens (initial + post-eviction reopen), two data requests
+      // (rejected + retried), one connection (no reconnect).
       expect(stats.routeOpens).toBe(2);
       expect(stats.dataRequests).toBe(2);
       expect(stats.connections).toBe(1);
@@ -736,6 +762,15 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       await writeFrame(
         socket,
         errorFrame(frame, { code: "unknown_channel", message: `unknown channel ${frame.header.channel}` }),
+        deadline,
+      );
+    } else if (options.dataMode === "stale-epoch-once" && options.stats.dataRequests === 1) {
+      await writeFrame(
+        socket,
+        errorFrame(frame, {
+          code: "stale_route_epoch",
+          message: `stale epoch ${frame.header.epoch} on channel ${frame.header.channel}`,
+        }),
         deadline,
       );
     } else {

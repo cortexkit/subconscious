@@ -2044,3 +2044,79 @@ async fn subc_consumer_push_burst_counts_overflow_and_keeps_the_subscription() {
     daemon.kill_and_wait();
     assert!(serve_task.await.unwrap().is_ok());
 }
+
+/// Emits stale_route_epoch on the FIRST request, then echoes. Stands in for
+/// the daemon's #39 router refusal until that lands; the client-side retry
+/// classification is identical either way (the code's documented contract is
+/// not-forwarded, so evict-reopen-retry-once is safe by construction).
+#[derive(Clone, Default)]
+struct StaleEpochOnceHandler {
+    fired: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl ModuleHandler for StaleEpochOnceHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        let mut fired = self
+            .fired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*fired {
+            *fired = true;
+            return HandlerOutcome::Error {
+                code: "stale_route_epoch".to_string(),
+                message: "stale epoch".to_string(),
+            };
+        }
+        HandlerOutcome::Response(body)
+    }
+}
+
+/// Issue #39 client half: stale_route_epoch joins unknown_channel's
+/// evict-reopen-retry-once class. The caller sees success, not the error, and
+/// exactly one retry happens (the handler flips to echo after firing once,
+/// so a client that did NOT retry fails the assertion on the error and a
+/// client that retried more than once is visible in the module's state).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subc_consumer_retries_once_in_place_on_stale_route_epoch() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-stale-epoch");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = StaleEpochOnceHandler::default();
+    let (_module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(PUSH_MODULE_ID, &["echo"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, PUSH_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let payload = br#"{"jsonrpc":"2.0","id":"stale-epoch-retry"}"#.to_vec();
+    let reply = consumer
+        .call(
+            tool_target(PUSH_MODULE_ID),
+            consumer_identity("stale-epoch"),
+            payload.clone(),
+            fast_call_options(),
+        )
+        .await
+        .expect("stale_route_epoch must be retried once in place, not surfaced");
+    assert_eq!(reply, payload);
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}

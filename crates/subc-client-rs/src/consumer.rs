@@ -773,9 +773,13 @@ impl SubcConsumer {
                 // cannot double-execute. The cached bind is dead (module restarted;
                 // its route-gone GOODBYE raced or was missed) — invalidate it so the
                 // retry re-opens instead of resending into the same dead channel.
+                // stale_route_epoch is the same class with a sharper cause (issue
+                // #39): channel known, epoch released mid-flight. Its documented
+                // contract is NOT-FORWARDED (dropped before delivery), so the retry
+                // is safe by construction; the remedy is identical.
                 // Parity with the TS client's retry-once in call().
                 Ok(TerminalFrame::Error { body, .. })
-                    if body.code == "unknown_channel"
+                    if (body.code == "unknown_channel" || body.code == "stale_route_epoch")
                         && !retried_unknown_channel
                         && Instant::now() < call_deadline =>
                 {

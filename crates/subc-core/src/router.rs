@@ -325,6 +325,15 @@ impl Router {
             DataRoute::Client(DataRouteState::EpochMismatch) => {
                 if frame.header.ty == FrameType::Request {
                     self.counters.increment_client_frames_dropped_stale_route();
+                    // Dropped before forwarding; a re-bind retry cannot double-execute this request.
+                    let err = RouterError::StaleRouteEpoch {
+                        channel,
+                        epoch,
+                        corr,
+                    };
+                    if let Some(error_frame) = err.to_error_frame() {
+                        ctx.egress.send(error_frame).await?;
+                    }
                 }
                 debug!(
                     connection_id = ctx.connection_id.get(),
@@ -531,6 +540,11 @@ pub enum RouterError {
         epoch: u32,
         corr: u64,
     },
+    StaleRouteEpoch {
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+    },
     Backend {
         channel: u16,
         epoch: u32,
@@ -606,6 +620,17 @@ impl RouterError {
                 "unknown_channel",
                 format!("unknown channel {channel}"),
             ),
+            Self::StaleRouteEpoch {
+                channel,
+                epoch,
+                corr,
+            } => error_frame(
+                *channel,
+                *epoch,
+                *corr,
+                "stale_route_epoch",
+                format!("stale route epoch for channel {channel}"),
+            ),
             Self::Backend {
                 channel,
                 epoch,
@@ -656,6 +681,9 @@ impl fmt::Display for RouterError {
             Self::UnknownChannel { channel, corr, .. } => {
                 write!(f, "unknown channel {channel} for corr {corr}")
             }
+            Self::StaleRouteEpoch { channel, corr, .. } => {
+                write!(f, "stale route epoch for channel {channel} corr {corr}")
+            }
             Self::Backend {
                 channel,
                 corr,
@@ -689,6 +717,7 @@ impl Error for RouterError {
             Self::ReservedChannelZero
             | Self::DuplicateChannel { .. }
             | Self::UnknownChannel { .. }
+            | Self::StaleRouteEpoch { .. }
             | Self::Backend { .. }
             | Self::RouteError { .. } => None,
         }
@@ -1082,6 +1111,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let stale_error = client_rx.recv().await.unwrap();
+        assert_eq!(stale_error.header.ty, FrameType::Error);
+        assert_eq!(stale_error.header.channel, pending.client_channel);
+        assert_eq!(stale_error.header.epoch, pending.client_epoch + 1);
+        assert_eq!(stale_error.header.corr, 702);
+        let body: ErrorBody = serde_json::from_slice(&stale_error.body).unwrap();
+        assert_eq!(body.code, "stale_route_epoch");
         assert!(module_rx.try_recv().is_err());
         assert!(client_rx.try_recv().is_err());
         let counters = router.counters.snapshot();
@@ -1161,6 +1197,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let stale_error = client_rx.recv().await.unwrap();
+        assert_eq!(stale_error.header.ty, FrameType::Error);
+        assert_eq!(stale_error.header.channel, pending.client_channel);
+        assert_eq!(stale_error.header.epoch, pending.client_epoch + 1);
+        assert_eq!(stale_error.header.corr, 902);
+        let body: ErrorBody = serde_json::from_slice(&stale_error.body).unwrap();
+        assert_eq!(body.code, "stale_route_epoch");
         router
             .route_for_connection(
                 &module_ctx,

@@ -2869,6 +2869,52 @@ async fn nonzero_goodbye_detaches_one_route_and_leaves_sibling_route_live() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_request_with_mismatched_route_epoch_emits_stale_route_epoch_without_forwarding() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-stale-route-epoch";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "stale-route-epoch").await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 608, "ses-stale-route-epoch").await;
+    let stale_corr = 609;
+    write_frame(
+        &mut client,
+        &data_request(
+            ack.route_channel,
+            ack.route_epoch + 1,
+            stale_corr,
+            b"stale-route-epoch",
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let error = read_frame_timeout(&mut client).await;
+    assert_eq!(error.header.epoch, ack.route_epoch + 1);
+    assert_error(&error, ack.route_channel, stale_corr, "stale_route_epoch");
+    assert_no_stub_event_within(&events_path, Duration::from_millis(100), |event| {
+        event["kind"] == "request_received" && event["corr"].as_u64() == Some(stale_corr)
+    })
+    .await;
+
+    let live_payload = b"live-route-epoch";
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, 610, live_payload),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_response(&response, ack.route_channel, 610, live_payload);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));

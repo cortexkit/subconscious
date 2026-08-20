@@ -7,6 +7,7 @@ import {
   type ReconnectBackoff,
   type RequestOptions,
   type RouteTarget,
+  type SubcCallErrorKind,
 } from "./client.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
 import {
@@ -350,6 +351,7 @@ export class SubcProviderError extends Error {
   constructor(
     message: string,
     readonly code?: string,
+    readonly kind: SubcCallErrorKind = "terminal",
   ) {
     super(message);
   }
@@ -1221,7 +1223,11 @@ function routeKey(handle: RouteHandle, corr: bigint): string {
 function providerErrorFromFrame(frame: Frame): SubcProviderError {
   try {
     const body = parseJson(frame.body) as { code?: string; message?: string };
-    return new SubcProviderError(body.message ?? "subc error", body.code);
+    return new SubcProviderError(
+      body.message ?? "subc error",
+      body.code,
+      body.code === "stale_route_epoch" || body.code === "unknown_channel" ? "not_sent" : "terminal",
+    );
   } catch {
     return new SubcProviderError(Buffer.from(frame.body).toString("utf8") || "subc error");
   }

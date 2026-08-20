@@ -518,6 +518,21 @@ astrocyte's fresh store appeared mid-move: the var-drop rescan undid the
 stop). During a store move, carry `enabled:false` in the config itself through
 the move, rescan (now spawn-free), move, then flip enabled back and start.
 
+A MIGRATION MUST BELONG TO THE CONSTRUCTOR THAT ASKED THE ENVIRONMENT WHERE
+TO LIVE (QTA's insula journal move): placed in a general-purpose constructor,
+the adopt-on-first-read migration ran under `cargo test` -- which resolved the
+LEGACY path from the process environment while building over a scratch dir,
+adopted the host's real records into the scratch file, and deleted the
+original eight minutes before the deploy meant to migrate them (harmless only
+because every record was past retention; on a host with a pending record it
+destroys a live fence). Anything reachable from a general constructor is
+reachable from a test, and a test that runs a migration has production side
+effects unless the path cannot consult the environment at all. Companion: a
+guard for this class must be able to FAIL -- QTA's first test seeded a scratch
+legacy file the buggy path never read (it reads the environment's), so it
+passed with the bug reinstated; the decidable form asserts over SOURCE that
+the universal path never references the legacy location.
+
 And do not read a green `--check-config` preflight as clearance for the move:
 preflight validates the CONFIG FILE, while this hazard lives between the config
 and the STORE (the var/resolver disagreement is invisible to any check that

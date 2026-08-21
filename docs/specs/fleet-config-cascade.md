@@ -1,8 +1,7 @@
 # Fleet Config Cascade (auto-approval and every future gate)
 
-Status: ASSEMBLED DRAFT — all three halves folded (subc, plexus, prefrontal).
-Pending: ALF review of the assembled text, then Ufuk's review before anything
-is built.
+Status: CO-SIGNED (subc, plexus, prefrontal) — awaiting Ufuk's build-gate
+review. Nothing is built until he reviews this document.
 
 Ufuk's requirement: fleet config gates are settable at
 GLOBAL > WORKSPACE > PROJECT > ALFONSO with override at each level, one common
@@ -53,11 +52,13 @@ consumer, not the shape). Plexus is a consumer, not the designer.
      asks nobody will action — the 875-of-877 non-alarm gap-row class that
      trains dismissal. Both arms are fail-closed; only one mints an artifact.
 3. **Bounded call, measured number.** The resolve call carries BOTH a p99
-   target and a hard timeout (a p99 target is not a timeout). Latency is
-   measured and published with the op, not promised: expectation is p50 <5ms
-   daemon-local (wire floor ~0.3ms measured), steady state zero round trips
-   under the TTL cache. Dispatch paths sit under supervisor deadlines; no
-   unbounded inline dependency.
+   target and a hard timeout (a p99 target is not a timeout). The timeout is
+   ENFORCED BY THE SHARED HELPER in subc-client-rs, not by each consumer, so
+   five consumers cannot invent five timeout behaviors around one op. Latency
+   is measured and published with the op, not promised: expectation is p50
+   <5ms daemon-local (wire floor ~0.3ms measured), steady state zero round
+   trips under the TTL cache. Dispatch paths sit under supervisor deadlines;
+   no unbounded inline dependency.
 4. **The push lane must never carry correctness** — stated as a constraint,
    not a description, because it erodes: the moment any consumer skips a fetch
    because a push said "nothing changed", the restart-catch-up-by-construction
@@ -86,10 +87,13 @@ function of `(gate_id, subject_agent_id)`: ONE open ask per gate+subject,
 subsequent refused actions queue behind it and never mint siblings — the
 dedupe that keeps a slow answer from becoming an ask wall. An answer writes an
 ALFONSO-scope policy row: the answer IS policy authoring, so it persists,
-bumps the revision, and no per-action re-asks occur. No auto-expiry by
-default — a parked decision stays until decided, because auto-expiry
-re-manufactures the silent drop the parking exists to prevent; the ask
-carries `default_decision` semantics per the existing ask contract.
+bumps the revision, and no per-action re-asks occur. The answer-authored row
+is ATTRIBUTED (`authored_by: ask-answer`, ask id in provenance) so a policy
+audit distinguishes operator-authored rows from answer-authored ones — the
+same absent-never-fabricated discipline as every other field here. No
+auto-expiry by default — a parked decision stays until decided, because
+auto-expiry re-manufactures the silent drop the parking exists to prevent;
+the ask carries `default_decision` semantics per the existing ask contract.
 
 ## Policy authoring (prefrontal, settled)
 

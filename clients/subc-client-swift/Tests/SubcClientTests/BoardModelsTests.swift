@@ -60,6 +60,10 @@ final class BoardModelsTests: XCTestCase {
         }
         XCTAssertEqual(props.status, "answered")
         XCTAssertEqual(props.answer, "After sweep")
+        // The answer-delivery stamp decodes TYPED on answered asks (fixture
+        // digest ec4255bc; on the live wire since 2026-08-16 — leniency was
+        // silently dropping it before the model gained the field).
+        XCTAssertEqual(props.answeredAtMs, 1030)
     }
 
     func testMalformedTeePreservesDefectAndPartialDigest() throws {
@@ -157,7 +161,7 @@ final class BoardModelsTests: XCTestCase {
             .joined()
         XCTAssertEqual(
             digest,
-            "63bbed6bd4cca3801413fadd035f159583b46f5599609e4e6ad37aef79e3d50d",
+            "ec4255bc0f2489f42b76e70969f242919e6beaca585f6c4bb9e380129de605da",
             """
             The vendored board fixture no longer matches the copy alfonso pins. \
             Re-sync from alfonso rather than updating this digest: the fixture is \

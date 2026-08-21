@@ -74,3 +74,26 @@ the harness takes a POSITIONAL module id; a first canary run passed
 `--module-id reservation-probe` and probed the literal string `--module-id`
 (unreserved, correctly admitted). The header line printing the probed subject
 is what caught it. Verdict lines above are from the corrected positional run.
+
+## Nonce forgery surface (the claim consumers cite, stated once)
+
+What a spawn nonce is: minted per-spawn from the daemon's CSPRNG, injected into
+the child's environment (`SUBC_LAUNCH_NONCE`), never logged, never on the wire
+outside the HELLO that redeems it. The reserved-name gate holds it only while
+the process it authorizes is the live holder; a reserved id with no live
+holder holds `None` and refuses every claimant (the canary arms above).
+
+The boundary, verified live by CKCRED on this host (`ps eww` against the
+running vault process, same uid): **supervisor attestation is trustworthy
+against remote and cross-account claimants; against same-uid local processes
+it is an integrity signal, not a secret.** Same-uid readability is a property
+of process environments on this platform, not of the minting. A same-uid
+impostor additionally needs a window in which the reserved module is NOT the
+live holder, because the duplicate-id gate refuses a second registration while
+it is — which is what makes principal-scoped grants strictly stronger than
+on-disk bearer handles for this attacker class: the file asks for one read,
+the impersonation asks for a read plus a window that does not normally exist.
+
+Named non-goal: no read-plane mechanism on this host defends against a
+same-uid adversary. Designs consuming this attestation should state that as a
+non-goal rather than leaving it for an auditor to discover.

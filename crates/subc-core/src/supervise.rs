@@ -1118,6 +1118,14 @@ impl SupervisedModule {
         })
     }
 
+    pub(crate) fn is_warming(&self) -> Result<bool, SuperviseError> {
+        let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
+        Ok(matches!(
+            snapshot.state,
+            ModuleState::Starting | ModuleState::Running | ModuleState::Restarting
+        ))
+    }
+
     /// Drain the module and stop monitoring it.
     pub async fn drain(&self) -> Result<(), SuperviseError> {
         self.stop().await
@@ -3935,6 +3943,36 @@ mod terminal_history_tests {
                 .will_recover_after_connection_loss()
                 .unwrap()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warming_snapshot_is_limited_to_startup_phases() {
+        for state in [
+            ModuleState::Starting,
+            ModuleState::Running,
+            ModuleState::Restarting,
+        ] {
+            assert!(
+                module_with_recovery_snapshot(state, true, 0)
+                    .is_warming()
+                    .unwrap(),
+                "{state:?} should be warming"
+            );
+        }
+        for state in [
+            ModuleState::Unresponsive,
+            ModuleState::Draining,
+            ModuleState::Stopped,
+            ModuleState::Failed,
+            ModuleState::Disabled,
+        ] {
+            assert!(
+                !module_with_recovery_snapshot(state, true, 0)
+                    .is_warming()
+                    .unwrap(),
+                "{state:?} should not be warming"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

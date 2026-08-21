@@ -1339,6 +1339,7 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
   return (
     code === "unknown_module" ||
     code === "module_reloading" ||
+    code === "module_warming" ||
     code === "target_unavailable" ||
     code === "module_timeout"
   );

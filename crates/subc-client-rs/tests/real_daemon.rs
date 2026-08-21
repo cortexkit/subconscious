@@ -152,40 +152,96 @@ struct PolicyModuleHandler {
     scripts: Arc<Mutex<VecDeque<PolicyScript>>>,
     calls: Arc<AtomicU64>,
     routes: Arc<Mutex<HashMap<u16, RouteHandle>>>,
+    /// Queued revision bumps served over the HELD policy.subscribe stream --
+    /// the live resolver's lane (StreamData on a held-open request), which the
+    /// first cut faked as spontaneous route pushes its own helper accepted.
+    bump_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u64>>>>,
+    /// Shared across handler clones (serve holds one), so close_bumps() can
+    /// end the held stream from the harness side: serve waits on the stream,
+    /// stop waits on serve, and a per-clone sender would deadlock the pair.
+    bump_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<u64>>>>,
 }
 
 impl PolicyModuleHandler {
     fn new(scripts: impl IntoIterator<Item = PolicyScript>) -> Self {
+        let (bump_tx, bump_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
             calls: Arc::new(AtomicU64::new(0)),
             routes: Arc::new(Mutex::new(HashMap::new())),
+            bump_rx: Arc::new(Mutex::new(Some(bump_rx))),
+            bump_tx: Arc::new(Mutex::new(Some(bump_tx))),
         }
     }
 
+    /// Count of policy.resolve calls only; the held subscription is not a call.
     fn calls(&self) -> u64 {
         self.calls.load(Ordering::SeqCst)
     }
 
-    fn route(&self) -> Option<RouteHandle> {
-        self.routes
+    fn send_bump(&self, revision: u64) {
+        self.bump_tx
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .next()
-            .copied()
+            .as_ref()
+            .expect("bump channel open")
+            .send(revision)
+            .expect("bump channel open");
+    }
+
+    /// Close the bump lane so the held policy.subscribe stream ends; without
+    /// this, harness.stop() deadlocks on a serve task waiting for a stream
+    /// whose sender serve's own handler clone keeps alive.
+    fn close_bumps(&self) {
+        self.bump_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 }
 
 #[async_trait]
 impl ModuleHandler for PolicyModuleHandler {
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let request: Value = serde_json::from_slice(&body).expect("policy request must be JSON");
         // The managed-call convention: {method, params} out, {result} back.
         // The fake mirrors the CONVENTION rather than the helper draft -- the
         // first cut of this handler accepted a flat body its own helper
         // invented, and the real resolver refused every live call.
+        if request["method"] == "policy.subscribe" {
+            // Serve the held bump stream until the test closes the channel.
+            let Some(mut rx) = self
+                .bump_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            else {
+                return HandlerOutcome::Error {
+                    code: "already_subscribed".to_string(),
+                    message: "one held stream per harness".to_string(),
+                };
+            };
+            loop {
+                tokio::select! {
+                    // Graceful stop cancels in-flight handlers; a held stream
+                    // that ignores cancellation deadlocks harness.stop().
+                    _ = ctx.cancelled() => break,
+                    maybe = rx.recv() => {
+                        let Some(revision) = maybe else { break };
+                        let event = serde_json::to_vec(&json!({
+                            "op": "policy.revision_bump",
+                            "revision": revision,
+                        }))
+                        .unwrap();
+                        if ctx.emit(event).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            return HandlerOutcome::Streamed;
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(request["method"], "policy.resolve");
         let params = request.get("params").expect("params envelope");
         assert!(params.get("domain").is_some());
@@ -1651,19 +1707,6 @@ async fn wait_for_module_route(handler: &PushModuleHandler, channel: u16) -> Rou
     }
 }
 
-async fn wait_for_policy_module_route(handler: &PolicyModuleHandler) -> RouteHandle {
-    let deadline = Instant::now() + EVENT_TIMEOUT;
-    loop {
-        if let Some(handle) = handler.route() {
-            return handle;
-        }
-        if Instant::now() >= deadline {
-            panic!("policy module did not bind a route within {EVENT_TIMEOUT:?}");
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-}
-
 struct PolicyHarness {
     daemon: LiveDaemon,
     module: ModuleHandle,
@@ -1673,6 +1716,7 @@ struct PolicyHarness {
 
 impl PolicyHarness {
     async fn stop(mut self) {
+        self.handler.close_bumps();
         self.daemon.kill_and_wait();
         drop(self.module);
         assert!(self.serve_task.await.unwrap().is_ok());
@@ -2330,17 +2374,15 @@ async fn policy_resolver_uses_a_live_ttl_cache_entry_without_a_second_wire_call(
     let project_root = policy_project_root();
     let subject = Subject::AgentId("agent-cache".to_string());
 
-    assert_eq!(
-        resolver
-            .resolve(
-                "approval",
-                "plexus.github_write",
-                subject.clone(),
-                &project_root
-            )
-            .await,
-        Ok(PolicyVerdict::Allow)
-    );
+    let first = resolver
+        .resolve(
+            "approval",
+            "plexus.github_write",
+            subject.clone(),
+            &project_root,
+        )
+        .await;
+    assert_eq!(first, Ok(PolicyVerdict::Allow));
     assert_eq!(
         resolver
             .resolve("approval", "plexus.github_write", subject, &project_root)
@@ -2573,23 +2615,11 @@ async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
             .await,
         Ok(PolicyVerdict::Allow)
     );
-    let route = wait_for_policy_module_route(&harness.handler).await;
-    harness
-        .module
-        .push(
-            &route,
-            serde_json::to_vec(&json!({
-                "op": "policy.revision_bump",
-                "revision": 2,
-            }))
-            .unwrap(),
-            None,
-        )
-        .await
-        .unwrap();
-    // The route push is asynchronous; let the registered receiver consume it before
-    // exercising the next resolve. The reply below proves the push did not answer it.
-    sleep(Duration::from_millis(100)).await;
+    // Queue the bump onto the HELD subscription stream (the live lane); it is
+    // asynchronous, so give the subscriber a beat to fold it. The reply below
+    // proves the bump did not answer the resolve.
+    harness.handler.send_bump(2);
+    sleep(Duration::from_millis(200)).await;
 
     assert_eq!(
         resolver

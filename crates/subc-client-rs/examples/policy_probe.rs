@@ -4,7 +4,7 @@
 //! when the target is wrong (bounded by the helper's hard timeout).
 use std::path::Path;
 use std::time::Duration;
-use subc_client_rs::{PolicyResolver, PolicyResolverConfig, SubcConsumer, Subject};
+use subc_client_rs::{PolicyResolver, PolicyResolverConfig, ProjectRef, SubcConsumer, Subject};
 
 #[tokio::main]
 async fn main() {
@@ -30,7 +30,7 @@ async fn main() {
             "approval",
             "subc.integration_probe_gate",
             Subject::SessionToResolve("ses_12a4fa38dffe81Fz7Y2AsWb5Cg".into()),
-            "/tmp",
+            ProjectRef::Root("/tmp".to_string()),
         )
         .await;
     println!("arm1 unknown-gate closed-default: {verdict:?}");
@@ -51,7 +51,7 @@ async fn main() {
             "approval",
             "subc.integration_probe_gate",
             Subject::SessionToResolve("ses_12a4fa38dffe81Fz7Y2AsWb5Cg".into()),
-            "/tmp",
+            ProjectRef::Root("/tmp".to_string()),
         )
         .await;
     println!(
@@ -63,7 +63,7 @@ async fn main() {
             "approval",
             "subc.integration_probe_gate",
             Subject::SessionToResolve("ses_12a4fa38dffe81Fz7Y2AsWb5Cg".into()),
-            "/tmp",
+            ProjectRef::Root("/tmp".to_string()),
         )
         .await;
     println!("arm3 cached-repeat: {again:?}");

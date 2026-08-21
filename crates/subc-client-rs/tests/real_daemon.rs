@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use subc_client_rs::{
     async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
     ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler, PolicyResolveError,
-    PolicyResolver, PolicyResolverConfig, PolicyVerdict, RequestCtx, RetryBackoff, RouteHandle,
-    SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
+    PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
+    RouteHandle, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -228,9 +228,11 @@ impl ModuleHandler for PolicyModuleHandler {
                     _ = ctx.cancelled() => break,
                     maybe = rx.recv() => {
                         let Some(revision) = maybe else { break };
+                        // NESTED framing, pinned by the producer's push_event
+                        // fixture entry (the flat form was the eighth drift).
                         let event = serde_json::to_vec(&json!({
                             "op": "policy.revision_bump",
-                            "revision": revision,
+                            "body": { "revision": revision },
                         }))
                         .unwrap();
                         if ctx.emit(event).await.is_err() {
@@ -2379,13 +2381,18 @@ async fn policy_resolver_uses_a_live_ttl_cache_entry_without_a_second_wire_call(
             "approval",
             "plexus.github_write",
             subject.clone(),
-            &project_root,
+            ProjectRef::Root(project_root.clone()),
         )
         .await;
     assert_eq!(first, Ok(PolicyVerdict::Allow));
     assert_eq!(
         resolver
-            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject,
+                ProjectRef::Root(project_root.clone())
+            )
             .await,
         Ok(PolicyVerdict::Allow)
     );
@@ -2429,20 +2436,30 @@ async fn policy_resolver_reply_revision_invalidates_every_older_cache_entry() {
                 "approval",
                 "plexus.github_write",
                 subject.clone(),
-                &project_root
+                ProjectRef::Root(project_root.clone())
             )
             .await,
         Ok(PolicyVerdict::Allow)
     );
     assert_eq!(
         resolver
-            .resolve("approval", "plexus.merge", subject.clone(), &project_root)
+            .resolve(
+                "approval",
+                "plexus.merge",
+                subject.clone(),
+                ProjectRef::Root(project_root.clone())
+            )
             .await,
         Ok(PolicyVerdict::Allow)
     );
     assert_eq!(
         resolver
-            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject,
+                ProjectRef::Root(project_root.clone())
+            )
             .await,
         Ok(PolicyVerdict::Deny)
     );
@@ -2481,7 +2498,7 @@ async fn policy_resolver_refetches_after_ttl_expiry() {
                 "approval",
                 "plexus.github_write",
                 subject.clone(),
-                &project_root
+                ProjectRef::Root(project_root.clone())
             )
             .await,
         Ok(PolicyVerdict::Allow)
@@ -2489,7 +2506,12 @@ async fn policy_resolver_refetches_after_ttl_expiry() {
     sleep(Duration::from_millis(40)).await;
     assert_eq!(
         resolver
-            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject,
+                ProjectRef::Root(project_root.clone())
+            )
             .await,
         Ok(PolicyVerdict::Deny)
     );
@@ -2516,7 +2538,7 @@ async fn policy_resolver_hard_timeout_is_a_fault_before_the_provider_stall_finis
             "approval",
             "plexus.github_write",
             Subject::AgentId("agent-timeout".to_string()),
-            &project_root,
+            ProjectRef::Root(project_root.clone()),
         )
         .await;
     let elapsed = started.elapsed();
@@ -2559,7 +2581,7 @@ async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
             "approval",
             "plexus.github_write",
             Subject::AgentId("agent-denied".to_string()),
-            &project_root,
+            ProjectRef::Root(project_root.clone()),
         )
         .await;
     let fault = resolver
@@ -2567,7 +2589,7 @@ async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
             "approval",
             "plexus.merge",
             Subject::AgentId("agent-stalled".to_string()),
-            &project_root,
+            ProjectRef::Root(project_root.clone()),
         )
         .await;
     assert_eq!(denied, Ok(PolicyVerdict::Deny));
@@ -2610,7 +2632,7 @@ async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
                 "approval",
                 "plexus.github_write",
                 subject.clone(),
-                &project_root
+                ProjectRef::Root(project_root.clone())
             )
             .await,
         Ok(PolicyVerdict::Allow)
@@ -2623,7 +2645,12 @@ async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
 
     assert_eq!(
         resolver
-            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject,
+                ProjectRef::Root(project_root.clone())
+            )
             .await,
         Ok(PolicyVerdict::Deny)
     );

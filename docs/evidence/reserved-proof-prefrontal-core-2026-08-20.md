@@ -48,3 +48,29 @@ verified absent from catalog after). Fixed in subc-core (reserved names with
 no legitimate holder now refuse ALL HELLOs); serves at the next daemon bounce.
 Every SPAWNED reserved module (claustrum, cerebellum, condition-runner,
 prefrontal-core) was protected throughout.
+
+## Post-deploy acceptance, 2026-08-21 (daemon 0.7.0 @ bb0a64b5, pid 6467)
+
+Live production run of `clients/subc-client/tests/reserved-proof.ts` after the
+bounce that activated cdb90283 (a reserved name with no legitimate holder
+refuses every HELLO).
+
+Spawned reserved id (`prefrontal-core`):
+
+    ARM 1 forged-nonce: Error code=reserved_module message="module_id 'prefrontal-core' is reserved; HELLO without a valid launch nonce is rejected"
+    ARM 2 absent-nonce: Error code=reserved_module message="module_id 'prefrontal-core' is reserved; HELLO without a valid launch nonce is rejected"
+    ARM 3 positive: prefrontal-core running/ok in `ck module list` (its own registration through the same gate)
+
+Never-spawned reserved id (`reservation-probe`, `enabled: false` canary):
+
+    ARM 1 forged-nonce: Error code=reserved_module message="module_id 'reservation-probe' is reserved; HELLO without a valid launch nonce is rejected"
+    ARM 2 absent-nonce: Error code=reserved_module message="module_id 'reservation-probe' is reserved; HELLO without a valid launch nonce is rejected"
+
+The canary arms are the lazily-populated-gate close: before cdb90283 a
+reserved-but-never-spawned id had no gate entry and admitted any claimant.
+
+Instrument note, recorded because the artifact looked exactly like the defect:
+the harness takes a POSITIONAL module id; a first canary run passed
+`--module-id reservation-probe` and probed the literal string `--module-id`
+(unreserved, correctly admitted). The header line printing the probed subject
+is what caught it. Verdict lines above are from the corrected positional run.

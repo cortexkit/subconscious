@@ -9,25 +9,49 @@ export function postgresDatabaseName(moduleId: string): string {
 }
 
 /**
- * The platform data home: `$XDG_DATA_HOME` if set and absolute, else
- * `$HOME/.local/share`. THE definition — byte-parity with Rust
- * `cortexkit-store-types::resolve_data_home`. Modules must not re-derive it by
- * hand: hand-rolled env-or-XDG-or-HOME assembly is how a module directory got
- * fed back in as a data home and doubled a production store path
- * (`<module>/cortexkit/<module>`, astrocyte 2026-08). Relocation is
- * XDG_DATA_HOME only; private `*_DATA_DIR` conventions are unsupported.
+ * The platform data home, resolved by THE SUPERVISOR'S RULES — a mirror of
+ * `default_data_home` in `crates/subc-core/src/daemon_config.rs`, which is the
+ * authority: the daemon resolves every module's storage descriptor with that
+ * function, so resolving your own path by different rules silently splits it
+ * from the directory the supervisor serves. Rule changes land THERE first;
+ * this mirror is pinned by the shared golden fixture
+ * (`crates/subc-core/tests/golden/data_home_resolution.json`).
+ *
+ * Rules in order: non-empty `XDG_DATA_HOME` AS-IS (relative included, no
+ * trimming — compose sites trim); on Windows non-empty `APPDATA`, else
+ * `USERPROFILE\AppData\Roaming`; then `$HOME/.local/share`; finally relative
+ * `.local/share`. Empty values count as unset. Joins use the platform
+ * separator, matching the daemon's PathBuf behavior.
+ *
+ * Modules must not re-derive this by hand: hand-rolled env-or-XDG-or-HOME
+ * assembly is how a module directory got fed back in as a data home and
+ * doubled a production store path (`<module>/cortexkit/<module>`, astrocyte
+ * 2026-08). Relocation is XDG_DATA_HOME only; private `*_DATA_DIR`
+ * conventions are unsupported.
  */
-export function resolveDataHome(env: Record<string, string | undefined> = processEnv()): string {
+export function resolveDataHome(
+  env: Record<string, string | undefined> = processEnv(),
+  platform: string = processPlatform(),
+): string {
+  const sep = platform === "win32" ? "\\" : "/";
   const xdg = env.XDG_DATA_HOME;
-  if (xdg && xdg.startsWith("/")) return xdg.replace(/\/+$/, "");
-  const home = (env.HOME ?? "~").replace(/\/+$/, "");
-  return `${home}/.local/share`;
+  if (xdg) return xdg;
+  if (platform === "win32") {
+    if (env.APPDATA) return env.APPDATA;
+    if (env.USERPROFILE) return `${env.USERPROFILE}${sep}AppData${sep}Roaming`;
+  }
+  if (env.HOME) return `${env.HOME}${sep}.local${sep}share`;
+  return `.local${sep}share`;
 }
 
 /** The conventional module data directory for non-sqlite state (journals, caches). */
 export function moduleDataDir(moduleId: string, env?: Record<string, string | undefined>): string {
   assertPathSafeModuleId(moduleId);
-  return `${resolveDataHome(env)}/cortexkit/${moduleId}`;
+  return `${resolveDataHome(env).replace(/\/+$/, "")}/cortexkit/${moduleId}`;
+}
+
+function processPlatform(): string {
+  return (globalThis as { process?: { platform?: string } }).process?.platform ?? "linux";
 }
 
 /**

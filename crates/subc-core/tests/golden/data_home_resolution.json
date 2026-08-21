@@ -1,0 +1,105 @@
+{
+  "authority": "crates/subc-core/src/daemon_config.rs default_data_home -- the daemon resolves every module's storage descriptor with this function; mirrors (cortexkit-store-types resolve_data_home, @cortexkit/store resolveDataHome) assert against these rows and may not diverge",
+  "notes": "env maps list ONLY the variables set for the case; the harness must clear XDG_DATA_HOME, APPDATA, USERPROFILE, and HOME before applying each case. Empty string values are deliberately present to pin empty-counts-as-unset. Platform 'any' rows must pass on every OS; 'unix'/'windows' rows only where cfg matches. Resolver output is asserted RAW (no trimming); the composed rows pin that trailing-slash trimming happens at compose time.",
+  "cases": [
+    {
+      "name": "xdg_absolute_as_is",
+      "platform": "any",
+      "env": {
+        "XDG_DATA_HOME": "/tmp/xdg-golden"
+      },
+      "expect": "/tmp/xdg-golden"
+    },
+    {
+      "name": "xdg_relative_honored_as_is",
+      "platform": "any",
+      "env": {
+        "XDG_DATA_HOME": "relative/path"
+      },
+      "expect": "relative/path"
+    },
+    {
+      "name": "xdg_trailing_slash_kept_by_resolver",
+      "platform": "any",
+      "env": {
+        "XDG_DATA_HOME": "/tmp/xdg-golden/"
+      },
+      "expect": "/tmp/xdg-golden/"
+    },
+    {
+      "name": "xdg_empty_is_unset",
+      "platform": "unix",
+      "env": {
+        "XDG_DATA_HOME": "",
+        "HOME": "/home/golden"
+      },
+      "expect": "/home/golden/.local/share"
+    },
+    {
+      "name": "home_fallback",
+      "platform": "unix",
+      "env": {
+        "HOME": "/home/golden"
+      },
+      "expect": "/home/golden/.local/share"
+    },
+    {
+      "name": "all_unset_falls_to_relative",
+      "platform": "unix",
+      "env": {},
+      "expect": ".local/share"
+    },
+    {
+      "name": "appdata_wins_on_windows",
+      "platform": "windows",
+      "env": {
+        "APPDATA": "C:\\Users\\golden\\AppData\\Roaming"
+      },
+      "expect": "C:\\Users\\golden\\AppData\\Roaming"
+    },
+    {
+      "name": "userprofile_appends_appdata_roaming",
+      "platform": "windows",
+      "env": {
+        "USERPROFILE": "C:\\Users\\golden"
+      },
+      "expect": "C:\\Users\\golden\\AppData\\Roaming"
+    },
+    {
+      "name": "xdg_beats_appdata_on_windows",
+      "platform": "windows",
+      "env": {
+        "XDG_DATA_HOME": "C:/xdg-golden",
+        "APPDATA": "C:\\Users\\golden\\AppData\\Roaming"
+      },
+      "expect": "C:/xdg-golden"
+    },
+    {
+      "name": "windows_empty_appdata_userprofile_falls_to_home",
+      "platform": "windows",
+      "env": {
+        "APPDATA": "",
+        "USERPROFILE": "",
+        "HOME": "C:/golden-home"
+      },
+      "expect": "C:/golden-home\\.local\\share"
+    },
+    {
+      "name": "windows_all_unset_falls_to_relative",
+      "platform": "windows",
+      "env": {},
+      "expect": ".local\\share"
+    }
+  ],
+  "composed": [
+    {
+      "name": "trailing_slash_trimmed_at_compose",
+      "platform": "any",
+      "env": {
+        "XDG_DATA_HOME": "/tmp/xdg-golden/"
+      },
+      "module_id": "golden-module",
+      "expect_store": "/tmp/xdg-golden/cortexkit/golden-module/store.db"
+    }
+  ]
+}

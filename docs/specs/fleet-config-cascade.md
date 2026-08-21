@@ -1,8 +1,8 @@
 # Fleet Config Cascade (auto-approval and every future gate)
 
-Status: DRAFT — subc + plexus halves settled; prefrontal half open (resolver
-op shape, policy authoring surface, parking confirmation). Co-signed when ALF's
-sections land.
+Status: ASSEMBLED DRAFT — all three halves folded (subc, plexus, prefrontal).
+Pending: ALF review of the assembled text, then Ufuk's review before anything
+is built.
 
 Ufuk's requirement: fleet config gates are settable at
 GLOBAL > WORKSPACE > PROJECT > ALFONSO with override at each level, one common
@@ -11,12 +11,21 @@ consumer, not the shape). Plexus is a consumer, not the designer.
 
 ## Roles
 
-- **prefrontal** owns RESOLUTION: a `policy.resolve` management op —
-  `(gate_id, subject_principal, project_root) -> verdict + revision + ttl_ms`.
-  It holds agent identity, already stamps admission facts modules trust
-  (cerebellum's `sessionKind`), and queries entorhinal for workspace/project
-  membership, so the hierarchy has exactly one home. Working precedent for the
-  whole shape, cited as evidence rather than argument: plexus
+- **prefrontal** owns RESOLUTION, as a second POLICY DOMAIN on the existing
+  wake-policy ladder (`crates/prefrontal-core-store/src/wake_policy.rs`, which
+  already resolves agent > project > workspace > global with per-field
+  most-specific-wins) — approval posture is new policy content, not new
+  machinery. Op: `policy.resolve(domain, gate_id, subject, project_root) ->
+  {verdict, revision, ttl_ms}` where subject is the registry AGENT_ID (or a
+  session id the resolver maps to one): consumers never learn identity
+  topology — the resolver owns the session/principal-to-agent mapping just as
+  it owns the scope hierarchy. `revision` is a single monotonic policy
+  generation across all scopes; any policy write bumps it, so push
+  invalidation and cache watermarks are the same number. It holds agent
+  identity, already stamps admission facts modules trust (cerebellum's
+  `sessionKind`), and queries entorhinal for workspace/project membership, so
+  the hierarchy has exactly one home. Working precedent for the whole shape,
+  cited as evidence rather than argument: plexus
   `crates/plexus-core/src/github_identity.rs` already fetches prefrontal's
   read-only `agent.github_identity` fail-closed — enforcer-initiated, no
   caller-carried claims.
@@ -69,11 +78,33 @@ the row; remove one and it lingers holding authority. The sharper framing is
 OWNERSHIP, not caching: the consumer holds rows whose correctness depends on
 state it has no way to observe, so it cannot even detect that they are stale.
 
-## Open (prefrontal)
+## Parking mechanics (prefrontal, confirmed)
 
-- `policy.resolve` op shape + gate_id namespace; where cascade policy is
-  AUTHORED (scope-level config files vs store rows; workspace scope likely
-  entorhinal-adjacent) — authoring is decision-plane.
-- Parking mechanics for the attended arm (whose ask, what dedupe, what expiry).
-- Confirmation of the decision-vs-fault split (constraint 2) since the parking
-  machinery is prefrontal's.
+Parking fires for ATTENDED callers only; the unattended arm is transient-fault
+retry with zero asks (constraint 2, adopted verbatim). Ask identity is a pure
+function of `(gate_id, subject_agent_id)`: ONE open ask per gate+subject,
+subsequent refused actions queue behind it and never mint siblings — the
+dedupe that keeps a slow answer from becoming an ask wall. An answer writes an
+ALFONSO-scope policy row: the answer IS policy authoring, so it persists,
+bumps the revision, and no per-action re-asks occur. No auto-expiry by
+default — a parked decision stays until decided, because auto-expiry
+re-manufactures the silent drop the parking exists to prevent; the ask
+carries `default_decision` semantics per the existing ask contract.
+
+## Policy authoring (prefrontal, settled)
+
+Cascade policy lives as PREFRONTAL STORE ROWS authored over management ops
+(`wake.policy_set` precedent) — NOT config files, which carry the
+schema-default clobber history, no revision semantics, and are being actively
+thinned. Apps and CLI author through ops. Entorhinal stays pure topology
+(which workspace owns this project) and stores no policy.
+
+Gate namespace: freeform dotted ids namespaced by consumer module
+(`plexus.github_write`), no registration ceremony. An unresolvable or
+policy-less gate resolves to the DOMAIN'S DECLARED DEFAULT — closed for
+approval domains — so an unknown gate is safe by construction.
+
+## Process
+
+Ufuk reviews the assembled spec before anything is built; the doc routes to
+him at co-sign time.

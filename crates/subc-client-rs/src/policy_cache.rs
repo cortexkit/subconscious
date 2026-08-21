@@ -22,13 +22,21 @@ const POLICY_RESOLVER_HARNESS: &str = "subc-client-rs-policy-resolver";
 const POLICY_RESOLVE_OP: &str = "policy.resolve";
 const POLICY_REVISION_BUMP_OP: &str = "policy.revision_bump";
 
-/// The principal whose policy is being resolved.
+/// The principal whose policy is being resolved. Wire encoding is the
+/// resolver's UNTAGGED object-key form — `{"agent_id": ...}` or
+/// `{"session_id": ...}` — pinned by the producer-real contract vectors
+/// (tests/fixtures/policy_resolve_contract_vectors.json, vendored from
+/// prefrontal where each committed request is executed against live dispatch).
+/// The first cut serialized a tagged {kind, value} form and every live call
+/// failed shape-parse: prose pinned the field names but only bytes pin an
+/// encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Subject {
     /// A stable registry agent identifier.
+    #[serde(rename = "agent_id")]
     AgentId(String),
     /// A session identifier that the resolver maps to an agent.
+    #[serde(rename = "session_id")]
     SessionToResolve(String),
 }
 
@@ -41,12 +49,21 @@ impl Subject {
     }
 }
 
-/// A resolver decision. Unknown wire values are retained so an older consumer
-/// does not discard a valid reply from a newer resolver.
+/// A resolver decision. The vocabulary is closed AT AUTHORING on the resolver
+/// side (policy.set refuses anything but allow | deny | ask, mutation-proved
+/// there), with two reply-only values: `deny` doubles as the policy-less
+/// closed default, and `deny_unknown_domain` marks a domain no producer
+/// declared — a consumer bug surfaced as its own variant rather than folded
+/// into an ordinary deny. `ask` is the ask-first/park spelling: the caller-arm
+/// split (attended parks, unattended treats as transient) happens ABOVE this
+/// type; the helper only carries the verdict. Unknown wire values are retained
+/// so an older consumer does not discard a valid reply from a newer resolver.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PolicyVerdict {
-    Allowed,
-    Denied,
+    Allow,
+    Deny,
+    Ask,
+    DenyUnknownDomain,
     Unknown(String),
 }
 
@@ -54,8 +71,10 @@ impl PolicyVerdict {
     /// Return the wire spelling of this decision.
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Allowed => "allowed",
-            Self::Denied => "denied",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+            Self::DenyUnknownDomain => "deny_unknown_domain",
             Self::Unknown(value) => value,
         }
     }
@@ -77,8 +96,10 @@ impl<'de> Deserialize<'de> for PolicyVerdict {
     {
         let value = String::deserialize(deserializer)?;
         Ok(match value.as_str() {
-            "allowed" => Self::Allowed,
-            "denied" => Self::Denied,
+            "allow" => Self::Allow,
+            "deny" => Self::Deny,
+            "ask" => Self::Ask,
+            "deny_unknown_domain" => Self::DenyUnknownDomain,
             _ => Self::Unknown(value),
         })
     }
@@ -93,17 +114,30 @@ pub struct PolicyResolverConfig {
     pub ttl_floor_ms: u64,
 }
 
-/// A resolver failure rather than a policy decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A resolver failure rather than a policy decision. The `cause` is
+/// diagnostic prose for logs and operators, never for matching: callers
+/// branch on the VARIANT (per the decision-vs-fault split), and the cause
+/// exists because a unit Fault swallowed three different integration defects
+/// (subject shape, request envelope, wrong route plane) in its first hour,
+/// each costing a raw-probe cycle to see through.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyResolveError {
     /// The resolver could not supply a usable decision within the hard timeout.
-    Fault,
+    Fault { cause: String },
+}
+
+impl PolicyResolveError {
+    fn fault(cause: impl Into<String>) -> Self {
+        Self::Fault {
+            cause: cause.into(),
+        }
+    }
 }
 
 impl fmt::Display for PolicyResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Fault => f.write_str("policy resolver fault"),
+            Self::Fault { cause } => write!(f, "policy resolver fault: {cause}"),
         }
     }
 }
@@ -156,8 +190,17 @@ struct CacheEntry {
 }
 
 #[derive(Serialize)]
+/// The managed-call envelope: `{method, params}` out, `{result}` back — the
+/// module-op convention every consumer speaks (proven against the live
+/// resolver; the first cut sent a flat body its own fake accepted, which is
+/// the build-local trap: the fake must mirror the CONVENTION, not the draft).
 struct PolicyResolveRequest<'a> {
-    op: &'static str,
+    method: &'static str,
+    params: PolicyResolveParams<'a>,
+}
+
+#[derive(Serialize)]
+struct PolicyResolveParams<'a> {
     domain: &'a str,
     gate_id: &'a str,
     subject: &'a Subject,
@@ -165,8 +208,16 @@ struct PolicyResolveRequest<'a> {
 }
 
 #[derive(Deserialize)]
+struct PolicyResolveEnvelope {
+    result: PolicyResolveReply,
+}
+
+#[derive(Deserialize)]
 struct PolicyResolveReply {
     verdict: PolicyVerdict,
+    /// The CURRENT global policy generation at resolve time — the cache
+    /// watermark — never the matched rule's write stamp (producer-pinned
+    /// semantic: any policy write in any scope bumps it).
     revision: u64,
     ttl_ms: u64,
 }
@@ -217,13 +268,16 @@ impl PolicyResolver {
         }
 
         let request = PolicyResolveRequest {
-            op: POLICY_RESOLVE_OP,
-            domain,
-            gate_id,
-            subject: &subject,
-            project_root,
+            method: POLICY_RESOLVE_OP,
+            params: PolicyResolveParams {
+                domain,
+                gate_id,
+                subject: &subject,
+                project_root,
+            },
         };
-        let body = serde_json::to_vec(&request).map_err(|_| PolicyResolveError::Fault)?;
+        let body = serde_json::to_vec(&request)
+            .map_err(|e| PolicyResolveError::fault(format!("request encode: {e}")))?;
         let route_identity = BindIdentity {
             project_root: PathBuf::from(project_root),
             harness: POLICY_RESOLVER_HARNESS.to_string(),
@@ -239,35 +293,44 @@ impl PolicyResolver {
             let route = self
                 .consumer
                 .open_route(
-                    RouteTarget::ToolProvider {
+                    // policy.resolve serves on the resolver's MANAGEMENT
+                    // SURFACE (live-proven; a ToolProvider bind reaches the
+                    // wrong plane and faults every call).
+                    RouteTarget::ManagementSurface {
                         module_id: self.resolver_module_id.clone(),
                     },
                     route_identity,
                     call_options.clone(),
                 )
                 .await
-                .map_err(|_| PolicyResolveError::Fault)?;
+                .map_err(|e| PolicyResolveError::fault(format!("route open: {e}")))?;
             self.install_push_receiver(route)?;
             self.consumer
                 .request(&route, body, call_options)
                 .await
-                .map_err(|_| PolicyResolveError::Fault)
+                .map_err(|e| PolicyResolveError::fault(format!("request: {e}")))
         };
         let response = timeout(self.config.hard_timeout, wire_call)
             .await
-            .map_err(|_| PolicyResolveError::Fault)??;
-        let reply: PolicyResolveReply =
-            serde_json::from_slice(&response).map_err(|_| PolicyResolveError::Fault)?;
+            .map_err(|_| PolicyResolveError::fault("hard timeout elapsed"))??;
+        // Module replies wrap in the `{result}` envelope; a missing wrapper is
+        // a contract violation, not a tolerable variant — the raw shape never
+        // reaches consumers un-enveloped on this convention.
+        let envelope: PolicyResolveEnvelope = serde_json::from_slice(&response)
+            .map_err(|e| PolicyResolveError::fault(format!("reply envelope: {e}")))?;
+        let reply = envelope.result;
         let ttl = Duration::from_millis(reply.ttl_ms.max(self.config.ttl_floor_ms));
         let expires_at = Instant::now()
             .checked_add(ttl)
-            .ok_or(PolicyResolveError::Fault)?;
+            .ok_or_else(|| PolicyResolveError::fault("ttl overflow"))?;
 
         let mut cache = lock(&self.cache);
         // A regression cannot be a fresh answer after this process has observed a
         // newer monotonic generation, so never return or cache it as a decision.
         if reply.revision < cache.last_known_revision {
-            return Err(PolicyResolveError::Fault);
+            return Err(PolicyResolveError::fault(
+                "reply revision regressed below an observed generation",
+            ));
         }
         cache.observe_revision(reply.revision);
         cache.entries.insert(
@@ -299,9 +362,11 @@ impl PolicyResolver {
             }
             match self.consumer.push_events(&route) {
                 Ok(events) => events,
-                Err(_) => {
+                Err(e) => {
                     cache.push_routes.remove(&route);
-                    return Err(PolicyResolveError::Fault);
+                    return Err(PolicyResolveError::fault(format!(
+                        "push receiver install: {e}"
+                    )));
                 }
             }
         };

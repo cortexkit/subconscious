@@ -1,5 +1,5 @@
 {
-  "$comment": "Board wire contract v1 fixtures — canonical shapes SUBC's tab builds against. Casing: camelCase everywhere. Wire law: absent means unknown/not-applicable, present-empty means empty; renderers must distinguish. Unknown `kind` renders as a digest card. `digest` is MODULE-DERIVED from props at post time; agents never author it. Kind vocabulary v1: text, status, ask, show, work (+ reserved: todos). `rooms.list` with `kind: board` includes the optional durable agent-seat `displayName`. Version: board-wire-v1.",
+  "$comment": "Board wire contract v1 fixtures \u2014 canonical shapes SUBC's tab builds against. Casing: camelCase everywhere. Wire law: absent means unknown/not-applicable, present-empty means empty; renderers must distinguish. Unknown `kind` renders as a digest card. `digest` is MODULE-DERIVED from props at post time; agents never author it. Kind vocabulary v1: text, status, ask, show, work (+ reserved: todos). `rooms.list` with `kind: board` includes the optional durable agent-seat `displayName`. Version: board-wire-v1.",
   "blocks": [
     {
       "$case": "status block, all digest fields present",
@@ -9,7 +9,10 @@
       "rev": 3,
       "props": {
         "text": "Rooms reduction implementing; probe sweep 14/21 tools done",
-        "progress": { "done": 14, "total": 21 },
+        "progress": {
+          "done": 14,
+          "total": 21
+        },
         "state": "working"
       },
       "digest": {
@@ -24,8 +27,12 @@
       "lane": "status",
       "kind": "text",
       "rev": 1,
-      "props": { "text": "Baseline re-measure chosen over epoch reuse; 5 min cost accepted." },
-      "digest": { "title": "Baseline re-measure chosen over epoch reuse; 5 min cost accepted." }
+      "props": {
+        "text": "Baseline re-measure chosen over epoch reuse; 5 min cost accepted."
+      },
+      "digest": {
+        "title": "Baseline re-measure chosen over epoch reuse; 5 min cost accepted."
+      }
     },
     {
       "$case": "ask block, joined ask row, pending",
@@ -36,14 +43,20 @@
       "props": {
         "requestId": "ask_9f2c11aa",
         "question": "Merge the worktree pool now or after the probe sweep?",
-        "options": ["Merge now", "After sweep"],
+        "options": [
+          "Merge now",
+          "After sweep"
+        ],
         "allowFreeText": true,
         "status": "pending",
-        "silencePolicy": { "waitUntil": 1784412000000, "defaultDecision": "After sweep" }
+        "silencePolicy": {
+          "waitUntil": 1784412000000,
+          "defaultDecision": "After sweep"
+        }
       },
       "digest": {
         "title": "Merge the worktree pool now or after the probe sweep?",
-        "line2": "2 options · default: After sweep",
+        "line2": "2 options \u00b7 default: After sweep",
         "badge": "ask",
         "urgency": "normal"
       }
@@ -57,10 +70,14 @@
       "props": {
         "requestId": "ask_9f2c11aa",
         "question": "Merge the worktree pool now or after the probe sweep?",
-        "options": ["Merge now", "After sweep"],
+        "options": [
+          "Merge now",
+          "After sweep"
+        ],
         "allowFreeText": true,
         "status": "answered",
-        "answer": "After sweep"
+        "answer": "After sweep",
+        "answeredAtMs": 1030
       },
       "digest": {
         "title": "Merge the worktree pool now or after the probe sweep?",
@@ -79,7 +96,11 @@
         "language": "diff",
         "body": "-                AND state IN ('sent','canceling','failed')\",\n+                AND state IN ('sent','canceling','failed','dead')\","
       },
-      "digest": { "title": "settle_canceling fix", "line2": "diff · 2 lines", "badge": "show" }
+      "digest": {
+        "title": "settle_canceling fix",
+        "line2": "diff \u00b7 2 lines",
+        "badge": "show"
+      }
     },
     {
       "$case": "chat block, tee-produced from a well-formed <touser> span",
@@ -91,10 +112,12 @@
         "text": "Campaign attempt 23 is through provisioning; first measured round expected within the hour.",
         "producer": "tee"
       },
-      "digest": { "title": "Campaign attempt 23 is through provisioning; first measured round expected within the hour." }
+      "digest": {
+        "title": "Campaign attempt 23 is through provisioning; first measured round expected within the hour."
+      }
     },
     {
-      "$case": "chat block, tee captured a MALFORMED tag (unclosed) — degraded render path; module truncated at turn end, flagged in props; counted in health",
+      "$case": "chat block, tee captured a MALFORMED tag (unclosed) \u2014 degraded render path; module truncated at turn end, flagged in props; counted in health",
       "blockId": "blk-chat-000042",
       "lane": "chat",
       "kind": "text",
@@ -104,16 +127,30 @@
         "producer": "tee",
         "teeDefect": "unclosed_tag"
       },
-      "digest": { "title": "Heads up: the merge is", "badge": "partial" }
+      "digest": {
+        "title": "Heads up: the merge is",
+        "badge": "partial"
+      }
     },
     {
-      "$case": "UNKNOWN kind from a future vocabulary version — renderer must fall back to digest card, never decode-fail",
+      "$case": "UNKNOWN kind from a future vocabulary version \u2014 renderer must fall back to digest card, never decode-fail",
       "blockId": "blk-future-1",
       "lane": "status",
       "kind": "flamegraph",
       "rev": 1,
-      "props": { "$comment": "opaque to a v1 renderer", "columns": [1, 2, 3] },
-      "digest": { "title": "Decode hot path flamegraph", "line2": "unknown block kind (flamegraph)", "badge": "opaque" }
+      "props": {
+        "$comment": "opaque to a v1 renderer",
+        "columns": [
+          1,
+          2,
+          3
+        ]
+      },
+      "digest": {
+        "title": "Decode hot path flamegraph",
+        "line2": "unknown block kind (flamegraph)",
+        "badge": "opaque"
+      }
     },
     {
       "$case": "work block, read-time projection of a claimed graph row",
@@ -126,12 +163,14 @@
         "itemType": "task",
         "status": "in_progress",
         "ready": false,
-        "blockedBy": ["wi-prepare-wire"],
+        "blockedBy": [
+          "wi-prepare-wire"
+        ],
         "acceptanceCriteria": "Projection is read-time only."
       },
       "digest": {
         "title": "Build the board work lane",
-        "line2": "in_progress · 1 blocker",
+        "line2": "in_progress \u00b7 1 blocker",
         "badge": "in_progress"
       }
     },
@@ -143,8 +182,16 @@
       "rev": 1,
       "props": {
         "items": [
-          { "content": "Read the board plan", "status": "in_progress", "priority": "high" },
-          { "content": "Run the fixture tests", "status": "pending", "priority": "medium" }
+          {
+            "content": "Read the board plan",
+            "status": "in_progress",
+            "priority": "high"
+          },
+          {
+            "content": "Run the fixture tests",
+            "status": "pending",
+            "priority": "medium"
+          }
         ]
       },
       "digest": {
@@ -167,37 +214,68 @@
         "status": "pending",
         "askedAt": 1000,
         "ageMs": 500,
-        "silencePolicy": { "waitUntil": 2000, "defaultDecision": "Continue" }
+        "silencePolicy": {
+          "waitUntil": 2000,
+          "defaultDecision": "Continue"
+        }
       },
       "digest": {
         "title": "Continue the benchmark?",
-        "line2": "0 options · default: Continue",
+        "line2": "0 options \u00b7 default: Continue",
         "badge": "ask",
         "urgency": "normal"
       }
     }
   ],
   "boardState": {
-    "$case": "full board.state reply — the renderer folds this snapshot verbatim; no client-side rev arithmetic",
+    "$case": "full board.state reply \u2014 the renderer folds this snapshot verbatim; no client-side rev arithmetic",
     "roomId": "rm_board_ses_example",
     "sessionId": "ses_example",
     "vocabulary": "board-wire-v1",
     "servedSeq": 412,
-    "lanes": ["chat", "asks", "status", "artifacts", "work"],
+    "lanes": [
+      "chat",
+      "asks",
+      "status",
+      "artifacts",
+      "work"
+    ],
     "blocks": [
-      { "$ref": "blk-status-build (rev 3 — newest-wins fold already applied)" },
-      { "$ref": "blk-ask-9f2c (rev 2)" },
-      { "$ref": "blk-show-diff (rev 1)" },
-      { "$ref": "blk-chat-000041 (rev 1)" },
-      { "$ref": "blk-chat-000042 (rev 1)" },
-      { "$ref": "ask-projected-open (read-time projection)" }
+      {
+        "$ref": "blk-status-build (rev 3 \u2014 newest-wins fold already applied)"
+      },
+      {
+        "$ref": "blk-ask-9f2c (rev 2)"
+      },
+      {
+        "$ref": "blk-show-diff (rev 1)"
+      },
+      {
+        "$ref": "blk-chat-000041 (rev 1)"
+      },
+      {
+        "$ref": "blk-chat-000042 (rev 1)"
+      },
+      {
+        "$ref": "ask-projected-open (read-time projection)"
+      }
     ],
     "health": {
       "kind": "health",
       "props": {
-        "rung2Counters": { "proseQuestionsAtTurnEnd": 0 },
-        "rung3Counters": { "nudges": 0, "staleChipShown": false },
-        "teeCounters": { "wellFormed": 41, "malformed": 1, "leakedOtherHarness": 0, "syntaxMimicry": 0 }
+        "rung2Counters": {
+          "proseQuestionsAtTurnEnd": 0
+        },
+        "rung3Counters": {
+          "nudges": 0,
+          "staleChipShown": false
+        },
+        "teeCounters": {
+          "wellFormed": 41,
+          "malformed": 1,
+          "leakedOtherHarness": 0,
+          "syntaxMimicry": 0
+        }
       }
     }
   },
@@ -208,7 +286,10 @@
         "mode": "board",
         "joinPolicy": "invite_only",
         "title": "Board for ses_example",
-        "createdBy": { "harness": "opencode", "sessionId": "ses_example" },
+        "createdBy": {
+          "harness": "opencode",
+          "sessionId": "ses_example"
+        },
         "state": "active",
         "agendaJson": null,
         "minQuorum": 1,
@@ -227,7 +308,10 @@
       },
       "member": {
         "roomId": "rm_board_ses_example",
-        "identity": { "harness": "ck-app", "sessionId": "ses_example" },
+        "identity": {
+          "harness": "ck-app",
+          "sessionId": "ses_example"
+        },
         "displayName": "User",
         "role": "human",
         "rsvp": "accepted",
@@ -249,7 +333,10 @@
         "mode": "board",
         "joinPolicy": "invite_only",
         "title": "Board for ses_unnamed",
-        "createdBy": { "harness": "opencode", "sessionId": "ses_unnamed" },
+        "createdBy": {
+          "harness": "opencode",
+          "sessionId": "ses_unnamed"
+        },
         "state": "active",
         "agendaJson": null,
         "minQuorum": 1,
@@ -268,7 +355,10 @@
       },
       "member": {
         "roomId": "rm_board_ses_unnamed",
-        "identity": { "harness": "ck-app", "sessionId": "ses_unnamed" },
+        "identity": {
+          "harness": "ck-app",
+          "sessionId": "ses_unnamed"
+        },
         "displayName": "User",
         "role": "human",
         "rsvp": "accepted",

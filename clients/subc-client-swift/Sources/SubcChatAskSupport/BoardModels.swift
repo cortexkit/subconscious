@@ -45,6 +45,10 @@ public struct BoardAskProps: Codable, Equatable {
     public var askedAt: Int64?
     public var ageMs: Int64?
     public var resolvedAt: Int64?
+    /// Epoch ms when the answer was DELIVERED to the asking session. Present
+    /// only on answered asks; absent-never-fabricated on pending/canceled
+    /// (producer contract, live on the wire since 2026-08-16).
+    public var answeredAtMs: Int64?
 }
 
 /// A Board v2 artifact block.

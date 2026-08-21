@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -14,8 +14,9 @@ use std::{
 use serde_json::{json, Value};
 use subc_client_rs::{
     async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
-    ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler, RequestCtx, RetryBackoff,
-    RouteHandle, SubcConsumer, SubcModuleError, SubscribeOptions,
+    ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler, PolicyResolveError,
+    PolicyResolver, PolicyResolverConfig, PolicyVerdict, RequestCtx, RetryBackoff, RouteHandle,
+    SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -44,6 +45,7 @@ const CONSUMER_MODULE_A: &str = "subc-client-rs-consumer-a";
 const CONSUMER_MODULE_B: &str = "subc-client-rs-consumer-b";
 const CATALOG_FAKE_AFT_MODULE_ID: &str = "subc-client-rs-catalog-fake-aft";
 const PUSH_MODULE_ID: &str = "subc-client-rs-push";
+const POLICY_MODULE_ID: &str = "subc-client-rs-policy-resolver";
 
 struct LiveDaemon {
     child: Child,
@@ -112,6 +114,110 @@ impl PushModuleHandler {
 impl ModuleHandler for PushModuleHandler {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         HandlerOutcome::Response(body)
+    }
+
+    async fn on_bound(&self, handle: &RouteHandle) {
+        self.routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(handle.channel, *handle);
+    }
+
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        let mut routes = self
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if routes.get(&handle.channel) == Some(handle) {
+            routes.remove(&handle.channel);
+        }
+    }
+}
+
+#[derive(Clone)]
+enum PolicyScript {
+    Reply {
+        verdict: &'static str,
+        revision: u64,
+        ttl_ms: u64,
+    },
+    Stall {
+        duration: Duration,
+    },
+}
+
+#[derive(Clone)]
+struct PolicyModuleHandler {
+    scripts: Arc<Mutex<VecDeque<PolicyScript>>>,
+    calls: Arc<AtomicU64>,
+    routes: Arc<Mutex<HashMap<u16, RouteHandle>>>,
+}
+
+impl PolicyModuleHandler {
+    fn new(scripts: impl IntoIterator<Item = PolicyScript>) -> Self {
+        Self {
+            scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
+            calls: Arc::new(AtomicU64::new(0)),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn route(&self) -> Option<RouteHandle> {
+        self.routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .next()
+            .copied()
+    }
+}
+
+#[async_trait]
+impl ModuleHandler for PolicyModuleHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let request: Value = serde_json::from_slice(&body).expect("policy request must be JSON");
+        assert_eq!(request["op"], "policy.resolve");
+        assert!(request.get("domain").is_some());
+        assert!(request.get("gate_id").is_some());
+        assert!(request.get("subject").is_some());
+        assert!(request.get("project_root").is_some());
+
+        let script = self
+            .scripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+            .expect("policy test received an unexpected wire call");
+        match script {
+            PolicyScript::Reply {
+                verdict,
+                revision,
+                ttl_ms,
+            } => HandlerOutcome::Response(
+                serde_json::to_vec(&json!({
+                    "verdict": verdict,
+                    "revision": revision,
+                    "ttl_ms": ttl_ms,
+                }))
+                .unwrap(),
+            ),
+            PolicyScript::Stall { duration } => {
+                sleep(duration).await;
+                HandlerOutcome::Response(
+                    serde_json::to_vec(&json!({
+                        "verdict": "allowed",
+                        "revision": 1,
+                        "ttl_ms": 1_000,
+                    }))
+                    .unwrap(),
+                )
+            }
+        }
     }
 
     async fn on_bound(&self, handle: &RouteHandle) {
@@ -1537,6 +1643,83 @@ async fn wait_for_module_route(handler: &PushModuleHandler, channel: u16) -> Rou
     }
 }
 
+async fn wait_for_policy_module_route(handler: &PolicyModuleHandler) -> RouteHandle {
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if let Some(handle) = handler.route() {
+            return handle;
+        }
+        if Instant::now() >= deadline {
+            panic!("policy module did not bind a route within {EVENT_TIMEOUT:?}");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+struct PolicyHarness {
+    daemon: LiveDaemon,
+    module: ModuleHandle,
+    serve_task: tokio::task::JoinHandle<Result<(), SubcModuleError>>,
+    handler: PolicyModuleHandler,
+}
+
+impl PolicyHarness {
+    async fn stop(mut self) {
+        self.daemon.kill_and_wait();
+        drop(self.module);
+        assert!(self.serve_task.await.unwrap().is_ok());
+    }
+}
+
+async fn start_policy_harness(scripts: impl IntoIterator<Item = PolicyScript>) -> PolicyHarness {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-policy-resolver");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let handler = PolicyModuleHandler::new(scripts);
+    let (module, serve_task) = spawn_inline_module_with_handler(
+        &daemon.connection_file,
+        inline_push_module_manifest(POLICY_MODULE_ID, &["policy.resolve"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, POLICY_MODULE_ID, START_TIMEOUT).await;
+
+    PolicyHarness {
+        daemon,
+        module,
+        serve_task,
+        handler,
+    }
+}
+
+fn policy_resolver(consumer: SubcConsumer, hard_timeout: Duration) -> PolicyResolver {
+    PolicyResolver::with_resolver_target(
+        consumer,
+        POLICY_MODULE_ID,
+        PolicyResolverConfig {
+            hard_timeout,
+            ttl_floor_ms: 1,
+        },
+    )
+}
+
+fn policy_project_root() -> String {
+    let root = unique_temp_dir("subc-client-rs-policy-project");
+    fs::create_dir_all(&root).unwrap();
+    root.to_string_lossy().into_owned()
+}
+
 async fn wait_for_module_route_gone(handler: &PushModuleHandler, channel: u16) {
     let deadline = Instant::now() + EVENT_TIMEOUT;
     loop {
@@ -2120,4 +2303,287 @@ async fn subc_consumer_retries_once_in_place_on_stale_route_epoch() {
 
     daemon.kill_and_wait();
     assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_resolver_uses_a_live_ttl_cache_entry_without_a_second_wire_call() {
+    let harness = start_policy_harness([PolicyScript::Reply {
+        verdict: "allowed",
+        revision: 1,
+        ttl_ms: 1_000,
+    }])
+    .await;
+    let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let resolver = policy_resolver(consumer, Duration::from_secs(1));
+    let project_root = policy_project_root();
+    let subject = Subject::AgentId("agent-cache".to_string());
+
+    assert_eq!(
+        resolver
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject.clone(),
+                &project_root
+            )
+            .await,
+        Ok(PolicyVerdict::Allowed)
+    );
+    assert_eq!(
+        resolver
+            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .await,
+        Ok(PolicyVerdict::Allowed)
+    );
+    // Mutation fence: a cache miss would consume an unscripted provider call.
+    assert_eq!(harness.handler.calls(), 1);
+
+    drop(resolver);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_resolver_reply_revision_invalidates_every_older_cache_entry() {
+    let harness = start_policy_harness([
+        PolicyScript::Reply {
+            verdict: "allowed",
+            revision: 1,
+            ttl_ms: 1_000,
+        },
+        PolicyScript::Reply {
+            verdict: "allowed",
+            revision: 2,
+            ttl_ms: 1_000,
+        },
+        PolicyScript::Reply {
+            verdict: "denied",
+            revision: 2,
+            ttl_ms: 1_000,
+        },
+    ])
+    .await;
+    let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let resolver = policy_resolver(consumer, Duration::from_secs(1));
+    let project_root = policy_project_root();
+    let subject = Subject::AgentId("agent-revision".to_string());
+
+    assert_eq!(
+        resolver
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject.clone(),
+                &project_root
+            )
+            .await,
+        Ok(PolicyVerdict::Allowed)
+    );
+    assert_eq!(
+        resolver
+            .resolve("approval", "plexus.merge", subject.clone(), &project_root)
+            .await,
+        Ok(PolicyVerdict::Allowed)
+    );
+    assert_eq!(
+        resolver
+            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .await,
+        Ok(PolicyVerdict::Denied)
+    );
+    // Mutation fence: revision 2 must evict the older gate rather than leave it cached.
+    assert_eq!(harness.handler.calls(), 3);
+
+    drop(resolver);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_resolver_refetches_after_ttl_expiry() {
+    let harness = start_policy_harness([
+        PolicyScript::Reply {
+            verdict: "allowed",
+            revision: 1,
+            ttl_ms: 5,
+        },
+        PolicyScript::Reply {
+            verdict: "denied",
+            revision: 1,
+            ttl_ms: 5,
+        },
+    ])
+    .await;
+    let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let resolver = policy_resolver(consumer, Duration::from_secs(1));
+    let project_root = policy_project_root();
+    let subject = Subject::AgentId("agent-ttl".to_string());
+
+    assert_eq!(
+        resolver
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject.clone(),
+                &project_root
+            )
+            .await,
+        Ok(PolicyVerdict::Allowed)
+    );
+    sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        resolver
+            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .await,
+        Ok(PolicyVerdict::Denied)
+    );
+    // Mutation fence: the post-expiry reply differs, so a stale hit cannot pass.
+    assert_eq!(harness.handler.calls(), 2);
+
+    drop(resolver);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_resolver_hard_timeout_is_a_fault_before_the_provider_stall_finishes() {
+    let stall = Duration::from_secs(1);
+    let harness = start_policy_harness([PolicyScript::Stall { duration: stall }]).await;
+    let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let resolver = policy_resolver(consumer, Duration::from_millis(200));
+    let project_root = policy_project_root();
+
+    let started = Instant::now();
+    let result = resolver
+        .resolve(
+            "approval",
+            "plexus.github_write",
+            Subject::AgentId("agent-timeout".to_string()),
+            &project_root,
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(PolicyResolveError::Fault));
+    // Mutation fence: the helper timeout, not the test, must beat the provider's stall.
+    assert!(
+        elapsed < stall,
+        "resolve took {elapsed:?}, stall was {stall:?}"
+    );
+    assert_eq!(harness.handler.calls(), 1);
+
+    drop(resolver);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
+    let harness = start_policy_harness([
+        PolicyScript::Reply {
+            verdict: "denied",
+            revision: 1,
+            ttl_ms: 1_000,
+        },
+        PolicyScript::Stall {
+            duration: Duration::from_secs(1),
+        },
+    ])
+    .await;
+    let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let resolver = policy_resolver(consumer, Duration::from_millis(200));
+    let project_root = policy_project_root();
+
+    let denied = resolver
+        .resolve(
+            "approval",
+            "plexus.github_write",
+            Subject::AgentId("agent-denied".to_string()),
+            &project_root,
+        )
+        .await;
+    let fault = resolver
+        .resolve(
+            "approval",
+            "plexus.merge",
+            Subject::AgentId("agent-stalled".to_string()),
+            &project_root,
+        )
+        .await;
+    assert_eq!(denied, Ok(PolicyVerdict::Denied));
+    assert_eq!(fault, Err(PolicyResolveError::Fault));
+    // Mutation fence: both branches reached the fake; neither is a local default.
+    assert_eq!(harness.handler.calls(), 2);
+
+    drop(resolver);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
+    let harness = start_policy_harness([
+        PolicyScript::Reply {
+            verdict: "allowed",
+            revision: 1,
+            ttl_ms: 1_000,
+        },
+        PolicyScript::Reply {
+            verdict: "denied",
+            revision: 2,
+            ttl_ms: 1_000,
+        },
+    ])
+    .await;
+    let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let resolver = policy_resolver(consumer, Duration::from_secs(1));
+    let project_root = policy_project_root();
+    let subject = Subject::SessionToResolve("session-push".to_string());
+
+    assert_eq!(
+        resolver
+            .resolve(
+                "approval",
+                "plexus.github_write",
+                subject.clone(),
+                &project_root
+            )
+            .await,
+        Ok(PolicyVerdict::Allowed)
+    );
+    let route = wait_for_policy_module_route(&harness.handler).await;
+    harness
+        .module
+        .push(
+            &route,
+            serde_json::to_vec(&json!({
+                "op": "policy.revision_bump",
+                "revision": 2,
+            }))
+            .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    // The route push is asynchronous; let the registered receiver consume it before
+    // exercising the next resolve. The reply below proves the push did not answer it.
+    sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        resolver
+            .resolve("approval", "plexus.github_write", subject, &project_root)
+            .await,
+        Ok(PolicyVerdict::Denied)
+    );
+    // After a policy revision bump, the next resolution must contact the provider.
+    assert_eq!(harness.handler.calls(), 2);
+
+    drop(resolver);
+    harness.stop().await;
 }

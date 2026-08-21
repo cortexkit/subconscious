@@ -6,6 +6,7 @@ import {
   moduleStorePath,
   parseStorageDescriptor,
   postgresDatabaseName,
+  resolveDataHome,
   sqliteStorePath,
   type StorageDescriptor,
 } from "../src/index.js";
@@ -119,22 +120,63 @@ describe("sqliteStorePath path-hazard refusal (issue #32)", () => {
   });
 });
 
-describe("data-home resolver (parity with cortexkit-store-types 0.2.0)", () => {
+describe("data-home resolver (mirror of subc default_data_home)", () => {
+  // The golden fixture is authored next to the daemon's default_data_home
+  // (the authority: it resolves every module's storage descriptor) and
+  // asserted by three implementations — the daemon itself, the Rust
+  // cortexkit-store-types crate, and this file. Platform is a parameter here
+  // rather than a cfg, so unlike the Rust harnesses this one runs EVERY row
+  // on every host: 'any' rows under both platforms, unix rows under linux,
+  // windows rows under win32.
+  const golden = require("../../../crates/subc-core/tests/golden/data_home_resolution.json") as {
+    cases: { name: string; platform: string; env: Record<string, string>; expect: string }[];
+    composed: {
+      name: string;
+      platform: string;
+      env: Record<string, string>;
+      module_id: string;
+      expect_store: string;
+    }[];
+  };
+  const platformsFor = (p: string) =>
+    p === "any" ? ["linux", "win32"] : p === "windows" ? ["win32"] : ["linux"];
+
+  test("every golden row matches the supervisor's rule", () => {
+    let ran = 0;
+    for (const c of golden.cases) {
+      for (const platform of platformsFor(c.platform)) {
+        expect(resolveDataHome(c.env, platform), `golden case '${c.name}' on ${platform}`).toBe(
+          c.expect,
+        );
+        ran += 1;
+      }
+    }
+    for (const c of golden.composed) {
+      for (const platform of platformsFor(c.platform)) {
+        expect(
+          sqliteStorePath(resolveDataHome(c.env, platform), c.module_id),
+          `composed golden case '${c.name}' on ${platform}`,
+        ).toBe(c.expect_store);
+        ran += 1;
+      }
+    }
+    // Vacuity floor: 11 cases + 1 composed, 'any' rows doubled => 16 runs.
+    expect(ran).toBeGreaterThanOrEqual(16);
+  });
+
   test("moduleStorePath honours absolute XDG_DATA_HOME", () => {
     expect(moduleStorePath("astrocyte", { XDG_DATA_HOME: "/tmp/xdg-test" })).toBe(
       "/tmp/xdg-test/cortexkit/astrocyte/store.db",
     );
   });
 
-  test("moduleStorePath defaults to HOME/.local/share", () => {
-    expect(moduleStorePath("astrocyte", { HOME: "/tmp/home-test" })).toBe(
-      "/tmp/home-test/.local/share/cortexkit/astrocyte/store.db",
-    );
-  });
-
-  test("relative XDG_DATA_HOME is ignored per the basedir spec", () => {
+  test("relative XDG_DATA_HOME is honored as-is, matching the daemon", () => {
+    // The XDG basedir spec calls relative values invalid, but the authority is
+    // the SUPERVISOR, not the spec: subc honours non-empty XDG_DATA_HOME
+    // verbatim, and diverging from the daemon is the defect class this
+    // resolver exists to eliminate.
     expect(moduleStorePath("m", { XDG_DATA_HOME: "relative/path", HOME: "/tmp/home-test" })).toBe(
-      "/tmp/home-test/.local/share/cortexkit/m/store.db",
+      "relative/path/cortexkit/m/store.db",
     );
   });
 

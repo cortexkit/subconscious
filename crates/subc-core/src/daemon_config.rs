@@ -695,6 +695,62 @@ impl Error for DaemonConfigError {
 mod tests {
     use super::*;
 
+    /// The golden fixture is the CONTRACT for data-home resolution: mirror
+    /// implementations (cortexkit-store-types `resolve_data_home`,
+    /// @cortexkit/store `resolveDataHome`) assert against the same rows, so a
+    /// rule change here that skips the fixture breaks THIS test rather than
+    /// silently splitting a module's self-resolved path from the descriptor
+    /// the daemon serves (the CKCRED Windows divergence, 2026-08).
+    /// Env-mutating tests share this lock: cargo runs tests on multiple
+    /// threads and the four data-home variables are process-global.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn default_data_home_matches_golden_fixture() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/golden/data_home_resolution.json"))
+                .expect("golden parses");
+        let vars = ["XDG_DATA_HOME", "APPDATA", "USERPROFILE", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            vars.iter().map(|v| (*v, env::var_os(v))).collect();
+        let platform_matches =
+            |p: &str| p == "any" || p == if cfg!(windows) { "windows" } else { "unix" };
+
+        let mut ran = 0usize;
+        for case in doc["cases"].as_array().expect("cases array") {
+            let name = case["name"].as_str().expect("name");
+            if !platform_matches(case["platform"].as_str().expect("platform")) {
+                continue;
+            }
+            for v in vars {
+                env::remove_var(v);
+            }
+            for (k, v) in case["env"].as_object().expect("env map") {
+                env::set_var(k, v.as_str().expect("env value"));
+            }
+            let got = default_data_home();
+            assert_eq!(
+                got.to_string_lossy(),
+                case["expect"].as_str().expect("expect"),
+                "golden case '{name}' diverged"
+            );
+            ran += 1;
+        }
+        // Vacuity floor: 'any' rows plus this platform's rows must both run.
+        assert!(
+            ran >= 6,
+            "only {ran} golden cases ran; fixture or filter broken"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
     #[test]
     fn no_storage_section_yields_none() {
         let config = parse_doc(
@@ -724,22 +780,16 @@ mod tests {
     fn sqlite_storage_defaults_data_home_when_omitted() {
         // With no data_home, it falls back to the platform data home (here forced
         // via XDG_DATA_HOME so the test is deterministic).
+        // Mutating the environment is a process-wide side effect; every test
+        // reading or writing the data-home variables serializes on ENV_LOCK
+        // (the golden-fixture test above mutates all four variables).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("XDG_DATA_HOME", "/forced/data/home");
         let config = parse_doc(
             r#"{ "version": 1, "storage": { "backend": "sqlite" } }"#,
             Path::new("/tmp/subc.jsonc"),
         )
         .expect("parse");
-        // Mutating the environment is a process-wide side effect and cargo runs
-        // tests on multiple threads, so this is only safe while nothing else can
-        // read this variable concurrently. Today the sole reader is
-        // `platform_data_home` below, reached from this test alone -- checked
-        // rather than assumed. A second test touching storage defaults would
-        // race this one, and the symptom would be an occasional wrong path
-        // rather than a failure naming the environment.
-        //
-        // Under edition 2024 these calls become unsafe and the compiler raises
-        // the question for us; this crate is on 2021, so the note stands in.
         std::env::remove_var("XDG_DATA_HOME");
         assert_eq!(
             config.storage,

@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use subc_protocol::{BindIdentity, RouteTarget};
 use tokio::time::timeout;
 
-use crate::{CallOptions, RouteHandle, SubcConsumer};
+use crate::{CallOptions, RouteHandle, SubcConsumer, SubscribeOptions};
 
 /// The resolver module used when a deployment does not override the target.
 pub const DEFAULT_POLICY_RESOLVER_MODULE_ID: &str = "prefrontal-core";
@@ -21,6 +21,7 @@ pub const DEFAULT_POLICY_RESOLVER_MODULE_ID: &str = "prefrontal-core";
 const POLICY_RESOLVER_HARNESS: &str = "subc-client-rs-policy-resolver";
 const POLICY_RESOLVE_OP: &str = "policy.resolve";
 const POLICY_REVISION_BUMP_OP: &str = "policy.revision_bump";
+const POLICY_SUBSCRIBE_OP: &str = "policy.subscribe";
 
 /// The principal whose policy is being resolved. Wire encoding is the
 /// resolver's UNTAGGED object-key form — `{"agent_id": ...}` or
@@ -146,7 +147,9 @@ impl Error for PolicyResolveError {}
 
 /// Shared resolve-with-cache helper for fleet policy gates.
 pub struct PolicyResolver {
-    consumer: SubcConsumer,
+    // Arc so the bump-subscription task can hold the consumer without
+    // demanding Clone on SubcConsumer's public surface.
+    consumer: std::sync::Arc<SubcConsumer>,
     resolver_module_id: String,
     config: PolicyResolverConfig,
     cache: Arc<Mutex<CacheState>>,
@@ -241,7 +244,7 @@ impl PolicyResolver {
         config: PolicyResolverConfig,
     ) -> Self {
         Self {
-            consumer,
+            consumer: std::sync::Arc::new(consumer),
             resolver_module_id: resolver_module_id.into(),
             config,
             cache: Arc::new(Mutex::new(CacheState::new())),
@@ -354,25 +357,43 @@ impl PolicyResolver {
         }
     }
 
+    /// Hold the resolver's `policy.subscribe` stream and fold revision bumps
+    /// into the cache watermark. The bump lane is the HOUSE SUBSCRIPTION
+    /// pattern -- a held-open request answered with StreamData events -- not
+    /// spontaneous Push frames; the first cut installed a push receiver its
+    /// own fake satisfied while the live module streamed to nobody (the
+    /// convention-vs-draft class, sixth member). Best-effort by constraint 4:
+    /// the stream dying only means staleness reverts to the TTL bound, so the
+    /// holder re-subscribes on the next resolve rather than retrying in a
+    /// loop.
     fn install_push_receiver(&self, route: RouteHandle) -> Result<(), PolicyResolveError> {
-        let events = {
+        {
             let mut cache = lock(&self.cache);
             if !cache.push_routes.insert(route) {
                 return Ok(());
             }
-            match self.consumer.push_events(&route) {
-                Ok(events) => events,
-                Err(e) => {
-                    cache.push_routes.remove(&route);
-                    return Err(PolicyResolveError::fault(format!(
-                        "push receiver install: {e}"
-                    )));
+        }
+        let consumer = std::sync::Arc::clone(&self.consumer);
+        let cache = Arc::clone(&self.cache);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "method": POLICY_SUBSCRIBE_OP,
+            "params": {},
+        }))
+        .expect("static subscribe body serializes");
+        tokio::spawn(async move {
+            match consumer
+                .subscribe_route(&route, body, SubscribeOptions::default())
+                .await
+            {
+                Ok(mut subscription) => {
+                    drain_revision_bumps(subscription.events(), Arc::clone(&cache)).await;
+                }
+                Err(_) => {
+                    // No bump lane: TTL alone bounds staleness (constraint 4
+                    // makes that correct, merely slower). Clearing the marker
+                    // lets the next resolve retry the subscription.
                 }
             }
-        };
-        let cache = Arc::clone(&self.cache);
-        tokio::spawn(async move {
-            drain_revision_bumps(events, Arc::clone(&cache)).await;
             lock(&cache).push_routes.remove(&route);
         });
         Ok(())
@@ -380,11 +401,11 @@ impl PolicyResolver {
 }
 
 async fn drain_revision_bumps(
-    mut events: tokio::sync::mpsc::Receiver<crate::PushEvent>,
+    events: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     cache: Arc<Mutex<CacheState>>,
 ) {
-    while let Some(event) = events.recv().await {
-        let Ok(bump) = serde_json::from_slice::<PolicyRevisionBump>(&event.body) else {
+    while let Some(body) = events.recv().await {
+        let Ok(bump) = serde_json::from_slice::<PolicyRevisionBump>(&body) else {
             continue;
         };
         if bump.op == POLICY_REVISION_BUMP_OP {

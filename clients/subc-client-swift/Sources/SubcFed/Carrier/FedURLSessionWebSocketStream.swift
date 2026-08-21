@@ -124,16 +124,78 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
         return stream
     }
 
-    private func ping() async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            task.sendPing { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
+    // MARK: Keepalive
+
+    private var keepaliveTask: Task<Void, Never>?
+    private var lastPongAt: ContinuousClock.Instant?
+
+    /// Liveness probe for long-lived streams (the rendezvous control WS). A
+    /// half-open socket -- server evicted/hibernated WITHOUT a close frame --
+    /// stays TCP-ESTABLISHED and leaves `receive()` pending forever while every
+    /// mirror lookup is answered from a snapshot that can no longer refresh;
+    /// CALLO's daemon waited three hours on exactly this shape. The probe sends
+    /// a WS ping every `interval` and requires SOME pong since that ping within
+    /// `pongDeadline`; otherwise the stream is declared dead and the underlying
+    /// task cancelled, which fails the pending `receive()` so the owner's read
+    /// loop runs its ordinary closed path (disconnect -> redial on next use).
+    ///
+    /// Pong bookkeeping is POLL-BASED (the completion stamps `lastPongAt`;
+    /// nothing awaits it) because `sendPing`'s completion is not guaranteed to
+    /// fire on this platform while unread frames are queued -- the recorded
+    /// reason the slice-1 upgrade validator abandoned ping round-trips. In
+    /// steady state the read loop keeps the queue drained so pongs deliver; if
+    /// one is swallowed anyway, the cost is a spurious redial (bounded, visible)
+    /// rather than the unbounded silent deafness this probe exists to kill.
+    public func startKeepalive(interval: TimeInterval, pongDeadline: TimeInterval) {
+        guard keepaliveTask == nil, !closed else { return }
+        keepaliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                let alive = await self.probeOnce(pongDeadline: pongDeadline)
+                if !alive {
+                    await self.declareDead()
+                    return
                 }
             }
         }
+    }
+
+    /// One ping/deadline cycle; true = a pong arrived after this ping was sent.
+    private func probeOnce(pongDeadline: TimeInterval) async -> Bool {
+        if closed { return false }
+        let sentAt = ContinuousClock.now
+        task.sendPing { [weak self] error in
+            guard let self, error == nil else { return }
+            Task { await self.notePong() }
+        }
+        try? await Task.sleep(nanoseconds: UInt64(pongDeadline * 1_000_000_000))
+        if closed { return false }
+        return Self.pongProves(lastPong: lastPongAt, pingSentAt: sentAt)
+    }
+
+    /// The liveness verdict, pure so both polarities are testable: only a pong
+    /// stamped AFTER the ping was sent proves the link; an older pong is
+    /// evidence about a previous cycle and a nil one is no evidence at all.
+    static func pongProves(
+        lastPong: ContinuousClock.Instant?,
+        pingSentAt: ContinuousClock.Instant
+    ) -> Bool {
+        guard let lastPong else { return false }
+        return lastPong >= pingSentAt
+    }
+
+    private func notePong() {
+        lastPongAt = ContinuousClock.now
+    }
+
+    private func declareDead() {
+        guard !closed else { return }
+        closed = true
+        // Abnormal cancel: the pending receive() throws, close code is not
+        // 1000/1001 and not an rdv application code, so the reader surfaces
+        // carrierClosed -- the same path a genuine transport drop takes.
+        task.cancel(with: .abnormalClosure, reason: nil)
     }
 
     public func send(_ message: FedWebSocketMessage) async throws {
@@ -179,6 +241,8 @@ public actor FedURLSessionWebSocketStream: FedWebSocketStream {
     public func close() async {
         guard !closed else { return }
         closed = true
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
         task.cancel(with: .normalClosure, reason: nil)
     }
 }

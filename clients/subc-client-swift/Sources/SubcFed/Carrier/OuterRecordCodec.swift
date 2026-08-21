@@ -182,6 +182,18 @@ public protocol FedWebSocketStream: Sendable {
     func send(_ message: FedWebSocketMessage) async throws
     func receive() async throws -> FedWebSocketMessage?
     func close() async
+    /// Start transport-level liveness probing on a LONG-LIVED stream. A stream
+    /// that goes quiet is declared dead so the pending `receive()` fails and the
+    /// owner's read loop observes the death, instead of waiting forever on a
+    /// half-open socket (server gone without a close frame: TCP ESTABLISHED,
+    /// session dead, every mirror answer silently stale). Default is a no-op:
+    /// short-lived streams (relay pipes have their own 4000-idle teardown) and
+    /// test fakes do not probe.
+    func startKeepalive(interval: TimeInterval, pongDeadline: TimeInterval) async
+}
+
+extension FedWebSocketStream {
+    public func startKeepalive(interval: TimeInterval, pongDeadline: TimeInterval) async {}
 }
 
 public actor FedTCPRecordCarrier {

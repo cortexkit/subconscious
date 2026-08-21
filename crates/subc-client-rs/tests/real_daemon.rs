@@ -21,8 +21,9 @@ use subc_client_rs::{
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+        StorageScope, Tool, TrustTier,
     },
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
@@ -181,11 +182,16 @@ impl ModuleHandler for PolicyModuleHandler {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request: Value = serde_json::from_slice(&body).expect("policy request must be JSON");
-        assert_eq!(request["op"], "policy.resolve");
-        assert!(request.get("domain").is_some());
-        assert!(request.get("gate_id").is_some());
-        assert!(request.get("subject").is_some());
-        assert!(request.get("project_root").is_some());
+        // The managed-call convention: {method, params} out, {result} back.
+        // The fake mirrors the CONVENTION rather than the helper draft -- the
+        // first cut of this handler accepted a flat body its own helper
+        // invented, and the real resolver refused every live call.
+        assert_eq!(request["method"], "policy.resolve");
+        let params = request.get("params").expect("params envelope");
+        assert!(params.get("domain").is_some());
+        assert!(params.get("gate_id").is_some());
+        assert!(params.get("subject").is_some());
+        assert!(params.get("project_root").is_some());
 
         let script = self
             .scripts
@@ -200,9 +206,11 @@ impl ModuleHandler for PolicyModuleHandler {
                 ttl_ms,
             } => HandlerOutcome::Response(
                 serde_json::to_vec(&json!({
-                    "verdict": verdict,
-                    "revision": revision,
-                    "ttl_ms": ttl_ms,
+                    "result": {
+                        "verdict": verdict,
+                        "revision": revision,
+                        "ttl_ms": ttl_ms,
+                    }
                 }))
                 .unwrap(),
             ),
@@ -210,7 +218,7 @@ impl ModuleHandler for PolicyModuleHandler {
                 sleep(duration).await;
                 HandlerOutcome::Response(
                     serde_json::to_vec(&json!({
-                        "verdict": "allowed",
+                        "verdict": "allow",
                         "revision": 1,
                         "ttl_ms": 1_000,
                     }))
@@ -1687,9 +1695,11 @@ async fn start_policy_harness(scripts: impl IntoIterator<Item = PolicyScript>) -
     let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     let handler = PolicyModuleHandler::new(scripts);
+    // The resolver serves policy.resolve on its MANAGEMENT SURFACE (as the
+    // live module does); the helper binds that plane, so the fake must too.
     let (module, serve_task) = spawn_inline_module_with_handler(
         &daemon.connection_file,
-        inline_push_module_manifest(POLICY_MODULE_ID, &["policy.resolve"]),
+        management_surface_manifest(POLICY_MODULE_ID, &["policy.resolve"]),
         handler.clone(),
     )
     .await;
@@ -2308,7 +2318,7 @@ async fn subc_consumer_retries_once_in_place_on_stale_route_epoch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_resolver_uses_a_live_ttl_cache_entry_without_a_second_wire_call() {
     let harness = start_policy_harness([PolicyScript::Reply {
-        verdict: "allowed",
+        verdict: "allow",
         revision: 1,
         ttl_ms: 1_000,
     }])
@@ -2329,13 +2339,13 @@ async fn policy_resolver_uses_a_live_ttl_cache_entry_without_a_second_wire_call(
                 &project_root
             )
             .await,
-        Ok(PolicyVerdict::Allowed)
+        Ok(PolicyVerdict::Allow)
     );
     assert_eq!(
         resolver
             .resolve("approval", "plexus.github_write", subject, &project_root)
             .await,
-        Ok(PolicyVerdict::Allowed)
+        Ok(PolicyVerdict::Allow)
     );
     // Mutation fence: a cache miss would consume an unscripted provider call.
     assert_eq!(harness.handler.calls(), 1);
@@ -2348,17 +2358,17 @@ async fn policy_resolver_uses_a_live_ttl_cache_entry_without_a_second_wire_call(
 async fn policy_resolver_reply_revision_invalidates_every_older_cache_entry() {
     let harness = start_policy_harness([
         PolicyScript::Reply {
-            verdict: "allowed",
+            verdict: "allow",
             revision: 1,
             ttl_ms: 1_000,
         },
         PolicyScript::Reply {
-            verdict: "allowed",
+            verdict: "allow",
             revision: 2,
             ttl_ms: 1_000,
         },
         PolicyScript::Reply {
-            verdict: "denied",
+            verdict: "deny",
             revision: 2,
             ttl_ms: 1_000,
         },
@@ -2380,19 +2390,19 @@ async fn policy_resolver_reply_revision_invalidates_every_older_cache_entry() {
                 &project_root
             )
             .await,
-        Ok(PolicyVerdict::Allowed)
+        Ok(PolicyVerdict::Allow)
     );
     assert_eq!(
         resolver
             .resolve("approval", "plexus.merge", subject.clone(), &project_root)
             .await,
-        Ok(PolicyVerdict::Allowed)
+        Ok(PolicyVerdict::Allow)
     );
     assert_eq!(
         resolver
             .resolve("approval", "plexus.github_write", subject, &project_root)
             .await,
-        Ok(PolicyVerdict::Denied)
+        Ok(PolicyVerdict::Deny)
     );
     // Mutation fence: revision 2 must evict the older gate rather than leave it cached.
     assert_eq!(harness.handler.calls(), 3);
@@ -2405,12 +2415,12 @@ async fn policy_resolver_reply_revision_invalidates_every_older_cache_entry() {
 async fn policy_resolver_refetches_after_ttl_expiry() {
     let harness = start_policy_harness([
         PolicyScript::Reply {
-            verdict: "allowed",
+            verdict: "allow",
             revision: 1,
             ttl_ms: 5,
         },
         PolicyScript::Reply {
-            verdict: "denied",
+            verdict: "deny",
             revision: 1,
             ttl_ms: 5,
         },
@@ -2432,14 +2442,14 @@ async fn policy_resolver_refetches_after_ttl_expiry() {
                 &project_root
             )
             .await,
-        Ok(PolicyVerdict::Allowed)
+        Ok(PolicyVerdict::Allow)
     );
     sleep(Duration::from_millis(40)).await;
     assert_eq!(
         resolver
             .resolve("approval", "plexus.github_write", subject, &project_root)
             .await,
-        Ok(PolicyVerdict::Denied)
+        Ok(PolicyVerdict::Deny)
     );
     // Mutation fence: the post-expiry reply differs, so a stale hit cannot pass.
     assert_eq!(harness.handler.calls(), 2);
@@ -2468,7 +2478,10 @@ async fn policy_resolver_hard_timeout_is_a_fault_before_the_provider_stall_finis
         )
         .await;
     let elapsed = started.elapsed();
-    assert_eq!(result, Err(PolicyResolveError::Fault));
+    assert!(
+        matches!(result, Err(PolicyResolveError::Fault { .. })),
+        "expected a fault, got {result:?}"
+    );
     // Mutation fence: the helper timeout, not the test, must beat the provider's stall.
     assert!(
         elapsed < stall,
@@ -2484,7 +2497,7 @@ async fn policy_resolver_hard_timeout_is_a_fault_before_the_provider_stall_finis
 async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
     let harness = start_policy_harness([
         PolicyScript::Reply {
-            verdict: "denied",
+            verdict: "deny",
             revision: 1,
             ttl_ms: 1_000,
         },
@@ -2515,8 +2528,11 @@ async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
             &project_root,
         )
         .await;
-    assert_eq!(denied, Ok(PolicyVerdict::Denied));
-    assert_eq!(fault, Err(PolicyResolveError::Fault));
+    assert_eq!(denied, Ok(PolicyVerdict::Deny));
+    assert!(
+        matches!(fault, Err(PolicyResolveError::Fault { .. })),
+        "expected a fault, got {fault:?}"
+    );
     // Mutation fence: both branches reached the fake; neither is a local default.
     assert_eq!(harness.handler.calls(), 2);
 
@@ -2528,12 +2544,12 @@ async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
 async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
     let harness = start_policy_harness([
         PolicyScript::Reply {
-            verdict: "allowed",
+            verdict: "allow",
             revision: 1,
             ttl_ms: 1_000,
         },
         PolicyScript::Reply {
-            verdict: "denied",
+            verdict: "deny",
             revision: 2,
             ttl_ms: 1_000,
         },
@@ -2555,7 +2571,7 @@ async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
                 &project_root
             )
             .await,
-        Ok(PolicyVerdict::Allowed)
+        Ok(PolicyVerdict::Allow)
     );
     let route = wait_for_policy_module_route(&harness.handler).await;
     harness
@@ -2579,11 +2595,32 @@ async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
         resolver
             .resolve("approval", "plexus.github_write", subject, &project_root)
             .await,
-        Ok(PolicyVerdict::Denied)
+        Ok(PolicyVerdict::Deny)
     );
     // After a policy revision bump, the next resolution must contact the provider.
     assert_eq!(harness.handler.calls(), 2);
 
     drop(resolver);
     harness.stop().await;
+}
+
+/// A management-surface manifest for the policy fake: the live resolver serves
+/// policy.resolve on its management plane, and a role mismatch between fake
+/// and reality is exactly how the helper shipped binding the wrong plane.
+fn management_surface_manifest(module_id: &str, operations: &[&str]) -> ModuleManifest {
+    let mut manifest = inline_module_manifest(module_id, &[]);
+    manifest.provides = vec![ProviderRole::ManagementSurface {
+        operations: operations
+            .iter()
+            .map(|name| ManagementOperation {
+                name: (*name).to_string(),
+                kind: ManagementOperationKind::Query,
+            })
+            .collect(),
+        config_schema: serde_json::json!({}),
+        observability: Vec::new(),
+        identity_scope: Vec::new(),
+        concurrency: Concurrency::ModuleManaged,
+    }];
+    manifest
 }

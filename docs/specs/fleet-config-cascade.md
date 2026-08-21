@@ -1,7 +1,8 @@
 # Fleet Config Cascade (auto-approval and every future gate)
 
-Status: CO-SIGNED (subc, plexus, prefrontal) — awaiting Ufuk's build-gate
-review. Nothing is built until he reviews this document.
+Status: CO-SIGNED and build-approved (Ufuk, ask_639e782a). Resolver op and
+consumer helper are LIVE and integration-proven against each other; parking
+and revision_bump push are the next prefrontal slice.
 
 Ufuk's requirement: fleet config gates are settable at
 GLOBAL > WORKSPACE > PROJECT > ALFONSO with override at each level, one common
@@ -69,6 +70,27 @@ consumer, not the shape). Plexus is a consumer, not the designer.
    block independent of the cascade (break-glass narrowing, reachable-module
    independent). Same polarity rule as the MCP router (docs/specs/mcp-router.md):
    local narrows, only the cascade widens.
+
+## Wire contract (pinned as BYTES, not prose)
+
+The authority is the producer-real vector file
+`prefrontal crates/prefrontal-core-module/tests/fixtures/policy_resolve/contract_vectors.json`
+(each committed request is EXECUTED against live dispatch on the producer's
+tests; consumers vendor the file under the repin discipline). Summary, not
+authority: transport envelope `{method, params}` out / `{result}` back;
+subject is UNTAGGED object-key `{agent_id}` | `{session_id}`; the verdict
+vocabulary is closed at authoring — rules carry exactly `allow | deny | ask`
+(policy.set refuses others), replies additionally serve `deny` (policy-less
+closed default) and `deny_unknown_domain` (undeclared-domain marker);
+`unknown_session` / `unknown_agent` are typed refusals, not verdicts; reply
+`revision` is the CURRENT global generation at resolve time, never the matched
+rule's write stamp. The op serves on the resolver's MANAGEMENT SURFACE.
+
+Lesson pinned with the contract, from three integration drifts (subject
+encoding, request envelope, route plane) that field-name prose never covered:
+PRE-COMMITTING FIELD NAMES IS NOT PRE-COMMITTING THE CONTRACT — encodings,
+envelopes, vocabularies, and planes pin only as producer-real bytes, and a
+build-local fake must mirror the CONVENTION, not the draft that invented it.
 
 ## Named anti-pattern: materializing the cascade into consumer rows
 

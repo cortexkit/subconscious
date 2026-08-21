@@ -1,0 +1,115 @@
+{
+  "_comment": "Producer-minted policy.resolve contract vectors. Each vector's request is executed against the live dispatch in policy_ops tests and the reply/error asserted byte-equal, so these bytes ARE the wire contract. Consumers (subc-client-rs policy_cache) vendor this file under the digest-pin discipline. Subject placeholders: {AGENT_ID} is substituted with the seeded agent's id at test time; every other byte is literal. Reply revision is the CURRENT global policy generation at resolve time (the cache watermark), never the matched rule's write-time stamp - all vectors resolve against a store whose generation is 3. Complete verdict vocabulary: rules carry allow | deny | ask (closed at authoring per domain); replies additionally serve deny (policy-less approval default) and deny_unknown_domain (undeclared domain marker). ask is the attended-parking verdict: consumers park attended callers and treat unattended refusal-to-proceed as transient-fault per the cascade spec.",
+  "vectors": [
+    {
+      "name": "agent_subject_allow",
+      "request": {
+        "domain": "approval",
+        "gate_id": "plexus.github_write",
+        "subject": {
+          "agent_id": "{AGENT_ID}"
+        },
+        "project_root": "/repo"
+      },
+      "reply": {
+        "verdict": "allow",
+        "revision": 3,
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "name": "session_subject_allow",
+      "request": {
+        "domain": "approval",
+        "gate_id": "plexus.github_write",
+        "subject": {
+          "session_id": "ses_vectors"
+        },
+        "project_root": "/repo"
+      },
+      "reply": {
+        "verdict": "allow",
+        "revision": 3,
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "name": "deny_rule",
+      "request": {
+        "domain": "approval",
+        "gate_id": "plexus.reactions",
+        "subject": {
+          "session_id": "ses_vectors"
+        },
+        "project_root": "/repo"
+      },
+      "reply": {
+        "verdict": "deny",
+        "revision": 3,
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "name": "ask_rule_attended_parking_verdict",
+      "request": {
+        "domain": "approval",
+        "gate_id": "plexus.issue_comment",
+        "subject": {
+          "session_id": "ses_vectors"
+        },
+        "project_root": "/repo"
+      },
+      "reply": {
+        "verdict": "ask",
+        "revision": 3,
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "name": "unknown_gate_resolves_domain_default_closed",
+      "request": {
+        "domain": "approval",
+        "gate_id": "nobody.declared_this",
+        "subject": {
+          "session_id": "ses_vectors"
+        },
+        "project_root": "/repo"
+      },
+      "reply": {
+        "verdict": "deny",
+        "revision": 3,
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "name": "unknown_domain_marker",
+      "request": {
+        "domain": "not_a_domain",
+        "gate_id": "plexus.github_write",
+        "subject": {
+          "session_id": "ses_vectors"
+        },
+        "project_root": "/repo"
+      },
+      "reply": {
+        "verdict": "deny_unknown_domain",
+        "revision": 3,
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "name": "unknown_session_refusal",
+      "request": {
+        "domain": "approval",
+        "gate_id": "plexus.github_write",
+        "subject": {
+          "session_id": "ses_nobody"
+        },
+        "project_root": "/repo"
+      },
+      "error": {
+        "code": "unknown_session"
+      }
+    }
+  ]
+}

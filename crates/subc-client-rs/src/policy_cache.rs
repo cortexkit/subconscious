@@ -178,12 +178,38 @@ impl CacheState {
     }
 }
 
+/// The project scope being resolved. Untagged params-level form pinned by the
+/// producer vectors: exactly one of `project_root` (filesystem root) or
+/// `project_id` (registry id, resolved through entorhinal) appears in params.
+/// An unknown id REFUSES (`project_unresolved`) rather than draping the
+/// closed default over a typo -- the vector's own name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub enum ProjectRef {
+    #[serde(rename = "project_root")]
+    Root(String),
+    #[serde(rename = "project_id")]
+    Id(String),
+}
+
+impl ProjectRef {
+    /// The bind-identity project root: a real root binds as itself; an id has
+    /// no filesystem meaning, so its route identity uses a stable synthetic
+    /// root (the daemon canonicalizes vanished roots, and the resolver never
+    /// reads this field for id-form scope resolution).
+    fn bind_root(&self) -> PathBuf {
+        match self {
+            Self::Root(root) => PathBuf::from(root),
+            Self::Id(_) => PathBuf::from("/"),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     domain: String,
     gate_id: String,
     subject: Subject,
-    project_root: String,
+    project: ProjectRef,
 }
 
 struct CacheEntry {
@@ -207,7 +233,8 @@ struct PolicyResolveParams<'a> {
     domain: &'a str,
     gate_id: &'a str,
     subject: &'a Subject,
-    project_root: &'a str,
+    #[serde(flatten)]
+    project: &'a ProjectRef,
 }
 
 #[derive(Deserialize)]
@@ -226,9 +253,18 @@ struct PolicyResolveReply {
 }
 
 #[derive(Deserialize)]
+struct PolicyRevisionBumpBody {
+    revision: u64,
+}
+
+/// The held-stream event, NESTED framing pinned by the producer's push_event
+/// fixture entry ({op, body: {revision}} -- the rooms.hint_wait emit shape).
+/// A flat {revision} was the eighth encoding drift; the fixture's byte-pin
+/// against the producer's own encoder is what keeps this parser honest.
+#[derive(Deserialize)]
 struct PolicyRevisionBump {
     op: String,
-    revision: u64,
+    body: PolicyRevisionBumpBody,
 }
 
 impl PolicyResolver {
@@ -257,13 +293,13 @@ impl PolicyResolver {
         domain: &str,
         gate_id: &str,
         subject: Subject,
-        project_root: &str,
+        project: ProjectRef,
     ) -> Result<PolicyVerdict, PolicyResolveError> {
         let key = CacheKey {
             domain: domain.to_string(),
             gate_id: gate_id.to_string(),
             subject: subject.clone(),
-            project_root: project_root.to_string(),
+            project: project.clone(),
         };
 
         if let Some(verdict) = self.cached_verdict(&key) {
@@ -276,13 +312,13 @@ impl PolicyResolver {
                 domain,
                 gate_id,
                 subject: &subject,
-                project_root,
+                project: &project,
             },
         };
         let body = serde_json::to_vec(&request)
             .map_err(|e| PolicyResolveError::fault(format!("request encode: {e}")))?;
         let route_identity = BindIdentity {
-            project_root: PathBuf::from(project_root),
+            project_root: project.bind_root(),
             harness: POLICY_RESOLVER_HARNESS.to_string(),
             session: subject.route_session(),
         };
@@ -411,7 +447,7 @@ async fn drain_revision_bumps(
         if bump.op == POLICY_REVISION_BUMP_OP {
             // A push only makes cached values stale sooner. It never completes a
             // resolve, creates a verdict, or extends a cached entry's lifetime.
-            lock(&cache).observe_revision(bump.revision);
+            lock(&cache).observe_revision(bump.body.revision);
         }
     }
 }

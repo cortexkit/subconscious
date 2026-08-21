@@ -1,5 +1,5 @@
 {
-  "_comment": "Producer-minted policy.resolve contract vectors. Each vector's request is executed against the live dispatch in policy_ops tests and the reply/error asserted byte-equal, so these bytes ARE the wire contract. Consumers (subc-client-rs policy_cache) vendor this file under the digest-pin discipline. Subject placeholders: {AGENT_ID} is substituted with the seeded agent's id at test time; every other byte is literal. Reply revision is the CURRENT global policy generation at resolve time (the cache watermark), never the matched rule's write-time stamp - all vectors resolve against a store whose generation is 3. Complete verdict vocabulary: rules carry allow | deny | ask (closed at authoring per domain); replies additionally serve deny (policy-less approval default) and deny_unknown_domain (undeclared domain marker). ask is the attended-parking verdict: consumers park attended callers and treat unattended refusal-to-proceed as transient-fault per the cascade spec.",
+  "_comment": "Producer-minted policy.resolve contract vectors. Each vector's request is executed against the live dispatch in policy_ops tests and the reply/error asserted byte-equal, so these bytes ARE the wire contract. Consumers (subc-client-rs policy_cache) vendor this file under the digest-pin discipline. Subject placeholders: {AGENT_ID} is substituted with the seeded agent's id at test time; every other byte is literal. Reply revision is the CURRENT global policy generation at resolve time (the cache watermark), never the matched rule's write-time stamp - all vectors resolve against a store whose generation is 3. Project reference is an untagged two-form like subject: {project_root} | {project_id} (plexus subscriptions carry ids, not roots); an unknown project_id REFUSES project_unresolved rather than draping the closed default over a typo. Complete verdict vocabulary: rules carry allow | deny | ask (closed at authoring per domain); replies additionally serve deny (policy-less approval default) and deny_unknown_domain (undeclared domain marker). ask is the attended-parking verdict: consumers park attended callers and treat unattended refusal-to-proceed as transient-fault per the cascade spec.",
   "vectors": [
     {
       "name": "agent_subject_allow",
@@ -110,6 +110,45 @@
       "error": {
         "code": "unknown_session"
       }
+    },
+    {
+      "name": "project_id_form_resolves_like_root",
+      "request": {
+        "domain": "approval",
+        "gate_id": "plexus.github_write",
+        "subject": {
+          "session_id": "ses_vectors"
+        },
+        "project_id": "project_1"
+      },
+      "reply": {
+        "verdict": "allow",
+        "revision": 3,
+        "ttl_ms": 30000
+      }
+    },
+    {
+      "name": "unknown_project_id_refuses_never_defaults",
+      "request": {
+        "domain": "approval",
+        "gate_id": "plexus.github_write",
+        "subject": {
+          "session_id": "ses_vectors"
+        },
+        "project_id": "pj-typo"
+      },
+      "error": {
+        "code": "project_unresolved"
+      }
     }
-  ]
+  ],
+  "push_event": {
+    "_comment": "The policy.subscribe held-stream event, byte-pinned from the producer's encoder. Shape is NESTED {op, body:{revision}} - the held-stream emit framing shared with rooms.hint_wait, not a flat {revision}. HOLD SEMANTICS: one event per hold, by construction (oneshot waiters, same park-and-rehold shape as rooms.hint_wait); a consumer re-subscribes after each event, and a bump between holds is absorbed by the TTL refetch - hint-only per constraint 4.",
+    "event": {
+      "op": "policy.revision_bump",
+      "body": {
+        "revision": 3
+      }
+    }
+  }
 }

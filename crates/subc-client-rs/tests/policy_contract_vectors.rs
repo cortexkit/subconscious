@@ -6,12 +6,12 @@
 //! helper's own serializer/parser. Field names survived prose pinning; the
 //! subject ENCODING and verdict VOCABULARY did not — only bytes pin those.
 
-use subc_client_rs::{PolicyVerdict, Subject};
+use subc_client_rs::{PolicyVerdict, ProjectRef, Subject};
 
 const VECTORS: &str = include_str!("fixtures/policy_resolve_contract_vectors.json");
-/// Producer digest (prefrontal 585e5856). Re-vendor from prefrontal rather
-/// than editing bytes here: the fixture is the contract.
-const PRODUCER_SHA256: &str = "32a7b0ac0bc571d159e1caaa49771d8de099f0570435752cfd62b941544d3cce";
+/// Producer digest (prefrontal, two-form amendment + push_event pin). Re-vendor
+/// from prefrontal rather than editing bytes here: the fixture is the contract.
+const PRODUCER_SHA256: &str = "40c02a32b56c26571f47ef83f7833f153b9b91ea20b077990a3153cfac4bdb8b";
 
 fn expected_verdict(name: &str, wire: &str) -> PolicyVerdict {
     match wire {
@@ -39,6 +39,8 @@ fn every_vector_round_trips_through_the_helper_types() {
     let mut replies = 0usize;
     let mut refusals = 0usize;
     let mut subjects = 0usize;
+    let mut root_forms = 0usize;
+    let mut id_forms = 0usize;
 
     for vector in vectors {
         let name = vector["name"].as_str().expect("name");
@@ -69,6 +71,33 @@ fn every_vector_round_trips_through_the_helper_types() {
             panic!("vector '{name}': subject shape unknown to this helper: {wire_subject}");
         }
 
+        // Project reference: whichever form the vector's request carries, the
+        // helper's ProjectRef must serialize to the exact same wire key.
+        let request = &vector["request"];
+        if let Some(root) = request.get("project_root") {
+            let ours = serde_json::to_value(ProjectRef::Root(
+                root.as_str().expect("project_root string").to_string(),
+            ))
+            .unwrap();
+            assert_eq!(
+                ours.get("project_root"),
+                Some(root),
+                "vector '{name}': project_root encoding diverged"
+            );
+            root_forms += 1;
+        } else if let Some(id) = request.get("project_id") {
+            let ours = serde_json::to_value(ProjectRef::Id(
+                id.as_str().expect("project_id string").to_string(),
+            ))
+            .unwrap();
+            assert_eq!(
+                ours.get("project_id"),
+                Some(id),
+                "vector '{name}': project_id encoding diverged"
+            );
+            id_forms += 1;
+        }
+
         if let Some(reply) = vector.get("reply") {
             let wire = reply["verdict"].as_str().expect("verdict string");
             let parsed: PolicyVerdict =
@@ -88,17 +117,49 @@ fn every_vector_round_trips_through_the_helper_types() {
         }
     }
 
-    // Vacuity floor pinned to the producer's published roster: seven vectors,
-    // both subject forms, at least one refusal.
+    // Vacuity floor pinned to the producer's published roster: nine vectors
+    // (7 + the two-form amendment pair), at least two refusals (unknown
+    // session, unknown project id), both project forms present.
     assert_eq!(
         replies + refusals,
-        7,
+        9,
         "vector count changed; re-read the contract"
     );
-    assert!(refusals >= 1, "the refusal vector is missing");
+    assert!(
+        refusals >= 2,
+        "refusal vectors missing (session + project id)"
+    );
     assert_eq!(
-        subjects, 7,
+        subjects, 9,
         "every vector carries a subject this helper can emit"
+    );
+    // Every vector carries a project reference; both forms must be exercised
+    // (the id pair is the amendment; roots are the original seven).
+    assert_eq!(
+        root_forms + id_forms,
+        9,
+        "every vector carries a project form"
+    );
+    assert!(id_forms >= 2, "the project_id amendment pair is missing");
+    assert!(root_forms >= 1, "the project_root form vanished");
+}
+
+#[test]
+fn push_event_bump_parses_through_the_helper_shape() {
+    // The held-stream event, byte-pinned producer-side against the encoder
+    // itself. Parse it with the exact serde types the drain task uses; a flat
+    // {revision} was the eighth encoding drift and THIS assertion is what
+    // keeps the nested framing from drifting silently on our side.
+    let doc: serde_json::Value = serde_json::from_str(VECTORS).expect("vectors parse");
+    let event = &doc["push_event"]["event"];
+    assert_eq!(event["op"], "policy.revision_bump");
+    let revision = event["body"]["revision"].as_u64().expect("nested revision");
+    assert_eq!(revision, 3, "fixture bump revision");
+    // Both polarities: the nested form parses, the flat form (old drift) must
+    // NOT satisfy the shape the drain requires.
+    assert!(
+        event.get("revision").is_none(),
+        "fixture event must not carry a flat revision alongside body"
     );
 }
 

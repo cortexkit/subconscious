@@ -8,7 +8,7 @@ pub use consumer::{
     SubscribeOptions, Subscription, SubscriptionClosed,
 };
 pub use policy_cache::{
-    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, Subject,
+    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, Subject,
     DEFAULT_POLICY_RESOLVER_MODULE_ID,
 };
 

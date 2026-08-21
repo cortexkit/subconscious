@@ -112,10 +112,19 @@ actor LoopbackWebSocketStream: FedWebSocketStream {
     let inbox: RdvMessageQueue
     let outbox: RdvMessageQueue
     private var closed = false
+    /// Recorded keepalive invocations `(interval, pongDeadline)`. The client is
+    /// REQUIRED to start liveness probing on its control stream -- the original
+    /// defect was a probe that existed and was never wired, so the wiring
+    /// itself is what this records for assertion.
+    private(set) var keepaliveStarts: [(TimeInterval, TimeInterval)] = []
 
     init(inbox: RdvMessageQueue, outbox: RdvMessageQueue) {
         self.inbox = inbox
         self.outbox = outbox
+    }
+
+    func startKeepalive(interval: TimeInterval, pongDeadline: TimeInterval) {
+        keepaliveStarts.append((interval, pongDeadline))
     }
 
     func send(_ message: FedWebSocketMessage) async throws {

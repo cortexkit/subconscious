@@ -937,4 +937,66 @@ final class FedRendezvousClientTests: XCTestCase {
         XCTAssertEqual(candidates?.count, expected, "an undecodable payload must not apply")
     }
 
+    // MARK: - Keepalive wiring
+
+    /// The control stream MUST have liveness probing started by the client.
+    /// This fences the wiring, not the probe: the original hole was a fully
+    /// written `ping()` with zero call sites, so an assertion that the probe
+    /// WORKS proves nothing about whether anything STARTS it. Recorded on the
+    /// fake the factory hands out; asserted against the client's published
+    /// cadence constants so a drive-by constant change shows up here too.
+    func testControlStreamKeepaliveIsWired() async throws {
+        let (identity, edPub) = try makeIdentity()
+        let registry = RdvServerPeerRegistry()
+        let capturedClientEnds = RdvCapturedStreams()
+        let configuration = FedRendezvousClient.Configuration(
+            controlURL: URL(string: "wss://rdv.test.invalid/v1/ws")!,
+            identity: identity,
+            signingKeyPin: try signingPin()
+        )
+        let client = FedRendezvousClient(configuration: configuration) { _ in
+            let pair = LoopbackWebSocketPair()
+            await registry.add(pair.server)
+            await capturedClientEnds.add(pair.client)
+            return pair.client
+        }
+
+        _ = try await connectWithBarrier(
+            client: client, registry: registry, identity: identity, deviceEd25519Pub: edPub,
+            snapshotPayload: snapshot("1", [rowA(candidateCount: 1)])
+        )
+
+        let maybeControlEnd = await capturedClientEnds.first
+        let controlEnd = try XCTUnwrap(maybeControlEnd)
+        let starts = await controlEnd.keepaliveStarts
+        XCTAssertEqual(starts.count, 1, "control stream keepalive must be started exactly once")
+        XCTAssertEqual(starts.first?.0, FedRendezvousClient.keepaliveInterval)
+        XCTAssertEqual(starts.first?.1, FedRendezvousClient.keepalivePongDeadline)
+
+        await client.disconnect()
+    }
+
+    /// Both polarities of the liveness verdict. `pongProves` is the pure core
+    /// of the URLSession keepalive loop (the loop itself needs a live socket):
+    /// a pong stamped after the ping proves the link; an older pong is stale
+    /// evidence from a previous cycle; no pong is no evidence.
+    func testKeepalivePongVerdictBothPolarities() {
+        let before = ContinuousClock.now
+        let pingAt = before.advanced(by: .milliseconds(5))
+        let after = pingAt.advanced(by: .milliseconds(5))
+        XCTAssertTrue(FedURLSessionWebSocketStream.pongProves(lastPong: after, pingSentAt: pingAt))
+        XCTAssertTrue(FedURLSessionWebSocketStream.pongProves(lastPong: pingAt, pingSentAt: pingAt))
+        XCTAssertFalse(FedURLSessionWebSocketStream.pongProves(lastPong: before, pingSentAt: pingAt))
+        XCTAssertFalse(FedURLSessionWebSocketStream.pongProves(lastPong: nil, pingSentAt: pingAt))
+    }
+}
+
+/// Captures the CLIENT ends the stream factory hands to the rendezvous client,
+/// so tests can assert what the client did to its own stream.
+actor RdvCapturedStreams {
+    private var streams: [LoopbackWebSocketStream] = []
+    var first: LoopbackWebSocketStream? { streams.first }
+    func add(_ stream: LoopbackWebSocketStream) {
+        streams.append(stream)
+    }
 }

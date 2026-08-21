@@ -209,10 +209,26 @@ public actor FedRendezvousClient {
         await teardown()
     }
 
+    /// Keepalive cadence for the control WS. This is a LONG-LIVED reused
+    /// socket answering mirror lookups from its session snapshot, so a
+    /// half-open link (server evicted without a close frame) must be detected
+    /// and killed rather than waited on: quiet past one interval+deadline
+    /// (~40s) fails the pending receive, the read supervisor lands in
+    /// `.disconnected`, and the next lookup redials for a fresh barrier.
+    static let keepaliveInterval: TimeInterval = 30
+    static let keepalivePongDeadline: TimeInterval = 10
+
     private func establishSession() async throws {
         state = .connecting
         let stream = try await streamFactory(configuration.controlURL)
         self.stream = stream
+        // Probe from connect, not from `.ready`: a link that dies during the
+        // hello/barrier exchange hangs those awaits exactly like a dead ready
+        // session, and the probe's kill fails them identically.
+        await stream.startKeepalive(
+            interval: Self.keepaliveInterval,
+            pongDeadline: Self.keepalivePongDeadline
+        )
 
         state = .awaitingHelloChallenge
         let challenge = try await readHelloChallenge(from: stream)

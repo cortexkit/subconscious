@@ -65,7 +65,8 @@ probed synchronously.
 - Reported-unresponsive (stale heartbeat) → restart per threshold.
 - Reported-degraded (slow but moving) → report/alert, no kill.
 
-Typed `module_warming` distinguishes post-respawn warm-up from reloading.
+The daemon emits typed `module_warming` to distinguish post-respawn warm-up from
+reloading.
 Note: the daemon schedules a module's **first** probe at cadence+jitter
 (~30s), so a freshly restarted module reads `unknown` for at least 30s
 regardless of readiness — that is not a failed boot.

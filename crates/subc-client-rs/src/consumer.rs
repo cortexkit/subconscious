@@ -3516,7 +3516,11 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
 fn is_retryable_route_open_code(code: &str) -> bool {
     matches!(
         code,
-        "unknown_module" | "module_reloading" | "target_unavailable" | "module_timeout"
+        "unknown_module"
+            | "module_reloading"
+            | "module_warming"
+            | "target_unavailable"
+            | "module_timeout"
     )
 }
 
@@ -3844,6 +3848,7 @@ mod tests {
         for code in [
             "unknown_module",
             "module_reloading",
+            "module_warming",
             "target_unavailable",
             "module_timeout",
         ] {

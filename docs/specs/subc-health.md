@@ -37,8 +37,8 @@ The generic split, for every module:
   (stale heartbeat) → restart per existing threshold (the module itself
   attests its dispatch is wedged). Reported-degraded (slow but moving) →
   report/alert only, never kill.
-- **`module_warming`**: post-respawn route-unavailability is a typed,
-  retryable state distinct from `reloading`, so clients distinguish
+- **`module_warming`**: the daemon emits post-respawn route-unavailability as a
+  typed, retryable state distinct from `reloading`, so clients distinguish
   retry-soon from stuck. Modules shrink the window with lazy root/domain
   warm-on-bind rather than upfront warm.
 

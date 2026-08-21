@@ -1162,10 +1162,16 @@ impl ControlHandler {
             .get_module(&target_module_id)
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
         else {
-            if let Some(status) = self.supervisor_status(&target_module_id, frame.header.corr)? {
+            if let Some((status, warming)) =
+                self.supervisor_status(&target_module_id, frame.header.corr)?
+            {
                 return Ok(vec![control_error_frame(
                     &frame,
-                    "target_unavailable",
+                    if warming {
+                        "module_warming"
+                    } else {
+                        "target_unavailable"
+                    },
                     format!(
                         "module_id '{target_module_id}' is supervised but not available (state={}, enabled={}, live={})",
                         status.state, status.enabled, status.live
@@ -2245,10 +2251,19 @@ impl ControlHandler {
         &self,
         module_id: &str,
         corr: u64,
-    ) -> Result<Option<crate::supervise::ModuleStatus>, RouterError> {
+    ) -> Result<Option<(crate::supervise::ModuleStatus, bool)>, RouterError> {
         self.supervisor
             .get(module_id)
             .map(|module| {
+                let warming = module.is_warming().map_err(|err| {
+                    RouterError::backend(
+                        0,
+                        corr,
+                        format!(
+                            "failed to read supervisor warming state for module_id '{module_id}': {err}"
+                        ),
+                    )
+                })?;
                 module.status().map_err(|err| {
                     RouterError::backend(
                         0,
@@ -2257,7 +2272,7 @@ impl ControlHandler {
                             "failed to read supervisor status for module_id '{module_id}': {err}"
                         ),
                     )
-                })
+                }).map(|status| (status, warming))
             })
             .transpose()
     }
@@ -3136,7 +3151,7 @@ mod tests {
         registry::ChannelState,
         router::FrameSink,
         stderr_tail::DEFAULT_MAX_LINE_BYTES,
-        supervise::{ModuleSpec, RestartPolicy, Supervisor},
+        supervise::{ModuleSpec, ModuleState, RestartPolicy, Supervisor, SupervisorHandle},
         RouteCtx, Router,
     };
     use tokio::{
@@ -4917,6 +4932,154 @@ mod tests {
         handler
             .cleanup_connection(module_ctx.connection_id)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_open_classifies_unregistered_running_supervised_module_as_warming() {
+        let registry = Arc::new(Registry::default());
+        let supervisor_handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+                .with_handle(supervisor_handle.clone())
+                .with_connection_file_path(
+                    std::env::temp_dir()
+                        .join(format!("subc-route-open-warming-{}", std::process::id())),
+                );
+        let module = supervisor
+            .supervise_configured(
+                ModuleSpec {
+                    module_id: "warming".to_string(),
+                    program: fake_aft_stub_path(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(module.state().unwrap(), ModuleState::Running);
+
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+        let (ctx, _rx) = route_ctx(ConnectionId::new(39));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(304, "warming", unique_project_root("warming")),
+            )
+            .await
+            .unwrap();
+        module.stop().await.unwrap();
+
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        let error = parse_error(&response[0]);
+        assert_eq!(error["code"], "module_warming");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("state=running, enabled=true, live=false"));
+    }
+
+    #[tokio::test]
+    async fn route_open_keeps_failed_unregistered_supervised_module_unavailable() {
+        let registry = Arc::new(Registry::default());
+        let supervisor_handle = SupervisorHandle::new();
+        let missing_program = std::env::temp_dir().join(format!(
+            "subc-route-open-missing-program-{}",
+            std::process::id()
+        ));
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+                .with_handle(supervisor_handle.clone());
+        let module = supervisor
+            .supervise_configured(
+                ModuleSpec {
+                    module_id: "failed".to_string(),
+                    program: missing_program,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(module.state().unwrap(), ModuleState::Failed);
+
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+        let (ctx, _rx) = route_ctx(ConnectionId::new(40));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(305, "failed", unique_project_root("failed")),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        let error = parse_error(&response[0]);
+        assert_eq!(error["code"], "target_unavailable");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("state=failed, enabled=true, live=false"));
+    }
+
+    #[tokio::test]
+    async fn route_open_role_mismatch_remains_target_unavailable() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        handler
+            .handle_control(
+                ConnectionId::new(41),
+                non_routable_hello_frame_with_control_ops("health-only", 306, None),
+            )
+            .unwrap();
+
+        let (ctx, _rx) = route_ctx(ConnectionId::new(42));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(307, "health-only", unique_project_root("role-mismatch")),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(parse_error(&response[0])["code"], "target_unavailable");
+        assert!(parse_error(&response[0])["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not provide the requested target"));
+    }
+
+    #[tokio::test]
+    async fn route_open_inactive_registration_remains_target_unavailable() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        handler
+            .handle_control(
+                ConnectionId::new(43),
+                hello_frame("inactive", PROTOCOL_VERSION, 308),
+            )
+            .unwrap();
+        assert!(registry
+            .set_module_state_for_test("inactive", ChannelState::Closed)
+            .unwrap());
+
+        let (ctx, _rx) = route_ctx(ConnectionId::new(44));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(309, "inactive", unique_project_root("inactive")),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(parse_error(&response[0])["code"], "target_unavailable");
+        assert!(parse_error(&response[0])["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not active"));
     }
 
     #[tokio::test]

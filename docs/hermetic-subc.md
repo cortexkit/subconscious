@@ -73,8 +73,11 @@ the moment each process is *launched*, never the moment it becomes able to serve
 
 The consequence for a consumer that classifies at attach time: **config ordering
 cannot fix it.** The mechanism that does is already on the wire — `route.open`
-answers `module_warming`, `target_unavailable`, `unknown_module`, `module_reloading`
-and `module_timeout` as *retryable* codes, and every SDK retries in place. So attach
+answers `target_unavailable`, `unknown_module`, `module_reloading` and
+`module_timeout` as *retryable* codes, and every SDK retries in place. (A
+warming module answers `target_unavailable` today; the typed `module_warming`
+code that would distinguish warming from stuck is designed but not emitted by
+any shipped daemon — see issue #52.) So attach
 lazily on first use and let the retry absorb the race. A rig that attaches at boot
 and caches the result is relying on luck that happens to hold while the alphabet
 cooperates.

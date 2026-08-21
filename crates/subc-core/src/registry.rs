@@ -110,6 +110,20 @@ impl Registry {
         Ok(self.lock_inner()?.generation)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_module_state_for_test(
+        &self,
+        module_id: &str,
+        state: ChannelState,
+    ) -> Result<bool, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        let Some(registration) = inner.modules.get_mut(module_id) else {
+            return Ok(false);
+        };
+        registration.state = state;
+        Ok(true)
+    }
+
     pub fn get_module_by_connection(
         &self,
         connection_id: ConnectionId,

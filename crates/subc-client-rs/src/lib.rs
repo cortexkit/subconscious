@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
 pub mod consumer;
+pub mod policy_cache;
 pub use consumer::{
     CallError, CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerError,
     ConsumerOptions, ControlPush, PushEvent, RetryBackoff, RoutePollResult, SubcConsumer,
     SubscribeOptions, Subscription, SubscriptionClosed,
+};
+pub use policy_cache::{
+    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, Subject,
+    DEFAULT_POLICY_RESOLVER_MODULE_ID,
 };
 
 use std::{

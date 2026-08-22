@@ -11,6 +11,10 @@ the spin itself is unattributed — frames are in the stripped Bun binary,
 consistent with Bun internals or JIT'd plugin JS. ALF's same-day sample
 matched (single stable stack). Attribution owner: AFT/OC.
 
+Corroboration: ALF sampled pid 68653 independently ~11:0x local the same morning —
+2143/2143 samples in one stack, all frames in the stripped binary (summary only;
+raw not retained). This file's 6,300-line specimen is the attribution corpus.
+
 ## SUBC sample (pid 68653, 2026-08-22 ~08:5xZ, live CPU 85-108%)
 ```
 

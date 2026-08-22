@@ -24,8 +24,8 @@ final class PublicAPISurfaceTests: XCTestCase {
         XCTAssertNotNil(keyStore)
         XCTAssertNotNil(stateStore)
 
-        let target = try FedManagementTarget(moduleID: "alfonso-core")
-        XCTAssertEqual(target.moduleID, "alfonso-core")
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
+        XCTAssertEqual(target.moduleID, "prefrontal-core")
     }
 
     func testPackageProductNameIsSubcFed() {

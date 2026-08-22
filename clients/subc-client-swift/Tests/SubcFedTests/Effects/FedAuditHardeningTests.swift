@@ -73,7 +73,7 @@ final class FedAuditHardeningTests: XCTestCase {
 
         do {
             _ = try await engine.admitManagementCall(
-                moduleID: "alfonso-core",
+                moduleID: "prefrontal-core",
                 method: "board.post",
                 params: FedJSONObject(["t": .string("x")]),
                 policy: try FedAdmissionPolicySnapshot()
@@ -118,7 +118,7 @@ final class FedAuditHardeningTests: XCTestCase {
         await faulting.fail(.markSent)
         do {
             _ = try await engine.admitManagementCall(
-                moduleID: "alfonso-core",
+                moduleID: "prefrontal-core",
                 method: "board.post",
                 params: FedJSONObject(["t": .string("x")]),
                 policy: try FedAdmissionPolicySnapshot()
@@ -280,7 +280,7 @@ final class FedAuditHardeningTests: XCTestCase {
         try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
 
         let admitted = try await engine.admitManagementCall(
-            moduleID: "alfonso-core",
+            moduleID: "prefrontal-core",
             method: "board.post",
             params: FedJSONObject(["t": .string("x")]),
             policy: try FedAdmissionPolicySnapshot()
@@ -357,7 +357,7 @@ final class FedAuditHardeningTests: XCTestCase {
         try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
 
         let admitted = try await engine.admitManagementCall(
-            moduleID: "alfonso-core",
+            moduleID: "prefrontal-core",
             method: "board.post",
             params: FedJSONObject(["t": .string("x")]),
             policy: try FedAdmissionPolicySnapshot()
@@ -387,7 +387,7 @@ final class FedAuditHardeningTests: XCTestCase {
 
     private var mutateCatalog: String {
         """
-        {"modules":[{"module_id":"alfonso-core","management":{"operations":[
+        {"modules":[{"module_id":"prefrontal-core","management":{"operations":[
           {"name":"board.post","kind":"mutate"},
           {"name":"board.state","kind":"query"}
         ]}}]}

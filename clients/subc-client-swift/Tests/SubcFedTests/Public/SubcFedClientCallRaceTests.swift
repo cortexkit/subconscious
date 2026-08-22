@@ -14,7 +14,7 @@ final class SubcFedClientCallRaceTests: XCTestCase {
     private let peerLedgerEpoch = "00000000-0000-4000-8000-0000000000bb"
 
     private let catalogJSON = """
-    {"modules":[{"module_id":"alfonso-core","management":{"operations":[
+    {"modules":[{"module_id":"prefrontal-core","management":{"operations":[
       {"name":"board.state","kind":"query"},
       {"name":"ask.persist_answer","kind":"mutate"}
     ]}}]}
@@ -40,7 +40,7 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         defer { Task { await client.disconnect() } }
 
         await transport.armGate()
-        let target = try FedManagementTarget(moduleID: "alfonso-core")
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
 
         let callTask = Task {
             try await client.callManagement(
@@ -72,7 +72,7 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         defer { Task { await client.disconnect() } }
 
         await transport.armGate()
-        let target = try FedManagementTarget(moduleID: "alfonso-core")
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
 
         let callTask = Task {
             try await client.callManagement(
@@ -112,7 +112,7 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         defer { Task { await client.disconnect() } }
 
         await transport.armGate()
-        let target = try FedManagementTarget(moduleID: "alfonso-core")
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
 
         let callTask = Task {
             try await client.callManagement(
@@ -152,7 +152,7 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         defer { Task { await client.disconnect() } }
 
         await transport.armGate()
-        let target = try FedManagementTarget(moduleID: "alfonso-core")
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
         let callTask = Task {
             try await client.callManagement(
                 target: target,
@@ -209,7 +209,7 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         defer { Task { await client.disconnect() } }
 
         await transport.armGate()
-        let target = try FedManagementTarget(moduleID: "alfonso-core")
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
         let callTask = Task {
             try await client.callManagement(
                 target: target,

@@ -130,3 +130,13 @@ read what changed before touching the digest.
 The conformance tests verify canonical key ordering, decimal-string numerics,
 NFC enforcement, minimal escaping, duplicate-key rejection, and the depth-128
 boundary.
+## Historical instance data
+
+The committed fed-frame vectors embed `module:"alfonso-core"` as their call
+target. That module was renamed to `prefrontal-core` fleet-wide (2026-08);
+the string here is INSTANCE DATA inside byte-pinned goldens, not a contract
+claim, and it is deliberately left unrenamed: regenerating every golden to
+update a test-arbitrary string would churn the byte-parity artifacts for
+zero wire value. A rename sweep will match this directory without there
+being anything to change. If the goldens are ever regenerated for a real
+contract reason, use `prefrontal-core` in the new bytes.

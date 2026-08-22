@@ -396,8 +396,8 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         // retired ids for the same reason -- the store golden vectors still
         // carry `llm-runner`, renamed months ago -- so a sweep for a renamed
         // module will match here and should leave these alone.
-        let target = try FedManagementTarget(moduleID: "alfonso-core")
-        XCTAssertEqual(target.moduleID, "alfonso-core")
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
+        XCTAssertEqual(target.moduleID, "prefrontal-core")
         XCTAssertThrowsError(try FedManagementTarget(moduleID: "  "))
     }
 
@@ -411,9 +411,9 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         XCTAssertThrowsError(try decoder.decode(FedManagementTarget.self, from: missing))
 
         // A valid payload decodes, trims, and round-trips through encode/decode.
-        let valid = Data("{\"moduleID\":\"  alfonso-core  \"}".utf8)
+        let valid = Data("{\"moduleID\":\"  prefrontal-core  \"}".utf8)
         let decoded = try decoder.decode(FedManagementTarget.self, from: valid)
-        XCTAssertEqual(decoded.moduleID, "alfonso-core")
+        XCTAssertEqual(decoded.moduleID, "prefrontal-core")
         let encoded = try JSONEncoder().encode(decoded)
         let roundTripped = try decoder.decode(FedManagementTarget.self, from: encoded)
         XCTAssertEqual(roundTripped, decoded)

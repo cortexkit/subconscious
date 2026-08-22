@@ -75,7 +75,7 @@ public struct AskSilencePolicy: Codable, Equatable {
     public var effectiveAutonomy: JSONValue?
 }
 
-/// A pending user ask from alfonso-core. Only the identity, question, and timestamp
+/// A pending user ask from prefrontal-core. Only the identity, question, and timestamp
 /// are required by the wire contract; all other fields may be absent for older or
 /// purpose-specific asks.
 public struct AskRequest: Codable, Equatable, Identifiable {

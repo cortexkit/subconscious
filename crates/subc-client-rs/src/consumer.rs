@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex, MutexGuard,
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use subc_control::{
@@ -32,7 +32,7 @@ use tokio::{
     net::{tcp::OwnedReadHalf, TcpStream},
     sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
-    time::{sleep, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout_at, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +45,7 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 // overall call timeout below).
 const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const DEFAULT_RESTORED_DEBOUNCE: Duration = Duration::from_millis(250);
+const DEFAULT_LIVENESS_PROBE_WINDOW: Duration = Duration::from_secs(2);
 const EGRESS_BUFFER: usize = 128;
 const DEFAULT_ROUTE_WINDOW: usize = 1024;
 const DEFAULT_SUBSCRIPTION_EVENT_BUFFER: usize = 128;
@@ -87,6 +88,9 @@ pub struct ConsumerOptions {
     pub call_timeout: Duration,
     pub reconnect_backoff: RetryBackoff,
     pub restored_debounce: Duration,
+    /// Window a post-deadline Ping waits for any inbound frame before the connection is
+    /// treated as half-open. Exposed so callers can use a shorter deterministic test window.
+    pub liveness_probe_window: Duration,
 }
 
 impl Default for ConsumerOptions {
@@ -96,6 +100,7 @@ impl Default for ConsumerOptions {
             call_timeout: DEFAULT_CALL_TIMEOUT,
             reconnect_backoff: RetryBackoff::default(),
             restored_debounce: DEFAULT_RESTORED_DEBOUNCE,
+            liveness_probe_window: DEFAULT_LIVENESS_PROBE_WINDOW,
         }
     }
 }
@@ -1121,6 +1126,12 @@ struct Shared {
     inner: Mutex<Inner>,
     notify: Notify,
     close_token: CancellationToken,
+    /// Epoch milliseconds of the last frame dispatched from the current connection.
+    /// The liveness probe reads this to distinguish a healthy slow request from a
+    /// socket that has silently stopped delivering inbound traffic.
+    last_inbound_ms: AtomicU64,
+    /// Only one deadline-triggered liveness probe may be active across generations.
+    liveness_probe_running: AtomicBool,
     pushes_dropped_no_receiver: AtomicU64,
     /// Always-present drop counter for channel-0 control pushes (no receiver,
     /// receiver full/closed, or unparseable body). Before this surface existed
@@ -1242,6 +1253,8 @@ impl Shared {
             }),
             notify: Notify::new(),
             close_token: CancellationToken::new(),
+            last_inbound_ms: AtomicU64::new(0),
+            liveness_probe_running: AtomicBool::new(false),
             pushes_dropped_no_receiver: AtomicU64::new(0),
             control_pushes_dropped: AtomicU64::new(0),
             pushes_dropped_receiver_full: AtomicU64::new(0),
@@ -1299,6 +1312,7 @@ impl Shared {
             inner.route_epochs.clear();
             inner.next_corr = Some(1);
             inner.writer = Some(tx);
+            self.last_inbound_ms.store(0, Ordering::Release);
             (
                 generation,
                 epoch,
@@ -1933,6 +1947,9 @@ impl Shared {
                     } else {
                         registration.remove_pending().unwrap_or(false)
                     };
+                    if accepted {
+                        self.spawn_liveness_probe();
+                    }
                     Err(classify_failure(
                         accepted,
                         format!("request on channel {channel} timed out at its deadline"),
@@ -1944,6 +1961,84 @@ impl Shared {
                 Err(classify_failure(accepted, "consumer closed while request was pending"))
             }
         }
+    }
+
+    /// Probe a connection retained after an accepted request reaches its reply deadline.
+    ///
+    /// Deadline timeouts deliberately keep a connection because scheduler pressure can delay
+    /// an otherwise healthy reply. A channel-0 Ping plus any later inbound frame separates that
+    /// case from a half-open socket, which would otherwise pin every subsequent request.
+    fn spawn_liveness_probe(self: &Arc<Self>) {
+        if self.liveness_probe_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let allocation = {
+            let mut inner = self.lock_inner();
+            if inner.closed || !matches!(&inner.reconnect, ReconnectState::Idle) {
+                None
+            } else {
+                match (inner.next_corr, inner.writer.clone()) {
+                    (Some(corr), Some(writer)) => {
+                        inner.next_corr = corr.checked_add(1);
+                        Some((inner.generation, corr, writer))
+                    }
+                    (None, _) | (_, None) => None,
+                }
+            }
+        };
+        let Some((generation, corr, writer)) = allocation else {
+            self.liveness_probe_running.store(false, Ordering::Release);
+            return;
+        };
+
+        let t0 = epoch_millis();
+        let ping = match Frame::build(
+            FrameType::Ping,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            corr,
+            Vec::new(),
+        ) {
+            Ok(ping) => ping,
+            Err(_) => {
+                self.liveness_probe_running.store(false, Ordering::Release);
+                return;
+            }
+        };
+        let window = self.opts.liveness_probe_window;
+        let shared = Arc::clone(self);
+        tokio::spawn(async move {
+            let window_end = Instant::now() + window;
+            // A write failure proves nothing in the healthy direction: it may be the
+            // first sign of the same broken transport. Let the inbound window decide.
+            let _ = timeout_at(
+                window_end,
+                writer.send(WriteCommand {
+                    frame: ping,
+                    pending: None,
+                }),
+            )
+            .await;
+            sleep_until(window_end).await;
+
+            if !shared.close_token.is_cancelled()
+                && shared.generation_is_current(generation)
+                && shared.last_inbound_ms.load(Ordering::Acquire) < t0
+            {
+                shared.handle_generation_drop(
+                    generation,
+                    format!(
+                        "liveness probe convicted a half-open socket: no inbound frame for {}ms after a channel-0 Ping",
+                        window.as_millis()
+                    ),
+                );
+            }
+            shared
+                .liveness_probe_running
+                .store(false, Ordering::Release);
+        });
     }
 
     async fn send_subscription(
@@ -3196,7 +3291,7 @@ async fn reader_loop(shared: Arc<Shared>, mut reader: OwnedReadHalf, generation:
 }
 
 async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> bool {
-    if !shared.generation_is_current(generation) {
+    if !shared.record_inbound_if_current(generation) {
         return false;
     }
     if frame.header.channel != 0
@@ -3310,6 +3405,18 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
 }
 
 impl Shared {
+    /// Stamp after holding the same state lock that guards generation changes, so a
+    /// late frame from an older reader can never vouch for a newly installed socket.
+    fn record_inbound_if_current(&self, generation: u64) -> bool {
+        let inner = self.lock_inner();
+        if inner.closed || inner.generation != generation || inner.writer.is_none() {
+            return false;
+        }
+        self.last_inbound_ms
+            .store(epoch_millis(), Ordering::Release);
+        true
+    }
+
     fn generation_is_current(&self, generation: u64) -> bool {
         let inner = self.lock_inner();
         !inner.closed && inner.generation == generation && inner.writer.is_some()
@@ -3440,6 +3547,16 @@ fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
         module_id,
         launch_nonce,
     })
+}
+
+fn epoch_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn classify_failure(accepted: bool, reason: impl Into<String>) -> CallError {

@@ -1634,6 +1634,7 @@ fn fast_consumer_options() -> ConsumerOptions {
             max_attempts: 20,
         },
         restored_debounce: Duration::from_millis(10),
+        liveness_probe_window: Duration::from_secs(2),
     }
 }
 

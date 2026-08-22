@@ -29,6 +29,12 @@ worth keeping distinct (ENGRAM's naming):
   at all, one shared connection carrying credential/tool/transform planes),
   cerebellum (fired write-failure detector landing in a JoinHandle nobody
   polls until a read loop that cannot return returns).
+- IMMUNE BY ROLE SHAPE: claustrum daemon (purely reactive after HELLO — no
+  requester role, so no reply-deadline exists and nothing outlives a timeout;
+  its CLI is one-connection-per-process with a verify-before-retry refusal).
+  Residual: a deaf read loop depends entirely on the supervisor's probe-silence
+  restart lane, confirmed unconditional at source (dark window = cadence x
+  threshold + drain).
 - COVERED BY ENFORCER, NOT HABIT: engram (pooled reqwest discards on error in
   a layer they do not control — survives their future edits; caveat on record:
   in-process reconnect on their frame loop would inherit the class instantly).

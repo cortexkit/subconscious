@@ -897,6 +897,30 @@ EOF
 # The header follows the file's comment-rule convention; there is no section()
 # helper in this script (the first run of this leg proved that with a
 # command-not-found that the loop survived -- fail-open on a missing header).
+# -- hand-rolled subc client census (standing, per ASTRO 2026-08-22) --
+# SDK-level transport fixes (subc-client-rs) do NOT reach modules that consume
+# subc-transport/protocol directly with hand-rolled frame loops; nothing in a
+# green fleet check distinguishes them. This census keeps the population named
+# so every future SDK fix has its non-inheriting list ready-made (docs:
+# cortexkit-sdk-affordances.md \u00a710b).
+echo "-- hand-rolled subc clients (SDK fixes do not reach these)"
+hr_examined=0; hr_found=0
+for _r in "$HOME/Work/Projects/CortexKit"/*/; do
+  _repo="${_r%/}"
+  [ -e "$_repo/Cargo.toml" ] || ls "$_repo"/crates/*/Cargo.toml >/dev/null 2>&1 || continue
+  hr_examined=$((hr_examined+1))
+  if grep -rlq "subc-client-rs" "$_repo" --include=Cargo.toml 2>/dev/null; then
+    :
+  elif grep -rlqE "subc-transport|subc_transport" "$_repo" --include=Cargo.toml 2>/dev/null; then
+    echo "  $(basename "$_repo"): hand-rolled (transport-direct, no subc-client-rs)"
+    hr_found=$((hr_found+1))
+  fi
+done
+if [ "$hr_examined" -lt 8 ]; then
+  echo "  CENSUS BROKEN: only $hr_examined rust repos examined -- expected 8+ (check the CortexKit projects root)"
+fi
+echo "  census: $hr_found hand-rolled of $hr_examined rust repos examined"
+
 echo "-- release ledger (manifest vs tag vs deployed)"
 NOW_EPOCH=$(date +%s)
 for spec in "broca:ck-broca" "engram:ck-engram" "fusiform:ck-fusiform"; do

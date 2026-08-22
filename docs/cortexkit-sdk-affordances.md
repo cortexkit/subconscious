@@ -17,11 +17,25 @@ stub a peer that accepts, routes, then never answers — assert the SECOND call
 does NOT reuse the first call's connection.
 
 POPULATION NOTE: fixes shipped in the SDKs land everywhere EXCEPT hand-rolled
-clients, and nothing in a green fleet check distinguishes them. As of
-2026-08-22 the hand-rolled Rust population is: insula (fixed), engram,
-cerebellum, astrocyte, broca. If you hand-roll, this document is your SDK
-changelog: when a resilience fix ships in subc-client{,-rs}, check whether your
-frame loop needs the same one.
+clients, and nothing in a green fleet check distinguishes them (fleet-pulse now
+prints the census each cycle). The 2026-08-22 sweep found five, in three states
+worth keeping distinct (ENGRAM's naming):
+- AFFECTED: insula (retained-dead-connection on timeout; fixed d7f262f), broca
+  (worse — route-level recovery exists but no connection-level reconnect path
+  at all, one shared connection carrying credential/tool/transform planes),
+  cerebellum (fired write-failure detector landing in a JoinHandle nobody
+  polls until a read loop that cannot return returns).
+- COVERED BY ENFORCER, NOT HABIT: engram (pooled reqwest discards on error in
+  a layer they do not control — survives their future edits; caveat on record:
+  in-process reconnect on their frame loop would inherit the class instantly).
+- COVERED BY ACCIDENT: astrocyte (timeout maps to the same Err arm as socket
+  death, so eviction covers a case its author was not considering; the comment
+  now names it, because broad code under a narrow comment invites the refactor
+  that splits the arms "for clarity" and reintroduces the defect).
+If you hand-roll, this document is your SDK changelog: when a resilience fix
+ships in subc-client{,-rs}, check whether your frame loop needs the same one.
+Fail-before assertions must check CONNECTION IDENTITY, not the error message —
+reused-corpse and fresh-connection both return timeouts (ASTRO).
 
 ## 11. When your plugin lanes are dead, the wire is usually still there
 

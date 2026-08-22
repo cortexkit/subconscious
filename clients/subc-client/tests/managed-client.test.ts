@@ -73,6 +73,11 @@ interface FakeDaemonOptions {
   // body. Models the #31 push family arriving interleaved with control traffic,
   // including the garbage arm the MUST-ignore clause exists for.
   controlPushesBeforeCatalogList?: boolean;
+  // Accept catalog.list and never answer it (keep reading). Models the daemon's
+  // connection loop parked in a slow inline channel-0 handler (route.open's
+  // bind relay waits up to ~12s in production) — the case where OUR ping going
+  // unanswered is explained by OUR own in-flight control op.
+  holdCatalogList?: boolean;
 }
 
 interface FakeDaemon {
@@ -670,6 +675,50 @@ describe("SubcClient managed call", () => {
     }
   });
 
+  test("an in-flight channel-0 request suspends conviction: silence is self-explained", async () => {
+    // The daemon's connection loop is FIFO and some channel-0 handlers park it
+    // inline for seconds (route.open's bind relay). A probe Ping sent behind
+    // one sits unread — silence explained by OUR OWN control op, not by a dead
+    // socket — so the probe must not convict while one is in flight. The fake
+    // parks catalog.list forever and goes deaf on data (worst case: even the
+    // Ping is unanswered); the gate must still withhold conviction, keeping
+    // the ORIGINAL connection: both later deadline errors ride it (accepts
+    // stays 1) rather than reconnecting onto a fresh one.
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, dataMode: "half-open", holdCatalogList: true });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: { baseMs: 1, capMs: 5, maxAttempts: 4 },
+      timeoutArbitrationGraceMs: 10,
+      livenessProbeWindowMs: 40,
+    });
+
+    try {
+      // Parked forever server-side: this channel-0 pending is the explanation
+      // the gate consults. Settled locally by client.close() in finally.
+      const held = client.catalogList().catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      await expect(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 })).rejects.toMatchObject({
+        code: "deadline_exceeded_no_drop_observed",
+      });
+      // Probe window elapses; WITHOUT the gate this convicts and the next call
+      // would open a second connection.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await expect(client.call("managed-provider", "mutate", { n: 2 }, { timeoutMs: 60 })).rejects.toMatchObject({
+        code: "deadline_exceeded_no_drop_observed",
+      });
+      expect(stats.connections).toBe(1);
+      void held;
+    } finally {
+      client.close();
+    }
+  });
+
   test("a half-open socket is convicted by the liveness probe and the next call reconnects", async () => {
     // The peer accepts one request then vanishes WITHOUT a FIN/RST (host
     // sleep/wake shape): the deadline settles as deadline-no-drop, which
@@ -761,6 +810,9 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       const request = parseJson(frame.body) as { op?: string };
       requestFrame.controlOp = request.op;
       if (request.op === "catalog.list") {
+        if (options.holdCatalogList) {
+          continue; // parked forever: the pending stays in flight client-side
+        }
         if (options.controlPushesBeforeCatalogList) {
           await writeFrame(
             socket,

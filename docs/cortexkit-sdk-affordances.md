@@ -1,4 +1,28 @@
 
+## 10b. Half-open sockets: the question every hand-rolled client must answer
+
+A socket killed without FIN/RST (host sleep/wake, peer power loss) SAYS NOTHING:
+writes vanish, the reader stays blocked, and the only symptom is request
+timeouts. If your timeout path returns a transient error while LEAVING THE
+CONNECTION INSTALLED, every later call reuses the corpse and your module is dark
+until restart — with every health surface green (insula d7f262f is the shipped
+fix for exactly this; subc-client 0.8.0 / subc-client-rs 0.7.0 carry the SDK
+form: a channel-0 Ping after a reply-deadline settle, any inbound frame
+exonerates, silence convicts and tears down through the normal drop path so the
+next call reconnects).
+
+Self-audit question: after a request times out with no socket error, what
+happens to the connection object? "Nothing" is the defect. Fail-before proof:
+stub a peer that accepts, routes, then never answers — assert the SECOND call
+does NOT reuse the first call's connection.
+
+POPULATION NOTE: fixes shipped in the SDKs land everywhere EXCEPT hand-rolled
+clients, and nothing in a green fleet check distinguishes them. As of
+2026-08-22 the hand-rolled Rust population is: insula (fixed), engram,
+cerebellum, astrocyte, broca. If you hand-roll, this document is your SDK
+changelog: when a resilience fix ships in subc-client{,-rs}, check whether your
+frame loop needs the same one.
+
 ## 11. When your plugin lanes are dead, the wire is usually still there
 
 The tool surface (board/ask/peer/aft tools) rides long-lived plugin clients inside

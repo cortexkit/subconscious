@@ -18,7 +18,11 @@ does NOT reuse the first call's connection.
 
 POPULATION NOTE: fixes shipped in the SDKs land everywhere EXCEPT hand-rolled
 clients, and nothing in a green fleet check distinguishes them (fleet-pulse now
-prints the census each cycle). The 2026-08-22 sweep found five, in three states
+prints the census each cycle). The 2026-08-22 sweep found six — claustrum surfaced late because staged
+Athena evidence artifacts under its .cortexkit/ carried another repo's
+subc-client-rs manifests and the first census read them as its dependency
+(the drifted-copy class striking the census itself; scan now excludes
+.cortexkit/) — in three states
 worth keeping distinct (ENGRAM's naming):
 - AFFECTED: insula (retained-dead-connection on timeout; fixed d7f262f), broca
   (worse — route-level recovery exists but no connection-level reconnect path
@@ -28,6 +32,9 @@ worth keeping distinct (ENGRAM's naming):
 - COVERED BY ENFORCER, NOT HABIT: engram (pooled reqwest discards on error in
   a layer they do not control — survives their future edits; caveat on record:
   in-process reconnect on their frame loop would inherit the class instantly).
+- PENDING SELF-AUDIT: claustrum (credentials-module is transport-direct; the
+  vault's credential-leg profile — long-lived, low-traffic — is exactly the
+  connection class that bit insula).
 - COVERED BY ACCIDENT: astrocyte (timeout maps to the same Err arm as socket
   death, so eviction covers a case its author was not considering; the comment
   now names it, because broad code under a narrow comment invites the refactor

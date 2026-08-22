@@ -34,7 +34,15 @@ worth keeping distinct (ENGRAM's naming):
   its CLI is one-connection-per-process with a verify-before-retry refusal).
   Residual: a deaf read loop depends entirely on the supervisor's probe-silence
   restart lane, confirmed unconditional at source (dark window = cadence x
-  threshold + drain).
+  threshold + drain; ~2min on defaults, and after max_restarts silent deaths
+  the module PARKS — for the vault that is the actual failure mode, visible
+  and operator-revivable, not a hazard). TRIP-WIRE (CKCRED's own): this
+  immunity is a property of the CURRENT role, not a permanent one — one
+  outbound request that awaits a reply ends it silently, with nothing in the
+  diff looking like a connection-lifecycle change. Enforcer coverage degrades
+  loudly when the enforcer is removed; role-shape immunity degrades quietly
+  when a feature is added. The stronger state is the more fragile one to
+  inherit.
 - COVERED BY ENFORCER, NOT HABIT: engram (pooled reqwest discards on error in
   a layer they do not control — survives their future edits; caveat on record:
   in-process reconnect on their frame loop would inherit the class instantly).

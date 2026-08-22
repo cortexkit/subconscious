@@ -20,6 +20,14 @@ Emergency paths, proven in the 2026-08-22 outage:
   `peer.enqueue_message` on prefrontal-core's ManagementSurface
   (`{method, params}` envelope; params are camelCase — `fromName`,
   `fromSessionID`, `toName`, `toSessionID`, `toDirectory`, `body`, `urgency`).
+  Two details that bite under pressure (found by the first seat to exercise
+  this leg live): THE WIRE IS camelCase AND THE STORE IS snake_case — reading
+  the schema first (the natural move when sqlite is the only thing answering)
+  and building params from column names (`from_name`, `to_session_id`) gets a
+  rejection at the worst moment; use the camelCase spellings above. And
+  `toDirectory` is not guessable and not in any envelope you see — recover a
+  correct address with
+  `SELECT DISTINCT to_directory FROM peer_messages WHERE to_name='<recipient>'`.
 - **Read (inbox, board state):** the same fresh client can call the read ops; or
   read the store directly with `sqlite3 "file:$HOME/.local/share/cortexkit/prefrontal-core/store.db?mode=ro"`
   (never read-write: the module holds the single-writer lease).

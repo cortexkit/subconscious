@@ -1586,6 +1586,13 @@ impl HealthProbeRuntime {
 /// The asymmetry is the whole point: under saturation the WEAKEST signal is the
 /// one that fires most often, and while every variant collapsed into one string
 /// it carried the same weight as the strongest.
+///
+/// LIVE BEHAVIOUR TODAY, stated here because this doc block describes the
+/// DESIGN and a reader stopping at it gets the build backwards: the restart
+/// decision does NOT yet consult this classification -- consecutive `NoAnswer`
+/// probes still increment the failure streak and drive escalation at the
+/// threshold (see `is_proof_of_death` below for why that is deliberate and
+/// what gates the change). Absence of evidence restarts modules today.
 #[derive(Debug)]
 enum HealthProbeEvidence {
     /// The module's control lane is gone. Proof of death.

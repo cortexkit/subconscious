@@ -15,6 +15,17 @@ Corroboration: ALF sampled pid 68653 independently ~11:0x local the same morning
 2143/2143 samples in one stack, all frames in the stripped binary (summary only;
 raw not retained). This file's 6,300-line specimen is the attribution corpus.
 
+Blast radius (self-reported, all self-healed, same signature): SUBC ~40min,
+ALF similar window, QTA ~10min, THALAMUS ~2h (same morning), AVA ~50min the
+prior evening on rig routes. Trigger candidate from QTA, correlation x2 and
+explicitly not a mechanism: a `ck module restart` preceded the wedge by ~90s
+both times (insula 2026-08-22, aft 2026-08-08). Plausible chain for the hunt:
+restart broadcasts route.closing/GOODBYE to every session holding routes ->
+simultaneous route-reopen bursts across all plugin clients in the ONE shared
+serve process -> per-retry listener re-registration (the MaxListeners
+signature) -> spin. Testable: correlate future spin onsets with supervisor
+restart timestamps in the daemon log.
+
 ## SUBC sample (pid 68653, 2026-08-22 ~08:5xZ, live CPU 85-108%)
 ```
 

@@ -43,7 +43,14 @@ down.
 
 Request envelope: `{"server": "<configured-name>", "op": "tools/list" | "tools/call", "payload": <MCP-shaped request>}`.
 
-Response envelope: `{"served_from": "live" | "cache", "observed_at_ms": <u64>, "payload": <the child's MCP-shaped result or error>}`.
+Response envelope: `{"served_from": "live" | "cache", "observed_at_ms": <u64>, "payload": <the child's MCP-shaped result or error>}`,
+plus `spawn_elapsed_ms` (u64, OPTIONAL) present exactly when THIS call paid a child spawn+initialize
+(the lazy-spawn first call after a shed). Callers running vendor-health accounting subtract it:
+cold-start cost is the adapter's scheduling artifact, not vendor latency, and without the field a
+breaker learns the shed schedule instead of vendor health (the 19-backend reviewer's seam A on
+plexus#4, resolved as attribution-in-the-envelope rather than a warming refusal — one round trip,
+no new caller-facing error code, deadline semantics unchanged: the call stays bounded end-to-end
+by `deadline_ms`, which at its 120s default dwarfs the 30s spawn budget).
 `served_from`/`observed_at_ms` are the adapter's only additions and are ALWAYS present (a live serve
 says `"live"` with the serve time), so consumers never branch on field absence. `observed_at_ms`
 is epoch milliseconds wall clock (the domain plexus computes staleness in). The child payload is
@@ -122,6 +129,15 @@ Per server: `command`, `args`, `cwd`, `env` (map, below), `idle_ttl_ms` (absent/
   never auto-retried: legitimate-oversize and runaway are indistinguishable at the framing layer,
   so resolution is operator config only.
 
+## Standing state across sheds (ruled)
+
+v1 supports STATELESS backends only: any state a child holds (subscriptions, session objects,
+in-child caches) dies with the shed, and no component re-establishes it. This is a stated contract
+line, not a discovered behavior — a backend requiring standing state is DECLARED UNSUPPORTED at
+registry review rather than failing mysteriously at the first 300s boundary. If a stateful backend
+ever matters, re-establishment needs a named owner and its own design round; the v1 answer is
+refusal at review time.
+
 ## Child lifecycle
 
 - Lazy spawn on first call needing a child; MCP `initialize` completes before any tool request is
@@ -147,6 +163,15 @@ Per server: `command`, `args`, `cwd`, `env` (map, below), `idle_ttl_ms` (absent/
   that touches its test; a per-server env entry may shadow a base key (override wins; the shadowing
   arm is tested). The adapter's own attestation env (`SUBC_LAUNCH_NONCE`, `SUBC_MODULE_ID`) and
   everything else are structurally absent from every child.
+- **Credential custody (ruled on the plexus#4 operational record):** resolution happens AT EVERY
+  SPAWN and resolved secret VALUES never outlive the child generation they were rendered for — no
+  cross-generation cache, because the 300s shed cycle is the rotation-propagation path and a cached
+  secret silently converts bounded staleness into unbounded. Resolve failure is fail-loud
+  `spawn_failed` (`credential_resolution`); there is NO fallback arm to a previous or shared value
+  by construction — a child running on a stale secret is the confusing failure class (healthy,
+  authenticated-looking, wrong identity) and this spec refuses to make it constructable. Handles in
+  the env map are minted scoped to THIS adapter's module identity (claustrum-side grant scoping),
+  so one compromised server definition cannot resolve a sibling adapter's secrets.
 - **Credential resolution — BUILD ITEM, not an existing path:** the campaign's evidence sweep found
   no reusable handle-resolution client for the `{handle: ...}` map; the adapter's first slice builds
   a claustrum route-plane consumer (subc-client-rs against claustrum's possession-only read surface,

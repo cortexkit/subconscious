@@ -78,7 +78,7 @@ final class FedFrameCodecTests: XCTestCase {
         let baseline = try FedFrameCodec.encode(headerData: baselineHeader)
         XCTAssertEqual(baseline, framedBytes(header: baselineHeader, body: Data()))
 
-        let managementHeader = Data(("{\"type\":\"call\",\"effect\":{\"incarnation\":\"" + incarnation + "\",\"seq\":1},\"module\":\"alfonso-core\",\"surface\":\"management\",\"deadline_ms\":300000}").utf8)
+        let managementHeader = Data(("{\"type\":\"call\",\"effect\":{\"incarnation\":\"" + incarnation + "\",\"seq\":1},\"module\":\"prefrontal-core\",\"surface\":\"management\",\"deadline_ms\":300000}").utf8)
         let managementBody = Data(#"{"method":"board.state","params":{}}"#.utf8)
         let management = try FedFrameCodec.encode(
             headerData: managementHeader,

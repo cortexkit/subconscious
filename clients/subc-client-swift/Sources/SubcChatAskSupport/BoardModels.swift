@@ -122,7 +122,7 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
     public var digest: BoardDigest
     /// When this block last changed, in epoch milliseconds.
     ///
-    /// Additive projection field: absent on alfonso-core builds that predate
+    /// Additive projection field: absent on prefrontal-core builds that predate
     /// it, so a consumer must treat nil as "unknown" rather than as a time.
     public var updatedAtMs: Int64?
 
@@ -296,14 +296,14 @@ public struct BoardState: Codable, Equatable {
 
 // MARK: - Board discovery (board.list)
 
-/// One row of alfonso-core's board.list projection: a session that owns board
+/// One row of prefrontal-core's board.list projection: a session that owns board
 /// data, with enough summary for a picker card. statusText/statusState mirror
 /// the board's current status.main block.
 public struct BoardSummary: Codable, Identifiable, Equatable {
     public var harness: String
     public var session: String
     /// Agent display name (ALF, MC, SUBC...) from the rooms name source;
-    /// additive projection field, absent on older alfonso-core builds.
+    /// additive projection field, absent on older prefrontal-core builds.
     public var displayName: String?
     public var projectRoot: String?
     public var updatedAtMs: Int64?

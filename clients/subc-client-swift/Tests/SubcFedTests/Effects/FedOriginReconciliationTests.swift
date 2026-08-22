@@ -15,7 +15,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     private let liveEpoch = "00000000-0000-4000-8000-0000000000bb"
 
     private let mutateCatalog = """
-    {"modules":[{"module_id":"alfonso-core","management":{"operations":[
+    {"modules":[{"module_id":"prefrontal-core","management":{"operations":[
       {"name":"board.post","kind":"mutate"},
       {"name":"board.state","kind":"query"}
     ]}}]}
@@ -281,7 +281,7 @@ final class FedOriginReconciliationTests: XCTestCase {
         // A new mutating admission starts but must wait on the reconciliation barrier.
         let mutateTask = Task {
             try await engine.admitManagementCall(
-                moduleID: "alfonso-core",
+                moduleID: "prefrontal-core",
                 method: "board.post",
                 params: FedJSONObject(["t": .string("x")]),
                 policy: policy
@@ -301,7 +301,7 @@ final class FedOriginReconciliationTests: XCTestCase {
 
         // A pure call proceeds during reconciliation.
         let pure = try await engine.admitManagementCall(
-            moduleID: "alfonso-core",
+            moduleID: "prefrontal-core",
             method: "board.state",
             params: FedJSONObject(),
             policy: policy

@@ -73,7 +73,7 @@ final class FedSessionEngineTests: XCTestCase {
         try await feed(
             transport,
             frame: remoteCatalogFrame(modulesJSON: """
-            {"modules":[{"module_id":"alfonso-core","management":{"operations":[
+            {"modules":[{"module_id":"prefrontal-core","management":{"operations":[
               {"name":"board.state","kind":"query"},
               {"name":"board.post","kind":"mutate"}
             ]}}]}
@@ -86,8 +86,8 @@ final class FedSessionEngineTests: XCTestCase {
 
         let remote = await engine.remoteCatalog
         XCTAssertEqual(remote?.modules.count, 1)
-        XCTAssertEqual(remote?.lookup(moduleID: "alfonso-core", operation: "board.state")?.kind, "query")
-        XCTAssertEqual(remote?.lookup(moduleID: "alfonso-core", operation: "board.post")?.kind, "mutate")
+        XCTAssertEqual(remote?.lookup(moduleID: "prefrontal-core", operation: "board.state")?.kind, "query")
+        XCTAssertEqual(remote?.lookup(moduleID: "prefrontal-core", operation: "board.post")?.kind, "mutate")
     }
 
     func testHelloFirstRejectsNonHello() throws {
@@ -136,7 +136,7 @@ final class FedSessionEngineTests: XCTestCase {
         let good = try FedCatalogCodec.parseRemote(
             frame: remoteCatalogFrame(modulesJSON: """
             {"modules":[
-              {"module_id":"alfonso-core","management":{"operations":[
+              {"module_id":"prefrontal-core","management":{"operations":[
                 {"name":"board.state","kind":"query"},
                 {"name":"ask.get","kind":"query"},
                 {"name":"bad","kind":"unknown"},
@@ -418,7 +418,7 @@ final class FedSessionEngineTests: XCTestCase {
         XCTAssertNil(frame)
         do {
             _ = try await engine.admitManagementCall(
-                moduleID: "alfonso-core",
+                moduleID: "prefrontal-core",
                 method: "board.state",
                 params: FedJSONObject(),
                 policy: try FedAdmissionPolicySnapshot()
@@ -482,7 +482,7 @@ final class FedSessionEngineTests: XCTestCase {
             transport: transport,
             task: establish,
             modulesJSON: """
-            {"modules":[{"module_id":"alfonso-core","management":{"operations":[
+            {"modules":[{"module_id":"prefrontal-core","management":{"operations":[
               {"name":"board.post","kind":"mutate"},
               {"name":"board.state","kind":"query"}
             ]}}]}
@@ -491,7 +491,7 @@ final class FedSessionEngineTests: XCTestCase {
 
         let policy = try FedAdmissionPolicySnapshot(defaultDeadlineMs: 60_000)
         let admitted = try await engine.admitManagementCall(
-            moduleID: "alfonso-core",
+            moduleID: "prefrontal-core",
             method: "board.post",
             params: FedJSONObject(["text": .string("hi")]),
             policy: policy

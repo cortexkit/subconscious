@@ -32,7 +32,7 @@ public enum JSONKeyNormalizer {
     }
 }
 
-// MARK: - Athena consult rows (alfonso-core athena.list_consults / athena.get_consult)
+// MARK: - Athena consult rows (prefrontal-core athena.list_consults / athena.get_consult)
 
 /// Row shape pinned from ALF's captured wire examples
 /// (alfonso .cortexkit/alfonso/docs/observe-ops-wire-examples.md, 2026-07-11).
@@ -197,7 +197,7 @@ public struct ConsultDetail: Codable {
     public var tokenUsage: TokenUsageRollup?
 }
 
-// MARK: - Recent runs (alfonso-core observe.recent_runs)
+// MARK: - Recent runs (prefrontal-core observe.recent_runs)
 
 public struct ObservedRun: Codable, Identifiable {
     public var ordinal: Int64?
@@ -378,7 +378,7 @@ public struct SpecEpic: Codable, Equatable {
 }
 
 /// A spec-kind Athena consult with its minted work graph and dispatch states,
-/// as served by alfonso-core's joined `athena.spec_status` projection.
+/// as served by prefrontal-core's joined `athena.spec_status` projection.
 /// `epic == nil` with empty slices means the consult is still in
 /// clarify/rounds and the work graph has not been minted yet.
 public struct SpecCampaign: Codable, Identifiable, Equatable {
@@ -387,7 +387,7 @@ public struct SpecCampaign: Codable, Identifiable, Equatable {
     public var round: Int?
     public var updatedAtMs: Int64?
     public var draftPath: String?
-    /// Attribution fields (additive; absent until alfonso-core serves them):
+    /// Attribution fields (additive; absent until prefrontal-core serves them):
     /// the agent session that fired the campaign, for project/agent grouping.
     public var callerSessionId: String?
     public var callerHarness: String?

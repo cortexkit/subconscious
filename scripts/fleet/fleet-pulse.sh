@@ -903,23 +903,49 @@ EOF
 # green fleet check distinguishes them. This census keeps the population named
 # so every future SDK fix has its non-inheriting list ready-made (docs:
 # cortexkit-sdk-affordances.md \u00a710b).
+# Transition-printing (ENGRAM's decay-shape note): a list that prints every
+# pulse becomes background by the third cycle, and the rows most worth reading
+# are the ones that only matter when they CHANGE. So membership transitions
+# print loudly; an unchanged population prints one count line. Full list on
+# demand: FLEET_PULSE_CENSUS_FULL=1. (Rung classification within the population
+# -- enforcer / enforcer-by-documentation / accident, sdk-affordances \u00a710b --
+# is audit knowledge a grep cannot derive; this census tracks membership only.)
 echo "-- hand-rolled subc clients (SDK fixes do not reach these)"
-hr_examined=0; hr_found=0
+hr_examined=0; hr_now=""
 for _r in "$HOME/Work/Projects/CortexKit"/*/; do
   _repo="${_r%/}"
   [ -e "$_repo/Cargo.toml" ] || ls "$_repo"/crates/*/Cargo.toml >/dev/null 2>&1 || continue
   hr_examined=$((hr_examined+1))
-  if grep -rlq "subc-client-rs" "$_repo" --include=Cargo.toml 2>/dev/null; then
+  # Bounded manifest discovery: --include=Cargo.toml still WALKS the whole tree
+  # (multi-GB target/ dirs made the census the pulse's slowest line); find with
+  # a depth cap and target/ pruned reads only the manifests.
+  _manifests=$(find "$_repo" -maxdepth 4 -name Cargo.toml -not -path "*/target/*" -not -path "*/.cortexkit/*" 2>/dev/null)
+  [ -n "$_manifests" ] || continue
+  if printf '%s\n' "$_manifests" | xargs grep -lq "subc-client-rs" 2>/dev/null; then
     :
-  elif grep -rlqE "subc-transport|subc_transport" "$_repo" --include=Cargo.toml 2>/dev/null; then
-    echo "  $(basename "$_repo"): hand-rolled (transport-direct, no subc-client-rs)"
-    hr_found=$((hr_found+1))
+  elif printf '%s\n' "$_manifests" | xargs grep -lqE "subc-transport|subc_transport" 2>/dev/null; then
+    hr_now="$hr_now$(basename "$_repo")\n"
   fi
 done
+hr_now=$(printf '%b' "$hr_now" | sort)
+hr_found=$(printf '%s\n' "$hr_now" | grep -c . || true)
+hr_prev_file="$HOME/.local/share/cortexkit/run/.fleet-pulse-handrolled-census"
+hr_prev=$(cat "$hr_prev_file" 2>/dev/null || true)
 if [ "$hr_examined" -lt 8 ]; then
   echo "  CENSUS BROKEN: only $hr_examined rust repos examined -- expected 8+ (check the CortexKit projects root)"
+elif [ -z "$hr_prev" ]; then
+  printf '%s\n' "$hr_now" | sed 's/^/  /'
+  echo "  census baseline: $hr_found hand-rolled of $hr_examined rust repos (transitions print from next pulse)"
+  printf '%s' "$hr_now" > "$hr_prev_file" 2>/dev/null || true
+elif [ "$hr_now" != "$hr_prev" ]; then
+  comm -13 <(printf '%s\n' "$hr_prev") <(printf '%s\n' "$hr_now") | sed 's/^/  ENTERED hand-rolled population: /'
+  comm -23 <(printf '%s\n' "$hr_prev") <(printf '%s\n' "$hr_now") | sed 's/^/  LEFT hand-rolled population (adopted SDK?): /'
+  echo "  census CHANGED: $hr_found hand-rolled of $hr_examined rust repos examined"
+  printf '%s' "$hr_now" > "$hr_prev_file" 2>/dev/null || true
+else
+  echo "  census unchanged: $hr_found hand-rolled of $hr_examined rust repos examined"
+  [ "${FLEET_PULSE_CENSUS_FULL:-0}" = "1" ] && printf '%s\n' "$hr_now" | sed 's/^/  /'
 fi
-echo "  census: $hr_found hand-rolled of $hr_examined rust repos examined"
 
 echo "-- release ledger (manifest vs tag vs deployed)"
 NOW_EPOCH=$(date +%s)

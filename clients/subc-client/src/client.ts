@@ -971,13 +971,35 @@ export class SubcClient {
    * enough to delay the read loop delays this probe's own timer identically,
    * and when both wake the buffered Pong dispatches before the check runs.
    *
+   * A PENDING CHANNEL-0 REQUEST SUSPENDS THE PROBE (both at launch and at the
+   * conviction check). The daemon's connection loop handles frames one at a
+   * time, and some channel-0 ops legally park it for seconds — route.open
+   * awaits the module's bind ack inline for up to route_bind_relay_timeout
+   * (~12s in production) — during which OUR Ping sits unread in the daemon's
+   * socket buffer. On an otherwise-quiet connection that silence is fully
+   * explained by our own in-flight control op, and convicting on it would
+   * tear down a healthy connection mid-bind (BROCA's Athena panel flagged
+   * this exact premise; the FIFO fact is verified in subc-core server.rs
+   * connection_loop + control.rs handle_route_open). The client always knows
+   * its own channel-0 pendings, so the gate is local and exact: no probe
+   * while one is in flight, no conviction if one appeared during the window.
+   *
    * Scope: hooked from the managed-call path only. Control-plane requests
    * (route.open, catalog.list) are short-lived and their failures already
    * escalate through reconnect classification; the managed path is where a
    * plugin lives for hours and where the pin was observed in production.
    */
+  /** Any in-flight channel-0 request (pendings keyed without a route handle). */
+  private hasControlPending(): boolean {
+    for (const pending of this.pending.values()) {
+      if (pending.handle === null) return true;
+    }
+    return false;
+  }
+
   private probeLivenessAfterDeadline(): void {
     if (this.livenessProbe || this.closeStarted || this.closedErr) return;
+    if (this.hasControlPending()) return; // silence would be self-explained; re-armed by the next settle
     const sock = this.sock;
     const generation = this.generation;
     let corr: bigint;
@@ -1003,6 +1025,9 @@ export class SubcClient {
       await this.opts.sleep(this.opts.livenessProbeWindowMs);
       if (this.sock !== sock || this.generation !== generation || this.closeStarted) return;
       if (this.lastInboundAtMs >= t0) return; // link proven — keep the socket
+      // A control op that started during the window explains the silence: the
+      // daemon's read loop may be parked in its inline handler, not dead.
+      if (this.hasControlPending()) return;
       this.fail(
         new SocketClosedError(
           `liveness probe convicted a half-open socket: no inbound frame for ${this.opts.livenessProbeWindowMs}ms after a channel-0 Ping (deadline-no-drop settles preceded this); closing so the next call reconnects`,

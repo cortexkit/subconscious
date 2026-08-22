@@ -1975,7 +1975,21 @@ impl Shared {
 
         let allocation = {
             let mut inner = self.lock_inner();
-            if inner.closed || !matches!(&inner.reconnect, ReconnectState::Idle) {
+            // A pending CHANNEL-0 request suspends the probe: the daemon's
+            // connection loop is FIFO and some channel-0 handlers park it
+            // inline for seconds (route.open awaits the module bind ack for up
+            // to route_bind_relay_timeout, ~12s in production), during which
+            // our Ping sits unread in the daemon's socket buffer. Silence is
+            // then explained by our own control op, and convicting would tear
+            // down a healthy connection mid-bind. The gate is local knowledge
+            // (we always know our own pendings) and re-arms on the next
+            // deadline settle; the same check runs again before conviction.
+            let control_pending = inner
+                .pending
+                .keys()
+                .any(|key| key.generation == inner.generation && key.channel == 0);
+            if inner.closed || control_pending || !matches!(&inner.reconnect, ReconnectState::Idle)
+            {
                 None
             } else {
                 match (inner.next_corr, inner.writer.clone()) {
@@ -2023,7 +2037,15 @@ impl Shared {
             .await;
             sleep_until(window_end).await;
 
+            let control_pending_now = {
+                let inner = shared.lock_inner();
+                inner
+                    .pending
+                    .keys()
+                    .any(|key| key.generation == generation && key.channel == 0)
+            };
             if !shared.close_token.is_cancelled()
+                && !control_pending_now // a control op begun during the window explains the silence
                 && shared.generation_is_current(generation)
                 && shared.last_inbound_ms.load(Ordering::Acquire) < t0
             {

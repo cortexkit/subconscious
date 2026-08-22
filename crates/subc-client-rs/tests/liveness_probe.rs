@@ -93,6 +93,70 @@ async fn liveness_probe_convicts_half_open_socket_and_next_call_recovers() {
     consumer.close().await;
 }
 
+/// An in-flight CHANNEL-0 request suspends conviction. The daemon's connection
+/// loop is FIFO and some channel-0 handlers legally park it inline for seconds
+/// (route.open awaits the module bind ack for up to route_bind_relay_timeout),
+/// during which a probe Ping sits unread — silence explained by the client's
+/// own control op, not by a dead socket. The fake parks catalog.list forever
+/// (it answers only RouteOpen) and goes deaf on data, so even the Ping is
+/// unanswered — the worst case — and the gate must still withhold conviction:
+/// the second deadline error rides the ORIGINAL connection (count stays 1)
+/// instead of a reconnect's fresh one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_probe_withholds_conviction_while_a_control_request_is_pending() {
+    let daemon = start_fake_daemon(DataMode::HalfOpen).await;
+    let consumer = SubcConsumer::connect(&daemon.connection_file, consumer_options())
+        .await
+        .expect("connect consumer");
+    let target = target();
+    let identity = identity();
+
+    // Parked forever server-side (the fake never answers CatalogList); this is
+    // the channel-0 pending the gate consults. Polled just long enough to send,
+    // then held pinned-but-unpolled: the pending registration lives in the
+    // consumer's shared state, not in this future's polling.
+    let held = consumer.catalog_list();
+    tokio::pin!(held);
+    tokio::select! {
+        _ = &mut held => panic!("catalog_list must stay parked at the fake daemon"),
+        () = sleep(Duration::from_millis(50)) => {}
+    }
+
+    let first = consumer
+        .call(
+            target.clone(),
+            identity.clone(),
+            b"first".to_vec(),
+            call_options(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("the deaf connection must time out after accepting the data frame");
+    assert!(matches!(first, CallError::OutcomeUnknown(_)));
+
+    // Give a (wrong) conviction ample time to fire, then prove it did not: the
+    // second call must ride the SAME connection into the same deadline class.
+    sleep(PROBE_WINDOW + PROBE_WINDOW + Duration::from_millis(100)).await;
+    let second = consumer
+        .call(
+            target,
+            identity,
+            b"second".to_vec(),
+            call_options(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("the corpse is deliberately kept while the control op explains the silence");
+    assert!(matches!(second, CallError::OutcomeUnknown(_)));
+    assert_eq!(
+        daemon.connection_count(),
+        1,
+        "conviction must be withheld while a channel-0 request is in flight"
+    );
+
+    // `held` (pinned, never completed) is released by scope exit; close() then
+    // settles its registration with the connection teardown.
+    consumer.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_probe_keeps_silent_but_healthy_socket_for_next_call() {
     let daemon = start_fake_daemon(DataMode::SilentHold).await;

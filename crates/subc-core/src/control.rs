@@ -1425,6 +1425,16 @@ impl ControlHandler {
             }
             Ok(Ok(RouteBindRelayOutcome::ModuleGone(message))) => {
                 reservation.release_and_disarm();
+                // Fires when the module's connection closes while a relayed
+                // bind is pending -- typically a caller racing a module restart
+                // whose bind was relayed BEFORE the drain mark went up. Logged
+                // because the caller sees only its own error and the fleet has
+                // already spent one diagnosis round unable to tell this arm
+                // from a relay timeout without daemon-side evidence.
+                tracing::warn!(
+                    module_id = %target_module_id,
+                    "route.bind relay abandoned: {message}"
+                );
                 Ok(vec![control_error_frame(
                     &frame,
                     "target_unavailable",
@@ -1441,6 +1451,18 @@ impl ControlHandler {
             }
             Err(_) => {
                 reservation.release_and_disarm();
+                // The generous budget just burned to no answer: the module is
+                // registered and its connection is up, but its bind handler sat
+                // on the ack for the full budget (warm-on-bind, cold configure,
+                // or a wedged handler). Every earlier unavailability shape
+                // fast-refuses BEFORE the relay, so this arm firing means the
+                // slowness is module-side -- log it so the per-module timeline
+                // is reconstructable without client audit rows.
+                tracing::warn!(
+                    module_id = %target_module_id,
+                    timeout_ms = route_bind_relay_timeout.as_millis() as u64,
+                    "route.bind relay timed out: module did not ack within budget"
+                );
                 Ok(vec![control_error_frame(
                     &frame,
                     "module_timeout",

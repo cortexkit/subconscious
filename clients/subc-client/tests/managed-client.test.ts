@@ -52,11 +52,16 @@ interface FakeDaemonOptions {
   //   `delayBodyMs` — so the client's read loop is mid-frame (bytes present) when a
   //   short request deadline fires, deterministically exercising timeout arbitration.
   // "silent-hold": accept the data request and never reply, keeping the socket
-  //   healthy — a genuine deadline with no drop.
+  //   healthy — a genuine deadline with no drop. (The fake still answers Pings,
+  //   like the real daemon: the liveness probe must EXONERATE this socket.)
+  // "half-open": accept the FIRST data request then go deaf — never answer
+  //   anything again on that connection, Pings included, while keeping TCP
+  //   open. The post-sleep/wake peer-vanished shape: the liveness probe must
+  //   CONVICT it. Later connections serve normally so recovery is provable.
   // "unknown-channel-once": reject the FIRST data request with the daemon
   //   router's unknown_channel ERROR (a stale bind after a module restart), then
   //   serve subsequent requests normally — the re-opened route works.
-  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "unknown-channel-once" | "unknown-channel-always" | "stale-epoch-once";
+  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "half-open" | "unknown-channel-once" | "unknown-channel-always" | "stale-epoch-once";
   delayBodyMs?: number;
   routeOpenError?: { code: string; message: string };
   // Reject the first N route.open requests with this code (a booting-target
@@ -637,6 +642,10 @@ describe("SubcClient managed call", () => {
       identity: IDENTITY,
       reconnectBackoff: { baseMs: 1, capMs: 1, maxAttempts: 1 },
       timeoutArbitrationGraceMs: 10,
+      // Short enough that the post-deadline liveness probe RUNS inside this
+      // test: the fake answers its Ping, so the probe must EXONERATE the
+      // socket — the connections===1 assertion below fences the keep arm.
+      livenessProbeWindowMs: 30,
     });
 
     try {
@@ -644,9 +653,55 @@ describe("SubcClient managed call", () => {
         kind: "outcome_unknown",
         code: "deadline_exceeded_no_drop_observed",
       });
-      // Give any (erroneous) reconnect a chance to open a second connection.
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Give the probe time to complete and any (erroneous) teardown/reconnect
+      // a chance to open a second connection.
+      await new Promise((resolve) => setTimeout(resolve, 100));
       expect(stats.connections).toBe(1);
+      // The exonerated socket must still CARRY calls: a probe that convicts
+      // despite the answered Ping closes it, and this second call would then
+      // reconnect — the connection count fences the keep arm only through a
+      // call that exercises the kept socket.
+      await expect(client.call("managed-provider", "mutate", { n: 2 }, { timeoutMs: 60 })).rejects.toMatchObject({
+        code: "deadline_exceeded_no_drop_observed",
+      });
+      expect(stats.connections).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a half-open socket is convicted by the liveness probe and the next call reconnects", async () => {
+    // The peer accepts one request then vanishes WITHOUT a FIN/RST (host
+    // sleep/wake shape): the deadline settles as deadline-no-drop, which
+    // deliberately keeps the socket — so without the probe this client would
+    // pin every future call to the corpse forever (the 2026-08-22 session
+    // outage). The probe's Ping goes unanswered, the socket is convicted and
+    // closed, and the NEXT call must reconnect and succeed.
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, dataMode: "half-open" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: { baseMs: 1, capMs: 5, maxAttempts: 4 },
+      timeoutArbitrationGraceMs: 10,
+      livenessProbeWindowMs: 40,
+    });
+
+    try {
+      await expect(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 })).rejects.toMatchObject({
+        kind: "outcome_unknown",
+        code: "deadline_exceeded_no_drop_observed",
+      });
+      // Let the probe window elapse and the conviction land.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      // The corpse is closed: this call reconnects (second daemon connection,
+      // fresh route) and completes against the now-normal serving arm.
+      const reply = await client.call("managed-provider", "mutate", { n: 2 }, { timeoutMs: 1_000 });
+      expect(reply).toMatchObject({ params: { n: 2 } });
+      expect(stats.connections).toBe(2);
     } finally {
       client.close();
     }
@@ -685,9 +740,19 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
   const deadline = Date.now() + 5_000;
   await authenticateFakeServer(reader, socket, deadline, options.key ?? KEY);
   let routeChannel = 41;
+  // half-open mode: once tripped, this connection reads forever and answers
+  // NOTHING (Pings included) — TCP stays open, the peer is effectively gone.
+  let deaf = false;
 
   for (;;) {
     const frame = await readFrame(reader, deadline);
+    if (deaf) continue;
+    if (frame.header.ty === FrameType.Ping && frame.header.channel === 0) {
+      // The real daemon always answers channel-0 Pings (subc-core control.rs);
+      // the liveness probe's exonerate arm depends on it.
+      await writeFrame(socket, pongFrame(frame), deadline);
+      continue;
+    }
     if (frame.header.ty !== FrameType.Request) continue;
 
     const requestFrame: { channel: number; controlOp?: string } = { channel: frame.header.channel };
@@ -745,6 +810,12 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       // deadline with no drop. Loop back to keep reading (and stay alive).
       continue;
     }
+    if (options.dataMode === "half-open" && options.stats.dataRequests === 1) {
+      // First data request only: later connections serve normally (echo), so a
+      // test can prove recovery-after-conviction end to end.
+      deaf = true;
+      continue;
+    }
     if (options.dataMode === "delay-body") {
       // Write the reply HEADER now, then the BODY after a delay, so the client's
       // read loop is parked mid-frame (bytes buffered) when a short deadline fires.
@@ -790,6 +861,10 @@ function responseFrame(request: Frame, body: unknown): Frame {
 
 function errorFrame(request: Frame, body: { code: string; message: string }): Frame {
   return buildFrame(FrameType.Error, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
+}
+
+function pongFrame(ping: Frame): Frame {
+  return buildFrame(FrameType.Pong, buildFlags(false, Priority.Interactive, false), 0, 0, ping.header.corr, new Uint8Array());
 }
 
 function controlPushFrame(body: Uint8Array): Frame {

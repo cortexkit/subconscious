@@ -56,6 +56,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 // NOT a deadline extension: an absent reply still settles right after the check
 // phase. Capped so it can never approach BODY_READ_TIMEOUT_MS.
 const TIMEOUT_ARBITRATION_GRACE_MS = 50;
+const LIVENESS_PROBE_WINDOW_MS = 2000;
 // Internal marker set as the `code` on the SubcError a request-deadline timeout
 // rejects with, so the managed classifier can tell a deadline (reply may simply
 // not have been read in time) from an actual connection drop. Never surfaced to
@@ -261,6 +262,15 @@ export interface ConnectOptions {
   /** Injectable sleep for timer-free reconnect tests. */
   sleep?: (ms: number) => Promise<void>;
   /**
+   * Window the post-deadline liveness probe waits for ANY inbound frame after
+   * sending its channel-0 Ping before convicting the socket as half-open.
+   * Genuine event-loop starvation self-protects at any setting: a loop starved
+   * enough to delay the probe's check also delays the read loop, and when it
+   * wakes the buffered Pong dispatches first. Exposed for deterministic tests.
+   */
+  livenessProbeWindowMs?: number;
+
+  /**
    * Hard cap on the timeout-arbitration grace window (see
    * TIMEOUT_ARBITRATION_GRACE_MS). A reply whose bytes are actively arriving when
    * the request deadline fires is given up to this long to finish dispatching
@@ -298,6 +308,7 @@ interface NormalizedConnectOptions {
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   timeoutArbitrationGraceMs: number;
+  livenessProbeWindowMs: number;
   onControlPush?: (push: ControlPush) => void;
 }
 
@@ -475,6 +486,14 @@ export class SubcClient {
           // late under load), so tearing it down would abandon a healthy connection
           // and its other in-flight routes for nothing.
           this.scheduleReconnectAfterDrop(err);
+        } else if (err.kind === "outcome_unknown" && err.code === DEADLINE_NO_DROP_CODE) {
+          // Keeping the socket is only correct when the socket is actually
+          // alive. A HALF-OPEN socket (peer gone with no FIN/RST — the
+          // post-sleep/wake shape) produces the identical observable, and
+          // keeping it pins every future call to a corpse: this exact keep
+          // turned one host sleep into a whole session's tool outage. The
+          // probe supplies the discriminator neither timer can.
+          this.probeLivenessAfterDeadline();
         }
         throw err;
       }
@@ -929,6 +948,73 @@ export class SubcClient {
     }
   }
 
+  // Stamped by dispatch() on every inbound frame; read by the liveness probe.
+  private lastInboundAtMs = 0;
+  // Single-flight guard: overlapping deadline-no-drop settles share one probe.
+  private livenessProbe: Promise<void> | null = null;
+
+  /**
+   * Discriminate event-loop starvation from a half-open socket after a
+   * deadline-no-drop settle. The arbitration deliberately keeps the socket on
+   * that verdict (a late-read reply under load must not cost a healthy
+   * connection), but a half-open socket — peer vanished with no FIN/RST, as
+   * after host sleep/wake — yields the SAME verdict forever, so the keep
+   * becomes a permanent pin to a dead transport. The discriminator is
+   * socket-level liveness evidence: send a channel-0 Ping (the daemon always
+   * answers — subc-core control.rs) and require ANY inbound frame within the
+   * window; the Pong suffices, and a busy socket's other traffic proves the
+   * link just as well. Silence convicts: the socket is failed with a named
+   * cause and closed, so the ordinary drop path (pending rejection now,
+   * reconnect on the next call) takes over.
+   *
+   * Starvation cannot be falsely convicted by a short window: a loop starved
+   * enough to delay the read loop delays this probe's own timer identically,
+   * and when both wake the buffered Pong dispatches before the check runs.
+   *
+   * Scope: hooked from the managed-call path only. Control-plane requests
+   * (route.open, catalog.list) are short-lived and their failures already
+   * escalate through reconnect classification; the managed path is where a
+   * plugin lives for hours and where the pin was observed in production.
+   */
+  private probeLivenessAfterDeadline(): void {
+    if (this.livenessProbe || this.closeStarted || this.closedErr) return;
+    const sock = this.sock;
+    const generation = this.generation;
+    let corr: bigint;
+    try {
+      corr = this.allocateCorr();
+    } catch {
+      return; // allocator exhausted: the next reconnect resets it
+    }
+    const t0 = Date.now();
+    const ping = buildFrame(
+      FrameType.Ping,
+      buildFlags(false, Priority.Interactive, false, AdmissionClass.Normal),
+      0,
+      0,
+      corr,
+      new Uint8Array(),
+    );
+    const probe = (async (): Promise<void> => {
+      // A failed WRITE is not exonerating: swallow it and let the window
+      // check run — a socket that cannot carry a Ping will not produce an
+      // inbound frame either, and conviction is the right verdict.
+      await writeBorrowed(sock, encodeFrame(ping), t0 + this.opts.livenessProbeWindowMs).catch(() => {});
+      await this.opts.sleep(this.opts.livenessProbeWindowMs);
+      if (this.sock !== sock || this.generation !== generation || this.closeStarted) return;
+      if (this.lastInboundAtMs >= t0) return; // link proven — keep the socket
+      this.fail(
+        new SocketClosedError(
+          `liveness probe convicted a half-open socket: no inbound frame for ${this.opts.livenessProbeWindowMs}ms after a channel-0 Ping (deadline-no-drop settles preceded this); closing so the next call reconnects`,
+        ),
+      );
+      sock.close();
+    })().finally(() => {
+      this.livenessProbe = null;
+    });
+    this.livenessProbe = probe;
+  }
+
   private async ensureConnectedForManaged(): Promise<void> {
     if (this.closeStarted) throw new SubcError("client closed");
     if (this.reconnecting) await this.reconnecting;
@@ -1061,6 +1147,11 @@ export class SubcClient {
   }
 
   private dispatch(frame: Frame): void {
+    // Every dispatched frame proves the socket delivers inbound bytes; the
+    // post-deadline liveness probe reads this stamp. Stamped after readLoop's
+    // generation gate, so a stale socket's late frames never vouch for the
+    // live one.
+    this.lastInboundAtMs = Date.now();
     if (frame.header.channel === 0 && frame.header.ty === FrameType.Push) {
       // Daemon-originated control push (route.closing / route.closed / future
       // ops). Never matches a pending (corr is daemon-chosen), never an error
@@ -1363,6 +1454,7 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS,
+    livenessProbeWindowMs: opts.livenessProbeWindowMs ?? LIVENESS_PROBE_WINDOW_MS,
     onControlPush: opts.onControlPush,
   };
 }

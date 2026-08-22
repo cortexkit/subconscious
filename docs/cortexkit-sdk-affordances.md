@@ -7,6 +7,12 @@ the shared host process. A starved or wedged host kills every lane at once while
 until you touch a plugin lane. The capability you lose is the TOOL SURFACE, not
 the wire: a fresh child process is untouched by the host's starvation.
 
+THE OUTAGE WILL EAT YOUR REPORT OF IT. The reporting channel (peer/board/ask
+tools) and the failing channel share a backend, so the natural first reaction --
+"tell someone" -- fails with the same error, and a seat that does not know this
+section exists will conclude the fleet is down rather than that its own lanes
+are. Do not spend retries deciding: use a fresh process.
+
 Emergency paths, proven in the 2026-08-22 outage:
 
 - **Write (peer message, e.g. to raise an alarm):** spawn a fresh `SubcConsumer`

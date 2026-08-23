@@ -54,6 +54,7 @@ impl ServerAuth {
         )
     }
 
+    // Production limits are deliberately not config-routed: loosening pre-auth DoS posture changes attack surface.
     pub fn with_limits(
         key: Vec<u8>,
         daemon_id: [u8; DAEMON_ID_LEN],

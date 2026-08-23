@@ -38,6 +38,19 @@ pub mod frame;
 pub mod manifest;
 pub mod session;
 
+/// Canonical error codes emitted while opening a client route.
+///
+/// Error frames remain extensible strings, but these daemon-owned route-open
+/// outcomes need identical spelling across the daemon and SDK retry policies.
+pub mod error_codes {
+    pub const UNKNOWN_MODULE: &str = "unknown_module";
+    pub const MODULE_REMOVED: &str = "module_removed";
+    pub const MODULE_RELOADING: &str = "module_reloading";
+    pub const MODULE_WARMING: &str = "module_warming";
+    pub const TARGET_UNAVAILABLE: &str = "target_unavailable";
+    pub const MODULE_TIMEOUT: &str = "module_timeout";
+}
+
 pub use frame::{Frame, FrameBuildError};
 
 /// Per-route bind identity shared by client-facing and module-facing control.

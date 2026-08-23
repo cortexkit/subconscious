@@ -482,6 +482,12 @@ pub struct SupervisorHandle {
     /// holder, not the NAME (found live by CKCRED's canary probe registering
     /// against a reserved scratch id).
     reserved_nonces: Arc<Mutex<HashMap<String, Option<String>>>>,
+    /// Module ids removed by an executed rescan and the unix-millisecond removal time.
+    ///
+    /// This is deliberately in-memory only: subc is state-free across daemon
+    /// restarts, and the tombstone only explains the hours-after-removal window
+    /// while this executing daemon is still alive. Do not persist it in a store.
+    removal_tombstones: Arc<Mutex<HashMap<String, u64>>>,
     /// The current launch nonce for every supervised spawn. This is separate from
     /// reserved_nonces because consumer route.open attestation applies to all spawned
     /// modules, while HELLO id-squatting protection remains opt-in via `reserved`.
@@ -564,9 +570,15 @@ impl SupervisorHandle {
             // holder, and the entry's absence is what used to leave the name
             // open to the first claimant.
             reserved_nonces.insert(spec.module_id.clone(), spawn_nonce);
-        } else {
-            reserved_nonces.remove(&spec.module_id);
         }
+        drop(reserved_nonces);
+        // A later unreserved declaration must not silently unreserve an id that
+        // was retained after its reserved configuration was removed. The explicit
+        // release ceremony is the only operation that retires that gate.
+        self.removal_tombstones
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&spec.module_id);
     }
 
     /// Whether a HELLO claiming `module_id` is authorized. An exact reserved id is
@@ -723,10 +735,16 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(module_id);
-        self.reserved_nonces
+        let mut reserved_nonces = self
+            .reserved_nonces
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(module_id);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reserved_nonces.contains_key(module_id) {
+            // The old nonce must die with the removed process, but the exact-id
+            // gate remains until an operator explicitly releases it.
+            reserved_nonces.insert(module_id.to_string(), None);
+        }
+        drop(reserved_nonces);
         self.reserved_prefix_owners
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -735,6 +753,44 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(module_id)
+    }
+
+    /// Remember a module removed by a non-preview rescan so route.open can
+    /// distinguish that intentional removal from an unknown id.
+    pub(crate) fn record_rescan_removal(&self, module_id: &str) {
+        self.removal_tombstones
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(module_id.to_string(), unix_ms_now());
+    }
+
+    /// Return how long ago a rescan removed this module in milliseconds.
+    pub(crate) fn removal_tombstone_age_ms(&self, module_id: &str) -> Option<u64> {
+        self.removal_tombstones
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .copied()
+            .map(|removed_at_ms| unix_ms_now().saturating_sub(removed_at_ms))
+    }
+
+    /// Retire a reserved-id gate only after its module has left supervision.
+    ///
+    /// A retained gate has no live nonce (`None`), so releasing any other entry
+    /// would weaken a currently configured or otherwise active reservation.
+    pub(crate) fn release_retained_reserved_gate(&self, module_id: &str) -> bool {
+        if self.get(module_id).is_some() {
+            return false;
+        }
+        let mut reserved_nonces = self
+            .reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(reserved_nonces.get(module_id), Some(None)) {
+            return false;
+        }
+        reserved_nonces.remove(module_id);
+        true
     }
 
     pub(crate) fn operation_lock(&self) -> Arc<AsyncMutex<()>> {
@@ -2201,6 +2257,33 @@ fn jittered_health_delay(module_id: &str, probe_index: u64, cadence: Duration) -
         },
     );
     cadence + Duration::from_millis(hash % jitter_span)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readding_a_module_clears_its_rescan_removal_tombstone() {
+        let handle = SupervisorHandle::new();
+        let module_id = "readded-tombstone";
+        handle.record_rescan_removal(module_id);
+        assert!(handle.removal_tombstone_age_ms(module_id).is_some());
+
+        handle.apply_identity_configuration(&ModuleSpec {
+            module_id: module_id.to_string(),
+            program: PathBuf::from("/test/module"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        });
+
+        assert!(
+            handle.removal_tombstone_age_ms(module_id).is_none(),
+            "a re-added module must not retain a stale removal tombstone"
+        );
+    }
 }
 
 fn unix_ms_now() -> u64 {

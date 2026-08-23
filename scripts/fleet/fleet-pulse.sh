@@ -981,6 +981,41 @@ for spec in "broca:ck-broca" "engram:ck-engram" "fusiform:ck-fusiform"; do
   fi
 done
 
+# Commons crates publish by tag push (<crate>-v<version>); a merged-but-untagged
+# crate is invisible from BOTH ends (QTA, twice on the same crate): the producer
+# sees the merge and assumes the release followed, the consumer sees the old
+# registry version and assumes batching, and the artifact that would surface the
+# gap -- the tag -- is exactly the thing that is missing. Same grace floor as
+# binaries: age from the bump commit, so a mid-release window stays dim.
+COMMONS="$HOME/Work/Projects/CortexKit/commons"
+if [ -d "$COMMONS/.git" ]; then
+  crates_seen=0
+  for ct in "$COMMONS"/crates/*/Cargo.toml; do
+    [ -f "$ct" ] || continue
+    crate=$(basename "$(dirname "$ct")")
+    manifest=$(grep -m1 '^version *= *"' "$ct" | sed 's/.*"\(.*\)".*/\1/')
+    [ -n "$manifest" ] || continue
+    crates_seen=$((crates_seen + 1))
+    tagv=$(cd "$COMMONS" && git tag --list "$crate-v[0-9]*" --sort=-v:refname 2>/dev/null | head -1)
+    tagv="${tagv#"$crate-v"}"
+    # Never-tagged crates are unpublished by omission (documented in README);
+    # only a crate with at least one release tag has a ledger to keep.
+    [ -n "$tagv" ] || continue
+    if [ "$manifest" != "$tagv" ]; then
+      bump_epoch=$(cd "$COMMONS" && git log -1 --format='%ct' -S"version = \"$manifest\"" -- "crates/$crate/Cargo.toml" 2>/dev/null)
+      age_min=$(( (NOW_EPOCH - ${bump_epoch:-NOW_EPOCH}) / 60 ))
+      if [ "$age_min" -ge 90 ]; then
+        echo "  commons/$crate: manifest $manifest tag ${tagv} -- MERGED BUT NEVER TAGGED for ${age_min}m"
+      else
+        dim "  commons/$crate: manifest $manifest tag ${tagv} -- mid-release (bump ${age_min}m old, grace 90m)"
+      fi
+    fi
+  done
+  [ "$crates_seen" -ge 1 ] || echo "  commons: VACUOUS (0 crates examined at $COMMONS/crates)"
+else
+  echo "  commons: skipped (no repo at $COMMONS)"
+fi
+
 # The daemon is not a module, so a module-derived list structurally cannot reach
 # it -- and it is the one binary whose staleness affects every other. Checked
 # separately for that reason, against the subc-core crates only: a commit to the

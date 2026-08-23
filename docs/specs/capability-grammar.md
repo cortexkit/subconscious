@@ -207,6 +207,17 @@ consumers):
 7. Owner drafting round for remaining cuts; consumers migrate joins
    opportunistically.
 
+### Candidate deny-edges (recorded as they surface)
+
+- `condition-runner` → `credentials-provider/v1` (keyless-by-design; the
+  founding edge).
+- display-producing modules → `federation-transport/v1`: CALLO's streaming-room
+  boundary (2026-08-23) — display frames may reach the fed hop only via the
+  producer-coalesced ring, because a raw display lane at fast-provider cadence
+  (measured 20x spread, 67 records/s) becomes per-record crypto and per-message
+  relay cost. A deny-edge makes "cannot be constructed" a route.open check
+  instead of a topology fact that silently acquires edges.
+
 ## 9. Open questions (for Athena rounds)
 
 - Capability version evolution: additive op growth within a version vs new

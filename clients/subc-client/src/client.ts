@@ -1445,8 +1445,8 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
  * is booting, mid-reload, transiently absent, or the bind relay timed out. A
  * daemon-rejected route.open is provably pre-send (no data frame ever left the
  * client), so these classify as not_sent; the managed path retries them in-place
- * within ROUTE_OPEN_RETRY_DEADLINE_MS. Permanent rejections (bad_consumer_identity,
- * config_divergence, unknown_target, ...) are excluded — they are pre-send but
+ * within ROUTE_OPEN_RETRY_DEADLINE_MS. Permanent rejections (module_removed,
+ * bad_consumer_identity, config_divergence, unknown_target, ...) are excluded — they are pre-send but
  * would never succeed, so retrying them would only storm the daemon. Kept
  * byte-identical to subc-client-rs is_retryable_route_open_code for cross-client
  * classification parity.

@@ -165,6 +165,12 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             ClientControlRequest::SupervisorRescan { preview: true },
         ),
         (
+            "client_control_request_supervisor_release_reserved",
+            ClientControlRequest::SupervisorReleaseReserved {
+                module_id: "vault".to_string(),
+            },
+        ),
+        (
             "client_control_request_supervisor_set_enabled",
             ClientControlRequest::SupervisorSetEnabled {
                 module_id: "aft-tools".to_string(),
@@ -473,6 +479,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.restart".to_string(),
         "supervisor.reload".to_string(),
         "supervisor.rescan".to_string(),
+        "supervisor.release_reserved".to_string(),
         "supervisor.set_enabled".to_string(),
         "supervisor.health_probe".to_string(),
         "supervisor.health".to_string(),

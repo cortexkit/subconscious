@@ -97,3 +97,21 @@ Emergency paths, proven in the 2026-08-22 outage:
 
 Do not restart the shared host process yourself: one host serves every seat, so
 the restart is fleet-wide and the human's call.
+
+## When the SDK ships a safety fix (producer-side duty)
+
+An SDK-level fix reaches SDK consumers by version bump and reaches
+direct-transport consumers **not at all** — they hand-roll the vulnerable code
+against `subc-transport`/`subc-protocol` and there is nothing for them to pick
+up. Two independent fixes have now missed the same modules this way (the
+retained-dead-connection census and the half-open liveness probe), so the gap
+is a targeting rule, not a coincidence:
+
+**Every client-side safety fix ships with an explicit answer to "does this
+reach the direct-transport consumers?"** The hand-rolled population is small,
+known, and slow-moving (engram, claustrum, mcp-stdio-adapter, subc-mcp shim
+paths, wernicke, thalamus gateway lanes — re-derive with the scan in
+`scripts/fleet/` rather than trusting this list). When the answer is no, the
+fix announcement names the population and states what each module must port,
+in the same message that announces the SDK release — the notification is the
+producer's duty because only the producer knows the fix exists.

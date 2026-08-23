@@ -1,25 +1,109 @@
 {
-  "comment": "Machine-readable fleet denominator: every supervised module, its source repo, and how its binary is acquired. Consumers: E2E's cross-module gate derives its checkout list from this file (per-module exclusions carry reasons here, never in a hand-list); fleet-pulse diffs the DEPLOYED subc.jsonc roster against this file both directions, so deployed-vs-committed drift alarms at the seat that owns deployed state. Update rule: any change to the supervised module set lands here in the same change; the fleet-pulse two-arm diff is the tripwire for forgetting.",
+  "comment": "Machine-readable fleet denominator: every supervised module, its source repo, and how its binary is acquired. Consumers: E2E's cross-module gate derives its checkout list from this file (per-module exclusions carry reasons here, never in a hand-list); fleet-pulse diffs the DEPLOYED subc.jsonc roster against this file both directions, so deployed-vs-committed drift alarms at the seat that owns deployed state. Update rule: any change to the supervised module set lands here in the same change; the fleet-pulse two-arm diff is the tripwire for forgetting. Build-only dependency repos (no supervised module, but path-dep targets of siblings) carry rows in build_dependencies with reasons -- a checkout derivation is manifest source repos UNION build_dependencies; deriving from modules alone drops the repo whose bumps start lock waves.",
   "version": 1,
   "modules": {
-    "aft":               { "repo": "cortexkit/aft",           "binary": "ck-aft",              "acquisition": "release_binary", "gate_exclusion_reason": "acquired as reviewed release asset by design; not built from source by consumers" },
-    "astrocyte":         { "repo": "cortexkit/astrocyte",     "binary": "ck-astrocyte",        "acquisition": "source" },
-    "broca":             { "repo": "cortexkit/broca",         "binary": "ck-broca",            "acquisition": "source" },
-    "callosum":          { "repo": "cortexkit/callosum",      "binary": "ck-callosum",         "acquisition": "source" },
-    "cerebellum":        { "repo": "cortexkit/cerebellum",    "binary": "ck-cerebellum",       "acquisition": "source" },
-    "claustrum":         { "repo": "cortexkit/claustrum",     "binary": "ck-claustrum",        "acquisition": "source" },
-    "condition-runner":  { "repo": "cortexkit/subconscious",  "binary": "ck-condition-runner", "acquisition": "source", "comment": "compiled bun binary staged from the wakes lane; source of truth is the vendored runner in subconscious" },
-    "engram":            { "repo": "cortexkit/engram",        "binary": "ck-engram",           "acquisition": "source" },
-    "entorhinal":        { "repo": "cortexkit/entorhinal",    "binary": "ck-entorhinal",       "acquisition": "source" },
-    "fusiform":          { "repo": "cortexkit/fusiform",      "binary": "ck-fusiform",         "acquisition": "source" },
-    "insula":            { "repo": "cortexkit/insula",        "binary": "ck-insula",           "acquisition": "source" },
-    "magic-context":     { "repo": "cortexkit/magic-context", "binary": "ck-mc",               "acquisition": "source" },
-    "plexus":            { "repo": "cortexkit/plexus",        "binary": "ck-plexus",           "acquisition": "source" },
-    "prefrontal-core":   { "repo": "cortexkit/prefrontal",    "binary": "ck-prefrontal-core",  "acquisition": "source" },
-    "prefrontal-routing":{ "repo": "cortexkit/prefrontal",    "binary": "ck-prefrontal-routing","acquisition": "source" },
-    "subc-mcp":          { "repo": "cortexkit/subconscious",  "binary": "ck-subc-mcp",         "acquisition": "source" },
-    "synapse":           { "repo": "cortexkit/synapse",       "binary": "ck-synapse",          "acquisition": "source" },
-    "thalamus":          { "repo": "cortexkit/thalamus",      "binary": "ck-thalamus",         "acquisition": "source" },
-    "wernicke":          { "repo": "cortexkit/wernicke",      "binary": "ck-wernicke",         "acquisition": "source" }
+    "aft": {
+      "repo": "cortexkit/aft",
+      "binary": "ck-aft",
+      "acquisition": "release_binary",
+      "gate_exclusion_reason": "acquired as reviewed release asset by design; not built from source by consumers"
+    },
+    "astrocyte": {
+      "repo": "cortexkit/astrocyte",
+      "binary": "ck-astrocyte",
+      "acquisition": "source"
+    },
+    "broca": {
+      "repo": "cortexkit/broca",
+      "binary": "ck-broca",
+      "acquisition": "source"
+    },
+    "callosum": {
+      "repo": "cortexkit/callosum",
+      "binary": "ck-callosum",
+      "acquisition": "source"
+    },
+    "cerebellum": {
+      "repo": "cortexkit/cerebellum",
+      "binary": "ck-cerebellum",
+      "acquisition": "source"
+    },
+    "claustrum": {
+      "repo": "cortexkit/claustrum",
+      "binary": "ck-claustrum",
+      "acquisition": "source"
+    },
+    "condition-runner": {
+      "repo": "cortexkit/subconscious",
+      "binary": "ck-condition-runner",
+      "acquisition": "source",
+      "comment": "compiled bun binary staged from the wakes lane; source of truth is the vendored runner in subconscious"
+    },
+    "engram": {
+      "repo": "cortexkit/engram",
+      "binary": "ck-engram",
+      "acquisition": "source"
+    },
+    "entorhinal": {
+      "repo": "cortexkit/entorhinal",
+      "binary": "ck-entorhinal",
+      "acquisition": "source"
+    },
+    "fusiform": {
+      "repo": "cortexkit/fusiform",
+      "binary": "ck-fusiform",
+      "acquisition": "source"
+    },
+    "insula": {
+      "repo": "cortexkit/insula",
+      "binary": "ck-insula",
+      "acquisition": "source"
+    },
+    "magic-context": {
+      "repo": "cortexkit/magic-context",
+      "binary": "ck-mc",
+      "acquisition": "source"
+    },
+    "plexus": {
+      "repo": "cortexkit/plexus",
+      "binary": "ck-plexus",
+      "acquisition": "source"
+    },
+    "prefrontal-core": {
+      "repo": "cortexkit/prefrontal",
+      "binary": "ck-prefrontal-core",
+      "acquisition": "source"
+    },
+    "prefrontal-routing": {
+      "repo": "cortexkit/prefrontal",
+      "binary": "ck-prefrontal-routing",
+      "acquisition": "source"
+    },
+    "subc-mcp": {
+      "repo": "cortexkit/subconscious",
+      "binary": "ck-subc-mcp",
+      "acquisition": "source"
+    },
+    "synapse": {
+      "repo": "cortexkit/synapse",
+      "binary": "ck-synapse",
+      "acquisition": "source"
+    },
+    "thalamus": {
+      "repo": "cortexkit/thalamus",
+      "binary": "ck-thalamus",
+      "acquisition": "source"
+    },
+    "wernicke": {
+      "repo": "cortexkit/wernicke",
+      "binary": "ck-wernicke",
+      "acquisition": "source"
+    }
+  },
+  "build_dependencies": {
+    "commons": {
+      "repo": "cortexkit/commons",
+      "reason": "not a supervised module; path-dep target of every Rust sibling (cortexkit-store-types, cortexkit-paths, cortexkit-lease); version bumps here invalidate sibling committed locks, so any cross-module gate must build against it"
+    }
   }
 }

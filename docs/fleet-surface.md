@@ -4,10 +4,13 @@ Op lists are machine-extracted from the live daemon (`catalog.list`, daemon 0.7.
 2026-08-23). One-line descriptions: tool descriptions come verbatim (truncated)
 from module manifests; management-surface ops carry no wire descriptions, so
 those lines are curated by hand and can drift — regenerate the op *lists* any
-time with:
+time from `clients/subc-client` (unset `SUBC_MODULE_ID`/`SUBC_LAUNCH_NONCE`):
 
-```
-bun clients/subc-client/.cortexkit/tmp-catalog-dump.ts   # catalog.list → JSON
+```ts
+import { SubcClient } from "./src/index.ts";
+const c = await SubcClient.connect({ connectionFile: process.env.HOME + "/.local/share/cortexkit/run/subc-connection.json" });
+console.log(JSON.stringify(await c.catalogList(), null, 2));
+c.close();
 ```
 
 `[q]` = query, `[m]` = mutate, `[tool]` = tool-provider tool (agent-facing).

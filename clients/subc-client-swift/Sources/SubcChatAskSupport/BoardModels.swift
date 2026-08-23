@@ -71,6 +71,43 @@ public struct BoardShowProps: Codable, Equatable {
     public var note: String?
 }
 
+/// One document-shaped block: the common shape behind the `artifact`, `note`,
+/// `report`, and `markdown` kinds.
+///
+/// These four kinds are distinct labels over one measured producer shape
+/// ({title, body?, path?, summary?, note?/text?} — counted from live fleet
+/// boards, where they were the majority of all blocks and previously fell to
+/// `.opaque`, rendering as nothing on phones). They deliberately share ONE arm
+/// rather than four: the renderer labels the row from `BoardBlock.kind`, and
+/// the model does not need to know what a "report" is.
+///
+/// Every field is optional because producers are agents writing against prompt
+/// guidance, not a schema; `digest.title` is the guaranteed row header when
+/// `title` is absent. `body` and `path` follow the same inline-vs-pointer
+/// contract as `BoardShowProps`.
+public struct BoardDocumentProps: Codable, Equatable {
+    public var title: String?
+    public var body: String?
+    /// Pointer to the deliverable on disk, for blocks whose body is the file.
+    public var path: String?
+    public var summary: String?
+    public var note: String?
+    /// The `note` kind carries its content under `text` rather than `body`.
+    public var text: String?
+    /// Reserved for prefrontal's content-addressed artifact store (trailing
+    /// slice of the artifacts redesign): an opaque `art_`-prefixed minted id.
+    /// Never parsed client-side. May coexist with `path` during transition;
+    /// absence means the block is not store-backed — nothing is fabricated.
+    public var artifactId: String?
+    /// Descriptor-sized rendering hints that ride with `artifactId`.
+    public var byteCount: Int64?
+    public var mime: String?
+
+    /// The renderable content, resolving the body-vs-text key split so callers
+    /// do not re-learn which kind uses which key.
+    public var content: String? { body ?? text }
+}
+
 /// Known v1 property shapes plus an opaque fallback.
 ///
 /// `.opaque` covers TWO cases. An earlier version of this comment claimed only the
@@ -87,6 +124,7 @@ public enum BoardBlockProps: Codable, Equatable {
     case status(BoardStatusProps)
     case ask(BoardAskProps)
     case show(BoardShowProps)
+    case document(BoardDocumentProps)
     case opaque(JSONValue)
 
     public init(from decoder: Decoder) throws {
@@ -101,6 +139,7 @@ public enum BoardBlockProps: Codable, Equatable {
         case let .status(value): try value.encode(to: encoder)
         case let .ask(value): try value.encode(to: encoder)
         case let .show(value): try value.encode(to: encoder)
+        case let .document(value): try value.encode(to: encoder)
         case let .opaque(value): try value.encode(to: encoder)
         }
     }
@@ -112,7 +151,10 @@ public enum BoardBlockProps: Codable, Equatable {
 public struct BoardBlock: Codable, Equatable, Identifiable {
     /// Kinds this model has a typed struct for. Kept in sync with the switch in
     /// `init(from:)` -- see the note there.
-    public static let knownKinds: Set<String> = ["text", "status", "ask", "show"]
+    public static let knownKinds: Set<String> = [
+        "text", "status", "ask", "show",
+        "artifact", "note", "report", "markdown",
+    ]
 
     public var blockId: String
     public var lane: String
@@ -185,6 +227,8 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
             case "status": typed(BoardStatusProps.self, BoardBlockProps.status)
             case "ask": typed(BoardAskProps.self, BoardBlockProps.ask)
             case "show": typed(BoardShowProps.self, BoardBlockProps.show)
+            case "artifact", "note", "report", "markdown":
+                typed(BoardDocumentProps.self, BoardBlockProps.document)
             default: nil
             }
         props = try decoded ?? .opaque(container.decode(JSONValue.self, forKey: .props))

@@ -165,6 +165,12 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             ClientControlRequest::SupervisorRescan { preview: true },
         ),
         (
+            "client_control_request_supervisor_release_reserved",
+            ClientControlRequest::SupervisorReleaseReserved {
+                module_id: "vault".to_string(),
+            },
+        ),
+        (
             "client_control_request_supervisor_set_enabled",
             ClientControlRequest::SupervisorSetEnabled {
                 module_id: "aft-tools".to_string(),
@@ -210,10 +216,14 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 connected_clients: 2,
                 counters: Some(serde_json::json!({
                     "module_frames_dropped_no_route": 3,
+                    "module_frames_dropped_no_route_by_module": { "vault": 3 },
+                    "module_frames_dropped_no_route_last_10m": 3,
+                    "module_frames_dropped_no_route_nonzero_minutes_last_10m": 3,
                     "client_frames_dropped_stale_route": 2,
                     "client_egress_close_delivery_failed": 1,
                     "goodbye_relay_client_failed": 4,
                     "goodbye_relay_module_dropped": 5,
+                    "goodbye_relay_module_dropped_by_module": { "vault": 5 },
                     "route_released_epoch_fenced": 6,
                     "route_release_stale_skipped": 7,
                 })),
@@ -473,6 +483,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.restart".to_string(),
         "supervisor.reload".to_string(),
         "supervisor.rescan".to_string(),
+        "supervisor.release_reserved".to_string(),
         "supervisor.set_enabled".to_string(),
         "supervisor.health_probe".to_string(),
         "supervisor.health".to_string(),

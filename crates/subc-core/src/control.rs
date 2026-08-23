@@ -14,6 +14,7 @@ use subc_control::{
     SupervisorRouteConsumer, SupervisorRouteModule, TerminalEntry, TerminalHistory,
 };
 use subc_protocol::{
+    error_codes,
     manifest::{Concurrency, ModuleManifest, ProviderRole},
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -63,6 +64,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_RESTART,
     ops::SUPERVISOR_RELOAD,
     ops::SUPERVISOR_RESCAN,
+    ops::SUPERVISOR_RELEASE_RESERVED,
     ops::SUPERVISOR_SET_ENABLED,
     ops::SUPERVISOR_HEALTH_PROBE,
     ops::SUPERVISOR_HEALTH,
@@ -615,7 +617,8 @@ impl ControlHandler {
                         self.counters.increment_goodbye_relay_client_failed();
                     }
                 } else {
-                    self.counters.increment_goodbye_relay_module_dropped();
+                    self.counters
+                        .increment_goodbye_relay_module_dropped(released.module_id.as_deref());
                     warn!(
                         target_connection_id = released.connection_id.get(),
                         route_channel = released.channel,
@@ -935,6 +938,10 @@ impl ControlHandler {
             ClientControlRequest::SupervisorRescan { preview } => {
                 self.handle_supervisor_rescan(frame, preview).await
             }
+            ClientControlRequest::SupervisorReleaseReserved { module_id } => {
+                self.handle_supervisor_release_reserved(frame, module_id)
+                    .await
+            }
             ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
                 self.handle_supervisor_set_enabled(frame, module_id, enabled)
                     .await
@@ -1178,9 +1185,18 @@ impl ControlHandler {
                     ),
                 )?]);
             }
+            if let Some(removed_ago_ms) =
+                self.supervisor.removal_tombstone_age_ms(&target_module_id)
+            {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    error_codes::MODULE_REMOVED,
+                    format!("module_id '{target_module_id}' was removed {removed_ago_ms} ms ago"),
+                )?]);
+            }
             return Ok(vec![control_error_frame(
                 &frame,
-                "unknown_module",
+                error_codes::UNKNOWN_MODULE,
                 format!("module_id '{target_module_id}' is not registered"),
             )?]);
         };
@@ -1888,6 +1904,74 @@ impl ControlHandler {
         )?])
     }
 
+    async fn handle_supervisor_release_reserved(
+        &self,
+        frame: Frame,
+        module_id: String,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(context) = self.rescan.clone() else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "release_unavailable",
+                "reserved-id release requires a daemon started with a reloadable config path",
+            )?]);
+        };
+        let operation_lock = self.supervisor.operation_lock();
+        let _operation_guard = operation_lock.lock().await;
+        let loaded = match crate::daemon_config::load(&context.config_path) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_daemon_config",
+                    format!(
+                        "daemon config not found at {}; refusing to release reserved module_id '{module_id}'",
+                        context.config_path.display()
+                    ),
+                )?])
+            }
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_daemon_config",
+                    format!("unable to verify reserved-id release against daemon config: {err}"),
+                )?])
+            }
+        };
+        if loaded
+            .modules
+            .iter()
+            .any(|configured| configured.module_id == module_id)
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_module_configured",
+                format!(
+                    "module_id '{module_id}' remains configured; remove its config entry and rescan before releasing its reserved id"
+                ),
+            )?]);
+        }
+        if !self.supervisor.release_retained_reserved_gate(&module_id) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_gate_not_retained",
+                format!(
+                    "module_id '{module_id}' has no retired reserved-id gate to release; rescan its removed reserved configuration first"
+                ),
+            )?]);
+        }
+
+        let response = ClientControlResponse::SupervisorAck {
+            module_id,
+            applied: true,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorAck",
+        )?])
+    }
+
     /// Reconcile the running module set against the configured one.
     ///
     /// With `preview` set, the diff is computed and returned WITHOUT applying any
@@ -1993,6 +2077,7 @@ impl ControlHandler {
                 format!("failed to retire module_id '{module_id}' during rescan: {err}")
             })?;
             self.supervisor.retire(module_id);
+            self.supervisor.record_rescan_removal(module_id);
         }
 
         for module_id in configured.keys() {

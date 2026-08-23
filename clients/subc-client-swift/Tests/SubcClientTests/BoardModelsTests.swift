@@ -4,6 +4,64 @@ import CryptoKit
 @testable import SubcChatAskSupport
 
 final class BoardModelsTests: XCTestCase {
+    /// The four document-shaped kinds decode into the shared `.document` arm with
+    /// their live-fleet prop shapes, `kind` preserved for the renderer's label.
+    /// Payloads mirror the measured producer shapes (artifact: body+title+path+
+    /// summary+note; note: title+text; report: title+path+summary with no body;
+    /// markdown: body+title+path).
+    func testDocumentKindsDecodeIntoSharedArmNotOpaque() throws {
+        let payloads: [(kind: String, props: String, expectContent: String?)] = [
+            ("artifact", "{\"title\":\"Fleet surface\",\"body\":\"all modules\",\"path\":\"docs/fleet-surface.md\",\"summary\":\"18 modules\",\"note\":\"live catalog\"}", "all modules"),
+            ("note", "{\"title\":\"Reminder\",\"text\":\"re-run the sweep\"}", "re-run the sweep"),
+            ("report", "{\"title\":\"Audit\",\"path\":\"docs/audits/r2.md\",\"summary\":\"3 findings\"}", nil),
+            ("markdown", "{\"title\":\"Runbook\",\"body\":\"# Steps\",\"path\":\"docs/runbook.md\"}", "# Steps"),
+        ]
+        for payload in payloads {
+            let json = "{\"blockId\":\"b1\",\"lane\":\"artifacts\",\"kind\":\"\(payload.kind)\",\"rev\":1,\"props\":\(payload.props),\"digest\":{\"title\":\"digest title\"}}"
+            let block = try JSONDecoder().decode(BoardBlock.self, from: Data(json.utf8))
+            XCTAssertEqual(block.kind, payload.kind)
+            switch block.props {
+            case let .document(props):
+                XCTAssertEqual(props.content, payload.expectContent, "content resolution for \(payload.kind)")
+            default:
+                XCTFail("\(payload.kind) must decode into .document, got \(block.props)")
+            }
+        }
+    }
+
+    /// Field fidelity on the richest shape (every measured artifact key survives)
+    /// plus the reserved store-backed fields ALF's redesign will emit.
+    func testDocumentArmPreservesAllFieldsIncludingReservedArtifactRef() throws {
+        let json = "{\"blockId\":\"b2\",\"lane\":\"artifacts\",\"kind\":\"artifact\",\"rev\":3,\"props\":{\"title\":\"T\",\"body\":\"B\",\"path\":\"P\",\"summary\":\"S\",\"note\":\"N\",\"artifactId\":\"art_9f2c\",\"byteCount\":2048,\"mime\":\"text/markdown\"},\"digest\":{\"title\":\"T\"}}"
+        let block = try JSONDecoder().decode(BoardBlock.self, from: Data(json.utf8))
+        switch block.props {
+        case let .document(props):
+            XCTAssertEqual(props.title, "T")
+            XCTAssertEqual(props.body, "B")
+            XCTAssertEqual(props.path, "P")
+            XCTAssertEqual(props.summary, "S")
+            XCTAssertEqual(props.note, "N")
+            XCTAssertEqual(props.artifactId, "art_9f2c")
+            XCTAssertEqual(props.byteCount, 2048)
+            XCTAssertEqual(props.mime, "text/markdown")
+        default:
+            XCTFail("artifact must decode into .document")
+        }
+    }
+
+    /// The document kinds are known kinds: a decoded document block must not count
+    /// as degraded, and `health` (deliberately unmodeled bookkeeping) stays out of
+    /// both the known set and the degraded count.
+    func testDocumentKindsAreKnownAndNotDegraded() throws {
+        let json = "{\"roomId\":\"rm_test\",\"sessionId\":\"ses_test\",\"vocabulary\":\"v2\",\"servedSeq\":1,\"lanes\":[\"artifacts\",\"status\"],\"blocks\":[{\"blockId\":\"a\",\"lane\":\"artifacts\",\"kind\":\"report\",\"rev\":1,\"props\":{\"title\":\"R\"},\"digest\":{\"title\":\"R\"}},{\"blockId\":\"h\",\"lane\":\"status\",\"kind\":\"health\",\"rev\":1,\"props\":{\"counters\":{\"asks\":{\"open\":2}}},\"digest\":{\"title\":\"health\"}}],\"servedBlocks\":2,\"totalBlocks\":2}"
+        let state = try JSONDecoder().decode(BoardState.self, from: Data(json.utf8))
+        XCTAssertEqual(state.degradedBlockCount, 0)
+        for kind in ["artifact", "note", "report", "markdown"] {
+            XCTAssertTrue(BoardBlock.knownKinds.contains(kind), "\(kind) must be a known kind")
+        }
+        XCTAssertFalse(BoardBlock.knownKinds.contains("health"), "health stays intentionally unmodeled")
+    }
+
     func testDecodesEveryFixtureBlockWithTypedKnownPropsAndOpaqueUnknown() throws {
         let blocks = try loadFixtureBlocks()
         XCTAssertEqual(blocks.count, 11)

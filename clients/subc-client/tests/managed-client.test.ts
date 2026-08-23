@@ -570,34 +570,56 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("surfaces a retryable route.open rejection as not_sent after the retry budget is exhausted", async () => {
-    // The target never comes up within the budget: the rejection is provably
-    // pre-send (no data frame left the client), so it must classify not_sent — not
-    // terminal — so the caller's own retry policy may safely re-attempt later.
-    const { connFile } = tempConnectionFile();
-    const stats = newStats();
-    const daemon = await startFakeDaemon({
-      stats,
+  test("module_removed fails fast while module_reloading retries at the same managed route.open call site", async () => {
+    // Both branches run through client.call's cached-route opener. A removal is
+    // intentional and permanent, while a reload can complete during the retry
+    // window; their attempt counts prove the classifier does not conflate them.
+    const reloadingConnection = tempConnectionFile();
+    const reloadingStats = newStats();
+    const reloadingDaemon = await startFakeDaemon({
+      stats: reloadingStats,
       routeOpenError: { code: "module_reloading", message: "target is reloading" },
     });
-    writeConnectionFile(connFile, daemon.port);
-
-    const client = await SubcClient.connect({
-      connectionFile: connFile,
+    writeConnectionFile(reloadingConnection.connFile, reloadingDaemon.port);
+    const reloadingClient = await SubcClient.connect({
+      connectionFile: reloadingConnection.connFile,
       identity: IDENTITY,
       reconnectBackoff: BACKOFF,
       sleep: async () => {},
     });
 
     try {
-      await expect(client.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
+      await expect(reloadingClient.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
         kind: "not_sent",
         code: "module_reloading",
       });
-      // Bounded by maxAttempts — did not storm the daemon.
-      expect(stats.routeOpens).toBe(BACKOFF.maxAttempts);
+      expect(reloadingStats.routeOpens).toBe(BACKOFF.maxAttempts);
     } finally {
-      client.close();
+      reloadingClient.close();
+    }
+
+    const removedConnection = tempConnectionFile();
+    const removedStats = newStats();
+    const removedDaemon = await startFakeDaemon({
+      stats: removedStats,
+      routeOpenError: { code: "module_removed", message: "target was removed" },
+    });
+    writeConnectionFile(removedConnection.connFile, removedDaemon.port);
+    const removedClient = await SubcClient.connect({
+      connectionFile: removedConnection.connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      sleep: async () => {},
+    });
+
+    try {
+      await expect(removedClient.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
+        kind: "terminal",
+        code: "module_removed",
+      });
+      expect(removedStats.routeOpens).toBe(1);
+    } finally {
+      removedClient.close();
     }
   });
 

@@ -197,6 +197,16 @@ impl Router {
 
     /// Start a connection-scoped routing context. Dropping the guard releases
     /// any control-plane registrations owned by the connection.
+    fn record_module_frame_drop(&self, connection_id: ConnectionId) -> Result<(), RouterError> {
+        let module_id = self
+            .forwarding
+            .module_id_for_connection(connection_id)
+            .map_err(RouterError::Forwarding)?;
+        self.counters
+            .increment_module_frames_dropped_no_route(module_id.as_deref());
+        Ok(())
+    }
+
     pub fn begin_connection(&self) -> RouterConnection {
         let raw = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let id = ConnectionId::new(raw);
@@ -250,7 +260,7 @@ impl Router {
                         ctx.egress.send(error_frame).await?;
                     }
                 } else {
-                    self.counters.increment_module_frames_dropped_no_route();
+                    self.record_module_frame_drop(ctx.connection_id)?;
                 }
                 debug!(
                     connection_id = ctx.connection_id.get(),
@@ -271,7 +281,7 @@ impl Router {
                         ctx.egress.send(error_frame).await?;
                     }
                 } else {
-                    self.counters.increment_module_frames_dropped_no_route();
+                    self.record_module_frame_drop(ctx.connection_id)?;
                 }
                 debug!(
                     connection_id = ctx.connection_id.get(),
@@ -292,7 +302,7 @@ impl Router {
                         ctx.egress.send(error_frame).await?;
                     }
                 } else {
-                    self.counters.increment_module_frames_dropped_no_route();
+                    self.record_module_frame_drop(ctx.connection_id)?;
                 }
                 debug!(
                     connection_id = ctx.connection_id.get(),
@@ -1311,6 +1321,10 @@ mod tests {
 
         let counters = router.counters.snapshot();
         assert_eq!(counters["goodbye_relay_module_dropped"], 1);
+        assert_eq!(
+            counters["goodbye_relay_module_dropped_by_module"],
+            serde_json::json!({ "epoch-router": 1 })
+        );
         assert_eq!(counters["route_released_epoch_fenced"], 1);
     }
 
@@ -1428,7 +1442,7 @@ mod tests {
     async fn non_request_module_frame_on_dead_route_is_counted_without_error() {
         let (
             router,
-            _forwarding,
+            forwarding,
             client_ctx,
             mut client_rx,
             module_ctx,
@@ -1436,6 +1450,16 @@ mod tests {
             mut module_rx,
             pending,
         ) = dynamic_route_fixture(true);
+        let (other_module_tx, _other_module_rx) = mpsc::channel(8);
+        forwarding
+            .register_module_connection(
+                ConnectionId::new(502),
+                "other-module".into(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(other_module_tx),
+            )
+            .unwrap();
         let _ = client_rx.recv().await.unwrap();
 
         router
@@ -1468,6 +1492,10 @@ mod tests {
         assert!(module_egress_rx.try_recv().is_err());
         let counters = router.counters.snapshot();
         assert_eq!(counters["module_frames_dropped_no_route"], 1);
+        assert_eq!(
+            counters["module_frames_dropped_no_route_by_module"],
+            serde_json::json!({ "epoch-router": 1 })
+        );
         assert_eq!(counters["module_requests_dropped_stale_route"], 0);
     }
 

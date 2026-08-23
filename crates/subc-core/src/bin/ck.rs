@@ -41,8 +41,11 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
+// Keep this conservative until the per-module split has supplied a week of
+// production baseline data; then calibrate whether every window minute is needed.
+const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -107,7 +110,7 @@ fn discover_external_domains() -> Vec<String> {
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
-  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it";
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    retire a removed module's retained reserved-id gate";
 
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
 
@@ -172,6 +175,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }) => module_restart(&mut client, &module_id, drain_timeout_ms, args.json).await,
         Command::Module(ModuleCommand::Rescan { preview }) => {
             module_rescan(&mut client, args.json, preview).await
+        }
+        Command::Module(ModuleCommand::ReleaseReserved { module_id }) => {
+            module_release_reserved(&mut client, &module_id, args.json).await
         }
         Command::Module(ModuleCommand::Stop { module_id }) => {
             module_set_enabled(&mut client, &module_id, false, args.json).await
@@ -287,7 +293,7 @@ fn print_dashboard(program: &Path, snapshot: &DashboardSnapshot, subc: Option<&P
         "daemon: {} ({build}) · pid {} · up {uptime} · {clients} clients",
         snapshot.daemon_ver, snapshot.pid
     );
-    print_dashboard_module_summary(&snapshot.modules, &snapshot.health);
+    print_dashboard_module_summary(&snapshot.modules, &snapshot.health, &snapshot.describe);
     print_static_domains();
     let footer = [
         next_step("ck health <id>", "for one module's metrics", subc),
@@ -331,7 +337,7 @@ fn print_dashboard_identity(program: &Path) {
     }
 }
 
-fn print_dashboard_module_summary(modules: &Value, health: &Value) {
+fn print_dashboard_module_summary(modules: &Value, health: &Value, describe: &Value) {
     let module_entries = modules_array(modules);
     let health_entries = modules_array(health);
     let running = module_entries
@@ -342,16 +348,26 @@ fn print_dashboard_module_summary(modules: &Value, health: &Value) {
         .iter()
         .filter(|module| dashboard_health_status(health_entries, module) == "ok")
         .count();
+    println!("modules: {running} running, {ok} ok");
+    println!(
+        "{}",
+        dashboard_alerts_line(module_entries, health_entries, describe)
+    );
+}
+
+/// The dashboard's alert line is kept as a rendered string so tests assert the
+/// exact operator-facing surface instead of only the counters that feed it.
+fn dashboard_alerts_line(modules: &[Value], health: &[Value], describe: &Value) -> String {
     let mut alerts = Vec::new();
-    for module in module_entries {
-        let status = dashboard_health_status(health_entries, module);
+    for module in modules {
+        let status = dashboard_health_status(health, module);
         if status != "ok" {
             alerts.push(display_field(module, "module_id"));
         }
     }
-    for entry in health_entries {
+    for entry in health {
         let module_id = display_field(entry, "module_id");
-        if !module_entries
+        if !modules
             .iter()
             .any(|module| display_field(module, "module_id") == module_id)
             && display_field(entry, "status") != "ok"
@@ -359,12 +375,47 @@ fn print_dashboard_module_summary(modules: &Value, health: &Value) {
             alerts.push(module_id);
         }
     }
-    println!("modules: {running} running, {ok} ok");
-    if alerts.is_empty() {
-        println!("alerts: none");
-    } else {
-        println!("alerts: {}", alerts.join(", "));
+    if let Some(alert) = dashboard_frame_drop_alert(describe) {
+        alerts.push(alert);
     }
+    if alerts.is_empty() {
+        "alerts: none".to_string()
+    } else {
+        format!("alerts: {}", alerts.join(", "))
+    }
+}
+
+fn dashboard_frame_drop_alert(describe: &Value) -> Option<String> {
+    let counters = describe.get("counters")?.as_object()?;
+    let nonzero_minutes = counters
+        .get("module_frames_dropped_no_route_nonzero_minutes_last_10m")?
+        .as_u64()?;
+    if nonzero_minutes != FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES {
+        return None;
+    }
+    let drops = counters
+        .get("module_frames_dropped_no_route_last_10m")?
+        .as_u64()?;
+    if drops == 0 {
+        return None;
+    }
+    let top_module = counters
+        .get("module_frames_dropped_no_route_by_module")
+        .and_then(Value::as_object)
+        .and_then(|modules| {
+            modules
+                .iter()
+                .filter_map(|(module_id, count)| count.as_u64().map(|count| (module_id, count)))
+                .max_by(|(left_id, left_count), (right_id, right_count)| {
+                    left_count
+                        .cmp(right_count)
+                        .then_with(|| right_id.cmp(left_id))
+                })
+                .map(|(module_id, _)| module_id)
+        })
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    Some(format!("frame drops ({drops} in 10m, top: {top_module})"))
 }
 
 fn dashboard_health_status(health_entries: &[Value], module: &Value) -> String {
@@ -511,6 +562,9 @@ enum ModuleCommand {
     },
     Rescan {
         preview: bool,
+    },
+    ReleaseReserved {
+        module_id: String,
     },
     Stop {
         module_id: String,
@@ -782,11 +836,15 @@ async fn module_status(
         .ok_or_else(|| CkError::Rejected(format!("module_id '{module_id}' is not supervised")))?;
     let health = supervisor_health(client).await?;
     let health_entry = find_module(&health, module_id).cloned();
+    let describe = client
+        .rpc_value(ClientControlRequest::ServerDescribe {})
+        .await?;
+    let frame_drops = module_frame_drop_count(&describe, module_id);
 
     if json_output {
         print_json(&json!({ "module": module, "health": health_entry }))?;
     } else {
-        print_status_table(&module, health_entry.as_ref());
+        print_status_table(&module, health_entry.as_ref(), frame_drops);
     }
     Ok(())
 }
@@ -1083,6 +1141,19 @@ async fn module_rescan(
         print_rescan_table(&result);
     }
     Ok(())
+}
+
+async fn module_release_reserved(
+    client: &mut CkClient,
+    module_id: &str,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let ack = client
+        .rpc_value(ClientControlRequest::SupervisorReleaseReserved {
+            module_id: module_id.to_string(),
+        })
+        .await?;
+    print_ack_with_state(client, module_id, ack, "release", json_output).await
 }
 
 async fn module_set_enabled(
@@ -2752,14 +2823,17 @@ fn print_rescan_table(result: &Value) {
     }
 }
 
-fn print_status_table(module: &Value, health: Option<&Value>) {
+fn print_status_table(module: &Value, health: Option<&Value>, frame_drops: Option<u64>) {
     let health_status = health
         .map(|entry| display_field(entry, "status"))
         .filter(|value| value != "-")
         .unwrap_or_else(|| display_field(module, "health"));
-    let detail = health
-        .map(|entry| display_field(entry, "detail"))
-        .unwrap_or_else(|| "-".to_string());
+    let detail = append_frame_drop_detail(
+        health
+            .map(|entry| display_field(entry, "detail"))
+            .unwrap_or_else(|| "-".to_string()),
+        frame_drops,
+    );
     let metrics = health
         .and_then(|entry| entry.get("metrics"))
         .map(display_json_value)
@@ -2801,6 +2875,27 @@ fn print_status_table(module: &Value, health: Option<&Value>) {
             truncate_cell(&metrics),
         ]],
     );
+}
+
+fn module_frame_drop_count(describe: &Value, module_id: &str) -> Option<u64> {
+    describe
+        .get("counters")
+        .and_then(Value::as_object)?
+        .get("module_frames_dropped_no_route_by_module")
+        .and_then(Value::as_object)?
+        .get(module_id)
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+}
+
+/// Add daemon-owned frame-drop telemetry to the module's existing detail cell,
+/// where the owning operator already looks for module-specific diagnostics.
+fn append_frame_drop_detail(detail: String, frame_drops: Option<u64>) -> String {
+    match frame_drops {
+        Some(frame_drops) if detail == "-" => format!("frames_dropped_no_route: {frame_drops}"),
+        Some(frame_drops) => format!("{detail}; frames_dropped_no_route: {frame_drops}"),
+        None => detail,
+    }
 }
 
 /// Render the restart budget as `used/allowed`, e.g. `2/3`.
@@ -3310,6 +3405,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 "rescan" => ModuleCommand::Rescan {
                     preview: tail.iter().any(|t| t == "--dry-run"),
                 },
+                "release" => ModuleCommand::ReleaseReserved { module_id: id(1)? },
                 "status" => ModuleCommand::Status { module_id: id(1)? },
                 // `-n <count>` narrows the tail daemon-side rather than here, so
                 // a caller asking for 20 lines is not shipped the whole ring to
@@ -3632,6 +3728,61 @@ mod tests {
 
     use super::*;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
+
+    #[test]
+    fn dashboard_alert_line_requires_drops_in_every_window_minute() {
+        let modules = Vec::new();
+        let health = Vec::new();
+        let scattered = json!({
+            "counters": {
+                "module_frames_dropped_no_route_last_10m": 9,
+                "module_frames_dropped_no_route_nonzero_minutes_last_10m": 9,
+                "module_frames_dropped_no_route_by_module": { "alpha": 9 }
+            }
+        });
+        assert_eq!(
+            dashboard_alerts_line(&modules, &health, &scattered),
+            "alerts: none",
+            "scattered drops must not create a dashboard alarm"
+        );
+
+        let sustained = json!({
+            "counters": {
+                "module_frames_dropped_no_route_last_10m": 14,
+                "module_frames_dropped_no_route_nonzero_minutes_last_10m": 10,
+                "module_frames_dropped_no_route_by_module": { "alpha": 5, "omega": 9 }
+            }
+        });
+        assert_eq!(
+            dashboard_alerts_line(&modules, &health, &sustained),
+            "alerts: frame drops (14 in 10m, top: omega)"
+        );
+    }
+
+    #[test]
+    fn module_status_detail_names_only_its_own_frame_drops() {
+        let describe = json!({
+            "counters": {
+                "module_frames_dropped_no_route_by_module": { "alpha": 3, "beta": 1 }
+            }
+        });
+        assert_eq!(module_frame_drop_count(&describe, "alpha"), Some(3));
+        assert_eq!(module_frame_drop_count(&describe, "idle"), None);
+        assert_eq!(
+            append_frame_drop_detail(
+                "healthy".to_string(),
+                module_frame_drop_count(&describe, "alpha")
+            ),
+            "healthy; frames_dropped_no_route: 3"
+        );
+        assert_eq!(
+            append_frame_drop_detail(
+                "healthy".to_string(),
+                module_frame_drop_count(&describe, "idle")
+            ),
+            "healthy"
+        );
+    }
 
     #[test]
     fn quota_progress_bars_have_fixed_width_at_thresholds() {
@@ -4340,6 +4491,20 @@ mod tests {
             Command::Module(ModuleCommand::Terminals { module_id }) if module_id == "aft"
         ));
         assert!(MODULE_HELP.contains("ck module terminals <id>"));
+    }
+
+    #[test]
+    fn module_release_is_parsed_and_documented() {
+        let command = parse_command(
+            "module",
+            &[OsString::from("release"), OsString::from("vault")],
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::Module(ModuleCommand::ReleaseReserved { module_id }) if module_id == "vault"
+        ));
+        assert!(MODULE_HELP.contains("ck module release <id>"));
     }
 
     #[test]

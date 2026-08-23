@@ -18,8 +18,8 @@ use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
 };
 use subc_protocol::{
-    AdmissionClass, BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority,
-    RouteTarget, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    error_codes, AdmissionClass, BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType,
+    Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 
 use crate::RouteHandle;
@@ -3655,11 +3655,11 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
 fn is_retryable_route_open_code(code: &str) -> bool {
     matches!(
         code,
-        "unknown_module"
-            | "module_reloading"
-            | "module_warming"
-            | "target_unavailable"
-            | "module_timeout"
+        error_codes::UNKNOWN_MODULE
+            | error_codes::MODULE_RELOADING
+            | error_codes::MODULE_WARMING
+            | error_codes::TARGET_UNAVAILABLE
+            | error_codes::MODULE_TIMEOUT
     )
 }
 
@@ -3993,8 +3993,84 @@ mod tests {
         ] {
             assert!(is_retryable_route_open_code(code), "{code} should retry");
         }
+        assert!(!is_retryable_route_open_code(error_codes::MODULE_REMOVED));
         assert!(!is_retryable_route_open_code("invalid_project_root"));
         assert!(!is_retryable_route_open_code("route_rejected"));
+    }
+
+    #[tokio::test]
+    async fn module_removed_fails_fast_while_module_reloading_retries_at_the_same_route_open_call_site(
+    ) {
+        async fn reject_route_open_attempts(code: &str, expected_attempts: usize) -> CallError {
+            let shared = Arc::new(Shared::new(
+                PathBuf::from("/tmp/does-not-exist"),
+                ConsumerOptions::default(),
+            ));
+            let (writer, mut receiver) = mpsc::channel(4);
+            {
+                let mut inner = shared.lock_inner();
+                inner.writer = Some(writer);
+            }
+            let consumer = SubcConsumer {
+                shared: Arc::clone(&shared),
+            };
+            let target = RouteTarget::ToolProvider {
+                module_id: "retry-polarity".to_string(),
+            };
+            let identity = BindIdentity {
+                project_root: PathBuf::from("/tmp/project"),
+                harness: "test".to_string(),
+                session: code.to_string(),
+            };
+            let options = CallOptions {
+                timeout: Duration::from_secs(1),
+                route_retry: RetryBackoff {
+                    base: Duration::ZERO,
+                    cap: Duration::ZERO,
+                    max_attempts: 2,
+                },
+                route_retry_deadline: Duration::from_secs(1),
+                ..CallOptions::default()
+            };
+            let task =
+                tokio::spawn(async move { consumer.open_route(target, identity, options).await });
+
+            for _ in 0..expected_attempts {
+                let command = tokio::time::timeout(Duration::from_millis(250), receiver.recv())
+                    .await
+                    .expect("route.open retry was not queued")
+                    .expect("route.open writer closed");
+                let body = serde_json::to_vec(&ErrorBody::new(code, "test rejection")).unwrap();
+                assert!(
+                    dispatch_frame(
+                        &shared,
+                        1,
+                        Frame::build(
+                            FrameType::Error,
+                            Flags::new(false, Priority::Interactive, false),
+                            0,
+                            0,
+                            command.frame.header.corr,
+                            body,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                );
+            }
+            let result = task.await.unwrap().expect_err("route.open must reject");
+            assert!(
+                receiver.try_recv().is_err(),
+                "the terminal code must not queue another route.open"
+            );
+            result
+        }
+
+        let reloading = reject_route_open_attempts(error_codes::MODULE_RELOADING, 2).await;
+        assert!(matches!(reloading, CallError::NotSent(_)));
+
+        let removed = reject_route_open_attempts(error_codes::MODULE_REMOVED, 1).await;
+        assert!(matches!(removed, CallError::NotSent(_)));
     }
 
     #[tokio::test]

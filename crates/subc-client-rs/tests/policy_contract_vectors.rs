@@ -164,24 +164,12 @@ fn push_event_bump_parses_through_the_helper_shape() {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    use std::process::Command;
-    // No sha2 dependency in this crate; shell out for the test-only digest.
-    let out = Command::new("shasum")
-        .args(["-a", "256", "-"])
-        .env("LC_ALL", "C")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.as_mut().unwrap().write_all(bytes)?;
-            child.wait_with_output()
-        })
-        .expect("shasum runs");
-    String::from_utf8(out.stdout)
-        .expect("utf8")
-        .split_whitespace()
-        .next()
-        .expect("digest")
-        .to_string()
+    // In-process digest (sha2 dev-dependency, already in the workspace lock via
+    // subc-transport). The first version shelled out to `shasum`, which does
+    // not exist on Windows runners -- the digest INSTRUMENT failed there, which
+    // reads identically to the vendored bytes drifting. An instrument must not
+    // have platform-shaped failure modes.
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }

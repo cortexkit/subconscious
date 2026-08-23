@@ -127,6 +127,9 @@ pub(crate) struct GoodbyeTarget {
     pub channel: u16,
     pub epoch: u32,
     pub kind: GoodbyeTargetKind,
+    /// The receiving module when this is a module-targeted relay. Client targets
+    /// have no module owner, while this identifier attributes a dropped relay.
+    pub module_id: Option<String>,
 }
 
 impl GoodbyeTarget {
@@ -1015,6 +1018,20 @@ impl ForwardingTable {
             .copied())
     }
 
+    /// Looks up the module registered on a data-plane connection so route-drop
+    /// diagnostics name the emitter instead of only reporting a daemon total.
+    pub(crate) fn module_id_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Option<String>, ForwardingError> {
+        let inner = self.read_inner()?;
+        Ok(inner
+            .endpoint_by_connection
+            .get(&connection_id)
+            .and_then(|endpoint| inner.module_id_by_endpoint.get(endpoint))
+            .cloned())
+    }
+
     pub(crate) fn has_live_module_connection(
         &self,
         module_id: &str,
@@ -1650,6 +1667,7 @@ fn endpoint_routes_locked(
                 channel: route.client_channel,
                 epoch: route.client_epoch,
                 kind: GoodbyeTargetKind::Client,
+                module_id: None,
             },
             principal: route.principal.clone(),
             bound_at: route.bound_at,
@@ -1709,6 +1727,7 @@ fn release_client_route_locked(
         channel: route.module_channel,
         epoch: route.module_epoch,
         kind: GoodbyeTargetKind::Module,
+        module_id: Some(route.module_id.clone()),
     })
 }
 
@@ -1741,6 +1760,7 @@ fn release_module_route_locked(
         channel: route.client_channel,
         epoch: route.client_epoch,
         kind: GoodbyeTargetKind::Client,
+        module_id: None,
     })
 }
 
@@ -1858,6 +1878,7 @@ fn abandoned_route_target(
         channel: reservation.module_key.channel,
         epoch: reservation.module_epoch,
         kind: GoodbyeTargetKind::Module,
+        module_id: Some(module_id.clone()),
     })
 }
 

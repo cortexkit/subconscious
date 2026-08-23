@@ -1,0 +1,18 @@
+#!/bin/sh
+# Refuse pushes whose HEAD carries a Cargo.toml/Cargo.lock inconsistency.
+#
+# Mechanism this fences (hit twice in one day, hours apart): a cargo command run
+# without --locked quietly updates the WORKING-TREE lockfile, so local --locked
+# gates pass while the COMMIT being pushed lacks the lock line -- every --locked
+# build on master then fails, and the finder's symptom is a mystifying dirty
+# Cargo.lock after a read-only command. Checking the commit's own tree (not the
+# working tree) is the property that matters.
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+if git archive HEAD Cargo.toml Cargo.lock crates clients 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
+  if ! (cd "$tmp" && cargo metadata --locked --format-version 1 >/dev/null 2>&1); then
+    echo "pre-push: HEAD's Cargo.lock does not match its manifests (run cargo update -w or commit the lock)" >&2
+    exit 1
+  fi
+fi
+exit 0

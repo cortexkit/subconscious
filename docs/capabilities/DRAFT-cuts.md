@@ -156,9 +156,12 @@ is meant to be third-party-callable it moves into an umbrella).
 - FLAG(ALF): `policy-cascade/v1` (policy.resolve/subscribe + set/delete/park)
   — sixth umbrella or fold into identity-authority? The cascade contract
   already has its own vectors, which argues sixth.
-- Tests: R pass per umbrella; C pass (no consumer spans all five); T —
-  settlement writes may span work+hire+evidence internally: FLAG(ALF) for the
-  transaction test on work-graph's seam.
+- Tests: R pass per umbrella; C pass (no consumer spans all five); T PASS
+  as cut (panel r2): settlement spans work-graph (IN) + hire/evidence
+  (PRIVATE) — private-to-umbrella coupling is implementation freedom.
+  Recorded as a FORWARD CONSTRAINT on the work-graph card instead: promoting
+  hire.*/manager.* delegation to its own umbrella re-triggers the transaction
+  test on work.settle, which must then be re-cut or exposed as a compound op.
 
 ## prefrontal-routing → `model-routing/v1`
 
@@ -191,8 +194,14 @@ is meant to be third-party-callable it moves into an umbrella).
   undo integration makes core+safety inseparable, merge those two.
 - `status` private (diagnostics).
 - Tests: R pass (a minimal provider replaces core alone), C pass (harness
-  agents use core+intel; simple scripts use core only), T FLAG (edit→undo
-  backup atomicity crosses core/safety — the merge question).
+  agents use core+intel; simple scripts use core only), T FAIL as drafted
+  (panel r2): the undo-record format is written by core ops (write/edit/
+  apply_patch/delete/move create backups) and consumed by safety ops, but
+  pinned by NEITHER umbrella — a hidden third interface. AFT owns the call,
+  before corpora are minted: (a) merge core+safety (nobody replaces half an
+  editor), or (b) keep the three-way cut and pin the undo-record contract as
+  a join key on the file-safety card with its own corpus vectors. The audit
+  must cover code-intel mutators (refactor/import/ast_replace) too.
 
 ## cerebellum → two umbrellas
 
@@ -245,10 +254,13 @@ session-scoped bridge protocol, not a replaceable fleet capability (v1).
 ## Cross-cutting flags for the correction round
 
 1. **Plumbing-vs-umbrella for single-sibling consumers** (prefrontal-routing,
-   wernicke, engram session.*): the consumer test says "not too big" trivially
-   at one consumer — the question is whether one sibling consumer makes it an
-   interface at all. Proposed rule: it is an umbrella only if a user
-   replacing EITHER side keeps the seam; otherwise it is private plumbing.
+   wernicke, engram session.*): settled r2 in the DECIDABLE form (the r1
+   "either side" wording was ambiguous between at-least-one and both-sides
+   readings with opposite verdicts): umbrella IFF provider-side replacement
+   keeps the seam AND (a second consumer plausibly exists OR the seam is a
+   declared minimal-package boundary). Under this rule prefrontal-routing and
+   wernicke resolve to PRIVATE PLUMBING for v1, op lists recorded as draft
+   cards so later promotion is cheap.
 2. **Ceremonies**: enrollment/admin ops stay outside umbrellas everywhere in
    this draft; the capability card documents "an X path must exist" without
    pinning ops. Confirm per module.

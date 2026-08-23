@@ -558,6 +558,24 @@ impl ChildLifecycle {
                     .map(OsString::from)
                     .map_err(|_| variable.clone())?,
             };
+            // Windows environment keys are case-insensitive: a declared
+            // override must REPLACE a base entry whose key differs only by
+            // case (registry "PATH" vs base allowlist "Path"), or the child
+            // receives two case-variant spellings of one logical variable and
+            // the OS collapses them unpredictably -- measured on CI, the base
+            // value won and the declared override silently lost. Unix keys
+            // are case-sensitive; no folding there.
+            #[cfg(windows)]
+            {
+                let case_collisions: Vec<OsString> = environment
+                    .keys()
+                    .filter(|key| key.eq_ignore_ascii_case(variable))
+                    .cloned()
+                    .collect();
+                for key in case_collisions {
+                    environment.remove(&key);
+                }
+            }
             environment.insert(OsString::from(variable), value);
         }
         Ok(environment)

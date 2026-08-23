@@ -113,6 +113,15 @@ async fn refusal(handler: &AdapterHandler, server: &str, method: &str) -> (Strin
     (code, detail)
 }
 
+/// Mirror of the adapter's declared-override semantics: on Windows a declared
+/// variable replaces base keys differing only by case (env keys are
+/// case-insensitive there); on Unix keys are distinct.
+fn declare(expected: &mut BTreeMap<String, String>, key: &str, value: &str) {
+    #[cfg(windows)]
+    expected.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+    expected.insert(key.to_string(), value.to_string());
+}
+
 async fn evict_after_test_ttl() {
     for _ in 0..5 {
         tokio::task::yield_now().await;
@@ -148,9 +157,9 @@ async fn real_stdio_child_is_lazily_spawned_isolated_and_resolved_again_after_id
                 .map(|value| ((*key).to_string(), value))
         })
         .collect();
-    expected.insert("FIXTURE_MODE".to_string(), "normal".to_string());
-    expected.insert("PATH".to_string(), "shadowed-path".to_string());
-    expected.insert("TAGGED".to_string(), "first-secret".to_string());
+    declare(&mut expected, "FIXTURE_MODE", "normal");
+    declare(&mut expected, "PATH", "shadowed-path");
+    declare(&mut expected, "TAGGED", "first-secret");
     assert_eq!(child_environment, expected);
     assert!(!child_environment.contains_key("SUBC_MODULE_ID"));
     assert!(!child_environment.contains_key("SUBC_LAUNCH_NONCE"));

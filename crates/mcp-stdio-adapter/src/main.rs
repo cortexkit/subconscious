@@ -3,12 +3,12 @@
 use std::{env, error::Error, ffi::OsString, path::PathBuf, process};
 
 use mcp_stdio_adapter::{
-    adapter::AdapterHandler,
+    adapter::{AdapterHandler, ClaustrumCredentialResolver, LifecycleSettings},
     attestation::StartupAttestation,
     registry::{default_config_path, load},
 };
 use serde_json::json;
-use subc_client_rs::serve_with_handle;
+use subc_client_rs::{serve_with_handle, ConsumerIdentity};
 use subc_protocol::manifest::ModuleManifest;
 use subc_protocol::{
     manifest::{
@@ -55,8 +55,19 @@ async fn run() -> Result<()> {
         )
     })?;
 
-    let (_handle, serve_future) =
-        serve_with_handle(&connection_file, manifest(), AdapterHandler::new(registry)).await?;
+    let credential_resolver = ClaustrumCredentialResolver::new(
+        connection_file.clone(),
+        ConsumerIdentity {
+            module_id: attestation.module_id().to_string(),
+            launch_nonce: attestation.launch_nonce().to_string(),
+        },
+    );
+    let handler = AdapterHandler::with_resolver(
+        registry,
+        std::sync::Arc::new(credential_resolver),
+        LifecycleSettings::default(),
+    );
+    let (_handle, serve_future) = serve_with_handle(&connection_file, manifest(), handler).await?;
     serve_future.await?;
     Ok(())
 }

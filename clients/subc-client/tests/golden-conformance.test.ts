@@ -104,6 +104,7 @@ describe("Rust golden fixtures", () => {
     // not speak it. The unconsumed ones are reported below instead.
     const relied = [
       "error_body",
+      "error_body_module_removed",
       "module_control_request_route_bind",
       "module_control_request_route_bind_without_consumer_capabilities",
       "module_control_request_health_check",
@@ -155,11 +156,14 @@ describe("Rust golden fixtures", () => {
 
   test("error bodies carry the fields the client reads off a failed frame", () => {
     const body = loadGolden("error_body");
+    const removed = loadGolden("error_body_module_removed");
     // errorFromFrame reads exactly these two, so a rename on the Rust side turns
     // every daemon error into the "subc error" fallback with its cause dropped:
     // a silent degradation rather than a failure, which is why it needs a test.
     expect(typeof body.code).toBe("string");
     expect(typeof body.message).toBe("string");
+    expect(removed.code).toBe("module_removed");
+    expect(typeof removed.message).toBe("string");
   });
 
   test("route targets keep the discriminator the client switches on", () => {

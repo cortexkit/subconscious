@@ -16,7 +16,14 @@ use subc_core::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
     read_frame, write_frame, Frame,
 };
-use subc_protocol::{BindIdentity, ErrorBody, Flags, FrameType, Priority, RouteTarget};
+use subc_protocol::{
+    manifest::{
+        Bindings, IdentityBinding, IdentityScope, ModuleManifest, StorageBinding, StorageKind,
+        StorageScope, TrustTier,
+    },
+    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloBody, Priority, RouteTarget,
+    PROTOCOL_VERSION,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -316,7 +323,111 @@ async fn rescan_removes_module_and_leaves_other_open_route_undisturbed() {
     let error = open_route_with_identity(&mut unknown_client, removed_id, 404, None)
         .await
         .unwrap_err();
+    assert_eq!(error.code, "module_removed");
+    assert!(error.message.contains(removed_id));
+    assert!(error.message.contains("ago"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_unknown_id_without_tombstone_stays_unknown_module() {
+    let daemon = RunningDaemon::start("daemon-unknown-no-tombstone", Some(config_doc([]))).await;
+    let mut client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let error = open_route_with_identity(&mut client, "never-configured", 405, None)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, "unknown_module");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_readding_a_module_clears_its_route_open_removal_tombstone() {
+    let module_id = "rescan-readd";
+    let configured = stub_module(module_id, true, []);
+    let daemon = RunningDaemon::start(
+        "daemon-rescan-readd",
+        Some(config_doc([configured.clone()])),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+
+    fs::write(&daemon.config_path, config_doc([])).unwrap();
+    let removed = supervisor_rescan(&daemon.connection_file_path, 410).await;
+    assert_eq!(removed.removed, [module_id]);
+    wait_for_catalog_absent(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+    let mut removed_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let tombstone = open_route_with_identity(&mut removed_client, module_id, 411, None)
+        .await
+        .unwrap_err();
+    assert_eq!(tombstone.code, "module_removed");
+
+    fs::write(&daemon.config_path, config_doc([configured])).unwrap();
+    let added = supervisor_rescan(&daemon.connection_file_path, 412).await;
+    assert_eq!(added.added, [module_id]);
+    wait_for_catalog_module(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+    let mut readded_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let route = open_route(&mut readded_client, module_id, 413).await;
+    assert!(
+        route.channel > 0,
+        "re-added module must open a normal route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_reserved_gate_refuses_hello_until_explicit_release_after_rescan_removal() {
+    let module_id = "reserved-after-removal";
+    let mut reserved = stub_module(module_id, false, []);
+    reserved["reserved"] = json!(true);
+    let daemon =
+        RunningDaemon::start("daemon-reserved-release", Some(config_doc([reserved]))).await;
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| entry.state == "disabled" && !entry.enabled,
+        STATE_TIMEOUT,
+    )
+    .await;
+
+    let mut configured_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let configured_error = control_rpc_result_on_stream(
+        &mut configured_client,
+        420,
+        ClientControlRequest::SupervisorReleaseReserved {
+            module_id: module_id.to_string(),
+        },
+    )
+    .await
+    .expect_err("release must refuse while the module remains configured");
+    assert_eq!(configured_error.code, "reserved_module_configured");
+
+    fs::write(&daemon.config_path, config_doc([])).unwrap();
+    let removed = supervisor_rescan(&daemon.connection_file_path, 421).await;
+    assert_eq!(removed.removed, [module_id]);
+    wait_for_supervisor_absent(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
+
+    let mut forged_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let rejection =
+        hello_error_on_stream(&mut forged_client, untrusted_hello_frame(module_id, 422)).await;
+    assert_eq!(rejection.code, "reserved_module");
+    assert_catalog_modules(&daemon.connection_file_path, Some(module_id), 423, 0).await;
+
+    let mut release_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let released = control_rpc_on_stream(
+        &mut release_client,
+        424,
+        ClientControlRequest::SupervisorReleaseReserved {
+            module_id: module_id.to_string(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        released,
+        ClientControlResponse::SupervisorAck { applied: true, .. }
+    ));
+
+    let mut released_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let accepted =
+        hello_on_stream(&mut released_client, untrusted_hello_frame(module_id, 425)).await;
+    assert_eq!(accepted.header.ty, FrameType::HelloAck);
+    wait_for_catalog_module(&daemon.connection_file_path, module_id, STATE_TIMEOUT).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1198,6 +1309,63 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
         body,
     )
     .unwrap()
+}
+
+fn untrusted_hello_frame(module_id: &str, corr: u64) -> Frame {
+    let manifest = ModuleManifest {
+        module_id: module_id.to_string(),
+        module_version: "0.0.0-test".to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: Vec::new(),
+        consumes: Vec::new(),
+        bindings: Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: false,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: Vec::new(),
+                optional: vec![IdentityScope::Project],
+            },
+        },
+    };
+    let body = serde_json::to_vec(&ModuleHelloBody {
+        manifest,
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: None,
+    })
+    .unwrap();
+    Frame::build(
+        FrameType::Hello,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        corr,
+        body,
+    )
+    .unwrap()
+}
+
+async fn hello_on_stream<S>(stream: &mut S, hello: Frame) -> Frame
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(stream, &hello).await.unwrap();
+    stream.flush().await.unwrap();
+    read_frame_timeout(stream).await
+}
+
+async fn hello_error_on_stream<S>(stream: &mut S, hello: Frame) -> ErrorBody
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = hello_on_stream(stream, hello).await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    serde_json::from_slice(&frame.body).unwrap()
 }
 
 fn data_request(route: RouteHandle, corr: u64, body: &[u8]) -> Frame {

@@ -1,0 +1,4 @@
+{
+  "module_id": "vault",
+  "op": "supervisor.release_reserved"
+}

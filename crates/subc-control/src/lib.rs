@@ -44,6 +44,7 @@ pub mod ops {
     pub const SUPERVISOR_RESTART: &str = "supervisor.restart";
     pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
     pub const SUPERVISOR_RESCAN: &str = "supervisor.rescan";
+    pub const SUPERVISOR_RELEASE_RESERVED: &str = "supervisor.release_reserved";
     pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
     pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
     pub const SUPERVISOR_HEALTH: &str = "supervisor.health";
@@ -144,6 +145,11 @@ pub enum ClientControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         preview: bool,
     },
+    /// Retire the retained exact-id reservation after its configuration entry has
+    /// been removed. This is intentionally separate from rescan so deleting
+    /// configuration never silently opens a protected module id to registration.
+    #[serde(rename = "supervisor.release_reserved")]
+    SupervisorReleaseReserved { module_id: String },
     #[serde(rename = "supervisor.set_enabled")]
     SupervisorSetEnabled { module_id: String, enabled: bool },
     #[serde(rename = "supervisor.health_probe")]

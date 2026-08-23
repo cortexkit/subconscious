@@ -3,6 +3,7 @@ use std::{fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_protocol::{
+    error_codes,
     manifest::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
@@ -41,6 +42,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     );
     assert_golden("error_body", &error_body());
     assert_golden("error_body_with_detail", &error_body_with_detail());
+    assert_golden("error_body_module_removed", &error_body_module_removed());
     assert_golden("principal_reserved", &principal_reserved());
     assert_golden("principal_direct", &Principal::Direct);
     assert_golden("principal_unverified", &Principal::Unverified);
@@ -224,6 +226,13 @@ fn error_body_with_detail() -> ErrorBody {
         "cause": "credential_resolution",
         "retry_after_ms": 60000,
     }))
+}
+
+fn error_body_module_removed() -> ErrorBody {
+    ErrorBody::new(
+        error_codes::MODULE_REMOVED,
+        "module_id 'vault' was removed 1200 ms ago",
+    )
 }
 
 fn principal_reserved() -> Principal {

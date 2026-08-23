@@ -27,6 +27,7 @@
     "supervisor.restart",
     "supervisor.reload",
     "supervisor.rescan",
+    "supervisor.release_reserved",
     "supervisor.set_enabled",
     "supervisor.health_probe",
     "supervisor.health",

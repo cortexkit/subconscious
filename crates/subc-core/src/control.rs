@@ -617,7 +617,8 @@ impl ControlHandler {
                         self.counters.increment_goodbye_relay_client_failed();
                     }
                 } else {
-                    self.counters.increment_goodbye_relay_module_dropped();
+                    self.counters
+                        .increment_goodbye_relay_module_dropped(released.module_id.as_deref());
                     warn!(
                         target_connection_id = released.connection_id.get(),
                         route_channel = released.channel,

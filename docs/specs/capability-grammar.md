@@ -229,6 +229,14 @@ consumers):
   payload it seals, so its capability card carries the obligation "refuse
   display-kind payload classes" as a corpus-pinned refusal vector. One
   boundary, two enforcement points, split by what each layer can see.
+  CALLO's vacuity precision (accepted): no display-kind payload class exists
+  on the fed wire today, so a refusal vector authored NOW cannot fail and
+  would read as satisfied forever. The obligation is therefore written as a
+  condition on the future change, not a check on current code: whoever adds
+  display vocabulary to fed-wire adds the ingress refusal IN THE SAME CHANGE,
+  with a vector that fails if the refusal is absent. CALLO holds a matching
+  trigger on their side keyed to display/streaming frame kinds appearing in
+  their wire spec.
 
 ## 9. Open questions (for Athena rounds)
 

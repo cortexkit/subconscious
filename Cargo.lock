@@ -877,6 +877,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "sha2",
  "subc-control",
  "subc-protocol",
  "subc-transport",

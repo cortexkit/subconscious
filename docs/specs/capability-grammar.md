@@ -218,6 +218,18 @@ consumers):
   relay cost. A deny-edge makes "cannot be constructed" a route.open check
   instead of a topology fact that silently acquires edges.
 
+  **Granularity limit (recorded before it bites):** the daemon deny-edge is
+  module-scoped by construction and can never be frame-kind-scoped — the data
+  plane routes on the 21-byte header without deserializing bodies, and a
+  display-kind frame is indistinguishable from any other StreamData at the
+  daemon. So the edge fully covers modules that never federate, and for a
+  dual-role module (emits display frames AND legitimately serves federated
+  calls) the boundary is NOT daemon-enforceable. For that case the enforcement
+  point is the federation-transport provider's own ingress: it parses every
+  payload it seals, so its capability card carries the obligation "refuse
+  display-kind payload classes" as a corpus-pinned refusal vector. One
+  boundary, two enforcement points, split by what each layer can see.
+
 ## 9. Open questions (for Athena rounds)
 
 - Capability version evolution: additive op growth within a version vs new

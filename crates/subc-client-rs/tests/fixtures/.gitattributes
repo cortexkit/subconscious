@@ -1,0 +1,5 @@
+# Vendored producer fixtures are byte-pinned: the digest test compares them
+# against the producer's recorded SHA-256. EOL conversion on checkout (Windows
+# autocrlf) rewrites the bytes and the mismatch reads as vendor drift when it
+# is checkout translation -- these files are content, not text.
+*.json -text

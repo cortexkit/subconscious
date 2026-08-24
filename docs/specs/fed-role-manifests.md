@@ -51,6 +51,13 @@ shipped in the same commit as the code that calls the ops:
   exist only as review rendering (§3), never as granted units.
 - Version rule mirrors the capability grammar: exact + immutable. A changed
   op set mints a new manifest_version; no ranges, no mutation in place.
+- Versions increment per MANIFEST CHANGE, never per build (CKIOS review,
+  measured: ~14 builds/fortnight vs ~2 op-set changes/week — per-build
+  versioning would render ~12 empty ceremony diffs a fortnight, and an
+  empty diff reviewed a dozen times is a diff nobody reads by the
+  thirteenth). Builds carry a REFERENCE to the current manifest version;
+  the app's release gate asserts the referenced version exists and is
+  accepted, not that it is new.
 
 ### 2. Acceptance: the fed config holds the accepted hash
 
@@ -107,7 +114,13 @@ consumers carry manifests.
 
 1. **Held-but-uncalled is a manifest refusal** (CKIOS's rule): the manifest
    declares what the app CALLS. An op with no calling surface fails review —
-   it is an audit smell, not a convenience.
+   it is an audit smell, not a convenience. The MIRROR case (granted, wired,
+   and never called on the wire — a dark feature or a withdrawable grant) is
+   invisible to build-time fences by construction; it belongs to the
+   ceremony's audit surface: an accepted op with zero wire calls after N
+   days is surfaced to the operator (source: callosum's per-op audit
+   records; the incident that mandates it: ask.attachment_content sat
+   granted+wired+dark for months because no producer emitted attachments).
 2. **Bidirectional presence-fence in each app repo** (CEREB's pattern):
    a test asserting manifest ops ⊆ wired call sites AND wired fed calls ⊆
    manifest ops, so drift fails at build time on the right side of the

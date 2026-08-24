@@ -27,7 +27,7 @@ use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 // a copy -- these two used to be byte-identical duplicates in different files,
 // with nothing asserting they agreed.
 use subc_core::bootstrap::user_connection_token;
-use subc_core::{read_frame, write_frame, Frame};
+use subc_core::{fleet_lint, read_frame, write_frame, Frame};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file, ConnectionFileError, ConnectionInfo};
 use tokio::{net::TcpStream, time};
@@ -45,7 +45,7 @@ const CK_HARNESS: &str = "ck";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, and connection info";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, and connection info";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -121,10 +121,13 @@ const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] hea
 const DAEMON_HELP: &str =
     "ck daemon — daemon version, uptime, and connection info\n\nusage: ck [--json] daemon";
 
+const FLEET_HELP: &str = "ck fleet — offline configured-module inspection\n\nusage:\n  ck fleet lint [<config>] [--verbose]\n\n`lint` reads module manifests without connecting to the daemon.";
+
 #[tokio::main]
 async fn main() {
     match run(env::args_os()).await {
         Ok(()) => process::exit(0),
+        Err(CkError::FleetLintExit { exit_code }) => process::exit(exit_code),
         Err(err) => {
             eprintln!("{err}");
             process::exit(err.exit_code());
@@ -146,6 +149,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     }
     if matches!(&args.command, Command::Dashboard) {
         return dashboard(&args).await;
+    }
+    if let Command::FleetLint { config, verbose } = &args.command {
+        return fleet_lint_command(config.as_deref(), *verbose).await;
     }
 
     let resolved = discover_connection_file(args.subc.as_deref())
@@ -212,7 +218,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             )
             .await
         }
-        Command::Help(_) | Command::External { .. } => unreachable!("handled before connect"),
+        Command::FleetLint { .. } | Command::Help(_) | Command::External { .. } => {
+            unreachable!("handled before connect")
+        }
     };
     result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
 }
@@ -227,6 +235,23 @@ struct DashboardSnapshot {
     describe: Value,
     modules: Value,
     health: Value,
+}
+
+async fn fleet_lint_command(config: Option<&Path>, verbose: bool) -> Result<(), CkError> {
+    let config = config
+        .map(PathBuf::from)
+        .unwrap_or_else(subc_core::daemon_config::default_config_path);
+    let report = fleet_lint::lint(&config, verbose)
+        .await
+        .map_err(|error| CkError::FleetLintConfig(error.to_string()))?;
+    println!("{}", report.render());
+    if report.outcome == fleet_lint::LintOutcome::Clean {
+        Ok(())
+    } else {
+        Err(CkError::FleetLintExit {
+            exit_code: report.outcome.exit_code(),
+        })
+    }
 }
 
 async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
@@ -428,7 +453,7 @@ fn dashboard_health_status(health_entries: &[Value], module: &Value) -> String {
 }
 
 fn print_static_domains() {
-    const BUILTIN_DOMAINS: [&str; 5] = ["module", "routes", "health", "quota", "daemon"];
+    const BUILTIN_DOMAINS: [&str; 6] = ["module", "routes", "health", "quota", "fleet", "daemon"];
     let mut domains = BUILTIN_DOMAINS
         .iter()
         .map(|domain| (*domain).to_string())
@@ -535,6 +560,10 @@ enum Command {
     Daemon,
     Quota {
         provider_id: Option<String>,
+        verbose: bool,
+    },
+    FleetLint {
+        config: Option<PathBuf>,
         verbose: bool,
     },
     /// Explicit help request (`ck <domain>` with no verb, `ck help …`,
@@ -3354,7 +3383,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
 fn is_builtin_domain(domain: &str) -> bool {
     matches!(
         domain,
-        "module" | "routes" | "health" | "daemon" | "quota" | "help"
+        "module" | "routes" | "health" | "daemon" | "quota" | "fleet" | "help"
     )
 }
 
@@ -3368,6 +3397,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("module") => MODULE_HELP.into(),
                 Some("routes") => ROUTES_HELP.into(),
                 Some("quota") => QUOTA_HELP.into(),
+                Some("fleet") => FLEET_HELP.into(),
                 Some("health") => HEALTH_HELP.into(),
                 Some("daemon") => DAEMON_HELP.into(),
                 _ => top_help(),
@@ -3465,6 +3495,39 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             None => Ok(Command::Daemon),
             Some(_) => Ok(Command::Help(DAEMON_HELP.into())),
         },
+        "fleet" => {
+            let Some(verb) = tail.first().map(|value| value.to_string_lossy()) else {
+                return Ok(Command::Help(FLEET_HELP.into()));
+            };
+            if matches!(verb.as_ref(), "-h" | "--help" | "help") {
+                return Ok(Command::Help(FLEET_HELP.into()));
+            }
+            if verb != "lint" {
+                return Err(CkError::Usage(format!(
+                    "unknown verb 'fleet {verb}'\n\n{FLEET_HELP}"
+                )));
+            }
+
+            let mut config = None;
+            let mut verbose = false;
+            for argument in &tail[1..] {
+                let argument = argument.to_string_lossy();
+                if argument == "--verbose" {
+                    verbose = true;
+                } else if argument.starts_with('-') {
+                    return Err(CkError::Usage(format!(
+                        "unknown fleet lint flag '{argument}'\n\n{FLEET_HELP}"
+                    )));
+                } else if config.is_none() {
+                    config = Some(PathBuf::from(argument.into_owned()));
+                } else {
+                    return Err(CkError::Usage(format!(
+                        "ck fleet lint accepts at most one config path\n\n{FLEET_HELP}"
+                    )));
+                }
+            }
+            Ok(Command::FleetLint { config, verbose })
+        }
         "quota" => {
             let mut provider_id = None;
             let mut verbose = false;
@@ -3639,11 +3702,24 @@ struct TriedConnectionFile {
 #[derive(Debug)]
 enum CkError {
     Usage(String),
-    Discovery { tried: Vec<TriedConnectionFile> },
-    Connection { path: PathBuf, source: String },
+    Discovery {
+        tried: Vec<TriedConnectionFile>,
+    },
+    Connection {
+        path: PathBuf,
+        source: String,
+    },
     Rejected(String),
-    WithFooter { error: Box<CkError>, footer: String },
+    WithFooter {
+        error: Box<CkError>,
+        footer: String,
+    },
     Message(String),
+    FleetLintConfig(String),
+    /// The report was written to stdout; exit silently with lint's classification.
+    FleetLintExit {
+        exit_code: i32,
+    },
     Json(serde_json::Error),
 }
 
@@ -3653,6 +3729,8 @@ impl CkError {
             Self::Usage(_) | Self::Discovery { .. } => 2,
             Self::Connection { .. } => 3,
             Self::Rejected(_) | Self::Message(_) | Self::Json(_) => 1,
+            Self::FleetLintConfig(_) => 2,
+            Self::FleetLintExit { exit_code } => *exit_code,
             Self::WithFooter { error, .. } => error.exit_code(),
         }
     }
@@ -3679,6 +3757,8 @@ impl fmt::Display for CkError {
             }
             Self::Rejected(message) => write!(f, "{message}"),
             Self::Message(message) => write!(f, "{message}"),
+            Self::FleetLintConfig(message) => write!(f, "ck fleet lint: {message}"),
+            Self::FleetLintExit { .. } => Ok(()),
             Self::Json(source) => write!(f, "json: {source}"),
             Self::WithFooter { error, footer } => {
                 write!(f, "{error}\n\nhelp[1]:\n  {footer}")

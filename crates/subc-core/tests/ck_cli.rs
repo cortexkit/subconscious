@@ -153,6 +153,27 @@ fn bare_ck_degrades_to_domains_when_daemon_is_unreachable() {
     assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
 }
 
+#[test]
+fn fleet_lint_uses_its_explicit_config_without_a_daemon_connection() {
+    let temp = TempDir::new("ck-fleet-lint");
+    let config = temp.path().join("subc.jsonc");
+    fs::write(&config, r#"{"version":1,"modules":{}}"#).unwrap();
+
+    let output = ck_command()
+        .args(["fleet", "lint"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 2);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    assert!(
+        text(&output.stdout).contains("examined 0 of 0 configured"),
+        "stdout: {}",
+        text(&output.stdout)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_list_json_uses_subc_override_and_shows_stub() {
     let server = TestServer::start().await;

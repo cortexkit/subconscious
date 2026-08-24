@@ -340,6 +340,9 @@ pub enum RouteCloseReason {
     Restart,
     Disable,
     Crash,
+    /// A live route became forbidden because newly attested capability metadata
+    /// matched its supervised opening module's deny edge.
+    CapabilityDenied,
 }
 
 /// A module's retained stderr, oldest entry first.

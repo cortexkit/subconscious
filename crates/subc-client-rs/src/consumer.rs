@@ -265,6 +265,66 @@ pub struct ControlPush {
     pub body: serde_json::Value,
 }
 
+/// A route-close reason accepted from the daemon control-push wire.
+///
+/// The protocol may add reasons before this SDK is upgraded. Preserve that fact
+/// as [`Self::Unknown`] and classify it conservatively rather than refusing to
+/// deliver the enclosing control push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteCloseReason {
+    Reload,
+    Restart,
+    Disable,
+    Crash,
+    CapabilityDenied,
+    Unknown(String),
+}
+
+/// Whether a closed route may be reopened automatically from its reason alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteCloseDisposition {
+    MayReopen,
+    MustNotReopen,
+}
+
+impl RouteCloseReason {
+    /// Decode a wire reason without making a new daemon reason fatal to push delivery.
+    pub fn from_wire(reason: &str) -> Self {
+        match reason {
+            "reload" => Self::Reload,
+            "restart" => Self::Restart,
+            "disable" => Self::Disable,
+            "crash" => Self::Crash,
+            "capability_denied" => Self::CapabilityDenied,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    /// Unknown reasons take the strictest action: never reopen on their behalf.
+    pub fn disposition(&self) -> RouteCloseDisposition {
+        match self {
+            Self::Reload | Self::Restart => RouteCloseDisposition::MayReopen,
+            Self::Disable | Self::Crash | Self::CapabilityDenied | Self::Unknown(_) => {
+                RouteCloseDisposition::MustNotReopen
+            }
+        }
+    }
+}
+
+impl ControlPush {
+    /// Decode the close reason from a route lifecycle push, if this is one.
+    pub fn route_close_reason(&self) -> Option<RouteCloseReason> {
+        matches!(self.op.as_str(), "route.closing" | "route.closed")
+            .then(|| {
+                self.body
+                    .get("reason")?
+                    .as_str()
+                    .map(RouteCloseReason::from_wire)
+            })
+            .flatten()
+    }
+}
+
 /// Managed Rust consumer for subc route calls.
 pub struct SubcConsumer {
     shared: Arc<Shared>,
@@ -3653,14 +3713,17 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
 }
 
 fn is_retryable_route_open_code(code: &str) -> bool {
-    matches!(
-        code,
+    match code {
+        // A capability deny is a policy refusal, not transient target absence.
+        // Keep this explicit so a future broad retry matcher cannot reopen it.
+        "capability_forbidden" => false,
         error_codes::UNKNOWN_MODULE
-            | error_codes::MODULE_RELOADING
-            | error_codes::MODULE_WARMING
-            | error_codes::TARGET_UNAVAILABLE
-            | error_codes::MODULE_TIMEOUT
-    )
+        | error_codes::MODULE_RELOADING
+        | error_codes::MODULE_WARMING
+        | error_codes::TARGET_UNAVAILABLE
+        | error_codes::MODULE_TIMEOUT => true,
+        _ => false,
+    }
 }
 
 fn is_retryable_catalog_transport_error(err: &CallError) -> bool {
@@ -3996,6 +4059,32 @@ mod tests {
         assert!(!is_retryable_route_open_code(error_codes::MODULE_REMOVED));
         assert!(!is_retryable_route_open_code("invalid_project_root"));
         assert!(!is_retryable_route_open_code("route_rejected"));
+        assert!(
+            !is_retryable_route_open_code("capability_forbidden"),
+            "a capability policy refusal must not enter the route.open retry set"
+        );
+    }
+
+    #[test]
+    fn route_close_reason_classifier_accepts_capability_denied_and_fails_closed_for_unknown() {
+        assert_eq!(
+            RouteCloseReason::from_wire("capability_denied"),
+            RouteCloseReason::CapabilityDenied
+        );
+        assert_eq!(
+            RouteCloseReason::from_wire("capability_denied").disposition(),
+            RouteCloseDisposition::MustNotReopen
+        );
+        assert_eq!(
+            RouteCloseReason::from_wire("future_policy_reason").disposition(),
+            RouteCloseDisposition::MustNotReopen,
+            "an unknown close reason must receive the strictest handling"
+        );
+        assert_eq!(
+            RouteCloseReason::from_wire("reload").disposition(),
+            RouteCloseDisposition::MayReopen,
+            "control proves the classifier can distinguish a conservative default"
+        );
     }
 
     #[tokio::test]

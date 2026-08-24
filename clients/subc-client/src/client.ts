@@ -300,6 +300,59 @@ export interface ControlPush {
   body: Record<string, unknown>;
 }
 
+/** A known route-close reason, excluding forward-compatible unknown values. */
+export type KnownRouteCloseReason =
+  | "reload"
+  | "restart"
+  | "disable"
+  | "crash"
+  | "capability_denied";
+
+/** A route-close reason decoded from a daemon control push. */
+export type RouteCloseReason = KnownRouteCloseReason | "unknown";
+
+/** Whether the close reason alone permits reopening a route automatically. */
+export type RouteCloseDisposition = "may_reopen" | "must_not_reopen";
+
+/**
+ * Decode a daemon close reason without rejecting a future wire value.
+ *
+ * An unknown reason remains observable as `unknown`; callers must use the
+ * strict disposition instead of treating an unrecognized policy change as safe.
+ */
+export function parseRouteCloseReason(reason: unknown): RouteCloseReason {
+  switch (reason) {
+    case "reload":
+    case "restart":
+    case "disable":
+    case "crash":
+    case "capability_denied":
+      return reason;
+    default:
+      return "unknown";
+  }
+}
+
+/** Unknown close reasons take the strictest action and must not trigger a reopen. */
+export function classifyRouteCloseReason(reason: unknown): RouteCloseDisposition {
+  switch (parseRouteCloseReason(reason)) {
+    case "reload":
+    case "restart":
+      return "may_reopen";
+    case "disable":
+    case "crash":
+    case "capability_denied":
+    case "unknown":
+      return "must_not_reopen";
+  }
+}
+
+/** Decode a close reason from a route lifecycle control push, if present. */
+export function routeCloseReason(push: ControlPush): RouteCloseReason | undefined {
+  if (push.op !== "route.closing" && push.op !== "route.closed") return undefined;
+  return parseRouteCloseReason(push.body.reason);
+}
+
 interface NormalizedConnectOptions {
   connectionFile: string;
   handshakeTimeoutMs?: number;
@@ -1447,11 +1500,14 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
  * client), so these classify as not_sent; the managed path retries them in-place
  * within ROUTE_OPEN_RETRY_DEADLINE_MS. Permanent rejections (module_removed,
  * bad_consumer_identity, config_divergence, unknown_target, ...) are excluded — they are pre-send but
- * would never succeed, so retrying them would only storm the daemon. Kept
- * byte-identical to subc-client-rs is_retryable_route_open_code for cross-client
+ * would never succeed, so retrying them would only storm the daemon. In
+ * particular, capability_forbidden is an explicit non-retryable policy refusal.
+ * Kept byte-identical to subc-client-rs is_retryable_route_open_code for cross-client
  * classification parity.
  */
 export function isRetryableRouteOpenCode(code: string | undefined): boolean {
+  // A capability deny is policy, never a transient target-availability failure.
+  if (code === "capability_forbidden") return false;
   return (
     code === "unknown_module" ||
     code === "module_reloading" ||

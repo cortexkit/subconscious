@@ -5,7 +5,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use subc_protocol::manifest::{ModuleManifest, ProviderRole};
+use subc_protocol::manifest::{CapabilityDeclarations, ModuleManifest, ProviderRole};
 
 /// Per-connection identity assigned by [`crate::Router`] while serving a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,11 +136,13 @@ impl Registry {
             .cloned())
     }
 
-    /// Replace only the provider role list for the module owned by `connection_id`.
-    pub fn replace_provides_for_connection(
+    /// Replace the provider role list and, when supplied, the attested capability
+    /// declaration for the module owned by `connection_id`.
+    pub fn replace_catalog_for_connection(
         &self,
         connection_id: ConnectionId,
         provides: Vec<ProviderRole>,
+        capabilities: Option<CapabilityDeclarations>,
     ) -> Result<Option<ModuleRegistration>, RegistryError> {
         let mut inner = self.lock_inner()?;
         let Some(module_id) = inner
@@ -157,6 +159,9 @@ impl Registry {
             .get_mut(&module_id)
             .expect("module_id discovered from registry values must still exist");
         registration.manifest.provides = provides;
+        if let Some(capabilities) = capabilities {
+            registration.manifest.capabilities = Some(capabilities);
+        }
         let updated = registration.clone();
         inner.bump_generation();
         Ok(Some(updated))

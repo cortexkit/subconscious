@@ -1256,6 +1256,7 @@ fn manifest(
                 optional: vec![IdentityScope::Session],
             },
         },
+        capabilities: None,
     }
 }
 

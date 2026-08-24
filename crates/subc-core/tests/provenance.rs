@@ -18,7 +18,7 @@ use subc_core::{
     read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
-use subc_protocol::{Flags, FrameType, Priority, SUBC_PROTOCOL_CRATE_VERSION};
+use subc_protocol::{Flags, FrameType, Priority};
 use tokio::{
     io::AsyncWriteExt,
     time::{sleep, timeout, Instant},
@@ -57,9 +57,10 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
                 ),
                 (
                     "FAKE_AFT_BUILD_LOCK_DIGEST",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                 ),
-                ("FAKE_AFT_STORE_SCHEMA_VERSION", "7"),
+                ("FAKE_AFT_WIRE_CRATE_VERSION", "0.0.0-forged"),
+                ("FAKE_AFT_STORE_SCHEMA_VERSION", "9999-forged-schema"),
             ],
         ))
         .unwrap();
@@ -84,13 +85,13 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     );
     assert_eq!(
         build.build_lock_digest.as_deref(),
-        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
     );
+    assert_eq!(build.wire_crate_version.as_deref(), Some("0.0.0-forged"));
     assert_eq!(
-        build.wire_crate_version.as_deref(),
-        Some(SUBC_PROTOCOL_CRATE_VERSION)
+        build.store_schema_version.as_deref(),
+        Some("9999-forged-schema")
     );
-    assert_eq!(build.store_schema_version.as_deref(), Some("7"));
     let status = module.status().unwrap();
     assert_eq!(observed.daemon_observed.pid, status.pid);
     assert_eq!(
@@ -100,7 +101,20 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     assert!(observed.daemon_observed.spawned_at_ms.unwrap_or_default() > 0);
     assert_running_image_matches(&observed.daemon_observed.running_image);
     let rendered = serde_json::to_string(&observed_daemon).unwrap();
-    assert!(!rendered.contains("ffffffffffffffffffffffffffffffffffffffff"));
+    for declared in [
+        build.build_git_sha.as_deref(),
+        build.build_lock_digest.as_deref(),
+        build.wire_crate_version.as_deref(),
+        build.store_schema_version.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            !rendered.contains(declared),
+            "daemon facts must not contain declared provenance value {declared:?}"
+        );
+    }
     module.stop().await.unwrap();
 }
 

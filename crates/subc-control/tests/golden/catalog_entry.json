@@ -72,6 +72,7 @@
       ],
       "operations": [
         {
+          "description": "List stored memory items and return their identifiers and metadata.",
           "kind": "query",
           "name": "memory.list"
         }

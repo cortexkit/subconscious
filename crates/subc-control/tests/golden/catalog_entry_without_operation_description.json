@@ -1,0 +1,24 @@
+{
+  "control_ops": [],
+  "module_id": "legacy-management",
+  "module_version": "0.7.0",
+  "roles": [
+    {
+      "concurrency": "module_managed",
+      "config_schema": {
+        "type": "object"
+      },
+      "identity_scope": [
+        "project"
+      ],
+      "observability": [],
+      "operations": [
+        {
+          "kind": "query",
+          "name": "records.list"
+        }
+      ],
+      "role": "management_surface"
+    }
+  ]
+}

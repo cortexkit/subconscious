@@ -19,10 +19,10 @@ use serde_json::{json, Value};
 use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, InternalTransport,
-        ManagementOperation, ManagementOperationKind, ObservabilityKind, ObservabilitySurface,
-        PipelineAppliesTo, PipelineStageKind, ProviderRole, StorageBinding, StorageKind,
-        StorageScope, Tool, TrustTier,
+        Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
+        IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
+        ObservabilityKind, ObservabilitySurface, PipelineAppliesTo, PipelineStageKind,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlResponse,
@@ -73,6 +73,8 @@ const FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH_ENV: &str = "FAKE_AFT_HEALTH_NEVER_
 const FAKE_AFT_HEALTH_STATUS_ENV: &str = "FAKE_AFT_HEALTH_STATUS";
 const FAKE_AFT_HEALTH_DETAIL_ENV: &str = "FAKE_AFT_HEALTH_DETAIL";
 const FAKE_AFT_HEALTH_METRICS_ENV: &str = "FAKE_AFT_HEALTH_METRICS";
+/// Optional static capability block used only by daemon integration fixtures.
+const FAKE_AFT_CAPABILITIES_ENV: &str = "FAKE_AFT_CAPABILITIES";
 /// Presence (not value) is the trigger: when set, the stub writes
 /// `FAKE_AFT_STDERR_LINE` (if any) to stderr and exits with this code before
 /// ever touching the connection file. Lets a portable spawn stand in for a
@@ -356,6 +358,7 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
             config.role.clone(),
             config.concurrency.clone(),
             &config.tools,
+            config.capabilities.clone(),
         ),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: if config.advertise_health {
@@ -1236,6 +1239,7 @@ fn manifest(
     role: StubRole,
     concurrency: Concurrency,
     tools: &[String],
+    capabilities: Option<CapabilityDeclarations>,
 ) -> subc_protocol::manifest::ModuleManifest {
     subc_protocol::manifest::ModuleManifest {
         module_id: module_id.to_string(),
@@ -1256,7 +1260,7 @@ fn manifest(
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
+        capabilities,
     }
 }
 
@@ -1377,6 +1381,7 @@ struct StubConfig {
     toolcall_error: bool,
     toolcall_subc_error: bool,
     tools: Vec<String>,
+    capabilities: Option<CapabilityDeclarations>,
     usage_get_fixture: Option<Value>,
     advertise_health: bool,
     health_never_reply: bool,
@@ -1496,6 +1501,13 @@ impl StubConfig {
             toolcall_error: env_flag(FAKE_AFT_TOOLCALL_ERROR_ENV),
             toolcall_subc_error: env_flag(FAKE_AFT_TOOLCALL_SUBC_ERROR_ENV),
             tools,
+            capabilities: env::var(FAKE_AFT_CAPABILITIES_ENV)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|raw| {
+                    serde_json::from_str::<CapabilityDeclarations>(&raw).map_err(StubError::Json)
+                })
+                .transpose()?,
             usage_get_fixture: env::var(FAKE_AFT_USAGE_GET_FIXTURE_ENV)
                 .ok()
                 .filter(|value| !value.is_empty())

@@ -87,6 +87,7 @@ const TOOLS_SEARCH_NAME: &str = "tools_search";
 const TOOLS_INVOKE_NAME: &str = "tools_invoke";
 const ACK_ONLY_TOOL_RESPONSE_TEXT: &str = "Queued for context compaction.";
 const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
+const MANIFEST_MODULE_ID: &str = "ck-subc-mcp";
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -843,6 +844,12 @@ fn service_error_to_reverse_error(error: ServiceError) -> ErrorData {
 
 #[tokio::main]
 async fn main() {
+    // Offline discovery must stay ahead of all mode parsing and network setup so
+    // assembly tooling can read a manifest from a machine with no running daemon.
+    if env::args_os().nth(1).is_some_and(|arg| arg == "--manifest") {
+        print_manifest(supervision_manifest(MANIFEST_MODULE_ID.to_string()));
+        process::exit(0);
+    }
     // Side-effect-free provenance probe, evaluated before any runtime arg
     // parsing or I/O so `ck-subc-mcp --version` never reaches shim/module setup.
     if env::args_os().nth(1).is_some_and(|arg| arg == "--version") {
@@ -1912,6 +1919,32 @@ fn supervision_error_frame(
         body,
     )
     .map_err(|source| other_error(format!("failed to build supervision ERROR: {source}")))
+}
+
+fn manifest_json(manifest: ModuleManifest) -> serde_json::Value {
+    let mut value = serde_json::to_value(manifest).expect("module manifests serialize");
+    value
+        .as_object_mut()
+        .expect("serialized module manifest is an object")
+        .insert(
+            "runtime_computed".to_string(),
+            serde_json::Value::Array(Vec::new()),
+        );
+    value
+}
+
+fn print_manifest(manifest: ModuleManifest) {
+    println!(
+        "{}",
+        serde_json::to_string(&manifest_json(manifest)).expect("module manifest JSON serializes")
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn manifest_output_always_includes_an_empty_runtime_computed_array() {
+    let value = manifest_json(supervision_manifest(MANIFEST_MODULE_ID.to_string()));
+    assert_eq!(value["runtime_computed"], serde_json::json!([]));
 }
 
 fn supervision_manifest(module_id: String) -> ModuleManifest {

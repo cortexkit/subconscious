@@ -4,8 +4,8 @@ pub mod consumer;
 pub mod policy_cache;
 pub use consumer::{
     CallError, CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerError,
-    ConsumerOptions, ControlPush, PushEvent, RetryBackoff, RoutePollResult, SubcConsumer,
-    SubscribeOptions, Subscription, SubscriptionClosed,
+    ConsumerOptions, ControlPush, PushEvent, RetryBackoff, RouteCloseDisposition, RouteCloseReason,
+    RoutePollResult, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, Subject,
@@ -43,7 +43,10 @@ use subc_protocol::{
     SUBC_MODULE_ID_ENV,
 };
 pub use subc_protocol::{
-    manifest::{ExecutionMode, ProviderRole, Tool},
+    manifest::{
+        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, ExecutionMode, ProviderRole,
+        Tool,
+    },
     session::{HealthReport, HealthStatus},
     AdmissionClass,
 };
@@ -184,16 +187,41 @@ impl ModuleHandle {
         &self,
         provides: Vec<ProviderRole>,
     ) -> Result<(), CatalogUpdateError> {
+        self.catalog_update_inner(provides, None).await
+    }
+
+    /// Replace provider roles and attest a new static capability declaration.
+    ///
+    /// The declaration must be the same static metadata emitted by the module's
+    /// current manifest; this update exists so the daemon can reconcile live routes
+    /// when that attested metadata changes.
+    pub async fn catalog_update_with_capabilities(
+        &self,
+        provides: Vec<ProviderRole>,
+        capabilities: CapabilityDeclarations,
+    ) -> Result<(), CatalogUpdateError> {
+        self.catalog_update_inner(provides, Some(capabilities))
+            .await
+    }
+
+    async fn catalog_update_inner(
+        &self,
+        provides: Vec<ProviderRole>,
+        capabilities: Option<CapabilityDeclarations>,
+    ) -> Result<(), CatalogUpdateError> {
         if !self.shared.supports_catalog_update {
             return Err(CatalogUpdateError::NotSupported);
         }
 
-        let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate { provides })
-            .map_err(|err| {
-                CatalogUpdateError::Protocol(format!(
-                    "failed to encode catalog.update request body: {err}"
-                ))
-            })?;
+        let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
+            provides,
+            capabilities,
+        })
+        .map_err(|err| {
+            CatalogUpdateError::Protocol(format!(
+                "failed to encode catalog.update request body: {err}"
+            ))
+        })?;
         let (corr, writer, rx) = self.shared.begin_catalog_update()?;
         let frame = Frame::build_with_version(
             self.shared.negotiated_ver,

@@ -456,6 +456,18 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             },
         ),
         (
+            // A capability census closes just the violating route immediately;
+            // it does not wait for a module drain or leave the target terminal.
+            "client_control_push_route_closed_capability_denied",
+            ClientControlPush::RouteClosed {
+                module_id: "credentials-provider".to_string(),
+                reason: RouteCloseReason::CapabilityDenied,
+                drained: false,
+                abandoned: 0,
+                terminal: Some(false),
+            },
+        ),
+        (
             // Matches cleanup_connection's crash-teardown shape exactly: a crash
             // has no drain, so abandoned is always 0 -- unlike the planned-drain
             // reasons above, crash + abandoned>0 is unreachable on the wire.

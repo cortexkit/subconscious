@@ -905,6 +905,7 @@ dependencies = [
  "rlimit",
  "serde",
  "serde_json",
+ "sha2",
  "subc-control",
  "subc-jsonc",
  "subc-protocol",

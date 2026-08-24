@@ -29,6 +29,7 @@ use crate::{
         CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
         ModuleDrainTarget, PendingModuleControlRpc,
     },
+    provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
     registry::RegistryError,
     stderr_tail::{pump_stderr, StderrRing, StderrTailConfig, StderrTailSnapshot},
     terminal_ring::{TerminalHistorySnapshot, TerminalRecord, TerminalRing, TerminalRingConfig},
@@ -63,6 +64,9 @@ struct SupervisedChild {
     child: Child,
     stderr_pump: Option<JoinHandle<()>>,
     stderr_ring: Arc<Mutex<StderrRing>>,
+    spawned_at_ms: u64,
+    spawned_from: PathBuf,
+    spawned_file_identity: Option<SpawnedFileIdentity>,
 }
 
 impl SupervisedChild {
@@ -334,6 +338,8 @@ pub struct ModuleStatus {
     /// about-to-be-retired module look ordinary.
     pub max_restarts: u32,
     pub pid: Option<u32>,
+    pub spawned_at_ms: Option<u64>,
+    pub spawned_from: Option<PathBuf>,
     pub last_exit: Option<ExitReport>,
     pub health: ModuleHealthStatus,
 }
@@ -345,6 +351,9 @@ struct SupervisorSnapshot {
     process_alive: bool,
     restart_count: u32,
     pid: Option<u32>,
+    spawned_at_ms: Option<u64>,
+    spawned_from: Option<PathBuf>,
+    spawned_file_identity: Option<SpawnedFileIdentity>,
     last_exit: Option<ExitReport>,
     health: ModuleHealthStatus,
 }
@@ -369,6 +378,9 @@ impl SupervisorSnapshot {
             process_alive: false,
             restart_count: 0,
             pid: None,
+            spawned_at_ms: None,
+            spawned_from: None,
+            spawned_file_identity: None,
             last_exit: None,
             health: ModuleHealthStatus::default(),
         }
@@ -810,6 +822,8 @@ pub struct Supervisor {
     supervisor_handle: Option<SupervisorHandle>,
     health: HealthConfig,
     daemon_started_at_ms: u64,
+    #[allow(dead_code)]
+    provenance_probe: ExecutableIdentityProbe,
 }
 
 impl Supervisor {
@@ -824,6 +838,7 @@ impl Supervisor {
             supervisor_handle: None,
             health: HealthConfig::default(),
             daemon_started_at_ms: unix_ms_now(),
+            provenance_probe: ExecutableIdentityProbe::default(),
         }
     }
 
@@ -876,7 +891,7 @@ impl Supervisor {
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
         )?;
-        set_running(&snapshot, child.id())?;
+        set_running(&snapshot, &child)?;
         self.process_liveness
             .track(spec.module_id.clone(), Arc::clone(&snapshot));
 
@@ -909,7 +924,7 @@ impl Supervisor {
             &runtime.stderr_ring,
         ) {
             Ok(child) => {
-                set_running(&snapshot, child.id())?;
+                set_running(&snapshot, &child)?;
                 self.process_liveness
                     .track(spec.module_id.clone(), Arc::clone(&snapshot));
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
@@ -954,7 +969,7 @@ impl Supervisor {
             &runtime.stderr_ring,
         ) {
             Ok(child) => {
-                set_running(&snapshot, child.id())?;
+                set_running(&snapshot, &child)?;
                 self.process_liveness
                     .track(spec.module_id.clone(), Arc::clone(&snapshot));
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
@@ -1034,6 +1049,7 @@ impl Supervisor {
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
                 max_restarts: self.restart_policy.max_restarts,
+                provenance_probe: self.provenance_probe.clone(),
             }),
         };
         if let Some(supervisor_handle) = &self.supervisor_handle {
@@ -1069,6 +1085,7 @@ struct SupervisedModuleInner {
     /// report the restart budget without reaching back into the supervisor. The
     /// policy is fixed for the process's lifetime, so a copy cannot drift.
     max_restarts: u32,
+    provenance_probe: ExecutableIdentityProbe,
 }
 
 impl fmt::Debug for SupervisedModule {
@@ -1156,9 +1173,31 @@ impl SupervisedModule {
             restart_count: snapshot.restart_count,
             max_restarts: self.inner.max_restarts,
             pid: snapshot.pid,
+            spawned_at_ms: snapshot.spawned_at_ms,
+            spawned_from: snapshot.spawned_from,
             last_exit: snapshot.last_exit,
             health: snapshot.health,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn running_image_agreement(&self) -> subc_control::RunningImageAgreement {
+        let snapshot = match lock_snapshot(&self.inner.snapshot) {
+            Ok(snapshot) => snapshot.clone(),
+            Err(_) => {
+                return subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::NotRunning,
+                };
+            }
+        };
+        self.inner
+            .provenance_probe
+            .observe(
+                snapshot.pid,
+                snapshot.spawned_from.as_deref(),
+                snapshot.spawned_file_identity,
+            )
+            .await
     }
 
     pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
@@ -1343,8 +1382,7 @@ impl Drop for SupervisedModuleInner {
         if let Some(monitor) = monitor.as_ref().filter(|monitor| !monitor.is_finished()) {
             let _ = update_snapshot(&self.snapshot, Some(&self.module_id), |state| {
                 state.state = ModuleState::Stopped;
-                state.process_alive = false;
-                state.pid = None;
+                clear_current_process_facts(state);
             });
             monitor.abort();
         }
@@ -2554,8 +2592,7 @@ async fn handle_supervisor_command(
                     );
                     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                         state.state = ModuleState::Failed;
-                        state.process_alive = false;
-                        state.pid = None;
+                        clear_current_process_facts(state);
                     });
                 }
             }
@@ -2642,8 +2679,7 @@ async fn restart_child(
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.enabled = true;
             state.state = ModuleState::Restarting;
-            state.process_alive = false;
-            state.pid = None;
+            clear_current_process_facts(state);
         })?;
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
     }
@@ -2710,8 +2746,7 @@ async fn reload_child(
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.enabled = true;
             state.state = ModuleState::Restarting;
-            state.process_alive = false;
-            state.pid = None;
+            clear_current_process_facts(state);
         })?;
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
     }
@@ -2840,8 +2875,7 @@ async fn set_child_enabled(
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.enabled = true;
             state.state = ModuleState::Starting;
-            state.process_alive = false;
-            state.pid = None;
+            clear_current_process_facts(state);
         })?;
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
         reset_restart_count(snapshot, &spec.module_id)?;
@@ -2851,8 +2885,7 @@ async fn set_child_enabled(
             Err(err) => {
                 if let Err(state_err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                     state.state = ModuleState::Failed;
-                    state.process_alive = false;
-                    state.pid = None;
+                    clear_current_process_facts(state);
                 }) {
                     error!(module_id = %spec.module_id, error = %state_err, "failed to record enable spawn failure");
                 }
@@ -2906,8 +2939,7 @@ async fn on_child_exit(
             );
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.state = ModuleState::Stopped;
-                state.process_alive = false;
-                state.pid = None;
+                clear_current_process_facts(state);
                 state.last_exit = Some(exit_report.clone());
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record clean module exit");
@@ -2940,8 +2972,7 @@ async fn on_child_exit(
             let mut should_restart = false;
             let mut disposition = TerminalDisposition::Disabled;
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                state.process_alive = false;
-                state.pid = None;
+                clear_current_process_facts(state);
                 state.last_exit = Some(exit_report.clone());
                 if daemon_will_restart(state.enabled, state.restart_count, policy.max_restarts) {
                     state.restart_count += 1;
@@ -3087,6 +3118,9 @@ fn spawn_child(
         program: spec.program.clone(),
         source,
     })?;
+    let spawned_at_ms = unix_ms_now();
+    let spawned_from = spec.program.clone();
+    let spawned_file_identity = spawned_file_identity(&spawned_from);
 
     let stderr_pump = match child.stderr.take() {
         Some(stderr) => {
@@ -3114,6 +3148,9 @@ fn spawn_child(
         child,
         stderr_pump,
         stderr_ring: Arc::clone(ring),
+        spawned_at_ms,
+        spawned_from,
+        spawned_file_identity,
     })
 }
 
@@ -3156,7 +3193,7 @@ fn spawn_and_mark_running(
         runtime.supervisor_handle.as_ref(),
         &runtime.stderr_ring,
     )?;
-    set_running(snapshot, child.id())?;
+    set_running(snapshot, &child)?;
     Ok(child)
 }
 
@@ -3592,8 +3629,7 @@ async fn handle_reload_spawn_failure(
 ) -> Result<(), SuperviseError> {
     let mut should_retry = false;
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.process_alive = false;
-        state.pid = None;
+        clear_current_process_facts(state);
         if daemon_will_restart(
             state.enabled,
             state.restart_count,
@@ -3668,8 +3704,7 @@ async fn drain_optional_child(
             if let Some(enabled) = enabled {
                 state.enabled = enabled;
             }
-            state.process_alive = false;
-            state.pid = None;
+            clear_current_process_facts(state);
         })?;
         wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
     }
@@ -3734,8 +3769,7 @@ async fn drain_child_to_state(
         if let Some(enabled) = enabled {
             state.enabled = enabled;
         }
-        state.process_alive = false;
-        state.pid = None;
+        clear_current_process_facts(state);
         state.last_exit = Some(exit_report.clone());
     })?;
     record_terminal(
@@ -3846,13 +3880,24 @@ fn reset_restart_count(snapshot: &SharedSnapshot, module_id: &str) -> Result<(),
     })
 }
 
-fn set_running(snapshot: &SharedSnapshot, pid: Option<u32>) -> Result<(), SuperviseError> {
+fn set_running(snapshot: &SharedSnapshot, child: &SupervisedChild) -> Result<(), SuperviseError> {
     update_snapshot(snapshot, None, |state| {
         state.state = ModuleState::Running;
         state.enabled = true;
         state.process_alive = true;
-        state.pid = pid;
+        state.pid = child.id();
+        state.spawned_at_ms = Some(child.spawned_at_ms);
+        state.spawned_from = Some(child.spawned_from.clone());
+        state.spawned_file_identity = child.spawned_file_identity;
     })
+}
+
+fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
+    state.process_alive = false;
+    state.pid = None;
+    state.spawned_at_ms = None;
+    state.spawned_from = None;
+    state.spawned_file_identity = None;
 }
 
 fn fail_snapshot(
@@ -3862,8 +3907,7 @@ fn fail_snapshot(
 ) {
     if let Err(err) = update_snapshot(snapshot, module_id, |state| {
         state.state = ModuleState::Failed;
-        state.process_alive = false;
-        state.pid = None;
+        clear_current_process_facts(state);
         if let Some(last_exit) = last_exit {
             state.last_exit = Some(last_exit);
         }

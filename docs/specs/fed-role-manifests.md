@@ -243,12 +243,23 @@ measurement. Both consumers independently converged on emitting the
 manifest from the issuing binary (--print-fed-manifest / allCases) — the
 fence-5 shape confirmed twice.
 
-Methodology pin from the prune confirm: presence checks are EXACT-MATCH from
-birth. CKIOS's first census counted files mentioning each op name and read
-rooms.list=16 alive — substring matches counting the _for_user successors as
-evidence for the superseded originals; exact-string search gave zero for all
-five. A prefix-blind census nearly reversed a correct prune verdict
-confidently. And the session.read epitaph, for every grant table's comment
+Methodology pin from the prune confirm (worded per CKIOS: carry the TRAP,
+not the result): PREFIX MATCHING MADE FOUR DEAD OPS LOOK ALIVE — a census
+counting files that mention an op name reads _for_user successors as
+evidence for their superseded originals (rooms.list "16 alive", exact
+matches zero). Presence checks are exact-match from birth, or they reverse
+correct verdicts confidently.
+
+Audit-half limits (rooms.ack sidebar): a grant change alone cannot exercise
+a call site — an ack fires only from an open room detail screen on a
+granted device, so post-grant silence reads IDENTICALLY to pre-grant
+silence in the audit; the never-called detector cannot distinguish "dead"
+from "not yet reachable by a human path". Verification came from source
+instead: the client cursor advances only after call success, so the first
+real ack is self-evidencing on both sides (server audit row AND advanced
+cursor). The sharp watch-item is not whether the first ack succeeds but
+whether it succeeds ONCE AND THEN STOPS — a cursor advanced past a range
+the server never recorded. And the session.read epitaph, for every grant table's comment
 field: a grant on a module that has never served the wire is not a
 capability, it is a comment — prune it; the real feature arrives with its
 own exposure decision anyway.

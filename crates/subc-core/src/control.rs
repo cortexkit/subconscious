@@ -2092,8 +2092,6 @@ impl ControlHandler {
                 },
             });
         }
-        modules.sort_by(|left, right| left.module_id.cmp(&right.module_id));
-
         let daemon = SupervisorDaemonProvenance {
             daemon_build: self.daemon_provenance.build.clone(),
             daemon_observed: DaemonObservedProcess {

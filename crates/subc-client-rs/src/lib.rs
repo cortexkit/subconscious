@@ -69,70 +69,6 @@ fn normalize_provenance_fact(value: Option<&str>) -> Option<String> {
     (!value.is_empty() && value != "unavailable").then(|| value.to_string())
 }
 
-#[test]
-fn build_provenance_normalizes_clean_build_facts() {
-    let provenance = build_provenance(
-        Some(" 0123456789abcdef0123456789abcdef01234567 "),
-        Some(" lock-digest "),
-        Some(" schema-v3 "),
-    );
-
-    assert_eq!(
-        provenance,
-        ManifestProvenance {
-            build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-            build_lock_digest: Some("lock-digest".to_string()),
-            wire_crate_version: Some(SUBC_PROTOCOL_CRATE_VERSION.to_string()),
-            store_schema_version: Some("schema-v3".to_string()),
-        }
-    );
-}
-
-#[test]
-fn build_provenance_preserves_a_dirty_revision_verbatim() {
-    let provenance = build_provenance(
-        Some("0123456789abcdef0123456789abcdef01234567-dirty"),
-        Some("lock-digest"),
-        None,
-    );
-
-    assert_eq!(
-        provenance.build_git_sha,
-        Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string())
-    );
-    assert_eq!(
-        provenance.build_lock_digest,
-        Some("lock-digest".to_string())
-    );
-}
-
-#[test]
-fn build_provenance_keeps_a_lock_digest_when_identity_is_unavailable() {
-    let provenance = build_provenance(Some("unavailable"), Some("lock-digest"), None);
-
-    assert_eq!(provenance.build_git_sha, None);
-    assert_eq!(
-        provenance.build_lock_digest,
-        Some("lock-digest".to_string())
-    );
-    assert_eq!(
-        provenance.wire_crate_version,
-        Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())
-    );
-}
-
-#[test]
-fn build_provenance_omits_fully_unavailable_inputs() {
-    let provenance = build_provenance(None, Some(" unavailable "), Some("   "));
-
-    assert_eq!(provenance.build_git_sha, None);
-    assert_eq!(provenance.build_lock_digest, None);
-    assert_eq!(provenance.store_schema_version, None);
-    assert_eq!(
-        provenance.wire_crate_version,
-        Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())
-    );
-}
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
     FrameIoError,
@@ -1602,6 +1538,71 @@ mod tests {
     use tokio::{sync::Notify, time::timeout};
 
     use super::*;
+
+    #[test]
+    fn build_provenance_normalizes_clean_build_facts() {
+        let provenance = build_provenance(
+            Some(" 0123456789abcdef0123456789abcdef01234567 "),
+            Some(" lock-digest "),
+            Some(" schema-v3 "),
+        );
+
+        assert_eq!(
+            provenance,
+            ManifestProvenance {
+                build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                build_lock_digest: Some("lock-digest".to_string()),
+                wire_crate_version: Some(SUBC_PROTOCOL_CRATE_VERSION.to_string()),
+                store_schema_version: Some("schema-v3".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn build_provenance_preserves_a_dirty_revision_verbatim() {
+        let provenance = build_provenance(
+            Some("0123456789abcdef0123456789abcdef01234567-dirty"),
+            Some("lock-digest"),
+            None,
+        );
+
+        assert_eq!(
+            provenance.build_git_sha,
+            Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string())
+        );
+        assert_eq!(
+            provenance.build_lock_digest,
+            Some("lock-digest".to_string())
+        );
+    }
+
+    #[test]
+    fn build_provenance_keeps_a_lock_digest_when_identity_is_unavailable() {
+        let provenance = build_provenance(Some("unavailable"), Some("lock-digest"), None);
+
+        assert_eq!(provenance.build_git_sha, None);
+        assert_eq!(
+            provenance.build_lock_digest,
+            Some("lock-digest".to_string())
+        );
+        assert_eq!(
+            provenance.wire_crate_version,
+            Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn build_provenance_omits_fully_unavailable_inputs() {
+        let provenance = build_provenance(None, Some(" unavailable "), Some("   "));
+
+        assert_eq!(provenance.build_git_sha, None);
+        assert_eq!(provenance.build_lock_digest, None);
+        assert_eq!(provenance.store_schema_version, None);
+        assert_eq!(
+            provenance.wire_crate_version,
+            Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())
+        );
+    }
 
     struct EchoHandler;
 

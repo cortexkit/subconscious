@@ -214,6 +214,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 // lets a newer client distinguish "old daemon" from a match.
                 build_git_sha: None,
                 build_lock_digest: None,
+                capability_requirements: Vec::new(),
             },
         ),
         (
@@ -242,6 +243,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 build_lock_digest: Some(
                     "9d2c0d69cd82f2151bbb2b32ab9ac9d861063ffde2f8582afe767ec7e1f2145c".to_string(),
                 ),
+                capability_requirements: Vec::new(),
             },
         ),
         (
@@ -293,6 +295,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     unchanged: 3,
                     preview: false,
                     restart_required: vec!["storage".to_string()],
+                    capability_warnings: Vec::new(),
                 },
             },
         ),

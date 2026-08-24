@@ -9,6 +9,7 @@ use std::{
 
 use serde::Deserialize;
 use subc_jsonc::jsonc_to_json;
+use subc_protocol::manifest::is_valid_capability_identifier;
 
 use crate::{HealthAction, HealthConfig, ModuleSpec};
 
@@ -52,6 +53,10 @@ pub struct DaemonConfig {
     pub admission_facts_carrier_module_id: Option<String>,
     /// Exact target module ids that may receive facts from the configured carrier.
     pub admission_facts_targets: Option<Vec<String>>,
+    /// Capability names reserved to one module id. The binding may name a module
+    /// that is not configured yet so an operator can reserve an interface before
+    /// installing its provider.
+    pub reserved_capabilities: BTreeMap<String, String>,
 }
 
 /// Central storage configuration: one backend for every managed module. subc
@@ -198,6 +203,8 @@ struct RawDaemonConfig {
     admission_facts_carrier_module_id: Option<String>,
     #[serde(default)]
     admission_facts_targets: Option<Vec<String>>,
+    #[serde(default)]
+    reserved_capabilities: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,6 +399,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
 
     validate_reserved_prefixes(&modules, path)?;
+    validate_reserved_capabilities(&raw.reserved_capabilities, path)?;
     validate_admission_facts_config(
         &modules,
         raw.admission_facts_carrier_module_id.as_deref(),
@@ -414,7 +422,44 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         storage,
         admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
         admission_facts_targets: raw.admission_facts_targets,
+        reserved_capabilities: raw.reserved_capabilities,
     })
+}
+
+fn validate_reserved_capabilities(
+    bindings: &BTreeMap<String, String>,
+    path: &Path,
+) -> Result<(), DaemonConfigError> {
+    for (capability, module_id) in bindings {
+        if !is_valid_capability_identifier(capability) {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "reserved_capabilities key {:?} is not a valid capability identifier",
+                    capability
+                ),
+            });
+        }
+        if module_id.trim().is_empty() {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "reserved_capabilities binding for {:?} has an empty module id",
+                    capability
+                ),
+            });
+        }
+        if let Err(reason) = crate::registry::module_id_path_hazard(module_id) {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "reserved_capabilities binding for {:?} has an unusable module id {:?}: {reason}",
+                    capability, module_id
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_admission_facts_config(
@@ -1062,6 +1107,40 @@ mod tests {
         assert!(config.modules[0].reserved_prefixes.is_empty());
         assert_eq!(config.modules[0].health, HealthConfig::default());
         assert!(!config.modules[1].enabled);
+    }
+
+    #[test]
+    fn reserved_capabilities_accept_unknown_bound_modules_and_refuse_bad_identifiers() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{
+                "version": 1,
+                "reserved_capabilities": {
+                    "credentials-provider/v1": "future-vault"
+                },
+                "modules": {}
+            }"#,
+            path,
+        )
+        .expect("a binding may predate its provider installation");
+        assert_eq!(
+            config.reserved_capabilities,
+            BTreeMap::from([(
+                "credentials-provider/v1".to_string(),
+                "future-vault".to_string()
+            )])
+        );
+
+        let error = parse_doc(
+            r#"{
+                "version": 1,
+                "reserved_capabilities": { "Credentials/v1": "vault" },
+                "modules": {}
+            }"#,
+            path,
+        )
+        .expect_err("reserved capabilities use the capability identifier grammar");
+        assert!(error.to_string().contains("reserved_capabilities key"));
     }
 
     #[test]

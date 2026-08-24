@@ -8,10 +8,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use subc_control::{
-    ops, CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse,
-    ConsumerIdentity, PollKind, RouteCloseReason, StderrCaptureState, StderrTail, StderrTailEntry,
-    SupervisorEntry, SupervisorHealthEntry, SupervisorRescanResult, SupervisorRoute,
-    SupervisorRouteConsumer, SupervisorRouteModule, TerminalEntry, TerminalHistory,
+    ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
+    ClientControlResponse, ConsumerIdentity, PollKind, RouteCloseReason, StderrCaptureState,
+    StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry, SupervisorRescanResult,
+    SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule, TerminalEntry,
+    TerminalHistory,
 };
 use subc_protocol::{
     error_codes,
@@ -28,6 +29,10 @@ use tokio::time::{timeout_at, Instant};
 use tracing::{debug, info, warn};
 
 use crate::{
+    capability_requirements::{
+        log_duplicate_claim_events, log_requirement_events, CapabilityRequirementEvaluator,
+        DuplicateClaimSource, RegisteredModule, RequirementStatus, RuntimeModule,
+    },
     forwarding::{
         CloseReason, EndpointRoute, ForwardingError, ForwardingTable, GoodbyeTarget,
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
@@ -122,6 +127,7 @@ pub struct ControlHandler {
     rescan: Option<SupervisorRescanContext>,
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
+    capability_evaluator: Arc<CapabilityRequirementEvaluator>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -246,6 +252,7 @@ impl ControlHandler {
             rescan: None,
             connected_clients: ConnectedClients::new(),
             counters,
+            capability_evaluator: Arc::new(CapabilityRequirementEvaluator::new()),
         }
     }
 
@@ -323,6 +330,19 @@ impl ControlHandler {
         self
     }
 
+    /// Install the configured module set and its reserved capability bindings.
+    /// Bindings are configuration-scoped and may point at a provider that has not
+    /// been installed yet, so this does not require the bound module to exist.
+    pub fn with_capability_config(
+        self,
+        modules: impl IntoIterator<Item = (String, bool)>,
+        reserved_capabilities: BTreeMap<String, String>,
+    ) -> Self {
+        self.capability_evaluator
+            .configure(modules, reserved_capabilities);
+        self
+    }
+
     pub fn with_supervisor_rescan(
         mut self,
         supervisor: Supervisor,
@@ -351,6 +371,75 @@ impl ControlHandler {
 
     pub(crate) fn counters(&self) -> DaemonCounters {
         self.counters.clone()
+    }
+
+    /// Wake at each candidate's own deadline so a stalled fresh exec emits its
+    /// requirement event without depending on an operator polling a status command.
+    pub fn spawn_capability_deadline_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                self.capability_evaluator
+                    .wait_for_change_or_deadline()
+                    .await;
+                self.refresh_capability_requirements();
+            }
+        });
+    }
+
+    fn runtime_capability_snapshot(
+        &self,
+    ) -> Result<(Vec<RuntimeModule>, Vec<RegisteredModule>), RouterError> {
+        let runtime = self
+            .supervisor
+            .list()
+            .into_iter()
+            .map(|module| {
+                let status = module.status().map_err(|err| {
+                    RouterError::backend(0, 0, format!("failed to read capability status: {err}"))
+                })?;
+                Ok(RuntimeModule {
+                    module_id: status.module_id,
+                    state: status.state,
+                    enabled: status.enabled,
+                })
+            })
+            .collect::<Result<Vec<_>, RouterError>>()?;
+        let (_, registrations) = self.registry.list_modules().map_err(|err| {
+            RouterError::backend(
+                0,
+                0,
+                format!("failed to list capability registrations: {err}"),
+            )
+        })?;
+        let registrations = registrations
+            .into_iter()
+            .map(|registration| RegisteredModule {
+                module_id: registration.manifest.module_id,
+                module_version: registration.manifest.module_version,
+                capabilities: registration.manifest.capabilities,
+            })
+            .collect();
+        Ok((runtime, registrations))
+    }
+
+    pub fn refresh_capability_requirements(&self) {
+        match self.runtime_capability_snapshot() {
+            Ok((runtime, registrations)) => {
+                log_requirement_events(
+                    self.capability_evaluator
+                        .evaluate_now(&runtime, &registrations),
+                );
+            }
+            Err(err) => warn!(error = %err, "failed to recompute capability requirements"),
+        }
+    }
+
+    fn capability_requirement_statuses(&self) -> Vec<CapabilityRequirementStatus> {
+        self.capability_evaluator
+            .statuses()
+            .into_iter()
+            .map(capability_requirement_status)
+            .collect()
     }
 
     /// Remove a connection's registry entries WITHOUT signalling the supervisor's
@@ -544,6 +633,8 @@ impl ControlHandler {
         // replacement never observes release while old routes still exist.
         if matches!(&registrations, Ok(r) if !r.is_empty()) {
             crate::supervise::notify_registration_release();
+            self.capability_evaluator.wake_deadline_loop();
+            self.refresh_capability_requirements();
         }
         registrations
     }
@@ -774,6 +865,24 @@ impl ControlHandler {
             )?]);
         }
 
+        let reserved_capability_refusals = self.capability_evaluator.reserved_hello_refusals(
+            &hello.manifest.module_id,
+            hello.manifest.capabilities.as_ref(),
+        );
+        if let Some(refusal) = reserved_capability_refusals.first() {
+            let capability = refusal.capability.clone();
+            let bound_module = refusal.claimants[0].clone();
+            log_duplicate_claim_events(reserved_capability_refusals);
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_capability",
+                format!(
+                    "capability '{}' is reserved for module_id '{}'; claimant '{}' was refused",
+                    capability, bound_module, hello.manifest.module_id
+                ),
+            )?]);
+        }
+
         // A connection that already opened client routes must not also register as
         // a module: cleanup would then release only one side and leak the other.
         if self
@@ -866,6 +975,19 @@ impl ControlHandler {
                 "management surface registered with DEFAULTED concurrency=module_managed (manifest predates the field; declare the real lane)"
             );
         }
+
+        let cached_registration = RegisteredModule {
+            module_id: registration.manifest.module_id.clone(),
+            module_version: registration.manifest.module_version.clone(),
+            capabilities: registration.manifest.capabilities.clone(),
+        };
+        if self.capability_evaluator.record_hello(&cached_registration) {
+            warn!(
+                module_id = %cached_registration.module_id,
+                "capability claims drifted from the cached manifest"
+            );
+        }
+        self.refresh_capability_requirements();
 
         info!(
             module_id = %registration.manifest.module_id,
@@ -1000,6 +1122,7 @@ impl ControlHandler {
         frame: Frame,
         provides: Vec<ProviderRole>,
     ) -> Result<Vec<Frame>, RouterError> {
+        self.refresh_capability_requirements();
         let Some(registration) = self
             .registry
             .get_module_by_connection(connection_id)
@@ -1033,6 +1156,13 @@ impl ControlHandler {
                 "catalog.update requires an active module registration owned by this connection",
             )?]);
         }
+        if let Ok((_, registrations)) = self.runtime_capability_snapshot() {
+            log_duplicate_claim_events(
+                self.capability_evaluator
+                    .duplicate_claims(DuplicateClaimSource::CatalogUpdate, &registrations),
+            );
+        }
+        self.refresh_capability_requirements();
 
         let response = ModuleControlResponseToModule::CatalogUpdate {};
         control_response_body_frame(
@@ -1044,6 +1174,7 @@ impl ControlHandler {
     }
 
     fn handle_server_describe(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        self.refresh_capability_requirements();
         // A bare connection count is ambiguous between many clients holding a
         // route each and one client accumulating hundreds, so publish the
         // concentration alongside it. Route state is best-effort here: a
@@ -1068,6 +1199,7 @@ impl ControlHandler {
             counters: Some(counters),
             build_git_sha: Some(env!("SUBC_BUILD_GIT_SHA").to_string()),
             build_lock_digest: Some(env!("SUBC_BUILD_LOCK_DIGEST").to_string()),
+            capability_requirements: self.capability_requirement_statuses(),
         };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -1687,6 +1819,7 @@ impl ControlHandler {
     }
 
     fn handle_supervisor_health(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        self.refresh_capability_requirements();
         let generation = self
             .registry
             .generation()
@@ -1703,10 +1836,17 @@ impl ControlHandler {
                         format!("failed to read supervisor health: {err}"),
                     )
                 })?;
+                let module_id = status.module_id;
+                let capability_detail = self
+                    .capability_evaluator
+                    .required_problem_detail(&module_id);
                 Ok(SupervisorHealthEntry {
-                    module_id: status.module_id,
+                    module_id,
                     status: status.health.status,
-                    detail: status.health.detail,
+                    detail: append_capability_problem_detail(
+                        status.health.detail,
+                        capability_detail,
+                    ),
                     metrics: status.health.metrics,
                     consecutive_failures: status.health.consecutive_failures,
                     late_answer_count: status.health.late_answer_count,
@@ -1856,12 +1996,14 @@ impl ControlHandler {
             admission_facts_carrier_module_id,
             admission_facts_targets,
             modules,
+            reserved_capabilities,
         ) = (
             config.port,
             config.storage,
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
             config.modules,
+            config.reserved_capabilities,
         );
 
         // Collect the sections rescan cannot apply, so the REPLY carries them.
@@ -1903,6 +2045,35 @@ impl ControlHandler {
             }
         }
 
+        let configured_capabilities = modules
+            .iter()
+            .map(|module| (module.module_id.clone(), module.enabled))
+            .collect::<Vec<_>>();
+        let preview_capability_warnings = if preview {
+            let (_, registrations) = self.runtime_capability_snapshot()?;
+            let current_modules = self
+                .supervisor
+                .list()
+                .into_iter()
+                .map(|module| module.module_id().to_string())
+                .collect::<BTreeSet<_>>();
+            let resulting_modules = configured_capabilities.clone();
+            let removed = current_modules
+                .into_iter()
+                .filter(|module_id| {
+                    !resulting_modules
+                        .iter()
+                        .any(|(configured_id, _)| configured_id == module_id)
+                })
+                .collect::<Vec<_>>();
+            self.capability_evaluator.preview_removal_warnings(
+                resulting_modules,
+                &removed,
+                &registrations,
+            )
+        } else {
+            Vec::new()
+        };
         let result = match self
             .reconcile_supervised_modules(&context.supervisor, modules, preview)
             .await
@@ -1912,8 +2083,15 @@ impl ControlHandler {
                 return Ok(vec![control_error_frame(&frame, "rescan_failed", message)?])
             }
         };
+        if !preview {
+            self.capability_evaluator
+                .configure(configured_capabilities, reserved_capabilities);
+            self.capability_evaluator.wake_deadline_loop();
+            self.refresh_capability_requirements();
+        }
         let mut result = result;
         result.restart_required = restart_required;
+        result.capability_warnings = preview_capability_warnings;
         let response = ClientControlResponse::SupervisorRescan { result };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -2083,6 +2261,7 @@ impl ControlHandler {
                 // restart-required sections identically to an executed rescan --
                 // the preview is where an operator is most likely to be looking.
                 restart_required: Vec::new(),
+                capability_warnings: Vec::new(),
             });
         }
 
@@ -2158,6 +2337,7 @@ impl ControlHandler {
             // Filled by the caller, which is the only layer that can see the
             // previous config to diff against.
             restart_required: Vec::new(),
+            capability_warnings: Vec::new(),
         })
     }
 
@@ -2188,6 +2368,8 @@ impl ControlHandler {
             }
         };
 
+        self.capability_evaluator.wake_deadline_loop();
+        self.refresh_capability_requirements();
         let response = ClientControlResponse::SupervisorAck { module_id, applied };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -2201,6 +2383,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
     ) -> Result<Vec<Frame>, RouterError> {
+        self.refresh_capability_requirements();
         let Some(registration) = self
             .registry
             .get_module(&module_id)
@@ -2305,10 +2488,13 @@ impl ControlHandler {
                     detail,
                     metrics,
                 } = report;
+                let capability_detail = self
+                    .capability_evaluator
+                    .required_problem_detail(&module_id);
                 let response = ClientControlResponse::SupervisorHealthProbe {
                     module_id,
                     status,
-                    detail,
+                    detail: append_capability_problem_detail(detail, capability_detail),
                     metrics,
                 };
                 Ok(vec![control_response_body_frame(
@@ -2772,6 +2958,34 @@ impl ControlHandler {
 impl Default for ControlHandler {
     fn default() -> Self {
         Self::new(Arc::new(Registry::default()))
+    }
+}
+
+fn capability_requirement_status(status: RequirementStatus) -> CapabilityRequirementStatus {
+    CapabilityRequirementStatus {
+        consumer: status.consumer,
+        capability: status.capability,
+        need: match status.need {
+            subc_protocol::manifest::CapabilityNeed::Required => "required".to_string(),
+            subc_protocol::manifest::CapabilityNeed::Optional => "optional".to_string(),
+        },
+        verdict: status.verdict.as_str().to_string(),
+        episode_seq: status.episode_seq,
+        config_satisfiable: status.config_satisfiable,
+        runtime_available: status.runtime_available,
+        detail: status.detail,
+    }
+}
+
+fn append_capability_problem_detail(
+    detail: Option<String>,
+    capability_detail: Option<String>,
+) -> Option<String> {
+    match (detail, capability_detail) {
+        (Some(detail), Some(capability_detail)) => Some(format!("{detail}; {capability_detail}")),
+        (Some(detail), None) => Some(detail),
+        (None, Some(capability_detail)) => Some(capability_detail),
+        (None, None) => None,
     }
 }
 
@@ -4210,6 +4424,110 @@ mod tests {
             serde_json::to_value(&modules[0].capabilities).expect("catalog capabilities serialize"),
             capabilities
         );
+    }
+
+    #[test]
+    fn reserved_capability_refusal_mutation_proof_leaves_no_catalog_entry() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_capability_config(
+            [("vault".to_string(), true), ("squatter".to_string(), true)],
+            BTreeMap::from([("credentials-provider/v1".to_string(), "vault".to_string())]),
+        );
+        let mut squatter = manifest("squatter", PROTOCOL_VERSION);
+        squatter.capabilities = Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec!["credentials-provider/v1".to_string()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        });
+        let frame = Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            77,
+            serde_json::to_vec(&ModuleHelloBody {
+                manifest: squatter,
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            })
+            .expect("HELLO serializes"),
+        )
+        .expect("HELLO frame builds");
+        let response = handler
+            .handle_control(ConnectionId::new(77), frame)
+            .expect("reserved claim receives a typed refusal");
+        assert_eq!(parse_error(&response[0])["code"], "reserved_capability");
+        assert_eq!(
+            registry
+                .active_registration_count()
+                .expect("registry reads"),
+            0,
+            "a reserved capability refusal must not leave a catalog entry"
+        );
+    }
+
+    #[test]
+    fn server_describe_surfaces_required_capability_verdict_fields() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_capability_config(
+            [
+                ("consumer".to_string(), true),
+                ("provider".to_string(), false),
+            ],
+            BTreeMap::new(),
+        );
+        let mut consumer = manifest("consumer", PROTOCOL_VERSION);
+        consumer.capabilities = Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: Vec::new(),
+            requires: vec![subc_protocol::manifest::CapabilityRequirement {
+                capability: "credentials-provider/v1".to_string(),
+                need: subc_protocol::manifest::CapabilityNeed::Required,
+            }],
+            must_never_reach: Vec::new(),
+        });
+        let hello = Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            78,
+            serde_json::to_vec(&ModuleHelloBody {
+                manifest: consumer,
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            })
+            .expect("HELLO serializes"),
+        )
+        .expect("HELLO frame builds");
+        handler
+            .handle_control(ConnectionId::new(78), hello)
+            .expect("consumer registers");
+        let describe = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            79,
+            serde_json::to_vec(&ClientControlRequest::ServerDescribe {})
+                .expect("request serializes"),
+        )
+        .expect("describe frame builds");
+        let response = handler
+            .handle_server_describe(describe)
+            .expect("server.describe succeeds");
+        let rendered: Value = serde_json::from_slice(&response[0].body).expect("response JSON");
+        let requirement = &rendered["capability_requirements"][0];
+        assert_eq!(requirement["consumer"], "consumer");
+        assert_eq!(requirement["verdict"], "never_provided");
+        assert_eq!(requirement["episode_seq"], 1);
+        assert_eq!(requirement["config_satisfiable"], false);
+        assert_eq!(requirement["runtime_available"], false);
+        assert!(requirement["detail"]
+            .as_str()
+            .expect("detail string")
+            .contains("credentials-provider/v1"));
     }
 
     #[test]

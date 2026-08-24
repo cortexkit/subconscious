@@ -1,0 +1,50 @@
+{
+  "daemon": {
+    "daemon_build": {
+      "build_git_sha": "fedcba9876543210fedcba9876543210fedcba98",
+      "build_lock_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "daemon_observed": {
+      "pid": 4400,
+      "running_image": {
+        "evidence": {
+          "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+          "method": "linux_proc_sha256"
+        },
+        "status": "match"
+      },
+      "started_at_ms": 1725000000005
+    }
+  },
+  "modules": [
+    {
+      "daemon_observed": {
+        "pid": 4401,
+        "running_image": {
+          "disk": {
+            "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "method": "linux_proc_sha256"
+          },
+          "running": {
+            "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "method": "linux_proc_sha256"
+          },
+          "status": "mismatch"
+        },
+        "spawned_at_ms": 1725000000006,
+        "spawned_from": "/opt/subc/bin/mcp"
+      },
+      "module_declared": {
+        "build": {
+          "build_commit": "fedcba9876543210fedcba9876543210fedcba98-dirty",
+          "build_lock_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "store_schema_version": "3",
+          "wire_crate_version": "0.13.0"
+        },
+        "status": "reported"
+      },
+      "module_id": "mcp"
+    }
+  ],
+  "op": "supervisor.provenance"
+}

@@ -29,6 +29,7 @@
     "supervisor.health",
     "supervisor.stderr_tail",
     "supervisor.terminals",
-    "supervisor.routes"
+    "supervisor.routes",
+    "supervisor.provenance"
   ]
 }

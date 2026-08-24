@@ -911,40 +911,85 @@ EOF
 # -- enforcer / enforcer-by-documentation / accident, sdk-affordances \u00a710b --
 # is audit knowledge a grep cannot derive; this census tracks membership only.)
 echo "-- hand-rolled subc clients (SDK fixes do not reach these)"
-hr_examined=0; hr_now=""
-for _r in "$HOME/Work/Projects/CortexKit"/*/; do
-  _repo="${_r%/}"
-  [ -e "$_repo/Cargo.toml" ] || ls "$_repo"/crates/*/Cargo.toml >/dev/null 2>&1 || continue
-  hr_examined=$((hr_examined+1))
-  # Bounded manifest discovery: --include=Cargo.toml still WALKS the whole tree
-  # (multi-GB target/ dirs made the census the pulse's slowest line); find with
-  # a depth cap and target/ pruned reads only the manifests.
-  _manifests=$(find "$_repo" -maxdepth 4 -name Cargo.toml -not -path "*/target/*" -not -path "*/.cortexkit/*" 2>/dev/null)
-  [ -n "$_manifests" ] || continue
-  if printf '%s\n' "$_manifests" | xargs grep -lq "subc-client-rs" 2>/dev/null; then
-    :
-  elif printf '%s\n' "$_manifests" | xargs grep -lqE "subc-transport|subc_transport" 2>/dev/null; then
-    hr_now="$hr_now$(basename "$_repo")\n"
-  fi
+hr_examined=0; hr_now=""; hr_examined_now=""
+# FLEET_PULSE_ROOTS keeps the maintainer's single-root layout as the default,
+# while allowing a fleet split across several project trees to remain one
+# census. Names are the identity used by the old census, so duplicate roots do
+# not double-count a repository. Keep this list-based: the fleet still includes
+# macOS boxes whose stock /usr/bin/env bash is 3.2.
+IFS=: read -r -a _hr_roots <<< "${FLEET_PULSE_ROOTS:-$HOME/Work/Projects/CortexKit}"
+_hr_seen=""
+for _root in "${_hr_roots[@]}"; do
+  [ -n "$_root" ] || continue
+  for _r in "$_root"/*/; do
+    _repo="${_r%/}"
+    [ -d "$_repo" ] || continue
+    _repo_name=$(basename "$_repo")
+    [ -e "$_repo/Cargo.toml" ] || ls "$_repo"/crates/*/Cargo.toml >/dev/null 2>&1 || continue
+    printf '%b' "$_hr_seen" | grep -qxF "$_repo_name" && continue
+    _hr_seen="$_hr_seen$_repo_name\n"
+    hr_examined=$((hr_examined+1))
+    hr_examined_now="$hr_examined_now$_repo_name\n"
+    # Bounded manifest discovery: --include=Cargo.toml still WALKS the whole tree
+    # (multi-GB target/ dirs made the census the pulse's slowest line); find with
+    # a depth cap and target/ pruned reads only the manifests.
+    _manifests=$(find "$_repo" -maxdepth 4 -name Cargo.toml -not -path "*/target/*" -not -path "*/.cortexkit/*" 2>/dev/null)
+    [ -n "$_manifests" ] || continue
+    if printf '%s\n' "$_manifests" | xargs grep -lq "subc-client-rs" 2>/dev/null; then
+      :
+    elif printf '%s\n' "$_manifests" | xargs grep -lqE "subc-transport|subc_transport" 2>/dev/null; then
+      hr_now="$hr_now$_repo_name\n"
+    fi
+  done
 done
+hr_examined_now=$(printf '%b' "$hr_examined_now" | sort -u)
 hr_now=$(printf '%b' "$hr_now" | sort)
 hr_found=$(printf '%s\n' "$hr_now" | grep -c . || true)
-hr_prev_file="$HOME/.local/share/cortexkit/run/.fleet-pulse-handrolled-census"
+hr_state_dir="${FLEET_PULSE_STATE_DIR:-$HOME/.local/share/cortexkit/run}"
+hr_prev_file="$hr_state_dir/.fleet-pulse-handrolled-census"
+hr_examined_prev_file="$hr_state_dir/.fleet-pulse-handrolled-census-examined"
+mkdir -p "$hr_state_dir" 2>/dev/null || true
 hr_prev=$(cat "$hr_prev_file" 2>/dev/null || true)
+hr_prev_examined=$(cat "$hr_examined_prev_file" 2>/dev/null || true)
+# A missing or malformed companion state cannot distinguish absence from
+# migration. Treat it as a baseline rather than printing an invented transition.
+if [ -z "$hr_prev_examined" ] \
+  || printf '%s\n%s\n' "$hr_prev" "$hr_prev_examined" | grep -q '[^[:alnum:]_.-]'; then
+  hr_prev=""; hr_prev_examined=""
+fi
 if [ "$hr_examined" -lt 8 ]; then
-  echo "  CENSUS BROKEN: only $hr_examined rust repos examined -- expected 8+ (check the CortexKit projects root)"
-elif [ -z "$hr_prev" ]; then
+  echo "  CENSUS BROKEN: only $hr_examined rust repos examined -- expected 8+ (check FLEET_PULSE_ROOTS)"
+elif [ -z "$hr_prev_examined" ]; then
   printf '%s\n' "$hr_now" | sed 's/^/  /'
   echo "  census baseline: $hr_found hand-rolled of $hr_examined rust repos (transitions print from next pulse)"
   printf '%s' "$hr_now" > "$hr_prev_file" 2>/dev/null || true
-elif [ "$hr_now" != "$hr_prev" ]; then
-  comm -13 <(printf '%s\n' "$hr_prev") <(printf '%s\n' "$hr_now") | sed 's/^/  ENTERED hand-rolled population: /'
-  comm -23 <(printf '%s\n' "$hr_prev") <(printf '%s\n' "$hr_now") | sed 's/^/  LEFT hand-rolled population (adopted SDK?): /'
-  echo "  census CHANGED: $hr_found hand-rolled of $hr_examined rust repos examined"
-  printf '%s' "$hr_now" > "$hr_prev_file" 2>/dev/null || true
+  printf '%s' "$hr_examined_now" > "$hr_examined_prev_file" 2>/dev/null || true
 else
-  echo "  census unchanged: $hr_found hand-rolled of $hr_examined rust repos examined"
-  [ "${FLEET_PULSE_CENSUS_FULL:-0}" = "1" ] && printf '%s\n' "$hr_now" | sed 's/^/  /'
+  hr_gaps=$(comm -23 <(printf '%s\n' "$hr_prev_examined") <(printf '%s\n' "$hr_examined_now"))
+  hr_entered=$(comm -13 <(printf '%s\n' "$hr_prev") <(printf '%s\n' "$hr_now"))
+  hr_left=$(comm -23 <(printf '%s\n' "$hr_prev") <(printf '%s\n' "$hr_now"))
+  hr_migrated=$(comm -23 <(printf '%s\n' "$hr_left") <(printf '%s\n' "$hr_gaps"))
+  if [ -n "$hr_gaps" ] || [ -n "$hr_entered" ] || [ -n "$hr_migrated" ] \
+    || [ "$hr_now" != "$hr_prev" ] || [ "$hr_examined_now" != "$hr_prev_examined" ]; then
+    while IFS= read -r _gap; do
+      [ -n "$_gap" ] || continue
+      if printf '%s\n' "$hr_prev" | grep -qxF "$_gap"; then
+        echo "  CENSUS GAP: $_gap was in the hand-rolled population and is no longer FOUND by the scan (moved? renamed? check FLEET_PULSE_ROOTS) -- NOT evidence of SDK adoption"
+      else
+        echo "  CENSUS GAP: $_gap was examined by the census and is no longer FOUND by the scan (moved? renamed? check FLEET_PULSE_ROOTS)"
+      fi
+    done <<EOF
+$hr_gaps
+EOF
+    printf '%s\n' "$hr_entered" | sed '/^$/d; s/^/  ENTERED hand-rolled population: /'
+    printf '%s\n' "$hr_migrated" | sed '/^$/d; s/^/  LEFT hand-rolled population (adopted SDK): /'
+    echo "  census CHANGED: $hr_found hand-rolled of $hr_examined rust repos examined"
+    printf '%s' "$hr_now" > "$hr_prev_file" 2>/dev/null || true
+    printf '%s' "$hr_examined_now" > "$hr_examined_prev_file" 2>/dev/null || true
+  else
+    echo "  census unchanged: $hr_found hand-rolled of $hr_examined rust repos examined"
+    [ "${FLEET_PULSE_CENSUS_FULL:-0}" = "1" ] && printf '%s\n' "$hr_now" | sed 's/^/  /'
+  fi
 fi
 
 echo "-- release ledger (manifest vs tag vs deployed)"

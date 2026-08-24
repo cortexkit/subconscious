@@ -448,3 +448,13 @@ This build ships the mechanism: manifest vocabulary, static assembly evaluation,
 `ck fleet lint` proves only static assembly coherence: declared requirements against declared or seeded providers; deny consistency defined exactly as a same-module `requires`/`must_never_reach` self-contradiction check; and reserved-capability consistency. Lint has no route census, so ordinary coexistence of a deny edge with another module's provider declaration is not a violation, and lint silence is not evidence of runtime-equivalent deny enforcement.
 
 The build does not and cannot prove runtime availability, implementation correctness against capability corpora, direct-client isolation, or replaceability of real modules whose declarations have not landed. Runtime deny enforcement is restricted to attested supervised routes and is explicitly not an isolation boundary. Third-party replaceability is enabled by this mechanism and completed by the owner-cut and corpus rounds.
+
+## chair errata 2 — vacuity floor classification (slice-3 contradiction, ratified)
+
+Slice 3 found a real contradiction: r8/r12 close the per-program operational
+taxonomy at eight classes, while the vacuity floor (zero modules examined =
+exit 2) is an evaluation-level failure the taxonomy does not name. The
+implemented resolution is ratified: the vacuity floor renders an explicit
+unclassified line and exits 2 WITHOUT a ninth per-program class — it is a
+property of the evaluation, not of any program, and the closed taxonomy
+stays per-program-scoped.

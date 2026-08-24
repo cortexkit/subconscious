@@ -235,6 +235,11 @@ pub enum ClientControlResponse {
         /// field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_lock_digest: Option<String>,
+        /// Daemon-evaluated capability requirements. Present when the configured
+        /// fleet has declarations to evaluate, so operators can inspect an absent
+        /// required capability without parsing daemon logs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capability_requirements: Vec<CapabilityRequirementStatus>,
     },
     #[serde(rename = "catalog.list")]
     CatalogList {
@@ -508,6 +513,18 @@ pub struct CatalogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityRequirementStatus {
+    pub consumer: String,
+    pub capability: String,
+    pub need: String,
+    pub verdict: String,
+    pub episode_seq: u64,
+    pub config_satisfiable: bool,
+    pub runtime_available: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupervisorRescanResult {
     pub added: Vec<String>,
     pub removed: Vec<String>,
@@ -555,6 +572,11 @@ pub struct SupervisorRescanResult {
     /// parsing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restart_required: Vec<String>,
+    /// Required capabilities that a dry-run's resulting module set would leave
+    /// unprovided. Rows are human-readable because the preview is an operator
+    /// explanation, not a second manifest schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

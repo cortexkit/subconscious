@@ -609,6 +609,8 @@ pub struct PipelineAppliesTo {
 pub struct ManagementOperation {
     pub name: String,
     pub kind: ManagementOperationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

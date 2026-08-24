@@ -1286,14 +1286,17 @@ fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> 
                 ManagementOperation {
                     name: "memory.list".to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
                 ManagementOperation {
                     name: "bus.publish".to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: None,
                 },
                 ManagementOperation {
                     name: "usage.get".to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
             ],
             config_schema: json!({"type": "object"}),

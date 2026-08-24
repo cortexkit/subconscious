@@ -110,10 +110,18 @@ fn manifest() -> ModuleManifest {
                 ManagementOperation {
                     name: "tools/list".to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: Some(
+                        "List the MCP tools exposed by the configured child servers and return their names, descriptions, and input schemas."
+                            .to_string(),
+                    ),
                 },
                 ManagementOperation {
                     name: "tools/call".to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: Some(
+                        "Invoke a named tool on a configured child server and return the child's MCP result."
+                            .to_string(),
+                    ),
                 },
             ],
             config_schema: json!({"type": "object"}),
@@ -205,6 +213,15 @@ mod tests {
                 concurrency: Concurrency::ModuleManaged,
                 ..
             } if observability.iter().any(|surface| surface.name == "health")
+        ));
+        let ProviderRole::ManagementSurface { operations, .. } = &manifest.provides[0] else {
+            panic!("adapter manifest must expose a management surface");
+        };
+        assert_eq!(operations[0].description.as_deref(), Some(
+            "List the MCP tools exposed by the configured child servers and return their names, descriptions, and input schemas."
+        ));
+        assert_eq!(operations[1].description.as_deref(), Some(
+            "Invoke a named tool on a configured child server and return the child's MCP result."
         ));
         assert_eq!(manifest.provides.len(), 1);
     }

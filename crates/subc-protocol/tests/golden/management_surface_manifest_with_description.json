@@ -1,0 +1,46 @@
+{
+  "bindings": {
+    "identity": {
+      "optional": [],
+      "requires": [
+        "project"
+      ]
+    },
+    "storage": {
+      "kind": "sqlite",
+      "owns_schema": false,
+      "scope": "project"
+    },
+    "vault_grants": []
+  },
+  "consumes": [],
+  "module_id": "management-surface",
+  "module_version": "1.2.3",
+  "protocol_ver": 2,
+  "provides": [
+    {
+      "concurrency": "module_managed",
+      "config_schema": {
+        "type": "object"
+      },
+      "identity_scope": [
+        "project"
+      ],
+      "observability": [
+        {
+          "kind": "snapshot",
+          "name": "records.stats"
+        }
+      ],
+      "operations": [
+        {
+          "description": "List managed records and return their identifiers and metadata.",
+          "kind": "query",
+          "name": "records.list"
+        }
+      ],
+      "role": "management_surface"
+    }
+  ],
+  "trust_tier": "first_party"
+}

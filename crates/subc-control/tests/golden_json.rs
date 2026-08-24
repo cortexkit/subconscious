@@ -10,9 +10,10 @@ use subc_control::{
 };
 use subc_protocol::{
     manifest::{
-        Concurrency, ExecutionMode, IdentityScope, InternalTransport, ManagementOperation,
-        ManagementOperationKind, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
-        PipelineStageKind, ProviderRole, Tool,
+        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
+        IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
+        ObservabilityKind, ObservabilitySurface, PipelineAppliesTo, PipelineStageKind,
+        ProviderRole, Tool,
     },
     session::HealthStatus,
     BindIdentity, RouteTarget, PROTOCOL_VERSION,
@@ -32,6 +33,14 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         assert_golden(name, &push);
     }
     assert_golden("catalog_entry", &catalog_entry());
+    assert_golden(
+        "client_control_response_catalog_list_without_capabilities",
+        &ClientControlResponse::CatalogList {
+            generation: 8,
+            modules: vec![catalog_entry_without_capabilities()],
+            subc_ops: thin_core_ops(),
+        },
+    );
     assert_golden("supervisor_entry", &supervisor_entry());
     assert_golden("poll_kind_status", &PollKind::Status);
     assert_golden("poll_kind_liveness", &PollKind::Liveness);
@@ -507,6 +516,24 @@ fn catalog_entry() -> CatalogEntry {
         module_version: Some("0.9.3".to_string()),
         roles: provider_roles(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
+        capabilities: Some(CapabilityDeclarations {
+            provides: vec!["credentials-provider/v1".to_string()],
+            requires: vec![CapabilityRequirement {
+                capability: "context-transform/v1".to_string(),
+                need: CapabilityNeed::Optional,
+            }],
+            must_never_reach: vec!["federation-transport/v1".to_string()],
+        }),
+    }
+}
+
+fn catalog_entry_without_capabilities() -> CatalogEntry {
+    CatalogEntry {
+        module_id: "legacy-tools".to_string(),
+        module_version: Some("0.8.0".to_string()),
+        roles: Vec::new(),
+        control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
+        capabilities: None,
     }
 }
 

@@ -190,5 +190,6 @@ fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
+        capabilities: None,
     }
 }

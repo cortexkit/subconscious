@@ -110,6 +110,7 @@ fn manifest() -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
+        capabilities: None,
     }
 }
 

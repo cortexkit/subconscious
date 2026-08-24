@@ -1,0 +1,34 @@
+{
+  "generation": 8,
+  "modules": [
+    {
+      "control_ops": [
+        "route.bind",
+        "route.status"
+      ],
+      "module_id": "legacy-tools",
+      "module_version": "0.8.0",
+      "roles": []
+    }
+  ],
+  "op": "catalog.list",
+  "subc_ops": [
+    "server.describe",
+    "catalog.list",
+    "route.open",
+    "route.poll",
+    "route.closing",
+    "route.closed",
+    "supervisor.list",
+    "supervisor.restart",
+    "supervisor.reload",
+    "supervisor.rescan",
+    "supervisor.release_reserved",
+    "supervisor.set_enabled",
+    "supervisor.health_probe",
+    "supervisor.health",
+    "supervisor.stderr_tail",
+    "supervisor.terminals",
+    "supervisor.routes"
+  ]
+}

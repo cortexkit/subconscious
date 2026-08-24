@@ -1331,6 +1331,7 @@ fn untrusted_hello_frame(module_id: &str, corr: u64) -> Frame {
                 optional: vec![IdentityScope::Project],
             },
         },
+        capabilities: None,
     };
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,

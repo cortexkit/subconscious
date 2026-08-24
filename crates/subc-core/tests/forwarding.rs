@@ -5386,6 +5386,7 @@ fn consumer_manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Project],
             },
         },
+        capabilities: None,
     }
 }
 

@@ -305,6 +305,7 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
+        capabilities: None,
     }
 }
 

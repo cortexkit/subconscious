@@ -1,4 +1,18 @@
 {
+  "capabilities": {
+    "must_never_reach": [
+      "federation-transport/v1"
+    ],
+    "provides": [
+      "credentials-provider/v1"
+    ],
+    "requires": [
+      {
+        "capability": "context-transform/v1",
+        "need": "optional"
+      }
+    ]
+  },
   "control_ops": [
     "route.bind",
     "route.status"

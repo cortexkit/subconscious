@@ -2810,6 +2810,12 @@ fn print_rescan_table(result: &Value) {
         println!("\npreview only — nothing was changed. Run `ck module rescan` to apply.");
     }
 
+    if let Some(warnings) = result.get("capability_warnings").and_then(Value::as_array) {
+        for warning in warnings.iter().filter_map(Value::as_str) {
+            println!("{warning}");
+        }
+    }
+
     // Sections rescan cannot apply. Printed AFTER the change table and the
     // preview line, so it is the last thing on screen: it is the only part of
     // this output that requires a further action, and a module whose config did

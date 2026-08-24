@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     error::Error,
     ffi::OsString,
@@ -69,6 +70,7 @@ pub struct BootstrapConfig {
     /// any module without a per-module override). `None` = built-in default
     /// (12s — see `control::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT`).
     route_bind_relay_default_ms: Option<u64>,
+    reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
 }
 
@@ -84,6 +86,7 @@ impl BootstrapConfig {
             daemon_config_path: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
+            reserved_capabilities: BTreeMap::new(),
             watchdog_config: DaemonSelfWatchdogConfig::default(),
         }
     }
@@ -111,6 +114,10 @@ impl BootstrapConfig {
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
+        let reserved_capabilities = daemon_config
+            .as_ref()
+            .map(|config| config.reserved_capabilities.clone())
+            .unwrap_or_default();
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
@@ -138,6 +145,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
+            .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, config_port))
     }
 
@@ -161,6 +169,10 @@ impl BootstrapConfig {
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
+        let reserved_capabilities = daemon_config
+            .as_ref()
+            .map(|config| config.reserved_capabilities.clone())
+            .unwrap_or_default();
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
@@ -169,6 +181,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
+            .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, configured_port))
     }
 
@@ -208,6 +221,14 @@ impl BootstrapConfig {
     /// it into the control handler's daemon-wide field.
     pub fn with_route_bind_relay_default_ms(mut self, ms: Option<u64>) -> Self {
         self.route_bind_relay_default_ms = ms;
+        self
+    }
+
+    pub fn with_reserved_capabilities(
+        mut self,
+        reserved_capabilities: BTreeMap<String, String>,
+    ) -> Self {
+        self.reserved_capabilities = reserved_capabilities;
         self
     }
 
@@ -274,6 +295,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let daemon_config_path = config.daemon_config_path.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
+    let reserved_capabilities = config.reserved_capabilities.clone();
     let watchdog_config = config.watchdog_config.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
@@ -289,6 +311,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 daemon_config_path,
                 configured_port,
                 route_bind_relay_default_ms,
+                reserved_capabilities,
                 watchdog_config,
             )
             .await
@@ -380,6 +403,7 @@ async fn serve_bound_daemon(
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
+    reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
 ) -> Result<(), BootstrapError> {
     raise_nofile_limit();
@@ -420,7 +444,13 @@ async fn serve_bound_daemon(
         .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config)
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
-        .with_route_bind_relay_timeouts(route_bind_relay_timeouts);
+        .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
+        .with_capability_config(
+            configured_modules
+                .iter()
+                .map(|module| (module.module_id.clone(), module.enabled)),
+            reserved_capabilities,
+        );
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a
         // `None` here leaves the ControlHandler's 12s default in place.
@@ -429,7 +459,8 @@ async fn serve_bound_daemon(
     if let Some(config_path) = daemon_config_path {
         control = control.with_supervisor_rescan(supervisor.clone(), config_path, configured_port);
     }
-    let router = Arc::new(Router::with_control_handler(Arc::new(control)));
+    let control = Arc::new(control);
+    let router = Arc::new(Router::with_control_handler(Arc::clone(&control)));
     let auth = ServerAuth::new(
         bound.connection_info.key.clone(),
         bound.connection_info.daemon_id,
@@ -485,6 +516,9 @@ async fn serve_bound_daemon(
             }
         }
     }
+
+    control.refresh_capability_requirements();
+    Arc::clone(&control).spawn_capability_deadline_loop();
 
     serve_task
         .join()

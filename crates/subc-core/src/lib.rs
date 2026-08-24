@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub(crate) mod capability_requirements;
 pub mod control;
 pub mod daemon_config;
 #[cfg(test)]

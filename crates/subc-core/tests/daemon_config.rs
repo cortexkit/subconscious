@@ -912,6 +912,175 @@ async fn ck_module_rescan_prints_reconcile_table() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn required_capability_absence_surfaces_in_health_and_server_describe() {
+    let consumer = stub_module(
+        "capability-consumer",
+        true,
+        [
+            (
+                "FAKE_AFT_CAPABILITIES",
+                r#"{"requires":[{"capability":"credentials-provider/v1","need":"required"}]}"#,
+            ),
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+        ],
+    );
+    let disabled_provider = stub_module(
+        "capability-provider",
+        false,
+        [(
+            "FAKE_AFT_CAPABILITIES",
+            r#"{"provides":["credentials-provider/v1"]}"#,
+        )],
+    );
+    let daemon = RunningDaemon::start(
+        "capability-surface",
+        Some(config_doc([consumer, disabled_provider])),
+    )
+    .await;
+    wait_for_catalog_module(
+        &daemon.connection_file_path,
+        "capability-consumer",
+        STATE_TIMEOUT,
+    )
+    .await;
+
+    let mut client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let describe =
+        control_rpc_on_stream(&mut client, 950, ClientControlRequest::ServerDescribe {}).await;
+    let ClientControlResponse::ServerDescribe {
+        capability_requirements,
+        ..
+    } = describe
+    else {
+        panic!("server.describe response expected");
+    };
+    assert!(capability_requirements.iter().any(|status| {
+        status.consumer == "capability-consumer"
+            && status.capability == "credentials-provider/v1"
+            && status.verdict == "never_provided"
+            && status.detail.contains("credentials-provider/v1")
+    }));
+
+    let health = supervisor_health_entries(&daemon.connection_file_path, 951).await;
+    let consumer_health = health
+        .iter()
+        .find(|entry| entry.module_id == "capability-consumer")
+        .expect("consumer health row");
+    assert!(
+        consumer_health
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("requires:credentials-provider/v1 unprovided"),
+        "capability absence must render in ck health/module status detail"
+    );
+
+    for args in [
+        vec![
+            "health",
+            "--subc",
+            daemon.connection_file_path.to_str().unwrap(),
+        ],
+        vec![
+            "health",
+            "capability-consumer",
+            "--subc",
+            daemon.connection_file_path.to_str().unwrap(),
+        ],
+        vec![
+            "module",
+            "status",
+            "capability-consumer",
+            "--subc",
+            daemon.connection_file_path.to_str().unwrap(),
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ck"))
+            .args(args)
+            .output()
+            .expect("ck launches");
+        assert!(
+            output.status.success(),
+            "ck stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("requires:credentials-provider/v1 unprovided"),
+            "ck must render the daemon-owned capability detail"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_preview_reports_removal_that_strands_a_capability_consumer() {
+    let consumer = stub_module(
+        "preview-consumer",
+        true,
+        [(
+            "FAKE_AFT_CAPABILITIES",
+            r#"{"requires":[{"capability":"credentials-provider/v1","need":"required"}]}"#,
+        )],
+    );
+    let provider = stub_module(
+        "preview-provider",
+        true,
+        [(
+            "FAKE_AFT_CAPABILITIES",
+            r#"{"provides":["credentials-provider/v1"]}"#,
+        )],
+    );
+    let daemon = RunningDaemon::start(
+        "capability-preview",
+        Some(config_doc([consumer.clone(), provider])),
+    )
+    .await;
+    wait_for_catalog_module(
+        &daemon.connection_file_path,
+        "preview-consumer",
+        STATE_TIMEOUT,
+    )
+    .await;
+    wait_for_catalog_module(
+        &daemon.connection_file_path,
+        "preview-provider",
+        STATE_TIMEOUT,
+    )
+    .await;
+
+    fs::write(&daemon.config_path, config_doc([consumer])).unwrap();
+    let preview = supervisor_rescan_with(&daemon.connection_file_path, 952, true).await;
+    assert_eq!(
+        preview.capability_warnings,
+        vec![
+            "removing preview-provider leaves preview-consumer requires:credentials-provider/v1 unprovided"
+                .to_string()
+        ]
+    );
+    assert!(
+        catalog_modules(&daemon.connection_file_path, Some("preview-provider"), 953)
+            .await
+            .len()
+            == 1,
+        "preview must not remove the provider it warns about"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_ck"))
+        .args(["module", "rescan", "--dry-run", "--subc"])
+        .arg(&daemon.connection_file_path)
+        .output()
+        .expect("ck launches");
+    assert!(
+        output.status.success(),
+        "ck stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("removing preview-provider leaves preview-consumer requires:credentials-provider/v1 unprovided")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_config_starts_bare_daemon_with_no_supervised_modules() {
     let daemon = RunningDaemon::start("daemon-config-absent", None).await;
     assert!(!daemon.config_path.exists());
@@ -1104,6 +1273,18 @@ async fn catalog_modules(
     {
         ClientControlResponse::CatalogList { modules, .. } => modules,
         other => panic!("unexpected catalog.list response: {other:?}"),
+    }
+}
+
+async fn supervisor_health_entries(
+    path: &Path,
+    corr: u64,
+) -> Vec<subc_control::SupervisorHealthEntry> {
+    let mut client = wait_for_client(path, START_TIMEOUT).await;
+    match control_rpc_on_stream(&mut client, corr, ClientControlRequest::SupervisorHealth {}).await
+    {
+        ClientControlResponse::SupervisorHealth { modules, .. } => modules,
+        other => panic!("unexpected supervisor.health response: {other:?}"),
     }
 }
 

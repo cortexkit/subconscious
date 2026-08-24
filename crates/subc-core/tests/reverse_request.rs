@@ -1040,6 +1040,7 @@ fn tool_provider_manifest(module_id: &str, concurrency: Concurrency) -> ModuleMa
                 optional: vec![IdentityScope::Session],
             },
         },
+        capabilities: None,
     }
 }
 

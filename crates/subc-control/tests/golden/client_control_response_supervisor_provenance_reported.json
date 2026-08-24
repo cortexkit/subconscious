@@ -1,0 +1,46 @@
+{
+  "daemon": {
+    "daemon_build": {
+      "build_git_sha": "0123456789abcdef0123456789abcdef01234567-dirty",
+      "build_lock_digest": "9d2c0d69cd82f2151bbb2b32ab9ac9d861063ffde2f8582afe767ec7e1f2145c"
+    },
+    "daemon_observed": {
+      "pid": 4200,
+      "running_image": {
+        "evidence": {
+          "digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "method": "linux_proc_sha256"
+        },
+        "status": "match"
+      },
+      "started_at_ms": 1725000000001
+    }
+  },
+  "modules": [
+    {
+      "daemon_observed": {
+        "pid": 4201,
+        "running_image": {
+          "evidence": {
+            "digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "method": "linux_proc_sha256"
+          },
+          "status": "match"
+        },
+        "spawned_at_ms": 1725000000002,
+        "spawned_from": "/opt/subc/bin/aft"
+      },
+      "module_declared": {
+        "build": {
+          "build_commit": "0123456789abcdef0123456789abcdef01234567",
+          "build_lock_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "store_schema_version": "2",
+          "wire_crate_version": "0.13.0"
+        },
+        "status": "reported"
+      },
+      "module_id": "aft"
+    }
+  ],
+  "op": "supervisor.provenance"
+}

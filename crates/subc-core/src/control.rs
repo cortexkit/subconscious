@@ -1190,6 +1190,12 @@ impl ControlHandler {
             ClientControlRequest::SupervisorRoutes { module_id } => {
                 self.handle_supervisor_routes(frame, module_id)
             }
+            // exhaustiveness arm: replaced by the real handler in the provenance daemon slice (task 4)
+            ClientControlRequest::SupervisorProvenance { .. } => Ok(vec![control_error_frame(
+                &frame,
+                "unknown_control_op",
+                "unknown client control op: supervisor.provenance",
+            )?]),
             ClientControlRequest::SupervisorStderrTail {
                 module_id,
                 max_lines,
@@ -6527,6 +6533,33 @@ mod tests {
         assert_eq!(response[0].header.ty, FrameType::Error);
         assert_eq!(response[0].header.corr, 55);
         assert_eq!(parse_error(&response[0])["code"], "unknown_control_op");
+    }
+
+    #[tokio::test]
+    async fn supervisor_provenance_is_refused_until_handler_lands() {
+        let handler = ControlHandler::default();
+        let (ctx, _rx) = route_ctx(ConnectionId::new(79));
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            57,
+            br#"{"op":"supervisor.provenance"}"#.to_vec(),
+        )
+        .unwrap();
+
+        let response = handler.handle_control_frame(&ctx, request).await.unwrap();
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        assert_eq!(response[0].header.corr, 57);
+        let error = parse_error(&response[0]);
+        assert_eq!(error["code"], "unknown_control_op");
+        assert_eq!(
+            error["message"],
+            "unknown client control op: supervisor.provenance"
+        );
     }
 
     #[tokio::test]

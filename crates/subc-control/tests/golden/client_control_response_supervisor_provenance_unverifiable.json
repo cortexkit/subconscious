@@ -1,0 +1,39 @@
+{
+  "daemon": {
+    "daemon_build": {},
+    "daemon_observed": {
+      "pid": 4300,
+      "running_image": {
+        "evidence": {
+          "device": 2049,
+          "inode": 99001,
+          "method": "macos_spawn_inode"
+        },
+        "status": "match"
+      },
+      "started_at_ms": 1725000000003
+    }
+  },
+  "modules": [
+    {
+      "daemon_observed": {
+        "pid": 4301,
+        "running_image": {
+          "evidence": {
+            "device": 2049,
+            "inode": 99002,
+            "method": "macos_spawn_inode"
+          },
+          "status": "match"
+        },
+        "spawned_at_ms": 1725000000004,
+        "spawned_from": "/opt/subc/bin/vault"
+      },
+      "module_declared": {
+        "status": "unverifiable"
+      },
+      "module_id": "vault"
+    }
+  ],
+  "op": "supervisor.provenance"
+}

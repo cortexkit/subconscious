@@ -60,7 +60,17 @@ shipped in the same commit as the code that calls the ops:
   wired-but-ungranted class must not reappear one dependency edge away,
   reachable by a commit in a different repository (path-dependency builds
   make "same commit as the calling code" structurally false for crate-issued
-  ops; the fragment union is what restores the invariant).
+  ops; the fragment union is what restores the invariant). Observed form,
+  same day the rule was written: subconscious d7ee6327 added three
+  CallError variants and broke alfonso-desktop's build with zero commits in
+  their history — library code changing a consumer's binary between two of
+  its own builds is the concrete shape of the abstract argument.
+- APP_ID IS THE AUTHORITATIVE IDENTITY (CKDESK question): manifests,
+  acceptance records, and ceremonies key on (principal, app_id). Harness
+  strings inside bind identities are per-session presentation (one app may
+  legitimately bind as several harnesses — desktop binds ck-app for
+  prefrontal calls and runner for broca session paths) and are NEVER a
+  grant key. One app, one manifest, N harness identities.
 - MANIFESTS DESCRIBE DIRECT CALLS, NOT REACH (CKDESK finding 4): an app that
   forwards another module's tool definitions into a session (desktop
   forwarding aft tools via broca) causes transitive execution while holding
@@ -194,10 +204,19 @@ consumers carry manifests.
 5. **Fences read an enumerated op surface, not source text** (CKDESK
    finding 3, CKIOS independently): the presence-fence is only mechanical
    over a closed op vocabulary (enum/const table) that call sites reference
-   and the manifest generator reads — compile-time exhaustiveness, not
-   grep. A text-scraping fence fails open on constructed op names, silently,
-   in exactly the ops that matter. The vocabulary refactor is a named
-   prerequisite of adoption (Sequencing step 2).
+   and the manifest generator reads. Direction honesty (CKDESK,
+   implemented): only "wired calls ⊆ vocabulary" is truly compile-time (the
+   type system); "vocabulary ⊆ wired call sites" remains a source scan —
+   what the type change buys is the scan's SOUNDNESS (op names can no
+   longer be assembled at runtime, so a variant absent from source is
+   genuinely never issued), not the scan's elimination. Consumers should
+   not expect a purely compile-time both-directions fence. Reference
+   implementation notes (alfonso-desktop): derive the op list from an
+   exhaustive match/next() chain rather than a hand-array-plus-length
+   (the array form only catches omissions if someone also updates the
+   length — the drift class this kills); generate the manifest from the
+   SAME BINARY that issues the calls (--print-fed-manifest), never a file
+   maintained beside it.
 
 ## Non-goals
 

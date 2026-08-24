@@ -46,6 +46,28 @@ shipped in the same commit as the code that calls the ops:
   forks from the module/capability vocabulary. Same tokens, different
   principals (devices, not modules); deliberately NOT merged with the
   capability grammar.
+- SCOPE OF THE VOCABULARY (CKDESK finding 2): manifests enumerate MODULE ops
+  only. Subc-level ops (`catalog.*`, `route.*`, and policy-plane ops that
+  ride channel-0 shapes) cannot be spelled in `{module, operation}` and are
+  granted by enrollment itself, not by manifests. A fence must neither scan
+  for them nor false-positive on them.
+- MANIFESTS COMPOSE (CKDESK finding 1): any linked client crate that issues
+  fed ops from library code (e.g. `subc-client-rs`'s PolicyResolver issuing
+  `policy.*` under its own harness identity) ships its OWN op-manifest
+  fragment, fenced on the crate's side; an app's effective manifest is the
+  UNION of its direct ops and the fragments of every linked op-issuing
+  crate. Library-issued ops are never silently out of scope — the
+  wired-but-ungranted class must not reappear one dependency edge away,
+  reachable by a commit in a different repository (path-dependency builds
+  make "same commit as the calling code" structurally false for crate-issued
+  ops; the fragment union is what restores the invariant).
+- MANIFESTS DESCRIBE DIRECT CALLS, NOT REACH (CKDESK finding 4): an app that
+  forwards another module's tool definitions into a session (desktop
+  forwarding aft tools via broca) causes transitive execution while holding
+  zero ops on that module. A manifest is not a reach summary and must not be
+  read as one; the ceremony's audit surface may later render derivable
+  transitive reach, but the manifest's claim is direct calls only — stated
+  so an operator cannot conclude "no aft ops = cannot reach aft".
 - PER-OP, never per-family. A family is a growth surface: a family gaining
   an op would silently widen every app holding the family grant. Families
   exist only as review rendering (§3), never as granted units.
@@ -72,9 +94,14 @@ shipped in the same commit as the code that calls the ops:
 }
 ```
 
-- At bind, the app presents `(app_id, manifest_version, manifest_sha256)`.
-  Mismatch against the accepted record refuses TYPED, naming both sides'
-  versions.
+- BIND-TIME PRESENTATION IS THE PRIMARY MECHANISM (CKDESK finding 5): the
+  app presents `(app_id, manifest_version, manifest_sha256)` at every bind.
+  Match serves; mismatch refuses TYPED, naming both sides' versions and both
+  remedies. Acceptance is keyed to the MANIFEST CHANGING as observed at
+  bind — never to a distribution event, because desktop consumers may have
+  none (a rebuild from a sibling path-dependency commit changes the binary
+  with no release and no app-repo commit). Upgrade-triggered ceremonies are
+  an iOS-shaped convenience layered on top, not the mechanism.
 - App-repo-only would be self-minted authority (an app update granting
   itself ops with nobody's eyes on it). Fed-config-only is today's drift
   with extra steps. Both-meeting-at-the-hash is the same producer/consumer
@@ -128,6 +155,19 @@ consumers carry manifests.
 3. **The scope sentence** (§ top) appears in every consumer-facing
    description of this feature. Value claims beyond administration,
    containment, and audit legibility are struck at review.
+4. **Typed refusals must survive the last hop** (CKDESK finding 6): consumer
+   apps surface grant refusals DISTINCTLY from empty results. An
+   `Err(_) => Vec::new()` arm converts a refused grant into an empty board —
+   the exact illegibility this design exists to kill, reintroduced
+   client-side. Every consumer's adoption includes auditing optional-data
+   arms for refusal swallowing.
+5. **Fences read an enumerated op surface, not source text** (CKDESK
+   finding 3, CKIOS independently): the presence-fence is only mechanical
+   over a closed op vocabulary (enum/const table) that call sites reference
+   and the manifest generator reads — compile-time exhaustiveness, not
+   grep. A text-scraping fence fails open on constructed op names, silently,
+   in exactly the ops that matter. The vocabulary refactor is a named
+   prerequisite of adoption (Sequencing step 2).
 
 ## Non-goals
 
@@ -141,7 +181,10 @@ consumers carry manifests.
 ## Sequencing
 
 1. This spec reviewed by ALF (+ prefrontal op inventory), CKIOS, CKDESK.
-2. CKIOS + CKDESK author manifests + presence-fence tests (their repos).
+2. CKIOS + CKDESK refactor call sites onto closed op vocabularies, then
+   author manifests generated from those vocabularies + bidirectional
+   presence-fence tests (their repos). subc-client-rs ships its op-manifest
+   fragment (policy.*) with a crate-side fence (this repo).
 3. Acceptance ceremony tooling (`ck fed accept <app> <manifest-path>`):
    diff render, hash pin, expose[] generation, callosum bounce.
 4. Bind-time (version, hash) presentation + typed refusal (callosum,

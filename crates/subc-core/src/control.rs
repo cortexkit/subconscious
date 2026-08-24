@@ -1320,8 +1320,8 @@ impl ControlHandler {
             capabilities: self.subc_capabilities.as_ref().to_vec(),
             connected_clients: self.connected_clients.count(),
             counters: Some(counters),
-            build_git_sha: Some(env!("SUBC_BUILD_GIT_SHA").to_string()),
-            build_lock_digest: Some(env!("SUBC_BUILD_LOCK_DIGEST").to_string()),
+            build_git_sha: Some(env!("CK_BUILD_REV").to_string()),
+            build_lock_digest: Some(env!("CK_BUILD_LOCK_DIGEST").to_string()),
             capability_requirements: self.capability_requirement_statuses(),
         };
         Ok(vec![control_response_body_frame(
@@ -3941,6 +3941,7 @@ mod tests {
                 },
             },
             capabilities: None,
+            provenance: None,
         }
     }
 

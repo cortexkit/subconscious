@@ -146,6 +146,7 @@ fn manifest() -> ModuleManifest {
             },
         },
         capabilities: None,
+        provenance: None,
     }
 }
 

@@ -243,6 +243,16 @@ measurement. Both consumers independently converged on emitting the
 manifest from the issuing binary (--print-fed-manifest / allCases) — the
 fence-5 shape confirmed twice.
 
+Methodology pin from the prune confirm: presence checks are EXACT-MATCH from
+birth. CKIOS's first census counted files mentioning each op name and read
+rooms.list=16 alive — substring matches counting the _for_user successors as
+evidence for the superseded originals; exact-string search gave zero for all
+five. A prefix-blind census nearly reversed a correct prune verdict
+confidently. And the session.read epitaph, for every grant table's comment
+field: a grant on a module that has never served the wire is not a
+capability, it is a comment — prune it; the real feature arrives with its
+own exposure decision anyway.
+
 ## Op descriptions (adopted, first buildable piece)
 
 Every module op crossing the catalog gains an optional `description`

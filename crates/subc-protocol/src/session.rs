@@ -8,7 +8,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{manifest::ProviderRole, BindIdentity, Principal, RouteTarget};
+use crate::{
+    manifest::{CapabilityDeclarations, ProviderRole},
+    BindIdentity, Principal, RouteTarget,
+};
 
 pub const MODULE_CONTROL_OP_HEALTH_CHECK: &str = "health.check";
 pub const MODULE_TO_SUBC_OP_CATALOG_UPDATE: &str = "catalog.update";
@@ -111,7 +114,14 @@ pub enum ModuleControlResponse {
 #[serde(tag = "op")]
 pub enum ModuleControlRequestFromModule {
     #[serde(rename = "catalog.update")]
-    CatalogUpdate { provides: Vec<ProviderRole> },
+    CatalogUpdate {
+        provides: Vec<ProviderRole>,
+        /// An attested replacement for the static capability declaration emitted
+        /// by the module's current manifest. `None` preserves the prior
+        /// declaration so existing role-only catalog updates remain byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<CapabilityDeclarations>,
+    },
 }
 
 /// subc's channel-0 response body for module-originated control RPCs.

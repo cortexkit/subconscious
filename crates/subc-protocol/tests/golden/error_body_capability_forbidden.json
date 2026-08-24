@@ -1,0 +1,4 @@
+{
+  "code": "capability_forbidden",
+  "message": "module_id 'runner' must never reach capability 'credentials-provider/v1' provided by 'vault'"
+}

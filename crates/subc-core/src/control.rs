@@ -16,7 +16,10 @@ use subc_control::{
 };
 use subc_protocol::{
     error_codes,
-    manifest::{validate_hello_capability_grammar, Concurrency, ModuleManifest, ProviderRole},
+    manifest::{
+        validate_hello_capability_grammar, CapabilityDeclarations, Concurrency, ModuleManifest,
+        ProviderRole,
+    },
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -431,6 +434,98 @@ impl ControlHandler {
                 );
             }
             Err(err) => warn!(error = %err, "failed to recompute capability requirements"),
+        }
+    }
+
+    /// Reconcile only live, attested route bindings after a capability deny edge
+    /// or target claim was added. This is deliberately a control-plane census:
+    /// the opaque forwarding hot path must not grow a per-frame capability check.
+    fn enforce_capability_denies(&self) {
+        let (_, registrations) = match self.registry.list_modules() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!(error = %err, "failed to read registrations for capability deny census");
+                return;
+            }
+        };
+        let manifests = registrations
+            .into_iter()
+            .map(|registration| {
+                (
+                    registration.manifest.module_id.clone(),
+                    registration.manifest,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let census = match self.forwarding.route_census(None) {
+            Ok(census) => census,
+            Err(err) => {
+                warn!(error = %err, "failed to read route census for capability deny enforcement");
+                return;
+            }
+        };
+
+        for (target_module_id, routes) in census {
+            let Some(target_manifest) = manifests.get(&target_module_id) else {
+                continue;
+            };
+            let mut closed_routes = Vec::new();
+            let mut module_goodbyes = Vec::new();
+            for route in routes {
+                let Principal::Reserved {
+                    module_id: opening_module_id,
+                } = &route.principal
+                else {
+                    continue;
+                };
+                let Some(opening_manifest) = manifests.get(opening_module_id) else {
+                    continue;
+                };
+                let Some(capability) = denied_capability(opening_manifest, target_manifest) else {
+                    continue;
+                };
+
+                match self.forwarding.release_client_route(
+                    route.goodbye_target.connection_id,
+                    route.goodbye_target.channel,
+                    route.goodbye_target.epoch,
+                ) {
+                    Ok(RouteRelease::Removed(module_goodbye)) => {
+                        warn!(
+                            opening_module_id,
+                            target_module_id,
+                            capability,
+                            "force-closing route because an attested capability deny edge now matches"
+                        );
+                        closed_routes.push(route);
+                        module_goodbyes.push(module_goodbye);
+                    }
+                    Ok(RouteRelease::Stale | RouteRelease::Absent) => {}
+                    Err(err) => warn!(
+                        opening_module_id,
+                        target_module_id,
+                        capability,
+                        error = %err,
+                        "failed to force-close capability-denied route"
+                    ),
+                }
+            }
+
+            if closed_routes.is_empty() {
+                continue;
+            }
+            send_route_control_pushes(
+                &self.forwarding,
+                closed_routes,
+                ClientControlPush::RouteClosed {
+                    module_id: target_module_id,
+                    reason: RouteCloseReason::CapabilityDenied,
+                    drained: false,
+                    abandoned: 0,
+                    terminal: Some(false),
+                },
+            );
+            self.emit_route_goodbyes(module_goodbyes);
         }
     }
 
@@ -987,6 +1082,9 @@ impl ControlHandler {
                 "capability claims drifted from the cached manifest"
             );
         }
+        if capability_census_trigger(None, registration.manifest.capabilities.as_ref()) {
+            self.enforce_capability_denies();
+        }
         self.refresh_capability_requirements();
 
         info!(
@@ -1110,9 +1208,10 @@ impl ControlHandler {
         request: ModuleControlRequestFromModule,
     ) -> Result<Vec<Frame>, RouterError> {
         match request {
-            ModuleControlRequestFromModule::CatalogUpdate { provides } => {
-                self.handle_catalog_update(connection_id, frame, provides)
-            }
+            ModuleControlRequestFromModule::CatalogUpdate {
+                provides,
+                capabilities,
+            } => self.handle_catalog_update(connection_id, frame, provides, capabilities),
         }
     }
 
@@ -1121,6 +1220,7 @@ impl ControlHandler {
         connection_id: ConnectionId,
         frame: Frame,
         provides: Vec<ProviderRole>,
+        capabilities: Option<CapabilityDeclarations>,
     ) -> Result<Vec<Frame>, RouterError> {
         self.refresh_capability_requirements();
         let Some(registration) = self
@@ -1145,9 +1245,24 @@ impl ControlHandler {
             )?]);
         }
 
+        let candidate = ModuleManifest {
+            provides: provides.clone(),
+            capabilities: capabilities
+                .clone()
+                .or_else(|| registration.manifest.capabilities.clone()),
+            ..registration.manifest.clone()
+        };
+        if let Err(err) = candidate.validate_capability_grammar() {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_capability_grammar",
+                err.to_string(),
+            )?]);
+        }
+
         let updated = self
             .registry
-            .replace_provides_for_connection(connection_id, provides)
+            .replace_catalog_for_connection(connection_id, provides, capabilities)
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
         if updated.is_none() {
             return Ok(vec![control_error_frame(
@@ -1161,6 +1276,14 @@ impl ControlHandler {
                 self.capability_evaluator
                     .duplicate_claims(DuplicateClaimSource::CatalogUpdate, &registrations),
             );
+        }
+        if capability_census_trigger(
+            registration.manifest.capabilities.as_ref(),
+            updated
+                .as_ref()
+                .and_then(|entry| entry.manifest.capabilities.as_ref()),
+        ) {
+            self.enforce_capability_denies();
         }
         self.refresh_capability_requirements();
 
@@ -1414,6 +1537,38 @@ impl ControlHandler {
             Ok(principal) => principal,
             Err(error) => return Ok(vec![error]),
         };
+
+        // This is attested, control-plane policy for supervised module origins.
+        // Keep it before route reservation and out of the opaque forwarding hot
+        // path: data frames must never acquire a per-frame capability check.
+        if let Principal::Reserved {
+            module_id: opening_module_id,
+        } = &principal
+        {
+            if let Some(opening_registration) = self
+                .registry
+                .get_module(opening_module_id)
+                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            {
+                if let Some(capability) =
+                    denied_capability(&opening_registration.manifest, &registration.manifest)
+                {
+                    warn!(
+                        opening_module_id,
+                        target_module_id,
+                        capability,
+                        "refusing route.open because an attested capability deny edge matches"
+                    );
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "capability_forbidden",
+                        format!(
+                            "module_id '{opening_module_id}' must never reach capability '{capability}' provided by '{target_module_id}'"
+                        ),
+                    )?]);
+                }
+            }
+        }
 
         if admission_facts.is_some() {
             let carrier_matches = matches!(
@@ -3140,6 +3295,54 @@ fn provider_role_kind(role: &ProviderRole) -> ProviderRoleKind {
 
 fn provider_role_kind_set(roles: &[ProviderRole]) -> BTreeSet<ProviderRoleKind> {
     roles.iter().map(provider_role_kind).collect()
+}
+
+/// Return whether a catalog change can create a newly violating live route.
+/// Removing an attested claim is intentionally excluded: it makes fewer routes
+/// forbidden and therefore must leave the existing route census untouched.
+fn capability_census_trigger(
+    old: Option<&CapabilityDeclarations>,
+    new: Option<&CapabilityDeclarations>,
+) -> bool {
+    let old_provides = old
+        .map(|capabilities| capabilities.provides.iter().collect::<HashSet<_>>())
+        .unwrap_or_default();
+    let old_denies = old
+        .map(|capabilities| capabilities.must_never_reach.iter().collect::<HashSet<_>>())
+        .unwrap_or_default();
+    let new = new.cloned().unwrap_or(CapabilityDeclarations {
+        provides: Vec::new(),
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    });
+
+    new.provides
+        .iter()
+        .any(|capability| !old_provides.contains(capability))
+        || new
+            .must_never_reach
+            .iter()
+            .any(|capability| !old_denies.contains(capability))
+}
+
+/// Find the first capability an attested opener denies that an attested target
+/// claims. Both manifests are live registry records, never cached or client data.
+fn denied_capability<'a>(
+    opening_manifest: &'a ModuleManifest,
+    target_manifest: &ModuleManifest,
+) -> Option<&'a str> {
+    let opening_capabilities = opening_manifest.capabilities.as_ref()?;
+    let target_capabilities = target_manifest.capabilities.as_ref()?;
+    opening_capabilities
+        .must_never_reach
+        .iter()
+        .find(|denied| {
+            target_capabilities
+                .provides
+                .iter()
+                .any(|provided| provided == *denied)
+        })
+        .map(String::as_str)
 }
 
 fn catalog_update_frozen_field_message(
@@ -6359,6 +6562,491 @@ mod tests {
 
         assert!(registry.get_module("aft").unwrap().is_none());
         assert_eq!(registry.active_registration_count().unwrap(), 0);
+    }
+
+    fn capability_manifest(
+        module_id: &str,
+        provides: &[&str],
+        must_never_reach: &[&str],
+    ) -> ModuleManifest {
+        let mut manifest = manifest(module_id, PROTOCOL_VERSION);
+        manifest.capabilities = Some(CapabilityDeclarations {
+            provides: provides
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+            requires: Vec::new(),
+            must_never_reach: must_never_reach
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+        });
+        manifest
+    }
+
+    fn hello_frame_with_manifest(manifest: ModuleManifest, corr: u64) -> Frame {
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&ModuleHelloBody {
+                protocol_ver: manifest.protocol_ver,
+                manifest,
+                control_ops: None,
+                launch_nonce: None,
+            })
+            .expect("capability test HELLO serializes"),
+        )
+        .expect("capability test HELLO frame builds")
+    }
+
+    fn catalog_update_with_capabilities_frame(
+        corr: u64,
+        capabilities: CapabilityDeclarations,
+    ) -> Frame {
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
+                provides: manifest("catalog-update-placeholder", PROTOCOL_VERSION).provides,
+                capabilities: Some(capabilities),
+            })
+            .expect("capability catalog.update serializes"),
+        )
+        .expect("capability catalog.update frame builds")
+    }
+
+    async fn register_capability_manifest(
+        handler: &ControlHandler,
+        ctx: &RouteCtx,
+        manifest: ModuleManifest,
+        corr: u64,
+    ) {
+        let replies = handler
+            .handle_control_frame(ctx, hello_frame_with_manifest(manifest, corr))
+            .await
+            .expect("capability test HELLO succeeds");
+        assert!(
+            matches!(replies.as_slice(), [Frame { header, .. }] if header.ty == FrameType::HelloAck),
+            "capability test HELLO must register"
+        );
+    }
+
+    async fn open_route_for_capability_test(
+        handler: &ControlHandler,
+        target_ctx: &RouteCtx,
+        target_rx: &mut mpsc::Receiver<Frame>,
+        client_connection_id: u64,
+        corr: u64,
+        target_module_id: &str,
+        consumer_identity: Option<ConsumerIdentity>,
+    ) -> (mpsc::Receiver<Frame>, ModuleControlRequest) {
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(client_connection_id));
+        let route_handler = handler.clone();
+        let target_module_id = target_module_id.to_string();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(
+                    &client_ctx,
+                    route_open_frame_with_admission_facts(
+                        corr,
+                        &target_module_id,
+                        consumer_identity,
+                        None,
+                    ),
+                )
+                .await
+                .expect("capability test route.open succeeds")
+        });
+        let bind = tokio::time::timeout(Duration::from_secs(1), target_rx.recv())
+            .await
+            .expect("capability test route.open must reach route.bind")
+            .expect("target control receiver stays open");
+        let bind_request: ModuleControlRequest =
+            serde_json::from_slice(&bind.body).expect("route.bind decodes");
+        handler
+            .handle_control_frame(target_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .expect("capability test route.bind ACK succeeds");
+        assert!(route_task.await.expect("route.open task joins").is_empty());
+        let opened = client_rx
+            .recv()
+            .await
+            .expect("successful route.open publishes a response");
+        assert!(matches!(
+            serde_json::from_slice::<ClientControlResponse>(&opened.body),
+            Ok(ClientControlResponse::RouteOpen { .. })
+        ));
+        (client_rx, bind_request)
+    }
+
+    fn assert_capability_denied_push(frame: Frame, target_module_id: &str) {
+        assert_eq!(frame.header.ty, FrameType::Push);
+        assert_eq!(frame.header.channel, 0);
+        assert_eq!(
+            serde_json::from_slice::<ClientControlPush>(&frame.body)
+                .expect("route.closed control push decodes"),
+            ClientControlPush::RouteClosed {
+                module_id: target_module_id.to_string(),
+                reason: RouteCloseReason::CapabilityDenied,
+                drained: false,
+                abandoned: 0,
+                terminal: Some(false),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn route_open_capability_forbidden_mutation_proof_creates_no_route() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("opener", "opener-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(700));
+        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(701));
+        register_capability_manifest(
+            &handler,
+            &target_ctx,
+            capability_manifest("target", &["credentials-provider/v1"], &[]),
+            1,
+        )
+        .await;
+        register_capability_manifest(
+            &handler,
+            &opener_ctx,
+            capability_manifest("opener", &[], &["credentials-provider/v1"]),
+            2,
+        )
+        .await;
+
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(702));
+        let replies = handler
+            .handle_control_frame(
+                &client_ctx,
+                route_open_frame_with_admission_facts(
+                    3,
+                    "target",
+                    Some(ConsumerIdentity {
+                        module_id: "opener".to_string(),
+                        launch_nonce: "opener-nonce".to_string(),
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .expect("denied route.open returns a typed frame");
+        assert_eq!(parse_error(&replies[0])["code"], "capability_forbidden");
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+        assert!(
+            target_rx.try_recv().is_err(),
+            "forbidden route.open must not relay route.bind"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_deny_edge_hello_mutation_proof_force_closes_existing_route() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("opener", "opener-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(710));
+        let (old_opener_ctx, _old_opener_rx) = route_ctx(ConnectionId::new(711));
+        register_capability_manifest(
+            &handler,
+            &target_ctx,
+            capability_manifest("target", &["credentials-provider/v1"], &[]),
+            1,
+        )
+        .await;
+        register_capability_manifest(
+            &handler,
+            &old_opener_ctx,
+            capability_manifest("opener", &[], &[]),
+            2,
+        )
+        .await;
+        let (mut client_rx, _) = open_route_for_capability_test(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            712,
+            3,
+            "target",
+            Some(ConsumerIdentity {
+                module_id: "opener".to_string(),
+                launch_nonce: "opener-nonce".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+
+        handler
+            .cleanup_connection(old_opener_ctx.connection_id)
+            .expect("old opener registration cleans up");
+        let (new_opener_ctx, _new_opener_rx) = route_ctx(ConnectionId::new(713));
+        register_capability_manifest(
+            &handler,
+            &new_opener_ctx,
+            capability_manifest("opener", &[], &["credentials-provider/v1"]),
+            4,
+        )
+        .await;
+
+        assert_capability_denied_push(
+            client_rx
+                .try_recv()
+                .expect("HELLO deny addition must emit route.closed"),
+            "target",
+        );
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+        assert!(matches!(
+            target_rx.try_recv(),
+            Ok(Frame { header, .. }) if header.ty == FrameType::Goodbye
+        ));
+    }
+
+    #[tokio::test]
+    async fn capability_claim_catalog_update_mutation_proof_force_closes_existing_route() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("opener", "opener-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(720));
+        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(721));
+        register_capability_manifest(
+            &handler,
+            &target_ctx,
+            capability_manifest("target", &[], &[]),
+            1,
+        )
+        .await;
+        register_capability_manifest(
+            &handler,
+            &opener_ctx,
+            capability_manifest("opener", &[], &["credentials-provider/v1"]),
+            2,
+        )
+        .await;
+        let (mut client_rx, _) = open_route_for_capability_test(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            722,
+            3,
+            "target",
+            Some(ConsumerIdentity {
+                module_id: "opener".to_string(),
+                launch_nonce: "opener-nonce".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+
+        let replies = handler
+            .handle_control_frame(
+                &target_ctx,
+                catalog_update_with_capabilities_frame(
+                    4,
+                    CapabilityDeclarations {
+                        provides: vec!["credentials-provider/v1".to_string()],
+                        requires: Vec::new(),
+                        must_never_reach: Vec::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("claim catalog.update succeeds");
+        assert!(matches!(
+            serde_json::from_slice::<ModuleControlResponseToModule>(&replies[0].body),
+            Ok(ModuleControlResponseToModule::CatalogUpdate {})
+        ));
+        assert_capability_denied_push(
+            client_rx
+                .try_recv()
+                .expect("claim addition must emit route.closed"),
+            "target",
+        );
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+        assert!(matches!(
+            target_rx.try_recv(),
+            Ok(Frame { header, .. }) if header.ty == FrameType::Goodbye
+        ));
+    }
+
+    #[tokio::test]
+    async fn capability_claim_removal_mutation_proof_keeps_route_open_without_close_frame() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("opener", "opener-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(730));
+        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(731));
+        register_capability_manifest(
+            &handler,
+            &target_ctx,
+            capability_manifest("target", &["credentials-provider/v1"], &[]),
+            1,
+        )
+        .await;
+        register_capability_manifest(
+            &handler,
+            &opener_ctx,
+            capability_manifest("opener", &[], &[]),
+            2,
+        )
+        .await;
+        let (mut client_rx, _) = open_route_for_capability_test(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            732,
+            3,
+            "target",
+            Some(ConsumerIdentity {
+                module_id: "opener".to_string(),
+                launch_nonce: "opener-nonce".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+
+        handler
+            .handle_control_frame(
+                &target_ctx,
+                catalog_update_with_capabilities_frame(
+                    4,
+                    CapabilityDeclarations {
+                        provides: Vec::new(),
+                        requires: Vec::new(),
+                        must_never_reach: Vec::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("claim removal catalog.update succeeds");
+        assert_eq!(
+            forwarding.active_binding_count().unwrap(),
+            1,
+            "removing an attested target claim must leave the route census unchanged"
+        );
+        assert!(
+            client_rx.try_recv().is_err(),
+            "claim removal must not emit route.closed capability_denied"
+        );
+        assert!(
+            target_rx.try_recv().is_err(),
+            "claim removal must not send the target a route GOODBYE"
+        );
+    }
+
+    /// A direct client may open a route to a denied capability provider; this
+    /// policy applies only to attested supervised module origins, not to direct clients.
+    #[tokio::test]
+    async fn direct_client_scope_honesty_mutation_proof_opens_denied_capability_provider() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("opener", "opener-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(740));
+        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(741));
+        register_capability_manifest(
+            &handler,
+            &target_ctx,
+            capability_manifest("target", &["credentials-provider/v1"], &[]),
+            1,
+        )
+        .await;
+        register_capability_manifest(
+            &handler,
+            &opener_ctx,
+            capability_manifest("opener", &[], &["credentials-provider/v1"]),
+            2,
+        )
+        .await;
+
+        let (_client_rx, bind) = open_route_for_capability_test(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            742,
+            3,
+            "target",
+            None,
+        )
+        .await;
+        let ModuleControlRequest::RouteBind { principal, .. } = bind else {
+            panic!("direct scope-honesty route must bind");
+        };
+        assert_eq!(principal, Some(Principal::Direct));
+        assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+    }
+
+    /// A module that denies a capability receives no self-route exemption when it
+    /// also attestedly provides that capability.
+    #[tokio::test]
+    async fn must_never_reach_self_route_is_capability_forbidden() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("self-provider", "self-nonce".to_string());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
+                .with_supervisor(supervisor);
+        let (self_ctx, mut self_rx) = route_ctx(ConnectionId::new(750));
+        register_capability_manifest(
+            &handler,
+            &self_ctx,
+            capability_manifest(
+                "self-provider",
+                &["credentials-provider/v1"],
+                &["credentials-provider/v1"],
+            ),
+            1,
+        )
+        .await;
+
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(751));
+        let replies = handler
+            .handle_control_frame(
+                &client_ctx,
+                route_open_frame_with_admission_facts(
+                    2,
+                    "self-provider",
+                    Some(ConsumerIdentity {
+                        module_id: "self-provider".to_string(),
+                        launch_nonce: "self-nonce".to_string(),
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .expect("self-route refusal returns a typed frame");
+        assert_eq!(parse_error(&replies[0])["code"], "capability_forbidden");
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+        assert!(
+            self_rx.try_recv().is_err(),
+            "self denial must not relay route.bind"
+        );
     }
 
     #[test]

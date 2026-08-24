@@ -5,8 +5,9 @@ use serde_json::Value;
 use subc_protocol::{
     error_codes,
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
+        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
+        Tool, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -43,6 +44,10 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden("error_body", &error_body());
     assert_golden("error_body_with_detail", &error_body_with_detail());
     assert_golden("error_body_module_removed", &error_body_module_removed());
+    assert_golden(
+        "error_body_capability_forbidden",
+        &error_body_capability_forbidden(),
+    );
     assert_golden("principal_reserved", &principal_reserved());
     assert_golden("principal_direct", &Principal::Direct);
     assert_golden("principal_unverified", &Principal::Unverified);
@@ -79,6 +84,18 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         "module_control_request_from_module_catalog_update",
         &ModuleControlRequestFromModule::CatalogUpdate {
             provides: provider_roles(),
+            capabilities: None,
+        },
+    );
+    assert_golden(
+        "module_control_request_from_module_catalog_update_capabilities",
+        &ModuleControlRequestFromModule::CatalogUpdate {
+            provides: provider_roles(),
+            capabilities: Some(CapabilityDeclarations {
+                provides: vec!["credentials-provider/v1".to_string()],
+                requires: Vec::new(),
+                must_never_reach: vec!["federation-transport/v1".to_string()],
+            }),
         },
     );
     assert_golden(
@@ -232,6 +249,13 @@ fn error_body_module_removed() -> ErrorBody {
     ErrorBody::new(
         error_codes::MODULE_REMOVED,
         "module_id 'vault' was removed 1200 ms ago",
+    )
+}
+
+fn error_body_capability_forbidden() -> ErrorBody {
+    ErrorBody::new(
+        "capability_forbidden",
+        "module_id 'runner' must never reach capability 'credentials-provider/v1' provided by 'vault'",
     )
 }
 

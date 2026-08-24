@@ -6,8 +6,10 @@ authoritative — `crates/subc-client-rs/src/consumer.rs` for Rust,
 this document says so rather than averaging them.)
 
 Audience: OWNERS OF HAND-ROLLED CLIENTS. Seven fleet modules speak the wire
-directly on `subc-protocol`/`subc-transport` (aft, broca, engram, astrocyte,
-cerebellum, insula, claustrum) and never execute the SDK code where these
+directly on `subc-protocol`/`subc-transport` (broca, engram, astrocyte,
+cerebellum, insula, claustrum — measured 2026-08-24 by lockfile census: these
+six carry no `subc-client-rs` in their committed Cargo.lock; aft has since
+adopted the SDK and left this list) and never execute the SDK code where these
 affordances live. The SDKs arrived at each behavior by decision; a hand-rolled
 client arrives at whatever its author reached for. The motivating failure
 shape: a client that retries a wrong module id without a bound and without

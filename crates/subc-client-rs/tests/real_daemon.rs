@@ -21,9 +21,9 @@ use subc_client_rs::{
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
-        ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
-        StorageScope, Tool, TrustTier,
+        Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
+        IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
+        StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
@@ -362,6 +362,131 @@ async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
     assert!(tool.schema.is_object());
 
     daemon.kill_and_wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capability_resolver_does_not_fall_back_to_module_id_equality_and_orders_claimants() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-capability-resolvers");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    let (_fallback_module, fallback_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_capability_module_manifest("fallback-only", None),
+    )
+    .await;
+    let (_single_module, single_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_capability_module_manifest("single-provider", Some("single-provider/v1")),
+    )
+    .await;
+    let (_z_module, z_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_capability_module_manifest("z-provider", Some("many-provider/v1")),
+    )
+    .await;
+    let (_a_module, a_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_capability_module_manifest("a-provider", Some("many-provider/v1")),
+    )
+    .await;
+    for module_id in [
+        "fallback-only",
+        "single-provider",
+        "z-provider",
+        "a-provider",
+    ] {
+        wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+    }
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    assert_eq!(
+        consumer
+            .resolve_providers("missing-provider/v1")
+            .await
+            .unwrap(),
+        Vec::<String>::new()
+    );
+    let missing = consumer
+        .resolve_provider("missing-provider/v1")
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Some("capability_unprovided"));
+    assert!(matches!(
+        missing,
+        CallError::CapabilityUnprovided { capability } if capability == "missing-provider/v1"
+    ));
+    assert_eq!(
+        consumer
+            .resolve_provider("single-provider/v1")
+            .await
+            .unwrap(),
+        "single-provider"
+    );
+    assert_eq!(
+        consumer
+            .resolve_providers("many-provider/v1")
+            .await
+            .unwrap(),
+        vec!["a-provider".to_string(), "z-provider".to_string()]
+    );
+    let ambiguous = consumer
+        .resolve_provider("many-provider/v1")
+        .await
+        .unwrap_err();
+    assert_eq!(ambiguous.code(), Some("capability_ambiguous"));
+    assert!(matches!(
+        ambiguous,
+        CallError::CapabilityAmbiguous { capability, claimants }
+            if capability == "many-provider/v1"
+                && claimants == vec!["a-provider".to_string(), "z-provider".to_string()]
+    ));
+    // The module id equals the capability name but the manifest does not claim it.
+    // This load-bearing negative prevents name-addressed fallback from returning it.
+    assert_eq!(
+        consumer
+            .resolve_providers("fallback-only/v1")
+            .await
+            .unwrap(),
+        Vec::<String>::new()
+    );
+    let fallback = consumer
+        .resolve_provider("fallback-only/v1")
+        .await
+        .unwrap_err();
+    assert_eq!(fallback.code(), Some("capability_unprovided"));
+    assert!(matches!(
+        fallback,
+        CallError::CapabilityUnprovided { capability } if capability == "fallback-only/v1"
+    ));
+    let malformed = consumer
+        .resolve_providers("Malformed/v1")
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), Some("invalid_capability_identifier"));
+    assert!(matches!(
+        malformed,
+        CallError::InvalidCapabilityIdentifier { capability } if capability == "Malformed/v1"
+    ));
+
+    consumer.close().await;
+    daemon.kill_and_wait();
+    assert!(fallback_task.await.unwrap().is_ok());
+    assert!(single_task.await.unwrap().is_ok());
+    assert!(z_task.await.unwrap().is_ok());
+    assert!(a_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1482,6 +1607,16 @@ fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifes
         },
         capabilities: None,
     }
+}
+
+fn inline_capability_module_manifest(module_id: &str, capability: Option<&str>) -> ModuleManifest {
+    let mut manifest = inline_module_manifest(module_id, &["capability.resolve"]);
+    manifest.capabilities = capability.map(|capability| CapabilityDeclarations {
+        provides: vec![capability.to_string()],
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    });
+    manifest
 }
 
 fn inline_push_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifest {

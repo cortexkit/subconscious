@@ -18,8 +18,9 @@ use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
 };
 use subc_protocol::{
-    error_codes, AdmissionClass, BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType,
-    Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    error_codes, manifest::is_valid_capability_identifier, AdmissionClass, BindIdentity, ErrorBody,
+    Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV,
+    SUBC_MODULE_ID_ENV,
 };
 
 use crate::RouteHandle;
@@ -567,6 +568,36 @@ impl SubcConsumer {
         }
     }
 
+    /// Resolve the sole catalog claimant for a capability.
+    ///
+    /// Resolution is deliberately based only on the static capabilities mirror in
+    /// `catalog.list`; module ids and role names are not fallback claims. Calling
+    /// this method expresses singular intent, so a plural catalog result is an
+    /// explicit ambiguity rather than an arbitrary choice.
+    pub async fn resolve_provider(&self, capability: &str) -> Result<String, CallError> {
+        let claimants = self.resolve_providers(capability).await?;
+        match claimants.as_slice() {
+            [] => Err(CallError::CapabilityUnprovided {
+                capability: capability.to_string(),
+            }),
+            [claimant] => Ok(claimant.clone()),
+            _ => Err(CallError::CapabilityAmbiguous {
+                capability: capability.to_string(),
+                claimants,
+            }),
+        }
+    }
+
+    /// Resolve every catalog claimant for a capability in module-id order.
+    ///
+    /// The identifier is validated before any channel-0 request is made, so a
+    /// typo cannot become a network-dependent "unprovided" result.
+    pub async fn resolve_providers(&self, capability: &str) -> Result<Vec<String>, CallError> {
+        validate_capability_for_resolution(capability)?;
+        let catalog = self.catalog_list().await?;
+        Ok(capability_claimants(&catalog, capability))
+    }
+
     /// Send one request using an already-opened route handle.
     pub async fn request(
         &self,
@@ -1110,9 +1141,32 @@ pub enum CallError {
     SubscriptionBackpressure(Box<dyn Error + Send + Sync>),
     /// The handle belongs to an earlier connection and no frame was emitted.
     StaleRouteHandle(RouteHandle),
+    /// No registered catalog entry claims the requested capability.
+    CapabilityUnprovided { capability: String },
+    /// More than one registered catalog entry claims a singularly requested capability.
+    CapabilityAmbiguous {
+        capability: String,
+        claimants: Vec<String>,
+    },
+    /// The resolver rejected a malformed capability identifier before querying the daemon.
+    InvalidCapabilityIdentifier { capability: String },
 }
 
 impl CallError {
+    /// Return the stable machine-readable code for typed errors.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Module(body) => Some(&body.code),
+            Self::CapabilityUnprovided { .. } => Some("capability_unprovided"),
+            Self::CapabilityAmbiguous { .. } => Some("capability_ambiguous"),
+            Self::InvalidCapabilityIdentifier { .. } => Some("invalid_capability_identifier"),
+            Self::NotSent(_)
+            | Self::OutcomeUnknown(_)
+            | Self::SubscriptionBackpressure(_)
+            | Self::StaleRouteHandle(_) => None,
+        }
+    }
+
     fn not_sent(reason: impl Into<String>) -> Self {
         Self::NotSent(Box::new(SimpleError(reason.into())))
     }
@@ -1140,6 +1194,23 @@ impl fmt::Display for CallError {
                 write!(f, "subscription event channel backpressure: {err}")
             }
             Self::StaleRouteHandle(handle) => write!(f, "stale route handle: {handle:?}"),
+            Self::CapabilityUnprovided { capability } => {
+                write!(
+                    f,
+                    "capability_unprovided: no catalog claimant for {capability}"
+                )
+            }
+            Self::CapabilityAmbiguous {
+                capability,
+                claimants,
+            } => write!(
+                f,
+                "capability_ambiguous: multiple catalog claimants for {capability}: {claimants:?}"
+            ),
+            Self::InvalidCapabilityIdentifier { capability } => write!(
+                f,
+                "invalid_capability_identifier: malformed capability identifier {capability:?}"
+            ),
         }
     }
 }
@@ -1150,7 +1221,11 @@ impl Error for CallError {
             Self::NotSent(err)
             | Self::OutcomeUnknown(err)
             | Self::SubscriptionBackpressure(err) => Some(err.as_ref()),
-            Self::Module(_) | Self::StaleRouteHandle(_) => None,
+            Self::Module(_)
+            | Self::StaleRouteHandle(_)
+            | Self::CapabilityUnprovided { .. }
+            | Self::CapabilityAmbiguous { .. }
+            | Self::InvalidCapabilityIdentifier { .. } => None,
         }
     }
 }
@@ -3070,6 +3145,12 @@ impl From<CallError> for SharedCallFailure {
                 kind: FailureKind::NotSent,
                 message: format!("stale route handle: {handle:?}"),
             },
+            error @ (CallError::CapabilityUnprovided { .. }
+            | CallError::CapabilityAmbiguous { .. }
+            | CallError::InvalidCapabilityIdentifier { .. }) => Self {
+                kind: FailureKind::NotSent,
+                message: error.to_string(),
+            },
         }
     }
 }
@@ -3629,6 +3710,34 @@ fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
         module_id,
         launch_nonce,
     })
+}
+
+fn validate_capability_for_resolution(capability: &str) -> Result<(), CallError> {
+    if is_valid_capability_identifier(capability) {
+        Ok(())
+    } else {
+        Err(CallError::InvalidCapabilityIdentifier {
+            capability: capability.to_string(),
+        })
+    }
+}
+
+fn capability_claimants(catalog: &CatalogList, capability: &str) -> Vec<String> {
+    let mut claimants = catalog
+        .modules
+        .iter()
+        .filter(|module| {
+            module.capabilities.as_ref().is_some_and(|capabilities| {
+                capabilities
+                    .provides
+                    .iter()
+                    .any(|claim| claim == capability)
+            })
+        })
+        .map(|module| module.module_id.clone())
+        .collect::<Vec<_>>();
+    claimants.sort();
+    claimants
 }
 
 fn epoch_millis() -> u64 {

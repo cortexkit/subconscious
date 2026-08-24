@@ -112,10 +112,23 @@ export interface RouteOpenOptions {
   consumerCapabilities?: string[];
 }
 
+export interface CatalogCapabilityRequirement {
+  capability: string;
+  need: "required" | "optional";
+}
+
+export interface CatalogCapabilities {
+  provides: string[];
+  requires: CatalogCapabilityRequirement[];
+  must_never_reach: string[];
+}
+
 export interface CatalogEntry {
   module_id: string;
   roles: unknown[];
   control_ops: string[];
+  /** Static capability claims mirrored from the registered module manifest. */
+  capabilities?: CatalogCapabilities | null;
 }
 
 export interface RequestOptions {
@@ -436,7 +449,42 @@ export class SubcClient {
     return parsed.modules ?? [];
   }
 
-    /** Open a route and return its connection-bound immutable handle. */
+  /**
+   * Resolve the sole catalog claimant for a capability.
+   *
+   * This expresses singular intent even when the fleet permits plural claims;
+   * ambiguity is returned instead of selecting an arbitrary module.
+   */
+  async resolveProvider(capability: string): Promise<string> {
+    const claimants = await this.resolveProviders(capability);
+    if (claimants.length === 0) {
+      throw new SubcError(`no catalog claimant for capability ${capability}`, "capability_unprovided");
+    }
+    if (claimants.length > 1) {
+      throw new SubcError(
+        `multiple catalog claimants for capability ${capability}: ${claimants.join(", ")}`,
+        "capability_ambiguous",
+      );
+    }
+    return claimants[0]!;
+  }
+
+  /** Resolve every catalog claimant in deterministic module-id order. */
+  async resolveProviders(capability: string): Promise<string[]> {
+    if (!isValidCapabilityIdentifier(capability)) {
+      throw new SubcError(
+        `malformed capability identifier ${JSON.stringify(capability)}`,
+        "invalid_capability_identifier",
+      );
+    }
+    const modules = await this.catalogList();
+    return modules
+      .filter((module) => module.capabilities?.provides.includes(capability) ?? false)
+      .map((module) => module.module_id)
+      .sort();
+  }
+
+  /** Open a route and return its connection-bound immutable handle. */
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<RouteHandle> {
     const consumerIdentity = routeOpenConsumerIdentity(opts);
     const consumerCapabilities = opts.consumerCapabilities;
@@ -1538,6 +1586,21 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     livenessProbeWindowMs: opts.livenessProbeWindowMs ?? LIVENESS_PROBE_WINDOW_MS,
     onControlPush: opts.onControlPush,
   };
+}
+
+/** Validate the exact capability-grammar identifier before catalog I/O. */
+export function isValidCapabilityIdentifier(identifier: string): boolean {
+  if (/\s/u.test(identifier)) return false;
+  const separator = identifier.indexOf("/v");
+  if (separator <= 0 || identifier.indexOf("/v", separator + 1) !== -1) return false;
+  const name = identifier.slice(0, separator);
+  const version = identifier.slice(separator + 2);
+  if (new TextEncoder().encode(name).byteLength > 64 || version.length === 0) return false;
+  if (!/^[a-z][a-z0-9-]*[a-z0-9]$/u.test(name) && !/^[a-z]$/u.test(name)) return false;
+  if (name.includes("--")) return false;
+  if (!/^\d+$/u.test(version) || (version.length > 1 && version.startsWith("0"))) return false;
+  const numericVersion = Number(version);
+  return Number.isSafeInteger(numericVersion) && numericVersion >= 1 && numericVersion <= 0xffff_ffff;
 }
 
 function routeCacheKey(

@@ -95,7 +95,7 @@ pub struct CapabilityDeclarations {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_commit: Option<String>,
+    pub build_git_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_lock_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -52,12 +52,12 @@ pub use subc_protocol::{
 };
 
 pub fn build_provenance(
-    build_commit: Option<&str>,
+    build_git_sha: Option<&str>,
     build_lock_digest: Option<&str>,
     store_schema_version: Option<&str>,
 ) -> ManifestProvenance {
     ManifestProvenance {
-        build_commit: normalize_provenance_fact(build_commit),
+        build_git_sha: normalize_provenance_fact(build_git_sha),
         build_lock_digest: normalize_provenance_fact(build_lock_digest),
         wire_crate_version: Some(SUBC_PROTOCOL_CRATE_VERSION.to_string()),
         store_schema_version: normalize_provenance_fact(store_schema_version),
@@ -80,7 +80,7 @@ fn build_provenance_normalizes_clean_build_facts() {
     assert_eq!(
         provenance,
         ManifestProvenance {
-            build_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
             build_lock_digest: Some("lock-digest".to_string()),
             wire_crate_version: Some(SUBC_PROTOCOL_CRATE_VERSION.to_string()),
             store_schema_version: Some("schema-v3".to_string()),
@@ -97,7 +97,7 @@ fn build_provenance_preserves_a_dirty_revision_verbatim() {
     );
 
     assert_eq!(
-        provenance.build_commit,
+        provenance.build_git_sha,
         Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string())
     );
     assert_eq!(
@@ -110,7 +110,7 @@ fn build_provenance_preserves_a_dirty_revision_verbatim() {
 fn build_provenance_keeps_a_lock_digest_when_identity_is_unavailable() {
     let provenance = build_provenance(Some("unavailable"), Some("lock-digest"), None);
 
-    assert_eq!(provenance.build_commit, None);
+    assert_eq!(provenance.build_git_sha, None);
     assert_eq!(
         provenance.build_lock_digest,
         Some("lock-digest".to_string())
@@ -125,7 +125,7 @@ fn build_provenance_keeps_a_lock_digest_when_identity_is_unavailable() {
 fn build_provenance_omits_fully_unavailable_inputs() {
     let provenance = build_provenance(None, Some(" unavailable "), Some("   "));
 
-    assert_eq!(provenance.build_commit, None);
+    assert_eq!(provenance.build_git_sha, None);
     assert_eq!(provenance.build_lock_digest, None);
     assert_eq!(provenance.store_schema_version, None);
     assert_eq!(

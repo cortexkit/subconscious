@@ -24,6 +24,7 @@ pub(crate) fn spawned_file_identity(path: &Path) -> Option<SpawnedFileIdentity> 
     {
         use std::os::unix::fs::MetadataExt;
 
+        // Followed metadata identifies the spawn-time target the supervisor executed, not a symlink name.
         std::fs::metadata(path)
             .ok()
             .map(|metadata| SpawnedFileIdentity {

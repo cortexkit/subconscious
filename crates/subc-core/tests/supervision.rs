@@ -30,6 +30,12 @@ impl Deref for TestServer {
     }
 }
 
+fn assert_current_process_facts_cleared(status: &ModuleStatus) {
+    assert_eq!(status.pid, None);
+    assert_eq!(status.spawned_at_ms, None);
+    assert_eq!(status.spawned_from, None);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_registers_stub_and_reports_running() {
     let server = TestServer::start().await;
@@ -143,6 +149,27 @@ async fn crash_restarts_and_reregisters_stub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_clears_current_process_facts_before_replacement() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(250));
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "fake-aft-crash-clears-process-facts",
+        [("FAKE_AFT_CRASH_AFTER_MS", "100")],
+    )
+    .await;
+
+    let restarting = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Restarting && !status.process_alive
+    })
+    .await;
+    assert_current_process_facts_cleared(&restarting);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_enabled_current_value_returns_false_without_state_mutation() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
@@ -204,7 +231,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
     );
     assert!(failed.enabled);
     assert!(!failed.process_alive);
-    assert_eq!(failed.pid, None);
+    assert_current_process_facts_cleared(&failed);
     assert!(
         matches!(second, Err(SuperviseError::Spawn { .. })),
         "second enable must retry spawning instead of returning {second:?}"
@@ -261,10 +288,11 @@ async fn restart_and_reload_are_rejected_for_a_disabled_module() {
     // Disable it, then confirm restart and reload both refuse.
     let changed = module.set_enabled(false).await.unwrap();
     assert!(changed, "module should transition from enabled to disabled");
-    wait_for_status(&module, Duration::from_secs(3), |status| {
+    let disabled = wait_for_status(&module, Duration::from_secs(3), |status| {
         status.state == ModuleState::Disabled && !status.process_alive
     })
     .await;
+    assert_current_process_facts_cleared(&disabled);
 
     let restart_err = module
         .restart(None)
@@ -541,6 +569,7 @@ async fn clean_exit_keeps_supervision_task_alive_for_operator_restart() {
     })
     .await;
     assert!(!stopped.live);
+    assert_current_process_facts_cleared(&stopped);
 
     // The load-bearing assertion: the supervision task must still answer
     // commands after the clean exit, and restart must fully revive the module.

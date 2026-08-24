@@ -6,8 +6,9 @@ use subc_protocol::{
     error_codes,
     manifest::{
         Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
-        IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope,
-        Tool, TrustTier,
+        IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ObservabilityKind, ObservabilitySurface, ProviderRole, StorageBinding, StorageKind,
+        StorageScope, Tool, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -110,6 +111,16 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             execution_mode: ExecutionMode::Mutating,
             schema: serde_json::json!({"type": "object"}),
         },
+    );
+    assert_golden(
+        "management_surface_manifest_with_description",
+        &management_surface_manifest(Some(
+            "List managed records and return their identifiers and metadata.",
+        )),
+    );
+    assert_golden(
+        "management_surface_manifest_without_description",
+        &management_surface_manifest(None),
     );
     assert_golden(
         "module_control_push_route_status",
@@ -327,6 +338,43 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
             identity: IdentityBinding {
                 requires: vec![IdentityScope::Project],
                 optional: vec![IdentityScope::Session],
+            },
+        },
+        capabilities: None,
+    }
+}
+
+fn management_surface_manifest(description: Option<&str>) -> ModuleManifest {
+    ModuleManifest {
+        module_id: "management-surface".to_string(),
+        module_version: "1.2.3".to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: vec![ProviderRole::ManagementSurface {
+            operations: vec![ManagementOperation {
+                name: "records.list".to_string(),
+                kind: ManagementOperationKind::Query,
+                description: description.map(ToOwned::to_owned),
+            }],
+            config_schema: serde_json::json!({"type": "object"}),
+            observability: vec![ObservabilitySurface {
+                name: "records.stats".to_string(),
+                kind: ObservabilityKind::Snapshot,
+            }],
+            identity_scope: vec![IdentityScope::Project],
+            concurrency: Concurrency::ModuleManaged,
+        }],
+        consumes: Vec::new(),
+        bindings: Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: false,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: vec![IdentityScope::Project],
+                optional: Vec::new(),
             },
         },
         capabilities: None,

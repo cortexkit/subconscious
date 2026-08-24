@@ -34,10 +34,22 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     }
     assert_golden("catalog_entry", &catalog_entry());
     assert_golden(
+        "catalog_entry_without_operation_description",
+        &catalog_entry_without_operation_description(),
+    );
+    assert_golden(
         "client_control_response_catalog_list_without_capabilities",
         &ClientControlResponse::CatalogList {
             generation: 8,
             modules: vec![catalog_entry_without_capabilities()],
+            subc_ops: thin_core_ops(),
+        },
+    );
+    assert_golden(
+        "client_control_response_catalog_list_without_operation_description",
+        &ClientControlResponse::CatalogList {
+            generation: 9,
+            modules: vec![catalog_entry_without_operation_description()],
             subc_ops: thin_core_ops(),
         },
     );
@@ -552,6 +564,26 @@ fn catalog_entry_without_capabilities() -> CatalogEntry {
     }
 }
 
+fn catalog_entry_without_operation_description() -> CatalogEntry {
+    CatalogEntry {
+        module_id: "legacy-management".to_string(),
+        module_version: Some("0.7.0".to_string()),
+        roles: vec![ProviderRole::ManagementSurface {
+            operations: vec![ManagementOperation {
+                name: "records.list".to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            }],
+            config_schema: serde_json::json!({"type": "object"}),
+            observability: Vec::new(),
+            identity_scope: vec![IdentityScope::Project],
+            concurrency: Concurrency::ModuleManaged,
+        }],
+        control_ops: Vec::new(),
+        capabilities: None,
+    }
+}
+
 fn supervisor_entry() -> SupervisorEntry {
     SupervisorEntry {
         module_id: "aft-tools".to_string(),
@@ -614,6 +646,10 @@ fn provider_roles() -> Vec<ProviderRole> {
             operations: vec![ManagementOperation {
                 name: "memory.list".to_string(),
                 kind: ManagementOperationKind::Query,
+                description: Some(
+                    "List stored memory items and return their identifiers and metadata."
+                        .to_string(),
+                ),
             }],
             config_schema: serde_json::json!({"type": "object"}),
             observability: vec![ObservabilitySurface {

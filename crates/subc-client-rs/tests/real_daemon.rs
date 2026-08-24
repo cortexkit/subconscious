@@ -2809,6 +2809,7 @@ fn management_surface_manifest(module_id: &str, operations: &[&str]) -> ModuleMa
             .map(|name| ManagementOperation {
                 name: (*name).to_string(),
                 kind: ManagementOperationKind::Query,
+                description: None,
             })
             .collect(),
         config_schema: serde_json::json!({}),

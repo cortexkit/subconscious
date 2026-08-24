@@ -359,8 +359,11 @@ fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
 }
 
 fn catalog_update_frame(corr: u64, provides: Vec<ProviderRole>) -> Frame {
-    let body =
-        serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate { provides }).unwrap();
+    let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
+        provides,
+        capabilities: None,
+    })
+    .unwrap();
     Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
 }
 

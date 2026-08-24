@@ -12,6 +12,7 @@ pub mod control;
 pub mod daemon_config;
 #[cfg(test)]
 pub(crate) mod dispatch_spike;
+pub mod fleet_lint;
 pub mod forwarding;
 pub mod identity;
 pub mod observability;

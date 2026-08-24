@@ -36,6 +36,16 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    // Emit static discovery data before attestation, config, or daemon setup so
+    // offline fleet lint can inspect the binary without runtime side effects.
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--manifest")
+    {
+        print_manifest(manifest())?;
+        return Ok(());
+    }
+
     // This is intentionally first: no config read or daemon connection may occur
     // before a hand-launched process is refused.
     let attestation = StartupAttestation::require_and_scrub()?;
@@ -69,6 +79,23 @@ async fn run() -> Result<()> {
     );
     let (_handle, serve_future) = serve_with_handle(&connection_file, manifest(), handler).await?;
     serve_future.await?;
+    Ok(())
+}
+
+fn manifest_json(manifest: ModuleManifest) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(manifest)?;
+    value
+        .as_object_mut()
+        .expect("serialized module manifest is an object")
+        .insert(
+            "runtime_computed".to_string(),
+            serde_json::Value::Array(Vec::new()),
+        );
+    Ok(value)
+}
+
+fn print_manifest(manifest: ModuleManifest) -> Result<()> {
+    println!("{}", serde_json::to_string(&manifest_json(manifest)?)?);
     Ok(())
 }
 
@@ -163,7 +190,7 @@ fn required_value(arguments: &mut impl Iterator<Item = OsString>, flag: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{manifest, StartupArgs, MODULE_ID};
+    use super::{manifest, manifest_json, StartupArgs, MODULE_ID};
     use subc_protocol::manifest::{Concurrency, ProviderRole};
 
     #[test]
@@ -180,6 +207,12 @@ mod tests {
             } if observability.iter().any(|surface| surface.name == "health")
         ));
         assert_eq!(manifest.provides.len(), 1);
+    }
+
+    #[test]
+    fn manifest_output_always_includes_an_empty_runtime_computed_array() {
+        let value = manifest_json(manifest()).unwrap();
+        assert_eq!(value["runtime_computed"], serde_json::json!([]));
     }
 
     #[test]

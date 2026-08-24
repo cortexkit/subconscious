@@ -107,6 +107,36 @@ shipped in the same commit as the code that calls the ops:
   with extra steps. Both-meeting-at-the-hash is the same producer/consumer
   pin discipline as gh.route manifests and vendored fixtures.
 
+### 2b. Multi-residence model (Ufuk-ratified)
+
+Enforcement is PER-RESIDENCE; approval authority is PER-OPERATOR. Each host
+machine (Mac, VPS, …) runs its own daemon + callosum and fences access to
+the Alfonsos residing on it, reading only its local acceptance record — the
+machine that holds the data is the machine that refuses; a grant recorded
+anywhere else is advisory, and advisory fences are theatre. A phone viewing
+N residences holds N federation sessions; the merged fleet view is
+presentation, every action authorizes at the target's residence.
+
+Acceptance end-state: an OPERATOR-SIGNED record (account/device key). The
+operator approves a manifest diff ONCE, from whichever device they hold;
+the signed acceptance propagates to residences (rendezvous account state),
+and each callosum verifies signature + manifest hash LOCALLY before
+materializing expose rows. A residence that never received the record keeps
+refusing — fail-closed by construction. v1 collapses to one residence (the
+Mac), where decision and record coincide; this section exists so the
+second residence is an extension, not a redesign.
+
+Authority vs cache, pinned: the authority is operator-owned artifacts the
+daemon READS AND NEVER WRITES (no code path by which a module grants
+itself anything). Materialized runtime state may live wherever callosum
+likes; it is rebuildable and never authoritative.
+
+UX BAR, binding (Ufuk): the operator sees WHAT they are approving (the
+diff, with op descriptions once the description field ships) and approves
+in TWO CLICKS on the machine/device they choose. Any ceremony design that
+requires shell access to a residence, or more than one decision per
+manifest change, fails this bar.
+
 ### 3. The ceremony: diff render is the security review
 
 Pairing accepts the initial manifest; an app upgrade whose manifest_version
@@ -177,6 +207,15 @@ consumers carry manifests.
 - Op-level runtime policy beyond grant membership (callosum enforcement
   semantics unchanged).
 - Retroactive manifests for unpaired/legacy devices.
+
+## Op descriptions (adopted, first buildable piece)
+
+Every module op crossing the catalog gains an optional `description`
+(additive `subc-protocol` field on `ManagementOperation`, serde-default,
+CONSUMER-IMPACT + goldens; owners fill values in the capability owner
+round). Consumers before any UI exists: the ceremony diff (names alone are
+a weak review; names + descriptions are a real one) and the regenerable
+fleet-surface doc.
 
 ## Sequencing
 

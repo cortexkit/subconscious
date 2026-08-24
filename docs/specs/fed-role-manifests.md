@@ -227,6 +227,22 @@ consumers carry manifests.
   semantics unchanged).
 - Retroactive manifests for unpaired/legacy devices.
 
+## Worked example: the first reconciliation was a measurement (CKIOS)
+
+Before any ceremony tooling existed, CKIOS built the client-side vocabulary
+(String-backed CaseIterable enum — outside-vocabulary calls unconstructible)
+and diffed it against the live grant profile. Five minutes, seven rows,
+three findings nobody was hunting: one CALLED-BUT-NOT-GRANTED op (rooms.ack,
+the sixth wired-but-ungranted instance — availability-guarded, fails closed
+and silent, which is exactly how it survived); five grants NEVER CALLED
+through the fed wire (held-but-uncalled subjects, one requiring owner
+confirm because the audit proves wire-silence, not intent); two grants
+confirmed in use with nobody needing to announce anything. "The first
+ceremony diff will surface stale grants" was a claim; this is the
+measurement. Both consumers independently converged on emitting the
+manifest from the issuing binary (--print-fed-manifest / allCases) — the
+fence-5 shape confirmed twice.
+
 ## Op descriptions (adopted, first buildable piece)
 
 Every module op crossing the catalog gains an optional `description`

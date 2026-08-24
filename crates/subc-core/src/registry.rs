@@ -293,6 +293,7 @@ mod path_hazard_tests {
                     optional: Vec::new(),
                 },
             },
+            capabilities: None,
         }
     }
 

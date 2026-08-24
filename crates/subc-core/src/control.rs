@@ -15,7 +15,7 @@ use subc_control::{
 };
 use subc_protocol::{
     error_codes,
-    manifest::{Concurrency, ModuleManifest, ProviderRole},
+    manifest::{validate_hello_capability_grammar, Concurrency, ModuleManifest, ProviderRole},
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -687,7 +687,24 @@ impl ControlHandler {
             corr = frame.header.corr,
             "handling HELLO"
         );
-        let hello = match serde_json::from_slice::<ModuleHelloBody>(&frame.body) {
+        let hello_value = match serde_json::from_slice::<serde_json::Value>(&frame.body) {
+            Ok(value) => value,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_hello",
+                    format!("malformed HELLO body: {err}"),
+                )?])
+            }
+        };
+        if let Err(err) = validate_hello_capability_grammar(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_capability_grammar",
+                err.to_string(),
+            )?]);
+        }
+        let hello = match serde_json::from_value::<ModuleHelloBody>(hello_value) {
             Ok(hello) => hello,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -1082,6 +1099,7 @@ impl ControlHandler {
                     module_version: Some(registration.manifest.module_version),
                     roles,
                     control_ops: registration.control_ops,
+                    capabilities: registration.manifest.capabilities,
                 }
             })
             .collect();
@@ -3504,6 +3522,7 @@ mod tests {
                     optional: vec![IdentityScope::Session],
                 },
             },
+            capabilities: None,
         }
     }
 
@@ -3567,6 +3586,33 @@ mod tests {
         })
         .unwrap();
         Frame::build(FrameType::Hello, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    fn capability_grammar_hello_frame(
+        capabilities: Value,
+        runtime_computed: Option<Value>,
+        corr: u64,
+    ) -> Frame {
+        let mut body = serde_json::to_value(ModuleHelloBody {
+            manifest: manifest("capability-grammar-test", PROTOCOL_VERSION),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .expect("HELLO body serializes");
+        body["manifest"]["capabilities"] = capabilities;
+        if let Some(runtime_computed) = runtime_computed {
+            body["runtime_computed"] = runtime_computed;
+        }
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&body).expect("HELLO body reserializes"),
+        )
+        .expect("HELLO frame builds")
     }
 
     fn channel_request(channel: u16, corr: u64) -> Frame {
@@ -3970,6 +4016,232 @@ mod tests {
         assert_eq!(registration.state, ChannelState::Active);
         assert_eq!(registration.connection_id, conn);
         assert_eq!(registration.control_ops, module_baseline_control_ops());
+    }
+
+    #[test]
+    fn capability_grammar_refusals_name_the_field_and_leave_no_catalog_entry() {
+        let invalid_identifiers = [
+            ("case_change", "credentials-Provider/v1"),
+            ("leading_zero", "credentials-provider/v01"),
+            ("trailing_hyphen", "credentials-provider-/v1"),
+            ("consecutive_hyphens", "credentials--provider/v1"),
+            ("uppercase", "Credentials-provider/v1"),
+            ("missing_v", "credentials-provider/1"),
+            ("whitespace", "credentials provider/v1"),
+            ("zero_version", "credentials-provider/v0"),
+            ("out_of_range_version", "credentials-provider/v4294967296"),
+            (
+                "overlength_name",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/v1",
+            ),
+        ];
+        let mut cases = invalid_identifiers
+            .into_iter()
+            .map(|(name, identifier)| {
+                (
+                    format!("identifier_{name}"),
+                    "capabilities.provides[0]".to_string(),
+                    identifier.to_string(),
+                    json!({ "provides": [identifier] }),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        cases.extend([
+            (
+                "unknown_need".to_string(),
+                "capabilities.requires[0].need".to_string(),
+                "deferred".to_string(),
+                json!({ "requires": [{ "capability": "credentials-provider/v1", "need": "deferred" }] }),
+                None,
+            ),
+            (
+                "duplicate_provides".to_string(),
+                "capabilities.provides[1]".to_string(),
+                "credentials-provider/v1".to_string(),
+                json!({ "provides": ["credentials-provider/v1", "credentials-provider/v1"] }),
+                None,
+            ),
+            (
+                "duplicate_must_never_reach".to_string(),
+                "capabilities.must_never_reach[1]".to_string(),
+                "credentials-provider/v1".to_string(),
+                json!({ "must_never_reach": ["credentials-provider/v1", "credentials-provider/v1"] }),
+                None,
+            ),
+            (
+                "duplicate_requires_same_need".to_string(),
+                "capabilities.requires[1]".to_string(),
+                "credentials-provider/v1".to_string(),
+                json!({ "requires": [
+                    { "capability": "credentials-provider/v1", "need": "required" },
+                    { "capability": "credentials-provider/v1", "need": "required" }
+                ] }),
+                None,
+            ),
+            (
+                "duplicate_requires_conflicting_need".to_string(),
+                "capabilities.requires[1]".to_string(),
+                "credentials-provider/v1".to_string(),
+                json!({ "requires": [
+                    { "capability": "credentials-provider/v1", "need": "required" },
+                    { "capability": "credentials-provider/v1", "need": "optional" }
+                ] }),
+                None,
+            ),
+            (
+                "capabilities_root_pointer".to_string(),
+                "runtime_computed[0]".to_string(),
+                "/capabilities".to_string(),
+                json!({}),
+                Some(json!(["/capabilities"])),
+            ),
+            (
+                "capabilities_descendant_pointer".to_string(),
+                "runtime_computed[0]".to_string(),
+                "/capabilities/provides".to_string(),
+                json!({}),
+                Some(json!(["/capabilities/provides"])),
+            ),
+            (
+                "malformed_pointer_without_leading_slash".to_string(),
+                "runtime_computed[0]".to_string(),
+                "capabilities".to_string(),
+                json!({}),
+                Some(json!(["capabilities"])),
+            ),
+            (
+                "malformed_pointer_escape".to_string(),
+                "runtime_computed[0]".to_string(),
+                "/roles/~2/tools".to_string(),
+                json!({}),
+                Some(json!(["/roles/~2/tools"])),
+            ),
+            (
+                "unknown_capabilities_field".to_string(),
+                "capabilities.future".to_string(),
+                "<array>".to_string(),
+                json!({ "future": [] }),
+                None,
+            ),
+        ]);
+
+        for (index, (name, field, value, capabilities, runtime_computed)) in
+            cases.into_iter().enumerate()
+        {
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(Arc::clone(&registry));
+            let response = handler
+                .handle_control(
+                    ConnectionId::new((index + 1) as u64),
+                    capability_grammar_hello_frame(
+                        capabilities,
+                        runtime_computed,
+                        index as u64 + 1,
+                    ),
+                )
+                .expect("invalid HELLO returns a refusal");
+
+            assert_eq!(response.len(), 1, "{name} must emit one refusal");
+            let error = parse_error(&response[0]);
+            assert_eq!(error["code"], "invalid_capability_grammar", "{name}");
+            let message = error["message"]
+                .as_str()
+                .expect("error message is a string");
+            assert!(
+                message.contains(&field),
+                "{name}: field missing from {message}"
+            );
+            assert!(
+                message.contains(&value),
+                "{name}: value missing from {message}"
+            );
+            assert_eq!(
+                registry
+                    .active_registration_count()
+                    .expect("registry reads"),
+                0,
+                "{name}: refused HELLO must not create a catalog entry"
+            );
+        }
+    }
+
+    #[test]
+    fn legal_runtime_pointer_and_capabilities_are_mirrored_in_catalog_list() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let capabilities = json!({
+            "provides": ["credentials-provider/v1"],
+            "requires": [{ "capability": "context-transform/v1", "need": "optional" }],
+            "must_never_reach": ["federation-transport/v1"]
+        });
+        let response = handler
+            .handle_control(
+                ConnectionId::new(99),
+                capability_grammar_hello_frame(
+                    capabilities.clone(),
+                    Some(json!(["/roles/0/tools"])),
+                    99,
+                ),
+            )
+            .expect("valid HELLO registers");
+        assert_eq!(response[0].header.ty, FrameType::HelloAck);
+
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            100,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None })
+                .expect("catalog request serializes"),
+        )
+        .expect("catalog request frame builds");
+        let response = handler
+            .handle_catalog_list(request, None)
+            .expect("catalog list succeeds");
+        let ClientControlResponse::CatalogList { modules, .. } =
+            serde_json::from_slice(&response[0].body).expect("catalog response decodes")
+        else {
+            panic!("catalog request must return catalog.list");
+        };
+        assert_eq!(modules.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&modules[0].capabilities).expect("catalog capabilities serialize"),
+            capabilities
+        );
+    }
+
+    #[test]
+    fn catalog_list_omits_capabilities_for_legacy_manifest() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let hello = handler
+            .handle_control(
+                ConnectionId::new(101),
+                hello_frame("legacy-capability-manifest", PROTOCOL_VERSION, 101),
+            )
+            .expect("legacy HELLO registers");
+        assert_eq!(hello[0].header.ty, FrameType::HelloAck);
+
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            102,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None })
+                .expect("catalog request serializes"),
+        )
+        .expect("catalog request frame builds");
+        let response = handler
+            .handle_catalog_list(request, None)
+            .expect("catalog list succeeds");
+        let body: Value = serde_json::from_slice(&response[0].body).expect("catalog response JSON");
+        assert!(
+            body["modules"][0].get("capabilities").is_none(),
+            "legacy manifest must retain an absent capabilities field on catalog.list"
+        );
     }
 
     #[test]

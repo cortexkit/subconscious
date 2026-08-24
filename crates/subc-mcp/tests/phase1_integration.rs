@@ -4609,6 +4609,7 @@ fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
+        capabilities: None,
     }
 }
 

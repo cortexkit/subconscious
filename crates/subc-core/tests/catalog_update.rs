@@ -429,6 +429,7 @@ fn supervision_only_manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
+        capabilities: None,
     }
 }
 

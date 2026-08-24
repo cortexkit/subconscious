@@ -1,0 +1,71 @@
+{
+  "identifier_accepts": [
+    "a/v1",
+    "credentials-provider/v1",
+    "a1-b2/v4294967295",
+    "a123456789012345678901234567890123456789012345678901234567890123/v1"
+  ],
+  "identifier_rejects": [
+    "credentials-Provider/v1",
+    "credentials-provider/v01",
+    "credentials-provider-/v1",
+    "credentials--provider/v1",
+    "Credentials-provider/v1",
+    "credentials-provider/1",
+    "credentials provider/v1",
+    "credentials-provider/v0",
+    "credentials-provider/v4294967296",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/v1"
+  ],
+  "runtime_computed_legal": "/roles/0/tools",
+  "refusals": [
+    {
+      "field": "capabilities.requires[0].need",
+      "value": "deferred",
+      "capabilities": {
+        "requires": [
+          { "capability": "credentials-provider/v1", "need": "deferred" }
+        ]
+      }
+    },
+    {
+      "field": "capabilities.provides[1]",
+      "value": "credentials-provider/v1",
+      "capabilities": {
+        "provides": ["credentials-provider/v1", "credentials-provider/v1"]
+      }
+    },
+    {
+      "field": "capabilities.must_never_reach[1]",
+      "value": "credentials-provider/v1",
+      "capabilities": {
+        "must_never_reach": ["credentials-provider/v1", "credentials-provider/v1"]
+      }
+    },
+    {
+      "field": "capabilities.requires[1]",
+      "value": "credentials-provider/v1",
+      "capabilities": {
+        "requires": [
+          { "capability": "credentials-provider/v1", "need": "required" },
+          { "capability": "credentials-provider/v1", "need": "optional" }
+        ]
+      }
+    },
+    {
+      "field": "runtime_computed[0]",
+      "value": "/capabilities",
+      "runtime_computed": ["/capabilities"]
+    },
+    {
+      "field": "runtime_computed[0]",
+      "value": "/capabilities/provides",
+      "runtime_computed": ["/capabilities/provides"]
+    },
+    {
+      "field": "runtime_computed[0]",
+      "value": "capabilities",
+      "runtime_computed": ["capabilities"]
+    }
+  ]
+}

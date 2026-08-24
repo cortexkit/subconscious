@@ -8,7 +8,11 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use subc_protocol::{manifest::ProviderRole, session::HealthStatus, BindIdentity, RouteTarget};
+use subc_protocol::{
+    manifest::{CapabilityDeclarations, ProviderRole},
+    session::HealthStatus,
+    BindIdentity, RouteTarget,
+};
 
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -495,6 +499,12 @@ pub struct CatalogEntry {
     pub module_version: Option<String>,
     pub roles: Vec<ProviderRole>,
     pub control_ops: Vec<String>,
+    /// Static capability declarations from the registering module's manifest.
+    ///
+    /// Optional on the wire so consumers connected to a daemon that predates the
+    /// capability grammar retain their existing catalog decoding behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<CapabilityDeclarations>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

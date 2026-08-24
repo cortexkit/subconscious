@@ -6,19 +6,463 @@
 //! (for example, AFT's per-project actor map) remains internal to the singleton
 //! module.
 
-use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, fmt};
+
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// A module's full declared participation in the subc mesh.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct ModuleManifest {
     pub module_id: String,
     pub module_version: String,
     pub protocol_ver: u8,
     pub trust_tier: TrustTier,
+    /// Existing role declarations; capability grammar claims deliberately live in
+    /// the separate [`CapabilityDeclarations`] block below.
     pub provides: Vec<ProviderRole>,
     pub consumes: Vec<ConsumerRole>,
     pub bindings: Bindings,
+    /// Optional capability-grammar declarations.
+    ///
+    /// Omitting this block preserves the manifest contract used before capability
+    /// grammar was introduced. A present block is static discovery metadata that
+    /// the daemon validates before accepting a HELLO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<CapabilityDeclarations>,
+}
+
+#[derive(Deserialize)]
+struct ModuleManifestWire {
+    module_id: String,
+    module_version: String,
+    protocol_ver: u8,
+    trust_tier: TrustTier,
+    provides: Vec<ProviderRole>,
+    consumes: Vec<ConsumerRole>,
+    bindings: Bindings,
+    #[serde(default)]
+    capabilities: Option<CapabilityDeclarations>,
+    // `runtime_computed` belongs to --manifest output rather than the retained
+    // manifest model. Deserialize it only long enough to enforce that capability
+    // declarations cannot be omitted as runtime-varying data.
+    #[serde(default)]
+    runtime_computed: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for ModuleManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModuleManifestWire::deserialize(deserializer)?;
+        validate_runtime_computed(wire.runtime_computed.as_ref(), "runtime_computed")
+            .map_err(D::Error::custom)?;
+        let manifest = Self {
+            module_id: wire.module_id,
+            module_version: wire.module_version,
+            protocol_ver: wire.protocol_ver,
+            trust_tier: wire.trust_tier,
+            provides: wire.provides,
+            consumes: wire.consumes,
+            bindings: wire.bindings,
+            capabilities: wire.capabilities,
+        };
+        manifest
+            .validate_capability_grammar()
+            .map_err(D::Error::custom)?;
+        Ok(manifest)
+    }
+}
+
+/// Static, versioned capabilities declared by a module.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityDeclarations {
+    #[serde(default)]
+    pub provides: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<CapabilityRequirement>,
+    #[serde(default)]
+    pub must_never_reach: Vec<String>,
+}
+
+/// One capability a module consumes and whether its absence is tolerated.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityRequirement {
+    pub capability: String,
+    pub need: CapabilityNeed,
+}
+
+/// Closed capability requirement strength vocabulary.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityNeed {
+    Required,
+    Optional,
+}
+
+/// A safe-to-report capability-schema validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityGrammarError {
+    field: String,
+    value: String,
+}
+
+impl CapabilityGrammarError {
+    fn new(field: impl Into<String>, value: impl AsRef<str>) -> Self {
+        Self {
+            field: field.into(),
+            value: safe_error_value(value.as_ref()),
+        }
+    }
+
+    /// The precise malformed field path.
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// The offending value, redacted when it resembles a credential.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for CapabilityGrammarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid capability grammar: field {} has offending value {:?}",
+            self.field, self.value
+        )
+    }
+}
+
+impl std::error::Error for CapabilityGrammarError {}
+
+impl ModuleManifest {
+    /// Validate the typed capability block after serde has decoded it.
+    pub fn validate_capability_grammar(&self) -> Result<(), CapabilityGrammarError> {
+        let Some(capabilities) = &self.capabilities else {
+            return Ok(());
+        };
+
+        validate_capability_list("capabilities.provides", &capabilities.provides)?;
+        validate_requires(&capabilities.requires)?;
+        validate_capability_list(
+            "capabilities.must_never_reach",
+            &capabilities.must_never_reach,
+        )
+    }
+}
+
+/// Validate capability grammar in a standalone manifest JSON value.
+///
+/// The raw-value form lets HELLO distinguish schema failures from malformed JSON,
+/// including an unknown `need` that cannot be represented by [`CapabilityNeed`].
+pub fn validate_manifest_capability_grammar(
+    manifest: &Value,
+) -> Result<(), CapabilityGrammarError> {
+    let Some(object) = manifest.as_object() else {
+        return Ok(());
+    };
+
+    validate_capabilities_value(object.get("capabilities"))?;
+    validate_runtime_computed(object.get("runtime_computed"), "runtime_computed")
+}
+
+/// Validate capability grammar in a raw HELLO body.
+///
+/// `runtime_computed` is a top-level sibling in --manifest output. HELLO keeps
+/// accepting that sibling only so an attempted dynamic capability declaration is
+/// refused explicitly instead of being silently ignored by serde.
+pub fn validate_hello_capability_grammar(hello: &Value) -> Result<(), CapabilityGrammarError> {
+    let Some(object) = hello.as_object() else {
+        return Ok(());
+    };
+    if let Some(manifest) = object.get("manifest") {
+        validate_manifest_capability_grammar(manifest)?;
+    }
+    validate_runtime_computed(object.get("runtime_computed"), "runtime_computed")
+}
+
+/// Return whether `identifier` has the exact `<name>/v<N>` capability spelling.
+pub fn is_valid_capability_identifier(identifier: &str) -> bool {
+    if identifier.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((name, version)) = identifier.split_once("/v") else {
+        return false;
+    };
+    if name.is_empty() || name.len() > 64 || version.is_empty() {
+        return false;
+    }
+
+    let name_bytes = name.as_bytes();
+    if !name_bytes[0].is_ascii_lowercase()
+        || (name.len() > 1
+            && !name_bytes[name.len() - 1].is_ascii_lowercase()
+            && !name_bytes[name.len() - 1].is_ascii_digit())
+        || name_bytes.windows(2).any(|pair| pair == b"--")
+    {
+        return false;
+    }
+    if !name_bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return false;
+    }
+
+    if version.len() > 1 && version.starts_with('0')
+        || !version.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    matches!(
+        version.parse::<u64>(),
+        Ok(value) if (1..=u64::from(u32::MAX)).contains(&value)
+    )
+}
+
+fn validate_capabilities_value(value: Option<&Value>) -> Result<(), CapabilityGrammarError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(object) = value.as_object() else {
+        return Err(CapabilityGrammarError::new(
+            "capabilities",
+            value_description(value),
+        ));
+    };
+
+    for (key, value) in object {
+        if !matches!(key.as_str(), "provides" | "requires" | "must_never_reach") {
+            return Err(CapabilityGrammarError::new(
+                field_child("capabilities", key),
+                value_description(value),
+            ));
+        }
+    }
+
+    validate_capability_list_value("capabilities.provides", object.get("provides"))?;
+    validate_requires_value(object.get("requires"))?;
+    validate_capability_list_value(
+        "capabilities.must_never_reach",
+        object.get("must_never_reach"),
+    )
+}
+
+fn validate_capability_list_value(
+    field: &str,
+    value: Option<&Value>,
+) -> Result<(), CapabilityGrammarError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(CapabilityGrammarError::new(field, value_description(value)));
+    };
+
+    let mut seen = HashSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let field = format!("{field}[{index}]");
+        let Some(identifier) = value.as_str() else {
+            return Err(CapabilityGrammarError::new(field, value_description(value)));
+        };
+        validate_capability_identifier(&field, identifier)?;
+        if !seen.insert(identifier) {
+            return Err(CapabilityGrammarError::new(field, identifier));
+        }
+    }
+    Ok(())
+}
+
+fn validate_requires_value(value: Option<&Value>) -> Result<(), CapabilityGrammarError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(CapabilityGrammarError::new(
+            "capabilities.requires",
+            value_description(value),
+        ));
+    };
+
+    let mut seen = HashSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let entry_field = format!("capabilities.requires[{index}]");
+        let Some(object) = value.as_object() else {
+            return Err(CapabilityGrammarError::new(
+                entry_field,
+                value_description(value),
+            ));
+        };
+        for (key, value) in object {
+            if !matches!(key.as_str(), "capability" | "need") {
+                return Err(CapabilityGrammarError::new(
+                    field_child(&entry_field, key),
+                    value_description(value),
+                ));
+            }
+        }
+        let capability_field = format!("{entry_field}.capability");
+        let Some(capability) = object.get("capability").and_then(Value::as_str) else {
+            return Err(CapabilityGrammarError::new(
+                capability_field,
+                object
+                    .get("capability")
+                    .map_or("<missing>".to_string(), value_description),
+            ));
+        };
+        validate_capability_identifier(&capability_field, capability)?;
+
+        let need_field = format!("{entry_field}.need");
+        let Some(need) = object.get("need").and_then(Value::as_str) else {
+            return Err(CapabilityGrammarError::new(
+                need_field,
+                object
+                    .get("need")
+                    .map_or("<missing>".to_string(), value_description),
+            ));
+        };
+        if !matches!(need, "required" | "optional") {
+            return Err(CapabilityGrammarError::new(need_field, need));
+        }
+        if !seen.insert(capability) {
+            return Err(CapabilityGrammarError::new(entry_field, capability));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capability_list(field: &str, values: &[String]) -> Result<(), CapabilityGrammarError> {
+    let mut seen = HashSet::new();
+    for (index, identifier) in values.iter().enumerate() {
+        let field = format!("{field}[{index}]");
+        validate_capability_identifier(&field, identifier)?;
+        if !seen.insert(identifier) {
+            return Err(CapabilityGrammarError::new(field, identifier));
+        }
+    }
+    Ok(())
+}
+
+fn validate_requires(values: &[CapabilityRequirement]) -> Result<(), CapabilityGrammarError> {
+    let mut seen = HashSet::new();
+    for (index, requirement) in values.iter().enumerate() {
+        let field = format!("capabilities.requires[{index}].capability");
+        validate_capability_identifier(&field, &requirement.capability)?;
+        if !seen.insert(&requirement.capability) {
+            return Err(CapabilityGrammarError::new(
+                format!("capabilities.requires[{index}]"),
+                &requirement.capability,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capability_identifier(
+    field: &str,
+    identifier: &str,
+) -> Result<(), CapabilityGrammarError> {
+    if is_valid_capability_identifier(identifier) {
+        Ok(())
+    } else {
+        Err(CapabilityGrammarError::new(field, identifier))
+    }
+}
+
+fn validate_runtime_computed(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<(), CapabilityGrammarError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(pointers) = value.as_array() else {
+        return Err(CapabilityGrammarError::new(field, value_description(value)));
+    };
+
+    for (index, pointer) in pointers.iter().enumerate() {
+        let field = format!("{field}[{index}]");
+        let Some(pointer) = pointer.as_str() else {
+            return Err(CapabilityGrammarError::new(
+                field,
+                value_description(pointer),
+            ));
+        };
+        let Some(tokens) = parse_json_pointer(pointer) else {
+            return Err(CapabilityGrammarError::new(field, pointer));
+        };
+        if tokens.first().is_some_and(|token| token == "capabilities") {
+            return Err(CapabilityGrammarError::new(field, pointer));
+        }
+    }
+    Ok(())
+}
+
+fn parse_json_pointer(pointer: &str) -> Option<Vec<String>> {
+    if pointer.is_empty() {
+        return Some(Vec::new());
+    }
+    let raw_tokens = pointer.strip_prefix('/')?;
+    raw_tokens
+        .split('/')
+        .map(unescape_json_pointer_token)
+        .collect()
+}
+
+fn unescape_json_pointer_token(token: &str) -> Option<String> {
+    let mut output = String::with_capacity(token.len());
+    let mut characters = token.chars();
+    while let Some(character) = characters.next() {
+        if character != '~' {
+            output.push(character);
+            continue;
+        }
+        match characters.next()? {
+            '0' => output.push('~'),
+            '1' => output.push('/'),
+            _ => return None,
+        }
+    }
+    Some(output)
+}
+
+fn field_child(parent: &str, child: &str) -> String {
+    let child = safe_error_value(child);
+    format!("{parent}.{child}")
+}
+
+fn value_description(value: &Value) -> String {
+    match value {
+        Value::String(value) => safe_error_value(value),
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Array(_) => "<array>".to_string(),
+        Value::Object(_) => "<object>".to_string(),
+    }
+}
+
+fn safe_error_value(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if ["secret", "password", "api_key"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || lower.starts_with("sk-")
+        || lower.starts_with("akia")
+        || lower.starts_with("bearer ")
+        || lower.starts_with("token=")
+        || lower.starts_with("credential=")
+    {
+        "<redacted>".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 /// Trust gate applied by subc before routing capabilities.
@@ -322,6 +766,7 @@ mod tests {
                     optional: vec![IdentityScope::Session],
                 },
             },
+            capabilities: None,
         }
     }
 
@@ -380,5 +825,60 @@ mod tests {
         let value = serde_json::to_value(&manifest).unwrap();
 
         assert_eq!(value["provides"][0]["role"], "tool_provider");
+    }
+
+    #[test]
+    fn manifest_without_capabilities_preserves_the_existing_wire_shape() {
+        let manifest = aft_manifest_fixture();
+        let encoded = serde_json::to_value(&manifest).expect("manifest serializes");
+        assert!(encoded.get("capabilities").is_none());
+
+        let decoded: ModuleManifest =
+            serde_json::from_value(encoded).expect("legacy manifest parses");
+        assert_eq!(decoded.capabilities, None);
+    }
+
+    #[test]
+    fn capability_identifier_lexical_grammar_accepts_only_pinned_forms() {
+        for identifier in [
+            "a/v1",
+            "credentials-provider/v1",
+            "a1-b2/v4294967295",
+            "a123456789012345678901234567890123456789012345678901234567890123/v1",
+        ] {
+            assert!(
+                is_valid_capability_identifier(identifier),
+                "identifier must be accepted: {identifier}"
+            );
+        }
+
+        for identifier in [
+            "credentials-Provider/v1",
+            "credentials-provider/v01",
+            "credentials-provider-/v1",
+            "credentials--provider/v1",
+            "Credentials-provider/v1",
+            "credentials-provider/1",
+            "credentials provider/v1",
+            "credentials-provider/v0",
+            "credentials-provider/v4294967296",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/v1",
+        ] {
+            assert!(
+                !is_valid_capability_identifier(identifier),
+                "identifier must be rejected: {identifier}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_grammar_errors_redact_secret_shaped_values() {
+        let error = validate_manifest_capability_grammar(&json!({
+            "capabilities": { "provides": ["sk-secret-value/v0"] }
+        }))
+        .expect_err("secret-shaped capability identifier is malformed");
+        assert_eq!(error.field(), "capabilities.provides[0]");
+        assert_eq!(error.value(), "<redacted>");
+        assert!(!error.to_string().contains("sk-secret-value"));
     }
 }

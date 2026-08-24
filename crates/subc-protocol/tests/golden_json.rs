@@ -164,7 +164,7 @@ fn manifest_provenance_round_trips_all_facts_through_the_real_manifest_deseriali
     assert_eq!(
         encoded["manifest"]["provenance"],
         serde_json::json!({
-            "build_commit": "0123456789abcdef0123456789abcdef01234567-dirty",
+            "build_git_sha": "0123456789abcdef0123456789abcdef01234567-dirty",
             "build_lock_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             "wire_crate_version": "0.13.0",
             "store_schema_version": "42"
@@ -177,19 +177,19 @@ fn manifest_provenance_round_trips_all_facts_through_the_real_manifest_deseriali
 #[test]
 fn manifest_provenance_omits_each_unavailable_fact_independently() {
     for field in [
-        "build_commit",
+        "build_git_sha",
         "build_lock_digest",
         "wire_crate_version",
         "store_schema_version",
     ] {
         let mut provenance = ManifestProvenance {
-            build_commit: Some("commit".to_string()),
+            build_git_sha: Some("commit".to_string()),
             build_lock_digest: Some("lock".to_string()),
             wire_crate_version: Some("wire".to_string()),
             store_schema_version: Some("schema".to_string()),
         };
         match field {
-            "build_commit" => provenance.build_commit = None,
+            "build_git_sha" => provenance.build_git_sha = None,
             "build_lock_digest" => provenance.build_lock_digest = None,
             "wire_crate_version" => provenance.wire_crate_version = None,
             "store_schema_version" => provenance.store_schema_version = None,
@@ -376,7 +376,7 @@ fn module_hello_body() -> ModuleHelloBody {
 fn module_hello_body_with_provenance() -> ModuleHelloBody {
     let mut hello = module_hello_body();
     hello.manifest.provenance = Some(ManifestProvenance {
-        build_commit: Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string()),
+        build_git_sha: Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string()),
         build_lock_digest: Some(
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
         ),

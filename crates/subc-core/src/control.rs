@@ -112,7 +112,7 @@ impl Default for DaemonProvenanceFacts {
     fn default() -> Self {
         Self {
             build: DaemonBuildProvenance {
-                build_commit: None,
+                build_git_sha: None,
                 build_lock_digest: None,
             },
             pid: None,
@@ -373,13 +373,13 @@ impl ControlHandler {
         pid: u32,
         started_at_ms: u64,
         executable_path: Option<PathBuf>,
-        build_commit: Option<String>,
+        build_git_sha: Option<String>,
         build_lock_digest: Option<String>,
     ) -> Self {
         let executable_identity = executable_path.as_deref().and_then(spawned_file_identity);
         self.daemon_provenance = DaemonProvenanceFacts {
             build: DaemonBuildProvenance {
-                build_commit,
+                build_git_sha,
                 build_lock_digest,
             },
             pid: Some(pid),
@@ -1387,7 +1387,7 @@ impl ControlHandler {
             capabilities: self.subc_capabilities.as_ref().to_vec(),
             connected_clients: self.connected_clients.count(),
             counters: Some(counters),
-            build_commit: Some(env!("CK_BUILD_REV").to_string()),
+            build_git_sha: Some(env!("CK_BUILD_REV").to_string()),
             build_lock_digest: Some(env!("CK_BUILD_LOCK_DIGEST").to_string()),
             capability_requirements: self.capability_requirement_statuses(),
         };

@@ -1325,7 +1325,7 @@ fn manifest_provenance() -> Option<ManifestProvenance> {
         return None;
     }
     Some(ManifestProvenance {
-        build_commit,
+        build_git_sha: build_commit,
         build_lock_digest,
         wire_crate_version: wire_crate_version
             .or_else(|| Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())),

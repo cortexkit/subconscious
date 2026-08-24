@@ -18,6 +18,7 @@ use subc_core::{
     read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
+use subc_protocol::manifest::ManifestProvenance;
 use subc_protocol::{Flags, FrameType, Priority};
 use tokio::{
     io::AsyncWriteExt,
@@ -101,11 +102,20 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     assert!(observed.daemon_observed.spawned_at_ms.unwrap_or_default() > 0);
     assert_running_image_matches(&observed.daemon_observed.running_image);
     let rendered = serde_json::to_string(&observed_daemon).unwrap();
+    // Destructured rather than field-accessed so that adding a field to
+    // ManifestProvenance fails to compile here instead of silently escaping the
+    // leakage sweep below.
+    let ManifestProvenance {
+        build_git_sha,
+        build_lock_digest,
+        wire_crate_version,
+        store_schema_version,
+    } = build;
     for declared in [
-        build.build_git_sha.as_deref(),
-        build.build_lock_digest.as_deref(),
-        build.wire_crate_version.as_deref(),
-        build.store_schema_version.as_deref(),
+        build_git_sha.as_deref(),
+        build_lock_digest.as_deref(),
+        wire_crate_version.as_deref(),
+        store_schema_version.as_deref(),
     ]
     .into_iter()
     .flatten()

@@ -14,13 +14,48 @@ umbrellas").
 
 ---
 
-## claustrum → `credentials-provider/v1`
+## claustrum → THREE umbrellas (OWNER-CORRECTED, CKCRED, 2026-08-24)
 
-- IN: `credential.get`, `credential.get_many`, `credential.status`,
-  `credential.sign`, `credential.public_key`, `credential.report_auth_failure`
-- PRIVATE: admin ops (`admin.reactivate`…), enrollment/vault ceremonies, `ck-auth` CLI surface.
-- Consumers: broca, prefrontal-core (push keys, GitHub App), plexus, insula, mcp-stdio-adapter (planned).
-- Tests: R pass, C pass, T pass. The cleanest cut in the fleet.
+The draft's single-umbrella cut was wrong in three ways CKCRED corrected from
+shipped code (0bac65b): the op list was missing get_scoped and the admin
+pair, the retrieval/exercise split is ENFORCED BY FENCES (get-family refuses
+SigningKey records; sign-family refuses non-SigningKey — the two families
+cannot address the same record), and the admin family answers to a different
+authority root (master-key HMAC challenge, not capability handles).
+
+**`credentials-provider/v1`** — plaintext secret retrieval
+- IN: `credential.get`, `credential.get_scoped`, `credential.get_many`,
+  `credential.status`, `credential.report_auth_failure`
+- Consumers: broca, plexus, insula, mcp-stdio-adapter (planned).
+
+**`signing-authority/v1`** (name pending CKCRED) — key exercise without disclosure
+- IN: `credential.sign`, `credential.public_key`
+- Consumers: prefrontal-core (agent assertion minting), push-seal lanes.
+
+**`vault-admin/v1`** (name pending CKCRED) — custody mutation
+- IN: `admin.challenge`, `admin.op`
+- Different authority root (master-key HMAC). Cut as a named capability
+  rather than private precisely so deny edges CAN name it: a deny on
+  retrieval that silently omitted the mutation surface would read as
+  covering the vault while leaving custody mutation undeclared.
+
+**Sealing: NO capability cut until the CEREB fork resolves.** CKCRED ships
+no wrap/unwrap op. The designed CEREB integration resolves either to raw-DEK
+service (= family 1, the exact surface CEREB wants denied) or to a
+CKCRED-driven wrap op family that does not exist yet. Cutting it today would
+name either the thing being denied or a fiction.
+
+**Deny granularity caveat (affects CEREB's declaration):** must_never_reach
+is enforced at route.open toward the PROVIDING MODULE — module granularity,
+not op granularity (op-level deny is an explicit v1 open question). Denying
+any claustrum capability therefore fences ALL routes to claustrum for the
+declarant today; a consumer that must deny retrieval while reaching a future
+sealing surface on the same module cannot express that until op-level deny
+exists or the surfaces live on different modules.
+
+- Tests: R pass per umbrella (a secret store need not be a signer; a signer
+  need not hold master-key ceremonies), C pass (consumer partition is total),
+  T pass per CKCRED.
 
 ## astrocyte → `spend-metering/v1`
 

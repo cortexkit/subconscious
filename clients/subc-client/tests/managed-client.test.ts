@@ -18,6 +18,7 @@ import {
   SubcCallError,
   SubcClient,
   type BindIdentity,
+  type CatalogEntry,
   type Frame,
 } from "../src/index.js";
 
@@ -78,6 +79,7 @@ interface FakeDaemonOptions {
   // bind relay waits up to ~12s in production) — the case where OUR ping going
   // unanswered is explained by OUR own in-flight control op.
   holdCatalogList?: boolean;
+  catalogModules?: CatalogEntry[];
 }
 
 interface FakeDaemon {
@@ -151,6 +153,75 @@ describe("daemon-originated control pushes", () => {
       // The push (and the observer throw) land before this response on the same
       // stream; a resolved reply means the throw was contained.
       await expect(client.catalogList()).resolves.toEqual([]);
+    } finally {
+      client.close();
+    }
+  });
+});
+
+describe("SubcClient capability resolution", () => {
+  test("resolves only explicit capability claims across zero, one, and many claimant arms", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({
+      stats,
+      catalogModules: [
+        catalogEntry("fallback-only", undefined),
+        catalogEntry("single-provider", ["single-provider/v1"]),
+        catalogEntry("z-provider", ["many-provider/v1"]),
+        catalogEntry("a-provider", ["many-provider/v1"]),
+      ],
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      await expect(client.resolveProviders("missing-provider/v1")).resolves.toEqual([]);
+      await expect(client.resolveProvider("missing-provider/v1")).rejects.toMatchObject({
+        code: "capability_unprovided",
+      });
+      await expect(client.resolveProvider("single-provider/v1")).resolves.toBe("single-provider");
+      await expect(client.resolveProviders("many-provider/v1")).resolves.toEqual(["a-provider", "z-provider"]);
+      await expect(client.resolveProvider("many-provider/v1")).rejects.toMatchObject({
+        code: "capability_ambiguous",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  test("does not fall back to module_id equality when a module does not claim", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({
+      stats,
+      catalogModules: [catalogEntry("fallback-only", undefined)],
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      await expect(client.resolveProviders("fallback-only/v1")).resolves.toEqual([]);
+      await expect(client.resolveProvider("fallback-only/v1")).rejects.toMatchObject({
+        code: "capability_unprovided",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  test("rejects malformed capability identifiers before catalog I/O", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, catalogModules: [] });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      await expect(client.resolveProviders("Bad/v1")).rejects.toMatchObject({
+        code: "invalid_capability_identifier",
+      });
+      expect(stats.requestFrames).toEqual([]);
     } finally {
       client.close();
     }
@@ -849,7 +920,11 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
             deadline,
           );
         }
-        await writeFrame(socket, responseFrame(frame, { op: "catalog.list", modules: [] }), deadline);
+        await writeFrame(
+          socket,
+          responseFrame(frame, { op: "catalog.list", modules: options.catalogModules ?? [] }),
+          deadline,
+        );
       } else if (request.op === "route.open") {
         options.stats.routeOpens += 1;
         options.stats.routeOpenConsumerIdentities.push(
@@ -927,6 +1002,23 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       return;
     }
   }
+}
+
+function catalogEntry(module_id: string, provides: string[] | undefined): CatalogEntry {
+  return {
+    module_id,
+    roles: [],
+    control_ops: [],
+    ...(provides === undefined
+      ? {}
+      : {
+          capabilities: {
+            provides,
+            requires: [],
+            must_never_reach: [],
+          },
+        }),
+  };
 }
 
 function responseFrame(request: Frame, body: unknown): Frame {

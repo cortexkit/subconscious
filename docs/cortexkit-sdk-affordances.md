@@ -109,9 +109,12 @@ is a targeting rule, not a coincidence:
 
 **Every client-side safety fix ships with an explicit answer to "does this
 reach the direct-transport consumers?"** The hand-rolled population is small,
-known, and slow-moving (engram, claustrum, mcp-stdio-adapter, subc-mcp shim
-paths, wernicke, thalamus gateway lanes — re-derive with the scan in
-`scripts/fleet/` rather than trusting this list). When the answer is no, the
+known, and slow-moving — six module repos as of the 2026-08-24 lockfile census
+(broca, engram, astrocyte, cerebellum, insula, claustrum), plus the in-repo
+subc-mcp shim paths — but ALWAYS re-derive with the fleet-pulse census in
+`scripts/fleet/` rather than trusting this parenthetical: its previous
+revision listed two repos that had already migrated, and an outside
+contributor caught the drift by running the scan. When the answer is no, the
 fix announcement names the population and states what each module must port,
 in the same message that announces the SDK release — the notification is the
 producer's duty because only the producer knows the fix exists.

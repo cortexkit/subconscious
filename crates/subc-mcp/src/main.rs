@@ -5389,6 +5389,73 @@ mod tests {
 
     use super::*;
 
+    /// The reverse-request reply leg is a REBUILD, not a byte forward: the
+    /// host's JSON is deserialized into rmcp's typed `ClientResult` union and
+    /// re-serialized toward the module. This test writes that allowlist down
+    /// so it is a documented boundary rather than an accident of rmcp's
+    /// models (a boundary that rebuilds rather than forwards is an allowlist,
+    /// and an allowlist nobody wrote down has no termination condition).
+    ///
+    /// Pinned behavior, all three arms load-bearing:
+    /// - MCP-spec content on a recognized shape survives, INCLUDING `_meta`
+    ///   (the spec's own extension point).
+    /// - An out-of-spec TOP-LEVEL extra on a recognized shape is silently
+    ///   dropped (typed variant matches; unknown fields are not re-emitted).
+    ///   If rmcp ever adds deny_unknown_fields to these models, such replies
+    ///   would fall through to CustomResult and survive verbatim instead --
+    ///   this test failing on an rmcp upgrade is exactly the notice we want.
+    /// - An unrecognized shape falls through to `CustomResult` and survives
+    ///   verbatim; `EmptyResult` cannot swallow it (deny_unknown_fields on
+    ///   EmptyObject), so no reply flattens to `{}`.
+    #[test]
+    fn reverse_reply_rebuild_allowlist_is_pinned() {
+        // Arm 1: recognized elicitation reply; spec fields + _meta survive.
+        let spec_reply = serde_json::json!({
+            "action": "accept",
+            "content": {"answer": 42},
+            "_meta": {"traceId": "t-1"}
+        });
+        let parsed: ClientResult =
+            serde_json::from_value(spec_reply.clone()).expect("typed variant must match");
+        let reencoded = serde_json::to_value(&parsed).expect("reserialize");
+        assert_eq!(
+            reencoded, spec_reply,
+            "spec-compliant elicitation reply must round-trip byte-equivalent"
+        );
+
+        // Arm 2: same shape plus an out-of-spec top-level extra -- dropped.
+        let extended_reply = serde_json::json!({
+            "action": "accept",
+            "content": {"answer": 42},
+            "vendorExtra": true
+        });
+        let parsed: ClientResult =
+            serde_json::from_value(extended_reply).expect("typed variant still matches");
+        let reencoded = serde_json::to_value(&parsed).expect("reserialize");
+        assert!(
+            reencoded.get("vendorExtra").is_none(),
+            "out-of-spec top-level extras are dropped by the typed rebuild; if this \
+             starts surviving, the boundary moved and the module-facing contract changed"
+        );
+        assert_eq!(
+            reencoded.get("action").and_then(|v| v.as_str()),
+            Some("accept")
+        );
+
+        // Arm 3: unrecognized shape survives verbatim via CustomResult; the
+        // deny_unknown_fields on EmptyObject is what makes this reachable.
+        let unknown_reply = serde_json::json!({
+            "somethingNovel": {"nested": [1, 2, 3]}
+        });
+        let parsed: ClientResult =
+            serde_json::from_value(unknown_reply.clone()).expect("CustomResult catch-all");
+        let reencoded = serde_json::to_value(&parsed).expect("reserialize");
+        assert_eq!(
+            reencoded, unknown_reply,
+            "unrecognized reply shapes must pass through CustomResult verbatim, not flatten to {{}}"
+        );
+    }
+
     /// One malformed provider must not delete every other provider's tools.
     ///
     /// This is the fleet-wide Claude Code outage, reduced: `plexus` published a

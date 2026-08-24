@@ -53,7 +53,26 @@ impl CredentialResolver for MissingResolver {
 }
 
 fn fixture_path() -> String {
+    warm_fixture();
     env!("CARGO_BIN_EXE_fake-mcp-child").to_string()
+}
+
+/// Pay the macOS first-exec assessment toll on the freshly built fixture
+/// binary once, outside any spawn/initialize budget. Cargo mints a new inode
+/// for the fixture on every rebuild, and under host load the kernel's
+/// first-execution assessment of a new inode can stall for tens of seconds;
+/// unwarmed, that toll lands inside spawn_initialize_budget and converts
+/// framing/idle-shed tests into initialize_failed flakes. The fixture exits
+/// on stdin EOF, so a null-stdin run terminates immediately once assessed.
+fn warm_fixture() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_fake-mcp-child"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
 }
 
 fn test_settings() -> LifecycleSettings {

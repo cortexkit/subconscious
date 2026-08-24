@@ -1184,7 +1184,6 @@ impl SupervisedModule {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn running_image_agreement(&self) -> subc_control::RunningImageAgreement {
         let snapshot = match lock_snapshot(&self.inner.snapshot) {
             Ok(snapshot) => snapshot.clone(),

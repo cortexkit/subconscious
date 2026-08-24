@@ -91,7 +91,7 @@ impl ExecutableIdentityProbe {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (pid, spawned_from, spawned_identity);
+            let _ = (pid, spawned_from, _spawned_identity);
             unavailable(RunningImageUnavailableReason::UnsupportedPlatform)
         }
     }

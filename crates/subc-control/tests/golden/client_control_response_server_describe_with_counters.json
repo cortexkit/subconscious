@@ -1,5 +1,5 @@
 {
-  "build_git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "build_commit": "0123456789abcdef0123456789abcdef01234567",
   "build_lock_digest": "9d2c0d69cd82f2151bbb2b32ab9ac9d861063ffde2f8582afe767ec7e1f2145c",
   "capabilities": [
     "manifest_registration_v1"

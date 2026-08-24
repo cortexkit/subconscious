@@ -3681,8 +3681,9 @@ mod tests {
     use serde_json::{json, Value};
     use subc_protocol::{
         manifest::{
-            Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ProviderRole,
-            StorageBinding, StorageKind, StorageScope, Tool,
+            Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope,
+            ManagementOperation, ManagementOperationKind, ObservabilityKind, ObservabilitySurface,
+            ProviderRole, StorageBinding, StorageKind, StorageScope, Tool,
         },
         session::HealthStatus,
         FrameType,
@@ -4626,6 +4627,55 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&modules[0].capabilities).expect("catalog capabilities serialize"),
             capabilities
+        );
+    }
+
+    #[test]
+    fn catalog_list_mirrors_management_operation_description() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let description = "List managed records and return their identifiers and metadata.";
+        let mut manifest = manifest("described-management", PROTOCOL_VERSION);
+        manifest.provides = vec![ProviderRole::ManagementSurface {
+            operations: vec![ManagementOperation {
+                name: "records.list".to_string(),
+                kind: ManagementOperationKind::Query,
+                description: Some(description.to_string()),
+            }],
+            config_schema: json!({"type": "object"}),
+            observability: vec![ObservabilitySurface {
+                name: "records.stats".to_string(),
+                kind: ObservabilityKind::Snapshot,
+            }],
+            identity_scope: vec![IdentityScope::Project],
+            concurrency: Concurrency::ModuleManaged,
+        }];
+        registry
+            .register_with_control_ops(
+                manifest,
+                PROTOCOL_VERSION,
+                ConnectionId::new(99),
+                Vec::new(),
+            )
+            .expect("described management manifest registers");
+
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            100,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None })
+                .expect("catalog request serializes"),
+        )
+        .expect("catalog request frame builds");
+        let response = handler
+            .handle_catalog_list(request, None)
+            .expect("catalog list succeeds");
+        let body: Value = serde_json::from_slice(&response[0].body).expect("catalog response JSON");
+        assert_eq!(
+            body["modules"][0]["roles"][0]["operations"][0]["description"], description,
+            "catalog.list must preserve the declared operation description verbatim"
         );
     }
 

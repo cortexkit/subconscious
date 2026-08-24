@@ -232,7 +232,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 // Absent in this fixture: pins that a daemon predating the
                 // provenance fields serializes no key at all, which is what
                 // lets a newer client distinguish "old daemon" from a match.
-                build_commit: None,
+                build_git_sha: None,
                 build_lock_digest: None,
                 capability_requirements: Vec::new(),
             },
@@ -259,7 +259,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 })),
                 // Distinct values, real shapes: a 40-hex commit and a 64-hex
                 // digest, so the pin would catch the two fields transposed.
-                build_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
                 build_lock_digest: Some(
                     "9d2c0d69cd82f2151bbb2b32ab9ac9d861063ffde2f8582afe767ec7e1f2145c".to_string(),
                 ),
@@ -370,7 +370,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             ClientControlResponse::SupervisorProvenance {
                 daemon: SupervisorDaemonProvenance {
                     daemon_build: DaemonBuildProvenance {
-                        build_commit: Some(
+                        build_git_sha: Some(
                             "0123456789abcdef0123456789abcdef01234567-dirty".to_string(),
                         ),
                         build_lock_digest: Some(
@@ -393,7 +393,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     module_id: "aft".to_string(),
                     module_declared: ModuleDeclaredProvenance::Reported {
                         build: ManifestProvenance {
-                            build_commit: Some(
+                            build_git_sha: Some(
                                 "0123456789abcdef0123456789abcdef01234567".to_string(),
                             ),
                             build_lock_digest: Some(
@@ -423,7 +423,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             ClientControlResponse::SupervisorProvenance {
                 daemon: SupervisorDaemonProvenance {
                     daemon_build: DaemonBuildProvenance {
-                        build_commit: None,
+                        build_git_sha: None,
                         build_lock_digest: None,
                     },
                     daemon_observed: DaemonObservedProcess {
@@ -459,7 +459,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             ClientControlResponse::SupervisorProvenance {
                 daemon: SupervisorDaemonProvenance {
                     daemon_build: DaemonBuildProvenance {
-                        build_commit: Some(
+                        build_git_sha: Some(
                             "fedcba9876543210fedcba9876543210fedcba98".to_string(),
                         ),
                         build_lock_digest: Some(
@@ -482,7 +482,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     module_id: "mcp".to_string(),
                     module_declared: ModuleDeclaredProvenance::Reported {
                         build: ManifestProvenance {
-                            build_commit: Some(
+                            build_git_sha: Some(
                                 "fedcba9876543210fedcba9876543210fedcba98-dirty".to_string(),
                             ),
                             build_lock_digest: Some(

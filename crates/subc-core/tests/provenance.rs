@@ -79,7 +79,7 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
         panic!("the provenance block must remain a module declaration");
     };
     assert_eq!(
-        build.build_commit.as_deref(),
+        build.build_git_sha.as_deref(),
         Some("ffffffffffffffffffffffffffffffffffffffff")
     );
     assert_eq!(

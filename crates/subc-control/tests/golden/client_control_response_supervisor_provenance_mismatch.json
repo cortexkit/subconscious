@@ -1,7 +1,7 @@
 {
   "daemon": {
     "daemon_build": {
-      "build_commit": "fedcba9876543210fedcba9876543210fedcba98",
+      "build_git_sha": "fedcba9876543210fedcba9876543210fedcba98",
       "build_lock_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "daemon_observed": {
@@ -36,7 +36,7 @@
       },
       "module_declared": {
         "build": {
-          "build_commit": "fedcba9876543210fedcba9876543210fedcba98-dirty",
+          "build_git_sha": "fedcba9876543210fedcba9876543210fedcba98-dirty",
           "build_lock_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
           "store_schema_version": "3",
           "wire_crate_version": "0.13.0"

@@ -237,7 +237,7 @@ pub enum ClientControlResponse {
         /// commit to detect that it is talking to an older build than it was
         /// compiled with. Absent from daemons predating the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        build_commit: Option<String>,
+        build_git_sha: Option<String>,
         /// sha256 of the workspace Cargo.lock at build time, or "unavailable".
         /// Answers "which dependency set" where the commit answers "which
         /// source"; a commit match with a digest mismatch means a rebuild
@@ -444,7 +444,7 @@ pub struct SupervisorDaemonProvenance {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonBuildProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_commit: Option<String>,
+    pub build_git_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_lock_digest: Option<String>,
 }

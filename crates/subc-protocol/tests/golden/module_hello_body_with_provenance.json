@@ -25,7 +25,7 @@
     "module_version": "1.2.3",
     "protocol_ver": 2,
     "provenance": {
-      "build_commit": "0123456789abcdef0123456789abcdef01234567-dirty",
+      "build_git_sha": "0123456789abcdef0123456789abcdef01234567-dirty",
       "build_lock_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
       "store_schema_version": "42",
       "wire_crate_version": "0.13.0"

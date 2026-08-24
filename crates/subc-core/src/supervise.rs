@@ -467,6 +467,8 @@ struct SupervisorRuntimeConfig {
     /// exactly when it is asked for.
     stderr_ring: Arc<Mutex<StderrRing>>,
     terminal_ring: Arc<Mutex<TerminalRing>>,
+    #[cfg(test)]
+    test_seed_stale_facts_before_enable_spawn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1010,6 +1012,8 @@ impl Supervisor {
                 TerminalRingConfig::default(),
                 self.daemon_started_at_ms,
             ))),
+            #[cfg(test)]
+            test_seed_stale_facts_before_enable_spawn: false,
         }
     }
 
@@ -2322,6 +2326,163 @@ mod tests {
             "a re-added module must not retain a stale removal tombstone"
         );
     }
+
+    fn stale_process_snapshot(state: ModuleState, enabled: bool) -> SharedSnapshot {
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(state, enabled)));
+        update_snapshot(&snapshot, Some("stale-process-facts"), |snapshot| {
+            snapshot.process_alive = true;
+            snapshot.pid = Some(41);
+            snapshot.spawned_at_ms = Some(42);
+            snapshot.spawned_from = Some(PathBuf::from("/spawned/module"));
+            snapshot.spawned_file_identity = Some(SpawnedFileIdentity {
+                device: 43,
+                inode: 44,
+            });
+        })
+        .unwrap();
+        snapshot
+    }
+
+    fn assert_snapshot_process_facts_cleared(snapshot: &SharedSnapshot) {
+        let snapshot = lock_snapshot(snapshot).unwrap();
+        assert!(!snapshot.process_alive);
+        assert_eq!(snapshot.pid, None);
+        assert_eq!(snapshot.spawned_at_ms, None);
+        assert_eq!(snapshot.spawned_from, None);
+        assert_eq!(snapshot.spawned_file_identity, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_enable_spawn_clears_preexisting_current_process_facts() {
+        let supervisor = Supervisor::default();
+        let mut runtime = supervisor.runtime_config();
+        runtime.test_seed_stale_facts_before_enable_spawn = true;
+        let snapshot = stale_process_snapshot(ModuleState::Disabled, false);
+        let mut child = None;
+        let spec = ModuleSpec {
+            module_id: "failed-enable-clears-facts".to_string(),
+            program: PathBuf::from("/definitely/missing/failed-enable-module"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+
+        let result = set_child_enabled(
+            &spec,
+            &runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            true,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SuperviseError::Spawn { .. })));
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        assert_snapshot_process_facts_cleared(&snapshot);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_reload_spawn_clears_current_process_facts() {
+        let supervisor = Supervisor::default();
+        let mut runtime = supervisor.runtime_config();
+        runtime.restart_policy = RestartPolicy::new(0, Duration::ZERO);
+        let snapshot = stale_process_snapshot(ModuleState::Running, true);
+        let mut child = None;
+        let spec = ModuleSpec {
+            module_id: "failed-reload-clears-facts".to_string(),
+            program: PathBuf::from("/unused/failed-reload-module"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+
+        let result = handle_reload_spawn_failure(
+            &spec,
+            &runtime,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            "forced reload spawn failure".to_string(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SuperviseError::ReloadFailed { .. })));
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        assert_snapshot_process_facts_cleared(&snapshot);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_module_with_an_active_monitor_clears_current_process_facts() {
+        let supervisor = Supervisor::default();
+        let snapshot = stale_process_snapshot(ModuleState::Running, true);
+        let module = supervisor.supervised_module(
+            ModuleSpec {
+                module_id: "drop-clears-facts".to_string(),
+                program: PathBuf::from("/unused/drop-module"),
+                args: Vec::new(),
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            },
+            supervisor.runtime_config(),
+            Arc::clone(&snapshot),
+            None,
+        );
+        assert!(!module
+            .inner
+            .monitor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_finished());
+
+        drop(module);
+
+        assert_eq!(
+            lock_snapshot(&snapshot).unwrap().state,
+            ModuleState::Stopped
+        );
+        assert_snapshot_process_facts_cleared(&snapshot);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configuration_update_does_not_replace_captured_running_process_facts() {
+        let supervisor = Supervisor::default();
+        let snapshot = stale_process_snapshot(ModuleState::Running, true);
+        let initial = ModuleSpec {
+            module_id: "rescan-preserves-spawn-facts".to_string(),
+            program: PathBuf::from("/spawned/module"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+        let module = supervisor.supervised_module(
+            initial.clone(),
+            supervisor.runtime_config(),
+            snapshot,
+            None,
+        );
+        let before = module.status().unwrap();
+        let mut replacement = initial;
+        replacement.program = PathBuf::from("/rescanned/replacement-module");
+
+        module
+            .update_configuration(replacement, HealthConfig::default(), None)
+            .await
+            .unwrap();
+
+        let after = module.status().unwrap();
+        assert_eq!(after.pid, before.pid);
+        assert_eq!(after.spawned_at_ms, before.spawned_at_ms);
+        assert_eq!(after.spawned_from, before.spawned_from);
+        drop(module);
+    }
 }
 
 fn unix_ms_now() -> u64 {
@@ -2877,6 +3038,19 @@ async fn set_child_enabled(
             state.state = ModuleState::Starting;
             clear_current_process_facts(state);
         })?;
+        #[cfg(test)]
+        if runtime.test_seed_stale_facts_before_enable_spawn {
+            update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                state.process_alive = true;
+                state.pid = Some(41);
+                state.spawned_at_ms = Some(42);
+                state.spawned_from = Some(PathBuf::from("/spawned/module"));
+                state.spawned_file_identity = Some(SpawnedFileIdentity {
+                    device: 43,
+                    inode: 44,
+                });
+            })?;
+        }
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
         reset_restart_count(snapshot, &spec.module_id)?;
         process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));

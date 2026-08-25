@@ -905,8 +905,9 @@ EOF
 # night-later discovery into next-pulse discovery. Runs the existing checker so
 # there is exactly one implementation to trust.
 echo "-- sibling committed locks (subconscious/commons bumps re-stale dependents)"
-if [ -x "$SUBCONSCIOUS_DIR/scripts/fleet/check-sibling-locks.sh" ]; then
-  _lock_out=$("$SUBCONSCIOUS_DIR/scripts/fleet/check-sibling-locks.sh" 2>&1) || true
+_lock_checker="$HOME/Work/Projects/CortexKit/subconscious/scripts/fleet/check-sibling-locks.sh"
+if [ -x "$_lock_checker" ]; then
+  _lock_out=$("$_lock_checker" 2>&1) || true
   # Three verdict states, all counted: OK, STALE (committed lock does not
   # resolve), DIRTY (working-tree lock differs from committed -- an unlocked
   # command already repaired it locally, which is the mask-that-gets-stronger

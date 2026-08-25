@@ -115,12 +115,25 @@ const FAKE_AFT_ORPHAN_WRITER_MODE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_MODE";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const STUB_EGRESS_BUFFER: usize = 64;
+const FAKE_AFT_FIXTURE_SUFFIX: &str = ".fixture.json";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FixtureSpec {
+    stdout: String,
+    exit_code: i32,
+    sleep_ms: u64,
+}
 
 type InFlightKey = (u16, u32, u64);
 type InFlightRegistry = Arc<Mutex<HashMap<InFlightKey, oneshot::Sender<()>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), StubError> {
+    if let Some(fixture) = fixture_from_sidecar()? {
+        return run_fixture(fixture).await;
+    }
+
     // Checked before StubConfig::from_env(), which requires a `--subc
     // <connection-file-path>` argument neither of these paths receives: the
     // orphan re-exec is spawned by `spawn_orphan_writer` with no args at all,
@@ -140,6 +153,34 @@ async fn main() -> Result<(), StubError> {
 
     let config = StubConfig::from_env()?;
     run(config).await
+}
+
+fn fixture_from_sidecar() -> Result<Option<FixtureSpec>, StubError> {
+    let Ok(executable) = env::current_exe() else {
+        return Ok(None);
+    };
+    let mut sidecar = executable.into_os_string();
+    sidecar.push(FAKE_AFT_FIXTURE_SUFFIX);
+    match fs::read(PathBuf::from(sidecar)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(StubError::Json),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StubError::Io(error)),
+    }
+}
+
+/// Runs a sidecar fixture without touching the connection file or network.
+async fn run_fixture(fixture: FixtureSpec) -> Result<(), StubError> {
+    if fixture.sleep_ms != 0 {
+        sleep(Duration::from_millis(fixture.sleep_ms)).await;
+    }
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(fixture.stdout.as_bytes())
+        .map_err(StubError::Io)?;
+    stdout.flush().map_err(StubError::Io)?;
+    std::process::exit(fixture.exit_code);
 }
 
 /// Writes the configured stderr line (if any), optionally spawns the orphan

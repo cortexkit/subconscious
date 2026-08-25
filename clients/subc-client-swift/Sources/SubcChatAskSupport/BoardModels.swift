@@ -18,7 +18,6 @@ public struct BoardProgress: Codable, Equatable {
 public struct BoardTextProps: Codable, Equatable {
     public var text: String
     public var producer: String?
-    public var teeDefect: String?
 }
 
 public struct BoardStatusProps: Codable, Equatable {
@@ -265,7 +264,10 @@ public struct BoardBlock: Codable, Equatable, Identifiable {
 }
 
 public struct BoardRung2Counters: Codable, Equatable {
-    public var proseQuestionsAtTurnEnd: Int?
+    // Renamed from proseQuestionsAtTurnEnd in the chat-lane excision cut
+    // (board-wire-fixtures-v2.0); the old key is deliberately not decoded so a
+    // producer re-divergence surfaces as nil rather than being absorbed.
+    public var turnFinalQuestionsWithoutAsk: Int?
 }
 
 public struct BoardRung3Counters: Codable, Equatable {
@@ -273,17 +275,12 @@ public struct BoardRung3Counters: Codable, Equatable {
     public var staleChipShown: Bool?
 }
 
-public struct BoardTeeCounters: Codable, Equatable {
-    public var wellFormed: Int?
-    public var malformed: Int?
-    public var leakedOtherHarness: Int?
-    public var syntaxMimicry: Int?
-}
-
+// teeDefect/BoardTeeCounters were deleted with the chat-lane excision: the
+// plugin-side tee that produced them no longer exists, and a decode arm for
+// vocabulary no producer can emit would absorb a regression silently.
 public struct BoardHealthProps: Codable, Equatable {
     public var rung2Counters: BoardRung2Counters?
     public var rung3Counters: BoardRung3Counters?
-    public var teeCounters: BoardTeeCounters?
 }
 
 public struct BoardHealth: Codable, Equatable {

@@ -64,7 +64,7 @@ final class BoardModelsTests: XCTestCase {
 
     func testDecodesEveryFixtureBlockWithTypedKnownPropsAndOpaqueUnknown() throws {
         let blocks = try loadFixtureBlocks()
-        XCTAssertEqual(blocks.count, 11)
+        XCTAssertEqual(blocks.count, 9)
 
         // Kinds this client types, and kinds it deliberately does not. The second
         // list is the load-bearing one: a block whose kind arrived after this
@@ -119,19 +119,9 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(props.status, "answered")
         XCTAssertEqual(props.answer, "After sweep")
         // The answer-delivery stamp decodes TYPED on answered asks (fixture
-        // digest ec4255bc; on the live wire since 2026-08-16 — leniency was
+        // digest 73c163eb; on the live wire since 2026-08-16 — leniency was
         // silently dropping it before the model gained the field).
         XCTAssertEqual(props.answeredAtMs, 1030)
-    }
-
-    func testMalformedTeePreservesDefectAndPartialDigest() throws {
-        let block = try XCTUnwrap(loadFixtureBlocks().first { $0.blockId == "blk-chat-000042" })
-        guard case let .text(props) = block.props else {
-            return XCTFail("expected typed text props")
-        }
-        XCTAssertEqual(props.teeDefect, "unclosed_tag")
-        XCTAssertEqual(block.digest.badge, "partial")
-        XCTAssertEqual(props.text, "Heads up: the merge is")
     }
 
     func testBoardStateDecodesWithLaneOrderAndHealthCounters() throws {
@@ -139,8 +129,11 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(state.roomId, "rm_board_ses_example")
         XCTAssertEqual(state.sessionId, "ses_example")
         XCTAssertEqual(state.servedSeq, 412)
-        XCTAssertEqual(state.lanes, ["chat", "asks", "status", "artifacts", "work"])
-        XCTAssertEqual(state.blocks.count, 6)
+        // Chat left the lane vocabulary in the excision cut; this assertion
+        // reddening on the v2.0 re-vendor was the producer/consumer fixture
+        // pairing carrying the contract change, exactly as designed.
+        XCTAssertEqual(state.lanes, ["asks", "status", "artifacts", "work"])
+        XCTAssertEqual(state.blocks.count, 4)
         // The count alone became vacuous the moment element decoding went
         // fail-soft: six blocks that each lost every typed field would still be
         // six blocks. CKIOS hit this in their own suite -- a count assertion
@@ -150,10 +143,9 @@ final class BoardModelsTests: XCTestCase {
             state.degradedBlockCount, 0,
             "every known-kind block in the fixture must decode to its typed arm"
         )
-        XCTAssertEqual(state.health?.props.teeCounters?.wellFormed, 41)
-        XCTAssertEqual(state.health?.props.teeCounters?.malformed, 1)
-        XCTAssertEqual(state.health?.props.rung2Counters?.proseQuestionsAtTurnEnd, 0)
+        XCTAssertEqual(state.health?.props.rung2Counters?.turnFinalQuestionsWithoutAsk, 0)
         XCTAssertEqual(state.health?.props.rung3Counters?.nudges, 0)
+        XCTAssertEqual(state.health?.props.rung3Counters?.staleChipShown, false)
     }
 
     func testUnknownKindRoundTripsThroughFoldWithoutLosingDigest() throws {
@@ -219,7 +211,9 @@ final class BoardModelsTests: XCTestCase {
             .joined()
         XCTAssertEqual(
             digest,
-            "ec4255bc0f2489f42b76e70969f242919e6beaca585f6c4bb9e380129de605da",
+            // board-wire-fixtures-v2.0 (chat-lane excision re-mint), digest and
+            // byte count pinned in alfonso's tag message per the vector-tag rule.
+            "73c163eb5422234eab5c3b29a91ac1eb394f070e7ba73f5ce2f6864f324b69ce",
             """
             The vendored board fixture no longer matches the copy alfonso pins. \
             Re-sync from alfonso rather than updating this digest: the fixture is \

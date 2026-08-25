@@ -1,5 +1,5 @@
 {
-  "$comment": "Board wire contract v1 fixtures \u2014 canonical shapes SUBC's tab builds against. Casing: camelCase everywhere. Wire law: absent means unknown/not-applicable, present-empty means empty; renderers must distinguish. Unknown `kind` renders as a digest card. `digest` is MODULE-DERIVED from props at post time; agents never author it. Kind vocabulary v1: text, status, ask, show, work (+ reserved: todos). `rooms.list` with `kind: board` includes the optional durable agent-seat `displayName`. Version: board-wire-v1.",
+  "$comment": "Board wire contract v1 fixtures — canonical shapes SUBC's tab builds against. Casing: camelCase everywhere. Wire law: absent means unknown/not-applicable, present-empty means empty; renderers must distinguish. Unknown `kind` renders as a digest card. `digest` is MODULE-DERIVED from props at post time; agents never author it. Live lanes: asks, status, artifacts, work. The chat lane is retired from the write surface; historical room events are not live board blocks. Kind vocabulary v1: text, status, ask, show, work (+ reserved: todos). `rooms.list` with `kind: board` includes the optional durable agent-seat `displayName`. Version: board-wire-v1.",
   "blocks": [
     {
       "$case": "status block, all digest fields present",
@@ -100,36 +100,6 @@
         "title": "settle_canceling fix",
         "line2": "diff \u00b7 2 lines",
         "badge": "show"
-      }
-    },
-    {
-      "$case": "chat block, tee-produced from a well-formed <touser> span",
-      "blockId": "blk-chat-000041",
-      "lane": "chat",
-      "kind": "text",
-      "rev": 1,
-      "props": {
-        "text": "Campaign attempt 23 is through provisioning; first measured round expected within the hour.",
-        "producer": "tee"
-      },
-      "digest": {
-        "title": "Campaign attempt 23 is through provisioning; first measured round expected within the hour."
-      }
-    },
-    {
-      "$case": "chat block, tee captured a MALFORMED tag (unclosed) \u2014 degraded render path; module truncated at turn end, flagged in props; counted in health",
-      "blockId": "blk-chat-000042",
-      "lane": "chat",
-      "kind": "text",
-      "rev": 1,
-      "props": {
-        "text": "Heads up: the merge is",
-        "producer": "tee",
-        "teeDefect": "unclosed_tag"
-      },
-      "digest": {
-        "title": "Heads up: the merge is",
-        "badge": "partial"
       }
     },
     {
@@ -234,7 +204,6 @@
     "vocabulary": "board-wire-v1",
     "servedSeq": 412,
     "lanes": [
-      "chat",
       "asks",
       "status",
       "artifacts",
@@ -251,12 +220,6 @@
         "$ref": "blk-show-diff (rev 1)"
       },
       {
-        "$ref": "blk-chat-000041 (rev 1)"
-      },
-      {
-        "$ref": "blk-chat-000042 (rev 1)"
-      },
-      {
         "$ref": "ask-projected-open (read-time projection)"
       }
     ],
@@ -264,17 +227,11 @@
       "kind": "health",
       "props": {
         "rung2Counters": {
-          "proseQuestionsAtTurnEnd": 0
+          "turnFinalQuestionsWithoutAsk": 0
         },
         "rung3Counters": {
           "nudges": 0,
           "staleChipShown": false
-        },
-        "teeCounters": {
-          "wellFormed": 41,
-          "malformed": 1,
-          "leakedOtherHarness": 0,
-          "syntaxMimicry": 0
         }
       }
     }

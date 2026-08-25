@@ -3383,6 +3383,7 @@ async fn begin_forwarding_drain_with(
         let routes = forwarding
             .endpoint_routes(target.endpoint)
             .map_err(SuperviseError::Forwarding)?;
+        let routes_notified = routes.len();
         crate::control::send_route_control_pushes(
             forwarding,
             routes.clone(),
@@ -3447,8 +3448,24 @@ async fn begin_forwarding_drain_with(
                 return Err(SuperviseError::Forwarding(err));
             }
         };
+        let route_goodbye_count = released_routes.len();
         send_route_goodbyes(forwarding, released_routes);
         send_module_goodbye(&spec.module_id, forwarding, target);
+
+        // The drain's happy path was previously silent: every emission above is
+        // best-effort with only its failure arm logged, so "were consumers told"
+        // was unprovable from the daemon log (surfaced by a 30-minute consumer
+        // hang where the open question was exactly whether teardown notice went
+        // out). One summary line makes that class decidable in one grep.
+        info!(
+            module_id = %spec.module_id,
+            ?reason,
+            routes_notified,
+            route_goodbyes = route_goodbye_count,
+            abandoned_reservations = target.abandoned_bindings.len(),
+            drained,
+            "module drain complete; consumers notified via route.closing/route.closed pushes and per-route GOODBYE frames"
+        );
     }
 
     Ok(())

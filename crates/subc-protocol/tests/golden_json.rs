@@ -208,6 +208,30 @@ fn manifest_provenance_omits_each_unavailable_fact_independently() {
 }
 
 #[test]
+fn manifest_provenance_rejects_non_printable_and_overlong_values() {
+    for field in [
+        "build_git_sha",
+        "build_lock_digest",
+        "wire_crate_version",
+        "store_schema_version",
+    ] {
+        let mut encoded =
+            serde_json::to_value(module_hello_body_with_provenance()).expect("HELLO serializes");
+        encoded["manifest"]["provenance"][field] = Value::String("\u{1b}[2J".to_string());
+        let error = serde_json::from_value::<ModuleHelloBody>(encoded)
+            .expect_err("non-printable provenance must refuse the manifest");
+        assert!(error.to_string().contains(field), "error: {error}");
+
+        let mut encoded =
+            serde_json::to_value(module_hello_body_with_provenance()).expect("HELLO serializes");
+        encoded["manifest"]["provenance"][field] = Value::String("x".repeat(129));
+        let error = serde_json::from_value::<ModuleHelloBody>(encoded)
+            .expect_err("overlong provenance must refuse the manifest");
+        assert!(error.to_string().contains(field), "error: {error}");
+    }
+}
+
+#[test]
 fn legacy_manifest_decoder_ignores_the_additive_provenance_block() {
     let encoded = serde_json::to_value(module_hello_body_with_provenance().manifest)
         .expect("current manifest serializes");

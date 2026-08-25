@@ -24,11 +24,11 @@ fn main() {
     // would compare EQUAL between two broken builds, which reads as a verified
     // match precisely when nothing was verified.
     println!(
-        "cargo:rustc-env=CK_BUILD_REV={}",
+        "cargo:rustc-env=SUBC_BUILD_GIT_SHA={}",
         git_head_sha().unwrap_or_else(|| "unavailable".to_string())
     );
     println!(
-        "cargo:rustc-env=CK_BUILD_LOCK_DIGEST={}",
+        "cargo:rustc-env=SUBC_BUILD_LOCK_DIGEST={}",
         lock_digest().unwrap_or_else(|| "unavailable".to_string())
     );
 }

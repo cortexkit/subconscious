@@ -387,18 +387,28 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
         .rfind("DAEMON-OBSERVED")
         .unwrap_or_else(|| panic!("stdout:\n{stdout}"));
     assert!(declared_at < observed_at, "stdout:\n{stdout}");
+    let module_declared = &stdout[declared_at..observed_at];
+    let module_observed = &stdout[observed_at..];
+    assert!(
+        module_observed.starts_with("DAEMON-OBSERVED\n  PID:"),
+        "module-level observed section boundary was not verified:\n{module_observed}"
+    );
     for declared in [
         "declared-dirty-dirty",
         "declared-lock",
         "declared-wire",
         "declared-schema",
     ] {
-        let value_at = stdout
+        let value_at = module_declared
             .find(declared)
             .unwrap_or_else(|| panic!("missing {declared:?} in:\n{stdout}"));
         assert!(
-            declared_at < value_at && value_at < observed_at,
+            value_at < module_declared.len(),
             "declared value {declared:?} escaped its source section:\n{stdout}"
+        );
+        assert!(
+            !module_observed.contains(declared),
+            "declared value {declared:?} leaked into module-level observed section:\n{module_observed}"
         );
     }
     assert!(stdout.contains("DAEMON BUILD"), "stdout:\n{stdout}");

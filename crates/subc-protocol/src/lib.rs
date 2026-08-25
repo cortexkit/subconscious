@@ -13,7 +13,7 @@
 //!    0      4    len       u32     # of BODY bytes after this 21-byte header
 //!    4      1    ver       u8      envelope version
 //!    5      1    type      u8      frame kind (see FrameType)
-//!    6      1    flags     u8      bit0 BINARY · bits1-2 PRIORITY · bit3 LAST · bits4-5 ADMISSION · bits6-7 reserved
+//!    6      1    flags     u8     bit0 BINARY · bits1-2 PRIORITY · bit3 LAST · bits4-5 ADMISSION · bit6 DAEMON_ORIGIN · bit7 reserved
 //!    7      2    channel   u16     route = (component, session); 0 = subc itself
 //!    9      4    epoch     u32     per-slot binding epoch; 0 on channel 0
 //!   13      8    corr      u64     correlation id; CANCEL carries the target call's corr
@@ -310,7 +310,8 @@ const FLAG_PRIORITY_SHIFT: u8 = 1;
 const FLAG_LAST: u8 = 0b0000_1000; // bit 3
 const FLAG_ADMISSION_MASK: u8 = 0b0011_0000; // bits 4-5
 const FLAG_ADMISSION_SHIFT: u8 = 4;
-const FLAG_RESERVED_MASK: u8 = 0b1100_0000; // bits 6-7 must be zero
+pub const FLAG_DAEMON_ORIGIN: u8 = 0b0100_0000;
+const FLAG_RESERVED_MASK: u8 = 0b1000_0000; // bit 7 must be zero
 
 /// The `flags` byte (offset 6): binary, priority, last, admission, then reserved bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,9 +358,25 @@ impl Flags {
         AdmissionClass::from_bits((self.0 & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT)
     }
 
-    /// True if either reserved bit (6-7) is set.
+    /// True if the reserved bit 7 is set.
     pub fn has_reserved_bits(self) -> bool {
         self.0 & FLAG_RESERVED_MASK != 0
+    }
+
+    /// True when the frame was authored by the daemon.
+    pub fn is_daemon_origin(self) -> bool {
+        self.0 & FLAG_DAEMON_ORIGIN != 0
+    }
+
+    /// Return these flags with daemon origin asserted.
+    pub fn with_daemon_origin(mut self) -> Self {
+        self.0 |= FLAG_DAEMON_ORIGIN;
+        self
+    }
+
+    /// Return these flags with daemon origin cleared.
+    pub fn without_daemon_origin(self) -> Self {
+        Self(self.0 & !FLAG_DAEMON_ORIGIN)
     }
 }
 
@@ -661,6 +678,19 @@ mod tests {
         assert_eq!(f.admission_class(), Some(AdmissionClass::Expedite));
         let h = hdr(8, FrameType::StreamData, f, 1, 1);
         assert_eq!(decode_header(&h.encode()).unwrap().flags, f);
+    }
+
+    #[test]
+    fn daemon_origin_flags_decode_and_round_trip() {
+        let old = hdr(0, FrameType::Error, Flags(0), 7, 1);
+        let old_decoded = decode_header(&old.encode()).unwrap();
+        assert!(!old_decoded.flags.is_daemon_origin());
+
+        let daemon = hdr(0, FrameType::Error, Flags(0).with_daemon_origin(), 7, 1);
+        let daemon_decoded = decode_header(&daemon.encode()).unwrap();
+        assert!(daemon_decoded.flags.is_daemon_origin());
+        assert_eq!(daemon_decoded.flags.without_daemon_origin(), Flags(0));
+        assert!(Flags(0).with_daemon_origin().is_daemon_origin());
     }
 
     #[test]

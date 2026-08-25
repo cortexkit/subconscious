@@ -65,6 +65,17 @@
       "expected_frame_hex": "27000000020504ffffffffffff63000000000000007b22636f6465223a226261645f72657175657374222c226d657373616765223a226f6f7073227d"
     },
     {
+      "name": "error_json_max_epoch_daemon_origin",
+      "ty": 5,
+      "flags": 64,
+      "channel": 65535,
+      "epoch": 4294967295,
+      "corr": 100,
+      "body_hex": "7b22636f6465223a226261645f72657175657374222c226d657373616765223a226f6f7073227d",
+      "expected_header_hex": "27000000020540ffffffffffff6400000000000000",
+      "expected_frame_hex": "27000000020540ffffffffffff64000000000000007b22636f6465223a226261645f72657175657374222c226d657373616765223a226f6f7073227d"
+    },
+    {
       "name": "push_sheddable_max_epoch",
       "ty": 2,
       "flags": 32,

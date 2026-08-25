@@ -137,8 +137,13 @@ final class EnvelopeRevisionTests: XCTestCase {
         assertDecodeError(.unknownFrameType(byte: 255), bytes: bytes)
 
         bytes = encodeHeader(valid)
-        bytes[6] = 0b0100_0000
-        assertDecodeError(.reservedFlagBits(flags: 0b0100_0000), bytes: bytes)
+        bytes[6] = DAEMON_ORIGIN_FLAG
+        let daemon = try decodeHeader(bytes)
+        XCTAssertTrue(daemon.daemonOrigin)
+
+        bytes = encodeHeader(valid)
+        bytes[6] = 0b1000_0000
+        assertDecodeError(.reservedFlagBits(flags: 0b1000_0000), bytes: bytes)
 
         bytes = encodeHeader(valid)
         bytes[6] = 0b0000_0110

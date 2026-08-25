@@ -48,7 +48,7 @@ const CK_HARNESS: &str = "ck";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, connection info, and offline triage";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, connection info, and offline triage";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -116,6 +116,8 @@ const MODULE_HELP: &str = "ck module — inspect and control supervised modules\
   ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    retire a removed module's retained reserved-id gate";
 
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
+
+const PROVENANCE_HELP: &str = "ck provenance — inspect source-tagged module provenance\n\nusage: ck [--json] provenance <module-id>\n\n  ck provenance <id>  daemon-attested process facts beside module declarations";
 
 const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
@@ -207,6 +209,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             )
             .await
         }
+        Command::Provenance { module_id } => provenance(&mut client, &module_id, args.json).await,
         Command::Health => health(&mut client, args.json, args.subc.as_deref()).await,
         Command::HealthDetail { module_id } => {
             health_detail(&mut client, &module_id, args.json).await
@@ -560,6 +563,9 @@ enum Command {
     Module(ModuleCommand),
     Routes {
         module_id: Option<String>,
+    },
+    Provenance {
+        module_id: String,
     },
     Health,
     HealthDetail {
@@ -1290,6 +1296,130 @@ async fn supervisor_routes(
         print_table(&["MODULE", "CONSUMER", "AGE", "STATE"], rows);
     }
     Ok(())
+}
+
+async fn provenance(
+    client: &mut CkClient,
+    module_id: &str,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let response = client
+        .rpc_value(ClientControlRequest::SupervisorProvenance {
+            module_id: Some(module_id.to_string()),
+        })
+        .await?;
+    if json_output {
+        print_json(&response)?;
+        return Ok(());
+    }
+
+    let daemon = response
+        .get("daemon")
+        .ok_or_else(|| CkError::Message("provenance response omitted daemon".to_string()))?;
+    let module = modules_array(&response)
+        .first()
+        .ok_or_else(|| CkError::Message("provenance response omitted module".to_string()))?;
+
+    println!("DAEMON BUILD");
+    let daemon_build = daemon.get("daemon_build").unwrap_or(&Value::Null);
+    println!(
+        "  COMMIT: {}",
+        provenance_value(daemon_build.get("build_git_sha"))
+    );
+    println!(
+        "  LOCK DIGEST: {}",
+        provenance_value(daemon_build.get("build_lock_digest"))
+    );
+    println!("DAEMON-OBSERVED");
+    let daemon_observed = daemon.get("daemon_observed").unwrap_or(&Value::Null);
+    println!("  PID: {}", provenance_value(daemon_observed.get("pid")));
+    println!(
+        "  START TIME: {}",
+        provenance_value(daemon_observed.get("started_at_ms"))
+    );
+    println!(
+        "  RUNNING IMAGE: {}",
+        provenance_image(daemon_observed.get("running_image"))
+    );
+
+    println!("MODULE: {}", display_field(module, "module_id"));
+    println!("MODULE-DECLARED");
+    match module.get("module_declared") {
+        Some(declared) if declared.get("status").and_then(Value::as_str) == Some("reported") => {
+            let build = declared.get("build").unwrap_or(&Value::Null);
+            let commit = build.get("build_git_sha");
+            println!("  COMMIT: {}", provenance_value(commit));
+            if commit
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.ends_with("-dirty"))
+            {
+                println!("  STATUS: commit match only");
+            }
+            let lock = build.get("build_lock_digest");
+            println!("  LOCK DIGEST: {}", provenance_value(lock));
+            if commit.is_none() && lock.is_some() {
+                println!("  STATUS: change-detectable; commit identity unavailable");
+            }
+            println!(
+                "  WIRE CRATE VERSION: {}",
+                provenance_value(build.get("wire_crate_version"))
+            );
+            println!(
+                "  STORE SCHEMA VERSION: {}",
+                provenance_value(build.get("store_schema_version"))
+            );
+        }
+        _ => println!("  unverifiable"),
+    }
+
+    println!("DAEMON-OBSERVED");
+    let observed = module.get("daemon_observed").unwrap_or(&Value::Null);
+    println!("  PID: {}", provenance_value(observed.get("pid")));
+    println!(
+        "  SPAWN TIME: {}",
+        provenance_value(observed.get("spawned_at_ms"))
+    );
+    println!(
+        "  SPAWNED-FROM: {}",
+        provenance_value(observed.get("spawned_from"))
+    );
+    println!(
+        "  RUNNING IMAGE: {}",
+        provenance_image(observed.get("running_image"))
+    );
+    Ok(())
+}
+
+fn provenance_value(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => "unavailable".to_string(),
+    }
+}
+
+fn provenance_image(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "unavailable".to_string();
+    };
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    match status {
+        "match" => format!(
+            "match ({})",
+            provenance_value(
+                value
+                    .get("evidence")
+                    .and_then(|evidence| evidence.get("method"))
+            )
+        ),
+        "mismatch" => "mismatch (running vs disk)".to_string(),
+        "unavailable" => format!("unavailable ({})", provenance_value(value.get("reason"))),
+        other => other.to_string(),
+    }
 }
 
 async fn print_ack_with_state(
@@ -3865,7 +3995,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
 fn is_builtin_domain(domain: &str) -> bool {
     matches!(
         domain,
-        "module" | "routes" | "health" | "daemon" | "quota" | "fleet" | "help"
+        "module" | "routes" | "provenance" | "health" | "daemon" | "quota" | "fleet" | "help"
     )
 }
 
@@ -3878,6 +4008,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             Ok(Command::Help(match topic.as_deref() {
                 Some("module") => MODULE_HELP.into(),
                 Some("routes") => ROUTES_HELP.into(),
+                Some("provenance") => PROVENANCE_HELP.into(),
                 Some("quota") => QUOTA_HELP.into(),
                 Some("fleet") => FLEET_HELP.into(),
                 Some("health") => HEALTH_HELP.into(),
@@ -3960,6 +4091,18 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             }
             _ => Ok(Command::Help(ROUTES_HELP.into())),
         },
+        "provenance" => {
+            let Some(module_id) = tail.first() else {
+                return Ok(Command::Help(PROVENANCE_HELP.into()));
+            };
+            if tail.len() != 1 || module_id == "-h" || module_id == "--help" || module_id == "help"
+            {
+                return Ok(Command::Help(PROVENANCE_HELP.into()));
+            }
+            Ok(Command::Provenance {
+                module_id: module_id.to_string_lossy().into_owned(),
+            })
+        }
         "health" => match tail.first() {
             None => Ok(Command::Health),
             Some(argument) => {

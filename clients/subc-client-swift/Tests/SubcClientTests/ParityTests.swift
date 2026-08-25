@@ -151,6 +151,29 @@ final class ParityTests: XCTestCase {
     func testDecodeHeaderRoundTripsGoldenHeaders() throws {
         let vectors = try loadWireVectors()
 
+        let old = try XCTUnwrap(vectors.frameVectors.first { $0.name == "error_json_max_epoch" })
+        let daemon = try XCTUnwrap(vectors.frameVectors.first { $0.name == "error_json_max_epoch_daemon_origin" })
+        let daemonHeader = EnvelopeHeader(
+            len: UInt32(try Data(hex: daemon.bodyHex, name: "daemon.body_hex").count),
+            ver: PROTOCOL_VERSION,
+            ty: try frameType(for: daemon),
+            flags: daemon.flags,
+            channel: daemon.channel,
+            epoch: daemon.epoch,
+            corr: daemon.corr
+        )
+        let oldHeader = EnvelopeHeader(
+            len: UInt32(try Data(hex: old.bodyHex, name: "old.body_hex").count),
+            ver: PROTOCOL_VERSION,
+            ty: try frameType(for: old),
+            flags: old.flags,
+            channel: old.channel,
+            epoch: old.epoch,
+            corr: old.corr
+        )
+        XCTAssertTrue(try decodeHeader(encodeHeader(daemonHeader)).daemonOrigin)
+        XCTAssertFalse(try decodeHeader(encodeHeader(oldHeader)).daemonOrigin)
+
         for vector in vectors.frameVectors {
             let ty = try frameType(for: vector)
             let body = try Data(hex: vector.bodyHex, name: "\(vector.name).body_hex")

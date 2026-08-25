@@ -8,6 +8,7 @@ public let PROTOCOL_VERSION: UInt8 = 2
 public let HEADER_LEN = 21
 public let FROZEN_PREFIX_LEN = 5
 public let MAX_FRAME_BODY_LEN = 64 * 1024 * 1024
+public let DAEMON_ORIGIN_FLAG: UInt8 = 0x40
 
 /// `type` byte at offset 5.
 public enum FrameType: UInt8, Equatable, Sendable {
@@ -73,6 +74,10 @@ public struct EnvelopeHeader: Equatable, Sendable {
     /// Typed view of flags bits 4-5. Invalid raw headers return nil until decode rejects them.
     public var admissionClass: AdmissionClass? {
         AdmissionClass(rawValue: (flags >> 4) & 0b11)
+    }
+
+    public var daemonOrigin: Bool {
+        flags & DAEMON_ORIGIN_FLAG != 0
     }
 
     public init(
@@ -192,7 +197,7 @@ public func decodeHeader(_ bytes: Data) throws -> EnvelopeHeader {
         throw DecodeError.unknownFrameType(byte: raw[5])
     }
     let flags = raw[6]
-    guard flags & 0b1100_0000 == 0 else {
+    guard flags & 0b1000_0000 == 0 else {
         throw DecodeError.reservedFlagBits(flags: flags)
     }
     guard (flags >> 1) & 0b11 != 0b11 else {

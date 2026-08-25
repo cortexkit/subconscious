@@ -439,10 +439,16 @@ first-party-fleet principle (§0). No quarantine code ships.
 | 1-2  | PRIORITY        | unchanged: relay-QoS **ordering within a class**; 0b11 decode-rejected |
 | 3    | LAST            | unchanged                                          |
 | 4-5  | ADMISSION CLASS | **NEW** mutually-exclusive field, see below        |
-| 6-7  | reserved        | must be zero, decode-rejected (unchanged rule)     |
+| 6    | DAEMON_ORIGIN   | daemon-authored envelope; forwarded frames clear it |
+| 7    | reserved        | must be zero, decode-rejected; stale-binary tripwire |
 
 Admission class (one 2-bit field, not two independent bits — per-frame the
 states are exclusive and `EXPEDITE+SHEDDABLE` dies by construction):
+
+`DAEMON_ORIGIN` is accepted by all Phase 1 decoders but is not set by ordinary
+emitters. In the Phase 2 routing order, forwarded frames clear bit 6 and
+daemon-authored errors set it; retry and classification guidance deliberately
+waits for that phase.
 
 - `00` NORMAL — must-deliver semantics exactly as today.
 - `01` EXPEDITE — admission/relay priority **hint**: the daemon MAY relay
@@ -494,7 +500,7 @@ ships with the shedding implementation, not with flip-day.
   `Push`/`StreamData`.
 - `NonzeroEpochOnControlChannel { epoch }` — channel 0 with `epoch != 0`.
 - Existing errors unchanged: `TooShortForPrefix`, `UnknownFrameType`,
-  `ReservedFlagBits` (now bits 6-7 only), `ReservedPriorityBits`,
+  `ReservedFlagBits` (bit 7 only), `ReservedPriorityBits`,
   `PureHeaderFrameWithBody`.
 
 ## 7. Surface changes by artifact

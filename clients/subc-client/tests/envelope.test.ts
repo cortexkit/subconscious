@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   AdmissionClass,
+  DAEMON_ORIGIN_FLAG,
   buildFlags,
   buildFrame,
   buildFrameWithVersion,
@@ -10,6 +11,7 @@ import {
   encodeFrame,
   encodeHeader,
   FrameType,
+  hasDaemonOrigin,
   HEADER_LEN,
   MAX_FRAME_BODY_LEN,
   PROTOCOL_VERSION,
@@ -155,6 +157,17 @@ describe("21-byte envelope header", () => {
     expect(() => decodeHeader(reserved)).toThrow(/reserved flag bits/);
     const priority = encodeHeader(header(0, FrameType.Request, 0b0000_0110, 0, 0, 0n));
     expect(() => decodeHeader(priority)).toThrow(/reserved priority bits/);
+  });
+
+  test("accepts daemon-origin Error headers while retaining bit 7 rejection", () => {
+    const old = encodeHeader(header(0, FrameType.Error, 0, 7, 1, 0n));
+    expect(hasDaemonOrigin(decodeHeader(old).flags)).toBe(false);
+
+    const daemon = encodeHeader(header(0, FrameType.Error, DAEMON_ORIGIN_FLAG, 7, 1, 0n));
+    expect(hasDaemonOrigin(decodeHeader(daemon).flags)).toBe(true);
+
+    const reserved = encodeHeader(header(0, FrameType.Error, 0b1000_0000, 7, 1, 0n));
+    expect(() => decodeHeader(reserved)).toThrow(/reserved flag bits/);
   });
 
   test("enforces pure-header length and encodes body after byte 21", () => {

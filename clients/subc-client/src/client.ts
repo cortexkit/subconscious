@@ -1277,6 +1277,13 @@ export class SubcClient {
     // post-deadline liveness probe reads this stamp. Stamped after readLoop's
     // generation gate, so a stale socket's late frames never vouch for the
     // live one.
+    //
+    // PLACEMENT IS LOAD-BEARING: every inbound frame passes this one point
+    // before demux, which is the whole reason a single stamp works. A future
+    // fast path or drain-and-dispatch refactor that routes frames around
+    // dispatch() makes the stamp skippable, and the liveness watermark
+    // quietly stops meaning "the link delivered bytes" -- the cheapest
+    // correctness property here is also the easiest to lose in a refactor.
     this.lastInboundAtMs = Date.now();
     if (frame.header.channel === 0 && frame.header.ty === FrameType.Push) {
       // Daemon-originated control push (route.closing / route.closed / future

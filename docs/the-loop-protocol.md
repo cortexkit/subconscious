@@ -229,3 +229,25 @@ Constraints:
 - Commit with a message naming the mechanism, not the symptom. Then report the SHA
   and the before/after of your regression test.
 ```
+
+## Standing sweep patterns
+
+Run these against any module in a LOOP round; both have caught real bugs in
+two or more modules, which is the bar for a standing pattern.
+
+**Global-id-scope.** An id-keyed map built by walking a whole
+conversation/document/lineage, consumed assuming a uniqueness the id-space
+does not guarantee. Flag ONLY when the map key's scope is WIDER than the
+id-space's uniqueness scope — ask "can two distinct scopes ever mint the same
+id this map keys on?" (synthetic `call_N`-per-step or a reused foreign
+tool_call_id across an interrupt: bug; a globally-unique run_id/UUID under a
+global map: safe). A trustworthy fix serde-compares byte-identity for
+non-colliding inputs, carries a non-vacuous revert-fails collision
+regression, and bumps no renderer.
+
+**Panic-teardown / exactly-once.** Three sub-shapes from the same arc:
+detached-task resurrection (capture the generation token BEFORE spawn so a
+late first-poll cannot resurrect a route after session close),
+released-lease-under-panic, and false-terminal-on-run-task-panic. The common
+question: what does the exactly-once machinery believe after the task that
+owned it died at the worst instruction boundary?

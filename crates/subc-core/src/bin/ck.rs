@@ -1774,16 +1774,42 @@ fn triage_process_fact(pid: Option<u32>) -> Value {
     let Some(pid) = pid else {
         return json!({ "status": "skipped", "skipped": "no pid recovered from connection file or start-lock" });
     };
+    // Platform split: `ps` is the honest probe on unix; Windows has no ps
+    // executable (a PowerShell alias is not spawnable), so shelling it there
+    // either fails to start or resolves to a Git-supplied ps.exe with
+    // different flag semantics -- both misreport a live pid as dead/skipped.
+    // tasklist ships with every Windows edition the fleet targets.
+    #[cfg(not(windows))]
     let output = process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "pid=,comm="])
         .output();
+    #[cfg(windows)]
+    let output = process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output();
     let Ok(output) = output else {
-        return json!({ "pid": pid, "status": "skipped", "skipped": "ps command could not be started" });
+        return json!({ "pid": pid, "status": "skipped", "skipped": "process probe command could not be started" });
     };
-    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // tasklist exits 0 with an INFO: prose line when the filter matches
+    // nothing, so "no CSV row" is the not-running signal there; ps signals it
+    // via exit status or empty output.
+    #[cfg(windows)]
+    let running = output.status.success() && stdout.starts_with('"');
+    #[cfg(not(windows))]
+    let running = output.status.success() && !stdout.is_empty();
+    if !running {
         return json!({ "pid": pid, "status": "dead", "executable": { "status": "not-running" } });
     }
-    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    #[cfg(windows)]
+    let command = stdout
+        .split('"')
+        .nth(1)
+        .unwrap_or(&stdout)
+        .trim_end_matches(".exe")
+        .to_string();
+    #[cfg(not(windows))]
+    let command = stdout;
     let executable = Path::new(command.split_whitespace().last().unwrap_or(&command))
         .file_name()
         .and_then(OsStr::to_str)
@@ -5157,9 +5183,14 @@ mod tests {
     fn daemon_triage_fresh_connection_with_dead_pid_is_ambiguous() {
         let dir = triage_fixture_dir("dead");
         let connection = dir.join(CONNECTION_FILE_NAME);
-        let mut child = process::Command::new("sh")
-            .arg("-c")
-            .arg("exit 0")
+        // Spawn the test binary itself as the short-lived child: libtest's
+        // --help exits immediately, and current_exe needs no shell on PATH
+        // (spawning "sh" here passed on Windows CI only by Git-toolchain
+        // runner luck -- the fixture class that broke fleet_lint's tests).
+        let mut child = process::Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
             .spawn()
             .unwrap();
         let pid = child.id();
@@ -5217,8 +5248,17 @@ mod tests {
         let connection = dir.join(CONNECTION_FILE_NAME);
         let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
         let object = report.json.as_object().unwrap();
+        // Compare SORTED keys: serde_json::Map iteration order is a feature
+        // flag, not a behavior. A lone `-p subc-core` build iterates
+        // alphabetically, while a workspace build unifies features with
+        // agent-token-vectors (whose RFC 8785 canonicalizer legitimately
+        // enables `preserve_order`), flipping iteration to insertion order --
+        // so an order-sensitive assertion here passes or fails based on which
+        // crates were built alongside this one.
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
         assert_eq!(
-            object.keys().cloned().collect::<Vec<_>>(),
+            keys,
             [
                 "connection_file",
                 "log_tail",

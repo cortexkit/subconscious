@@ -50,7 +50,13 @@ process. A missing manifest block is `unverifiable`; it is not an empty build cl
 
 The module declaration may contain `build_git_sha`, `build_lock_digest`,
 `wire_crate_version`, and `store_schema_version`. The daemon never promotes those
-values into its observed layer. `supervisor.provenance {}` reads the whole box;
+values into its observed layer. Each present value must be non-empty, at most 128
+bytes, and printable ASCII (`0x20`–`0x7e`). A violation refuses HELLO with
+`invalid_manifest`, so the module does not register. An absent block is valid and
+continues registration normally; it produces `module_declared.status = unverifiable`.
+The bound exists because declared values are module-controlled and reach operator
+terminals, so the daemon limits their size and character set at its boundary.
+`supervisor.provenance {}` reads the whole box;
 `supervisor.provenance { module_id }` reads one module.
 
 On Linux, running-image evidence is SHA-256 over open handles for `/proc/<pid>/exe`
@@ -60,8 +66,9 @@ a placeholder digest. Linux digesting is a cold read on the first observation; a
 bounded process-local cache holds 64 file identities and clears when full.
 
 `ck provenance <module>` preserves these source labels in human output. With `--json`
-it emits the typed response unchanged. This surface does not implement `origin_delta`,
-`buildable_at_head`, deploy, git, or network logic.
+it emits the typed response unchanged. Non-printable bytes in malformed declared
+values are escaped in diagnostics rather than emitted raw. This surface does not
+implement `origin_delta`, `buildable_at_head`, deploy, git, or network logic.
 
 ## aft — agent tool substrate (21 tools)
 

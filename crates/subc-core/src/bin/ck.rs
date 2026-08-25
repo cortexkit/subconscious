@@ -13,7 +13,7 @@ use std::{
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Read, Seek, SeekFrom},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process,
@@ -37,6 +37,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_FILE_NAME: &str = "subc-connection.json";
+const TRIAGE_LOG_MAX_BYTES: u64 = 64 * 1024;
+const TRIAGE_LOG_TAIL_LINES: usize = 20;
+const EXPECTED_DAEMON_BINARY: &str = "ck-subc";
 const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 const QUOTA_MODULE_ID: &str = "insula";
@@ -45,7 +48,7 @@ const CK_HARNESS: &str = "ck";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, and connection info";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, connection info, and offline triage";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -118,8 +121,7 @@ const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusag
 
 const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with FULL metrics — bypasses\n                       the supervisor cache and its size truncation";
 
-const DAEMON_HELP: &str =
-    "ck daemon — daemon version, uptime, and connection info\n\nusage: ck [--json] daemon";
+const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, and offline triage\n\nusage:\n  ck [--json] daemon\n  ck [--json] daemon triage\n\n  triage reads only the local run directory; it never contacts the daemon.";
 
 const FLEET_HELP: &str = "ck fleet — offline configured-module inspection\n\nusage:\n  ck fleet lint [<config>] [--verbose]\n\n`lint` reads module manifests without connecting to the daemon.";
 
@@ -127,7 +129,9 @@ const FLEET_HELP: &str = "ck fleet — offline configured-module inspection\n\nu
 async fn main() {
     match run(env::args_os()).await {
         Ok(()) => process::exit(0),
-        Err(CkError::FleetLintExit { exit_code }) => process::exit(exit_code),
+        Err(CkError::FleetLintExit { exit_code } | CkError::TriageExit { exit_code }) => {
+            process::exit(exit_code)
+        }
         Err(err) => {
             eprintln!("{err}");
             process::exit(err.exit_code());
@@ -152,6 +156,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     }
     if let Command::FleetLint { config, verbose } = &args.command {
         return fleet_lint_command(config.as_deref(), *verbose).await;
+    }
+    if matches!(&args.command, Command::DaemonTriage) {
+        return daemon_triage(args.subc.as_deref(), args.json);
     }
 
     let resolved = discover_connection_file(args.subc.as_deref())
@@ -205,6 +212,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             health_detail(&mut client, &module_id, args.json).await
         }
         Command::Daemon => daemon(&mut client, args.json).await,
+        Command::DaemonTriage => unreachable!("handled before connecting"),
         Command::Quota {
             provider_id,
             verbose,
@@ -558,6 +566,7 @@ enum Command {
         module_id: String,
     },
     Daemon,
+    DaemonTriage,
     Quota {
         provider_id: Option<String>,
         verbose: bool,
@@ -1486,6 +1495,439 @@ fn scalar_text(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+fn daemon_triage(override_path: Option<&Path>, json_output: bool) -> Result<(), CkError> {
+    let candidates = connection_file_candidates(override_path);
+    let run_dir = candidates
+        .first()
+        .and_then(|path| path.parent())
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let report = collect_daemon_triage(&candidates, &run_dir);
+    if json_output {
+        print_json(&report.json)
+    } else {
+        print_daemon_triage(&report);
+        Ok(())
+    }?;
+    Err(CkError::TriageExit {
+        exit_code: report.exit_code,
+    })
+}
+
+struct TriageReport {
+    json: Value,
+    exit_code: i32,
+    text: String,
+}
+
+fn collect_daemon_triage(candidates: &[PathBuf], run_dir: &Path) -> TriageReport {
+    let mut start_locks = Vec::new();
+    for candidate in candidates {
+        let lock_path = triage_start_lock_path(candidate);
+        start_locks.push(triage_file_fact(&lock_path));
+    }
+
+    let mut connection_candidates = Vec::new();
+    let mut selected: Option<(PathBuf, Value, Option<u64>)> = None;
+    for path in candidates {
+        let mut fact = serde_json::Map::new();
+        fact.insert("path".into(), json!(path.display().to_string()));
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => {
+                fact.insert("status".into(), json!("present"));
+                fact.insert("size_bytes".into(), json!(metadata.len()));
+                fact.insert("mtime".into(), triage_mtime_fact(&metadata));
+                Some(metadata)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fact.insert("status".into(), json!("absent"));
+                fact.insert("finding".into(), json!("connection file absent"));
+                None
+            }
+            Err(error) => {
+                fact.insert("status".into(), json!("skipped"));
+                fact.insert("skipped".into(), json!(format!("stat failed: {error}")));
+                None
+            }
+        };
+        if metadata.is_some() {
+            match fs::read(path) {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(value) => {
+                        fact.insert("json".into(), json!("valid"));
+                        let fields = triage_connection_fields(&value);
+                        fact.insert("fields".into(), fields.clone());
+                        let pid = value.get("pid").and_then(Value::as_u64);
+                        if selected.is_none() {
+                            selected = Some((path.clone(), value, pid));
+                        }
+                    }
+                    Err(error) => {
+                        fact.insert("json".into(), json!("invalid"));
+                        fact.insert(
+                            "finding".into(),
+                            json!(format!("connection file JSON parse failure: {error}")),
+                        );
+                    }
+                },
+                Err(error) => {
+                    fact.insert("status".into(), json!("skipped"));
+                    fact.insert("skipped".into(), json!(format!("read failed: {error}")));
+                }
+            }
+        }
+        connection_candidates.push(Value::Object(fact));
+    }
+
+    let connection_fact = if let Some((path, value, pid)) = &selected {
+        let fields = triage_connection_fields(value);
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "candidates".into(),
+            Value::Array(connection_candidates.clone()),
+        );
+        object.insert("selected_path".into(), json!(path.display().to_string()));
+        object.insert("fields".into(), fields);
+        if let Some(port) = value
+            .get("endpoints")
+            .and_then(Value::as_array)
+            .and_then(|endpoints| endpoints.first())
+            .and_then(|endpoint| endpoint.get("port"))
+        {
+            object.insert("port".into(), port.clone());
+        }
+        if let Some(daemon_id) = value.get("daemon_id") {
+            object.insert("daemon_id".into(), daemon_id.clone());
+        }
+        if let Some(wire_version) = value.get("wire_version") {
+            object.insert("wire_version".into(), wire_version.clone());
+        }
+        if let Some(pid) = pid {
+            object.insert("pid".into(), json!(pid));
+        }
+        Value::Object(object)
+    } else {
+        json!({
+            "candidates": connection_candidates.clone(),
+            "status": "absent-or-unusable"
+        })
+    };
+
+    let effective_run_dir = selected
+        .as_ref()
+        .and_then(|(path, _, _)| path.parent())
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(run_dir);
+    let pid = selected
+        .as_ref()
+        .and_then(|(_, _, pid)| *pid)
+        .and_then(|pid| u32::try_from(pid).ok());
+    let process_fact = triage_process_fact(pid);
+    let log_path = effective_run_dir.join("subc.log");
+    let log_fact = triage_log_fact(&log_path);
+    let connection_present = selected.is_some()
+        || connection_candidates
+            .iter()
+            .any(|candidate| candidate.get("status") == Some(&json!("present")));
+    let parse_failure = connection_candidates
+        .iter()
+        .any(|candidate| candidate.get("json") == Some(&json!("invalid")));
+    let fields_complete = selected.as_ref().is_some_and(|(_, value, _)| {
+        triage_connection_fields(value)
+            .get("port")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("present"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            && triage_connection_fields(value)
+                .get("daemon_id")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("present"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && triage_connection_fields(value)
+                .get("wire_version")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("present"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    });
+    let (verdict, reason, exit_code) = if !connection_present {
+        ("daemon-appears-down", "no connection file", 2)
+    } else if parse_failure && selected.is_none() {
+        ("daemon-state-ambiguous", "connection file is malformed", 3)
+    } else if !fields_complete {
+        (
+            "daemon-state-ambiguous",
+            "connection file is missing required fields",
+            3,
+        )
+    } else if process_fact.get("status") == Some(&json!("live")) {
+        (
+            "daemon-appears-live",
+            "connection file is present and pid is alive",
+            0,
+        )
+    } else if process_fact.get("status") == Some(&json!("dead")) {
+        (
+            "daemon-state-ambiguous",
+            "fresh connection file conflicts with a dead pid",
+            3,
+        )
+    } else {
+        (
+            "daemon-state-ambiguous",
+            "pid liveness could not be established",
+            3,
+        )
+    };
+    let json_report = json!({
+        "run_dir": effective_run_dir.display().to_string(),
+        "start_lock": { "candidates": start_locks },
+        "connection_file": connection_fact,
+        "process_liveness": process_fact,
+        "log_tail": log_fact,
+        "verdict": { "status": verdict, "reason": reason }
+    });
+    let text = format!("run dir: {}\n", effective_run_dir.display());
+    TriageReport {
+        json: json_report,
+        exit_code,
+        text,
+    }
+}
+
+fn triage_connection_fields(value: &Value) -> Value {
+    let port = value
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .and_then(|endpoints| endpoints.first())
+        .and_then(|endpoint| endpoint.get("port"));
+    json!({
+        "port": { "present": port.is_some(), "value": port.cloned().unwrap_or(Value::Bool(false)) },
+        "daemon_id": { "present": value.get("daemon_id").is_some() },
+        "wire_version": { "present": value.get("wire_version").is_some() }
+    })
+}
+
+fn triage_file_fact(path: &Path) -> Value {
+    match fs::metadata(path) {
+        Ok(metadata) => json!({
+            "path": path.display().to_string(),
+            "status": "present",
+            "size_bytes": metadata.len(),
+            "mtime": triage_mtime_fact(&metadata)
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({
+            "path": path.display().to_string(), "status": "absent", "finding": "start-lock absent"
+        }),
+        Err(error) => json!({
+            "path": path.display().to_string(), "status": "skipped", "skipped": format!("stat failed: {error}")
+        }),
+    }
+}
+
+fn triage_mtime_fact(metadata: &fs::Metadata) -> Value {
+    match metadata
+        .modified()
+        .and_then(|modified| modified.elapsed().map_err(io::Error::other))
+    {
+        Ok(age) => json!({ "status": "known", "age_seconds": age.as_secs() }),
+        Err(error) => {
+            json!({ "status": "skipped", "skipped": format!("mtime age unavailable: {error}") })
+        }
+    }
+}
+
+// bootstrap.rs:801-812 derives the advisory path as <connection-file>.start-lock
+// in the connection file's parent; keep this disk-only copy aligned with that source.
+fn triage_start_lock_path(connection_file_path: &Path) -> PathBuf {
+    let file_name = connection_file_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| CONNECTION_FILE_NAME.into());
+    let parent = connection_file_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{file_name}.start-lock"))
+}
+
+fn triage_process_fact(pid: Option<u32>) -> Value {
+    let Some(pid) = pid else {
+        return json!({ "status": "skipped", "skipped": "no pid recovered from connection file or start-lock" });
+    };
+    let output = process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid=,comm="])
+        .output();
+    let Ok(output) = output else {
+        return json!({ "pid": pid, "status": "skipped", "skipped": "ps command could not be started" });
+    };
+    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        return json!({ "pid": pid, "status": "dead", "executable": { "status": "not-running" } });
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let executable = Path::new(command.split_whitespace().last().unwrap_or(&command))
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(&command);
+    json!({
+        "pid": pid,
+        "status": "live",
+        "executable": {
+            "status": if executable == EXPECTED_DAEMON_BINARY { "match" } else { "mismatch" },
+            "observed": executable,
+            "expected": EXPECTED_DAEMON_BINARY
+        }
+    })
+}
+
+fn triage_log_fact(path: &Path) -> Value {
+    let Ok(metadata) = fs::metadata(path) else {
+        return if path.exists() {
+            json!({ "path": path.display().to_string(), "status": "skipped", "skipped": "log metadata could not be read" })
+        } else {
+            json!({ "path": path.display().to_string(), "status": "absent", "finding": "log absent" })
+        };
+    };
+    if metadata.len() == 0 {
+        return json!({ "path": path.display().to_string(), "status": "empty", "finding": "log empty" });
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "status": "skipped", "skipped": format!("log open failed: {error}") })
+        }
+    };
+    let read_len = metadata.len().min(TRIAGE_LOG_MAX_BYTES);
+    if file.seek(SeekFrom::End(-(read_len as i64))).is_err() {
+        return json!({ "path": path.display().to_string(), "status": "skipped", "skipped": "log seek failed" });
+    }
+    let mut bytes = vec![0; read_len as usize];
+    if let Err(error) = file.read_exact(&mut bytes) {
+        return json!({ "path": path.display().to_string(), "status": "skipped", "skipped": format!("log read failed: {error}") });
+    }
+    let all = String::from_utf8_lossy(&bytes);
+    let lines = all.lines().collect::<Vec<_>>();
+    let tail = lines
+        .iter()
+        .rev()
+        .take(TRIAGE_LOG_TAIL_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let truncated = metadata.len() > TRIAGE_LOG_MAX_BYTES;
+    let mut fact = serde_json::Map::new();
+    fact.insert("path".into(), json!(path.display().to_string()));
+    fact.insert("status".into(), json!("present"));
+    fact.insert("lines".into(), json!(tail));
+    fact.insert("tail_lines".into(), json!(tail.len()));
+    if truncated {
+        fact.insert(
+            "summary".into(),
+            json!(format!(
+                "last {} lines (read capped at {} bytes)",
+                TRIAGE_LOG_TAIL_LINES, TRIAGE_LOG_MAX_BYTES
+            )),
+        );
+    } else {
+        fact.insert(
+            "summary".into(),
+            json!(format!("showing {} of {} lines", tail.len(), lines.len())),
+        );
+    }
+    Value::Object(fact)
+}
+
+fn print_daemon_triage(report: &TriageReport) {
+    println!("{}", report.text.trim_end());
+    let connection = &report.json["connection_file"];
+    println!("start-lock:");
+    for fact in report.json["start_lock"]["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "  {}: {}",
+            triage_string(fact.get("path")),
+            triage_string(fact.get("status"))
+        );
+        if let Some(size) = fact.get("size_bytes") {
+            println!("    size: {size} bytes");
+        }
+        if let Some(mtime) = fact.get("mtime") {
+            println!("    mtime: {mtime}");
+        }
+        if let Some(finding) = fact.get("finding").and_then(Value::as_str) {
+            println!("    finding: {finding}");
+        }
+    }
+    println!("connection-file:");
+    for fact in connection["candidates"].as_array().into_iter().flatten() {
+        println!(
+            "  {}: {}",
+            triage_string(fact.get("path")),
+            triage_string(fact.get("status"))
+        );
+        if let Some(size) = fact.get("size_bytes") {
+            println!("    size: {size} bytes");
+        }
+        if let Some(mtime) = fact.get("mtime") {
+            println!("    mtime: {mtime}");
+        }
+        if let Some(json_status) = fact.get("json") {
+            println!("    parses as JSON: {json_status}");
+        }
+        if let Some(finding) = fact.get("finding").and_then(Value::as_str) {
+            println!("    finding: {finding}");
+        }
+        if let Some(fields) = fact.get("fields") {
+            println!("    fields: {fields}");
+        }
+    }
+    if let Some(path) = connection.get("selected_path").and_then(Value::as_str) {
+        println!("  selected: {path}");
+        for field in ["port", "daemon_id", "wire_version"] {
+            if let Some(value) = connection.get(field) {
+                println!("    {field}: {value}");
+            }
+        }
+    }
+    println!("process-liveness:");
+    println!("  {}", report.json["process_liveness"]);
+    println!("log-tail:");
+    let log = &report.json["log_tail"];
+    println!(
+        "  {}: {}",
+        triage_string(log.get("path")),
+        triage_string(log.get("status"))
+    );
+    if let Some(finding) = log.get("finding").and_then(Value::as_str) {
+        println!("  finding: {finding}");
+    }
+    if let Some(summary) = log.get("summary").and_then(Value::as_str) {
+        println!("  {summary}");
+    }
+    if let Some(lines) = log.get("lines").and_then(Value::as_array) {
+        for line in lines.iter().filter_map(Value::as_str) {
+            println!("  {line}");
+        }
+    }
+    println!(
+        "verdict: {} — {}",
+        triage_string(report.json["verdict"].get("status")),
+        triage_string(report.json["verdict"].get("reason"))
+    );
+}
+
+fn triage_string(value: Option<&Value>) -> &str {
+    value.and_then(Value::as_str).unwrap_or("-")
 }
 
 async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError> {
@@ -3491,10 +3933,21 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 }
             }
         },
-        "daemon" => match tail.first() {
-            None => Ok(Command::Daemon),
-            Some(_) => Ok(Command::Help(DAEMON_HELP.into())),
-        },
+        "daemon" => {
+            if tail.is_empty() {
+                return Ok(Command::Daemon);
+            }
+            if tail
+                .iter()
+                .any(|arg| arg == "-h" || arg == "--help" || arg == "help")
+            {
+                return Ok(Command::Help(DAEMON_HELP.into()));
+            }
+            if tail.len() == 1 && tail[0] == "triage" {
+                return Ok(Command::DaemonTriage);
+            }
+            Ok(Command::Help(DAEMON_HELP.into()))
+        }
         "fleet" => {
             let Some(verb) = tail.first().map(|value| value.to_string_lossy()) else {
                 return Ok(Command::Help(FLEET_HELP.into()));
@@ -3720,6 +4173,10 @@ enum CkError {
     FleetLintExit {
         exit_code: i32,
     },
+    /// Triage prints its complete report before returning its classification.
+    TriageExit {
+        exit_code: i32,
+    },
     Json(serde_json::Error),
 }
 
@@ -3730,7 +4187,7 @@ impl CkError {
             Self::Connection { .. } => 3,
             Self::Rejected(_) | Self::Message(_) | Self::Json(_) => 1,
             Self::FleetLintConfig(_) => 2,
-            Self::FleetLintExit { exit_code } => *exit_code,
+            Self::FleetLintExit { exit_code } | Self::TriageExit { exit_code } => *exit_code,
             Self::WithFooter { error, .. } => error.exit_code(),
         }
     }
@@ -3758,7 +4215,7 @@ impl fmt::Display for CkError {
             Self::Rejected(message) => write!(f, "{message}"),
             Self::Message(message) => write!(f, "{message}"),
             Self::FleetLintConfig(message) => write!(f, "ck fleet lint: {message}"),
-            Self::FleetLintExit { .. } => Ok(()),
+            Self::FleetLintExit { .. } | Self::TriageExit { .. } => Ok(()),
             Self::Json(source) => write!(f, "json: {source}"),
             Self::WithFooter { error, footer } => {
                 write!(f, "{error}\n\nhelp[1]:\n  {footer}")
@@ -4605,5 +5062,190 @@ mod tests {
                 module_id: Some(module_id)
             } if module_id == "aft"
         ));
+    }
+
+    fn triage_fixture_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "ck-triage-{name}-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_triage_connection(path: &Path, pid: u32, key: &str) {
+        fs::write(
+            path,
+            format!(
+                r#"{{"schema":1,"wire_version":1,"endpoints":[{{"host":"127.0.0.1","port":8757}}],"key":"{key}","daemon_id":"daemon-test","pid":{pid}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_absent_everything_reports_named_findings_and_down() {
+        let dir = triage_fixture_dir("absent");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        assert_eq!(report.exit_code, 2);
+        assert_eq!(report.json["verdict"]["status"], "daemon-appears-down");
+        assert_eq!(report.json["verdict"]["reason"], "no connection file");
+        assert_eq!(
+            report.json["start_lock"]["candidates"][0]["finding"],
+            "start-lock absent"
+        );
+        assert_eq!(
+            report.json["connection_file"]["candidates"][0]["finding"],
+            "connection file absent"
+        );
+        assert_eq!(
+            report.json["process_liveness"]["skipped"],
+            "no pid recovered from connection file or start-lock"
+        );
+        assert_eq!(report.json["log_tail"]["finding"], "log absent");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_triage_command_completes_without_a_daemon() {
+        let dir = triage_fixture_dir("command-absent");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let result = run([
+            OsString::from("ck"),
+            OsString::from("daemon"),
+            OsString::from("triage"),
+            OsString::from("--subc"),
+            connection.clone().into_os_string(),
+        ])
+        .await;
+        assert!(matches!(result, Err(CkError::TriageExit { exit_code: 2 })));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_fresh_connection_with_live_own_pid_is_live() {
+        let dir = triage_fixture_dir("live");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        write_triage_connection(&connection, process::id(), "never-print-this-key");
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        assert_eq!(report.exit_code, 0);
+        assert_eq!(report.json["verdict"]["status"], "daemon-appears-live");
+        assert_eq!(report.json["process_liveness"]["status"], "live");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_fresh_connection_with_dead_pid_is_ambiguous() {
+        let dir = triage_fixture_dir("dead");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let mut child = process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        write_triage_connection(&connection, pid, "dead-key");
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        assert_eq!(report.exit_code, 3);
+        assert_eq!(report.json["verdict"]["status"], "daemon-state-ambiguous");
+        assert!(report.json["verdict"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("dead pid"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_malformed_connection_is_named_and_ambiguous() {
+        let dir = triage_fixture_dir("malformed");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        fs::write(&connection, br#"{"schema":1,"wire_version":1"#).unwrap();
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        assert_eq!(report.exit_code, 3);
+        assert_eq!(report.json["verdict"]["status"], "daemon-state-ambiguous");
+        assert!(report.json["connection_file"]["candidates"][0]["finding"]
+            .as_str()
+            .unwrap()
+            .contains("JSON parse failure"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_log_tail_is_capped_and_contains_only_the_tail() {
+        let dir = triage_fixture_dir("log");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let log = dir.join("subc.log");
+        let mut contents = String::from("oldest-line\n");
+        contents.push_str(&"x".repeat((TRIAGE_LOG_MAX_BYTES as usize) + 1024));
+        contents.push_str("\nnewest-line\n");
+        fs::write(&log, contents).unwrap();
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        let log_fact = &report.json["log_tail"];
+        assert!(log_fact["summary"]
+            .as_str()
+            .unwrap()
+            .contains("read capped"));
+        let rendered = serde_json::to_string(log_fact).unwrap();
+        assert!(rendered.contains("newest-line"));
+        assert!(!rendered.contains("oldest-line"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_json_golden_keeps_arm_fields_and_skipped_distinct() {
+        let dir = triage_fixture_dir("json");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        let object = report.json.as_object().unwrap();
+        assert_eq!(
+            object.keys().cloned().collect::<Vec<_>>(),
+            [
+                "connection_file",
+                "log_tail",
+                "process_liveness",
+                "run_dir",
+                "start_lock",
+                "verdict"
+            ]
+        );
+        assert_eq!(
+            report.json["connection_file"]["candidates"][0]["status"],
+            "absent"
+        );
+        assert_eq!(report.json["process_liveness"]["status"], "skipped");
+        assert!(report.json["process_liveness"].get("skipped").is_some());
+        assert!(report.json["connection_file"]["candidates"][0]
+            .get("skipped")
+            .is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_never_prints_connection_key_in_any_report_arm() {
+        let dir = triage_fixture_dir("key");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let key = "known-secret-key-literal";
+        write_triage_connection(&connection, process::id(), key);
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        let json_output = serde_json::to_string(&report.json).unwrap();
+        assert!(!json_output.contains(key));
+        assert!(!report.text.contains(key));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_triage_help_is_help_before_verb_execution() {
+        let command = parse_command(
+            "daemon",
+            &[OsString::from("triage"), OsString::from("--help")],
+        )
+        .unwrap();
+        assert!(matches!(command, Command::Help(text) if text.contains("daemon triage")));
     }
 }

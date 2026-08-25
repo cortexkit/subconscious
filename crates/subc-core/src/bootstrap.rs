@@ -453,8 +453,8 @@ async fn serve_bound_daemon(
             bound.connection_info.pid,
             control_started_at_ms,
             std::env::current_exe().ok(),
-            normalized_build_provenance(env!("CK_BUILD_REV")),
-            normalized_build_provenance(env!("CK_BUILD_LOCK_DIGEST")),
+            normalized_build_provenance(env!("SUBC_BUILD_GIT_SHA")),
+            normalized_build_provenance(env!("SUBC_BUILD_LOCK_DIGEST")),
         )
         .with_capability_config(
             configured_modules

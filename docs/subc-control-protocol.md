@@ -183,11 +183,11 @@ The bound exists because declared values are module-controlled and reach operato
 terminals, so the daemon limits their size and character set at its boundary.
 
 The current `subc-core` build script emits
-`CK_BUILD_REV` and `CK_BUILD_LOCK_DIGEST`; its exact grammar is:
+`SUBC_BUILD_GIT_SHA` and `SUBC_BUILD_LOCK_DIGEST`; its exact grammar is:
 
 ```text
-cargo:rustc-env=CK_BUILD_REV=<40-hex SHA, or unavailable; -dirty when the tree is dirty>
-cargo:rustc-env=CK_BUILD_LOCK_DIGEST=<SHA-256 Cargo.lock digest, or unavailable>
+cargo:rustc-env=SUBC_BUILD_GIT_SHA=<40-hex SHA, or unavailable; -dirty when the tree is dirty>
+cargo:rustc-env=SUBC_BUILD_LOCK_DIGEST=<SHA-256 Cargo.lock digest, or unavailable>
 ```
 
 `wire_crate_version` and `store_schema_version` are supplied by the SDK/build

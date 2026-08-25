@@ -824,7 +824,6 @@ pub struct Supervisor {
     supervisor_handle: Option<SupervisorHandle>,
     health: HealthConfig,
     daemon_started_at_ms: u64,
-    #[allow(dead_code)]
     provenance_probe: ExecutableIdentityProbe,
 }
 

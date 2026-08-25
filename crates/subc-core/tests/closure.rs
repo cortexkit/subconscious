@@ -408,9 +408,17 @@ async fn assert_supervisor_provenance_reads_empty_supervisor(
     match response {
         ClientControlResponse::SupervisorProvenance { daemon, modules } => {
             assert!(modules.is_empty());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             assert!(matches!(
                 daemon.daemon_observed.running_image,
-                subc_control::RunningImageAgreement::Unavailable { .. }
+                subc_control::RunningImageAgreement::Match { .. }
+            ));
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            assert!(matches!(
+                daemon.daemon_observed.running_image,
+                subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::UnsupportedPlatform
+                }
             ));
         }
         other => panic!("unexpected supervisor.provenance response: {other:?}"),

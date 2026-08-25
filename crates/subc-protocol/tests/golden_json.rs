@@ -232,6 +232,27 @@ fn manifest_provenance_rejects_non_printable_and_overlong_values() {
 }
 
 #[test]
+fn manifest_provenance_rejects_empty_values_for_every_field() {
+    for field in [
+        "build_git_sha",
+        "build_lock_digest",
+        "wire_crate_version",
+        "store_schema_version",
+    ] {
+        let mut encoded =
+            serde_json::to_value(module_hello_body_with_provenance()).expect("HELLO serializes");
+        encoded["manifest"]["provenance"][field] = Value::String(String::new());
+        let error = serde_json::from_value::<ModuleHelloBody>(encoded)
+            .expect_err("empty provenance must refuse the manifest");
+        assert!(error.to_string().contains(field), "error: {error}");
+        assert!(
+            error.to_string().contains("must not be empty"),
+            "error: {error}"
+        );
+    }
+}
+
+#[test]
 fn legacy_manifest_decoder_ignores_the_additive_provenance_block() {
     let encoded = serde_json::to_value(module_hello_body_with_provenance().manifest)
         .expect("current manifest serializes");

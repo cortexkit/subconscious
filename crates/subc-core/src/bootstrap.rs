@@ -1031,6 +1031,17 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn normalized_build_provenance_preserves_real_values() {
+        assert_eq!(normalized_build_provenance("abc"), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn normalized_build_provenance_omits_unavailable_and_empty_values() {
+        assert_eq!(normalized_build_provenance("unavailable"), None);
+        assert_eq!(normalized_build_provenance(""), None);
+    }
+
     struct EnvGuard {
         key: &'static str,
         previous: Option<OsString>,

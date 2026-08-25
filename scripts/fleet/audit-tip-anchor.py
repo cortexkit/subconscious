@@ -40,7 +40,12 @@ def main() -> int:
         return 2
     metrics = payload.get("metrics", {})
     seq = metrics.get("auditSeq")
-    mac = metrics.get("auditTipMac")
+    # The CONSUMER-IMPACT announcement named auditTipMac; the shipped d0e8709
+    # wire serves entryMac. Both accepted so the witness records while the
+    # producer rules on the canonical spelling; divergence reported to CKCRED
+    # 2026-08-25. When one name wins, delete the loser HERE so a silent
+    # re-divergence trips the absent arm instead of being absorbed.
+    mac = metrics.get("auditTipMac", metrics.get("entryMac"))
     if seq is None or mac is None:
         # Absent is a defined state, not an error: empty chain, unreadable
         # store, or a claustrum binary predating the field. Name which.

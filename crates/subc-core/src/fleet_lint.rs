@@ -536,6 +536,12 @@ mod tests {
             )
             .unwrap();
         }
+        // Windows has no executable bit; spawnability there is decided by file
+        // extension, so the flag has nothing to act on. Consumed explicitly
+        // rather than underscore-renamed: the parameter is load-bearing on unix
+        // and renaming it would misdescribe it at every call site.
+        #[cfg(not(unix))]
+        let _ = executable;
         path
     }
 

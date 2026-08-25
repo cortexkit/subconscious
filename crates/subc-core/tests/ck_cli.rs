@@ -430,6 +430,25 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_hostile_declared_values_are_refused_before_rendering() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let _module = supervisor
+        .spawn(stub_spec_with_env(
+            "aft",
+            vec![
+                ("FAKE_AFT_BUILD_COMMIT", "\u{1b}]52;c;AAAA\u{07}"),
+                ("FAKE_AFT_BUILD_LOCK_DIGEST", "\u{1b}[2J"),
+            ],
+        ))
+        .unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, "aft", |entry| {
+        entry.state == "failed" && !entry.live
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provenance_renders_unverifiable_and_lock_only_declarations() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);
@@ -808,11 +827,20 @@ async fn spawn_stub_with_env(
 }
 
 fn stub_spec(module_id: &str) -> ModuleSpec {
+    stub_spec_with_env(module_id, Vec::new())
+}
+
+fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
     ModuleSpec {
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),
-        env: vec![("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())],
+        env: std::iter::once(("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()))
+            .chain(
+                env.into_iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
+            )
+            .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
     }

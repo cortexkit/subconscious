@@ -1342,7 +1342,7 @@ async fn provenance(
         provenance_image(daemon_observed.get("running_image"))
     );
 
-    println!("MODULE: {}", display_field(module, "module_id"));
+    println!("MODULE: {}", provenance_value(module.get("module_id")));
     println!("MODULE-DECLARED");
     match module.get("module_declared") {
         Some(declared) if declared.get("status").and_then(Value::as_str) == Some("reported") => {
@@ -1392,7 +1392,13 @@ async fn provenance(
 
 fn provenance_value(value: Option<&Value>) -> String {
     match value {
-        Some(Value::String(value)) => value.clone(),
+        Some(Value::String(value)) => value
+            .bytes()
+            .map(|byte| match byte {
+                0x20..=0x7e => (byte as char).to_string(),
+                _ => format!(r"\x{byte:02x}"),
+            })
+            .collect(),
         Some(Value::Number(value)) => value.to_string(),
         Some(Value::Bool(value)) => value.to_string(),
         _ => "unavailable".to_string(),
@@ -4454,6 +4460,23 @@ mod tests {
 
     use super::*;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
+
+    #[test]
+    fn provenance_value_escapes_terminal_controls() {
+        for value in [
+            "\u{1b}]52;c;AAAA\u{07}",
+            "\u{1b}[2J",
+            "\u{07}wire",
+            "schema\u{0a}",
+        ] {
+            let value = Value::String(value.to_string());
+            let escaped = provenance_value(Some(&value));
+            assert!(!escaped.bytes().any(|byte| byte < 0x20));
+            assert!(
+                escaped.contains(r"\x1b") || escaped.contains(r"\x07") || escaped.contains(r"\x0a")
+            );
+        }
+    }
 
     #[test]
     fn dashboard_alert_line_requires_drops_in_every_window_minute() {

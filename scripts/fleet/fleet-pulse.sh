@@ -897,6 +897,24 @@ EOF
 # The header follows the file's comment-rule convention; there is no section()
 # helper in this script (the first run of this leg proved that with a
 # command-not-found that the loop survived -- fail-open on a missing header).
+# -- claustrum audit-chain external anchor (standing, per CKCRED d0e8709) --
+# verify-audit proves prefix validity only: a deleted TAIL is a shorter valid
+# chain, so truncation is invisible from inside the store. This pulse is the
+# external witness: it records the served tip (auditSeq + auditTipMac) and
+# alarms on regression or mac-divergence-at-recorded-seq (monotonicity alone
+# passes truncate-and-reappend; mac-at-seq stability is the binding check).
+# Bound stated in the checker: catches truncation persisting across a pulse,
+# blind to full repair between two pulses. Engram generations are the
+# slow-window complement.
+echo "-- claustrum audit-chain anchor"
+_tip_out=$(ck health claustrum --json 2>/dev/null | python3 "$SUBCONSCIOUS_DIR/scripts/fleet/audit-tip-anchor.py" 2>&1)
+_tip_rc=$?
+if [ $_tip_rc -eq 3 ]; then
+  echo "  *** $_tip_out"
+else
+  echo "  $_tip_out"
+fi
+
 # -- sibling committed-lock staleness (standing, per E2E nightly 2026-08-25) --
 # A version bump in subconscious or commons re-stales every dependent sibling's
 # committed Cargo.lock with no change in that sibling's repo and no signal to

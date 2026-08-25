@@ -3570,6 +3570,14 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
 impl Shared {
     /// Stamp after holding the same state lock that guards generation changes, so a
     /// late frame from an older reader can never vouch for a newly installed socket.
+    ///
+    /// PLACEMENT IS LOAD-BEARING: the single caller sits on the frame-read
+    /// return, the one point every inbound frame passes before demux -- which
+    /// is why one stamp suffices. A future fast path or drain-and-dispatch
+    /// refactor that hands frames onward without crossing that point makes the
+    /// stamp skippable, and the liveness watermark quietly stops meaning "the
+    /// link delivered bytes": the cheapest correctness property in this file
+    /// and the easiest to lose in a refactor.
     fn record_inbound_if_current(&self, generation: u64) -> bool {
         let inner = self.lock_inner();
         if inner.closed || inner.generation != generation || inner.writer.is_none() {

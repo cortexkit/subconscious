@@ -92,7 +92,7 @@ pub struct CapabilityDeclarations {
     pub must_never_reach: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_git_sha: Option<String>,
@@ -102,6 +102,98 @@ pub struct ManifestProvenance {
     pub wire_crate_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_schema_version: Option<String>,
+}
+
+const MAX_PROVENANCE_VALUE_BYTES: usize = 128;
+
+#[derive(Deserialize)]
+struct ManifestProvenanceWire {
+    #[serde(default)]
+    build_git_sha: Option<String>,
+    #[serde(default)]
+    build_lock_digest: Option<String>,
+    #[serde(default)]
+    wire_crate_version: Option<String>,
+    #[serde(default)]
+    store_schema_version: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ManifestProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ManifestProvenanceWire::deserialize(deserializer)?;
+        let provenance = Self {
+            build_git_sha: wire.build_git_sha,
+            build_lock_digest: wire.build_lock_digest,
+            wire_crate_version: wire.wire_crate_version,
+            store_schema_version: wire.store_schema_version,
+        };
+        provenance.validate().map_err(D::Error::custom)?;
+        Ok(provenance)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestProvenanceError {
+    field: String,
+    value: String,
+    reason: &'static str,
+}
+
+impl ManifestProvenanceError {
+    fn new(field: &str, value: &str, reason: &'static str) -> Self {
+        Self {
+            field: field.to_string(),
+            value: safe_error_value(value),
+            reason,
+        }
+    }
+
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+}
+
+impl fmt::Display for ManifestProvenanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid manifest provenance: field {} has {} (value {:?})",
+            self.field, self.reason, self.value
+        )
+    }
+}
+
+impl std::error::Error for ManifestProvenanceError {}
+
+impl ManifestProvenance {
+    pub fn validate(&self) -> Result<(), ManifestProvenanceError> {
+        for (field, value) in [
+            ("build_git_sha", self.build_git_sha.as_deref()),
+            ("build_lock_digest", self.build_lock_digest.as_deref()),
+            ("wire_crate_version", self.wire_crate_version.as_deref()),
+            ("store_schema_version", self.store_schema_version.as_deref()),
+        ] {
+            let Some(value) = value else { continue };
+            if value.len() > MAX_PROVENANCE_VALUE_BYTES {
+                return Err(ManifestProvenanceError::new(
+                    field,
+                    value,
+                    "exceeds the 128-byte maximum",
+                ));
+            }
+            if value.bytes().any(|byte| !(0x20..=0x7e).contains(&byte)) {
+                return Err(ManifestProvenanceError::new(
+                    field,
+                    value,
+                    "contains non-printable ASCII",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One capability a module consumes and whether its absence is tolerated.

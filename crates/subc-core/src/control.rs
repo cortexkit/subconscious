@@ -18,8 +18,8 @@ use subc_control::{
 use subc_protocol::{
     error_codes,
     manifest::{
-        validate_hello_capability_grammar, CapabilityDeclarations, Concurrency, ModuleManifest,
-        ProviderRole,
+        validate_hello_capability_grammar, CapabilityDeclarations, Concurrency, ManifestProvenance,
+        ModuleManifest, ProviderRole,
     },
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -953,6 +953,18 @@ impl ControlHandler {
                 "invalid_capability_grammar",
                 err.to_string(),
             )?]);
+        }
+        if let Some(provenance) = hello_value
+            .get("manifest")
+            .and_then(|manifest| manifest.get("provenance"))
+        {
+            if let Err(err) = serde_json::from_value::<ManifestProvenance>(provenance.clone()) {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_manifest",
+                    format!("malformed manifest provenance: {err}"),
+                )?]);
+            }
         }
         let hello = match serde_json::from_value::<ModuleHelloBody>(hello_value) {
             Ok(hello) => hello,

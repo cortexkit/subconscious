@@ -290,3 +290,38 @@ per Health-Path-Rule v3.
 Golden vectors for the events facade (subscribe refusals, list/ack shapes,
 gap rows, health fields), pinned at both ends per the cross-repo payload
 rule, landing once ALF's consumer code exists to pin against.
+
+## Addendum: `deliver_to` delivery routing (shipped 2026-08-25, written from producer-real shapes)
+
+Multi-repo ownership broke the one-repo-one-agent assumption: a repo with no
+resident agent (commons) had observation but no delivery target, and its
+events surfaced only as unowned digest residue (measured: 22h unseen on an
+outside contributor's items). The fix is subscription-level routing metadata,
+shipped in plexus v22 (`2f1cac2`) and stamped on the first live rows the same
+week.
+
+Contract, from the shipped wire (field names are the producer's, not a
+paraphrase):
+
+- `deliver_to` (optional, registry agent **id**, e.g. `agent_2bfd6927602f7977`):
+  resolved from agent name at SET time and frozen as the id — names drift,
+  ids do not. Validation outcomes at set time are three-way: mistyped
+  (`deliver_to_agent_unknown`), retired (`deliver_to_agent_retired` — ALF's
+  registry serves retired ids as a positive "gone", distinct from unknown),
+  and resolver fault (typed, retryable, never fail-open).
+- Precedence: **`deliver_to` wins for delivery routing when present;
+  `project_id` remains attribution and the delivery fallback.** A row may
+  honestly carry `project_id: null` when the repo is owned rather than
+  project-resident.
+- Settable on existing subscriptions without touching cursor watermarks
+  (retrofit is cheap and does not replay history).
+- Consumer half (prefrontal): the routing ladder reads `deliver_to` first;
+  unowned residue renders with repo prefixes so what remains unrouted is
+  legible at a glance.
+
+Producer-real specimen (events `op=list`, `conn-github`, first live stamped
+row — quoted verbatim so the addendum cannot drift from the wire):
+
+```json
+{"action":"list_issues","actor_source":{"action":"issue_read","connection_id":"conn-github-comments","methods":["get_comments"]},"authority_expires_at_ms":null,"authority_state":"live","cadence_s":300,"connection_id":"conn-github","cursor_kind":"ordered_timestamp","cursor_state":{"watermark_id":"16","watermark_ms":1787552797000,"window_ms":60000},"deliver_to":"agent_2bfd6927602f7977","fixed_args":{"repo":"commons"},"project_id":null}
+```

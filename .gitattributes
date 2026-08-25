@@ -1,0 +1,15 @@
+# Golden vectors and conformance fixtures are CONTENT, not text: several suites
+# byte-compare them against generator output or producer-recorded digests, and
+# git's checkout EOL normalization on Windows rewrites LF to CRLF, failing those
+# comparisons with byte-identical-looking diffs (third incident: agent-token
+# vectors, adapter vendored fixtures, then PR #61's wire vectors). Marking the
+# directories rather than waiting for each suite to adopt byte comparison and
+# rediscover the trap. Parse-based consumers are unaffected either way.
+clients/store/tests/golden/** -text
+clients/subc-client-swift/Tests/SubcClientTests/Fixtures/** -text
+clients/subc-client-swift/Tests/SubcFedTests/Fixtures/** -text
+crates/subc-control/tests/golden/** -text
+crates/subc-core/tests/golden/** -text
+crates/subc-protocol/tests/golden/** -text
+crates/subc-transport/tests/golden/** -text
+docs/team-mode/fixtures/** -text

@@ -50,7 +50,8 @@ const FLAG_PRIORITY_SHIFT = 1;
 const FLAG_LAST = 0b0000_1000;
 const FLAG_ADMISSION_MASK = 0b0011_0000;
 const FLAG_ADMISSION_SHIFT = 4;
-const FLAG_RESERVED_MASK = 0b1100_0000;
+export const DAEMON_ORIGIN_FLAG = 0x40;
+const FLAG_RESERVED_MASK = 0b1000_0000;
 
 /** Build flags from typed components. Admission defaults to NORMAL. */
 export function buildFlags(
@@ -69,6 +70,10 @@ export function buildFlags(
 
 export function admissionClass(flags: number): AdmissionClass {
   return ((flags & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT) as AdmissionClass;
+}
+
+export function hasDaemonOrigin(flags: number): boolean {
+  return (flags & DAEMON_ORIGIN_FLAG) !== 0;
 }
 
 export interface EnvelopeHeader {

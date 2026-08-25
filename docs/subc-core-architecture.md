@@ -235,17 +235,18 @@ Tagged union on `role`. A module lists as many as it plays.
 
 ### 4.8 The wire envelope & versioning
 
-The frame that carries every message in §4.1–4.7 on the local subc↔module leg: a **fixed 17-byte little-endian header**, then the body. subc makes every routing and scheduling decision from the header alone and **splices the body without parsing it**.
+The frame that carries every message in §4.1–4.7 on the local subc↔module leg: a **fixed 21-byte little-endian header**, then the body. subc makes every routing and scheduling decision from the header alone and **splices the body without parsing it**.
 
 ```
  offset  size  field     type    purpose
    0      4    len       u32     # of BODY bytes after this header (4 GiB frame cap; large data streams via the bulk lane)
    4      1    ver       u8      envelope version
    5      1    type      u8      REQUEST/RESPONSE/PUSH/STREAM_DATA/STREAM_END/ERROR/CANCEL/PING/PONG/HELLO/HELLO_ACK/GOODBYE
-   6      1    flags     u8      bit0 BINARY (bulk-lane raw body) · bits1-2 PRIORITY (passive/interactive/background) · bit3 LAST (stream-final) · 4-7 reserved
+  6      1    flags     u8      bit0 BINARY (bulk-lane raw body) · bits1-2 PRIORITY (passive/interactive/background) · bit3 LAST (stream-final) · bits4-5 ADMISSION · bit6 DAEMON_ORIGIN · bit7 reserved
     7      2    channel   u16     route handle; bound at route.open, rewritten per-hop (client-local ↔ module-local, §4.9); 0 = subc control plane
-   9      8    corr      u64     correlation id; CANCEL carries the target call's corr
-  17 → body
+    9      4    epoch     u32     per-slot binding epoch; 0 on channel 0
+   13      8    corr      u64     correlation id; CANCEL carries the target call's corr
+   21 → body
 ```
 
 `CANCEL`/`PING`/`PONG`/`GOODBYE` are pure-header frames (`len = 0`); only `HELLO`/`HELLO_ACK` and RPC payloads carry bodies. Endianness little-endian (same-machine, native, no byte-swap on the hot path); `len` counts body bytes after the header.
@@ -261,7 +262,7 @@ The frame that carries every message in §4.1–4.7 on the local subc↔module l
 So any reader of any version can always: read 5 bytes → learn `ver` → look up that version's header length → read the rest → splice `len` body bytes. Corollary: `len` stays u32 forever (large payloads stream via the bulk lane, not as one giant frame).
 
 **Two tiers of extension:**
-- **Small additions — no bump:** new `type` values (~12 of 256 used) and new `flags` bits (4 reserved) are already accommodated.
+- **Small additions — no bump:** new `type` values (~12 of 256 used) and the allocated `DAEMON_ORIGIN` flag bit are already accommodated; bit 7 remains reserved for the next allocation.
 - **Structural changes — bump `ver`:** new or resized fields (e.g. `channel` u16 → u32 = a 19-byte v2 header). Old peers negotiate down; v2-capable peers use v2.
 
 **Transport is a separate, independently swappable layer.** Moving the local leg to HTTP/2 later (or the remote leg to HTTP/TLS) is negotiated at connection setup and does not touch envelope versioning — the body is transport-agnostic. Two independent evolution axes: the envelope via `ver` + frozen-prefix, the transport via connection negotiation.
@@ -397,4 +398,4 @@ Genuinely open (all later-plane / cross-team, none blocking v1 tool-plane):
 3. **Session/message-data owner** (mgmt plane) — what serves the dashboard's session/message view in a harness-agnostic, remote world (pending MC-Alfonso).
 4. **Route-channel tool-call contract + structured-result→MCP `content[]` mapping** (subc-mcp↔provider) — the opaque body shape the MCP gateway sends providers, and how AFT's structured/text results map onto MCP `content[]`. v1 = `{name, arguments, progress_token?}` → `{content:[{type:"text",text}], isError}` (single text block + isError); co-signed with AFT at their attach wiring (some AFT surfaces — search/inspect/callgraph — already emit agent-facing text; edit/read are JSON → decide single-block vs summary+data split per-surface against real shapes).
 
-**Resolved since (were open forks):** framing → locked 17-byte length-prefix envelope (§4.8); single-process-vs-per-root → **single AFT process**, singleton module (§2.1, §4.9); AFT concurrency-refactor shape → in-process `ProjectActor` extraction (Leg 1) + `RefCell`→`Arc` (Leg 2), sized by AFT's substrate inventory v3 (§6.2/§6.4); **channel-0 control protocol** → v0.4 direction-split tagged enums, `subc-control` (client wire) vs `subc-protocol` (module wire) crate split, multi-provider `route.open{RouteTarget}` routing, capability negotiation, `supervisor.*` ([`docs/subc-control-protocol.md`](./subc-control-protocol.md), AFT co-signed); **`cortexkit-paths` repo home** → published from the `cortexkit/commons` monorepo, consumed by subc + AFT as a pinned crates.io dep; **cross-machine topology** → subc↔subc **federation** (every machine runs its own subc + local modules loopback-only; WAN quarantined to a future subc-supervised InterSUBC module), not scattered remote modules.
+**Resolved since (were open forks):** framing → locked 21-byte length-prefix envelope (§4.8); single-process-vs-per-root → **single AFT process**, singleton module (§2.1, §4.9); AFT concurrency-refactor shape → in-process `ProjectActor` extraction (Leg 1) + `RefCell`→`Arc` (Leg 2), sized by AFT's substrate inventory v3 (§6.2/§6.4); **channel-0 control protocol** → v0.4 direction-split tagged enums, `subc-control` (client wire) vs `subc-protocol` (module wire) crate split, multi-provider `route.open{RouteTarget}` routing, capability negotiation, `supervisor.*` ([`docs/subc-control-protocol.md`](./subc-control-protocol.md), AFT co-signed); **`cortexkit-paths` repo home** → published from the `cortexkit/commons` monorepo, consumed by subc + AFT as a pinned crates.io dep; **cross-machine topology** → subc↔subc **federation** (every machine runs its own subc + local modules loopback-only; WAN quarantined to a future subc-supervised InterSUBC module), not scattered remote modules.

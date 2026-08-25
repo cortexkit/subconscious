@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use subc_core::{
@@ -146,7 +146,19 @@ async fn start_test_daemon_inner(
     let connected_clients = ConnectedClients::new();
     let mut handler = ControlHandler::new(Arc::clone(&registry))
         .with_connected_clients(connected_clients.clone())
-        .with_route_bind_relay_timeouts(per_module_bind_timeouts);
+        .with_route_bind_relay_timeouts(per_module_bind_timeouts)
+        .with_daemon_provenance(
+            conn.pid,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            std::env::current_exe().ok(),
+            Some("test-daemon-build".to_string()),
+            Some("test-daemon-lock".to_string()),
+        );
     if let Some(process_liveness) = process_liveness {
         handler = handler.with_process_liveness(process_liveness);
     }

@@ -897,6 +897,34 @@ EOF
 # The header follows the file's comment-rule convention; there is no section()
 # helper in this script (the first run of this leg proved that with a
 # command-not-found that the loop survived -- fail-open on a missing header).
+# -- sibling committed-lock staleness (standing, per E2E nightly 2026-08-25) --
+# A version bump in subconscious or commons re-stales every dependent sibling's
+# committed Cargo.lock with no change in that sibling's repo and no signal to
+# its owner; discovery previously happened a night later through E2E's floating
+# gate. The check is read-only and owner-directed; this pulse line converts
+# night-later discovery into next-pulse discovery. Runs the existing checker so
+# there is exactly one implementation to trust.
+echo "-- sibling committed locks (subconscious/commons bumps re-stale dependents)"
+if [ -x "$SUBCONSCIOUS_DIR/scripts/fleet/check-sibling-locks.sh" ]; then
+  _lock_out=$("$SUBCONSCIOUS_DIR/scripts/fleet/check-sibling-locks.sh" 2>&1) || true
+  # Three verdict states, all counted: OK, STALE (committed lock does not
+  # resolve), DIRTY (working-tree lock differs from committed -- an unlocked
+  # command already repaired it locally, which is the mask-that-gets-stronger
+  # case and MORE urgent than STALE, not less). Missing DIRTY here undercounted
+  # examined AND hid the worst rows; caught by driving this section against the
+  # live fleet before committing it.
+  _lock_examined=$(printf '%s\n' "$_lock_out" | grep -cE '^(OK|STALE|DIRTY)' || true)
+  if [ "${_lock_examined:-0}" -lt 1 ]; then
+    echo "  LOCK CHECK BROKEN: checker examined 0 repos (instrument, not cleanliness)"
+  else
+    printf '%s\n' "$_lock_out" | grep -E '^(STALE|DIRTY)' | sed 's/^/  /'
+    _lock_bad=$(printf '%s\n' "$_lock_out" | grep -cE '^(STALE|DIRTY)' || true)
+    echo "  locks: $_lock_bad stale-or-dirty of $_lock_examined examined"
+  fi
+else
+  echo "  LOCK CHECK MISSING: check-sibling-locks.sh not found or not executable"
+fi
+
 # -- hand-rolled subc client census (standing, per ASTRO 2026-08-22) --
 # SDK-level transport fixes (subc-client-rs) do NOT reach modules that consume
 # subc-transport/protocol directly with hand-rolled frame loops; nothing in a

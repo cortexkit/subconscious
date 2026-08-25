@@ -174,7 +174,15 @@ pub struct ManifestProvenance {
 }
 ```
 
-Each field is independently optional. The current `subc-core` build script emits
+Each field is independently optional. When present, each value must be non-empty,
+at most 128 bytes, and printable ASCII (`0x20`–`0x7e`). A manifest that violates any
+of these rules is refused at HELLO with `invalid_manifest`; the module does not
+register. An absent `provenance` block is different: it is valid, registration
+proceeds normally, and the response reports `module_declared.status = unverifiable`.
+The bound exists because declared values are module-controlled and reach operator
+terminals, so the daemon limits their size and character set at its boundary.
+
+The current `subc-core` build script emits
 `CK_BUILD_REV` and `CK_BUILD_LOCK_DIGEST`; its exact grammar is:
 
 ```text
@@ -222,9 +230,10 @@ cache retains up to 64 file identities (device, inode, size, and modification ti
 when it reaches 64 entries it is cleared.
 
 `ck provenance <module>` prints source labels in human output. `ck --json provenance
-<module>` prints the typed response without merging or relabeling fields. This surface
-deliberately excludes `origin_delta`, `buildable_at_head`, deploy, git, and network
-logic.
+<module>` prints the typed response without merging or relabeling fields. Non-printable
+bytes in a malformed declared value are escaped in diagnostics rather than emitted
+raw. This surface deliberately excludes `origin_delta`, `buildable_at_head`, deploy,
+git, and network logic.
 
 #[derive(Serialize, Deserialize)] #[serde(tag = "op")]   // NOT deny_unknown_fields
 pub enum ModuleControlPush {

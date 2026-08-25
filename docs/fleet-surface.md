@@ -33,10 +33,35 @@ The router. State-free by design; these ops are served by the daemon directly.
 - `supervisor.reload` / `supervisor.set_enabled` [m]: config reload; enable/disable (re-enable resets restart budget).
 - `supervisor.rescan` [m]: reconcile module set against config; `--dry-run` preview; refuses absent config.
 - `supervisor.health` [q] / `supervisor.health_probe` [m]: cached health snapshots / fresh one-shot probe.
+- `supervisor.provenance` [q]: daemon build/process facts beside each module's separately declared build facts; accepts an optional exact module filter.
 - `supervisor.routes` [q]: live route census — who holds routes to what, attested principals, ages, drain reasons.
 - `supervisor.stderr_tail` [q]: bounded per-module stderr ring with restart boundaries.
 - `supervisor.terminals` [q]: bounded per-module exit history (codes, signals, dispositions); readable even when the module's supervision task is wedged.
 - Channel-0 pushes: `route.closing` / `route.closed` (drain lifecycle, terminal flag).
+
+### Provenance reads
+
+`supervisor.provenance` has two source-separated layers. `daemon` contains the
+daemon's embedded build identity (`build_git_sha`, `build_lock_digest`) and its own
+pid, start time, and running-image evidence. Each module entry contains
+`module_declared`, copied from the module's optional HELLO manifest block, and
+`daemon_observed`, captured by the supervisor at spawn and read from the running
+process. A missing manifest block is `unverifiable`; it is not an empty build claim.
+
+The module declaration may contain `build_git_sha`, `build_lock_digest`,
+`wire_crate_version`, and `store_schema_version`. The daemon never promotes those
+values into its observed layer. `supervisor.provenance {}` reads the whole box;
+`supervisor.provenance { module_id }` reads one module.
+
+On Linux, running-image evidence is SHA-256 over open handles for `/proc/<pid>/exe`
+and the captured spawn path. On macOS it is a spawn-inode comparison only, weaker
+than a hash by design. Unsupported platforms return a typed unavailable result, not
+a placeholder digest. Linux digesting is a cold read on the first observation; a
+bounded process-local cache holds 64 file identities and clears when full.
+
+`ck provenance <module>` preserves these source labels in human output. With `--json`
+it emits the typed response unchanged. This surface does not implement `origin_delta`,
+`buildable_at_head`, deploy, git, or network logic.
 
 ## aft — agent tool substrate (21 tools)
 

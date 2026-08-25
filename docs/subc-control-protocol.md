@@ -94,9 +94,14 @@ pub enum ClientControlRequest {
     #[serde(rename = "supervisor.restart")]     SupervisorRestart { module_id: String },
     #[serde(rename = "supervisor.reload")]      SupervisorReload { module_id: String }, // drain-to-quiescence hot-swap
     #[serde(rename = "supervisor.rescan")]      SupervisorRescan {}, // reconcile module keys/specs from disk
+    #[serde(rename = "supervisor.release_reserved")] SupervisorReleaseReserved { module_id: String },
     #[serde(rename = "supervisor.set_enabled")] SupervisorSetEnabled { module_id: String, enabled: bool },
     #[serde(rename = "supervisor.health_probe")]SupervisorHealthProbe { module_id: String },
     #[serde(rename = "supervisor.health")]      SupervisorHealth {},
+    #[serde(rename = "supervisor.routes")]      SupervisorRoutes { module_id: Option<String> },
+    #[serde(rename = "supervisor.provenance")]  SupervisorProvenance { module_id: Option<String> },
+    #[serde(rename = "supervisor.stderr_tail")] SupervisorStderrTail { module_id: String, max_lines: Option<u32>, max_bytes: Option<u32> },
+    #[serde(rename = "supervisor.terminals")]   SupervisorTerminals { module_id: String },
     // FUTURE (additive): config.* (raw-tier get/put/changed)
 }
 
@@ -110,6 +115,12 @@ pub enum ClientControlResponse {
     #[serde(rename = "supervisor.list")] SupervisorList { generation: u64, modules: Vec<SupervisorEntry> },
     #[serde(rename = "supervisor.ack")]  SupervisorAck { module_id: String, applied: bool },
     #[serde(rename = "supervisor.rescan")] SupervisorRescan { #[serde(flatten)] result: SupervisorRescanResult },
+    #[serde(rename = "supervisor.health_probe")] SupervisorHealthProbe { module_id: String, status: HealthStatus, detail: Option<String>, metrics: Option<Value> },
+    #[serde(rename = "supervisor.health")] SupervisorHealth { generation: u64, modules: Vec<SupervisorHealthEntry> },
+    #[serde(rename = "supervisor.routes")] SupervisorRoutes { modules: Vec<SupervisorRouteModule> },
+    #[serde(rename = "supervisor.provenance")] SupervisorProvenance { daemon: SupervisorDaemonProvenance, modules: Vec<SupervisorModuleProvenance> },
+    #[serde(rename = "supervisor.stderr_tail")] SupervisorStderrTail { module_id: String, #[serde(flatten)] tail: StderrTail },
+    #[serde(rename = "supervisor.terminals")] SupervisorTerminals { module_id: String, #[serde(flatten)] terminals: TerminalHistory },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -144,6 +155,77 @@ pub struct ModuleHelloBody {
     pub protocol_ver: u8,
     pub control_ops: Option<Vec<String>>,  // None = legacy baseline ONLY (never "all"); Some([])=no optional; Some([..])=exactly those
 }
+
+`ModuleManifest.provenance` is optional. It is a module declaration, not a daemon
+observation:
+
+```rust
+pub struct ModuleManifest {
+    // ...required manifest fields...
+    pub capabilities: Option<CapabilityDeclarations>,
+    pub provenance: Option<ManifestProvenance>,
+}
+
+pub struct ManifestProvenance {
+    pub build_git_sha: Option<String>,
+    pub build_lock_digest: Option<String>,
+    pub wire_crate_version: Option<String>,
+    pub store_schema_version: Option<String>,
+}
+```
+
+Each field is independently optional. The current `subc-core` build script emits
+`CK_BUILD_REV` and `CK_BUILD_LOCK_DIGEST`; its exact grammar is:
+
+```text
+cargo:rustc-env=CK_BUILD_REV=<40-hex SHA, or unavailable; -dirty when the tree is dirty>
+cargo:rustc-env=CK_BUILD_LOCK_DIGEST=<SHA-256 Cargo.lock digest, or unavailable>
+```
+
+`wire_crate_version` and `store_schema_version` are supplied by the SDK/build
+integration, not by `subc-core/build.rs`.
+
+Old daemons ignore this additive optional block while decoding HELLO, so an absent or
+present block remains HELLO-compatible. Rust consumers that construct `ModuleManifest`
+with a struct literal are different: they must add `provenance: None` (or a value), or
+the path-dependency consumer can fail with a missing-field compile error after the
+protocol bump.
+
+The client request is `supervisor.provenance { module_id: Option<String> }`. The
+response keeps sources separate:
+
+```rust
+pub struct SupervisorModuleProvenance {
+    pub module_id: String,
+    pub module_declared: ModuleDeclaredProvenance,
+    pub daemon_observed: SupervisorObservedProcess,
+}
+```
+
+`module_declared` is `reported { build: ManifestProvenance }` or `unverifiable` when
+HELLO omitted the block. `daemon_observed` contains pid, spawn time, exact
+spawned-from path, and the running-image agreement. The response's `daemon` member
+contains the daemon's own build identity and observed process facts. A module claim
+never becomes a daemon-attested fact.
+
+Running-image evidence has three platform paths:
+
+* Linux opens `/proc/<pid>/exe` and the captured spawn path, then compares SHA-256
+  digests. Open handles make path replacement visible as a mismatch.
+* macOS compares the spawn-time device/inode with the current path's device/inode.
+  This is comparison-only and weaker than a hash. That is deliberate.
+* Other platforms return typed `unavailable { reason: "unsupported_platform" }`, never
+  a placeholder digest.
+
+The first Linux observation is a cold read of both executable files. A process-local
+cache retains up to 64 file identities (device, inode, size, and modification time);
+when it reaches 64 entries it is cleared.
+
+`ck provenance <module>` prints source labels in human output. `ck --json provenance
+<module>` prints the typed response without merging or relabeling fields. This surface
+deliberately excludes `origin_delta`, `buildable_at_head`, deploy, git, and network
+logic.
+
 #[derive(Serialize, Deserialize)] #[serde(tag = "op")]   // NOT deny_unknown_fields
 pub enum ModuleControlPush {
     #[serde(rename = "route.status")] RouteStatus { route_channel: u16, status: String }, // opaque, cached verbatim

@@ -177,6 +177,13 @@ impl ManifestProvenance {
             ("store_schema_version", self.store_schema_version.as_deref()),
         ] {
             let Some(value) = value else { continue };
+            if value.is_empty() {
+                return Err(ManifestProvenanceError::new(
+                    field,
+                    value,
+                    "must not be empty",
+                ));
+            }
             if value.len() > MAX_PROVENANCE_VALUE_BYTES {
                 return Err(ManifestProvenanceError::new(
                     field,

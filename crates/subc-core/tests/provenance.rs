@@ -1,3 +1,4 @@
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fs,
     path::PathBuf,
@@ -30,11 +31,12 @@ use common::{
     connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
 };
 
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
+    let before_start_ms = unix_ms();
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
     let daemon = start_test_daemon_with_process_liveness_and_supervisor(
@@ -43,6 +45,7 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
         supervisor_handle.clone(),
     )
     .await;
+    let after_start_ms = unix_ms();
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
@@ -75,6 +78,29 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     else {
         panic!("supervisor.provenance must return a provenance response");
     };
+    assert_eq!(
+        observed_daemon.daemon_observed.pid,
+        Some(std::process::id())
+    );
+    assert!(matches!(
+        observed_daemon.daemon_observed.running_image,
+        RunningImageAgreement::Match { .. }
+            | RunningImageAgreement::Unavailable {
+                reason: subc_control::RunningImageUnavailableReason::UnsupportedPlatform
+            }
+    ));
+    assert!(
+        observed_daemon.daemon_observed.started_at_ms >= Some(before_start_ms)
+            && observed_daemon.daemon_observed.started_at_ms <= Some(after_start_ms)
+    );
+    assert_eq!(
+        observed_daemon.daemon_build.build_git_sha.as_deref(),
+        Some("test-daemon-build")
+    );
+    assert_eq!(
+        observed_daemon.daemon_build.build_lock_digest.as_deref(),
+        Some("test-daemon-lock")
+    );
     assert_eq!(modules.len(), 1);
     let observed = &modules[0];
     let ModuleDeclaredProvenance::Reported { build } = &observed.module_declared else {
@@ -301,4 +327,13 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
 }

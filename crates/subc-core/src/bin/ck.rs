@@ -1600,7 +1600,21 @@ fn collect_daemon_triage(candidates: &[PathBuf], run_dir: &Path) -> TriageReport
             object.insert("port".into(), port.clone());
         }
         if let Some(daemon_id) = value.get("daemon_id") {
-            object.insert("daemon_id".into(), daemon_id.clone());
+            // The connection file stores daemon_id as a JSON byte array; render
+            // it as hex so the identity is comparable against log lines and
+            // other surfaces instead of appearing as a raw number list.
+            let rendered = daemon_id
+                .as_array()
+                .map(|bytes| {
+                    bytes
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                })
+                .map(Value::from)
+                .unwrap_or_else(|| daemon_id.clone());
+            object.insert("daemon_id".into(), rendered);
         }
         if let Some(wire_version) = value.get("wire_version") {
             object.insert("wire_version".into(), wire_version.clone());

@@ -488,6 +488,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        process::Command,
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -524,25 +525,89 @@ mod tests {
         }
     }
 
-    fn write_script(temp: &TempDir, name: &str, body: &str, executable: bool) -> PathBuf {
-        let path = temp.path().join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[derive(serde::Serialize)]
+    struct FixtureSpec {
+        stdout: String,
+        exit_code: i32,
+        sleep_ms: u64,
+        #[serde(skip)]
+        executable: bool,
+    }
+
+    impl Default for FixtureSpec {
+        fn default() -> Self {
+            Self {
+                stdout: String::new(),
+                exit_code: 0,
+                sleep_ms: 0,
+                executable: true,
+            }
+        }
+    }
+
+    /// Mirrors `control.rs::fake_aft_stub_path`: library tests have no
+    /// `CARGO_BIN_EXE_*`, so the stub is the sibling two directories above the
+    /// test executable. Keep the existence panic and its remedy: `--lib` does
+    /// not build this binary, while `cargo test -p subc-core` does.
+    fn fake_aft_stub_path() -> PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe available in tests");
+        path.pop(); // .../deps/
+        path.pop(); // .../<profile>/
+        path.push(if cfg!(windows) {
+            "fake-aft-stub.exe"
+        } else {
+            "fake-aft-stub"
+        });
+        assert!(
+            path.exists(),
+            "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds [[bin]] targets) rather than `cargo test -p subc-core --lib` (which does not)",
+            path.display()
+        );
+        path
+    }
+
+    fn write_fixture_program(temp: &TempDir, name: &str, fixture: FixtureSpec) -> PathBuf {
+        let filename = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        };
+        let path = temp.path().join(filename);
+        fs::copy(fake_aft_stub_path(), &path).unwrap();
+
+        // Per-temp-dir sidecars keep parallel tests isolated without environment
+        // variables, which are process-global in this multi-threaded test binary.
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".fixture.json");
+        fs::write(
+            PathBuf::from(sidecar),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(
                 &path,
-                fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+                fs::Permissions::from_mode(if fixture.executable { 0o755 } else { 0o644 }),
             )
             .unwrap();
         }
-        // Windows has no executable bit; spawnability there is decided by file
-        // extension, so the flag has nothing to act on. Consumed explicitly
-        // rather than underscore-renamed: the parameter is load-bearing on unix
-        // and renaming it would misdescribe it at every call site.
+        // Windows has no executable bit. The copied `.exe` is spawnable there,
+        // so this flag only changes the unix permission check.
         #[cfg(not(unix))]
-        let _ = executable;
+        let _ = fixture.executable;
         path
+    }
+
+    #[test]
+    fn fixture_sidecar_absent_preserves_existing_stub_behavior() {
+        let output = Command::new(fake_aft_stub_path())
+            .env("FAKE_AFT_EXIT_CODE", "17")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(17));
     }
 
     fn manifest(module_id: &str, capabilities: Value, protocol_ver: u8) -> String {
@@ -564,13 +629,15 @@ mod tests {
         .to_string()
     }
 
-    fn manifest_script(temp: &TempDir, module_id: &str, capabilities: Value) -> PathBuf {
+    fn manifest_fixture(temp: &TempDir, module_id: &str, capabilities: Value) -> PathBuf {
         let document = manifest(module_id, capabilities, PROTOCOL_VERSION);
-        write_script(
+        write_fixture_program(
             temp,
             module_id,
-            &format!("printf '%s\\n' '{document}'"),
-            true,
+            FixtureSpec {
+                stdout: document,
+                ..FixtureSpec::default()
+            },
         )
     }
 
@@ -625,18 +692,39 @@ mod tests {
     #[tokio::test]
     async fn fixture_program_not_executable_classifies_operational_failure() {
         let temp = TempDir::new("program-not-executable");
-        let script = write_script(&temp, "not-executable", "exit 0", false);
+        let script = write_fixture_program(
+            &temp,
+            "not-executable",
+            FixtureSpec {
+                executable: false,
+                ..FixtureSpec::default()
+            },
+        );
         let config = write_config(&temp, vec![("not-executable", &script, true)], json!({}));
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
+        #[cfg(unix)]
         assert!(report.has_failure(OperationalClass::ProgramNotExecutable, "not-executable"));
+        #[cfg(not(unix))]
+        {
+            // Windows has no executable permission bit, so the copied `.exe`
+            // spawns successfully and its empty stdout is classified instead.
+            assert!(report.has_failure(OperationalClass::ManifestUnparsable, "not-executable"));
+        }
     }
 
     #[tokio::test]
     async fn fixture_manifest_timeout_classifies_operational_failure() {
         let temp = TempDir::new("manifest-timeout");
-        let script = write_script(&temp, "timeout", "sleep 1", true);
+        let script = write_fixture_program(
+            &temp,
+            "timeout",
+            FixtureSpec {
+                sleep_ms: (MANIFEST_TIMEOUT + Duration::from_secs(1)).as_millis() as u64,
+                ..FixtureSpec::default()
+            },
+        );
         let config = write_config(&temp, vec![("timeout", &script, true)], json!({}));
 
         let report = lint_with_timeout(&config, false, Duration::from_millis(5))
@@ -650,7 +738,14 @@ mod tests {
     #[tokio::test]
     async fn fixture_manifest_exit_nonzero_classifies_operational_failure() {
         let temp = TempDir::new("manifest-exit-nonzero");
-        let script = write_script(&temp, "nonzero", "exit 7", true);
+        let script = write_fixture_program(
+            &temp,
+            "nonzero",
+            FixtureSpec {
+                exit_code: 7,
+                ..FixtureSpec::default()
+            },
+        );
         let config = write_config(&temp, vec![("nonzero", &script, true)], json!({}));
 
         let report = lint_config(&config, false).await;
@@ -661,7 +756,14 @@ mod tests {
     #[tokio::test]
     async fn fixture_manifest_unparsable_classifies_operational_failure() {
         let temp = TempDir::new("manifest-unparsable");
-        let script = write_script(&temp, "unparsable", "printf 'not json\\n'", true);
+        let script = write_fixture_program(
+            &temp,
+            "unparsable",
+            FixtureSpec {
+                stdout: "not json\\n".to_string(),
+                ..FixtureSpec::default()
+            },
+        );
         let config = write_config(&temp, vec![("unparsable", &script, true)], json!({}));
 
         let report = lint_config(&config, false).await;
@@ -681,11 +783,13 @@ mod tests {
             json!({"provides": [], "requires": [], "must_never_reach": []}),
             PROTOCOL_VERSION.saturating_add(1),
         );
-        let script = write_script(
+        let script = write_fixture_program(
             &temp,
             "unsupported",
-            &format!("printf '%s\\n' '{document}'"),
-            true,
+            FixtureSpec {
+                stdout: document,
+                ..FixtureSpec::default()
+            },
         );
         let config = write_config(&temp, vec![("unsupported", &script, true)], json!({}));
 
@@ -701,7 +805,7 @@ mod tests {
     #[tokio::test]
     async fn fixture_duplicate_module_id_classifies_operational_failure() {
         let temp = TempDir::new("duplicate-module-id");
-        let script = manifest_script(&temp, "duplicate", Value::Null);
+        let script = manifest_fixture(&temp, "duplicate", Value::Null);
         let config = temp.path().join("subc.jsonc");
         fs::write(
             &config,
@@ -721,7 +825,7 @@ mod tests {
     #[tokio::test]
     async fn fixture_manifest_invalid_classifies_operational_failure() {
         let temp = TempDir::new("manifest-invalid");
-        let script = manifest_script(
+        let script = manifest_fixture(
             &temp,
             "invalid",
             json!({"provides": ["Not-valid/v1"], "requires": [], "must_never_reach": []}),
@@ -736,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_modules_are_still_manifest_validated() {
         let temp = TempDir::new("disabled-manifest-invalid");
-        let script = manifest_script(
+        let script = manifest_fixture(
             &temp,
             "disabled-invalid",
             json!({"provides": ["Not-valid/v1"], "requires": [], "must_never_reach": []}),
@@ -751,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn golden_disabled_claimant_count_daemon_skip_and_verbose_optional_inventory() {
         let temp = TempDir::new("disabled-claimant");
-        let consumer = manifest_script(
+        let consumer = manifest_fixture(
             &temp,
             "consumer",
             json!({
@@ -763,7 +867,7 @@ mod tests {
                 "must_never_reach": []
             }),
         );
-        let disabled = manifest_script(
+        let disabled = manifest_fixture(
             &temp,
             "disabled",
             json!({"provides": ["credentials-provider/v1"], "requires": [], "must_never_reach": []}),
@@ -805,12 +909,12 @@ note: disabled (disabled) claims credentials-provider/v1"
     #[tokio::test]
     async fn golden_requirement_lines_sort_by_consumer_then_capability() {
         let temp = TempDir::new("requirement-order");
-        let alpha = manifest_script(
+        let alpha = manifest_fixture(
             &temp,
             "alpha",
             json!({"provides": [], "requires": [{"capability": "alpha/v1", "need": "required"}], "must_never_reach": []}),
         );
-        let zeta = manifest_script(
+        let zeta = manifest_fixture(
             &temp,
             "zeta",
             json!({"provides": [], "requires": [{"capability": "zeta/v1", "need": "required"}], "must_never_reach": []}),
@@ -833,7 +937,7 @@ note: disabled (disabled) claims credentials-provider/v1"
     #[tokio::test]
     async fn deny_self_contradiction_mutation_proof_requires_overlap() {
         let temp = TempDir::new("deny-self-contradiction");
-        let self_contradiction = manifest_script(
+        let self_contradiction = manifest_fixture(
             &temp,
             "contradictory",
             json!({
@@ -861,12 +965,19 @@ note: disabled (disabled) claims credentials-provider/v1"
     #[tokio::test]
     async fn operational_failure_overrides_semantic_exit_classification() {
         let temp = TempDir::new("operational-trump");
-        let consumer = manifest_script(
+        let consumer = manifest_fixture(
             &temp,
             "consumer",
             json!({"provides": [], "requires": [{"capability": "credentials-provider/v1", "need": "required"}], "must_never_reach": []}),
         );
-        let broken = write_script(&temp, "broken", "exit 1", true);
+        let broken = write_fixture_program(
+            &temp,
+            "broken",
+            FixtureSpec {
+                exit_code: 1,
+                ..FixtureSpec::default()
+            },
+        );
         let config = write_config(
             &temp,
             vec![("consumer", &consumer, true), ("broken", &broken, true)],
@@ -900,7 +1011,7 @@ note: disabled (disabled) claims credentials-provider/v1"
     #[tokio::test]
     async fn reserved_bindings_warn_when_unclaimed_and_fail_for_conflicting_claimants() {
         let temp = TempDir::new("reserved-bindings");
-        let claimant = manifest_script(
+        let claimant = manifest_fixture(
             &temp,
             "other",
             json!({"provides": ["credentials-provider/v1"], "requires": [], "must_never_reach": []}),

@@ -227,6 +227,18 @@ consumers carry manifests.
   semantics unchanged).
 - Retroactive manifests for unpaired/legacy devices.
 
+## Instance six: the rule's author, under the pressure the rule was written for
+
+The day after the executive seat adopted the merge-ritual rule ("name grant
+status in every delivery announcement"), an emergency deploy -- phone chat
+down -- skipped the ritual step and shipped wired-but-ungranted instance SIX
+(`agent.fleet_overview` + `session.display_read`, both phone peers). The
+rule's author broke the rule within 24 hours of writing it. That is not a
+discipline failure to fix with a better rule; it is the measured failure rate
+of procedural rules as a class, and the argument for this spec's structural
+deletion of the remember step: the app declares, the ceremony diffs, nobody
+remembers anything. Six instances, four apps, zero counter-examples.
+
 ## Worked example: the first reconciliation was a measurement (CKIOS)
 
 Before any ceremony tooling existed, CKIOS built the client-side vocabulary

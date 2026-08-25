@@ -807,12 +807,16 @@ mod tests {
         let temp = TempDir::new("duplicate-module-id");
         let script = manifest_fixture(&temp, "duplicate", Value::Null);
         let config = temp.path().join("subc.jsonc");
+        // Hand-written JSON because serde_json cannot emit the duplicate key
+        // this test exists to exercise -- but the PATH must still be a valid
+        // JSON string: on Windows `display()` yields backslashes, which are
+        // invalid JSON escapes and fail the parse before the duplicate-id
+        // check ever runs. serde-encode the path (quotes included) instead.
+        let program = serde_json::to_string(&script.display().to_string()).unwrap();
         fs::write(
             &config,
             format!(
-                r#"{{"version":1,"modules":{{"duplicate":{{"program":"{}"}},"duplicate":{{"program":"{}"}}}}}}"#,
-                script.display(),
-                script.display()
+                r#"{{"version":1,"modules":{{"duplicate":{{"program":{program}}},"duplicate":{{"program":{program}}}}}}}"#
             ),
         )
         .unwrap();

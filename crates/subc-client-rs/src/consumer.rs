@@ -1881,10 +1881,15 @@ impl Shared {
                         .await?;
                 }
                 Ok(TerminalFrame::Error { body, .. }) => {
-                    if is_retryable_route_open_code(&body.code)
-                        && attempt < opts.route_retry.max_attempts
-                        && Instant::now() < route_deadline
-                    {
+                    // The deadline is the ONLY binder for retryable refusals.
+                    // An attempt cap used to share this condition, and because
+                    // the capped backoff sums to seconds it strictly dominated
+                    // the deadline — the advertised reload patience was never
+                    // delivered, and module restarts whose reload exceeded a
+                    // few seconds failed every managed caller. Reloads
+                    // legitimately take tens of seconds (drain alone defaults
+                    // to 30s); capped per-attempt backoff bounds pressure.
+                    if is_retryable_route_open_code(&body.code) && Instant::now() < route_deadline {
                         let delay = opts.route_retry.delay_after_attempt(attempt);
                         self.sleep_until_retry(route_deadline, delay).await?;
                         continue;
@@ -1899,11 +1904,7 @@ impl Shared {
                 Ok(TerminalFrame::StreamEnd) => {
                     return Err(CallError::not_sent("route.open returned StreamEnd"));
                 }
-                Err(err)
-                    if err.is_not_sent()
-                        && attempt < opts.route_retry.max_attempts
-                        && Instant::now() < route_deadline =>
-                {
+                Err(err) if err.is_not_sent() && Instant::now() < route_deadline => {
                     let delay = opts.route_retry.delay_after_attempt(attempt);
                     self.sleep_until_retry(route_deadline, delay).await?;
                 }
@@ -4207,7 +4208,13 @@ mod tests {
     #[tokio::test]
     async fn module_removed_fails_fast_while_module_reloading_retries_at_the_same_route_open_call_site(
     ) {
-        async fn reject_route_open_attempts(code: &str, expected_attempts: usize) -> CallError {
+        // Serves rejections with `code` until the caller settles, returning
+        // (attempts_served, result). The retryable arm must keep retrying past
+        // any attempt count until the DEADLINE binds — the attempt cap in the
+        // options below is deliberately tiny so a regression that re-couples
+        // attempts into the retry condition (the 3.1s-effective-budget defect)
+        // stops the loop at 2 and fails the `> 2` assertion by name.
+        async fn reject_route_open_attempts(code: &str, deadline: Duration) -> (usize, CallError) {
             let shared = Arc::new(Shared::new(
                 PathBuf::from("/tmp/does-not-exist"),
                 ConsumerOptions::default(),
@@ -4229,54 +4236,79 @@ mod tests {
                 session: code.to_string(),
             };
             let options = CallOptions {
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(2),
                 route_retry: RetryBackoff {
                     base: Duration::ZERO,
                     cap: Duration::ZERO,
                     max_attempts: 2,
                 },
-                route_retry_deadline: Duration::from_secs(1),
+                route_retry_deadline: deadline,
                 ..CallOptions::default()
             };
-            let task =
+            let mut task =
                 tokio::spawn(async move { consumer.open_route(target, identity, options).await });
 
-            for _ in 0..expected_attempts {
-                let command = tokio::time::timeout(Duration::from_millis(250), receiver.recv())
-                    .await
-                    .expect("route.open retry was not queued")
-                    .expect("route.open writer closed");
-                let body = serde_json::to_vec(&ErrorBody::new(code, "test rejection")).unwrap();
-                assert!(
-                    dispatch_frame(
-                        &shared,
-                        1,
-                        Frame::build(
-                            FrameType::Error,
-                            Flags::new(false, Priority::Interactive, false),
-                            0,
-                            0,
-                            command.frame.header.corr,
-                            body,
-                        )
-                        .unwrap(),
-                    )
-                    .await
-                );
-            }
-            let result = task.await.unwrap().expect_err("route.open must reject");
+            let mut attempts = 0usize;
+            let result = loop {
+                tokio::select! {
+                    command = receiver.recv() => {
+                        // The consumer tears the writer down when the open
+                        // settles, so a closed channel here means the task is
+                        // finishing — join it rather than treating the race as
+                        // a broken harness.
+                        let Some(command) = command else {
+                            break task.await.unwrap().expect_err("route.open must reject");
+                        };
+                        attempts += 1;
+                        let body =
+                            serde_json::to_vec(&ErrorBody::new(code, "test rejection")).unwrap();
+                        assert!(
+                            dispatch_frame(
+                                &shared,
+                                1,
+                                Frame::build(
+                                    FrameType::Error,
+                                    Flags::new(false, Priority::Interactive, false),
+                                    0,
+                                    0,
+                                    command.frame.header.corr,
+                                    body,
+                                )
+                                .unwrap(),
+                            )
+                            .await
+                        );
+                    }
+                    joined = &mut task => {
+                        break joined.unwrap().expect_err("route.open must reject");
+                    }
+                }
+            };
             assert!(
                 receiver.try_recv().is_err(),
-                "the terminal code must not queue another route.open"
+                "a settled route.open must not queue another attempt"
             );
-            result
+            (attempts, result)
         }
 
-        let reloading = reject_route_open_attempts(error_codes::MODULE_RELOADING, 2).await;
+        let (reloading_attempts, reloading) =
+            reject_route_open_attempts(error_codes::MODULE_RELOADING, Duration::from_millis(150))
+                .await;
         assert!(matches!(reloading, CallError::NotSent(_)));
+        assert!(
+            reloading_attempts > 2,
+            "reloading retries must run until the deadline, not an attempt cap \
+             (served {reloading_attempts} attempts against max_attempts=2)"
+        );
 
-        let removed = reject_route_open_attempts(error_codes::MODULE_REMOVED, 1).await;
+        let (removed_attempts, removed) =
+            reject_route_open_attempts(error_codes::MODULE_REMOVED, Duration::from_millis(150))
+                .await;
         assert!(matches!(removed, CallError::NotSent(_)));
+        assert_eq!(
+            removed_attempts, 1,
+            "terminal codes settle on the first answer"
+        );
     }
 
     #[tokio::test]

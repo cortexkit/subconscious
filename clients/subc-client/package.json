@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/subc-client",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "TypeScript client for the subc daemon. Wire-compatible (byte-for-byte) with the Rust subc-transport handshake and subc-protocol envelope.",
   "type": "module",
   "exports": {

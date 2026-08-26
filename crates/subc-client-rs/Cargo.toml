@@ -1,6 +1,6 @@
 [package]
 name = "subc-client-rs"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 publish = true
 description = "Shared serve + consume client for Rust subc modules."

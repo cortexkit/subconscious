@@ -275,6 +275,14 @@ export interface ConnectOptions {
   /** Injectable sleep for timer-free reconnect tests. */
   sleep?: (ms: number) => Promise<void>;
   /**
+   * How long managed calls keep retrying route.open in-place on retryable
+   * refusals (module_reloading, module_warming, target_unavailable, …) before
+   * settling not_sent. This deadline is the ONLY binder on those retries —
+   * module reloads legitimately take tens of seconds (the daemon's drain alone
+   * defaults to 30s), so the default matches the daemon's drain ceiling.
+   */
+  routeOpenRetryDeadlineMs?: number;
+  /**
    * Window the post-deadline liveness probe waits for ANY inbound frame after
    * sending its channel-0 Ping before convicting the socket as half-open.
    * Genuine event-loop starvation self-protects at any setting: a loop starved
@@ -373,6 +381,7 @@ interface NormalizedConnectOptions {
   targetKind: ManagedRouteKind;
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
+  routeOpenRetryDeadlineMs: number;
   timeoutArbitrationGraceMs: number;
   livenessProbeWindowMs: number;
   onControlPush?: (push: ControlPush) => void;
@@ -999,7 +1008,7 @@ export class SubcClient {
   }
 
   private async openCachedRoute(cached: CachedRoute): Promise<RouteHandle> {
-    const routeRetryDeadline = Date.now() + ROUTE_OPEN_RETRY_DEADLINE_MS;
+    const routeRetryDeadline = Date.now() + this.opts.routeOpenRetryDeadlineMs;
     let routeRetryDelay = this.opts.reconnectBackoff.baseMs;
     let routeRetryAttempt = 0;
     for (;;) {
@@ -1033,14 +1042,21 @@ export class SubcClient {
           continue;
         }
         if (!this.closeStarted && error instanceof SubcError && isRetryableRouteOpenCode(error.code)) {
+          // The deadline is the ONLY binder here. An attempt cap used to share
+          // this condition, and because the capped backoff sums to ~3.1s it
+          // strictly dominated the 30s deadline — the advertised reload
+          // patience was never delivered, so every module restart whose reload
+          // exceeded ~3s failed managed callers with module_reloading. Module
+          // reloads legitimately take tens of seconds (drain alone defaults to
+          // 30s); the backoff cap below bounds retry pressure instead.
           routeRetryAttempt += 1;
-          if (routeRetryAttempt < this.opts.reconnectBackoff.maxAttempts && Date.now() < routeRetryDeadline) {
+          if (Date.now() < routeRetryDeadline) {
             await this.opts.sleep(routeRetryDelay);
             routeRetryDelay = Math.min(routeRetryDelay * 2, this.opts.reconnectBackoff.capMs);
             continue;
           }
           throw this.notSentCallError(
-            `route.open failed for module ${cached.moduleId}: ${error.code} (retry budget exhausted)`,
+            `route.open failed for module ${cached.moduleId}: ${error.code} (retry deadline exhausted after ${routeRetryAttempt} attempts)`,
             error,
           );
         }
@@ -1589,6 +1605,7 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     targetKind: opts.targetKind ?? DEFAULT_MANAGED_TARGET_KIND,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
+    routeOpenRetryDeadlineMs: opts.routeOpenRetryDeadlineMs ?? ROUTE_OPEN_RETRY_DEADLINE_MS,
     timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS,
     livenessProbeWindowMs: opts.livenessProbeWindowMs ?? LIVENESS_PROBE_WINDOW_MS,
     onControlPush: opts.onControlPush,

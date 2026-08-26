@@ -645,6 +645,12 @@ describe("SubcClient managed call", () => {
     // Both branches run through client.call's cached-route opener. A removal is
     // intentional and permanent, while a reload can complete during the retry
     // window; their attempt counts prove the classifier does not conflate them.
+    // The reloading arm must retry until the DEADLINE binds — an attempt cap
+    // used to share the condition and strictly dominated it (capped backoff
+    // sums to ~3.1s against a 30s deadline), so the advertised reload patience
+    // was never delivered and every >3s module restart failed managed callers.
+    // The `greaterThan(maxAttempts)` assertion reddens if that conjunction
+    // ever returns.
     const reloadingConnection = tempConnectionFile();
     const reloadingStats = newStats();
     const reloadingDaemon = await startFakeDaemon({
@@ -656,6 +662,7 @@ describe("SubcClient managed call", () => {
       connectionFile: reloadingConnection.connFile,
       identity: IDENTITY,
       reconnectBackoff: BACKOFF,
+      routeOpenRetryDeadlineMs: 200,
       sleep: async () => {},
     });
 
@@ -664,7 +671,7 @@ describe("SubcClient managed call", () => {
         kind: "not_sent",
         code: "module_reloading",
       });
-      expect(reloadingStats.routeOpens).toBe(BACKOFF.maxAttempts);
+      expect(reloadingStats.routeOpens).toBeGreaterThan(BACKOFF.maxAttempts);
     } finally {
       reloadingClient.close();
     }

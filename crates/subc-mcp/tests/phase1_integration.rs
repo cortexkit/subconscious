@@ -4610,6 +4610,7 @@ fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
             },
         },
         capabilities: None,
+        provenance: None,
     }
 }
 

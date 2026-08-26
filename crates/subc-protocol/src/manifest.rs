@@ -30,6 +30,8 @@ pub struct ModuleManifest {
     /// the daemon validates before accepting a HELLO.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilityDeclarations>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ManifestProvenance>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +45,8 @@ struct ModuleManifestWire {
     bindings: Bindings,
     #[serde(default)]
     capabilities: Option<CapabilityDeclarations>,
+    #[serde(default)]
+    provenance: Option<ManifestProvenance>,
     // `runtime_computed` belongs to --manifest output rather than the retained
     // manifest model. Deserialize it only long enough to enforce that capability
     // declarations cannot be omitted as runtime-varying data.
@@ -67,6 +71,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             consumes: wire.consumes,
             bindings: wire.bindings,
             capabilities: wire.capabilities,
+            provenance: wire.provenance,
         };
         manifest
             .validate_capability_grammar()
@@ -85,6 +90,18 @@ pub struct CapabilityDeclarations {
     pub requires: Vec<CapabilityRequirement>,
     #[serde(default)]
     pub must_never_reach: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ManifestProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_lock_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_crate_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_schema_version: Option<String>,
 }
 
 /// One capability a module consumes and whether its absence is tolerated.
@@ -769,6 +786,7 @@ mod tests {
                 },
             },
             capabilities: None,
+            provenance: None,
         }
     }
 

@@ -1,14 +1,14 @@
 use std::{fmt::Debug, fs, path::PathBuf};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use subc_protocol::{
     error_codes,
     manifest::{
         Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
-        IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ObservabilityKind, ObservabilitySurface, ProviderRole, StorageBinding, StorageKind,
-        StorageScope, Tool, TrustTier,
+        IdentityScope, ManagementOperation, ManagementOperationKind, ManifestProvenance,
+        ModuleManifest, ObservabilityKind, ObservabilitySurface, ProviderRole, StorageBinding,
+        StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -53,6 +53,10 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden("principal_direct", &Principal::Direct);
     assert_golden("principal_unverified", &Principal::Unverified);
     assert_golden("module_hello_body", &module_hello_body());
+    assert_golden(
+        "module_hello_body_with_provenance",
+        &module_hello_body_with_provenance(),
+    );
     assert_golden("module_hello_ack_body", &module_hello_ack_body());
     assert_golden(
         "module_control_request_route_bind",
@@ -130,6 +134,87 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             status: "indexing".to_string(),
         },
     );
+}
+
+#[derive(Deserialize)]
+struct LegacyModuleManifest {
+    module_id: String,
+}
+
+#[test]
+fn manifest_without_provenance_preserves_the_existing_hello_wire_shape() {
+    let encoded = serde_json::to_value(module_hello_body()).expect("HELLO serializes");
+
+    assert!(encoded["manifest"].get("provenance").is_none());
+    assert_eq!(
+        encoded,
+        serde_json::from_str::<Value>(
+            &fs::read_to_string(golden_path("module_hello_body")).expect("existing HELLO golden"),
+        )
+        .expect("existing HELLO golden is JSON"),
+        "an absent provenance declaration must preserve the existing HELLO bytes"
+    );
+}
+
+#[test]
+fn manifest_provenance_round_trips_all_facts_through_the_real_manifest_deserializer() {
+    let hello = module_hello_body_with_provenance();
+    let encoded = serde_json::to_value(&hello).expect("HELLO serializes");
+
+    assert_eq!(
+        encoded["manifest"]["provenance"],
+        serde_json::json!({
+            "build_commit": "0123456789abcdef0123456789abcdef01234567-dirty",
+            "build_lock_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "wire_crate_version": "0.13.0",
+            "store_schema_version": "42"
+        })
+    );
+    let decoded: ModuleHelloBody = serde_json::from_value(encoded).expect("HELLO deserializes");
+    assert_eq!(decoded, hello);
+}
+
+#[test]
+fn manifest_provenance_omits_each_unavailable_fact_independently() {
+    for field in [
+        "build_commit",
+        "build_lock_digest",
+        "wire_crate_version",
+        "store_schema_version",
+    ] {
+        let mut provenance = ManifestProvenance {
+            build_commit: Some("commit".to_string()),
+            build_lock_digest: Some("lock".to_string()),
+            wire_crate_version: Some("wire".to_string()),
+            store_schema_version: Some("schema".to_string()),
+        };
+        match field {
+            "build_commit" => provenance.build_commit = None,
+            "build_lock_digest" => provenance.build_lock_digest = None,
+            "wire_crate_version" => provenance.wire_crate_version = None,
+            "store_schema_version" => provenance.store_schema_version = None,
+            _ => unreachable!("fixed provenance field list"),
+        }
+
+        let encoded = serde_json::to_value(&provenance).expect("provenance serializes");
+        assert!(
+            encoded.get(field).is_none(),
+            "{field} must be omitted when unavailable"
+        );
+        let decoded: ManifestProvenance =
+            serde_json::from_value(encoded).expect("partial provenance deserializes");
+        assert_eq!(decoded, provenance);
+    }
+}
+
+#[test]
+fn legacy_manifest_decoder_ignores_the_additive_provenance_block() {
+    let encoded = serde_json::to_value(module_hello_body_with_provenance().manifest)
+        .expect("current manifest serializes");
+
+    let legacy: LegacyModuleManifest =
+        serde_json::from_value(encoded).expect("old decoder ignores additive fields");
+    assert_eq!(legacy.module_id, "aft-tools");
 }
 
 #[test]
@@ -288,6 +373,19 @@ fn module_hello_body() -> ModuleHelloBody {
     }
 }
 
+fn module_hello_body_with_provenance() -> ModuleHelloBody {
+    let mut hello = module_hello_body();
+    hello.manifest.provenance = Some(ManifestProvenance {
+        build_commit: Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string()),
+        build_lock_digest: Some(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+        ),
+        wire_crate_version: Some("0.13.0".to_string()),
+        store_schema_version: Some("42".to_string()),
+    });
+    hello
+}
+
 fn module_hello_ack_body() -> ModuleHelloAckBody {
     ModuleHelloAckBody {
         negotiated_ver: PROTOCOL_VERSION,
@@ -341,6 +439,7 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
             },
         },
         capabilities: None,
+        provenance: None,
     }
 }
 
@@ -378,6 +477,7 @@ fn management_surface_manifest(description: Option<&str>) -> ModuleManifest {
             },
         },
         capabilities: None,
+        provenance: None,
     }
 }
 

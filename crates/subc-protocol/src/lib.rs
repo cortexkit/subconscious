@@ -122,6 +122,8 @@ pub enum RouteTarget {
 /// Envelope protocol version this build speaks.
 pub const PROTOCOL_VERSION: u8 = 2;
 
+pub const SUBC_PROTOCOL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Oldest envelope protocol version this build accepts.
 pub const MIN_SUPPORTED_VERSION: u8 = 2;
 

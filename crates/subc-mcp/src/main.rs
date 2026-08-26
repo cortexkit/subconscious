@@ -1947,6 +1947,28 @@ fn manifest_output_always_includes_an_empty_runtime_computed_array() {
     assert_eq!(value["runtime_computed"], serde_json::json!([]));
 }
 
+#[cfg(test)]
+#[test]
+fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
+    let mut manifest = supervision_manifest(MANIFEST_MODULE_ID.to_string());
+    manifest.provenance = Some(subc_protocol::manifest::ManifestProvenance {
+        build_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        build_lock_digest: None,
+        wire_crate_version: Some("0.13.0".to_string()),
+        store_schema_version: None,
+    });
+
+    let value = manifest_json(manifest);
+    assert_eq!(
+        value["provenance"],
+        serde_json::json!({
+            "build_commit": "0123456789abcdef0123456789abcdef01234567",
+            "wire_crate_version": "0.13.0"
+        })
+    );
+    assert_eq!(value["runtime_computed"], serde_json::json!([]));
+}
+
 fn supervision_manifest(module_id: String) -> ModuleManifest {
     ModuleManifest {
         module_id,
@@ -1957,6 +1979,7 @@ fn supervision_manifest(module_id: String) -> ModuleManifest {
         consumes: vec![ConsumerRole::ToolClient { of: Vec::new() }],
         bindings: supervision_bindings(),
         capabilities: None,
+        provenance: None,
     }
 }
 

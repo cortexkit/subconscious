@@ -299,6 +299,7 @@ mod path_hazard_tests {
                 },
             },
             capabilities: None,
+            provenance: None,
         }
     }
 

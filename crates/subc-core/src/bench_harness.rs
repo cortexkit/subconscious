@@ -70,6 +70,7 @@ pub fn bench_tool_provider_manifest(module_id: &str) -> ModuleManifest {
             },
         },
         capabilities: None,
+        provenance: None,
     }
 }
 

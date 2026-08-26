@@ -1302,6 +1302,7 @@ fn manifest(
             },
         },
         capabilities,
+        provenance: None,
     }
 }
 

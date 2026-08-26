@@ -34,6 +34,22 @@ pub struct ModuleManifest {
     pub provenance: Option<ManifestProvenance>,
 }
 
+/// DELIBERATELY LENIENT: unknown top-level manifest keys are DROPPED at this
+/// parse boundary, not rejected and not retained. This is forward
+/// compatibility across version skew — a module built against a newer
+/// subc-protocol must still HELLO into an older daemon, and strictness here
+/// would turn every additive manifest field into a daemon-first flag day.
+/// The costs, so nobody re-derives them the hard way (CEREB found both):
+/// - A key you add module-side is INVISIBLE to the daemon until a typed field
+///   lands here. Producing it is honest; assuming a daemon-side reader exists
+///   is not. Say who the audience is next to any such producer.
+/// - There is deliberately NO untyped extension bag on this struct: a
+///   retained-verbatim Value map becomes an unversioned de-facto wire
+///   contract nobody authored (the drift class module-owned payload crates
+///   exist to prevent). When a daemon consumer materializes for a fact, the
+///   fact gets a typed optional field with a CONSUMER-IMPACT commit instead.
+/// `CapabilityDeclarations` below is strict by contrast because claims are
+/// routed on: an unparseable claim must refuse loudly, never partially apply.
 #[derive(Deserialize)]
 struct ModuleManifestWire {
     module_id: String,

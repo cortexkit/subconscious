@@ -31,6 +31,7 @@ getrandom = "0.2"
 rlimit = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 subc-control = { path = "../subc-control" }
 subc-jsonc = { path = "../subc-jsonc" }
 terminal_size = "0.4"

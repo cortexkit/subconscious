@@ -56,6 +56,69 @@ async fn spawn_registers_stub_and_reports_running() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_records_exact_process_facts() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-spawn-facts";
+    let spec = stub_spec(&server, module_id, std::iter::empty::<(&str, &str)>());
+    let expected_program = spec.program.clone();
+    let before_spawn_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let module = supervisor.spawn(spec).unwrap();
+    let after_spawn_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(10)).await;
+
+    let first = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+    assert!(first.pid.is_some(), "running child PID must be retained");
+    assert_ne!(first.spawned_at_ms, Some(0));
+    assert!(
+        first.spawned_at_ms.unwrap() >= before_spawn_ms
+            && first.spawned_at_ms.unwrap() <= after_spawn_ms,
+        "spawn time must be captured around Supervisor::spawn: {first:?}"
+    );
+    assert_eq!(first.spawned_from, Some(expected_program.clone()));
+
+    let before_restart_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    module.restart(None).await.unwrap();
+    let restarted = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Running && status.live && status.pid != first.pid
+    })
+    .await;
+    let after_restart_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_ne!(restarted.pid, first.pid);
+    assert!(
+        restarted.spawned_at_ms.unwrap() >= before_restart_ms
+            && restarted.spawned_at_ms.unwrap() <= after_restart_ms,
+        "restart must replace the spawn timestamp: {restarted:?}"
+    );
+    assert!(restarted.spawned_at_ms.unwrap() > first.spawned_at_ms.unwrap());
+    assert_eq!(restarted.spawned_from, Some(expected_program));
+
+    module.stop().await.unwrap();
+    let stopped = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Stopped && !status.process_alive
+    })
+    .await;
+    assert_eq!(stopped.pid, None);
+    assert_eq!(stopped.spawned_at_ms, None);
+    assert_eq!(stopped.spawned_from, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_restarts_and_reregisters_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 5, Duration::from_millis(20));

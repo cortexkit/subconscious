@@ -21,14 +21,16 @@ use subc_protocol::{
     manifest::{
         Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
         IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
-        ObservabilityKind, ObservabilitySurface, PipelineAppliesTo, PipelineStageKind,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        ManifestProvenance, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
+        PipelineStageKind, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool,
+        TrustTier,
     },
     session::{
         HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlResponse,
         MODULE_CONTROL_OP_HEALTH_CHECK,
     },
     ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
+    SUBC_PROTOCOL_CRATE_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, AuthError, ConnectionFileError};
 use tokio::{
@@ -87,6 +89,10 @@ const FAKE_AFT_EXIT_CODE_ENV: &str = "FAKE_AFT_EXIT_CODE";
 /// `{pid}` token, substituted with this process's pid, for tests that must
 /// distinguish which generation across a restart produced a line.
 const FAKE_AFT_STDERR_LINE_ENV: &str = "FAKE_AFT_STDERR_LINE";
+const FAKE_AFT_BUILD_COMMIT_ENV: &str = "FAKE_AFT_BUILD_COMMIT";
+const FAKE_AFT_BUILD_LOCK_DIGEST_ENV: &str = "FAKE_AFT_BUILD_LOCK_DIGEST";
+const FAKE_AFT_STORE_SCHEMA_VERSION_ENV: &str = "FAKE_AFT_STORE_SCHEMA_VERSION";
+const FAKE_AFT_WIRE_CRATE_VERSION_ENV: &str = "FAKE_AFT_WIRE_CRATE_VERSION";
 /// Milliseconds the detached orphan writer (below) sleeps before writing
 /// `FAKE_AFT_ORPHAN_WRITER_LINE` to stderr. Set alongside `FAKE_AFT_EXIT_CODE`
 /// to reproduce a wedged pump: a child that inherits this process's stderr
@@ -1302,7 +1308,29 @@ fn manifest(
             },
         },
         capabilities,
+        provenance: manifest_provenance(),
     }
+}
+
+fn manifest_provenance() -> Option<ManifestProvenance> {
+    let build_commit = env::var(FAKE_AFT_BUILD_COMMIT_ENV).ok();
+    let build_lock_digest = env::var(FAKE_AFT_BUILD_LOCK_DIGEST_ENV).ok();
+    let store_schema_version = env::var(FAKE_AFT_STORE_SCHEMA_VERSION_ENV).ok();
+    let wire_crate_version = env::var(FAKE_AFT_WIRE_CRATE_VERSION_ENV).ok();
+    if build_commit.is_none()
+        && build_lock_digest.is_none()
+        && store_schema_version.is_none()
+        && wire_crate_version.is_none()
+    {
+        return None;
+    }
+    Some(ManifestProvenance {
+        build_git_sha: build_commit,
+        build_lock_digest,
+        wire_crate_version: wire_crate_version
+            .or_else(|| Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())),
+        store_schema_version,
+    })
 }
 
 fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> ProviderRole {

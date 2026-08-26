@@ -4,16 +4,18 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse, ConsumerIdentity,
-    PollKind, RouteCloseReason, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorEntry,
-    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorRescanResult, SupervisorRoute,
-    SupervisorRouteConsumer, SupervisorRouteModule,
+    DaemonBuildProvenance, DaemonObservedProcess, ModuleDeclaredProvenance, PollKind,
+    RouteCloseReason, RunningImageAgreement, RunningImageEvidence, StderrCaptureState, StderrTail,
+    StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry, SupervisorHealthEntry,
+    SupervisorHealthStatus, SupervisorModuleProvenance, SupervisorObservedProcess,
+    SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
         IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
-        ObservabilityKind, ObservabilitySurface, PipelineAppliesTo, PipelineStageKind,
-        ProviderRole, Tool,
+        ManifestProvenance, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
+        PipelineStageKind, ProviderRole, Tool,
     },
     session::HealthStatus,
     BindIdentity, RouteTarget, PROTOCOL_VERSION,
@@ -208,6 +210,12 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             "client_control_request_supervisor_health",
             ClientControlRequest::SupervisorHealth {},
         ),
+        (
+            "client_control_request_supervisor_provenance_filtered",
+            ClientControlRequest::SupervisorProvenance {
+                module_id: Some("aft".to_string()),
+            },
+        ),
     ]
 }
 
@@ -354,6 +362,152 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                             drain_reason: Some(RouteCloseReason::Reload),
                         },
                     ],
+                }],
+            },
+        ),
+        (
+            "client_control_response_supervisor_provenance_reported",
+            ClientControlResponse::SupervisorProvenance {
+                daemon: SupervisorDaemonProvenance {
+                    daemon_build: DaemonBuildProvenance {
+                        build_git_sha: Some(
+                            "0123456789abcdef0123456789abcdef01234567-dirty".to_string(),
+                        ),
+                        build_lock_digest: Some(
+                            "9d2c0d69cd82f2151bbb2b32ab9ac9d861063ffde2f8582afe767ec7e1f2145c"
+                                .to_string(),
+                        ),
+                    },
+                    daemon_observed: DaemonObservedProcess {
+                        pid: Some(4200),
+                        started_at_ms: Some(1_725_000_000_001),
+                        running_image: RunningImageAgreement::Match {
+                            evidence: RunningImageEvidence::LinuxProcSha256 {
+                                digest: "1111111111111111111111111111111111111111111111111111111111111111"
+                                    .to_string(),
+                            },
+                        },
+                    },
+                },
+                modules: vec![SupervisorModuleProvenance {
+                    module_id: "aft".to_string(),
+                    module_declared: ModuleDeclaredProvenance::Reported {
+                        build: ManifestProvenance {
+                            build_git_sha: Some(
+                                "0123456789abcdef0123456789abcdef01234567".to_string(),
+                            ),
+                            build_lock_digest: Some(
+                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                    .to_string(),
+                            ),
+                            wire_crate_version: Some("0.13.0".to_string()),
+                            store_schema_version: Some("2".to_string()),
+                        },
+                    },
+                    daemon_observed: SupervisorObservedProcess {
+                        pid: Some(4201),
+                        spawned_at_ms: Some(1_725_000_000_002),
+                        spawned_from: Some(PathBuf::from("/opt/subc/bin/aft")),
+                        running_image: RunningImageAgreement::Match {
+                            evidence: RunningImageEvidence::LinuxProcSha256 {
+                                digest: "2222222222222222222222222222222222222222222222222222222222222222"
+                                    .to_string(),
+                            },
+                        },
+                    },
+                }],
+            },
+        ),
+        (
+            "client_control_response_supervisor_provenance_unverifiable",
+            ClientControlResponse::SupervisorProvenance {
+                daemon: SupervisorDaemonProvenance {
+                    daemon_build: DaemonBuildProvenance {
+                        build_git_sha: None,
+                        build_lock_digest: None,
+                    },
+                    daemon_observed: DaemonObservedProcess {
+                        pid: Some(4300),
+                        started_at_ms: Some(1_725_000_000_003),
+                        running_image: RunningImageAgreement::Match {
+                            evidence: RunningImageEvidence::MacosSpawnInode {
+                                device: 2_049,
+                                inode: 99_001,
+                            },
+                        },
+                    },
+                },
+                modules: vec![SupervisorModuleProvenance {
+                    module_id: "vault".to_string(),
+                    module_declared: ModuleDeclaredProvenance::Unverifiable,
+                    daemon_observed: SupervisorObservedProcess {
+                        pid: Some(4301),
+                        spawned_at_ms: Some(1_725_000_000_004),
+                        spawned_from: Some(PathBuf::from("/opt/subc/bin/vault")),
+                        running_image: RunningImageAgreement::Match {
+                            evidence: RunningImageEvidence::MacosSpawnInode {
+                                device: 2_049,
+                                inode: 99_002,
+                            },
+                        },
+                    },
+                }],
+            },
+        ),
+        (
+            "client_control_response_supervisor_provenance_mismatch",
+            ClientControlResponse::SupervisorProvenance {
+                daemon: SupervisorDaemonProvenance {
+                    daemon_build: DaemonBuildProvenance {
+                        build_git_sha: Some(
+                            "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+                        ),
+                        build_lock_digest: Some(
+                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                .to_string(),
+                        ),
+                    },
+                    daemon_observed: DaemonObservedProcess {
+                        pid: Some(4400),
+                        started_at_ms: Some(1_725_000_000_005),
+                        running_image: RunningImageAgreement::Match {
+                            evidence: RunningImageEvidence::LinuxProcSha256 {
+                                digest: "3333333333333333333333333333333333333333333333333333333333333333"
+                                    .to_string(),
+                            },
+                        },
+                    },
+                },
+                modules: vec![SupervisorModuleProvenance {
+                    module_id: "mcp".to_string(),
+                    module_declared: ModuleDeclaredProvenance::Reported {
+                        build: ManifestProvenance {
+                            build_git_sha: Some(
+                                "fedcba9876543210fedcba9876543210fedcba98-dirty".to_string(),
+                            ),
+                            build_lock_digest: Some(
+                                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                                    .to_string(),
+                            ),
+                            wire_crate_version: Some("0.13.0".to_string()),
+                            store_schema_version: Some("3".to_string()),
+                        },
+                    },
+                    daemon_observed: SupervisorObservedProcess {
+                        pid: Some(4401),
+                        spawned_at_ms: Some(1_725_000_000_006),
+                        spawned_from: Some(PathBuf::from("/opt/subc/bin/mcp")),
+                        running_image: RunningImageAgreement::Mismatch {
+                            running: RunningImageEvidence::LinuxProcSha256 {
+                                digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                                    .to_string(),
+                            },
+                            disk: RunningImageEvidence::LinuxProcSha256 {
+                                digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                                    .to_string(),
+                            },
+                        },
+                    },
                 }],
             },
         ),
@@ -526,6 +680,7 @@ fn thin_core_ops() -> Vec<String> {
         "supervisor.stderr_tail".to_string(),
         "supervisor.terminals".to_string(),
         "supervisor.routes".to_string(),
+        "supervisor.provenance".to_string(),
     ]
 }
 

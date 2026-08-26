@@ -16,6 +16,8 @@ pub mod fleet_lint;
 pub mod forwarding;
 pub mod identity;
 pub mod observability;
+#[allow(dead_code)]
+mod provenance;
 pub mod registry;
 pub mod router;
 pub mod server;

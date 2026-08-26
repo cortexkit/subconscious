@@ -12,8 +12,8 @@ use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManifestProvenance,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{
         ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
@@ -72,13 +72,16 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
     let server = TestServer::start().await;
     let module_id = "catalog-update-provider";
     let mut module = connect_endpoint(&server, "module").await;
-    let hello_ack = register_module(
-        &server,
-        &mut module,
-        tool_provider_manifest(module_id, &["a", "b"], Concurrency::ModuleManaged),
-        101,
-    )
-    .await;
+    let provenance = ManifestProvenance {
+        build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        build_lock_digest: Some("lock-digest".to_string()),
+        wire_crate_version: Some("0.13.0".to_string()),
+        store_schema_version: Some("3".to_string()),
+    };
+    let mut initial_manifest =
+        tool_provider_manifest(module_id, &["a", "b"], Concurrency::ModuleManaged);
+    initial_manifest.provenance = Some(provenance.clone());
+    let hello_ack = register_module(&server, &mut module, initial_manifest, 101).await;
     assert!(hello_ack.subc_ops.contains(&"catalog.update".to_string()));
 
     let (initial_generation, initial_modules) = catalog_list(&server, Some(module_id), 201).await;
@@ -130,6 +133,17 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
     let (updated_generation, updated_modules) = catalog_list(&server, Some(module_id), 202).await;
     assert!(updated_generation > initial_generation);
     assert_tool_names(&updated_modules[0], &["a", "c"]);
+    assert_eq!(
+        server
+            .registry
+            .get_module(module_id)
+            .expect("registry query succeeds")
+            .expect("catalog.update keeps the registration")
+            .manifest
+            .provenance,
+        Some(provenance),
+        "catalog.update must preserve HELLO provenance inherited by its struct update"
+    );
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 1);
     assert!(server
         .forwarding
@@ -433,6 +447,7 @@ fn supervision_only_manifest(module_id: &str) -> ModuleManifest {
             },
         },
         capabilities: None,
+        provenance: None,
     }
 }
 

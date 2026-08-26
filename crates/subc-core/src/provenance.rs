@@ -230,13 +230,20 @@ impl ImageDigestCache {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::{self, File},
+        fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+    // Only the linux sha256 tests open files directly, and only non-linux
+    // platforms assert the unavailable arm; each import gates with its users
+    // so the other platforms' clippy does not fail them as unused.
+    #[cfg(target_os = "linux")]
+    use std::fs::File;
 
     use super::*;
-    use subc_control::{RunningImageAgreement, RunningImageUnavailableReason};
+    use subc_control::RunningImageAgreement;
+    #[cfg(target_os = "linux")]
+    use subc_control::RunningImageUnavailableReason;
 
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()

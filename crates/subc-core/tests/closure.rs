@@ -84,6 +84,7 @@ async fn foreseeable_modules_close_over_existing_control_primitives() {
     assert_server_describe_uses_only_thin_core_ops(&server, &mut used_channel0_ops).await;
     assert_supervisor_routes_reads_the_empty_forwarding_table(&server, &mut used_channel0_ops)
         .await;
+    assert_supervisor_provenance_reads_empty_supervisor(&server, &mut used_channel0_ops).await;
     let embedding_payload = embedding_payload();
 
     modules.push(
@@ -386,6 +387,33 @@ async fn assert_supervisor_routes_reads_the_empty_forwarding_table(
     match response {
         ClientControlResponse::SupervisorRoutes { modules } => assert!(modules.is_empty()),
         other => panic!("unexpected supervisor.routes response: {other:?}"),
+    }
+}
+
+async fn assert_supervisor_provenance_reads_empty_supervisor(
+    server: &TestServer,
+    used_channel0_ops: &mut BTreeSet<&'static str>,
+) {
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let response = control_round_trip(
+        &mut client,
+        12,
+        ClientControlRequest::SupervisorProvenance { module_id: None },
+        ops::SUPERVISOR_PROVENANCE,
+        used_channel0_ops,
+    )
+    .await;
+    match response {
+        ClientControlResponse::SupervisorProvenance { daemon, modules } => {
+            assert!(modules.is_empty());
+            assert!(matches!(
+                daemon.daemon_observed.running_image,
+                subc_control::RunningImageAgreement::Unavailable { .. }
+            ));
+        }
+        other => panic!("unexpected supervisor.provenance response: {other:?}"),
     }
 }
 
@@ -729,6 +757,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_STDERR_TAIL,
         ops::SUPERVISOR_TERMINALS,
         ops::SUPERVISOR_ROUTES,
+        ops::SUPERVISOR_PROVENANCE,
     ])
 }
 

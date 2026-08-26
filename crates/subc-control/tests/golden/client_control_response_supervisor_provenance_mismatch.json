@@ -1,7 +1,7 @@
 {
   "daemon": {
     "daemon_build": {
-      "build_git_sha": "fedcba9876543210fedcba9876543210fedcba98",
+      "build_commit": "fedcba9876543210fedcba9876543210fedcba98",
       "build_lock_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "daemon_observed": {

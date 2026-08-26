@@ -11,7 +11,11 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
-use subc_control::{RunningImageAgreement, RunningImageEvidence, RunningImageUnavailableReason};
+use subc_control::{RunningImageAgreement, RunningImageUnavailableReason};
+// Both evidence constructors are cfg-gated to their probing platform, so on a
+// platform without a probe this import has no user and -D warnings rejects it.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use subc_control::RunningImageEvidence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpawnedFileIdentity {

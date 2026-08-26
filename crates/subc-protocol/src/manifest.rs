@@ -145,6 +145,22 @@ pub struct CapabilityDeclarations {
 ///   version inside the manifest constructor describes the source tree
 ///   sitting beside the running binary, not the binary — the exact claim
 ///   this struct exists to avoid.
+/// - Declare what you KNOW, not blanket-None (WERNI): `store_schema_version`
+///   needs no pipeline — any module with a migration list can state its
+///   newest migration as fact, and a daemon comparing it against the store's
+///   actual version sees a stale-binary mismatch directly. Blanket `None`
+///   where a field is knowable wastes the field; blanket-fill where it is
+///   not mints a lie. Absence also beats sentinel values (CKCRED): omit the
+///   block when BUILD_REV reads "unknown" — publishing the string "unknown"
+///   is a well-formed lie shape validation cannot catch.
+/// - PROXIED MANIFESTS STAY None PERMANENTLY (CALLO): a process that
+///   forwards another machine's manifest cannot observe that build, and a
+///   forwarded provenance claim is indistinguishable on the wire from a
+///   verified one — filling it launders an unverifiable assertion. Same
+///   reasoning as pinning a re-exported module's trust_tier to Untrusted.
+///   Record that at the construction site: injection-wiring sweeps grep for
+///   `provenance:` and the obvious action at a re-export site is the wrong
+///   one.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]

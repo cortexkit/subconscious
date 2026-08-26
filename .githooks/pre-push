@@ -41,6 +41,10 @@ if [ "${range_bumps:-0}" -gt 0 ]; then
   echo "  unconditional pull (the shared checkout may hold others' WIP; a clean" >&2
   echo "  merge over it is a silent failure). Name any NEWLY REQUIRED fields in" >&2
   echo "  the notice so mid-task workers don't satisfy the compiler with values" >&2
-  echo "  that aren't true." >&2
+  echo "  that aren't true. Consumers must verify against the COMMITTED lock" >&2
+  echo "  (git show HEAD:Cargo.lock | grep -A1 <crate>), not the working file:" >&2
+  echo "  any plain cargo build silently refreshes the working lock, so" >&2
+  echo "  'cargo check --locked' passing absolves a repo whose committed lock" >&2
+  echo "  is still stale (CKCRED hit exactly this)." >&2
 fi
 exit 0

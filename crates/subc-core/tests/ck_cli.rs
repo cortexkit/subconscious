@@ -1022,18 +1022,7 @@ where
     }
 }
 
-async fn control_rpc_value_on_stream<S>(
-    stream: &mut S,
-    corr: u64,
-    request: ClientControlRequest,
-) -> Value
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    control_rpc_value_on_stream_within(stream, corr, request, READ_TIMEOUT).await
-}
-
-/// Same RPC helper with a caller-sized reply window. The provenance op is the
+/// Control RPC helper with a caller-sized reply window. The provenance op is the
 /// motivating caller: on linux its first evaluation sha256-hashes the running
 /// module executable twice (via /proc and from disk), and a debug-profile stub
 /// on a cold, contended CI disk legitimately exceeds the default 10s — the

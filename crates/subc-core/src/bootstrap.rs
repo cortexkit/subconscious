@@ -45,6 +45,33 @@ const PROBE_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const START_LOCK_RETRIES: usize = 40;
 const START_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionFileSource {
+    XdgRuntimeDir,
+    TempDirFallback,
+    Explicit,
+}
+
+impl ConnectionFileSource {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::XdgRuntimeDir => "XDG_RUNTIME_DIR set and non-empty",
+            Self::TempDirFallback => "XDG_RUNTIME_DIR unset or empty",
+            Self::Explicit => "configured path",
+        }
+    }
+}
+
+impl fmt::Display for ConnectionFileSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::XdgRuntimeDir => "xdg_runtime_dir",
+            Self::TempDirFallback => "temp_dir_fallback",
+            Self::Explicit => "explicit",
+        })
+    }
+}
+
 /// Runtime bootstrap configuration. Production uses the default fixed port and
 /// optional daemon-config override; tests pass port 0 to let the OS assign a free
 /// loopback port and discover it from the connection file.
@@ -70,6 +97,7 @@ pub struct BootstrapConfig {
     route_bind_relay_default_ms: Option<u64>,
     reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
+    connection_file_source: ConnectionFileSource,
 }
 
 impl BootstrapConfig {
@@ -86,6 +114,7 @@ impl BootstrapConfig {
             route_bind_relay_default_ms: None,
             reserved_capabilities: BTreeMap::new(),
             watchdog_config: DaemonSelfWatchdogConfig::default(),
+            connection_file_source: ConnectionFileSource::Explicit,
         }
     }
 
@@ -138,13 +167,16 @@ impl BootstrapConfig {
             Ok(_) | Err(_) => config_port.unwrap_or(DEFAULT_SUBC_PORT),
         };
 
-        Ok(Self::new(connection_file_path(), port)
+        let (connection_file_path, connection_file_source) =
+            connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR"));
+        Ok(Self::new(connection_file_path, port)
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
-            .with_daemon_config_source(daemon_config_path, config_port))
+            .with_daemon_config_source(daemon_config_path, config_port)
+            .with_connection_file_source(connection_file_source))
     }
 
     pub fn with_daemon_config_path(
@@ -240,6 +272,11 @@ impl BootstrapConfig {
         self
     }
 
+    fn with_connection_file_source(mut self, source: ConnectionFileSource) -> Self {
+        self.connection_file_source = source;
+        self
+    }
+
     pub fn with_watchdog_config(mut self, watchdog_config: DaemonSelfWatchdogConfig) -> Self {
         self.watchdog_config = watchdog_config;
         self
@@ -261,6 +298,7 @@ pub struct BoundDaemon {
     pub listeners: Vec<TcpListener>,
     pub connection_info: ConnectionInfo,
     pub connection_file_path: PathBuf,
+    pub connection_file_source: ConnectionFileSource,
 }
 
 /// Resolve subc's per-user TCP connection-file path.
@@ -270,11 +308,23 @@ pub struct BoundDaemon {
 /// to the system temp dir with a per-user token in the filename so different OS
 /// users do not collide on shared temp directories.
 pub fn connection_file_path() -> PathBuf {
-    if let Some(runtime_dir) = non_empty_os_var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join(CONNECTION_FILE_NAME);
+    connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR")).0
+}
+
+fn connection_file_path_with_source(
+    runtime_dir: Option<OsString>,
+) -> (PathBuf, ConnectionFileSource) {
+    if let Some(runtime_dir) = runtime_dir.filter(|value| !value.is_empty()) {
+        return (
+            PathBuf::from(runtime_dir).join(CONNECTION_FILE_NAME),
+            ConnectionFileSource::XdgRuntimeDir,
+        );
     }
 
-    env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
+    (
+        env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token())),
+        ConnectionFileSource::TempDirFallback,
+    )
 }
 
 /// Resolve, claim, and serve the per-user daemon singleton.
@@ -408,6 +458,8 @@ async fn serve_bound_daemon(
 
     info!(
         connection_file = %bound.connection_file_path.display(),
+        connection_file_source = %bound.connection_file_source,
+        connection_file_source_reason = bound.connection_file_source.reason(),
         endpoints = ?bound.connection_info.endpoints,
         configured_modules = configured_modules.len(),
         "subc daemon starting"
@@ -599,6 +651,7 @@ pub async fn ensure_singleton_with_config(
         listeners,
         connection_info,
         connection_file_path: path,
+        connection_file_source: config.connection_file_source,
     }))
 }
 
@@ -1177,6 +1230,19 @@ mod tests {
     }
 
     #[test]
+    fn connection_file_path_source_is_xdg_runtime_dir_when_set() {
+        let runtime_dir = OsString::from("/run/user/1000");
+
+        let (path, source) = connection_file_path_with_source(Some(runtime_dir));
+
+        assert_eq!(
+            path,
+            PathBuf::from("/run/user/1000").join(CONNECTION_FILE_NAME)
+        );
+        assert_eq!(source, ConnectionFileSource::XdgRuntimeDir);
+    }
+
+    #[test]
     fn connection_file_path_falls_back_to_temp_dir_with_user_token_when_xdg_unset() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let _xdg = EnvGuard::unset("XDG_RUNTIME_DIR");
@@ -1185,6 +1251,28 @@ mod tests {
             connection_file_path(),
             env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
         );
+    }
+
+    #[test]
+    fn connection_file_path_source_is_temp_dir_when_xdg_unset() {
+        let (path, source) = connection_file_path_with_source(None);
+
+        assert_eq!(
+            path,
+            env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
+        );
+        assert_eq!(source, ConnectionFileSource::TempDirFallback);
+    }
+
+    #[test]
+    fn connection_file_path_source_is_temp_dir_when_xdg_empty() {
+        let (path, source) = connection_file_path_with_source(Some(OsString::new()));
+
+        assert_eq!(
+            path,
+            env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
+        );
+        assert_eq!(source, ConnectionFileSource::TempDirFallback);
     }
 
     #[test]

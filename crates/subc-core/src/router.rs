@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
@@ -234,7 +235,14 @@ impl Router {
                 frame_type = ?frame.header.ty,
                 "routing control frame"
             );
-            let responses = self.control.handle_control_frame(ctx, frame).await?;
+            // The connection loop calls this handler directly after reading the frame;
+            // there is no channel send, semaphore, or spawn await between receipt and
+            // dispatch, so this timing has no queue segment by construction.
+            let dispatch_started_at = (frame.header.ty == FrameType::Request).then(Instant::now);
+            let responses = self
+                .control
+                .handle_control_frame_timed(ctx, frame, dispatch_started_at)
+                .await?;
             for response in responses {
                 ctx.egress.send(response).await?;
             }
@@ -781,10 +789,68 @@ impl Error for RouterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forwarding::RouteBindRelayOutcome;
-    use std::{sync::Arc, time::Duration};
+    use crate::{
+        forwarding::RouteBindRelayOutcome,
+        supervise::{ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle},
+        ControlHandler, Registry,
+    };
+    use std::{
+        io::Write,
+        sync::{mpsc as std_mpsc, Arc, Mutex},
+        time::Duration,
+    };
     use subc_protocol::{manifest::Concurrency, ErrorBody, Flags, FrameType, Priority};
     use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("test log capture is not poisoned")
+                .extend(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn log_capture(
+        level: tracing::Level,
+    ) -> (Arc<Mutex<Vec<u8>>>, tracing::dispatcher::DefaultGuard) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || TestLogWriter(Arc::clone(&writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (output, guard)
+    }
+
+    fn captured_logs(output: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(
+            output
+                .lock()
+                .expect("test log capture is not poisoned")
+                .clone(),
+        )
+        .expect("tracing output is UTF-8")
+    }
+
+    fn logged_millis(logs: &str, field: &str) -> u64 {
+        logs.split_whitespace()
+            .find_map(|part| part.strip_prefix(field))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("missing numeric {field} in logs: {logs}"))
+    }
 
     fn request(channel: u16, corr: u64, body: &[u8]) -> Frame {
         Frame::build(
@@ -873,6 +939,135 @@ mod tests {
         assert_eq!(response.header.channel, 0);
         assert_eq!(response.header.corr, 77);
         assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_control_dispatch_logs_decoded_op_and_elapsed_time() {
+        let control = Arc::new(
+            ControlHandler::new(Arc::new(Registry::default()))
+                .with_control_dispatch_delay(Duration::from_millis(1050)),
+        );
+        let router = Router::with_control_handler(control);
+        let (ctx, mut rx) = route_ctx();
+        let (output, guard) = log_capture(tracing::Level::WARN);
+
+        router
+            .route_for_connection(&ctx, request(0, 41, br#"{"op":"server.describe"}"#))
+            .await
+            .expect("slow request routes");
+        assert!(rx.recv().await.is_some(), "request receives a response");
+        drop(guard);
+
+        let logs = captured_logs(&output);
+        assert!(logs.contains("slow control dispatch"));
+        assert!(logs.contains("op=server.describe"));
+        assert!(logs.contains("connection_id=0"));
+        assert!(logs.contains("corr=41"));
+        assert!(
+            logged_millis(&logs, "elapsed_ms=") >= 1050,
+            "elapsed must include the injected handler delay: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_control_dispatch_emits_arrival_without_slow_warning() {
+        let router = Router::with_default_self_handler();
+        let (ctx, mut rx) = route_ctx();
+        let (output, guard) = log_capture(tracing::Level::DEBUG);
+
+        router
+            .route_for_connection(&ctx, request(0, 42, br#"{"op":"server.describe"}"#))
+            .await
+            .expect("fast request routes");
+        assert!(rx.recv().await.is_some(), "request receives a response");
+        drop(guard);
+
+        let logs = captured_logs(&output);
+        assert!(logs.contains("control dispatch op=server.describe connection_id=0 corr=42"));
+        assert!(!logs.contains("slow control dispatch"));
+    }
+
+    #[tokio::test]
+    async fn control_dispatch_arrival_is_hidden_at_info() {
+        let router = Router::with_default_self_handler();
+        let (ctx, mut rx) = route_ctx();
+        let (output, guard) = log_capture(tracing::Level::INFO);
+
+        router
+            .route_for_connection(&ctx, request(0, 43, br#"{"op":"server.describe"}"#))
+            .await
+            .expect("fast request routes");
+        assert!(rx.recv().await.is_some(), "request receives a response");
+        drop(guard);
+
+        assert!(
+            !captured_logs(&output).contains("control dispatch"),
+            "arrival logging must stay hidden at INFO"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_list_logs_contended_snapshot_lock_only() {
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+            .with_handle(handle.clone());
+        let module = supervisor
+            .supervise_configured(
+                ModuleSpec {
+                    module_id: "held-module".to_string(),
+                    program: "test-module".into(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                },
+                false,
+            )
+            .expect("disabled test module is supervised");
+        let router = Router::with_control_handler(Arc::new(
+            ControlHandler::new(Arc::clone(&registry)).with_supervisor(handle),
+        ));
+        let (ctx, mut rx) = route_ctx();
+        let (acquired, ready) = std_mpsc::channel();
+        let holder = module.hold_snapshot_for_test(acquired, Duration::from_millis(400));
+        ready.recv().expect("holder acquired snapshot lock");
+        let (output, guard) = log_capture(tracing::Level::WARN);
+
+        router
+            .route_for_connection(&ctx, request(0, 44, br#"{"op":"supervisor.list"}"#))
+            .await
+            .expect("list request routes after the lock releases");
+        assert!(
+            rx.recv().await.is_some(),
+            "list request receives a response"
+        );
+        holder.join().expect("snapshot holder exits cleanly");
+        drop(guard);
+
+        let logs = captured_logs(&output);
+        assert!(logs.contains("slow snapshot lock"));
+        assert!(logs.contains("module_id=held-module"));
+        assert!(logs.contains("caller=list"));
+        assert!(
+            logged_millis(&logs, "waited_ms=") >= 250,
+            "wait must exceed the slow-lock threshold: {logs}"
+        );
+
+        let (output, guard) = log_capture(tracing::Level::WARN);
+        router
+            .route_for_connection(&ctx, request(0, 45, br#"{"op":"supervisor.list"}"#))
+            .await
+            .expect("uncontended list request routes");
+        assert!(
+            rx.recv().await.is_some(),
+            "uncontended list receives a response"
+        );
+        drop(guard);
+        assert!(
+            !captured_logs(&output).contains("slow snapshot lock"),
+            "uncontended list acquisition must not warn"
+        );
     }
 
     #[tokio::test]

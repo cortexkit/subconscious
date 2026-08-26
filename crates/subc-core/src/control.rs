@@ -3,7 +3,7 @@ use std::{
     fmt,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,7 @@ const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 /// bound retries the bind itself (the sanctioned warm-bind-retry pattern).
 const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const SLOW_CONTROL_DISPATCH_THRESHOLD: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 struct SupervisorRescanContext {
@@ -131,6 +132,8 @@ pub struct ControlHandler {
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
     capability_evaluator: Arc<CapabilityRequirementEvaluator>,
+    #[cfg(test)]
+    control_dispatch_delay: Option<Duration>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -256,6 +259,8 @@ impl ControlHandler {
             connected_clients: ConnectedClients::new(),
             counters,
             capability_evaluator: Arc::new(CapabilityRequirementEvaluator::new()),
+            #[cfg(test)]
+            control_dispatch_delay: None,
         }
     }
 
@@ -317,6 +322,12 @@ impl ControlHandler {
     #[cfg(test)]
     pub(crate) fn with_health_probe_timeout(mut self, timeout: Duration) -> Self {
         self.health_probe_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_control_dispatch_delay(mut self, delay: Duration) -> Self {
+        self.control_dispatch_delay = Some(delay);
         self
     }
 
@@ -578,6 +589,15 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
+        self.handle_control_frame_timed(ctx, frame, None).await
+    }
+
+    pub(crate) async fn handle_control_frame_timed(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        dispatch_started_at: Option<StdInstant>,
+    ) -> Result<Vec<Frame>, RouterError> {
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
@@ -615,7 +635,13 @@ impl ControlHandler {
                             )?])
                         }
                     };
-                    return self.handle_module_control_request(ctx.connection_id, frame, request);
+                    let op = module_control_request_op(&request);
+                    let corr = frame.header.corr;
+                    log_control_dispatch_arrival(op, ctx.connection_id, corr);
+                    let result =
+                        self.handle_module_control_request(ctx.connection_id, frame, request);
+                    log_slow_control_dispatch(dispatch_started_at, op, ctx.connection_id, corr);
+                    return result;
                 }
 
                 if is_known_module_request_op(&frame.body) {
@@ -643,8 +669,18 @@ impl ControlHandler {
                         )?])
                     }
                 };
-                self.handle_client_control_request(ctx, frame, request)
-                    .await
+                let op = client_control_request_op(&request);
+                let corr = frame.header.corr;
+                log_control_dispatch_arrival(op, ctx.connection_id, corr);
+                #[cfg(test)]
+                if let Some(delay) = self.control_dispatch_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                let result = self
+                    .handle_client_control_request(ctx, frame, request)
+                    .await;
+                log_slow_control_dispatch(dispatch_started_at, op, ctx.connection_id, corr);
+                result
             }
             FrameType::Push => {
                 let Some(endpoint) = self
@@ -1806,7 +1842,7 @@ impl ControlHandler {
             .list()
             .into_iter()
             .map(|module| {
-                let status = module.status().map_err(|err| {
+                let status = module.status_for_control("list").map_err(|err| {
                     RouterError::backend(
                         0,
                         frame.header.corr,
@@ -1984,7 +2020,7 @@ impl ControlHandler {
             .list()
             .into_iter()
             .map(|module| {
-                let status = module.status().map_err(|err| {
+                let status = module.status_for_control("health").map_err(|err| {
                     RouterError::backend(
                         0,
                         frame.header.corr,
@@ -2721,7 +2757,7 @@ impl ControlHandler {
         self.supervisor
             .get(module_id)
             .map(|module| {
-                let warming = module.is_warming().map_err(|err| {
+                let warming = module.is_warming_for_control("status").map_err(|err| {
                     RouterError::backend(
                         0,
                         corr,
@@ -2730,7 +2766,7 @@ impl ControlHandler {
                         ),
                     )
                 })?;
-                module.status().map_err(|err| {
+                module.status_for_control("status").map_err(|err| {
                     RouterError::backend(
                         0,
                         corr,
@@ -3244,6 +3280,62 @@ fn is_known_module_request_op(body: &[u8]) -> bool {
     serde_json::from_slice::<ControlOpProbe>(body)
         .map(|probe| MODULE_TO_SUBC_CONTROL_OPS.contains(&probe.op.as_str()))
         .unwrap_or(false)
+}
+
+fn log_control_dispatch_arrival(op: &'static str, connection_id: ConnectionId, corr: u64) {
+    debug!(
+        op = %op,
+        connection_id = connection_id.get(),
+        corr,
+        "control dispatch"
+    );
+}
+
+fn log_slow_control_dispatch(
+    dispatch_started_at: Option<StdInstant>,
+    op: &'static str,
+    connection_id: ConnectionId,
+    corr: u64,
+) {
+    let Some(dispatch_started_at) = dispatch_started_at else {
+        return;
+    };
+    let elapsed = dispatch_started_at.elapsed();
+    if elapsed >= SLOW_CONTROL_DISPATCH_THRESHOLD {
+        warn!(
+            op = %op,
+            connection_id = connection_id.get(),
+            corr,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow control dispatch"
+        );
+    }
+}
+
+fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
+    match request {
+        ClientControlRequest::ServerDescribe {} => ops::SERVER_DESCRIBE,
+        ClientControlRequest::CatalogList { .. } => ops::CATALOG_LIST,
+        ClientControlRequest::RouteOpen { .. } => ops::ROUTE_OPEN,
+        ClientControlRequest::RoutePoll { .. } => ops::ROUTE_POLL,
+        ClientControlRequest::SupervisorList {} => ops::SUPERVISOR_LIST,
+        ClientControlRequest::SupervisorRestart { .. } => ops::SUPERVISOR_RESTART,
+        ClientControlRequest::SupervisorReload { .. } => ops::SUPERVISOR_RELOAD,
+        ClientControlRequest::SupervisorRescan { .. } => ops::SUPERVISOR_RESCAN,
+        ClientControlRequest::SupervisorReleaseReserved { .. } => ops::SUPERVISOR_RELEASE_RESERVED,
+        ClientControlRequest::SupervisorSetEnabled { .. } => ops::SUPERVISOR_SET_ENABLED,
+        ClientControlRequest::SupervisorHealthProbe { .. } => ops::SUPERVISOR_HEALTH_PROBE,
+        ClientControlRequest::SupervisorHealth {} => ops::SUPERVISOR_HEALTH,
+        ClientControlRequest::SupervisorRoutes { .. } => ops::SUPERVISOR_ROUTES,
+        ClientControlRequest::SupervisorStderrTail { .. } => ops::SUPERVISOR_STDERR_TAIL,
+        ClientControlRequest::SupervisorTerminals { .. } => ops::SUPERVISOR_TERMINALS,
+    }
+}
+
+fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'static str {
+    match request {
+        ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+    }
 }
 
 fn parse_client_control_request(

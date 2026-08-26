@@ -337,12 +337,16 @@ async fn provenance_json_preserves_the_complete_daemon_response_without_a_footer
     )
     .await;
 
-    let expected = control_rpc_value_on_stream(
+    // First provenance evaluation pays the linux double-hash of the stub
+    // binary; see control_rpc_value_on_stream_within for why 10s is not enough
+    // on a contended CI disk.
+    let expected = control_rpc_value_on_stream_within(
         &mut wait_for_client(&server.connection_file_path).await,
         91,
         ClientControlRequest::SupervisorProvenance {
             module_id: Some("aft".to_string()),
         },
+        Duration::from_secs(120),
     )
     .await;
     let output = ck_with_subc(
@@ -1026,11 +1030,36 @@ async fn control_rpc_value_on_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    control_rpc_value_on_stream_within(stream, corr, request, READ_TIMEOUT).await
+}
+
+/// Same RPC helper with a caller-sized reply window. The provenance op is the
+/// motivating caller: on linux its first evaluation sha256-hashes the running
+/// module executable twice (via /proc and from disk), and a debug-profile stub
+/// on a cold, contended CI disk legitimately exceeds the default 10s — the
+/// ubuntu leg failed 2 of 3 runs on exactly that. The window is sized against
+/// the slowest acceptable progress of the operation, not the median.
+async fn control_rpc_value_on_stream_within<S>(
+    stream: &mut S,
+    corr: u64,
+    request: ClientControlRequest,
+    reply_window: Duration,
+) -> Value
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     write_frame(stream, &control_request_frame(corr, request))
         .await
         .unwrap();
     stream.flush().await.unwrap();
-    let frame = read_frame_timeout(stream).await;
+    let frame = timeout(reply_window, async {
+        read_frame(stream)
+            .await
+            .unwrap()
+            .expect("connection should stay open")
+    })
+    .await
+    .expect("timed out waiting for control RPC reply");
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
     assert_eq!(frame.header.ty, FrameType::Response);

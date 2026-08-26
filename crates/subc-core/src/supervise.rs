@@ -1134,7 +1134,30 @@ impl SupervisedModule {
     }
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
-        let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
+        self.status_with_snapshot_lock(&self.inner.snapshot, None)
+    }
+
+    /// Read status for a channel-0 renderer and report a contended snapshot lock.
+    ///
+    /// Internal supervision callers use [`Self::status`] so writer-side machinery
+    /// does not produce reader-observability logs.
+    pub(crate) fn status_for_control(
+        &self,
+        caller: &'static str,
+    ) -> Result<ModuleStatus, SuperviseError> {
+        self.status_with_snapshot_lock(&self.inner.snapshot, Some(caller))
+    }
+
+    fn status_with_snapshot_lock(
+        &self,
+        snapshot: &SharedSnapshot,
+        caller: Option<&'static str>,
+    ) -> Result<ModuleStatus, SuperviseError> {
+        let snapshot = match caller {
+            Some(caller) => lock_snapshot_for_control(snapshot, &self.inner.module_id, caller)?,
+            None => lock_snapshot(snapshot)?,
+        }
+        .clone();
         let registration_active = self
             .inner
             .registry
@@ -1161,6 +1184,22 @@ impl SupervisedModule {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_snapshot_for_test(
+        &self,
+        acquired: std::sync::mpsc::Sender<()>,
+        hold: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let snapshot = Arc::clone(&self.inner.snapshot);
+        std::thread::spawn(move || {
+            let _guard = snapshot.lock().expect("test snapshot lock is not poisoned");
+            acquired
+                .send(())
+                .expect("test receiver waits for snapshot lock");
+            std::thread::sleep(hold);
+        })
+    }
+
     pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
         let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
         Ok(match snapshot.state {
@@ -1174,8 +1213,29 @@ impl SupervisedModule {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn is_warming(&self) -> Result<bool, SuperviseError> {
-        let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
+        self.is_warming_with_snapshot_lock(None)
+    }
+
+    pub(crate) fn is_warming_for_control(
+        &self,
+        caller: &'static str,
+    ) -> Result<bool, SuperviseError> {
+        self.is_warming_with_snapshot_lock(Some(caller))
+    }
+
+    fn is_warming_with_snapshot_lock(
+        &self,
+        caller: Option<&'static str>,
+    ) -> Result<bool, SuperviseError> {
+        let snapshot = match caller {
+            Some(caller) => {
+                lock_snapshot_for_control(&self.inner.snapshot, &self.inner.module_id, caller)?
+            }
+            None => lock_snapshot(&self.inner.snapshot)?,
+        }
+        .clone();
         Ok(matches!(
             snapshot.state,
             ModuleState::Starting | ModuleState::Running | ModuleState::Restarting
@@ -3882,6 +3942,27 @@ fn update_snapshot(
     })?;
     update(&mut state);
     Ok(())
+}
+
+const SLOW_SNAPSHOT_LOCK_THRESHOLD: Duration = Duration::from_millis(250);
+
+fn lock_snapshot_for_control<'a>(
+    snapshot: &'a SharedSnapshot,
+    module_id: &str,
+    caller: &'static str,
+) -> Result<std::sync::MutexGuard<'a, SupervisorSnapshot>, SuperviseError> {
+    let started_at = Instant::now();
+    let guard = lock_snapshot(snapshot)?;
+    let waited = started_at.elapsed();
+    if waited >= SLOW_SNAPSHOT_LOCK_THRESHOLD {
+        warn!(
+            module_id = %module_id,
+            waited_ms = waited.as_millis() as u64,
+            caller = %caller,
+            "slow snapshot lock"
+        );
+    }
+    Ok(guard)
 }
 
 fn lock_snapshot(

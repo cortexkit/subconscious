@@ -305,6 +305,215 @@ async fn routes_empty_result_has_a_next_step_and_json_has_no_footer() {
     );
 }
 
+#[test]
+fn provenance_requires_exactly_one_module_id_without_connecting() {
+    for args in [
+        vec!["provenance"],
+        vec!["provenance", "--help"],
+        vec!["provenance", "aft", "extra"],
+    ] {
+        let output = ck_command().args(args).output().unwrap();
+        assert_exit(&output, 0);
+        let stdout = text(&output.stdout);
+        assert!(stdout.contains("ck provenance"), "stdout:\n{stdout}");
+        assert!(stdout.contains("usage:"), "stdout:\n{stdout}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_json_preserves_the_complete_daemon_response_without_a_footer() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "aft",
+        vec![
+            ("FAKE_AFT_BUILD_COMMIT", "declared-commit"),
+            ("FAKE_AFT_BUILD_LOCK_DIGEST", "declared-lock"),
+            ("FAKE_AFT_WIRE_CRATE_VERSION", "declared-wire"),
+            ("FAKE_AFT_STORE_SCHEMA_VERSION", "declared-schema"),
+        ],
+    )
+    .await;
+
+    let expected = control_rpc_value_on_stream(
+        &mut wait_for_client(&server.connection_file_path).await,
+        91,
+        ClientControlRequest::SupervisorProvenance {
+            module_id: Some("aft".to_string()),
+        },
+    )
+    .await;
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["--json", "provenance", "aft"],
+    );
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual, expected);
+    assert!(stdout.contains("\"module_declared\""), "stdout:\n{stdout}");
+    assert!(stdout.contains("\"daemon_observed\""), "stdout:\n{stdout}");
+    assert!(!stdout.contains("help["), "stdout:\n{stdout}");
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_human_output_keeps_declared_values_under_the_declared_label() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "aft",
+        vec![
+            ("FAKE_AFT_BUILD_COMMIT", "declared-dirty-dirty"),
+            ("FAKE_AFT_BUILD_LOCK_DIGEST", "declared-lock"),
+            ("FAKE_AFT_WIRE_CRATE_VERSION", "declared-wire"),
+            ("FAKE_AFT_STORE_SCHEMA_VERSION", "declared-schema"),
+        ],
+    )
+    .await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["provenance", "aft"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    let declared_at = stdout
+        .find("MODULE-DECLARED")
+        .unwrap_or_else(|| panic!("stdout:\n{stdout}"));
+    let observed_at = stdout
+        .rfind("DAEMON-OBSERVED")
+        .unwrap_or_else(|| panic!("stdout:\n{stdout}"));
+    assert!(declared_at < observed_at, "stdout:\n{stdout}");
+    let module_declared = &stdout[declared_at..observed_at];
+    let module_observed = &stdout[observed_at..];
+    assert!(
+        module_observed.starts_with("DAEMON-OBSERVED\n  PID:"),
+        "module-level observed section boundary was not verified:\n{module_observed}"
+    );
+    for declared in [
+        "declared-dirty-dirty",
+        "declared-lock",
+        "declared-wire",
+        "declared-schema",
+    ] {
+        let value_at = module_declared
+            .find(declared)
+            .unwrap_or_else(|| panic!("missing {declared:?} in:\n{stdout}"));
+        assert!(
+            value_at < module_declared.len(),
+            "declared value {declared:?} escaped its source section:\n{stdout}"
+        );
+        assert!(
+            !module_observed.contains(declared),
+            "declared value {declared:?} leaked into module-level observed section:\n{module_observed}"
+        );
+    }
+    assert!(stdout.contains("DAEMON BUILD"), "stdout:\n{stdout}");
+    assert_eq!(
+        stdout.matches("DAEMON BUILD").count(),
+        1,
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("MODULE: aft"), "stdout:\n{stdout}");
+    assert!(stdout.contains("PID:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("SPAWN TIME:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("SPAWNED-FROM:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("RUNNING IMAGE:"), "stdout:\n{stdout}");
+    let running_image = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("  RUNNING IMAGE: "))
+        .unwrap_or_else(|| panic!("missing running-image line in:\n{stdout}"));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        assert!(running_image.starts_with("match ("), "stdout:\n{stdout}");
+        let method = running_image
+            .strip_prefix("match (")
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("malformed running-image line:\n{stdout}"));
+        assert!(
+            matches!(method, "linux_proc_sha256" | "macos_spawn_inode"),
+            "unexpected running-image evidence method {method:?}:\n{stdout}"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    assert_eq!(
+        running_image, "unavailable (unsupported_platform)",
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("commit match only"), "stdout:\n{stdout}");
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_hostile_declared_values_are_refused_before_rendering() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let _module = supervisor
+        .spawn(stub_spec_with_env(
+            "aft",
+            vec![
+                ("FAKE_AFT_BUILD_COMMIT", "\u{1b}]52;c;AAAA\u{07}"),
+                ("FAKE_AFT_BUILD_LOCK_DIGEST", "\u{1b}[2J"),
+            ],
+        ))
+        .unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, "aft", |entry| {
+        entry.state == "failed" && !entry.live
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_renders_unverifiable_and_lock_only_declarations() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let unverifiable = spawn_stub(&server, &supervisor, "unverifiable").await;
+    let lock_only = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "lock-only",
+        vec![("FAKE_AFT_BUILD_LOCK_DIGEST", "declared-lock-only")],
+    )
+    .await;
+
+    let absent = ck_with_subc(&server.connection_file_path, ["provenance", "unverifiable"]);
+    assert_exit(&absent, 0);
+    assert!(
+        text(&absent.stdout).contains("unverifiable"),
+        "stdout:\n{}",
+        text(&absent.stdout)
+    );
+
+    let lock_only_output = ck_with_subc(&server.connection_file_path, ["provenance", "lock-only"]);
+    assert_exit(&lock_only_output, 0);
+    assert!(
+        text(&lock_only_output.stdout).contains("change-detectable; commit identity unavailable"),
+        "stdout:\n{}",
+        text(&lock_only_output.stdout)
+    );
+
+    unverifiable.stop().await.unwrap();
+    lock_only.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_unknown_module_preserves_the_daemon_error_and_exit_code() {
+    let server = TestServer::start().await;
+
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["provenance", "missing-module"],
+    );
+    assert_exit(&output, 1);
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("unknown_module"), "stderr:\n{stderr}");
+    assert!(stderr.contains("missing-module"), "stderr:\n{stderr}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_module_error_has_a_next_step_and_json_has_no_footer() {
     let server = TestServer::start().await;
@@ -617,12 +826,40 @@ async fn spawn_stub(
     module
 }
 
+async fn spawn_stub_with_env(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+    env: Vec<(&str, &str)>,
+) -> SupervisedModule {
+    let mut spec = stub_spec(module_id);
+    spec.env.extend(
+        env.into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+    );
+    let module = supervisor.spawn(spec).unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {
+        entry.state == "running" && entry.enabled && entry.live
+    })
+    .await;
+    module
+}
+
 fn stub_spec(module_id: &str) -> ModuleSpec {
+    stub_spec_with_env(module_id, Vec::new())
+}
+
+fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
     ModuleSpec {
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),
-        env: vec![("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())],
+        env: std::iter::once(("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()))
+            .chain(
+                env.into_iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
+            )
+            .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
     }
@@ -779,6 +1016,25 @@ where
         ),
         ty => panic!("unexpected control RPC frame type: {ty:?}"),
     }
+}
+
+async fn control_rpc_value_on_stream<S>(
+    stream: &mut S,
+    corr: u64,
+    request: ClientControlRequest,
+) -> Value
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(stream, &control_request_frame(corr, request))
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_frame_timeout(stream).await;
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    assert_eq!(frame.header.ty, FrameType::Response);
+    serde_json::from_slice(&frame.body).unwrap()
 }
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {

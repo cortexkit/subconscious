@@ -30,6 +30,12 @@ impl Deref for TestServer {
     }
 }
 
+fn assert_current_process_facts_cleared(status: &ModuleStatus) {
+    assert_eq!(status.pid, None);
+    assert_eq!(status.spawned_at_ms, None);
+    assert_eq!(status.spawned_from, None);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_registers_stub_and_reports_running() {
     let server = TestServer::start().await;
@@ -56,6 +62,69 @@ async fn spawn_registers_stub_and_reports_running() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_records_exact_process_facts() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-spawn-facts";
+    let spec = stub_spec(&server, module_id, std::iter::empty::<(&str, &str)>());
+    let expected_program = spec.program.clone();
+    let before_spawn_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let module = supervisor.spawn(spec).unwrap();
+    let after_spawn_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    wait_for_registration(&server.registry, module_id, Duration::from_secs(10)).await;
+
+    let first = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Running && status.live
+    })
+    .await;
+    assert!(first.pid.is_some(), "running child PID must be retained");
+    assert_ne!(first.spawned_at_ms, Some(0));
+    assert!(
+        first.spawned_at_ms.unwrap() >= before_spawn_ms
+            && first.spawned_at_ms.unwrap() <= after_spawn_ms,
+        "spawn time must be captured around Supervisor::spawn: {first:?}"
+    );
+    assert_eq!(first.spawned_from, Some(expected_program.clone()));
+
+    let before_restart_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    module.restart(None).await.unwrap();
+    let restarted = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Running && status.live && status.pid != first.pid
+    })
+    .await;
+    let after_restart_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_ne!(restarted.pid, first.pid);
+    assert!(
+        restarted.spawned_at_ms.unwrap() >= before_restart_ms
+            && restarted.spawned_at_ms.unwrap() <= after_restart_ms,
+        "restart must replace the spawn timestamp: {restarted:?}"
+    );
+    assert!(restarted.spawned_at_ms.unwrap() > first.spawned_at_ms.unwrap());
+    assert_eq!(restarted.spawned_from, Some(expected_program));
+
+    module.stop().await.unwrap();
+    let stopped = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Stopped && !status.process_alive
+    })
+    .await;
+    assert_eq!(stopped.pid, None);
+    assert_eq!(stopped.spawned_at_ms, None);
+    assert_eq!(stopped.spawned_from, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_restarts_and_reregisters_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 5, Duration::from_millis(20));
@@ -75,6 +144,27 @@ async fn crash_restarts_and_reregisters_stub() {
     assert!(status.process_alive);
     assert!(status.registration_active);
     assert!(status.restart_count >= 1);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_clears_current_process_facts_before_replacement() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(250));
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "fake-aft-crash-clears-process-facts",
+        [("FAKE_AFT_CRASH_AFTER_MS", "100")],
+    )
+    .await;
+
+    let restarting = wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Restarting && !status.process_alive
+    })
+    .await;
+    assert_current_process_facts_cleared(&restarting);
 
     module.stop().await.unwrap();
 }
@@ -141,7 +231,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
     );
     assert!(failed.enabled);
     assert!(!failed.process_alive);
-    assert_eq!(failed.pid, None);
+    assert_current_process_facts_cleared(&failed);
     assert!(
         matches!(second, Err(SuperviseError::Spawn { .. })),
         "second enable must retry spawning instead of returning {second:?}"
@@ -198,10 +288,11 @@ async fn restart_and_reload_are_rejected_for_a_disabled_module() {
     // Disable it, then confirm restart and reload both refuse.
     let changed = module.set_enabled(false).await.unwrap();
     assert!(changed, "module should transition from enabled to disabled");
-    wait_for_status(&module, Duration::from_secs(3), |status| {
+    let disabled = wait_for_status(&module, Duration::from_secs(3), |status| {
         status.state == ModuleState::Disabled && !status.process_alive
     })
     .await;
+    assert_current_process_facts_cleared(&disabled);
 
     let restart_err = module
         .restart(None)
@@ -478,6 +569,7 @@ async fn clean_exit_keeps_supervision_task_alive_for_operator_restart() {
     })
     .await;
     assert!(!stopped.live);
+    assert_current_process_facts_cleared(&stopped);
 
     // The load-bearing assertion: the supervision task must still answer
     // commands after the clean exit, and restart must fully revive the module.

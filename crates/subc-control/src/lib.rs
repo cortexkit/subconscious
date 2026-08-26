@@ -7,9 +7,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use subc_protocol::{
-    manifest::{CapabilityDeclarations, ProviderRole},
+    manifest::{CapabilityDeclarations, ManifestProvenance, ProviderRole},
     session::HealthStatus,
     BindIdentity, RouteTarget,
 };
@@ -55,6 +57,7 @@ pub mod ops {
     pub const SUPERVISOR_STDERR_TAIL: &str = "supervisor.stderr_tail";
     pub const SUPERVISOR_TERMINALS: &str = "supervisor.terminals";
     pub const SUPERVISOR_ROUTES: &str = "supervisor.routes";
+    pub const SUPERVISOR_PROVENANCE: &str = "supervisor.provenance";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -177,6 +180,13 @@ pub enum ClientControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         module_id: Option<String>,
     },
+    /// Report source-tagged provenance for supervised modules, optionally narrowed
+    /// to one module.
+    #[serde(rename = "supervisor.provenance")]
+    SupervisorProvenance {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module_id: Option<String>,
+    },
     /// Retained stderr for one module.
     ///
     /// A separate op rather than a field on `supervisor.list`: the tail is
@@ -287,6 +297,11 @@ pub enum ClientControlResponse {
     },
     #[serde(rename = "supervisor.routes")]
     SupervisorRoutes { modules: Vec<SupervisorRouteModule> },
+    #[serde(rename = "supervisor.provenance")]
+    SupervisorProvenance {
+        daemon: SupervisorDaemonProvenance,
+        modules: Vec<SupervisorModuleProvenance>,
+    },
     #[serde(rename = "supervisor.stderr_tail")]
     SupervisorStderrTail {
         module_id: String,
@@ -385,6 +400,98 @@ pub struct SupervisorRoute {
     /// never as not-draining.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_reason: Option<RouteCloseReason>,
+}
+
+/// Source-tagged provenance for one supervised module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorModuleProvenance {
+    pub module_id: String,
+    pub module_declared: ModuleDeclaredProvenance,
+    pub daemon_observed: SupervisorObservedProcess,
+}
+
+/// A module's declared build metadata, if its HELLO manifest carried it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ModuleDeclaredProvenance {
+    Reported { build: ManifestProvenance },
+    Unverifiable,
+}
+
+/// Process facts observed by the daemon for a supervised module.
+///
+/// Build claims remain under `module_declared`; mixing them here would imply the
+/// daemon independently observed module-provided metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorObservedProcess {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_from: Option<PathBuf>,
+    pub running_image: RunningImageAgreement,
+}
+
+/// Daemon provenance paired with its runtime process observation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorDaemonProvenance {
+    pub daemon_build: DaemonBuildProvenance,
+    pub daemon_observed: DaemonObservedProcess,
+}
+
+/// Build metadata embedded in the daemon binary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonBuildProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_git_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_lock_digest: Option<String>,
+}
+
+/// Runtime process facts observed for the daemon itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonObservedProcess {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    pub running_image: RunningImageAgreement,
+}
+
+/// Whether the executable currently running agrees with the spawned image.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RunningImageAgreement {
+    Match {
+        evidence: RunningImageEvidence,
+    },
+    Mismatch {
+        running: RunningImageEvidence,
+        disk: RunningImageEvidence,
+    },
+    Unavailable {
+        reason: RunningImageUnavailableReason,
+    },
+}
+
+/// Platform-specific evidence used to compare a running image with its spawn path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum RunningImageEvidence {
+    LinuxProcSha256 { digest: String },
+    MacosSpawnInode { device: u64, inode: u64 },
+}
+
+/// Closed reasons why an executable identity could not be observed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunningImageUnavailableReason {
+    NotRunning,
+    UnsupportedPlatform,
+    RunningExecutableUnreadable,
+    SpawnedPathUnreadable,
+    HashFailed,
 }
 
 /// The identity tier the daemon can honestly report for a route consumer.

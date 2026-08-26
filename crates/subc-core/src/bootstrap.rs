@@ -7,7 +7,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs4::{FileExt, TryLockError};
@@ -35,8 +35,6 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_SUBC_PORT: u16 = 8757;
 pub const SUBC_PORT_ENV: &str = "SUBC_PORT";
@@ -438,6 +436,12 @@ async fn serve_bound_daemon(
                 .map(|ms| (module.module_id.clone(), Duration::from_millis(ms)))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
+    let control_started_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_process_liveness(process_liveness)
         .with_supervisor(supervisor_handle)
@@ -445,6 +449,13 @@ async fn serve_bound_daemon(
         .with_storage_config(storage_config)
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
+        .with_daemon_provenance(
+            bound.connection_info.pid,
+            control_started_at_ms,
+            std::env::current_exe().ok(),
+            normalized_build_provenance(env!("SUBC_BUILD_GIT_SHA")),
+            normalized_build_provenance(env!("SUBC_BUILD_LOCK_DIGEST")),
+        )
         .with_capability_config(
             configured_modules
                 .iter()
@@ -525,6 +536,13 @@ async fn serve_bound_daemon(
         .await
         .map_err(BootstrapError::ServeJoin)?
         .map_err(BootstrapError::Serve)
+}
+
+fn normalized_build_provenance(value: &str) -> Option<String> {
+    match value.trim() {
+        "" | "unavailable" => None,
+        value => Some(value.to_string()),
+    }
 }
 
 /// Find an existing daemon or atomically bind loopback TCP for this daemon.
@@ -1012,6 +1030,17 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn normalized_build_provenance_preserves_real_values() {
+        assert_eq!(normalized_build_provenance("abc"), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn normalized_build_provenance_omits_unavailable_and_empty_values() {
+        assert_eq!(normalized_build_provenance("unavailable"), None);
+        assert_eq!(normalized_build_provenance(""), None);
+    }
 
     struct EnvGuard {
         key: &'static str,

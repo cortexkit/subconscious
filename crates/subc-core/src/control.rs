@@ -9,16 +9,17 @@ use std::{
 use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
-    ClientControlResponse, ConsumerIdentity, PollKind, RouteCloseReason, StderrCaptureState,
-    StderrTail, StderrTailEntry, SupervisorEntry, SupervisorHealthEntry, SupervisorRescanResult,
-    SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule, TerminalEntry,
-    TerminalHistory,
+    ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess,
+    ModuleDeclaredProvenance, PollKind, RouteCloseReason, StderrCaptureState, StderrTail,
+    StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry, SupervisorHealthEntry,
+    SupervisorModuleProvenance, SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute,
+    SupervisorRouteConsumer, SupervisorRouteModule, TerminalEntry, TerminalHistory,
 };
 use subc_protocol::{
     error_codes,
     manifest::{
-        validate_hello_capability_grammar, CapabilityDeclarations, Concurrency, ModuleManifest,
-        ProviderRole,
+        validate_hello_capability_grammar, CapabilityDeclarations, Concurrency, ManifestProvenance,
+        ModuleManifest, ProviderRole,
     },
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -41,6 +42,7 @@ use crate::{
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
         PendingModuleControlRpc, RouteBindRelayOutcome, RoutePollSnapshot, RouteRelease,
     },
+    provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
     stderr_tail::{CaptureState, TailEntry},
@@ -79,6 +81,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_STDERR_TAIL,
     ops::SUPERVISOR_TERMINALS,
     ops::SUPERVISOR_ROUTES,
+    ops::SUPERVISOR_PROVENANCE,
 ];
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[MODULE_TO_SUBC_OP_CATALOG_UPDATE];
@@ -95,6 +98,32 @@ const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_CONTROL_DISPATCH_THRESHOLD: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct DaemonProvenanceFacts {
+    build: DaemonBuildProvenance,
+    pid: Option<u32>,
+    started_at_ms: Option<u64>,
+    executable_path: Option<PathBuf>,
+    executable_identity: Option<SpawnedFileIdentity>,
+    probe: ExecutableIdentityProbe,
+}
+
+impl Default for DaemonProvenanceFacts {
+    fn default() -> Self {
+        Self {
+            build: DaemonBuildProvenance {
+                build_git_sha: None,
+                build_lock_digest: None,
+            },
+            pid: None,
+            started_at_ms: None,
+            executable_path: None,
+            executable_identity: None,
+            probe: ExecutableIdentityProbe::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SupervisorRescanContext {
@@ -132,8 +161,11 @@ pub struct ControlHandler {
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
     capability_evaluator: Arc<CapabilityRequirementEvaluator>,
+    daemon_provenance: DaemonProvenanceFacts,
     #[cfg(test)]
     control_dispatch_delay: Option<Duration>,
+    #[cfg(test)]
+    provenance_probe_override: Option<subc_control::RunningImageAgreement>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -259,8 +291,11 @@ impl ControlHandler {
             connected_clients: ConnectedClients::new(),
             counters,
             capability_evaluator: Arc::new(CapabilityRequirementEvaluator::new()),
+            daemon_provenance: DaemonProvenanceFacts::default(),
             #[cfg(test)]
             control_dispatch_delay: None,
+            #[cfg(test)]
+            provenance_probe_override: None,
         }
     }
 
@@ -341,6 +376,35 @@ impl ControlHandler {
 
     pub fn with_supervisor(mut self, supervisor: SupervisorHandle) -> Self {
         self.supervisor = supervisor;
+        self
+    }
+
+    pub fn with_daemon_provenance(
+        mut self,
+        pid: u32,
+        started_at_ms: u64,
+        executable_path: Option<PathBuf>,
+        build_git_sha: Option<String>,
+        build_lock_digest: Option<String>,
+    ) -> Self {
+        let executable_identity = executable_path.as_deref().and_then(spawned_file_identity);
+        self.daemon_provenance = DaemonProvenanceFacts {
+            build: DaemonBuildProvenance {
+                build_git_sha,
+                build_lock_digest,
+            },
+            pid: Some(pid),
+            started_at_ms: Some(started_at_ms),
+            executable_path,
+            executable_identity,
+            probe: ExecutableIdentityProbe::default(),
+        };
+        self
+    }
+
+    #[cfg(test)]
+    fn with_provenance_probe_result(mut self, result: subc_control::RunningImageAgreement) -> Self {
+        self.provenance_probe_override = Some(result);
         self
     }
 
@@ -926,6 +990,18 @@ impl ControlHandler {
                 err.to_string(),
             )?]);
         }
+        if let Some(provenance) = hello_value
+            .get("manifest")
+            .and_then(|manifest| manifest.get("provenance"))
+        {
+            if let Err(err) = serde_json::from_value::<ManifestProvenance>(provenance.clone()) {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_manifest",
+                    format!("malformed manifest provenance: {err}"),
+                )?]);
+            }
+        }
         let hello = match serde_json::from_value::<ModuleHelloBody>(hello_value) {
             Ok(hello) => hello,
             Err(err) => {
@@ -1225,6 +1301,9 @@ impl ControlHandler {
             ClientControlRequest::SupervisorHealth {} => self.handle_supervisor_health(frame),
             ClientControlRequest::SupervisorRoutes { module_id } => {
                 self.handle_supervisor_routes(frame, module_id)
+            }
+            ClientControlRequest::SupervisorProvenance { module_id } => {
+                self.handle_supervisor_provenance(frame, module_id).await
             }
             ClientControlRequest::SupervisorStderrTail {
                 module_id,
@@ -2006,6 +2085,82 @@ impl ControlHandler {
             &frame,
             &response,
             "ClientControlResponse::SupervisorRoutes",
+        )?])
+    }
+
+    async fn handle_supervisor_provenance(
+        &self,
+        frame: Frame,
+        module_id: Option<String>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let mut selected = if let Some(module_id) = module_id {
+            let Some(module) = self.supervisor.get(&module_id) else {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "unknown_module",
+                    format!("module_id '{module_id}' is not supervised"),
+                )?]);
+            };
+            vec![module]
+        } else {
+            self.supervisor.list()
+        };
+
+        let mut modules = Vec::with_capacity(selected.len());
+        for module in selected.drain(..) {
+            let status = module.status().map_err(|err| {
+                RouterError::backend(
+                    0,
+                    frame.header.corr,
+                    format!("failed to read supervisor status: {err}"),
+                )
+            })?;
+            let module_declared = self
+                .registry
+                .get_module(&status.module_id)
+                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+                .and_then(|registration| registration.manifest.provenance)
+                .map(|build| ModuleDeclaredProvenance::Reported { build })
+                .unwrap_or(ModuleDeclaredProvenance::Unverifiable);
+            #[cfg(test)]
+            let running_image = match &self.provenance_probe_override {
+                Some(result) => result.clone(),
+                None => module.running_image_agreement().await,
+            };
+            #[cfg(not(test))]
+            let running_image = module.running_image_agreement().await;
+            modules.push(SupervisorModuleProvenance {
+                module_id: status.module_id,
+                module_declared,
+                daemon_observed: SupervisorObservedProcess {
+                    pid: status.pid,
+                    spawned_at_ms: status.spawned_at_ms,
+                    spawned_from: status.spawned_from,
+                    running_image,
+                },
+            });
+        }
+        let daemon = SupervisorDaemonProvenance {
+            daemon_build: self.daemon_provenance.build.clone(),
+            daemon_observed: DaemonObservedProcess {
+                pid: self.daemon_provenance.pid,
+                started_at_ms: self.daemon_provenance.started_at_ms,
+                running_image: self
+                    .daemon_provenance
+                    .probe
+                    .observe(
+                        self.daemon_provenance.pid,
+                        self.daemon_provenance.executable_path.as_deref(),
+                        self.daemon_provenance.executable_identity,
+                    )
+                    .await,
+            },
+        };
+        let response = ClientControlResponse::SupervisorProvenance { daemon, modules };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorProvenance",
         )?])
     }
 
@@ -3315,6 +3470,7 @@ fn log_slow_control_dispatch(
 fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
     match request {
         ClientControlRequest::ServerDescribe {} => ops::SERVER_DESCRIBE,
+        ClientControlRequest::SupervisorProvenance { .. } => ops::SUPERVISOR_PROVENANCE,
         ClientControlRequest::CatalogList { .. } => ops::CATALOG_LIST,
         ClientControlRequest::RouteOpen { .. } => ops::ROUTE_OPEN,
         ClientControlRequest::RoutePoll { .. } => ops::ROUTE_POLL,
@@ -4033,6 +4189,7 @@ mod tests {
                 },
             },
             capabilities: None,
+            provenance: None,
         }
     }
 
@@ -6620,6 +6777,39 @@ mod tests {
         assert_eq!(response[0].header.ty, FrameType::Error);
         assert_eq!(response[0].header.corr, 55);
         assert_eq!(parse_error(&response[0])["code"], "unknown_control_op");
+    }
+
+    #[tokio::test]
+    async fn supervisor_provenance_rejects_unknown_exact_module() {
+        let handler = ControlHandler::default();
+        let (ctx, _rx) = route_ctx(ConnectionId::new(79));
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            57,
+            br#"{"op":"supervisor.provenance","module_id":"missing"}"#.to_vec(),
+        )
+        .unwrap();
+
+        let response = handler.handle_control_frame(&ctx, request).await.unwrap();
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        assert_eq!(response[0].header.corr, 57);
+        let error = parse_error(&response[0]);
+        assert_eq!(error["code"], "unknown_module");
+        assert_eq!(error["message"], "module_id 'missing' is not supervised");
+    }
+
+    #[test]
+    fn provenance_probe_override_keeps_handler_tests_deterministic() {
+        let expected = subc_control::RunningImageAgreement::Unavailable {
+            reason: subc_control::RunningImageUnavailableReason::HashFailed,
+        };
+        let handler = ControlHandler::default().with_provenance_probe_result(expected.clone());
+        assert_eq!(handler.provenance_probe_override, Some(expected));
     }
 
     #[tokio::test]

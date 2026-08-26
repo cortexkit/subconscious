@@ -1,6 +1,6 @@
 [package]
 name = "subc-control"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 publish = true
 description = "Client-facing subc control-plane wire shapes."

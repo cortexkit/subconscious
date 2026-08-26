@@ -16,5 +16,6 @@ fn manifest_is_emitted_offline_without_module_setup() {
     let manifest: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("manifest JSON");
     assert_eq!(manifest["runtime_computed"], serde_json::json!([]));
+    assert!(manifest.get("provenance").is_none());
     assert_eq!(manifest["module_id"], "ck-subc-mcp");
 }

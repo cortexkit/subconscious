@@ -97,15 +97,23 @@ pub struct CapabilityDeclarations {
 /// served together via `supervisor.provenance` and never merged.
 ///
 /// Honesty contract for constructors (ruled with the first adopters):
-/// - Every field is a VERIFIED-AT-BUILD claim. Populate `build_git_sha` only
-///   from a value injected by the build/release pipeline (`CK_BUILD_REV` via
-///   `option_env!` guarded by the packaging path, or build.rs equivalent) —
-///   never from ambient env at an arbitrary consumer compile, which mints a
-///   provenance claim from an accident of whoever ran cargo.
+/// - Every field is a VERIFIED-AT-BUILD claim. No field is required: a module
+///   may declare any subset, and omitting an inapplicable field is the honest
+///   choice rather than inventing a value to fill it. Populate `build_git_sha`
+///   only from a value injected by the build/release pipeline (`CK_BUILD_REV`
+///   via `option_env!` guarded by the packaging path, or build.rs equivalent)
+///   — never from ambient env at an arbitrary consumer compile, which mints a
+///   provenance claim from an accident of whoever ran cargo. A builder that
+///   can determine whether the tree was clean may declare the sha regardless
+///   of whether a release pipeline exists.
 /// - Dirty or unstamped builds declare `None` for the affected fields. A
 ///   populated field stops the reader asking; absent-and-honest beats
-///   present-and-best-effort, and the daemon renders absence as
-///   `declared_absent` rather than inventing a value.
+///   present-and-best-effort. Absence is reported at two levels with two
+///   distinct words: a module that declared no provenance block at all reads
+///   `unverifiable`, while an omitted field inside a declared block is
+///   dropped from the wire and reads `unavailable`. So omitting a field never
+///   costs a module its `Reported` status -- declaration is decided by
+///   whether the manifest carried a block, not by which fields it filled.
 /// - Dirty-tree stamps, where a pipeline chooses to emit them, append
 ///   `-dirty` to the sha (the reader must treat that as commit-match-only,
 ///   code-match unproven — the same downgrade `ck`'s skew detector applies).

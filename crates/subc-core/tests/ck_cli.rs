@@ -422,8 +422,27 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     assert!(stdout.contains("SPAWN TIME:"), "stdout:\n{stdout}");
     assert!(stdout.contains("SPAWNED-FROM:"), "stdout:\n{stdout}");
     assert!(stdout.contains("RUNNING IMAGE:"), "stdout:\n{stdout}");
-    assert!(stdout.contains("RUNNING IMAGE: match"), "stdout:\n{stdout}");
-    assert!(stdout.contains("linux_proc_sha256"), "stdout:\n{stdout}");
+    let running_image = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("  RUNNING IMAGE: "))
+        .unwrap_or_else(|| panic!("missing running-image line in:\n{stdout}"));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        assert!(running_image.starts_with("match ("), "stdout:\n{stdout}");
+        let method = running_image
+            .strip_prefix("match (")
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("malformed running-image line:\n{stdout}"));
+        assert!(
+            matches!(method, "linux_proc_sha256" | "macos_spawn_inode"),
+            "unexpected running-image evidence method {method:?}:\n{stdout}"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    assert_eq!(
+        running_image, "unavailable (unsupported_platform)",
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("commit match only"), "stdout:\n{stdout}");
 
     module.stop().await.unwrap();

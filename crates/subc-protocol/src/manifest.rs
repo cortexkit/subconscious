@@ -109,6 +109,17 @@ pub struct CapabilityDeclarations {
 /// - Dirty-tree stamps, where a pipeline chooses to emit them, append
 ///   `-dirty` to the sha (the reader must treat that as commit-match-only,
 ///   code-match unproven — the same downgrade `ck`'s skew detector applies).
+///   Stricter is better: cerebellum's build.rs reports the commit ONLY when
+///   the tree was clean, on the argument that dirty bytes match no commit and
+///   a precise-looking wrong answer beats absence at being believed.
+/// - Two silent-when-wrong checks for any build-rev embedder (CEREB): does
+///   the builder know whether the tree was clean, and can its no-git sentinel
+///   (source-tarball builds) escape into a field parsed as a sha? Sentinels
+///   render as absence, never as a value.
+/// - Fill fields FROM THE BUILD only: reading Cargo.lock or the wire crate
+///   version inside the manifest constructor describes the source tree
+///   sitting beside the running binary, not the binary — the exact claim
+///   this struct exists to avoid.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]

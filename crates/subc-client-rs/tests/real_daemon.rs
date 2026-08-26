@@ -1606,6 +1606,7 @@ fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifes
             },
         },
         capabilities: None,
+        provenance: None,
     }
 }
 

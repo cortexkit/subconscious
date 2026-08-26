@@ -2020,7 +2020,7 @@ async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError>
 /// nothing, and that prints as unverifiable rather than as a match -- absence
 /// of the check must not read as the check passing.
 fn print_build_skew(describe: &Value) {
-    let cli_sha = env!("SUBC_BUILD_GIT_SHA");
+    let cli_sha = env!("CK_BUILD_REV");
     let daemon_sha = describe.get("build_git_sha").and_then(Value::as_str);
     match daemon_sha {
         None => println!(

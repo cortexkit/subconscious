@@ -92,6 +92,23 @@ pub struct CapabilityDeclarations {
     pub must_never_reach: Vec<String>,
 }
 
+/// Build facts a module DECLARES about its own binary at HELLO. The daemon
+/// overlays process-identity evidence it alone can attest; the two halves are
+/// served together via `supervisor.provenance` and never merged.
+///
+/// Honesty contract for constructors (ruled with the first adopters):
+/// - Every field is a VERIFIED-AT-BUILD claim. Populate `build_git_sha` only
+///   from a value injected by the build/release pipeline (`CK_BUILD_REV` via
+///   `option_env!` guarded by the packaging path, or build.rs equivalent) —
+///   never from ambient env at an arbitrary consumer compile, which mints a
+///   provenance claim from an accident of whoever ran cargo.
+/// - Dirty or unstamped builds declare `None` for the affected fields. A
+///   populated field stops the reader asking; absent-and-honest beats
+///   present-and-best-effort, and the daemon renders absence as
+///   `declared_absent` rather than inventing a value.
+/// - Dirty-tree stamps, where a pipeline chooses to emit them, append
+///   `-dirty` to the sha (the reader must treat that as commit-match-only,
+///   code-match unproven — the same downgrade `ck`'s skew detector applies).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]

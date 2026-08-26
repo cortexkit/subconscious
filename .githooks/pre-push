@@ -36,6 +36,11 @@ if [ "${range_bumps:-0}" -gt 0 ]; then
     | grep -E '^(diff --git|\+version = )' | sed 's|diff --git a/|  |;s| b/.*||' >&2
   echo "  EVERY path-dep sibling's committed lock is stale from this moment." >&2
   echo "  Fan out now: bash scripts/fleet/check-sibling-locks.sh for the list," >&2
-  echo "  then peer-notify owners (fix: cargo update -w; gates; commit lock)." >&2
+  echo "  then peer-notify owners. Fix recipe to send: cargo update -w against" >&2
+  echo "  the ON-DISK sibling after checking its declared version -- never an" >&2
+  echo "  unconditional pull (the shared checkout may hold others' WIP; a clean" >&2
+  echo "  merge over it is a silent failure). Name any NEWLY REQUIRED fields in" >&2
+  echo "  the notice so mid-task workers don't satisfy the compiler with values" >&2
+  echo "  that aren't true." >&2
 fi
 exit 0

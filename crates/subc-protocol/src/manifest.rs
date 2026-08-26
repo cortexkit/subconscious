@@ -34,6 +34,23 @@ pub struct ModuleManifest {
     pub provenance: Option<ManifestProvenance>,
 }
 
+/// DELIBERATELY LENIENT: unknown top-level manifest keys are DROPPED at this
+/// parse boundary, not rejected and not retained. This is forward
+/// compatibility across version skew — a module built against a newer
+/// subc-protocol must still HELLO into an older daemon, and strictness here
+/// would turn every additive manifest field into a daemon-first flag day.
+/// The costs, so nobody re-derives them the hard way (CEREB found both):
+/// - A key you add module-side is INVISIBLE to the daemon until a typed field
+///   lands here. Producing it is honest; assuming a daemon-side reader exists
+///   is not. Say who the audience is next to any such producer.
+/// - There is deliberately NO untyped extension bag on this struct: a
+///   retained-verbatim Value map becomes an unversioned de-facto wire
+///   contract nobody authored (the drift class module-owned payload crates
+///   exist to prevent). When a daemon consumer materializes for a fact, the
+///   fact gets a typed optional field with a CONSUMER-IMPACT commit instead.
+///
+/// `CapabilityDeclarations` below is strict by contrast because claims are
+/// routed on: an unparseable claim must refuse loudly, never partially apply.
 #[derive(Deserialize)]
 struct ModuleManifestWire {
     module_id: String,
@@ -97,15 +114,23 @@ pub struct CapabilityDeclarations {
 /// served together via `supervisor.provenance` and never merged.
 ///
 /// Honesty contract for constructors (ruled with the first adopters):
-/// - Every field is a VERIFIED-AT-BUILD claim. Populate `build_git_sha` only
-///   from a value injected by the build/release pipeline (`CK_BUILD_REV` via
-///   `option_env!` guarded by the packaging path, or build.rs equivalent) —
-///   never from ambient env at an arbitrary consumer compile, which mints a
-///   provenance claim from an accident of whoever ran cargo.
+/// - Every field is a VERIFIED-AT-BUILD claim. No field is required: a module
+///   may declare any subset, and omitting an inapplicable field is the honest
+///   choice rather than inventing a value to fill it. Populate `build_git_sha`
+///   only from a value injected by the build/release pipeline (`CK_BUILD_REV`
+///   via `option_env!` guarded by the packaging path, or build.rs equivalent)
+///   — never from ambient env at an arbitrary consumer compile, which mints a
+///   provenance claim from an accident of whoever ran cargo. A builder that
+///   can determine whether the tree was clean may declare the sha regardless
+///   of whether a release pipeline exists.
 /// - Dirty or unstamped builds declare `None` for the affected fields. A
 ///   populated field stops the reader asking; absent-and-honest beats
-///   present-and-best-effort, and the daemon renders absence as
-///   `declared_absent` rather than inventing a value.
+///   present-and-best-effort. Absence is reported at two levels with two
+///   distinct words: a module that declared no provenance block at all reads
+///   `unverifiable`, while an omitted field inside a declared block is
+///   dropped from the wire and reads `unavailable`. So omitting a field never
+///   costs a module its `Reported` status -- declaration is decided by
+///   whether the manifest carried a block, not by which fields it filled.
 /// - Dirty-tree stamps, where a pipeline chooses to emit them, append
 ///   `-dirty` to the sha (the reader must treat that as commit-match-only,
 ///   code-match unproven — the same downgrade `ck`'s skew detector applies).

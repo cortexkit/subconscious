@@ -3470,6 +3470,7 @@ fn log_slow_control_dispatch(
 fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
     match request {
         ClientControlRequest::ServerDescribe {} => ops::SERVER_DESCRIBE,
+        ClientControlRequest::SupervisorProvenance { .. } => ops::SUPERVISOR_PROVENANCE,
         ClientControlRequest::CatalogList { .. } => ops::CATALOG_LIST,
         ClientControlRequest::RouteOpen { .. } => ops::ROUTE_OPEN,
         ClientControlRequest::RoutePoll { .. } => ops::ROUTE_POLL,

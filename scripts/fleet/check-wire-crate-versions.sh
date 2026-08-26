@@ -32,6 +32,16 @@ if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
   exit 2
 fi
 
+# Resolvability is not comparability (#72): a shallow checkout or a merge
+# commit fetched without its history can hold a ref that RESOLVES while
+# `$BASE...HEAD` has NO MERGE BASE -- every diff then fails, and a swallowed
+# failure reads as "unchanged", which composes into a confident all-clear over
+# zero comparisons. Prove the comparison is possible before counting anything.
+if ! git merge-base "$BASE" HEAD >/dev/null 2>&1; then
+  echo "  no merge base between '$BASE' and HEAD (shallow checkout?) -- cannot compare, refusing rather than passing" >&2
+  exit 2
+fi
+
 # The crates other repos actually path-depend on. Derived by sweeping sibling
 # manifests for `path = "../subconscious/crates/<name>"` rather than assumed;
 # re-derive with that sweep rather than editing from memory.
@@ -60,12 +70,21 @@ for crate in "${CRATES[@]}"; do
   src="crates/$crate/src"
   manifest="crates/$crate/Cargo.toml"
   [ -d "$src" ] || continue
-  examined=$((examined + 1))
 
   # Every added/removed line under src/, minus the diff's own +++/--- headers.
   # A rename or a pure move shows up here too, which is correct: a consumer
-  # compiles the result either way.
-  changed=$(git diff "$BASE"...HEAD -- "$src" \
+  # compiles the result either way. The diff's OWN failure must stay separate
+  # from its empty output (#72): capture the exit code before filtering, and
+  # count the crate as examined only once its comparison actually ran.
+  raw_diff=$(git diff "$BASE"...HEAD -- "$src" 2>&1)
+  diff_rc=$?
+  if [ "$diff_rc" -ne 0 ]; then
+    echo "  $crate: git diff failed (rc=$diff_rc): $raw_diff" >&2
+    echo "  a failed comparison is not an unchanged crate -- refusing" >&2
+    exit 2
+  fi
+  examined=$((examined + 1))
+  changed=$(printf '%s\n' "$raw_diff" \
     | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true)
   [ -z "$changed" ] && continue
 
@@ -78,8 +97,14 @@ for crate in "${CRATES[@]}"; do
     | grep -vE '^[[:space:]]*$' || true)
   [ -z "$substantive" ] && continue
 
-  # The version line must have moved in the same range.
-  if git diff "$BASE"...HEAD -- "$manifest" | grep -qE '^\+version[[:space:]]*='; then
+  # The version line must have moved in the same range. Same separation: a
+  # failed manifest diff must refuse, not read as "version did not move".
+  manifest_diff=$(git diff "$BASE"...HEAD -- "$manifest" 2>&1)
+  if [ $? -ne 0 ]; then
+    echo "  $crate: manifest diff failed: $manifest_diff -- refusing" >&2
+    exit 2
+  fi
+  if printf '%s\n' "$manifest_diff" | grep -qE '^\+version[[:space:]]*='; then
     continue
   fi
 

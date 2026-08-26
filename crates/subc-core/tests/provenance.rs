@@ -1,19 +1,23 @@
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{sync::Arc, time::Duration};
+// The sha256 re-hash apparatus (throwaway binaries in per-test temp dirs) is
+// LINUX-only — macOS proves identity by spawn inode and Windows serves the
+// unavailable arm, neither writes files — so these imports gate with it or
+// the other platforms clippy-fail them as unused under -D warnings.
+#[cfg(target_os = "linux")]
 use std::{
     fs,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
+// Used by the linux AND macos match arms of assert_running_image_matches.
+#[cfg(not(target_os = "windows"))]
+use subc_control::RunningImageEvidence;
 #[cfg(target_os = "windows")]
 use subc_control::RunningImageUnavailableReason;
 use subc_control::{
     ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, RunningImageAgreement,
-    RunningImageEvidence,
 };
 use subc_core::{
     read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle,
@@ -32,6 +36,7 @@ use common::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -321,6 +326,7 @@ fn assert_running_image_matches(result: &RunningImageAgreement) {
     ));
 }
 
+#[cfg(target_os = "linux")]
 fn unique_temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "subc-{label}-{}-{}",

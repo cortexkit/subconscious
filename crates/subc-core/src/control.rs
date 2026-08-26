@@ -4137,7 +4137,9 @@ mod tests {
         .unwrap()
     }
 
-    fn route_ctx(connection_id: ConnectionId) -> (RouteCtx, mpsc::Receiver<Frame>) {
+    fn route_ctx(
+        connection_id: ConnectionId,
+    ) -> (RouteCtx, mpsc::Receiver<crate::router::OutboundFrame>) {
         let (tx, rx) = mpsc::channel(8);
         (
             RouteCtx {
@@ -6782,12 +6784,15 @@ mod tests {
     async fn open_route_for_capability_test(
         handler: &ControlHandler,
         target_ctx: &RouteCtx,
-        target_rx: &mut mpsc::Receiver<Frame>,
+        target_rx: &mut mpsc::Receiver<crate::router::OutboundFrame>,
         client_connection_id: u64,
         corr: u64,
         target_module_id: &str,
         consumer_identity: Option<ConsumerIdentity>,
-    ) -> (mpsc::Receiver<Frame>, ModuleControlRequest) {
+    ) -> (
+        mpsc::Receiver<crate::router::OutboundFrame>,
+        ModuleControlRequest,
+    ) {
         let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(client_connection_id));
         let route_handler = handler.clone();
         let target_module_id = target_module_id.to_string();
@@ -6948,13 +6953,14 @@ mod tests {
         assert_capability_denied_push(
             client_rx
                 .try_recv()
-                .expect("HELLO deny addition must emit route.closed"),
+                .expect("HELLO deny addition must emit route.closed")
+                .frame,
             "target",
         );
         assert_eq!(forwarding.active_binding_count().unwrap(), 0);
         assert!(matches!(
             target_rx.try_recv(),
-            Ok(Frame { header, .. }) if header.ty == FrameType::Goodbye
+            Ok(outbound) if outbound.header.ty == FrameType::Goodbye
         ));
     }
 
@@ -7019,13 +7025,14 @@ mod tests {
         assert_capability_denied_push(
             client_rx
                 .try_recv()
-                .expect("claim addition must emit route.closed"),
+                .expect("claim addition must emit route.closed")
+                .frame,
             "target",
         );
         assert_eq!(forwarding.active_binding_count().unwrap(), 0);
         assert!(matches!(
             target_rx.try_recv(),
-            Ok(Frame { header, .. }) if header.ty == FrameType::Goodbye
+            Ok(outbound) if outbound.header.ty == FrameType::Goodbye
         ));
     }
 

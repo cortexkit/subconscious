@@ -5119,15 +5119,57 @@ fn project_root_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-fn default_module_connection_file_path() -> PathBuf {
-    if let Some(runtime_dir) = non_empty_os_var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join(MODULE_CONNECTION_FILE_NAME);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleConnectionFileSource {
+    XdgRuntimeDir,
+    TempDirFallback,
+}
+
+impl ModuleConnectionFileSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::XdgRuntimeDir => "xdg_runtime_dir",
+            Self::TempDirFallback => "temp_dir_fallback",
+        }
     }
 
-    env::temp_dir().join(format!(
-        "subc-mcp-{}.connection.json",
-        user_connection_token()
-    ))
+    fn reason(self) -> &'static str {
+        match self {
+            Self::XdgRuntimeDir => "XDG_RUNTIME_DIR set and non-empty",
+            Self::TempDirFallback => "XDG_RUNTIME_DIR unset or empty",
+        }
+    }
+}
+
+fn default_module_connection_file_path() -> PathBuf {
+    let (path, source) =
+        default_module_connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR"));
+    eprintln!(
+        "subc-mcp: module connection file path={} source={} reason={}",
+        path.display(),
+        source.name(),
+        source.reason()
+    );
+    path
+}
+
+fn default_module_connection_file_path_with_source(
+    runtime_dir: Option<OsString>,
+) -> (PathBuf, ModuleConnectionFileSource) {
+    if let Some(runtime_dir) = runtime_dir.filter(|value| !value.is_empty()) {
+        return (
+            PathBuf::from(runtime_dir).join(MODULE_CONNECTION_FILE_NAME),
+            ModuleConnectionFileSource::XdgRuntimeDir,
+        );
+    }
+
+    (
+        env::temp_dir().join(format!(
+            "subc-mcp-{}.connection.json",
+            user_connection_token()
+        )),
+        ModuleConnectionFileSource::TempDirFallback,
+    )
 }
 
 fn user_connection_token() -> String {
@@ -7074,5 +7116,33 @@ mod tests {
         });
         let hello: ShimHello = serde_json::from_value(old_wire).unwrap();
         assert_eq!(hello.instance_token, None);
+    }
+
+    #[test]
+    fn module_connection_file_source_tracks_xdg_runtime_dir() {
+        let (path, source) =
+            default_module_connection_file_path_with_source(Some(OsString::from("/run/user/1000")));
+
+        assert_eq!(
+            path,
+            PathBuf::from("/run/user/1000").join(MODULE_CONNECTION_FILE_NAME)
+        );
+        assert_eq!(source, ModuleConnectionFileSource::XdgRuntimeDir);
+    }
+
+    #[test]
+    fn module_connection_file_source_tracks_unset_and_empty_xdg() {
+        for runtime_dir in [None, Some(OsString::new())] {
+            let (path, source) = default_module_connection_file_path_with_source(runtime_dir);
+
+            assert_eq!(
+                path,
+                env::temp_dir().join(format!(
+                    "subc-mcp-{}.connection.json",
+                    user_connection_token()
+                ))
+            );
+            assert_eq!(source, ModuleConnectionFileSource::TempDirFallback);
+        }
     }
 }

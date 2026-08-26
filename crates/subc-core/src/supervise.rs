@@ -4335,7 +4335,7 @@ mod health_tombstone_tests {
         runtime: SupervisorRuntimeConfig,
         forwarding: Arc<ForwardingTable>,
         module_connection: ConnectionId,
-        module_rx: mpsc::Receiver<crate::Frame>,
+        module_rx: mpsc::Receiver<crate::router::OutboundFrame>,
         handler: ControlHandler,
         module: super::SupervisedModule,
     }

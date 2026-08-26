@@ -368,7 +368,7 @@ fn dispatcher_fixture(
     Arc<RouteDispatcher>,
     RouteDrain,
     Arc<ChannelFlow>,
-    mpsc::Receiver<Frame>,
+    mpsc::Receiver<crate::router::OutboundFrame>,
     mpsc::UnboundedReceiver<SyntheticTerminal>,
 ) {
     let flow = Arc::new(ChannelFlow::new(window));

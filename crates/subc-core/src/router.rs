@@ -23,6 +23,92 @@ use crate::{
     DaemonCounters, Frame, FrameBuildError,
 };
 
+/// One queued outbound frame plus the instant it entered the writer queue.
+///
+/// The stamp exists for the reply-path half of slow-control diagnosis: a
+/// handler can finish in microseconds while the reply sits in this queue
+/// waiting for the writer task to be scheduled, and without a per-item stamp
+/// that wait is invisible to every other timing point (the client's round
+/// trip is the only witness, and it cannot say which side ate the time).
+/// Constructed exclusively inside [`FrameSink`] so no caller can forget it.
+#[derive(Debug)]
+pub struct OutboundFrame {
+    pub frame: Frame,
+    pub enqueued_at: std::time::Instant,
+}
+
+impl OutboundFrame {
+    fn now(frame: Frame) -> Self {
+        Self {
+            frame,
+            enqueued_at: std::time::Instant::now(),
+        }
+    }
+}
+
+/// An `OutboundFrame` is a stamped `Frame`; deref keeps every existing frame
+/// read (headers, bodies, assertions) working on queued items unchanged.
+impl std::ops::Deref for OutboundFrame {
+    type Target = Frame;
+
+    fn deref(&self) -> &Frame {
+        &self.frame
+    }
+}
+
+/// Shared tracing-capture helpers for timing-observability tests across
+/// modules (router dispatch, server reply path). Test-only.
+#[cfg(test)]
+pub(crate) mod test_log {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("test log capture is not poisoned")
+                .extend(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn log_capture(
+        level: tracing::Level,
+    ) -> (Arc<Mutex<Vec<u8>>>, tracing::dispatcher::DefaultGuard) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || TestLogWriter(Arc::clone(&writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (output, guard)
+    }
+
+    pub(crate) fn captured_logs(output: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(
+            output
+                .lock()
+                .expect("test log capture is not poisoned")
+                .clone(),
+        )
+        .expect("tracing output is UTF-8")
+    }
+}
+
 /// Cheaply cloneable handle to one connection's bounded outbound frame queue.
 ///
 /// Backends emit responses, streaming frames, and future PUSH frames through this
@@ -30,11 +116,11 @@ use crate::{
 /// substrate; the socket layer owns the sole receiver/writer.
 #[derive(Debug, Clone)]
 pub struct FrameSink {
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<OutboundFrame>,
 }
 
 impl FrameSink {
-    pub fn new(tx: mpsc::Sender<Frame>) -> Self {
+    pub fn new(tx: mpsc::Sender<OutboundFrame>) -> Self {
         Self { tx }
     }
 
@@ -42,12 +128,14 @@ impl FrameSink {
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
-        self.tx.send(frame).await.map_err(|_| {
+        self.tx.send(OutboundFrame::now(frame)).await.map_err(|_| {
             RouterError::backend_with_epoch(channel, epoch, corr, "connection writer closed")
         })
     }
 
-    pub(crate) async fn reserve_owned(&self) -> Result<mpsc::OwnedPermit<Frame>, RouterError> {
+    pub(crate) async fn reserve_owned(
+        &self,
+    ) -> Result<mpsc::OwnedPermit<OutboundFrame>, RouterError> {
         self.tx
             .clone()
             .reserve_owned()
@@ -56,7 +144,9 @@ impl FrameSink {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_reserve_owned(&self) -> Result<mpsc::OwnedPermit<Frame>, RouterError> {
+    pub(crate) fn try_reserve_owned(
+        &self,
+    ) -> Result<mpsc::OwnedPermit<OutboundFrame>, RouterError> {
         self.tx
             .clone()
             .try_reserve_owned()
@@ -71,7 +161,7 @@ impl FrameSink {
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
-        self.tx.try_send(frame).map_err(|err| {
+        self.tx.try_send(OutboundFrame::now(frame)).map_err(|err| {
             RouterError::backend_with_epoch(
                 channel,
                 epoch,
@@ -795,55 +885,13 @@ mod tests {
         ControlHandler, Registry,
     };
     use std::{
-        io::Write,
-        sync::{mpsc as std_mpsc, Arc, Mutex},
+        sync::{mpsc as std_mpsc, Arc},
         time::Duration,
     };
     use subc_protocol::{manifest::Concurrency, ErrorBody, Flags, FrameType, Priority};
     use tokio::sync::mpsc;
 
-    #[derive(Clone)]
-    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for TestLogWriter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("test log capture is not poisoned")
-                .extend(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn log_capture(
-        level: tracing::Level,
-    ) -> (Arc<Mutex<Vec<u8>>>, tracing::dispatcher::DefaultGuard) {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = Arc::clone(&output);
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_writer(move || TestLogWriter(Arc::clone(&writer)))
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (output, guard)
-    }
-
-    fn captured_logs(output: &Arc<Mutex<Vec<u8>>>) -> String {
-        String::from_utf8(
-            output
-                .lock()
-                .expect("test log capture is not poisoned")
-                .clone(),
-        )
-        .expect("tracing output is UTF-8")
-    }
+    pub(crate) use crate::router::test_log::{captured_logs, log_capture};
 
     fn logged_millis(logs: &str, field: &str) -> u64 {
         logs.split_whitespace()
@@ -876,7 +924,7 @@ mod tests {
         .unwrap()
     }
 
-    fn route_ctx() -> (RouteCtx, mpsc::Receiver<Frame>) {
+    fn route_ctx() -> (RouteCtx, mpsc::Receiver<crate::router::OutboundFrame>) {
         let (tx, rx) = mpsc::channel(8);
         (
             RouteCtx {
@@ -1236,10 +1284,10 @@ mod tests {
         Router,
         Arc<ForwardingTable>,
         RouteCtx,
-        mpsc::Receiver<Frame>,
+        mpsc::Receiver<crate::router::OutboundFrame>,
         RouteCtx,
-        mpsc::Receiver<Frame>,
-        mpsc::Receiver<Frame>,
+        mpsc::Receiver<crate::router::OutboundFrame>,
+        mpsc::Receiver<crate::router::OutboundFrame>,
         crate::forwarding::PendingRouteBindRelay,
     );
 

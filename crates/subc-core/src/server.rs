@@ -273,7 +273,7 @@ where
     // of an in-progress frame read terminates the connection, so buffered bytes are never
     // stranded before a later read.
     let mut read_half = BufReader::new(read_half);
-    let (tx, rx) = mpsc::channel::<crate::Frame>(CONNECTION_EGRESS_BUFFER);
+    let (tx, rx) = mpsc::channel::<crate::router::OutboundFrame>(CONNECTION_EGRESS_BUFFER);
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
 
     let egress = FrameSink::new(tx);
@@ -457,21 +457,51 @@ fn close_reason(
 
 async fn drain_writer<W>(
     write_half: W,
-    mut rx: mpsc::Receiver<crate::Frame>,
+    mut rx: mpsc::Receiver<crate::router::OutboundFrame>,
 ) -> Result<(), FrameIoError>
 where
     W: AsyncWrite + Unpin,
 {
     let mut writer = BufWriter::new(write_half);
-    while let Some(frame) = rx.recv().await {
-        write_frame(&mut writer, &frame).await?;
-        while let Ok(frame) = rx.try_recv() {
-            write_frame(&mut writer, &frame).await?;
+    while let Some(outbound) = rx.recv().await {
+        write_outbound(&mut writer, outbound).await?;
+        while let Ok(outbound) = rx.try_recv() {
+            write_outbound(&mut writer, outbound).await?;
         }
         writer.flush().await.map_err(FrameIoError::Io)?;
     }
     writer.flush().await.map_err(FrameIoError::Io)?;
     Ok(())
+}
+
+/// Reply-path half of slow-control diagnosis: a channel-0 reply that sat in
+/// the writer queue past the threshold is reported with its queue residency
+/// and its own write duration separated, because "writer task not scheduled"
+/// and "socket write blocked" are different defects and the sum hides which.
+/// Data-plane frames are exempt: their latency is the client's own flow
+/// control, and logging them would drown the control signal in bulk traffic.
+async fn write_outbound<W>(
+    writer: &mut BufWriter<W>,
+    outbound: crate::router::OutboundFrame,
+) -> Result<(), FrameIoError>
+where
+    W: AsyncWrite + Unpin,
+{
+    const SLOW_REPLY_QUEUE: Duration = Duration::from_millis(1000);
+    let queued = outbound.enqueued_at.elapsed();
+    let frame = outbound.frame;
+    if frame.header.channel == 0 && queued >= SLOW_REPLY_QUEUE {
+        let write_started = std::time::Instant::now();
+        let result = write_frame(writer, &frame).await;
+        tracing::warn!(
+            corr = frame.header.corr,
+            queued_ms = queued.as_millis() as u64,
+            write_ms = write_started.elapsed().as_millis() as u64,
+            "slow control reply write"
+        );
+        return result;
+    }
+    write_frame(writer, &frame).await
 }
 
 #[derive(Debug)]
@@ -566,6 +596,117 @@ mod tests {
 
     const TEST_DEADLINE: Duration = Duration::from_secs(2);
     const TEST_DAEMON_VER: &str = "test-subc-server";
+
+    /// Reply-path stamp, slow polarity: a channel-0 reply whose queue residency
+    /// exceeds the threshold must produce the slow-control-reply-write WARN with
+    /// queued_ms reflecting the residency. Uses a backdated stamp rather than a
+    /// real stall so the test is fast and deterministic.
+    #[tokio::test]
+    async fn stale_queued_control_reply_logs_slow_reply_write() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::WARN);
+        let (tx, rx) = mpsc::channel::<crate::router::OutboundFrame>(4);
+        let reply = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Error,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            7,
+            serde_json::to_vec(&ErrorBody {
+                code: "test".into(),
+                message: "reply".into(),
+                detail: None,
+            })
+            .expect("body encodes"),
+        )
+        .expect("frame builds");
+        tx.send(crate::router::OutboundFrame {
+            frame: reply,
+            enqueued_at: std::time::Instant::now() - Duration::from_millis(1500),
+        })
+        .await
+        .expect("queued");
+        drop(tx);
+        let (write_half, mut read_half) = duplex(64 * 1024);
+        drain_writer(write_half, rx).await.expect("writer drains");
+        let mut sink = Vec::new();
+        read_half.read_to_end(&mut sink).await.expect("read");
+        assert!(!sink.is_empty(), "frame reached the socket");
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("slow control reply write") && captured.contains("corr=7"),
+            "expected slow reply WARN naming corr, got: {captured}"
+        );
+        let queued_ms: u64 = captured
+            .split("queued_ms=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("queued_ms present");
+        assert!(
+            queued_ms >= 1500,
+            "queued_ms reflects residency: {queued_ms}"
+        );
+    }
+
+    /// Fast polarity: a promptly-drained control reply and a stale DATA-PLANE
+    /// frame must both stay silent — the WARN is channel-0-only by design, and
+    /// a healthy queue must add zero log volume.
+    #[tokio::test]
+    async fn fresh_control_and_stale_data_frames_log_nothing() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::WARN);
+        let (tx, rx) = mpsc::channel::<crate::router::OutboundFrame>(4);
+        let control = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Error,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            8,
+            serde_json::to_vec(&ErrorBody {
+                code: "test".into(),
+                message: "fresh".into(),
+                detail: None,
+            })
+            .expect("body encodes"),
+        )
+        .expect("frame builds");
+        tx.send(crate::router::OutboundFrame {
+            frame: control,
+            enqueued_at: std::time::Instant::now(),
+        })
+        .await
+        .expect("queued");
+        let data = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Error,
+            Flags::new(false, Priority::Interactive, false),
+            9,
+            1,
+            9,
+            serde_json::to_vec(&ErrorBody {
+                code: "test".into(),
+                message: "data".into(),
+                detail: None,
+            })
+            .expect("body encodes"),
+        )
+        .expect("frame builds");
+        tx.send(crate::router::OutboundFrame {
+            frame: data,
+            enqueued_at: std::time::Instant::now() - Duration::from_millis(5000),
+        })
+        .await
+        .expect("queued");
+        drop(tx);
+        let (write_half, _read_half) = duplex(64 * 1024);
+        drain_writer(write_half, rx).await.expect("writer drains");
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            !captured.contains("slow control reply write"),
+            "no WARN for fresh control or stale data frames, got: {captured}"
+        );
+    }
 
     struct CountingReader {
         bytes: Vec<u8>,

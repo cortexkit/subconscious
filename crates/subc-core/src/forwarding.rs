@@ -249,7 +249,7 @@ struct PendingRouteBindRelayEntry {
     reservation: RouteReservation,
     client_sink: FrameSink,
     client_negotiated_ver: u8,
-    client_permit: mpsc::OwnedPermit<Frame>,
+    client_permit: mpsc::OwnedPermit<crate::router::OutboundFrame>,
     route_open_frame: Frame,
     principal: Principal,
     deadline: Instant,
@@ -588,7 +588,7 @@ impl ForwardingTable {
         expected_module_id: &str,
         principal: Principal,
         deadline: Instant,
-        client_permit: mpsc::OwnedPermit<Frame>,
+        client_permit: mpsc::OwnedPermit<crate::router::OutboundFrame>,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.write_inner()?;
         if inner.closing_connections.contains(&client_connection_id) {
@@ -1830,7 +1830,12 @@ fn commit_route_locked(
 
     // OwnedPermit::send cannot fail, but its returned sender reveals a receiver
     // that closed after reservation and before this locked publication point.
-    let client_sender = pending.client_permit.send(pending.route_open_frame);
+    // Stamp at publication: the permit was reserved earlier, but queue residency
+    // for the reply-write diagnosis starts when the frame actually enters the queue.
+    let client_sender = pending.client_permit.send(crate::router::OutboundFrame {
+        frame: pending.route_open_frame,
+        enqueued_at: std::time::Instant::now(),
+    });
     if client_sender.is_closed() {
         let abandoned = pending
             .relay_enqueued
@@ -2333,7 +2338,7 @@ mod tests {
         ModuleEndpointId,
         ConnectionId,
         FrameSink,
-        mpsc::Receiver<Frame>,
+        mpsc::Receiver<crate::router::OutboundFrame>,
     ) {
         let forwarding = ForwardingTable::default();
         let module_connection = ConnectionId::new(100);

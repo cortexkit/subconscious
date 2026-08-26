@@ -48,6 +48,7 @@ pub struct ModuleManifest {
 ///   contract nobody authored (the drift class module-owned payload crates
 ///   exist to prevent). When a daemon consumer materializes for a fact, the
 ///   fact gets a typed optional field with a CONSUMER-IMPACT commit instead.
+///
 /// `CapabilityDeclarations` below is strict by contrast because claims are
 /// routed on: an unparseable claim must refuse loudly, never partially apply.
 #[derive(Deserialize)]

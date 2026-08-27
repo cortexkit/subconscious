@@ -119,13 +119,47 @@ a bespoke script and its private grammar. The ten no-path repos gain releases
 by writing only the declaration. Existing entry-point names can stay as
 one-line wrappers (`scripts/release.sh` → `ck-release run crate-train`).
 
-## Open questions for review
+## Resolved questions (MC first-adopter review, r1→r2)
 
-1. Journal home: per-user data dir (above) vs in-repo gitignored — crash
-   evidence survives clones vs travels with the checkout.
-2. ci_watch: poll GH runs from the local machine (simple, ties up a terminal)
-   vs detached with the journal picking up on next invocation (matches
-   fire-and-park habits).
-3. Should `verify` include the census's marker/discriminator checks
-   (broca-style two-sided markers) as a declared per-train option, or is
-   sha+probe always sufficient once staging is standardized?
+1. **Journal home: per-user data dir, settled.** The repo tree is exactly
+   where crash residue does damage — MC's r8 corpse left dirty leftovers that
+   invisibly wedged three subsequent attempts at the clean-tree check. Zero
+   repo residue from a crashed release; no journal inheritance into clones.
+2. **ci_watch is layered, not either/or.** The workflow RUN-ID is journaled at
+   phase ENTRY before the first poll — GH state + run-id is the done-probe, so
+   a killed watcher is a non-event (rerun re-probes, nothing re-executes).
+   Default execution is a BLOCKING poll with per-poll journal lines: the
+   saga's evidence is one-sided — the blocking terminal run shipped while
+   every detached watcher was itself a casualty (the watcher infrastructure
+   was the least durable component in the story). The watch fails at FIRST
+   FAILED JOB with phase+job named, never at run completion. Conclusions are
+   read three-valued (success / failure / null-in-progress); a watch-transport
+   drop is a retry, never a verdict — MC shipped a false FAILED once by
+   reading in-progress nulls as failures after `gh run watch` dropped.
+3. **Stamp unconditional; artifact readback per-train.** Every train exports a
+   compiler-emitted build-sha (the `ModuleManifest.provenance` /
+   `CK_BUILD_REV` shape) at build time: sha+sidecar proves WHICH BYTES, the
+   embedded stamp proves WHICH BUILD, and the three-way deploy state
+   (not-swapped / swapped-not-bounced / done) needs the second. Doc comments
+   and inlined symbols fail as discriminators; the stamp must be the
+   compiler-emitted kind. Trains whose artifacts expose a manifest/strings
+   surface declare `verify.readback`; the rest rely on sha+probe.
+
+## Machine primitives adopted from the saga
+
+- **Box-gate mutual exclusion**: local load-affected phases take and respect
+  `~/.local/share/cortexkit/box-gate.lock` (staleness window 2h, writer
+  identity recorded). Today this is a two-seat handshake that works because
+  AFT and MC both remember it; the machine makes it a primitive, so
+  concurrent local gate storms cannot kill each other's releases (they killed
+  two of MC's attempts before the convention existed).
+- **MC's per-leg load-class taxonomy seeds the first phase declaration** —
+  which legs carry wall-clock budgets, readiness windows, and perf p95s is
+  already measured on MC's master; the MC train adopts it rather than
+  re-deriving.
+
+## Acceptance
+
+MC's 11 saga failure modes, each mapped to a journal resume or a typed
+refusal — the mapping table is drafted on MC's side from the saga ledger. Any
+mode mapping to neither indicts the spec, not the release.

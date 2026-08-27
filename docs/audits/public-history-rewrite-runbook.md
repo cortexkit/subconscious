@@ -97,3 +97,14 @@ zero hits across all blobs and messages.
 
 1. Timing vs iceteaSA's open PRs and the E2E campaign pins.
 2. Private archive home for bucket A (nested-git vs subconscious-private).
+
+## r3 — SYNAPSE eight-finding review folded (measured for subconscious)
+
+0. **Bundle backup is STEP 0**: `git bundle create ~/Backups/subconscious-preflip.bundle --all` — the recovery path post-force-push AND the permanent resolver for every old-SHA citation. No recovery path existed in r2.
+1. **Mirror-class push, never `push -f master`**: any surviving un-rewritten remote ref re-exposes the whole old history through ancestry. Measured: 3 remote branch heads, 41 tags — push all rewritten refs, DELETE the rest, verify with `git ls-remote` after.
+2. **Actions history goes public at flip**: 2,391 runs whose logs carry months of env dumps and paths. Delete ALL pre-flip runs (`gh api DELETE` per run) BEFORE the visibility change; artifacts die with runs.
+3. **Releases pin pre-scrub trees**: 5 subc-core releases exist and their auto-generated source archives survive force-push. Delete and recreate on rewritten tags, re-uploading the SAME binary assets (binaries are clean; the poisonous part is the frozen source tarball). AFT's CI pins a subc-core release binary — asset names and bytes must survive the recreation or AFT CI breaks.
+4. **Issue/PR TEXT is its own surface**: bodies and comments go public — grep them against the pattern classes, separately from diffs.
+5. **The fork is the disease**: iceteaSA's fork (measured: exactly 1 fork) retains the entire pre-scrub history regardless of what we push. Ceremony: their cooperation to delete and re-fork post-rewrite; GitHub support detach as fallback.
+6. **GitHub GC lag**: old SHAs stay fetchable server-side for a while even after a perfect mirror push — the rewrite is hygiene, not revocation; nothing real needs rotation here (whole-history secret scan clean).
+7. **LICENSE parity check runs both ways** — our flag caught synapse's own missing LICENSE; each repo in the window re-checks the other's tip.

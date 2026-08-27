@@ -15,8 +15,10 @@ fn main() {
 
 fn output_path(args: Vec<String>) -> Result<PathBuf, String> {
     match args.as_slice() {
-        [] => Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("vectors/agent_token_vectors_v1.json")),
+        [] => {
+            Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("vectors/agent_token_vectors_v1.json"))
+        }
         [flag, path] if flag == "--output" => Ok(PathBuf::from(path)),
         _ => Err("usage: generate [--output PATH]".into()),
     }

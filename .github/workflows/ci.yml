@@ -168,7 +168,15 @@ jobs:
               exit 0
               ;;
           esac
-          git fetch --depth=50 origin "$BASE" 2>/dev/null || git fetch --unshallow 2>/dev/null || true
+          # Deepen until BASE and HEAD actually CONNECT, not until a fetch
+          # succeeds: a depth-50 fetch of BASE can succeed while the shallow
+          # boundary still separates it from a depth-1 HEAD, and merge-base
+          # then fails on two perfectly valid SHAs (bit us on the first
+          # GitHub-runner push after the Blacksmith migration).
+          git fetch --depth=50 origin "$BASE" 2>/dev/null || true
+          if ! git merge-base "$BASE" HEAD >/dev/null 2>&1; then
+            git fetch --unshallow origin 2>/dev/null || git fetch --depth=2147483647 origin || true
+          fi
           bash scripts/fleet/check-wire-crate-versions.sh "$BASE"
         shell: bash
 

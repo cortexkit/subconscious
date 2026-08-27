@@ -122,6 +122,14 @@ pub enum RouteTarget {
 /// Envelope protocol version this build speaks.
 pub const PROTOCOL_VERSION: u8 = 2;
 
+/// The version of THIS crate (`subc-protocol`) as compiled into the linking
+/// binary — the fleet's shared wire-vocabulary version, and the value
+/// `ManifestProvenance.wire_crate_version` declares. Not the version of a
+/// module's own envelope or payload crates: those are different numbering
+/// spaces, and declaring one here produces a confident wrong answer at any
+/// version gate (insula shipped exactly that before the referent was written
+/// down). `env!` makes it a property of the compiled binary, not of whatever
+/// source tree sits beside it at run time.
 pub const SUBC_PROTOCOL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Oldest envelope protocol version this build accepts.

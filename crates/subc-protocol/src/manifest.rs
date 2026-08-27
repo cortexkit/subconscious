@@ -167,6 +167,14 @@ pub struct ManifestProvenance {
     pub build_git_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_lock_digest: Option<String>,
+    /// REFERENT: the `subc-protocol` crate version linked into this binary
+    /// (`subc_protocol::SUBC_PROTOCOL_CRATE_VERSION`) — the fleet's shared
+    /// wire vocabulary, one numbering space for every module. Never a
+    /// module's own envelope/payload crate version: that is real information
+    /// in a different numbering space, and here it scores as a confident
+    /// wrong answer at any census gate. (QTA's rule, learned live: a field
+    /// whose entire content is a referent cannot be documented by its
+    /// constraints — so the referent is stated here, where readers look.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_crate_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

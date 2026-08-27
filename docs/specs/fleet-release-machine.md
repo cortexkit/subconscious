@@ -1,6 +1,7 @@
-# Fleet Release Machine — draft r1
+# Fleet Release Machine — draft r4
 
-Status: DRAFT for review (Ufuk take → Athena rounds → spec campaign).
+Status: DRAFT — three seat reviews folded (MC r1→r2, AFT r2→r3, ALF r3→r4;
+all three GO). Next: Ufuk take → Athena rounds → spec campaign.
 Chartered by Ufuk via MC (2026-08-26) after MC's 11-attempt release saga.
 Evidence base: `docs/research/release-machinery-census.md` (18 repos, 162
 verified citations). MC is first adopter.
@@ -34,6 +35,21 @@ verification, and refusal grammar.
 A "train" is a named release lane within a repo (census: subconscious has three
 — crate, core-binary, npm; magic-context has two). Trains are independent state
 machines sharing the repo declaration.
+
+### The no-tag train is first-class (ALF, no-path-seat review)
+
+A train with NO tag, push, or publish phases is legal, not degenerate.
+Prefrontal is the specimen — a sixth re-entry form the census missed: its unit
+of release is a GATED DEPLOY (green ladder → release build →
+supervisor-restart with inode verification), multiple per day, no version, no
+tag, nothing addressable by version after the fact. Forcing tags onto that
+shape manufactures ceremony for artifacts nobody addresses by version. A
+no-tag train keeps the journal, resume, refusal grammar, and phase discipline
+in full; its done-probes key on ARTIFACT IDENTITY (embedded build-sha equals
+the intended release commit recorded at train start) rather than tag-at-HEAD.
+Under this reading the ladder-centric repos are ADOPTERS, not exceptions —
+and the ten-no-path-repos adoption claim gets cheaper: most of those repos
+release exactly this way today, without the discipline.
 
 ## Phase vocabulary (closed set; per-train subset of INSTANCES)
 
@@ -111,6 +127,14 @@ transitions are observable lines as they happen, a failure surfaces at failure
 time with its phase named, and "where is my release stuck" is a read of the
 ledger, not an archaeology. A terminal `notify` phase can post the completed
 ledger summary (Discord etc.) but the CONTRACT is the journal, not the toast.
+
+The fleet wiring for `notify` is the EXISTING delivery plane, not a second
+notification system (ALF): a journal transition is a wake_fire-shaped event
+(`source_kind: release`, registration-keyed routing to the owning seat's
+digest). The journal is truth; the wake is a pointer to it. Prefrontal's
+GH-digest architecture is the template, verbatim. Per-user journal home is
+also janitor-safe by construction: worktree sweeps claim repo trees and
+module state, and a data-dir ledger is invisible to them by design.
 
 ## Drift (MC constraint 5)
 
@@ -198,6 +222,14 @@ one-line wrappers (`scripts/release.sh` → `ck-release run crate-train`).
   lock — focused/lint legs must not queue behind a 40-minute gate — and
   holder liveness is PID+start-time so a crashed holder reclaims early
   instead of waiting out the 2h staleness window.
+  The lock's POPULATION is load-affected local phases of ANYTHING, not
+  phases-of-releases (ALF): prefrontal's CI-migrated gates take the lock as
+  participants despite never releasing by tag — their gate storms killed
+  MC's attempts before the convention and wedged the whole box this week.
+  The load-class taxonomy names ASSESSMENT-STORM as a distinct class: a
+  phase that mints many fresh Mach-Os is load-affected through the macOS
+  validator queue (amfid depth — 97 fresh binaries in ALF's postmortem), a
+  resource no CPU metric shows; two seats discovered it independently.
 - **tag-at-HEAD probes compare against the INTENDED release commit recorded
   at train start**, never live branch HEAD — the retag lane moves HEAD
   between attempts, and a live-HEAD probe would false-resume (AFT).
@@ -216,3 +248,10 @@ one-line wrappers (`scripts/release.sh` → `ck-release run crate-train`).
 MC's 11 saga failure modes, each mapped to a journal resume or a typed
 refusal — the mapping table is drafted on MC's side from the saga ledger. Any
 mode mapping to neither indicts the spec, not the release.
+
+Second adoption case (ALF, committed): prefrontal writes its `release.jsonc`
+against the no-tag train as the no-path acceptance test — gates_local (cheap
+tiers), ci_watch (their authoritative ladder, gaining the journaled run-id +
+three-valued reads their hand-rolled loop lacks), stage, verify (inode +
+provenance stamp; their binaries already carry `ModuleManifest.provenance`),
+with place correctly outside the machine.

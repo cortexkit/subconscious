@@ -35,11 +35,48 @@ A "train" is a named release lane within a repo (census: subconscious has three
 — crate, core-binary, npm; magic-context has two). Trains are independent state
 machines sharing the repo declaration.
 
-## Phase vocabulary (closed set, per-train subset)
+## Phase vocabulary (closed set; per-train subset of INSTANCES)
 
     preflight -> gates_local -> bump -> lock -> commit -> tag -> push
     -> ci_watch -> publish -> assets -> stage -> verify -> notify
     (place is deliberately NOT a phase — see Boundaries)
+
+Phases are PARAMETERIZED INSTANCES, not singleton slots (AFT finding 1): a
+train may instantiate a phase more than once with parameters — AFT's real
+pipeline runs TWO ci_watch instances of different kinds (pre-tag: the Tests
+workflow at the release-commit SHA must be green BEFORE tag; post-tag: the
+tag's own release workflow). `ci_watch` takes (workflow, ref-expression);
+without instance parameterization the machine cannot represent the fleet's
+biggest matrix.
+
+`publish` and `assets` carry PER-ARTIFACT sub-probes (AFT finding 2): each
+registry package and each asset has its own exists/sha probe, and resume
+re-enters the phase skipping per-artifact by probe. Live specimen: crates.io
+published 0.53.0 then the npm job refused, leaving registries split — a
+single phase-level probe makes that state unresolvable except by hand; nine
+npm packages each need their own exists-probe.
+
+### Ordering law (structural, not advisory)
+
+NO REFUSAL-CAPABLE CHECK MAY FIRST-RUN AFTER THE FIRST IRREVERSIBLE PUBLIC
+SIDE EFFECT. Every gate belongs to a pre-publish phase; `publish` executes
+only probes and uploads. Three AFT releases in one month (v0.51.0, v0.52.x,
+v0.53.0) failed at a gate running inside the npm publish job AFTER crates.io
+had published — the split-registry class exists because gates ran late, and
+the machine makes late gates inexpressible. Corollary: the RETAG RECOVERY
+lane (delete tag, fix, retag same version, tolerate already-published
+registries) is a typed resume path with machine assistance — three uses in a
+month on one seat is a lane, not an anomaly.
+
+### ci_watch internals
+
+Blocking poll, run-id journaled at entry, fail-at-first-FAILED-job with
+phase+job named, three-valued conclusions, transport-drop = retry. Plus a
+declared per-train RERUN BUDGET (AFT): N journaled `rerun --failed` attempts
+before the phase reports failure — on real matrices a single flake-family
+job failure per run is the NORM, and without a budget every release becomes
+operator intervention at the first flake. The primitive encodes both rerun
+forms: `rerun --failed` SKIPS cancelled jobs; cancelled needs rerun-by-job-id.
 
 Each phase declares, in the shared machine (not per repo):
 
@@ -86,10 +123,15 @@ fire-from-the-bump and the nightly lane; a release never absorbs it.
 ## Signing and staging (one form each, evidence-picked)
 
 - Signing: topology v2 — Apple Development identity + pinned per-binary
-  identifier on macOS; ad-hoc only where no TCC surface exists. Post-sign
-  SHA-256 sidecars always (hash-before-sign shipped a stale-bytes card once;
-  the machine writes the sidecar FROM the artifact it just signed, in the same
-  step — readback derived from the exact artifact written).
+  identifier on macOS; ad-hoc only where no TCC surface exists. Per-artifact
+  ORDER IS LAW: build → strip → sign → sidecar-from-signed-bytes →
+  verify-readback → upload, and upload's done-probe compares the PUBLISHED
+  asset's sha against the sidecar. Any mutation after sign is the AFT #238
+  class (strip ran post-codesign; macOS SIGKILL on launch); the machine makes
+  the order the only expressible one. `verify` includes raw-asset
+  verification where the train publishes executables: download the published
+  bytes, `codesign --verify --strict`, execute unmodified — seat memory
+  promoted to machine phase.
 - Staging: revision-keyed directory outside cargo target trees
   (claustrum's `target/staged/<rev>` shape at a non-target path), pruned by
   count with the deployed revision always retained. `/tmp` staging is retired
@@ -148,11 +190,22 @@ one-line wrappers (`scripts/release.sh` → `ck-release run crate-train`).
 ## Machine primitives adopted from the saga
 
 - **Box-gate mutual exclusion**: local load-affected phases take and respect
-  `~/.local/share/cortexkit/box-gate.lock` (staleness window 2h, writer
-  identity recorded). Today this is a two-seat handshake that works because
-  AFT and MC both remember it; the machine makes it a primitive, so
-  concurrent local gate storms cannot kill each other's releases (they killed
-  two of MC's attempts before the convention existed).
+  `~/.local/share/cortexkit/box-gate.lock`. Today this is a two-seat
+  handshake that works because AFT and MC both remember it; the machine makes
+  it a primitive, so concurrent local gate storms cannot kill each other's
+  releases (they killed two of MC's attempts before the convention existed).
+  Two nuances from the live handshake (AFT): only load-affected legs take the
+  lock — focused/lint legs must not queue behind a 40-minute gate — and
+  holder liveness is PID+start-time so a crashed holder reclaims early
+  instead of waiting out the 2h staleness window.
+- **tag-at-HEAD probes compare against the INTENDED release commit recorded
+  at train start**, never live branch HEAD — the retag lane moves HEAD
+  between attempts, and a live-HEAD probe would false-resume (AFT).
+- **gates_local declares a fix-mode per gate**: `check_only` vs
+  `restage_and_commit`. Real preflights MUTATE the tree (evidence restage,
+  governed-manifest chains, dist-freshness for plugin packages — the class
+  that cost AFT two tag re-cuts); a schema without the distinction forces
+  those back into bespoke scripts.
 - **MC's per-leg load-class taxonomy seeds the first phase declaration** —
   which legs carry wall-clock budgets, readiness windows, and perf p95s is
   already measured on MC's master; the MC train adopts it rather than

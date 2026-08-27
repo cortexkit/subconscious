@@ -13,3 +13,5 @@ crates/subc-core/tests/golden/** -text
 crates/subc-protocol/tests/golden/** -text
 crates/subc-transport/tests/golden/** -text
 docs/team-mode/fixtures/** -text
+crates/agent-token-vectors/vectors/** -text
+crates/subc-core/tests/fixtures/** -text

@@ -773,7 +773,7 @@ mod tests {
 
     const CORPUS: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/team-mode/conformance/vectors/agent-token/agent_token_vectors_v1.json"
+        "/vectors/agent_token_vectors_v1.json"
     ));
 
     #[test]

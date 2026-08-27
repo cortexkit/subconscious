@@ -5604,7 +5604,7 @@ mod tests {
     /// ignores additive unknown fields at the traversal emit terminus."
     fn fed_admission_facts_vectors() -> Vec<(String, Value)> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/team-mode/conformance/vectors/fed/admission-facts-emit.jsonl");
+            .join("tests/fixtures/fed/admission-facts-emit.jsonl");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("vendored fed corpus unreadable at {path:?}: {err}"));
         let vectors: Vec<(String, Value)> = text

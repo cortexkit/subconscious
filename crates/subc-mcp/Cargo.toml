@@ -2,6 +2,7 @@
 name = "subc-mcp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false
 description = "subc MCP integration skeleton: thin stdio shim and two-faced module (no MCP yet)."
 

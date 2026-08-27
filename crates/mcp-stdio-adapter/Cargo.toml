@@ -2,6 +2,7 @@
 name = "mcp-stdio-adapter"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false
 description = "Resident subc module for configured third-party stdio MCP servers."
 

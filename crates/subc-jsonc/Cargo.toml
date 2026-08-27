@@ -2,6 +2,7 @@
 name = "subc-jsonc"
 version = "0.0.0"
 edition = "2021"
+license = "MIT"
 publish = false
 description = "Shared JSONC-to-JSON normalization for internal subc config readers."
 

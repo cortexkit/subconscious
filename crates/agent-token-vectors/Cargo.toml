@@ -2,6 +2,7 @@
 name = "agent-token-vectors"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false
 description = "Golden conformance vectors for prefrontal-signed agent assertion tokens."
 

@@ -151,8 +151,20 @@ pub struct CapabilityDeclarations {
 ///   actual version sees a stale-binary mismatch directly. Blanket `None`
 ///   where a field is knowable wastes the field; blanket-fill where it is
 ///   not mints a lie. Absence also beats sentinel values (CKCRED): omit the
-///   block when BUILD_REV reads "unknown" — publishing the string "unknown"
-///   is a well-formed lie shape validation cannot catch.
+///   FIELD when BUILD_REV reads a builder sentinel ("unknown", "unavailable",
+///   "none", any casing) — publishing the sentinel string as a fact is a
+///   well-formed lie shape validation cannot catch. Field omission, not block
+///   omission, is the target shape for SDK modules: `wire_crate_version` is a
+///   compile-time constant of the linked crate, so a module using the SDK
+///   always has at least one honest fact and `build_provenance` reflects that
+///   by never returning an absent block. (Block absence remains meaningful on
+///   the wire — it reads `unverifiable`, the module made no claim — but it is
+///   the shape for non-adopters and proxied manifests, not a target for
+///   declarers; see #78.) The hazard in one sentence, for every referent and
+///   sentinel case alike: A PRESENT, WELL-FORMED FIELD STOPS THE READER
+///   ASKING — a value from the wrong domain and a sentinel from the wrong
+///   vocabulary are indistinguishable from a correct value to every check
+///   that inspects shape rather than meaning.
 /// - PROXIED MANIFESTS STAY None PERMANENTLY (CALLO): a process that
 ///   forwards another machine's manifest cannot observe that build, and a
 ///   forwarded provenance claim is indistinguishable on the wire from a

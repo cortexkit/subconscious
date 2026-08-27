@@ -64,9 +64,25 @@ pub fn build_provenance(
     }
 }
 
+/// Sentinel strings that build tooling emits where it means "no value": shell
+/// fallbacks and Makefile defaults produce `unknown`, wire vocabulary uses
+/// `unavailable`, and `git describe` failures surface as `none`. Publishing
+/// any of them as a fact is the well-formed-lie shape the provenance contract
+/// warns against — a present, well-formed field stops the reader asking — so
+/// the helper maps them all to field omission. Matched case-insensitively
+/// because `UNKNOWN`/`Unknown` are equally common from shell fallbacks.
+const PROVENANCE_SENTINELS: [&str; 3] = ["unknown", "unavailable", "none"];
+
 fn normalize_provenance_fact(value: Option<&str>) -> Option<String> {
     let value = value?.trim();
-    (!value.is_empty() && value != "unavailable").then(|| value.to_string())
+    if value.is_empty() {
+        return None;
+    }
+    let lowered = value.to_ascii_lowercase();
+    if PROVENANCE_SENTINELS.contains(&lowered.as_str()) {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 use subc_transport::{
@@ -1534,6 +1550,42 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
+
+    /// Builder sentinels are the strings tooling emits where it means "no
+    /// value" (shell fallbacks say `unknown`, not `unavailable`); publishing
+    /// one as a build fact is the well-formed lie the provenance contract
+    /// names. The helper must map every sentinel, any casing, to field
+    /// omission — and must keep real values intact (the control arm, so the
+    /// filter cannot pass by refusing everything).
+    #[test]
+    fn provenance_builder_sentinels_become_field_omission() {
+        for sentinel in [
+            "unknown",
+            "UNKNOWN",
+            "Unknown",
+            "unavailable",
+            "none",
+            "None",
+            "  unknown  ",
+            "",
+        ] {
+            let p = super::build_provenance(Some(sentinel), Some(sentinel), Some(sentinel));
+            assert_eq!(
+                (p.build_git_sha, p.build_lock_digest, p.store_schema_version),
+                (None, None, None),
+                "sentinel {sentinel:?} must be omitted, not published"
+            );
+        }
+        let real = super::build_provenance(Some("9f3c2ab"), None, Some("9"));
+        assert_eq!(real.build_git_sha.as_deref(), Some("9f3c2ab"));
+        assert_eq!(real.store_schema_version.as_deref(), Some("9"));
+        // The always-knowable fact: an SDK-built block is never empty, which
+        // is why the contract's target shape is FIELD omission (#78).
+        assert_eq!(
+            real.wire_crate_version.as_deref(),
+            Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+        );
+    }
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, Tool};
     use tokio::{sync::Notify, time::timeout};
 

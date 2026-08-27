@@ -30,7 +30,11 @@ use common::{
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+// Sized for the slowest acceptable runner, not the typical one: 2s passed on
+// Blacksmith and this machine by speed-coincidence and failed twice in a row
+// on GitHub-hosted runners. The timeout exists to bound a HUNG read, not to
+// assert latency (#6838); 10s is the house setup-timeout standard.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct TestServer {
     daemon: TestDaemon,

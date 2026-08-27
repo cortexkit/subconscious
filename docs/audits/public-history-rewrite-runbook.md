@@ -108,3 +108,26 @@ zero hits across all blobs and messages.
 5. **The fork is the disease**: iceteaSA's fork (measured: exactly 1 fork) retains the entire pre-scrub history regardless of what we push. Ceremony: their cooperation to delete and re-fork post-rewrite; GitHub support detach as fallback.
 6. **GitHub GC lag**: old SHAs stay fetchable server-side for a while even after a perfect mirror push — the rewrite is hygiene, not revocation; nothing real needs rotation here (whole-history secret scan clean).
 7. **LICENSE parity check runs both ways** — our flag caught synapse's own missing LICENSE; each repo in the window re-checks the other's tip.
+
+## EXECUTED 2026-08-27 — repo is public
+
+Ceremony ran start-to-finish in ~2h: bundle step-0 (6MB, ~/Backups) → bucket-A
+relocation (nested-git docs/private) → tip publicized (LICENSE/README/crate
+license fields) → verifier over 4,576 blobs (narrow classes; generic classes
+deliberately deleted per the rehearsal-2 lesson — fake test IPs and opaque
+task-id citations stayed) → filter-repo (2644→2496 commits, keep-list 453
+files, ONE replace entry) → gate 1 tree BYTE-IDENTICAL → gate 2 zero hits,
+zero dropped-path files → PR-paths check (no PR ever carried a dropped path)
++ issue/PR text grep clean → assets preserved then releases recreated
+byte-identical (AFT pin verified by sha diff) → 2,393 runs deleted →
+explicit-refs push + stale deletion, ls-remote verified exact → 19 stale twin
+branches pruned → visibility flip (NOTE: the first gh edit call timed out
+silently leaving the repo private — verify flips with a separate read plus an
+unauthenticated curl 200, never the edit's exit code) → canonical reset
+(tree-identity made it invisible to sibling consumers) → all-clears to
+SYNAPSE (GO), iceteaSA (#73 re-fork + rebase), AFT (re-index + asset window).
+
+Accepted residual, dispositioned not ignored: GitHub retains refs/pull/* and
+the fork's history until iceteaSA re-forks and server GC runs. The scrubbed
+classes are strategy docs, not credentials — hygiene, not revocation, per
+this runbook's own rule.

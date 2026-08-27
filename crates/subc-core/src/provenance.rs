@@ -56,6 +56,7 @@ impl ExecutableIdentityProbe {
         pid: Option<u32>,
         spawned_from: Option<&Path>,
         _spawned_identity: Option<SpawnedFileIdentity>,
+        expected_start_time: Option<u64>,
     ) -> RunningImageAgreement {
         let Some(pid) = pid else {
             return unavailable(RunningImageUnavailableReason::NotRunning);
@@ -66,17 +67,28 @@ impl ExecutableIdentityProbe {
 
         #[cfg(target_os = "linux")]
         {
+            let Some(expected_start_time) = expected_start_time else {
+                return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
+            };
             let cache = Arc::clone(&self.cache);
+            let running_path = PathBuf::from(format!("/proc/{pid}/exe"));
             let spawned_from = spawned_from.to_path_buf();
             tokio::task::spawn_blocking(move || {
+                let running = match File::open(&running_path) {
+                    Ok(file) => file,
+                    Err(_) => {
+                        return unavailable(
+                            RunningImageUnavailableReason::RunningExecutableUnreadable,
+                        )
+                    }
+                };
+                if process_start_time(pid) != Some(expected_start_time) {
+                    return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
+                }
                 let mut cache = cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                compare_opened_paths(
-                    &mut cache,
-                    &PathBuf::from(format!("/proc/{pid}/exe")),
-                    &spawned_from,
-                )
+                compare_opened_descriptor(&mut cache, &running_path, running, &spawned_from)
             })
             .await
             .unwrap_or_else(|_| unavailable(RunningImageUnavailableReason::HashFailed))
@@ -84,7 +96,7 @@ impl ExecutableIdentityProbe {
 
         #[cfg(target_os = "macos")]
         {
-            let _ = pid;
+            let _ = (pid, expected_start_time);
             match (_spawned_identity, spawned_file_identity(spawned_from)) {
                 (Some(spawned_identity), Some(current_identity)) => {
                     compare_spawn_inode(spawned_identity, current_identity)
@@ -95,10 +107,32 @@ impl ExecutableIdentityProbe {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (pid, spawned_from, _spawned_identity);
+            let _ = (pid, spawned_from, _spawned_identity, expected_start_time);
             unavailable(RunningImageUnavailableReason::UnsupportedPlatform)
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| process_start_time_from_stat(&stat))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn process_start_time_from_stat(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -129,6 +163,16 @@ fn compare_opened_paths(
         Ok(file) => file,
         Err(_) => return unavailable(RunningImageUnavailableReason::RunningExecutableUnreadable),
     };
+    compare_opened_descriptor(cache, running_path, running, spawned_path)
+}
+
+#[cfg(target_os = "linux")]
+fn compare_opened_descriptor(
+    cache: &mut ImageDigestCache,
+    _running_path: &Path,
+    running: File,
+    spawned_path: &Path,
+) -> RunningImageAgreement {
     let disk = match File::open(spawned_path) {
         Ok(file) => file,
         Err(_) => return unavailable(RunningImageUnavailableReason::SpawnedPathUnreadable),
@@ -179,6 +223,11 @@ fn digest_open_file(cache: &mut ImageDigestCache, mut file: File) -> io::Result<
 }
 
 #[cfg(target_os = "linux")]
+/// All five fields are load-bearing; none is redundant. Inode numbers are
+/// reused after deletion, so a `(device, inode)` key alone would serve a
+/// cached digest for replaced content — the same identifier-reuse hazard the
+/// start-time pairing above guards against for PIDs. `size` and the
+/// nanosecond mtime are what make a recycled inode miss the cache.
 fn cache_key(file: &File) -> io::Result<FileCacheKey> {
     use std::os::unix::fs::MetadataExt;
 
@@ -239,6 +288,8 @@ mod tests {
     // so the other platforms' clippy does not fail them as unused.
     #[cfg(target_os = "linux")]
     use std::fs::File;
+    #[cfg(target_os = "linux")]
+    use tokio::process::Command;
 
     use super::*;
     use subc_control::RunningImageAgreement;
@@ -330,6 +381,115 @@ mod tests {
             }
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_running_descriptor_survives_path_replacement() {
+        let dir = temp_dir("retained-descriptor");
+        let running_path = dir.join("running");
+        let spawned_path = dir.join("spawned");
+        fs::write(&running_path, b"content A").unwrap();
+        fs::write(&spawned_path, b"content A").unwrap();
+
+        let running = File::open(&running_path).unwrap();
+        fs::remove_file(&running_path).unwrap();
+        fs::write(&running_path, b"content B").unwrap();
+
+        let agreement = compare_opened_descriptor(
+            &mut ImageDigestCache::default(),
+            &running_path,
+            running,
+            &spawned_path,
+        );
+
+        assert_eq!(
+            agreement,
+            RunningImageAgreement::Match {
+                evidence: RunningImageEvidence::LinuxProcSha256 {
+                    digest: "49114a9a2b7d46ec27be62ae3eade12f78d46cf5a99c52cd4f80381d723eed6e"
+                        .to_string(),
+                },
+            }
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn proc_stat_parser_ignores_spaces_and_parentheses_in_comm() {
+        let stat = "123 (foo) bar) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
+
+        assert_eq!(process_start_time_from_stat(stat), Some(424242));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn differing_process_start_time_after_open_is_typed_unavailable() {
+        let executable = std::env::current_exe().unwrap();
+        let current_start_time = process_start_time(std::process::id()).unwrap();
+        let agreement = ExecutableIdentityProbe::default()
+            .observe(
+                Some(std::process::id()),
+                Some(&executable),
+                None,
+                Some(current_start_time + 1),
+            )
+            .await;
+
+        assert_eq!(
+            agreement,
+            RunningImageAgreement::Unavailable {
+                reason: RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+            }
+        );
+        assert!(!matches!(
+            agreement,
+            RunningImageAgreement::Match { .. } | RunningImageAgreement::Mismatch { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_spawned_process_with_matching_start_time_still_matches() {
+        let executable = PathBuf::from("/bin/sleep");
+        let mut child = Command::new(&executable).arg("60").spawn().unwrap();
+        let pid = child.id().unwrap();
+        let start_time = process_start_time(pid).unwrap();
+        let agreement = ExecutableIdentityProbe::default()
+            .observe(Some(pid), Some(&executable), None, Some(start_time))
+            .await;
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+
+        assert!(matches!(agreement, RunningImageAgreement::Match { .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn differing_start_time_wins_over_a_different_image_digest() {
+        let running_executable = PathBuf::from("/bin/sleep");
+        let spawned_executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(&running_executable).arg("60").spawn().unwrap();
+        let pid = child.id().unwrap();
+        let start_time = process_start_time(pid).unwrap();
+        let agreement = ExecutableIdentityProbe::default()
+            .observe(
+                Some(pid),
+                Some(&spawned_executable),
+                None,
+                Some(start_time + 1),
+            )
+            .await;
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(
+            agreement,
+            RunningImageAgreement::Unavailable {
+                reason: RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+            }
+        );
+        assert!(!matches!(agreement, RunningImageAgreement::Mismatch { .. }));
     }
 
     #[cfg(target_os = "linux")]

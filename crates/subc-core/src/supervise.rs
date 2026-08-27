@@ -67,6 +67,7 @@ struct SupervisedChild {
     spawned_at_ms: u64,
     spawned_from: PathBuf,
     spawned_file_identity: Option<SpawnedFileIdentity>,
+    process_start_time: Option<u64>,
 }
 
 impl SupervisedChild {
@@ -340,6 +341,7 @@ pub struct ModuleStatus {
     pub pid: Option<u32>,
     pub spawned_at_ms: Option<u64>,
     pub spawned_from: Option<PathBuf>,
+    pub process_start_time: Option<u64>,
     pub last_exit: Option<ExitReport>,
     pub health: ModuleHealthStatus,
 }
@@ -354,6 +356,7 @@ struct SupervisorSnapshot {
     spawned_at_ms: Option<u64>,
     spawned_from: Option<PathBuf>,
     spawned_file_identity: Option<SpawnedFileIdentity>,
+    process_start_time: Option<u64>,
     last_exit: Option<ExitReport>,
     health: ModuleHealthStatus,
 }
@@ -381,6 +384,7 @@ impl SupervisorSnapshot {
             spawned_at_ms: None,
             spawned_from: None,
             spawned_file_identity: None,
+            process_start_time: None,
             last_exit: None,
             health: ModuleHealthStatus::default(),
         }
@@ -1201,6 +1205,7 @@ impl SupervisedModule {
             pid: snapshot.pid,
             spawned_at_ms: snapshot.spawned_at_ms,
             spawned_from: snapshot.spawned_from,
+            process_start_time: snapshot.process_start_time,
             last_exit: snapshot.last_exit,
             health: snapshot.health,
         })
@@ -1237,6 +1242,7 @@ impl SupervisedModule {
                 snapshot.pid,
                 snapshot.spawned_from.as_deref(),
                 snapshot.spawned_file_identity,
+                snapshot.process_start_time,
             )
             .await
     }
@@ -3353,6 +3359,7 @@ fn spawn_child(
     let spawned_at_ms = unix_ms_now();
     let spawned_from = spec.program.clone();
     let spawned_file_identity = spawned_file_identity(&spawned_from);
+    let process_start_time = child.id().and_then(crate::provenance::process_start_time);
 
     let stderr_pump = match child.stderr.take() {
         Some(stderr) => {
@@ -3383,6 +3390,7 @@ fn spawn_child(
         spawned_at_ms,
         spawned_from,
         spawned_file_identity,
+        process_start_time,
     })
 }
 
@@ -4121,6 +4129,7 @@ fn set_running(snapshot: &SharedSnapshot, child: &SupervisedChild) -> Result<(),
         state.spawned_at_ms = Some(child.spawned_at_ms);
         state.spawned_from = Some(child.spawned_from.clone());
         state.spawned_file_identity = child.spawned_file_identity;
+        state.process_start_time = child.process_start_time;
     })
 }
 
@@ -4130,6 +4139,7 @@ fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.spawned_at_ms = None;
     state.spawned_from = None;
     state.spawned_file_identity = None;
+    state.process_start_time = None;
 }
 
 fn fail_snapshot(

@@ -333,6 +333,9 @@ pub struct ModuleStatus {
     pub registration_active: bool,
     pub live: bool,
     pub restart_count: u32,
+    /// Replacement processes spawned over this module's entire supervisor lifetime;
+    /// unlike `restart_count`, this value is never reset by an operator action.
+    pub lifetime_restarts: u32,
     /// The budget `restart_count` is spent against. Carried alongside the count
     /// because the count alone does not say how close the module is to being
     /// disabled, and reporting one without the other is what makes an
@@ -352,6 +355,7 @@ struct SupervisorSnapshot {
     enabled: bool,
     process_alive: bool,
     restart_count: u32,
+    lifetime_restarts: u32,
     pid: Option<u32>,
     spawned_at_ms: Option<u64>,
     spawned_from: Option<PathBuf>,
@@ -380,6 +384,7 @@ impl SupervisorSnapshot {
             enabled,
             process_alive: false,
             restart_count: 0,
+            lifetime_restarts: 0,
             pid: None,
             spawned_at_ms: None,
             spawned_from: None,
@@ -1201,6 +1206,7 @@ impl SupervisedModule {
             registration_active,
             live,
             restart_count: snapshot.restart_count,
+            lifetime_restarts: snapshot.lifetime_restarts,
             max_restarts: self.inner.max_restarts,
             pid: snapshot.pid,
             spawned_at_ms: snapshot.spawned_at_ms,
@@ -2227,6 +2233,7 @@ async fn health_restart_child(
 
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.restart_count += 1;
+        state.lifetime_restarts += 1;
         state.state = ModuleState::Unresponsive;
         state.health.status = status;
         state.health.last_action = Some(HealthAction::Restart.to_string());
@@ -3214,6 +3221,7 @@ async fn on_child_exit(
                 state.last_exit = Some(exit_report.clone());
                 if daemon_will_restart(state.enabled, state.restart_count, policy.max_restarts) {
                     state.restart_count += 1;
+                    state.lifetime_restarts += 1;
                     state.state = ModuleState::Restarting;
                     should_restart = true;
                     disposition = TerminalDisposition::Restarting;
@@ -3876,6 +3884,7 @@ async fn handle_reload_spawn_failure(
             runtime.restart_policy.max_restarts,
         ) {
             state.restart_count += 1;
+            state.lifetime_restarts += 1;
             state.state = ModuleState::Restarting;
             should_retry = true;
         } else if state.enabled {
@@ -4210,9 +4219,11 @@ mod terminal_history_tests {
     use tokio::time::sleep;
 
     use super::{
-        daemon_will_restart, drained_after_quiescence_wait, record_terminal, update_snapshot,
-        wait_error_exit_report, ExitKind, ModuleSpec, ModuleState, RestartPolicy, SuperviseError,
-        SupervisedModule, Supervisor, SupervisorHandle,
+        daemon_will_restart, drained_after_quiescence_wait, handle_reload_spawn_failure,
+        health_restart_child, lock_snapshot, on_child_exit, record_terminal, update_snapshot,
+        wait_error_exit_report, ExitKind, ExitReport, ModuleSpec, ModuleState, NextAction,
+        RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorHandle,
+        SupervisorHealthStatus, SupervisorSnapshot,
     };
     use crate::{
         registry::Registry,
@@ -4428,6 +4439,96 @@ mod terminal_history_tests {
             );
             sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Each restart-producing arm has its own state transition. Keeping their
+    /// lifetime count assertions adjacent prevents a later new arm from silently
+    /// spending budget without recording the historical restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_restart_increment_path_advances_lifetime_count() {
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(1, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            module_id: "lifetime-increment-path".to_string(),
+            program: PathBuf::from("/unused/lifetime-increment-path"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+
+        let crash_snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        assert!(matches!(
+            on_child_exit(
+                &spec,
+                runtime.restart_policy,
+                &supervisor.registry,
+                &crash_snapshot,
+                &runtime.terminal_ring,
+                ExitReport {
+                    kind: ExitKind::Crash,
+                    code: Some(1),
+                    signal: None,
+                    at_ms: 1,
+                },
+            )
+            .await,
+            NextAction::Restart
+        ));
+        let (crash_restarts, crash_lifetime) = {
+            let state = lock_snapshot(&crash_snapshot).unwrap();
+            (state.restart_count, state.lifetime_restarts)
+        };
+        assert_eq!(crash_restarts, 1);
+        assert_eq!(crash_lifetime, 1);
+
+        let health_snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let mut health_child = None;
+        assert!(matches!(
+            health_restart_child(
+                &spec,
+                &runtime,
+                &supervisor.registry,
+                &supervisor.process_liveness,
+                &health_snapshot,
+                &mut health_child,
+                SupervisorHealthStatus::Failing,
+                None,
+                2,
+            )
+            .await,
+            Err(SuperviseError::Spawn { .. })
+        ));
+        let (health_restarts, health_lifetime) = {
+            let state = lock_snapshot(&health_snapshot).unwrap();
+            (state.restart_count, state.lifetime_restarts)
+        };
+        assert_eq!(health_restarts, 1);
+        assert_eq!(health_lifetime, 1);
+
+        let reload_snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let mut reload_child = None;
+        assert!(matches!(
+            handle_reload_spawn_failure(
+                &spec,
+                &runtime,
+                &supervisor.process_liveness,
+                &reload_snapshot,
+                &mut reload_child,
+                "forced reload spawn failure".to_string(),
+            )
+            .await,
+            Err(SuperviseError::ReloadFailed { .. })
+        ));
+        let (reload_restarts, reload_lifetime) = {
+            let state = lock_snapshot(&reload_snapshot).unwrap();
+            (state.restart_count, state.lifetime_restarts)
+        };
+        assert_eq!(reload_restarts, 1);
+        assert_eq!(reload_lifetime, 1);
     }
 
     /// The `route.closed` `drained` value must be the quiescence wait's own

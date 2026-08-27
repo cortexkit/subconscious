@@ -3565,8 +3565,12 @@ fn format_restart_budget(module: &Value) -> String {
     match (
         module.get("restart_count").and_then(Value::as_u64),
         module.get("max_restarts").and_then(Value::as_u64),
+        module.get("lifetime_restarts").and_then(Value::as_u64),
     ) {
-        (Some(used), Some(allowed)) => format!("{used}/{allowed}"),
+        (Some(used), Some(allowed), Some(lifetime)) if lifetime != used => {
+            format!("{used}/{allowed} ({lifetime} lifetime)")
+        }
+        (Some(used), Some(allowed), _) => format!("{used}/{allowed}"),
         _ => "-".to_string(),
     }
 }
@@ -4476,6 +4480,28 @@ mod tests {
                 escaped.contains(r"\x1b") || escaped.contains(r"\x07") || escaped.contains(r"\x0a")
             );
         }
+    }
+
+    #[test]
+    fn restart_budget_hides_matching_lifetime_count() {
+        let module = serde_json::json!({
+            "restart_count": 2,
+            "max_restarts": 3,
+            "lifetime_restarts": 2,
+        });
+
+        assert_eq!(format_restart_budget(&module), "2/3");
+    }
+
+    #[test]
+    fn restart_budget_shows_lifetime_count_after_budget_reset() {
+        let module = serde_json::json!({
+            "restart_count": 0,
+            "max_restarts": 3,
+            "lifetime_restarts": 2,
+        });
+
+        assert_eq!(format_restart_budget(&module), "0/3 (2 lifetime)");
     }
 
     #[test]

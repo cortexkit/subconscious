@@ -741,6 +741,10 @@ pub struct SupervisorEntry {
     /// `restart_count`; absent on daemons predating the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_restarts: Option<u32>,
+    /// Replacement processes spawned over this module's entire supervisor lifetime.
+    /// Unlike `restart_count`, this value is never reset by an operator action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime_restarts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

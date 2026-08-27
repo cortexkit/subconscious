@@ -1,103 +1,122 @@
 {
-  "comment": "Machine-readable fleet denominator: every supervised module, its source repo, and how its binary is acquired. Consumers: E2E's cross-module gate derives its checkout list from this file (per-module exclusions carry reasons here, never in a hand-list); fleet-pulse diffs the DEPLOYED subc.jsonc roster against this file both directions, so deployed-vs-committed drift alarms at the seat that owns deployed state. Update rule: any change to the supervised module set lands here in the same change; the fleet-pulse two-arm diff is the tripwire for forgetting. Build-only dependency repos (no supervised module, but path-dep targets of siblings) carry rows in build_dependencies with reasons -- a checkout derivation is manifest source repos UNION build_dependencies; deriving from modules alone drops the repo whose bumps start lock waves.",
+  "comment": "Machine-readable fleet denominator: every supervised module, its source repo, and how its binary is acquired. Consumers: E2E's cross-module gate derives its checkout list from this file (per-module exclusions carry reasons here, never in a hand-list); fleet-pulse diffs the DEPLOYED subc.jsonc roster against this file both directions, so deployed-vs-committed drift alarms at the seat that owns deployed state. Update rule: any change to the supervised module set lands here in the same change; the fleet-pulse two-arm diff is the tripwire for forgetting. Build-only dependency repos (no supervised module, but path-dep targets of siblings) carry rows in build_dependencies with reasons -- a checkout derivation is manifest source repos UNION build_dependencies; deriving from modules alone drops the repo whose bumps start lock waves. lock_refresh: 'auto' means the subconscious post-bump runner executes the lock-only refresh recipe in that repo (owner opted in, owner's gate remains acceptance authority); 'manual' means the owner absorbs waves themselves. E2E's convergence gate splits stale counts by this field so a partial rollout cannot misread untreated repos as mechanism failure.",
   "version": 1,
   "modules": {
     "aft": {
       "repo": "cortexkit/aft",
       "binary": "ck-aft",
       "acquisition": "release_binary",
-      "gate_exclusion_reason": "acquired as reviewed release asset by design; not built from source by consumers"
+      "gate_exclusion_reason": "acquired as reviewed release asset by design; not built from source by consumers",
+      "lock_refresh": "manual"
     },
     "astrocyte": {
       "repo": "cortexkit/astrocyte",
       "binary": "ck-astrocyte",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "broca": {
       "repo": "cortexkit/broca",
       "binary": "ck-broca",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "callosum": {
       "repo": "cortexkit/callosum",
       "binary": "ck-callosum",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "cerebellum": {
       "repo": "cortexkit/cerebellum",
       "binary": "ck-cerebellum",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "claustrum": {
       "repo": "cortexkit/claustrum",
       "binary": "ck-claustrum",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "condition-runner": {
       "repo": "cortexkit/subconscious",
       "binary": "ck-condition-runner",
       "acquisition": "source",
-      "comment": "compiled bun binary staged from the wakes lane; source of truth is the vendored runner in subconscious"
+      "comment": "compiled bun binary staged from the wakes lane; source of truth is the vendored runner in subconscious",
+      "lock_refresh": "manual"
     },
     "engram": {
       "repo": "cortexkit/engram",
       "binary": "ck-engram",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "entorhinal": {
       "repo": "cortexkit/entorhinal",
       "binary": "ck-entorhinal",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "fusiform": {
       "repo": "cortexkit/fusiform",
       "binary": "ck-fusiform",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "insula": {
       "repo": "cortexkit/insula",
       "binary": "ck-insula",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "magic-context": {
       "repo": "cortexkit/magic-context",
       "binary": "ck-mc",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "plexus": {
       "repo": "cortexkit/plexus",
       "binary": "ck-plexus",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "prefrontal-core": {
       "repo": "cortexkit/prefrontal",
       "binary": "ck-prefrontal-core",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "prefrontal-routing": {
       "repo": "cortexkit/prefrontal",
       "binary": "ck-prefrontal-routing",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "subc-mcp": {
       "repo": "cortexkit/subconscious",
       "binary": "ck-subc-mcp",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "synapse": {
       "repo": "cortexkit/synapse",
       "binary": "ck-synapse",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "thalamus": {
       "repo": "cortexkit/thalamus",
       "binary": "ck-thalamus",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     },
     "wernicke": {
       "repo": "cortexkit/wernicke",
       "binary": "ck-wernicke",
-      "acquisition": "source"
+      "acquisition": "source",
+      "lock_refresh": "manual"
     }
   },
   "build_dependencies": {

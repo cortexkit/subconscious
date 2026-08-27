@@ -42,7 +42,9 @@ use crate::{
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
         PendingModuleControlRpc, RouteBindRelayOutcome, RoutePollSnapshot, RouteRelease,
     },
-    provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
+    provenance::{
+        process_start_time, spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity,
+    },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
     stderr_tail::{CaptureState, TailEntry},
@@ -106,6 +108,7 @@ struct DaemonProvenanceFacts {
     started_at_ms: Option<u64>,
     executable_path: Option<PathBuf>,
     executable_identity: Option<SpawnedFileIdentity>,
+    process_start_time: Option<u64>,
     probe: ExecutableIdentityProbe,
 }
 
@@ -120,6 +123,7 @@ impl Default for DaemonProvenanceFacts {
             started_at_ms: None,
             executable_path: None,
             executable_identity: None,
+            process_start_time: None,
             probe: ExecutableIdentityProbe::default(),
         }
     }
@@ -388,6 +392,7 @@ impl ControlHandler {
         build_lock_digest: Option<String>,
     ) -> Self {
         let executable_identity = executable_path.as_deref().and_then(spawned_file_identity);
+        let process_start_time = process_start_time(pid);
         self.daemon_provenance = DaemonProvenanceFacts {
             build: DaemonBuildProvenance {
                 build_git_sha,
@@ -397,6 +402,7 @@ impl ControlHandler {
             started_at_ms: Some(started_at_ms),
             executable_path,
             executable_identity,
+            process_start_time,
             probe: ExecutableIdentityProbe::default(),
         };
         self
@@ -2152,6 +2158,7 @@ impl ControlHandler {
                         self.daemon_provenance.pid,
                         self.daemon_provenance.executable_path.as_deref(),
                         self.daemon_provenance.executable_identity,
+                        self.daemon_provenance.process_start_time,
                     )
                     .await,
             },

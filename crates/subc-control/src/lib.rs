@@ -492,6 +492,7 @@ pub enum RunningImageUnavailableReason {
     RunningExecutableUnreadable,
     SpawnedPathUnreadable,
     HashFailed,
+    ProcessIdentityUnconfirmed,
 }
 
 /// The identity tier the daemon can honestly report for a route consumer.

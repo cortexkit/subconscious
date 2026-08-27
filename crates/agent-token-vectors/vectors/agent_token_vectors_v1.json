@@ -1,0 +1,483 @@
+{
+  "meta": {
+    "vector_set_version": 1,
+    "claim_shape_v": 1,
+    "pubkey_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "verify_now": 1800000000,
+    "reasons": [
+      "invalid_signature",
+      "claims_not_object",
+      "missing_claim",
+      "unknown_claim",
+      "v_type",
+      "v_mismatch",
+      "agent_id_type",
+      "surface_type",
+      "handle_type",
+      "installation_id_type",
+      "scope_type",
+      "binding_generation_type",
+      "jti_type",
+      "iat_type",
+      "exp_type",
+      "expired",
+      "future_iat",
+      "empty_scope",
+      "scope_mismatch",
+      "surface_mismatch"
+    ],
+    "rule_3_scope": "out_of_corpus_scope: requires verifier-local binding_generation watermark state"
+  },
+  "vectors": [
+    {
+      "name": "a-valid-minimal-realistic",
+      "expect": "valid",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "agent-token-minimal",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "c521169a3c616b3d22e9fb0178abd8238bc8661b5ca992feedccabe30fbf278a575b65cdfaaa0ef6616afac03e96b181d016ade1e5bb847ee1e6085ddaa25e03"
+    },
+    {
+      "name": "b-valid-full-shape-numeric-looking-strings",
+      "expect": "valid",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "0042",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "12345",
+        "scope": [
+          "manifest.apply",
+          "issue.comment"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "8f7385f5b7c5927510365b5b0df6f18567999526aa54a6bbbeed764a6b1b0ae48e9e20a2b78564cca157cf63682a04fb79a43fffe0ff81edb9ac872c6c4ffd0c"
+    },
+    {
+      "name": "c-valid-jcs-ordering-required",
+      "expect": "valid",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "surface": "github",
+        "scope": [
+          "manifest.apply"
+        ],
+        "v": 1,
+        "jti": "agent-token-jcs-order",
+        "installation_id": 12345678,
+        "handle": "plexus[bot]",
+        "exp": 1800000600,
+        "iat": 1799999990,
+        "binding_generation": 3,
+        "agent_id": "plexus"
+      },
+      "signature_hex": "cfa7c8af307a36b5461819b7b48676e39bf2be3b6557a9f61f1848ee98b31c849a586eac4f57ec707f8bb1877d36502f549d6d00e6a7eae34ad65e0f60189909"
+    },
+    {
+      "name": "d-refuse-signature-bit-flipped",
+      "expect": "refuse",
+      "reason": "invalid_signature",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "agent-token-signature-source",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "cea79357f5feb46abc4266d303cf4f487ccf4eaf9e89ef4dbc9b6fb9e69a2545bfbd8c0a2f499cbcdf01737602380566df866708e00e9709f67342ea65483904"
+    },
+    {
+      "name": "e-refuse-claims-mutated-after-signing",
+      "expect": "refuse",
+      "reason": "invalid_signature",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "forged[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "agent-token-signature-source",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "cfa79357f5feb46abc4266d303cf4f487ccf4eaf9e89ef4dbc9b6fb9e69a2545bfbd8c0a2f499cbcdf01737602380566df866708e00e9709f67342ea65483904"
+    },
+    {
+      "name": "f-refuse-different-signer",
+      "expect": "refuse",
+      "reason": "invalid_signature",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "agent-token-signature-source",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "75e8f8ffff96562abc763af300c0e27cb5d819a8f57b9ad558ceb7b36a6d2b9e30cedfa36592cfba0ce8f9f9b69894c6a85c5ee97960eb6df968828f74843a07"
+    },
+    {
+      "name": "g-refuse-installation-id-string",
+      "expect": "refuse",
+      "reason": "installation_id_type",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": "12345678",
+        "jti": "g-refuse-installation-id-string",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "b5afffbdd652f1ea72e66ed46bbb3ef47938b7c1bc355b6f947ed08a07dff09bc70e70b47457eecc19889adcf36f91691c7159105f4ec064901aead7e01ed406"
+    },
+    {
+      "name": "h-refuse-binding-generation-string",
+      "expect": "refuse",
+      "reason": "binding_generation_type",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": "3",
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "h-refuse-binding-generation-string",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "83c1d52cae3b8c535be740015dc649bc3aaf17733dc576d5e5385b2d208465fa98d906ba91434db2200722733821ca7c609693c318f981dbd64be3db423f7404"
+    },
+    {
+      "name": "i-refuse-iat-string",
+      "expect": "refuse",
+      "reason": "iat_type",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": "1799999990",
+        "installation_id": 12345678,
+        "jti": "i-refuse-iat-string",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "d7f3d4c4cb1cf147add21a282517e3619fb9d8abf4a4a84ed2ae7fcc739a7fd8bb133e7b137e7bffff0c44b897a084608ba9e433e94bd0f5800c99c8479f9309"
+    },
+    {
+      "name": "j-refuse-exp-string",
+      "expect": "refuse",
+      "reason": "exp_type",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": "1800000600",
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "j-refuse-exp-string",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "d1c99ef092b50536a1cfa09879a9ee12d55d78d27d6571fe9c114fba526e53459077a05b666bc518d990da14fdbed3ac05e85082b7a6832d7287010221c85002"
+    },
+    {
+      "name": "k-refuse-v-string",
+      "expect": "refuse",
+      "reason": "v_type",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "k-refuse-v-string",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": "1"
+      },
+      "signature_hex": "54954033328c6234f79314f85485dfc1f4620265b29884174576e82c559292bb1504125c7a2e2b7032d41a1995860c21e2715ea76962fecbe01b9d6ef65bf50a"
+    },
+    {
+      "name": "l-refuse-agent-id-number",
+      "expect": "refuse",
+      "reason": "agent_id_type",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": 42,
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "l-refuse-agent-id-number",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "673526b2dbc3c030f8737c1cf4585768ba23b9c087aa07535ee685b1f02f1eff56533ae893d24a13d84da66a5cc79600590a01a6ed8021375951dfcb1d8cec07"
+    },
+    {
+      "name": "m-refuse-jti-number",
+      "expect": "refuse",
+      "reason": "jti_type",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": 12345,
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "3e309c099af8957192f95527f3c21e09071071601c2660dfa588476946d8aca81076b162b3ec175e21be7eb5bd29f55a868575eceda3d843bc4c9d8ef083460e"
+    },
+    {
+      "name": "n-refuse-missing-required-scope",
+      "expect": "refuse",
+      "reason": "missing_claim",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "missing-scope",
+        "v": 1,
+        "surface": "github"
+      },
+      "signature_hex": "80dbd753da034a622c97a6fe04c2e8fb2be961522ab5222e2e0a15419ff0074e64d0193e14c1fff6c1e3192f369a1c6f45c1eba5c23b5e56424a8f969bb0380b"
+    },
+    {
+      "name": "o-refuse-unknown-extra-claim",
+      "expect": "refuse",
+      "reason": "unknown_claim",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "unknown-claim",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1,
+        "admin": true
+      },
+      "signature_hex": "448c8b92494292d7f9944acca309ef5485d2e7e27ebc70ddae264c58de04e9373a9821999729a85033b7eb2516181e2ebe225045ea10f32cf0cad16a2d279f0f"
+    },
+    {
+      "name": "p-refuse-expired",
+      "expect": "refuse",
+      "reason": "expired",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000000,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "expired-token",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "2a0d1b0785a2569f2f585f9e11ca0559bcd1fb9a09925343047566f247e55e84c2c29d20efa65665ddaf29091347ed72bde89946212c1f50e979257eabb00f09"
+    },
+    {
+      "name": "q-refuse-future-iat-beyond-skew",
+      "expect": "refuse",
+      "reason": "future_iat",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1800000061,
+        "installation_id": 12345678,
+        "jti": "future-iat",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "23168e18c5921007381afe01f1523b651637833fe63e1dc566f1367ee815f3cdd9d718f22d68cda4cfcaba494789dc505bee822523d7ea9a19d2ddbd28eded0b"
+    },
+    {
+      "name": "r-refuse-empty-scope",
+      "expect": "refuse",
+      "reason": "empty_scope",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "empty-scope",
+        "scope": [],
+        "surface": "github",
+        "v": 1
+      },
+      "signature_hex": "2065061910f0824ac76d7e927ac56db8d125222c2a1ace03e8a432c1af95f2b40ffbe521ad2ffff9488e2278eccffbc79a38932b2088be59773eae165217620a"
+    },
+    {
+      "name": "s-refuse-surface-mismatch",
+      "expect": "refuse",
+      "reason": "surface_mismatch",
+      "verify_context": {
+        "surface": "github",
+        "action": "manifest.apply"
+      },
+      "claims": {
+        "agent_id": "plexus",
+        "binding_generation": 3,
+        "exp": 1800000600,
+        "handle": "plexus[bot]",
+        "iat": 1799999990,
+        "installation_id": 12345678,
+        "jti": "gitlab-surface",
+        "scope": [
+          "manifest.apply"
+        ],
+        "surface": "gitlab",
+        "v": 1
+      },
+      "signature_hex": "790d125c3b86f5e15a662033213b88fde896888b5a599d94d7babf425c7cbd696e9d920f12d5604fdd5ea2ef8bdef72c03f6215df33071470750a3e27b22ce00"
+    }
+  ]
+}

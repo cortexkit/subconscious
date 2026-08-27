@@ -131,3 +131,15 @@ Accepted residual, dispositioned not ignored: GitHub retains refs/pull/* and
 the fork's history until iceteaSA re-forks and server GC runs. The scrubbed
 classes are strategy docs, not credentials — hygiene, not revocation, per
 this runbook's own rule.
+
+## Ceremony verbs under the gh shim (v9+)
+
+Use gh's NATIVE verbs for the two destructive steps — they are argv tuples the
+shim classifies admin-tier, refusing with the operator remedy named:
+`gh run delete <id>` (never raw `api -X DELETE`, which stays
+unclassified-refused by design: v1 api_rules are GET-only, and an unenforceable
+DELETE row would merely look adjudicated) and `gh repo edit --visibility`.
+Operator executes both under GH_SHIM_BYPASS=operator — refusal-by-design, not
+unclassified-by-accident. Flip verification stays three-arm: authenticated
+read, unauthenticated curl, ANONYMOUS CLONE (the only arm proving an outsider
+receives bytes).

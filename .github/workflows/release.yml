@@ -53,7 +53,7 @@ jobs:
             # image (24.04 produced GLIBC_2.39-requiring assets that failed on
             # GitHub's default ubuntu-22.04 runners, glibc 2.35). Consumers run
             # these binaries on arbitrary CI images; keep the floor low.
-            runner: blacksmith-2vcpu-ubuntu-2204
+            runner: ubuntu-latest
     runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -118,7 +118,7 @@ jobs:
     # Blacksmith runner (not GitHub-hosted): the owning org is on the free plan,
     # where GitHub blocks private-repo Actions jobs at the zero spending limit.
     # See ci.yml for the full rationale.
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     needs: verify
     steps:
       - uses: actions/checkout@v5

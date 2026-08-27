@@ -30,7 +30,7 @@ jobs:
     # Blacksmith runner (private repo on the free plan blocks GitHub-hosted
     # Actions). Blacksmith is a drop-in that honors GitHub-native OIDC, so
     # trusted publishing works unchanged as long as id-token: write is granted.
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 

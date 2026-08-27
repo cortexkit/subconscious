@@ -53,9 +53,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: ubuntu-latest
           - os: windows
-            runner: blacksmith-4vcpu-windows-2025
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -183,7 +183,7 @@ jobs:
   # arrives attached to the one action you least want to abort.
   ts-client:
     name: TS (${{ matrix.pkg }})
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:

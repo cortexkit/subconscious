@@ -143,3 +143,19 @@ Operator executes both under GH_SHIM_BYPASS=operator — refusal-by-design, not
 unclassified-by-accident. Flip verification stays three-arm: authenticated
 read, unauthenticated curl, ANONYMOUS CLONE (the only arm proving an outsider
 receives bytes).
+
+## Post-execution finding: git-rev pin consumers (THALAMUS, thalamus#3)
+
+A rewrite orphans every git-rev dependency pin on the rewritten repo, and the
+failure is COLD-BUILD ONLY: warm caches (local and CI) keep resolving the
+orphaned object, so every instrument the consumer owns reports green while a
+fresh clone cannot build. Nothing goes red at the moment of breakage — an
+outside contributor's failed build is the likely first report.
+
+Runbook amendment: the pre-flip notice enumerates git-rev pin consumers
+(sweep fleet Cargo.tomls for `git = ...subconscious` + `rev =`; control the
+sweep against a repo known to carry pins — THALAMUS's first sweep reported a
+false zero from a too-strict grep). Re-pin method for consumers: compare the
+crates/ SUBTREE hash at old and new revs (full-tree comparison wrongly
+rejects safe targets when only docs were scrubbed), then verify consumed
+crates individually.

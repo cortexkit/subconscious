@@ -1,7 +1,11 @@
-# Fleet Release Machine — draft r4
+# Fleet Release Machine — draft r5
 
-Status: DRAFT — three seat reviews folded (MC r1→r2, AFT r2→r3, ALF r3→r4;
-all three GO). Next: Ufuk take → Athena rounds → spec campaign.
+Status: DRAFT — three seat reviews folded (MC r1→r2, AFT r2→r3, ALF r3→r4; all
+GO), then Athena panel folded (r4→r5, consult ct_…cdf29ac19050: 4 seats, all
+blockers converged on one blind spot — the journal's own trust boundary under
+time, identity, and concurrency; panel caveat honestly noted: shared evidence
+corpus, so convergence is consistency, not independent replication). Next:
+spec campaign.
 Chartered by Ufuk via MC (2026-08-26) after MC's 11-attempt release saga.
 Evidence base: `docs/research/release-machinery-census.md` (18 repos, 162
 verified citations). MC is first adopter.
@@ -35,6 +39,18 @@ verification, and refusal grammar.
 A "train" is a named release lane within a repo (census: subconscious has three
 — crate, core-binary, npm; magic-context has two). Trains are independent state
 machines sharing the repo declaration.
+
+### Artifact identity channels (Athena blockers 6+7)
+
+Every declared artifact KIND names its IDENTITY CHANNEL: `embedded_stamp`
+(Mach-O/ELF with compiler-emitted build-sha), `manifest_field` (readable
+metadata surface), `content_digest` (sha against a destination that exposes
+the digest for readback), or — later — `oci_digest` (manifest digest +
+provenance annotation). A no-tag train declaring an artifact kind with NO
+decidable identity channel is REFUSED AT DECLARATION TIME, not mid-release:
+the embedded-stamp probe quietly generalizes only to stamped binaries, and
+npm tarballs / wasm / docker images need their channel named or they have no
+done-probe at all.
 
 ### The no-tag train is first-class (ALF, no-path-seat review)
 
@@ -106,6 +122,15 @@ Each phase declares, in the shared machine (not per repo):
    over the journal: the journal records what was INTENDED; the world records
    what happened (a declaration with no readback is unfalsifiable by its own
    producer — the provenance rule, applied to releases).
+   ALL done-probes are THREE-VALUED (Athena blocker 1): present / absent /
+   UNDECIDABLE, with a per-probe declared settle budget. Registry and GH
+   probes pass through eventual-consistency windows (crates.io index
+   propagation is in the census's own evidence — subconscious CI retries it);
+   a two-valued probe reads "propagating" as "absent" and resume re-fires an
+   already-executed irreversible publish, violating the never-re-executed
+   guarantee. UNDECIDABLE means wait-and-re-probe within the budget, NEVER
+   absent; failure is reported only on budget exhaustion. (This generalizes
+   the three-valued read ci_watch already mandates.)
 3. Its REFUSAL forms — typed, with the remedy named (tag-at-other-commit
    refuses with both SHAs; asset-sha-mismatch refuses and never clobbers
    silently).
@@ -113,14 +138,56 @@ Each phase declares, in the shared machine (not per repo):
 ## The journal (MC constraints 1 + 4)
 
 Durable per-train ledger at
-`~/.local/share/cortexkit/release/<repo>/<train>-<version>.journal` (JSONL,
-append-only): phase entered, phase done (with the done-probe's evidence),
-refusal (with reason). Crash anywhere → rerun the same command → preflight
-replays the journal AND re-runs every done-probe; the resume point is the
-first phase whose probe fails. Leftovers are recognized, never re-executed and
-never treated as corruption. tag-exists and already-published are resume
-points, not errors (MC constraint 2 — the aft/subconscious behaviour, now the
-only behaviour; magic-context's hard-error shape is retired by adoption).
+`~/.local/share/cortexkit/release/<repo>/<train>-<id>.journal` (JSONL,
+append-only), where `<id>` is the version for tagged trains and the
+INTENDED-COMMIT (short sha, plus start timestamp on collision) for no-tag
+trains — Athena's cleanest catch: r4 made no-tag trains first-class and
+versionless while keying the journal on version, so prefrontal's
+multiple-per-day deploys either collide on one ledger or cannot be named.
+
+Entries: phase entered, phase done (with the done-probe's evidence), refusal
+(with reason). Crash anywhere → rerun the same command → preflight replays
+the journal AND re-runs every done-probe; the resume point is the first phase
+whose probe fails (with UNDECIDABLE settling first — see done-probes).
+Leftovers are recognized, never re-executed and never treated as corruption.
+tag-exists and already-published are resume points, not errors (MC
+constraint 2 — the aft/subconscious behaviour, now the only behaviour;
+magic-context's hard-error shape is retired by adoption).
+
+### Durability and reconciliation (Athena blocker 2)
+
+Intent precedes effect DURABLY: the train-start record and every
+phase/artifact intent line are appended, flushed, and fsynced — each line
+checksummed — BEFORE the effect executes. Irreversible per-artifact calls
+(each `cargo publish`, each asset upload) get their own write-ahead intent
+line carrying a stable operation key and the expected result identity
+("attempting crates.io subc@0.53.0, expect sha X"), so a crash after the
+call but before any response is reconcilable: resume treats
+attempted-plus-undecidable as settle-and-re-probe, never re-fire, and
+attempted-plus-absent-after-budget as a typed refusal for the operator. On
+reopen, a torn FINAL JSONL record (checksum fails, nothing after it) is
+truncated as a non-event; a checksum failure anywhere earlier is corruption
+and fails loud.
+
+### Single-writer leases (Athena blocker 3)
+
+A per-(repo, train) LEASE FILE is taken at train start — PID+start-time
+liveness, the box-gate's mechanics reused — and released at terminal state; a
+second invocation refuses naming the live holder. Additionally, local
+TREE-MUTATING phases (bump, lock, commit, tag) take a per-REPO lease so two
+trains sharing one working tree serialize their mutations. The box-gate does
+not cover either case (its population is load-affected phases only, by
+design).
+
+### Declaration pinning (Athena blocker 5)
+
+The train-start record journals the EFFECTIVE-DECLARATION DIGEST (content
+hash of `release.jsonc` after JSONC normalization). Resume refuses on digest
+mismatch with a typed refusal offering exactly two exits — abandon the
+journal, or explicitly rebind to the new declaration — because a silently
+re-planned resume can drop a newly-inserted pre-publish gate or misalign
+parameterized phase instances, violating the ordering law across attempts.
+The Drift section covers sibling-lock drift; this covers SELF-drift.
 
 Notification-as-contract (constraint 4) falls out of the journal: phase
 transitions are observable lines as they happen, a failure surfaces at failure
@@ -144,10 +211,16 @@ Never handled mid-release. `preflight` runs the sibling-lock check
 dirty lock state, naming the wave that fixes it. Drift repair belongs to
 fire-from-the-bump and the nightly lane; a release never absorbs it.
 
-## Signing and staging (one form each, evidence-picked)
+## Signing and staging (invariant pipeline, per-artifact profiles)
 
-- Signing: topology v2 — Apple Development identity + pinned per-binary
-  identifier on macOS; ad-hoc only where no TCC surface exists. Per-artifact
+- Signing POLICY is a closed per-artifact PROFILE set, not one form — the
+  census contradicts single-form (Athena blocker 8): magic-context's
+  dashboard requires Developer ID distribution signing plus a Tauri updater
+  key, which Apple-Development-only cannot express. Profiles: `adhoc_pinned`
+  (no TCC surface), `apple_dev_tcc` (topology v2: Apple Development identity
+  + pinned per-binary identifier — the supervised-fleet default),
+  `developer_id_dist` (with notarization requirements), `tauri_updater`.
+  Each profile carries its own verification form. Per-artifact
   ORDER IS LAW: build → strip → sign → sidecar-from-signed-bytes →
   verify-readback → upload, and upload's done-probe compares the PUBLISHED
   asset's sha against the sidecar. Any mutation after sign is the AFT #238
@@ -156,10 +229,14 @@ fire-from-the-bump and the nightly lane; a release never absorbs it.
   verification where the train publishes executables: download the published
   bytes, `codesign --verify --strict`, execute unmodified — seat memory
   promoted to machine phase.
-- Staging: revision-keyed directory outside cargo target trees
-  (claustrum's `target/staged/<rev>` shape at a non-target path), pruned by
-  count with the deployed revision always retained. `/tmp` staging is retired
-  (OS reboot loses the handoff — house rule).
+- The PIPELINE ORDER stays invariant across all profiles: build → strip →
+  sign → sidecar-from-signed-bytes → verify-readback → upload.
+- Staging BACKEND is `directory` (revision-keyed, outside cargo target
+  trees — claustrum's shape; pruned by count with the deployed revision
+  retained) or `gh_draft` (magic-context's dashboard uses a single GH draft
+  release as its matrix rendezvous — draft-then-undraft owned by
+  assets/publish). `/tmp` staging is retired (OS reboot loses the handoff —
+  house rule).
 - Placement of staged binaries is by atomic rename, never cp-in-place.
 
 ## Boundaries (what the machine refuses to own)
@@ -171,8 +248,15 @@ fire-from-the-bump and the nightly lane; a release never absorbs it.
   thing that mutates production.)
 - Public side effects (crates.io/npm publish, GH release, tags that trigger
   publishing workflows) remain hard-gated on explicit user approval per
-  standing rule; the machine's `publish` phase REFUSES to start without an
-  approval token recorded in the journal.
+  standing rule. The gate sits on the FIRST public trigger in the train —
+  which for tag-triggered trains is tag/push, not the publish phase (Athena
+  blocker 4) — and the approval record BINDS to (repo, train, version or
+  no-tag run id, intended commit, declaration digest, artifact digest set
+  where available, and the exact public-effect list). Any changed commit,
+  plan, digest, or retag generation INVALIDATES the approval and requires
+  re-approval: the retag lane deliberately reuses a version, so a
+  train-scoped token would let a materially different release ride an
+  earlier yes.
 - No auto-bump-guessing: the version is an input; the machine validates it
   against manifests (subconscious's tag/version assertion, generalized).
 

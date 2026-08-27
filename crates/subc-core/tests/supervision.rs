@@ -336,23 +336,31 @@ async fn operator_restart_resets_restart_count() {
         &server,
         &supervisor,
         module_id,
-        [("FAKE_AFT_CRASH_AFTER_MS", "250")],
+        [("FAKE_AFT_CRASH_AFTER_MS", "750")],
     )
     .await;
 
-    let crashed = wait_for_status(&module, Duration::from_secs(3), |status| {
-        status.restart_count >= 1 && status.state == ModuleState::Running && status.live
+    let crashed = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.restart_count == 2
+            && status.lifetime_restarts == 2
+            && status.state == ModuleState::Running
+            && status.live
     })
     .await;
-    assert!(crashed.restart_count >= 1);
+    assert_eq!(crashed.restart_count, 2);
+    assert_eq!(crashed.lifetime_restarts, 2);
 
     module.restart(None).await.unwrap();
 
     let restarted = wait_for_status(&module, Duration::from_secs(3), |status| {
-        status.restart_count == 0 && status.state == ModuleState::Running && status.live
+        status.restart_count == 0
+            && status.lifetime_restarts == 2
+            && status.state == ModuleState::Running
+            && status.live
     })
     .await;
     assert_eq!(restarted.restart_count, 0);
+    assert_eq!(restarted.lifetime_restarts, 2);
     assert!(restarted.process_alive);
     assert!(restarted.registration_active);
 

@@ -1946,6 +1946,7 @@ impl ControlHandler {
                     last_exit_ms: status.last_exit.as_ref().map(|e| e.at_ms),
                     restart_count: Some(status.restart_count),
                     max_restarts: Some(status.max_restarts),
+                    lifetime_restarts: Some(status.lifetime_restarts),
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;

@@ -754,7 +754,31 @@ fn supervisor_entry() -> SupervisorEntry {
         // swapped, which equal values or a zeroed count could not.
         restart_count: Some(2),
         max_restarts: Some(3),
+        lifetime_restarts: None,
     }
+}
+
+/// A lifetime count is an additive fact: new peers preserve it exactly, while
+/// an old payload keeps its honest "unknown" state rather than asserting zero.
+#[test]
+fn supervisor_entry_lifetime_restarts_round_trips_and_old_wire_stays_unknown() {
+    let mut entry = supervisor_entry();
+    entry.lifetime_restarts = Some(5);
+
+    let encoded = serde_json::to_value(&entry).expect("supervisor entry serializes");
+    assert_eq!(encoded["lifetime_restarts"], 5);
+    let decoded: SupervisorEntry = serde_json::from_value(encoded).expect("new wire decodes");
+    assert_eq!(decoded.lifetime_restarts, Some(5));
+
+    let old_wire = r#"{
+        "module_id":"aft-tools",
+        "state":"running",
+        "enabled":true,
+        "live":true,
+        "health":"degraded"
+    }"#;
+    let old_entry: SupervisorEntry = serde_json::from_str(old_wire).expect("old wire decodes");
+    assert_eq!(old_entry.lifetime_restarts, None);
 }
 
 fn supervisor_health_entry() -> SupervisorHealthEntry {

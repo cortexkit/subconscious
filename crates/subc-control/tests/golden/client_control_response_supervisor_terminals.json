@@ -4,12 +4,14 @@
     {
       "at_ms": 1700000000001,
       "disposition": "restarting",
-      "exit_code": 23
+      "exit_code": 23,
+      "exit_kind": "crash"
     },
     {
       "at_ms": 1700000000002,
       "disposition": "failed",
-      "exit_code": 23
+      "exit_code": 23,
+      "exit_kind": "crash"
     }
   ],
   "module_id": "terminal-golden",

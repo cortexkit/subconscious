@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use subc_control::TerminalDisposition;
+use subc_control::{TerminalDisposition, TerminalExitKind};
 
 const DEFAULT_MAX_ENTRIES: usize = 32;
 
@@ -33,6 +33,7 @@ pub struct TerminalRecord {
     pub exit_signal: Option<i32>,
     pub at_ms: u64,
     pub disposition: TerminalDisposition,
+    pub exit_kind: TerminalExitKind,
 }
 
 /// The retained terminal suffix for one module.
@@ -85,7 +86,7 @@ impl TerminalRing {
 #[cfg(test)]
 mod tests {
     use super::{TerminalRecord, TerminalRing, TerminalRingConfig};
-    use subc_control::TerminalDisposition;
+    use subc_control::{TerminalDisposition, TerminalExitKind};
 
     fn record(at_ms: u64) -> TerminalRecord {
         TerminalRecord {
@@ -93,6 +94,7 @@ mod tests {
             exit_signal: None,
             at_ms,
             disposition: TerminalDisposition::Restarting,
+            exit_kind: TerminalExitKind::Crash,
         }
     }
 

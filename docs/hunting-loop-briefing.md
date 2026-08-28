@@ -11861,3 +11861,12 @@ mutation-restore rule in its general form: restore from a copy taken BEFORE
 the edit, never `git checkout` (HEAD is not where uncommitted work lives),
 and re-assert the mutated test's PRESENCE after restoring — a green suite
 proves nothing if the restore deleted the assertion.
+
+**A fail-closed stub is more misleading than an absence** (E2E, retracted
+same-hour): an absent function makes you look for the implementation; a stub
+that throws a specific, plausible reason ANSWERS the question wrongly and
+stops the search — theirs even named the correct blocker, which is what made
+it convincing. A wrapper's condition is not its callee's condition: the
+scripts listing shows the wrapper, and the callee's signature
+(consumes-verified-results, never executes) was the walked-past tell. Check
+the callee before believing the stub's story about it.

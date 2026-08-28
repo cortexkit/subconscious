@@ -11774,4 +11774,16 @@ plausibly and fail nothing. The identity assertion in the producer's test
 prevents; the readback reveals; different guards at different stages, and
 retiring the first because the second exists leaves the regression
 detectable only by whoever happens to look. Same split as write-ahead intent
-vs done-probe in the release machine.
+vs done-probe in the release machine — with QTA's boundary: both second
+halves are read-only about the first (a probe cannot make the intent
+correct, a readback cannot make a referent right), but a done-probe checks
+against a WORLD that can disagree while a relay-readback checks against
+nothing. The halves are unequal, and the weaker the revealing half, the
+stronger the case for the preventing test.
+
+**Corollary: an overstated rule manufactures its own counterexamples.**
+QTA's scoping catch on deploy-after-lock-commit: a seat the rule does not
+apply to (build_lock_digest: None — no build.rs reads the lock) that follows
+it anyway rebuilds to a byte-identical hash and now holds evidence AGAINST
+the rule for the seats where it genuinely bites. Scope preconditions into
+the rule text; state the predicate, not just a roster (rosters date).

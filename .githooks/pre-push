@@ -50,6 +50,10 @@ if [ "${range_bumps:-0}" -gt 0 ]; then
   echo "  on-disk Cargo.lock, so a module that absorbs the wave but skips its" >&2
   echo "  next deploy declares the PRE-wave digest -- ck provenance reads" >&2
   echo "  plausibly and is wrong (QTA proved this across a zero-source-line" >&2
-  echo "  commit). Deploy-after-lock-commit is part of the absorb, not optional." >&2
+  echo "  commit). Deploy-after-lock-commit is part of the absorb, not optional" >&2
+  echo "  -- UNLESS your module passes build_lock_digest: None (no build.rs" >&2
+  echo "  reads the lock; a lock-only commit leaves your binary byte-identical" >&2
+  echo "  and a rebuild proves nothing). Currently: astrocyte, fusiform," >&2
+  echo "  wernicke. Check your own build.rs, not this list." >&2
 fi
 exit 0

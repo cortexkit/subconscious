@@ -1495,7 +1495,13 @@ fn provenance_image(value: Option<&Value>) -> String {
         ),
         "mismatch" => "mismatch (running vs disk)".to_string(),
         "unavailable" => format!("unavailable ({})", provenance_value(value.get("reason"))),
-        other => other.to_string(),
+        other => {
+            let tag = provenance_value(Some(&Value::String(other.to_string())));
+            let body = serde_json::to_string(value)
+                .map(|body| provenance_value(Some(&Value::String(body))))
+                .unwrap_or_else(|_| "unavailable".to_string());
+            format!("unknown ({tag}; body={body})")
+        }
     }
 }
 
@@ -4870,6 +4876,22 @@ mod tests {
         assert!(rendered.starts_with("unavailable (future_reason"));
         assert!(rendered.contains(r"\x1b"));
         assert!(rendered.contains(r"\x07"));
+        assert!(!rendered.bytes().any(|byte| byte < 0x20));
+    }
+
+    #[test]
+    fn provenance_image_renders_unknown_tag_and_body_escaped() {
+        let value = serde_json::json!({
+            "status": "future_status\u{1b}]52;c;AAAA\u{07}",
+            "detail": "future detail\u{1b}[2J"
+        });
+
+        let rendered = provenance_image(Some(&value));
+
+        assert!(rendered.starts_with("unknown (future_status"));
+        assert!(rendered.contains("body="));
+        assert!(rendered.contains(r#"\u001b"#));
+        assert!(rendered.contains(r#"\u0007"#));
         assert!(!rendered.bytes().any(|byte| byte < 0x20));
     }
 

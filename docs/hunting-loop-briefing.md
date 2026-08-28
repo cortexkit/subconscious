@@ -11824,6 +11824,16 @@ census row made the correction contingent on the recipient habitually
 re-deriving claims about their own module. Sender-evaluated predicates scale
 with sender knowledge of every seat (which decays); recipient-evaluated ones
 scale with the recipient's knowledge of their own code (which stays fresh).
+QTA's mechanism for how the roster went wrong (530723e, all six rows
+re-derived): a mention-counting instrument (`grep field | grep -vc None`)
+read a doc comment STATING the field is unfilled and an `.is_none()` test
+asserting absence as evidence of population — the text discussing a property
+clusters exactly where the property is ABSENT, because absence is what needs
+explaining, so mention-counting is biased toward false positives precisely in
+the population it exists to exclude, and punishes the seats that documented
+their decision. Census rule: match the CONSTRUCT, never the name — and a
+wrong measurement travels further than a wrong conclusion, because it
+arrives as a fact rather than an argument.
 
 Companion bound on derived checks (BROCA, 40a7e951): a derived verdict is
 only as complete as the artifact it derives from — a STALE pin is safe

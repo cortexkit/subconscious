@@ -59,6 +59,22 @@ if [ "${range_bumps:-0}" -gt 0 ]; then
   echo "  (skipping this makes any inequality meaningless: could be build" >&2
   echo "  nondeterminism); (2) build both commits with stamp overrides set" >&2
   echo "  identically, compare. The hashes answer the actual question." >&2
+  echo "  Two facts about the NOTICE itself: it describes THIS wave's delta," >&2
+  echo "  and a consumer may be several waves behind -- what it reaches in" >&2
+  echo "  their tree only their own lock knows (WERNI absorbed a bump no" >&2
+  echo "  notice ever named for them). And a MISSED wave leaves no trace" >&2
+  echo "  except ' M Cargo.lock' in git status, because the next build heals" >&2
+  echo "  the working copy -- green gate, working binary, several waves" >&2
+  echo "  behind, nothing on any surface saying so. The committed-lock check" >&2
+  echo "  is not step ordering; it is the ONLY detector for a wave that was" >&2
+  echo "  never applied (QTA was two waves behind with every gate green)." >&2
+  echo "  Consumers: after cargo update -w, diff the ACTUAL lock delta against" >&2
+  echo "  the announced one and reconcile before committing (CKCRED). The" >&2
+  echo "  announced FROM is the announcer's previous state; a skipped hop makes" >&2
+  echo "  your travelled distance LARGER than the announced delta, and any" >&2
+  echo "  'lock-only / no construct change' assurance covers the ANNOUNCED hop" >&2
+  echo "  only -- the skipped hops may carry features. Bound skipped-hop risk" >&2
+  echo "  by dependency shape (dev-dep vs linked), not by the assurance." >&2
   # BROCA pin verdict, DERIVED not recalled: broca pins subtree hashes of the
   # three crates it links in SUBC_COMPAT (TREE lines). Three notices in one
   # day carried a wrong recollection of that pin set; a claim rebuilt from

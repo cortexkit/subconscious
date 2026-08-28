@@ -11787,3 +11787,33 @@ apply to (build_lock_digest: None — no build.rs reads the lock) that follows
 it anyway rebuilds to a byte-identical hash and now holds evidence AGAINST
 the rule for the seats where it genuinely bites. Scope preconditions into
 the rule text; state the predicate, not just a roster (rosters date).
+
+## Wave-notice asymmetry, measured four ways in one wave (2026-08-28)
+
+A version-bump notice is a delta of the PRODUCER's history. Four consumers
+proved the consumer-side truth in one afternoon: CALLO committed two waves in
+one commit (working trees drift forward on incidental builds); WERNI absorbed
+a direct-dep bump no notice ever named for them; QTA and CKCRED were each two
+hops behind with every gate green (a missed wave's only trace is ` M
+Cargo.lock` — the next build heals the working copy, so the committed lock is
+the only detector). Consequences, now in the recipe: consumers diff the
+ACTUAL lock delta against the announced one; any "lock-only / no construct
+change" assurance scopes to the announced hop only — skipped hops may carry
+features — and skipped-hop risk is bounded by dependency shape (dev-dep vs
+linked), never by the assurance.
+
+**A gate that mutates state must re-check that state after its last mutating
+step** (WERNI, from their own instrument): their gate's lock check ran first,
+the build then rewrote the lock, and the run reported on a world that no
+longer existed by exit — the fault its own execution created was visible only
+to the NEXT run. They then committed straight past the warning they had just
+built, because it fired at a moment when the fault had not happened yet.
+
+**Roster claims decay; predicates don't.** My per-seat deploy-after riders
+named populator/None verdicts from a recalled census; two of six populator
+entries were wrong within a day (CEREB pins None with a test; CKCRED is
+deliberate None with the well-formed-lie rationale). The recipe's empirical
+predicate was already the correct form — the riders should have said "run
+the two-step", not "this applies to you". Same class as BROCA's derived pin
+verdict: read the consumer's artifact or name the predicate; never relay a
+roster row as a per-seat fact.

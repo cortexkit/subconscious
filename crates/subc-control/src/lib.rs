@@ -569,6 +569,58 @@ pub struct TerminalEntry {
     pub exit_signal: Option<i32>,
     pub at_ms: u64,
     pub disposition: TerminalDisposition,
+    /// Supervisor classification of this exit. Absent on daemons that predate
+    /// the field; unknown future kinds remain readable instead of failing the
+    /// enclosing terminal record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_kind: Option<TerminalExitKind>,
+}
+
+/// Exit classification carried by supervisor history and census records.
+///
+/// This is an open string enum so future daemon variants degrade to a readable
+/// unknown kind rather than making a consumer discard the enclosing record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalExitKind {
+    Clean,
+    Crash,
+    DeliberateSeverance,
+    Unknown(String),
+}
+
+impl TerminalExitKind {
+    fn wire_name(&self) -> &str {
+        match self {
+            Self::Clean => "clean",
+            Self::Crash => "crash",
+            Self::DeliberateSeverance => "deliberate_severance",
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
+impl Serialize for TerminalExitKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalExitKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "clean" => Self::Clean,
+            "crash" => Self::Crash,
+            "deliberate_severance" => Self::DeliberateSeverance,
+            _ => Self::Unknown(value),
+        })
+    }
 }
 
 /// The supervisor disposition selected after observing a terminal exit.
@@ -719,6 +771,10 @@ pub struct SupervisorEntry {
     /// order their latest observed exit against events they already received.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit_ms: Option<u64>,
+    /// Classification of the most recent child exit. Absent on daemons that
+    /// predate exit-kind reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_kind: Option<TerminalExitKind>,
     /// Replacement processes spawned for this module so far, against the budget
     /// that disables it.
     ///
@@ -812,6 +868,46 @@ pub struct SupervisorHealthEntry {
 mod tests {
     use super::*;
     use subc_protocol::{BindIdentity, RouteTarget};
+
+    #[test]
+    fn legacy_terminal_decoder_ignores_deliberate_severance_kind() {
+        let entry = TerminalEntry {
+            exit_code: Some(1),
+            exit_signal: None,
+            at_ms: 1_700_000_000_123,
+            disposition: TerminalDisposition::Restarting,
+            exit_kind: Some(TerminalExitKind::DeliberateSeverance),
+        };
+        let wire = serde_json::to_string(&entry).expect("terminal entry serializes");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).expect("terminal entry is JSON")
+                ["exit_kind"],
+            "deliberate_severance"
+        );
+
+        #[derive(serde::Deserialize)]
+        struct LegacyTerminalEntry {
+            exit_code: Option<i32>,
+            exit_signal: Option<i32>,
+            at_ms: u64,
+            disposition: TerminalDisposition,
+        }
+
+        let decoded: LegacyTerminalEntry =
+            serde_json::from_str(&wire).expect("legacy decoder keeps the terminal record");
+        assert_eq!(decoded.exit_code, Some(1));
+        assert_eq!(decoded.exit_signal, None);
+        assert_eq!(decoded.at_ms, 1_700_000_000_123);
+        assert_eq!(decoded.disposition, TerminalDisposition::Restarting);
+
+        let future_wire = wire.replace("deliberate_severance", "future_exit_kind");
+        let future: TerminalEntry =
+            serde_json::from_str(&future_wire).expect("new decoder keeps a future terminal kind");
+        assert_eq!(
+            future.exit_kind,
+            Some(TerminalExitKind::Unknown("future_exit_kind".to_string()))
+        );
+    }
 
     #[test]
     fn route_poll_uses_kind_field() {

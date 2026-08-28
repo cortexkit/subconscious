@@ -750,6 +750,7 @@ fn supervisor_entry() -> SupervisorEntry {
         last_exit_code: None,
         last_exit_signal: None,
         last_exit_ms: Some(1_700_000_000_123),
+        last_exit_kind: None,
         // Non-equal and non-zero so the pin would catch the two fields being
         // swapped, which equal values or a zeroed count could not.
         restart_count: Some(2),

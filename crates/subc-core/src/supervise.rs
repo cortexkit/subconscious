@@ -11,6 +11,7 @@ use std::{
 use serde_json::Value;
 use subc_control::{
     ClientControlPush, RouteCloseReason, SupervisorHealthStatus, TerminalDisposition,
+    TerminalExitKind,
 };
 use subc_protocol::{
     session::{HealthReport, HealthStatus, ModuleControlRequest, MODULE_CONTROL_OP_HEALTH_CHECK},
@@ -68,11 +69,16 @@ struct SupervisedChild {
     spawned_from: PathBuf,
     spawned_file_identity: Option<SpawnedFileIdentity>,
     process_start_time: Option<u64>,
+    process_identity: Option<ProcessIdentity>,
 }
 
 impl SupervisedChild {
     fn id(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    fn process_identity(&self) -> Option<ProcessIdentity> {
+        self.process_identity
     }
 
     async fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -311,6 +317,25 @@ impl fmt::Display for ModuleState {
 pub enum ExitKind {
     Clean,
     Crash,
+    DeliberateSeverance,
+}
+
+impl From<ExitKind> for TerminalExitKind {
+    fn from(kind: ExitKind) -> Self {
+        match kind {
+            ExitKind::Clean => Self::Clean,
+            ExitKind::Crash => Self::Crash,
+            ExitKind::DeliberateSeverance => Self::DeliberateSeverance,
+        }
+    }
+}
+
+/// Exact process identity retained when a supervised module registers its
+/// connection. PID reuse makes a PID alone insufficient evidence of ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) start_time: u64,
 }
 
 /// Last observed child exit, if any.
@@ -361,6 +386,7 @@ struct SupervisorSnapshot {
     spawned_from: Option<PathBuf>,
     spawned_file_identity: Option<SpawnedFileIdentity>,
     process_start_time: Option<u64>,
+    deliberate_severance: Option<ProcessIdentity>,
     last_exit: Option<ExitReport>,
     health: ModuleHealthStatus,
 }
@@ -390,6 +416,7 @@ impl SupervisorSnapshot {
             spawned_from: None,
             spawned_file_identity: None,
             process_start_time: None,
+            deliberate_severance: None,
             last_exit: None,
             health: ModuleHealthStatus::default(),
         }
@@ -741,6 +768,22 @@ impl SupervisorHandle {
             state.health.consecutive_failures = 0;
         })?;
         Ok(true)
+    }
+
+    /// Arm the one-shot marker for the module process that this caller
+    /// deliberately initiated severance against. Generic connection teardown
+    /// must not call this:
+    /// a surviving process would otherwise retain an exemption for a later
+    /// genuine crash.
+    pub fn record_deliberate_severance(&self, module_id: &str) -> Result<bool, SuperviseError> {
+        let Some(module) = self.get(module_id) else {
+            return Ok(false);
+        };
+        let status = module.status()?;
+        let Some((pid, start_time)) = status.pid.zip(status.process_start_time) else {
+            return Ok(false);
+        };
+        module.record_deliberate_severance(ProcessIdentity { pid, start_time })
     }
 
     pub fn list(&self) -> Vec<SupervisedModule> {
@@ -1164,6 +1207,20 @@ impl SupervisedModule {
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
         self.status_with_snapshot_lock(&self.inner.snapshot, None)
+    }
+
+    pub(crate) fn record_deliberate_severance(
+        &self,
+        identity: ProcessIdentity,
+    ) -> Result<bool, SuperviseError> {
+        let mut snapshot = lock_snapshot(&self.inner.snapshot)?;
+        if snapshot.pid != Some(identity.pid)
+            || snapshot.process_start_time != Some(identity.start_time)
+        {
+            return Ok(false);
+        }
+        snapshot.deliberate_severance = Some(identity);
+        Ok(true)
     }
 
     /// Read status for a channel-0 renderer and report a contended snapshot lock.
@@ -2590,7 +2647,7 @@ async fn supervise_loop(
                     // ('supervisor command channel is closed') and required a
                     // full daemon restart to recover.
                     let exit_report = match wait_result {
-                        Ok(status) => classify_exit(&status),
+                        Ok(status) => classify_reaped_child_exit(&snapshot, active_child, &status),
                         Err(err) => {
                             active_child.drain_stderr(&spec.module_id).await;
                             fail_snapshot(&snapshot, Some(&spec.module_id), None);
@@ -3007,6 +3064,7 @@ async fn reload_child(
         wait_for_registration_after_reload(
             registry,
             &spec.module_id,
+            snapshot,
             active_child,
             REGISTRY_RELEASE_TIMEOUT,
         )
@@ -3063,7 +3121,11 @@ async fn reload_child(
                 snapshot,
                 child,
                 ReloadRegistrationFailure {
-                    exit_report: registration_failure_exit_report(classify_exit(&status)),
+                    exit_report: registration_failure_exit_report(classify_reaped_child_exit(
+                        snapshot,
+                        &timed_out_child,
+                        &status,
+                    )),
                     reason: format!(
                         "new child did not register within {:?}",
                         REGISTRY_RELEASE_TIMEOUT
@@ -3261,6 +3323,55 @@ async fn on_child_exit(
                 }
             }
         }
+        ExitKind::DeliberateSeverance => {
+            warn!(
+                module_id = %spec.module_id,
+                exit_code = ?exit_report.code,
+                exit_signal = ?exit_report.signal,
+                "supervised module exited after deliberate connection severance"
+            );
+            let mut should_restart = false;
+            let mut disposition = TerminalDisposition::Disabled;
+            if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                clear_current_process_facts(state);
+                state.last_exit = Some(exit_report.clone());
+                state.lifetime_restarts += 1;
+                if state.enabled {
+                    state.state = ModuleState::Restarting;
+                    should_restart = true;
+                    disposition = TerminalDisposition::Restarting;
+                } else {
+                    state.state = ModuleState::Disabled;
+                }
+            }) {
+                error!(module_id = %spec.module_id, error = %err, "failed to record deliberately severed module exit");
+                return NextAction::Stop {
+                    registration_released: false,
+                };
+            }
+            record_terminal(terminal_ring, &exit_report, disposition);
+
+            if should_restart {
+                NextAction::Restart
+            } else {
+                let registration_released = match wait_for_registration_release(
+                    registry,
+                    &spec.module_id,
+                    REGISTRY_RELEASE_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(module_id = %spec.module_id, error = %err, "registration still active after deliberately severed module exit");
+                        false
+                    }
+                };
+                NextAction::Stop {
+                    registration_released,
+                }
+            }
+        }
     }
 }
 
@@ -3277,6 +3388,7 @@ fn record_terminal(
             exit_signal: exit_report.signal,
             at_ms: exit_report.at_ms,
             disposition,
+            exit_kind: exit_report.kind.into(),
         });
 }
 
@@ -3367,7 +3479,11 @@ fn spawn_child(
     let spawned_at_ms = unix_ms_now();
     let spawned_from = spec.program.clone();
     let spawned_file_identity = spawned_file_identity(&spawned_from);
-    let process_start_time = child.id().and_then(crate::provenance::process_start_time);
+    let pid = child.id();
+    let process_start_time = pid.and_then(crate::provenance::process_start_time);
+    let process_identity = pid
+        .zip(process_start_time)
+        .map(|(pid, start_time)| ProcessIdentity { pid, start_time });
 
     let stderr_pump = match child.stderr.take() {
         Some(stderr) => {
@@ -3399,6 +3515,7 @@ fn spawn_child(
         spawned_from,
         spawned_file_identity,
         process_start_time,
+        process_identity,
     })
 }
 
@@ -3759,6 +3876,7 @@ async fn begin_forwarding_drain_with(
 async fn wait_for_registration_after_reload(
     registry: &Registry,
     module_id: &str,
+    snapshot: &SharedSnapshot,
     child: &mut SupervisedChild,
     wait: Duration,
 ) -> Result<RegistrationWaitOutcome, SuperviseError> {
@@ -3785,7 +3903,11 @@ async fn wait_for_registration_after_reload(
                     module_id: module_id.to_string(),
                     source,
                 })?;
-                return Ok(RegistrationWaitOutcome::Exited(classify_exit(&status)));
+                return Ok(RegistrationWaitOutcome::Exited(classify_reaped_child_exit(
+                    snapshot,
+                    child,
+                    &status,
+                )));
             }
             _ = sleep(poll) => {}
         }
@@ -3795,7 +3917,9 @@ async fn wait_for_registration_after_reload(
 fn registration_failure_exit_report(mut exit_report: ExitReport) -> ExitReport {
     // A replacement process that exits before HELLO did not provide service, even
     // if it used status 0. Count it against the restart cap as a new-binary failure.
-    exit_report.kind = ExitKind::Crash;
+    if exit_report.kind != ExitKind::DeliberateSeverance {
+        exit_report.kind = ExitKind::Crash;
+    }
     exit_report
 }
 
@@ -3978,7 +4102,7 @@ async fn drain_child_to_state(
     })?;
 
     let exit_report = match timeout(drain_timeout, child.wait()).await {
-        Ok(Ok(status)) => classify_exit(&status),
+        Ok(Ok(status)) => classify_reaped_child_exit(snapshot, &child, &status),
         Ok(Err(source)) => {
             fail_snapshot(snapshot, Some(module_id), None);
             return Err(SuperviseError::Wait {
@@ -4009,7 +4133,7 @@ async fn drain_child_to_state(
                     source,
                 }
             })?;
-            classify_exit(&status)
+            classify_reaped_child_exit(snapshot, &child, &status)
         }
     };
 
@@ -4020,6 +4144,9 @@ async fn drain_child_to_state(
         }
         clear_current_process_facts(state);
         state.last_exit = Some(exit_report.clone());
+        if exit_report.kind == ExitKind::DeliberateSeverance {
+            state.lifetime_restarts += 1;
+        }
     })?;
     record_terminal(
         terminal_ring,
@@ -4149,6 +4276,39 @@ fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.spawned_from = None;
     state.spawned_file_identity = None;
     state.process_start_time = None;
+    state.deliberate_severance = None;
+}
+
+#[cfg(test)]
+fn record_deliberate_severance(
+    snapshot: &SharedSnapshot,
+    identity: ProcessIdentity,
+) -> Result<(), SuperviseError> {
+    update_snapshot(snapshot, None, |state| {
+        state.deliberate_severance = Some(identity);
+    })
+}
+
+fn apply_deliberate_severance_marker(
+    snapshot: &SharedSnapshot,
+    exited_identity: Option<ProcessIdentity>,
+    mut exit_report: ExitReport,
+) -> ExitReport {
+    let marker = lock_snapshot(snapshot)
+        .ok()
+        .and_then(|mut state| state.deliberate_severance.take());
+    if marker.is_some() && marker == exited_identity {
+        exit_report.kind = ExitKind::DeliberateSeverance;
+    }
+    exit_report
+}
+
+fn classify_reaped_child_exit(
+    snapshot: &SharedSnapshot,
+    child: &SupervisedChild,
+    status: &ExitStatus,
+) -> ExitReport {
+    apply_deliberate_severance_marker(snapshot, child.process_identity(), classify_exit(status))
 }
 
 fn fail_snapshot(
@@ -4219,11 +4379,12 @@ mod terminal_history_tests {
     use tokio::time::sleep;
 
     use super::{
-        daemon_will_restart, drained_after_quiescence_wait, handle_reload_spawn_failure,
-        health_restart_child, lock_snapshot, on_child_exit, record_terminal, update_snapshot,
-        wait_error_exit_report, ExitKind, ExitReport, ModuleSpec, ModuleState, NextAction,
-        RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorHandle,
-        SupervisorHealthStatus, SupervisorSnapshot,
+        apply_deliberate_severance_marker, daemon_will_restart, drain_child_to_state,
+        drained_after_quiescence_wait, handle_reload_spawn_failure, health_restart_child,
+        lock_snapshot, on_child_exit, record_deliberate_severance, record_terminal,
+        spawn_and_mark_running, update_snapshot, wait_error_exit_report, ExitKind, ExitReport,
+        ModuleSpec, ModuleState, NextAction, ProcessIdentity, RestartPolicy, SuperviseError,
+        SupervisedModule, Supervisor, SupervisorHandle, SupervisorHealthStatus, SupervisorSnapshot,
     };
     use crate::{
         registry::Registry,
@@ -4529,6 +4690,237 @@ mod terminal_history_tests {
         };
         assert_eq!(reload_restarts, 1);
         assert_eq!(reload_lifetime, 1);
+    }
+
+    #[tokio::test]
+    async fn deliberately_severed_live_child_records_lifetime_without_spending_restart_budget() {
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            module_id: "deliberately-severed".to_string(),
+            program: PathBuf::from("/unused/deliberately-severed"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let process = ProcessIdentity {
+            pid: 41,
+            start_time: 101,
+        };
+        record_deliberate_severance(&snapshot, process).unwrap();
+        let exit_report = apply_deliberate_severance_marker(
+            &snapshot,
+            Some(process),
+            ExitReport {
+                kind: ExitKind::Crash,
+                code: Some(1),
+                signal: None,
+                at_ms: 1,
+            },
+        );
+        assert_eq!(exit_report.kind, ExitKind::DeliberateSeverance);
+
+        assert!(matches!(
+            on_child_exit(
+                &spec,
+                runtime.restart_policy,
+                &supervisor.registry,
+                &snapshot,
+                &runtime.terminal_ring,
+                exit_report,
+            )
+            .await,
+            NextAction::Restart
+        ));
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(state.lifetime_restarts, 1);
+        assert_eq!(state.restart_count, 0);
+    }
+
+    #[tokio::test]
+    async fn genuine_crash_spends_restart_budget_and_records_lifetime() {
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            module_id: "genuine-crash".to_string(),
+            program: PathBuf::from("/unused/genuine-crash"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+
+        assert!(matches!(
+            on_child_exit(
+                &spec,
+                runtime.restart_policy,
+                &supervisor.registry,
+                &snapshot,
+                &runtime.terminal_ring,
+                ExitReport {
+                    kind: ExitKind::Crash,
+                    code: Some(1),
+                    signal: None,
+                    at_ms: 1,
+                },
+            )
+            .await,
+            NextAction::Restart
+        ));
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(state.lifetime_restarts, 1);
+        assert_eq!(state.restart_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn severance_marker_for_a_dead_child_does_not_label_its_successor() {
+        let severed = ProcessIdentity {
+            pid: 41,
+            start_time: 101,
+        };
+        let successor = ProcessIdentity {
+            pid: 41,
+            start_time: 202,
+        };
+        let module = module_with_recovery_snapshot(ModuleState::Running, true, 0);
+        update_snapshot(&module.inner.snapshot, Some("recovery-snapshot"), |state| {
+            state.pid = Some(successor.pid);
+            state.process_start_time = Some(successor.start_time);
+        })
+        .unwrap();
+        assert!(!module.record_deliberate_severance(severed).unwrap());
+
+        let exit_report = apply_deliberate_severance_marker(
+            &module.inner.snapshot,
+            Some(successor),
+            ExitReport {
+                kind: ExitKind::Crash,
+                code: Some(1),
+                signal: None,
+                at_ms: 1,
+            },
+        );
+
+        assert_eq!(exit_report.kind, ExitKind::Crash);
+    }
+
+    #[tokio::test]
+    async fn drain_reap_marks_deliberate_severance_and_records_lifetime_without_budget() {
+        let registry = Registry::default();
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let spec = ModuleSpec {
+            module_id: "drain-deliberate-severance".to_string(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+        let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+        let process = ProcessIdentity {
+            pid: 41,
+            start_time: 101,
+        };
+        child.process_identity = Some(process);
+        update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+            state.pid = Some(process.pid);
+            state.process_start_time = Some(process.start_time);
+        })
+        .unwrap();
+        record_deliberate_severance(&snapshot, process).unwrap();
+
+        drain_child_to_state(
+            &spec.module_id,
+            &registry,
+            &snapshot,
+            &runtime.terminal_ring,
+            child,
+            Duration::from_secs(1),
+            ModuleState::Stopped,
+            Some(false),
+        )
+        .await
+        .unwrap();
+
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            state.last_exit.as_ref().map(|exit| exit.kind),
+            Some(ExitKind::DeliberateSeverance)
+        );
+        assert_eq!(state.lifetime_restarts, 1);
+        assert_eq!(state.restart_count, 0);
+        drop(state);
+        let history = runtime.terminal_ring.lock().unwrap().snapshot();
+        assert_eq!(
+            history.entries[0].exit_kind,
+            subc_control::TerminalExitKind::DeliberateSeverance
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_drain_reap_does_not_record_a_lifetime_restart() {
+        let registry = Registry::default();
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let spec = ModuleSpec {
+            module_id: "ordinary-drain".to_string(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        };
+        let child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+
+        drain_child_to_state(
+            &spec.module_id,
+            &registry,
+            &snapshot,
+            &runtime.terminal_ring,
+            child,
+            Duration::from_secs(1),
+            ModuleState::Stopped,
+            Some(false),
+        )
+        .await
+        .unwrap();
+
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            state.last_exit.as_ref().map(|exit| exit.kind),
+            Some(ExitKind::Crash)
+        );
+        assert_eq!(state.lifetime_restarts, 0);
+        assert_eq!(state.restart_count, 0);
+    }
+
+    #[test]
+    fn fatal_connection_teardown_cannot_arm_a_marker_for_a_surviving_process() {
+        // The server's generic fatal-routing branch only knows that the
+        // connection failed; it does not know that the daemon deliberately
+        // initiated a process-killing severance. Keep this seam explicit so a
+        // future connection error path cannot silently reintroduce the stale
+        // exemption that mislabels a later genuine crash.
+        assert!(!include_str!("server.rs")
+            .contains("router.record_deliberate_connection_severance(ctx.connection_id)"));
     }
 
     /// The `route.closed` `drained` value must be the quiescence wait's own

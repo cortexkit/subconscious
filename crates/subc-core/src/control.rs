@@ -1944,6 +1944,7 @@ impl ControlHandler {
                     last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
                     last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
                     last_exit_ms: status.last_exit.as_ref().map(|e| e.at_ms),
+                    last_exit_kind: status.last_exit.as_ref().map(|e| e.kind.into()),
                     restart_count: Some(status.restart_count),
                     max_restarts: Some(status.max_restarts),
                     lifetime_restarts: Some(status.lifetime_restarts),
@@ -2039,6 +2040,7 @@ impl ControlHandler {
                         exit_signal: entry.exit_signal,
                         at_ms: entry.at_ms,
                         disposition: entry.disposition,
+                        exit_kind: Some(entry.exit_kind),
                     })
                     .collect(),
                 dropped: snapshot.dropped,

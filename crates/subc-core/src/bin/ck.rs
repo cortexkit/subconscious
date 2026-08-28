@@ -1110,6 +1110,10 @@ async fn module_terminals(
             .get("disposition")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let exit_kind = entry
+            .get("exit_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let exit = match (
             entry.get("exit_signal").and_then(Value::as_i64),
             entry.get("exit_code").and_then(Value::as_i64),
@@ -1118,7 +1122,7 @@ async fn module_terminals(
             (None, Some(code)) => format!("code {code}"),
             (None, None) => "unknown exit".to_string(),
         };
-        println!("{at_ms} {exit} → {disposition}");
+        println!("{at_ms} {exit} [{exit_kind}] → {disposition}");
     }
     Ok(())
 }

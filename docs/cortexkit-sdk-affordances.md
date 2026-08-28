@@ -118,3 +118,29 @@ contributor caught the drift by running the scan. When the answer is no, the
 fix announcement names the population and states what each module must port,
 in the same message that announces the SDK release — the notification is the
 producer's duty because only the producer knows the fix exists.
+
+## 12. The route-bind session is a channel label, never a caller identity
+
+Two priced incidents in one week (PLEX's cross-principal invoke gate; ALF's
+assertion-mint authority gate, authorized-but-unreachable from birth) share
+one mechanism: a shared multiplexing client binds its routes with a constant
+marker identity, and an op author reads the ROUTE BIND's session as the
+CALLER's identity. The marker looks like a session id and nothing says it is
+not one, so every new gate author rediscovers the trap at their own cost.
+
+The rules, in order of authority:
+
+- Caller identity is REQUEST-scoped; the bind is CHANNEL-scoped. A shared
+  client carries many logical callers over one bind by design, so "put the
+  real caller in the bind" is structurally impossible — there is no single
+  real caller. Per-request caller identity rides request params, stamped at
+  the transport seam (real binds overwrite, trusted plugin channels pass
+  through, absent STRIPS — so an op requiring identity refuses typed rather
+  than reading a marker).
+- Marker sessions must not be session-shaped. A transport channel that must
+  present a session string presents one a human and a gate author cannot
+  mistake (`__transport-channel__`-class), so the wrong read fails loudly at
+  first contact instead of silently at each op.
+- The only unforgeable caller fact is the daemon-attested Principal from the
+  bind relay. Everything session-shaped above it is claims — usable inside a
+  trusted plugin channel, never as an authority input on its own.

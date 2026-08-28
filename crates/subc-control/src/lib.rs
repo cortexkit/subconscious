@@ -16,6 +16,53 @@ use subc_protocol::{
     BindIdentity, RouteTarget,
 };
 
+macro_rules! open_string_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $( $variant:ident => $wire_name:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum $name {
+            $( $variant, )+
+            Unknown(String),
+        }
+
+        impl $name {
+            fn wire_name(&self) -> &str {
+                match self {
+                    $( Self::$variant => $wire_name, )+
+                    Self::Unknown(value) => value,
+                }
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.wire_name())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Ok(match value.as_str() {
+                    $( $wire_name => Self::$variant, )+
+                    _ => Self::Unknown(value),
+                })
+            }
+        }
+    };
+}
+
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ConsumerIdentity {
@@ -483,16 +530,16 @@ pub enum RunningImageEvidence {
     MacosSpawnInode { device: u64, inode: u64 },
 }
 
-/// Closed reasons why an executable identity could not be observed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RunningImageUnavailableReason {
-    NotRunning,
-    UnsupportedPlatform,
-    RunningExecutableUnreadable,
-    SpawnedPathUnreadable,
-    HashFailed,
-    ProcessIdentityUnconfirmed,
+open_string_enum! {
+    /// Reasons why an executable identity could not be observed.
+    RunningImageUnavailableReason {
+        NotRunning => "not_running",
+        UnsupportedPlatform => "unsupported_platform",
+        RunningExecutableUnreadable => "running_executable_unreadable",
+        SpawnedPathUnreadable => "spawned_path_unreadable",
+        HashFailed => "hash_failed",
+        ProcessIdentityUnconfirmed => "process_identity_unconfirmed",
+    }
 }
 
 /// The identity tier the daemon can honestly report for a route consumer.
@@ -623,14 +670,14 @@ impl<'de> Deserialize<'de> for TerminalExitKind {
     }
 }
 
-/// The supervisor disposition selected after observing a terminal exit.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalDisposition {
-    Stopped,
-    Disabled,
-    Failed,
-    Restarting,
+open_string_enum! {
+    /// The supervisor disposition selected after observing a terminal exit.
+    TerminalDisposition {
+        Stopped => "stopped",
+        Disabled => "disabled",
+        Failed => "failed",
+        Restarting => "restarting",
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1027,5 +1074,136 @@ mod tests {
 
         let request: ClientControlRequest = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(serde_json::to_value(request).unwrap(), body);
+    }
+
+    #[test]
+    fn diagnostic_string_enums_retain_unknown_wire_values() {
+        let reason: RunningImageUnavailableReason =
+            serde_json::from_str("\"future_reason\"").unwrap();
+        let disposition: TerminalDisposition =
+            serde_json::from_str("\"future_disposition\"").unwrap();
+
+        assert_eq!(
+            reason,
+            RunningImageUnavailableReason::Unknown("future_reason".to_string())
+        );
+        assert_eq!(
+            disposition,
+            TerminalDisposition::Unknown("future_disposition".to_string())
+        );
+    }
+
+    #[test]
+    fn diagnostic_string_enums_preserve_existing_wire_names() {
+        let names = [
+            (RunningImageUnavailableReason::NotRunning, "not_running"),
+            (
+                RunningImageUnavailableReason::UnsupportedPlatform,
+                "unsupported_platform",
+            ),
+            (
+                RunningImageUnavailableReason::RunningExecutableUnreadable,
+                "running_executable_unreadable",
+            ),
+            (
+                RunningImageUnavailableReason::SpawnedPathUnreadable,
+                "spawned_path_unreadable",
+            ),
+            (RunningImageUnavailableReason::HashFailed, "hash_failed"),
+            (
+                RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+                "process_identity_unconfirmed",
+            ),
+        ];
+        for (value, expected) in names {
+            let wire = serde_json::to_string(&value).unwrap();
+            assert_eq!(wire, format!("\"{expected}\""));
+            let decoded: RunningImageUnavailableReason = serde_json::from_str(&wire).unwrap();
+            assert_eq!(decoded, value);
+        }
+
+        for (value, expected) in [
+            (TerminalDisposition::Stopped, "stopped"),
+            (TerminalDisposition::Disabled, "disabled"),
+            (TerminalDisposition::Failed, "failed"),
+            (TerminalDisposition::Restarting, "restarting"),
+        ] {
+            let wire = serde_json::to_string(&value).unwrap();
+            assert_eq!(wire, format!("\"{expected}\""));
+            let decoded: TerminalDisposition = serde_json::from_str(&wire).unwrap();
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn diagnostic_string_enums_reject_non_string_bodies() {
+        assert!(serde_json::from_str::<RunningImageUnavailableReason>("42").is_err());
+        assert!(serde_json::from_str::<TerminalDisposition>("{\"value\":\"failed\"}").is_err());
+    }
+
+    #[test]
+    fn unknown_provenance_reason_does_not_discard_healthy_siblings() {
+        let body = serde_json::json!({
+            "op": "supervisor.provenance",
+            "daemon": {
+                "daemon_build": {},
+                "daemon_observed": {
+                    "running_image": {
+                        "status": "unavailable",
+                        "reason": "not_running"
+                    }
+                }
+            },
+            "modules": [
+                {
+                    "module_id": "future",
+                    "module_declared": { "status": "unverifiable" },
+                    "daemon_observed": {
+                        "running_image": {
+                            "status": "unavailable",
+                            "reason": "future_reason"
+                        }
+                    }
+                },
+                {
+                    "module_id": "healthy-a",
+                    "module_declared": { "status": "unverifiable" },
+                    "daemon_observed": {
+                        "running_image": {
+                            "status": "match",
+                            "evidence": {
+                                "method": "linux_proc_sha256",
+                                "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            }
+                        }
+                    }
+                },
+                {
+                    "module_id": "healthy-b",
+                    "module_declared": { "status": "unverifiable" },
+                    "daemon_observed": {
+                        "running_image": {
+                            "status": "unavailable",
+                            "reason": "unsupported_platform"
+                        }
+                    }
+                }
+            ]
+        });
+
+        let decoded: ClientControlResponse = serde_json::from_value(body).unwrap();
+        let ClientControlResponse::SupervisorProvenance { modules, .. } = decoded else {
+            panic!("decoded wrong response variant");
+        };
+        assert_eq!(modules.len(), 3);
+        assert_eq!(modules[0].module_id, "future");
+        assert_eq!(
+            modules[0].daemon_observed.running_image,
+            RunningImageAgreement::Unavailable {
+                reason: RunningImageUnavailableReason::Unknown("future_reason".to_string())
+            }
+        );
+        assert_eq!(modules[1].module_id, "healthy-a");
+        assert_eq!(modules[2].module_id, "healthy-b");
     }
 }

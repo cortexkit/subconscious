@@ -11843,7 +11843,13 @@ literals — a mention is not a construction, and a marker is not material.
 And the unification with the falsifier rule: a falsifier that GREPS would
 confirm the wrong answer with more confidence than the census — the carried
 check must interrogate the construct, or it inherits the same bias wearing
-more authority.
+more authority. E2E's relation-form of the same error (their journal
+0f339f5): they measured which consumers RESOLVE a bumped crate and read that
+as which were STALED by it — presence of a dependency is not staleness
+against it; the count was real and the relation was wrong. Counting the
+wrong relation and counting mentions are one family: the instrument answers
+a question adjacent to the one asked, and the realness of the number is what
+makes the wrong answer travel.
 
 Companion bound on derived checks (BROCA, 40a7e951): a derived verdict is
 only as complete as the artifact it derives from — a STALE pin is safe

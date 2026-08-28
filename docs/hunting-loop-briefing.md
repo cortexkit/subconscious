@@ -11755,3 +11755,23 @@ available, rather than as closure.
 | THE WORKING TREE LIES SPECIFICALLY TO THE PERSON RUNNING THE CHECK (CEREB + WERNI, same wave, 3rd and 4th independent instances): an unlocked cargo/rust-analyzer run silently repairs the working lock, so every LOCAL instrument reads green while the committed state is stale — WERNI's probe built FOR this fault agreed when it should not have, because `cargo metadata --locked` reads the WORKING lock: the same command is two different checks depending on where it runs (sound in CI's fresh checkout, blind in a drifted local tree). Discriminators that survive: `git show HEAD:Cargo.lock` (three lines), or stash-then-probe (CEREB). Wave notices must carry the WHY, not just the step. WERNI's gate-design keeper: when one observable carries opposite meanings (dirty lock = staged-for-this-commit OR left-behind), report the state and name the consequence rather than pick a half quietly. |
 | BYPASS ATTACHES TO A CLASSIFICATION, NOT TO A REFUSAL (E2E, workflow-run capture): GH_SHIM_BYPASS=operator overrides a CLASSIFIED admin tier; an UNCLASSIFIED verb has nothing to override, so the bypass is refused identically — unclassified and denied are different states with the same observable until the manifest lands the tuple. Do not promise "bypass works now" for a verb whose tier does not exist yet; the promise is v-next-gated. Companion self-catch (E2E): a by-construction assertion (auto+manual == rows, with vocabulary already checked) reads as coverage while being unable to fail — deleting your own vacuous check inside a metric-soundness test is the class at its purest. |
 | A VERSION BYTE MAY SELECT A FRAME SHAPE, NOT A FORMAT REVISION (E2E x broca WAL lineage frames): "unsupported version 2" invites bumping the decoder's version constant — which would have decoded every lineage frame as a record, every record as unknown, and made the ERROR disappear while corrupting the read. The error text names the wrong fix by construction; reading the PRODUCER'S source is what separates shape-selector from revision. Corollary for validators: hash the discriminant byte you actually read (hashing 1 where the frame says 2 accepts a forgery). |
+
+## Two guard-verification rules from the 0.9.0 window (2026-08-28)
+
+**Assert on the refusal MESSAGE, not the exit code, when verifying a
+classification transition.** E2E's v10 tuple demonstration: the incomplete
+tuple (`gh_shim_unclassified: no manifest declaration`) and the complete one
+(`gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator`) both
+refuse with exit 86. An exit-code matrix scores the states as identical
+across the change it exists to verify; the message is the discriminant — a
+verb that names its own remedy versus a verb with no row to attach one to.
+
+**Prevent-vs-reveal: a readback does not retire the test that stops the
+regression shipping.** QTA's correction on provenance: `ck provenance`
+relays declared fields (falsifiable by inspection — makes a census possible)
+but only COMPARES the daemon-observed ones. A regressed referent would print
+plausibly and fail nothing. The identity assertion in the producer's test
+prevents; the readback reveals; different guards at different stages, and
+retiring the first because the second exists leaves the regression
+detectable only by whoever happens to look. Same split as write-ahead intent
+vs done-probe in the release machine.

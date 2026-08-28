@@ -11816,4 +11816,22 @@ deliberate None with the well-formed-lie rationale). The recipe's empirical
 predicate was already the correct form — the riders should have said "run
 the two-step", not "this applies to you". Same class as BROCA's derived pin
 verdict: read the consumer's artifact or name the predicate; never relay a
-roster row as a per-seat fact.
+roster row as a per-seat fact. CKCRED's sharper form: a cross-seat claim
+should carry THE CHECK THAT WOULD FALSIFY IT, addressed to the party who can
+run it cheaply — "you populate build_lock_digest (check your
+ManifestProvenance construction)" gets refuted in five seconds; the bare
+census row made the correction contingent on the recipient habitually
+re-deriving claims about their own module. Sender-evaluated predicates scale
+with sender knowledge of every seat (which decays); recipient-evaluated ones
+scale with the recipient's knowledge of their own code (which stays fresh).
+
+Companion bound on derived checks (BROCA, 40a7e951): a derived verdict is
+only as complete as the artifact it derives from — a STALE pin is safe
+(compares as moved), an ABSENT pin silences both sides at once, so coverage
+must be closed from the one artifact that knows what is linked (their
+Cargo.lock-driven linked-but-unpinned guard, with the parser-broken control
+so a lock-format change cannot pass by finding nothing). And the
+mutation-restore rule in its general form: restore from a copy taken BEFORE
+the edit, never `git checkout` (HEAD is not where uncommitted work lives),
+and re-assert the mutated test's PRESENCE after restoring — a green suite
+proves nothing if the restore deleted the assertion.

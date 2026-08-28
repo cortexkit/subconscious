@@ -333,6 +333,18 @@ MC's 11 saga failure modes, each mapped to a journal resume or a typed
 refusal — the mapping table is drafted on MC's side from the saga ledger. Any
 mode mapping to neither indicts the spec, not the release.
 
+Manual baseline, executed end-to-end (AFT v0.54.0, 2026-08-28): published
+GitHub release asset -> raw-asset verification (checksums.sha256 +
+codesign --verify --strict on the unmodified asset + exec self-report) ->
+pin-identifier re-sign for placement -> postsign sidecar -> staging seam ->
+supersession proof (tag resolves to expected commit AND the running image's
+commit proven contained via merge-base) -> temp+mv place -> drain-aware
+restart -> inode verify -> two-sided behavioral acceptance (release-delta
+feature serving from the placed binary; absent arm witnessed by the placing
+seat's own tool lane riding the bounce). Every phase above maps 1:1 onto
+this spec's phase vocabulary; the machine's job is to make this walkthrough
+the cheap default instead of the practiced exception.
+
 Second adoption case (ALF, committed): prefrontal writes its `release.jsonc`
 against the no-tag train as the no-path acceptance test — gates_local (cheap
 tiers), ci_watch (their authoritative ladder, gaining the journaled run-id +

@@ -51,9 +51,13 @@ if [ "${range_bumps:-0}" -gt 0 ]; then
   echo "  next deploy declares the PRE-wave digest -- ck provenance reads" >&2
   echo "  plausibly and is wrong (QTA proved this across a zero-source-line" >&2
   echo "  commit). Deploy-after-lock-commit is part of the absorb, not optional" >&2
-  echo "  -- UNLESS your module passes build_lock_digest: None (no build.rs" >&2
-  echo "  reads the lock; a lock-only commit leaves your binary byte-identical" >&2
-  echo "  and a rebuild proves nothing). Currently: astrocyte, fusiform," >&2
-  echo "  wernicke. Check your own build.rs, not this list." >&2
+  echo "  -- UNLESS your module passes build_lock_digest: None (nothing reads" >&2
+  echo "  the lock at build time; a lock-only commit leaves your binary" >&2
+  echo "  byte-identical). Decide EMPIRICALLY, not by reading build.rs (a" >&2
+  echo "  build.rs can exist and not read the lock, or read it and pass None):" >&2
+  echo "  (1) determinism control -- rebuild ONE commit twice, hashes identical" >&2
+  echo "  (skipping this makes any inequality meaningless: could be build" >&2
+  echo "  nondeterminism); (2) build both commits with stamp overrides set" >&2
+  echo "  identically, compare. The hashes answer the actual question." >&2
 fi
 exit 0

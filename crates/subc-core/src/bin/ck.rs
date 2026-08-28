@@ -4487,6 +4487,21 @@ mod tests {
     }
 
     #[test]
+    fn provenance_image_renders_unknown_reason_escaped() {
+        let value = serde_json::json!({
+            "status": "unavailable",
+            "reason": "future_reason\u{1b}]52;c;AAAA\u{07}"
+        });
+
+        let rendered = provenance_image(Some(&value));
+
+        assert!(rendered.starts_with("unavailable (future_reason"));
+        assert!(rendered.contains(r"\x1b"));
+        assert!(rendered.contains(r"\x07"));
+        assert!(!rendered.bytes().any(|byte| byte < 0x20));
+    }
+
+    #[test]
     fn restart_budget_hides_matching_lifetime_count() {
         let module = serde_json::json!({
             "restart_count": 2,

@@ -45,6 +45,11 @@ if [ "${range_bumps:-0}" -gt 0 ]; then
   echo "  (git show HEAD:Cargo.lock | grep -A1 <crate>), not the working file:" >&2
   echo "  any plain cargo build silently refreshes the working lock, so" >&2
   echo "  'cargo check --locked' passing absolves a repo whose committed lock" >&2
-  echo "  is still stale (CKCRED hit exactly this)." >&2
+  echo "  is still stale (CKCRED hit exactly this). A lock-only commit still" >&2
+  echo "  CHANGES THE BINARY's declared identity: build_lock_digest hashes the" >&2
+  echo "  on-disk Cargo.lock, so a module that absorbs the wave but skips its" >&2
+  echo "  next deploy declares the PRE-wave digest -- ck provenance reads" >&2
+  echo "  plausibly and is wrong (QTA proved this across a zero-source-line" >&2
+  echo "  commit). Deploy-after-lock-commit is part of the absorb, not optional." >&2
 fi
 exit 0

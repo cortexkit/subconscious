@@ -9,7 +9,11 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{Error as _, MapAccess, SeqAccess, Visitor},
+    ser::SerializeMap,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use subc_protocol::{
     manifest::{CapabilityDeclarations, ManifestProvenance, ProviderRole, SelfSignalDeclaration},
     session::HealthStatus,
@@ -408,7 +412,7 @@ pub enum RouteCloseReason {
 }
 
 /// A module's retained stderr, oldest entry first.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StderrTail {
     pub capture: StderrCaptureState,
     pub entries: Vec<StderrTailEntry>,
@@ -425,14 +429,14 @@ pub struct StderrTail {
 }
 
 /// Live routes served by one module.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorRouteModule {
     pub module_id: String,
     pub routes: Vec<SupervisorRoute>,
 }
 
 /// One live consumer route in a [`SupervisorRouteModule`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorRoute {
     pub consumer: SupervisorRouteConsumer,
     /// Milliseconds since the daemon bound this route.
@@ -450,7 +454,7 @@ pub struct SupervisorRoute {
 }
 
 /// Source-tagged provenance for one supervised module.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorModuleProvenance {
     pub module_id: String,
     pub module_declared: ModuleDeclaredProvenance,
@@ -458,18 +462,25 @@ pub struct SupervisorModuleProvenance {
 }
 
 /// A module's declared build metadata, if its HELLO manifest carried it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModuleDeclaredProvenance {
-    Reported { build: ManifestProvenance },
+    Reported {
+        build: ManifestProvenance,
+    },
     Unverifiable,
+    /// Future discriminator. `body` retains the complete ordered object; `tag`
+    /// is its decoded discriminator projection.
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
 }
 
 /// Process facts observed by the daemon for a supervised module.
 ///
 /// Build claims remain under `module_declared`; mixing them here would imply the
 /// daemon independently observed module-provided metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorObservedProcess {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -481,7 +492,7 @@ pub struct SupervisorObservedProcess {
 }
 
 /// Daemon provenance paired with its runtime process observation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorDaemonProvenance {
     pub daemon_build: DaemonBuildProvenance,
     pub daemon_observed: DaemonObservedProcess,
@@ -497,7 +508,7 @@ pub struct DaemonBuildProvenance {
 }
 
 /// Runtime process facts observed for the daemon itself.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DaemonObservedProcess {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -507,8 +518,7 @@ pub struct DaemonObservedProcess {
 }
 
 /// Whether the executable currently running agrees with the spawned image.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RunningImageAgreement {
     Match {
         evidence: RunningImageEvidence,
@@ -520,14 +530,30 @@ pub enum RunningImageAgreement {
     Unavailable {
         reason: RunningImageUnavailableReason,
     },
+    /// Future discriminator. `body` retains the complete ordered object; `tag`
+    /// is its decoded discriminator projection.
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
 }
 
 /// Platform-specific evidence used to compare a running image with its spawn path.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "method", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RunningImageEvidence {
-    LinuxProcSha256 { digest: String },
-    MacosSpawnInode { device: u64, inode: u64 },
+    LinuxProcSha256 {
+        digest: String,
+    },
+    MacosSpawnInode {
+        device: u64,
+        inode: u64,
+    },
+    /// Future discriminator. `body` retains the complete ordered object; `tag`
+    /// is its decoded discriminator projection.
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
 }
 
 open_string_enum! {
@@ -547,11 +573,20 @@ open_string_enum! {
 /// A caller that proved a live daemon-issued launch nonce is named `reserved`.
 /// A direct key-holder has no such attestation, so it is reported as `direct`
 /// with its connection counter instead of an invented module name.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SupervisorRouteConsumer {
-    Reserved { module_id: String },
-    Direct { connection_id: u64 },
+    Reserved {
+        module_id: String,
+    },
+    Direct {
+        connection_id: u64,
+    },
+    /// Future discriminator. `body` retains the complete ordered object; `tag`
+    /// is its decoded discriminator projection.
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
 }
 
 /// Whether stderr is being captured for a module, and if not, why not.
@@ -560,8 +595,7 @@ pub enum SupervisorRouteConsumer {
 /// nothing before dying" and "nobody was capturing" send an operator in opposite
 /// directions, and rendering them alike is the defect this op exists to fix --
 /// the same shape as a `detail -` that means both no-detail and never-probed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StderrCaptureState {
     /// A reader is attached, or was attached and saw clean EOF. An empty
     /// `entries` under this state means the module genuinely wrote nothing.
@@ -570,10 +604,15 @@ pub enum StderrCaptureState {
     Incomplete { reason: String },
     /// No reader was attached. `entries` says nothing about what the module wrote.
     NotCaptured { reason: String },
+    /// Future discriminator. `body` retains the complete ordered object; `tag`
+    /// is its decoded discriminator projection.
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StderrTailEntry {
     Line {
         text: String,
@@ -581,7 +620,6 @@ pub enum StderrTailEntry {
         ///
         /// Carried as a field rather than left to a marker in `text` so a
         /// consumer can branch on it without string matching.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
     /// The supervisor spawned a new process. Entries after this came from it.
@@ -589,6 +627,667 @@ pub enum StderrTailEntry {
     /// In-band because position is the information: which side of the restart a
     /// line falls on is unanswerable from a count.
     ProcessStart,
+    /// Future discriminator. `body` retains the complete ordered object; `tag`
+    /// is its decoded discriminator projection.
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ModuleDeclaredProvenanceWire {
+    Reported { build: ManifestProvenance },
+    Unverifiable,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RunningImageAgreementWire {
+    Match {
+        evidence: RunningImageEvidence,
+    },
+    Mismatch {
+        running: RunningImageEvidence,
+        disk: RunningImageEvidence,
+    },
+    Unavailable {
+        reason: RunningImageUnavailableReason,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+enum RunningImageEvidenceWire {
+    LinuxProcSha256 { digest: String },
+    MacosSpawnInode { device: u64, inode: u64 },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SupervisorRouteConsumerWire {
+    Reserved { module_id: String },
+    Direct { connection_id: u64 },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum StderrCaptureStateWire {
+    Captured,
+    Incomplete { reason: String },
+    NotCaptured { reason: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StderrTailEntryWire {
+    Line {
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    ProcessStart,
+}
+
+/// JSON values whose object members retain wire order at every depth.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderedJsonValue {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<Self>),
+    Object(OrderedJsonObject),
+}
+
+/// Ordered JSON members retained for an unknown tagged value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderedJsonObject(Vec<(String, OrderedJsonValue)>);
+
+impl OrderedJsonObject {
+    /// Returns the members in the order they appeared on the wire.
+    pub fn as_entries(&self) -> &[(String, OrderedJsonValue)] {
+        &self.0
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.0
+                .into_iter()
+                .map(|(key, value)| (key, value.into_value()))
+                .collect(),
+        )
+    }
+}
+
+impl OrderedJsonValue {
+    fn into_value(self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(value) => serde_json::Value::Bool(value),
+            Self::Number(value) => serde_json::Value::Number(value),
+            Self::String(value) => serde_json::Value::String(value),
+            Self::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(Self::into_value).collect())
+            }
+            Self::Object(value) => value.into_value(),
+        }
+    }
+}
+
+impl Serialize for OrderedJsonValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Number(value) => value.serialize(serializer),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Array(values) => values.serialize(serializer),
+            Self::Object(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OrderedValueVisitor;
+
+        impl<'de> Visitor<'de> for OrderedValueVisitor {
+            type Value = OrderedJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value with ordered object members")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::Null)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::Null)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                OrderedJsonValue::deserialize(deserializer)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::Number(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::Number(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(OrderedJsonValue::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OrderedJsonValue::String(value))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(OrderedJsonValue::Array(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    entries.push((key, value));
+                }
+                Ok(OrderedJsonValue::Object(OrderedJsonObject(entries)))
+            }
+        }
+
+        deserializer.deserialize_any(OrderedValueVisitor)
+    }
+}
+
+impl Serialize for OrderedJsonObject {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedJsonObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OrderedObjectVisitor;
+
+        impl<'de> Visitor<'de> for OrderedObjectVisitor {
+            type Value = OrderedJsonObject;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object with ordered JSON members")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    entries.push((key, value));
+                }
+                Ok(OrderedJsonObject(entries))
+            }
+        }
+
+        deserializer.deserialize_map(OrderedObjectVisitor)
+    }
+}
+
+fn read_tagged<'de, D>(
+    deserializer: D,
+    field: &'static str,
+) -> Result<(String, OrderedJsonObject), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let body = OrderedJsonObject::deserialize(deserializer)?;
+    let mut tag = None;
+    for (key, value) in body.as_entries() {
+        if key != field {
+            continue;
+        }
+        if tag.is_some() {
+            return Err(D::Error::custom(format!(
+                "tagged object has duplicate `{field}` field"
+            )));
+        }
+        let OrderedJsonValue::String(value) = value else {
+            return Err(D::Error::custom(format!(
+                "tagged object has no string `{field}` field"
+            )));
+        };
+        tag = Some(value);
+    }
+    let Some(tag) = tag else {
+        return Err(D::Error::custom(format!(
+            "tagged object has no string `{field}` field"
+        )));
+    };
+    Ok((tag.to_string(), body))
+}
+
+fn read_ordered_tagged(
+    value: OrderedJsonValue,
+    field: &'static str,
+) -> Result<(String, OrderedJsonObject), String> {
+    let OrderedJsonValue::Object(body) = value else {
+        return Err(format!("expected tagged object with `{field}` field"));
+    };
+    let mut tag = None;
+    for (key, value) in body.as_entries() {
+        if key != field {
+            continue;
+        }
+        if tag.is_some() {
+            return Err(format!("tagged object has duplicate `{field}` field"));
+        }
+        let OrderedJsonValue::String(value) = value else {
+            return Err(format!("tagged object has no string `{field}` field"));
+        };
+        tag = Some(value);
+    }
+    let Some(tag) = tag else {
+        return Err(format!("tagged object has no string `{field}` field"));
+    };
+    Ok((tag.to_string(), body))
+}
+
+fn ordered_field<'a>(body: &'a OrderedJsonObject, field: &str) -> Option<&'a OrderedJsonValue> {
+    body.as_entries()
+        .iter()
+        .find_map(|(key, value)| (key == field).then_some(value))
+}
+
+fn ordered_string(body: &OrderedJsonObject, field: &str) -> Result<String, String> {
+    match ordered_field(body, field) {
+        Some(OrderedJsonValue::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("tagged object field `{field}` is not a string")),
+        None => Err(format!("tagged object has no `{field}` field")),
+    }
+}
+
+fn decode_running_image_evidence(value: OrderedJsonValue) -> Result<RunningImageEvidence, String> {
+    let (tag, body) = read_ordered_tagged(value, "method")?;
+    match tag.as_str() {
+        "linux_proc_sha256" => Ok(RunningImageEvidence::LinuxProcSha256 {
+            digest: ordered_string(&body, "digest")?,
+        }),
+        "macos_spawn_inode" => {
+            let device = ordered_field(&body, "device")
+                .and_then(|value| match value {
+                    OrderedJsonValue::Number(number) => number.as_u64(),
+                    _ => None,
+                })
+                .ok_or_else(|| "tagged object has no unsigned `device` field".to_string())?;
+            let inode = ordered_field(&body, "inode")
+                .and_then(|value| match value {
+                    OrderedJsonValue::Number(number) => number.as_u64(),
+                    _ => None,
+                })
+                .ok_or_else(|| "tagged object has no unsigned `inode` field".to_string())?;
+            Ok(RunningImageEvidence::MacosSpawnInode { device, inode })
+        }
+        _ => Ok(RunningImageEvidence::Unknown { tag, body }),
+    }
+}
+
+impl Serialize for ModuleDeclaredProvenance {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Reported { build } => ModuleDeclaredProvenanceWire::Reported {
+                build: build.clone(),
+            }
+            .serialize(serializer),
+            Self::Unverifiable => ModuleDeclaredProvenanceWire::Unverifiable.serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ModuleDeclaredProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (tag, value) = read_tagged(deserializer, "status")?;
+        match tag.as_str() {
+            "reported" => match serde_json::from_value(value.into_value())
+                .map_err(D::Error::custom)?
+            {
+                ModuleDeclaredProvenanceWire::Reported { build } => Ok(Self::Reported { build }),
+                ModuleDeclaredProvenanceWire::Unverifiable => unreachable!(),
+            },
+            "unverifiable" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    ModuleDeclaredProvenanceWire::Unverifiable => Ok(Self::Unverifiable),
+                    ModuleDeclaredProvenanceWire::Reported { .. } => unreachable!(),
+                }
+            }
+            _ => Ok(Self::Unknown { tag, body: value }),
+        }
+    }
+}
+
+impl Serialize for RunningImageAgreement {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Match { evidence } => RunningImageAgreementWire::Match {
+                evidence: evidence.clone(),
+            }
+            .serialize(serializer),
+            Self::Mismatch { running, disk } => RunningImageAgreementWire::Mismatch {
+                running: running.clone(),
+                disk: disk.clone(),
+            }
+            .serialize(serializer),
+            Self::Unavailable { reason } => RunningImageAgreementWire::Unavailable {
+                reason: reason.clone(),
+            }
+            .serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RunningImageAgreement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (tag, value) = read_tagged(deserializer, "status")?;
+        match tag.as_str() {
+            "match" => Ok(Self::Match {
+                evidence: decode_running_image_evidence(
+                    ordered_field(&value, "evidence")
+                        .cloned()
+                        .ok_or_else(|| D::Error::custom("tagged object has no `evidence` field"))?,
+                )
+                .map_err(D::Error::custom)?,
+            }),
+            "mismatch" => Ok(Self::Mismatch {
+                running: decode_running_image_evidence(
+                    ordered_field(&value, "running")
+                        .cloned()
+                        .ok_or_else(|| D::Error::custom("tagged object has no `running` field"))?,
+                )
+                .map_err(D::Error::custom)?,
+                disk: decode_running_image_evidence(
+                    ordered_field(&value, "disk")
+                        .cloned()
+                        .ok_or_else(|| D::Error::custom("tagged object has no `disk` field"))?,
+                )
+                .map_err(D::Error::custom)?,
+            }),
+            "unavailable" => Ok(Self::Unavailable {
+                reason: serde_json::from_value(
+                    ordered_field(&value, "reason")
+                        .cloned()
+                        .ok_or_else(|| D::Error::custom("tagged object has no `reason` field"))?
+                        .into_value(),
+                )
+                .map_err(D::Error::custom)?,
+            }),
+            _ => Ok(Self::Unknown { tag, body: value }),
+        }
+    }
+}
+
+impl Serialize for RunningImageEvidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::LinuxProcSha256 { digest } => RunningImageEvidenceWire::LinuxProcSha256 {
+                digest: digest.clone(),
+            }
+            .serialize(serializer),
+            Self::MacosSpawnInode { device, inode } => RunningImageEvidenceWire::MacosSpawnInode {
+                device: *device,
+                inode: *inode,
+            }
+            .serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RunningImageEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (tag, value) = read_tagged(deserializer, "method")?;
+        match tag.as_str() {
+            "linux_proc_sha256" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    RunningImageEvidenceWire::LinuxProcSha256 { digest } => {
+                        Ok(Self::LinuxProcSha256 { digest })
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            "macos_spawn_inode" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    RunningImageEvidenceWire::MacosSpawnInode { device, inode } => {
+                        Ok(Self::MacosSpawnInode { device, inode })
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => Ok(Self::Unknown { tag, body: value }),
+        }
+    }
+}
+
+impl Serialize for SupervisorRouteConsumer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Reserved { module_id } => SupervisorRouteConsumerWire::Reserved {
+                module_id: module_id.clone(),
+            }
+            .serialize(serializer),
+            Self::Direct { connection_id } => SupervisorRouteConsumerWire::Direct {
+                connection_id: *connection_id,
+            }
+            .serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SupervisorRouteConsumer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (tag, value) = read_tagged(deserializer, "kind")?;
+        match tag.as_str() {
+            "reserved" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    SupervisorRouteConsumerWire::Reserved { module_id } => {
+                        Ok(Self::Reserved { module_id })
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            "direct" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    SupervisorRouteConsumerWire::Direct { connection_id } => {
+                        Ok(Self::Direct { connection_id })
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => Ok(Self::Unknown { tag, body: value }),
+        }
+    }
+}
+
+impl Serialize for StderrCaptureState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Captured => StderrCaptureStateWire::Captured.serialize(serializer),
+            Self::Incomplete { reason } => StderrCaptureStateWire::Incomplete {
+                reason: reason.clone(),
+            }
+            .serialize(serializer),
+            Self::NotCaptured { reason } => StderrCaptureStateWire::NotCaptured {
+                reason: reason.clone(),
+            }
+            .serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StderrCaptureState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (tag, value) = read_tagged(deserializer, "state")?;
+        match tag.as_str() {
+            "captured" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    StderrCaptureStateWire::Captured => Ok(Self::Captured),
+                    _ => unreachable!(),
+                }
+            }
+            "incomplete" => match serde_json::from_value(value.into_value())
+                .map_err(D::Error::custom)?
+            {
+                StderrCaptureStateWire::Incomplete { reason } => Ok(Self::Incomplete { reason }),
+                _ => unreachable!(),
+            },
+            "not_captured" => match serde_json::from_value(value.into_value())
+                .map_err(D::Error::custom)?
+            {
+                StderrCaptureStateWire::NotCaptured { reason } => Ok(Self::NotCaptured { reason }),
+                _ => unreachable!(),
+            },
+            _ => Ok(Self::Unknown { tag, body: value }),
+        }
+    }
+}
+
+impl Serialize for StderrTailEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Line { text, truncated } => StderrTailEntryWire::Line {
+                text: text.clone(),
+                truncated: *truncated,
+            }
+            .serialize(serializer),
+            Self::ProcessStart => StderrTailEntryWire::ProcessStart.serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StderrTailEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (tag, value) = read_tagged(deserializer, "kind")?;
+        match tag.as_str() {
+            "line" => match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                StderrTailEntryWire::Line { text, truncated } => Ok(Self::Line { text, truncated }),
+                _ => unreachable!(),
+            },
+            "process_start" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    StderrTailEntryWire::ProcessStart => Ok(Self::ProcessStart),
+                    _ => unreachable!(),
+                }
+            }
+            _ => Ok(Self::Unknown { tag, body: value }),
+        }
+    }
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -1209,5 +1908,199 @@ mod tests {
         );
         assert_eq!(modules[1].module_id, "healthy-a");
         assert_eq!(modules[2].module_id, "healthy-b");
+    }
+
+    #[test]
+    fn tagged_unknown_values_retain_tag_and_body() {
+        macro_rules! assert_unknown_round_trip {
+            ($ty:ident, $field:literal, $value:expr) => {
+                let value = $value;
+                let wire = serde_json::to_string(&value).unwrap();
+                let decoded: $ty = serde_json::from_str(&wire).unwrap();
+                match decoded {
+                    $ty::Unknown { tag, body } => {
+                        assert_eq!(tag, value[$field].as_str().unwrap());
+                        assert_eq!(serde_json::to_value(&body).unwrap(), value);
+                    }
+                    _ => panic!("decoded known variant"),
+                }
+            };
+        }
+
+        assert_unknown_round_trip!(
+            ModuleDeclaredProvenance,
+            "status",
+            serde_json::json!({"status": "future", "build": {"version": 7}})
+        );
+        assert_unknown_round_trip!(
+            RunningImageAgreement,
+            "status",
+            serde_json::json!({"status": "future", "evidence": {"digest": "abc"}})
+        );
+        assert_unknown_round_trip!(
+            RunningImageEvidence,
+            "method",
+            serde_json::json!({"method": "future", "digest": "abc"})
+        );
+        assert_unknown_round_trip!(
+            SupervisorRouteConsumer,
+            "kind",
+            serde_json::json!({"kind": "future", "module_id": "m"})
+        );
+        assert_unknown_round_trip!(
+            StderrCaptureState,
+            "state",
+            serde_json::json!({"state": "future", "reason": "because"})
+        );
+        assert_unknown_round_trip!(
+            StderrTailEntry,
+            "kind",
+            serde_json::json!({"kind": "future", "text": "line"})
+        );
+    }
+
+    #[test]
+    fn tagged_unknown_values_round_trip_the_original_json() {
+        let wire = r#"{"kind":"future_consumer","detail":{"z":1}}"#;
+        let decoded: SupervisorRouteConsumer = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn tagged_unknown_values_round_trip_trailing_tag() {
+        let route_wire = r#"{"detail":{"z":1},"kind":"future_consumer"}"#;
+        let route: SupervisorRouteConsumer = serde_json::from_str(route_wire).unwrap();
+        assert_eq!(serde_json::to_string(&route).unwrap(), route_wire);
+
+        let stderr_wire = r#"{"reason":"because","state":"future_state"}"#;
+        let stderr: StderrCaptureState = serde_json::from_str(stderr_wire).unwrap();
+        assert_eq!(serde_json::to_string(&stderr).unwrap(), stderr_wire);
+    }
+
+    #[test]
+    fn tagged_unknown_values_round_trip_middle_tag() {
+        let route_wire = r#"{"a":1,"kind":"future_x","b":2}"#;
+        let route: SupervisorRouteConsumer = serde_json::from_str(route_wire).unwrap();
+        assert_eq!(serde_json::to_string(&route).unwrap(), route_wire);
+
+        let stderr_wire = r#"{"a":1,"state":"future_state","b":2}"#;
+        let stderr: StderrCaptureState = serde_json::from_str(stderr_wire).unwrap();
+        assert_eq!(serde_json::to_string(&stderr).unwrap(), stderr_wire);
+    }
+
+    #[test]
+    fn tagged_unknown_values_round_trip_deep_payload() {
+        let route_wire = r#"{"a":{"n":[1,2]},"kind":"future_x","zz":"s","b":null}"#;
+        let route: SupervisorRouteConsumer = serde_json::from_str(route_wire).unwrap();
+        assert_eq!(serde_json::to_string(&route).unwrap(), route_wire);
+
+        let stderr_wire = r#"{"a":{"n":[1,2]},"state":"future_state","zz":"s","b":null}"#;
+        let stderr: StderrCaptureState = serde_json::from_str(stderr_wire).unwrap();
+        assert_eq!(serde_json::to_string(&stderr).unwrap(), stderr_wire);
+    }
+
+    #[test]
+    fn tagged_unknown_values_reject_non_object_bodies() {
+        for wire in ["42", r#""future""#, "[]"] {
+            assert!(serde_json::from_str::<SupervisorRouteConsumer>(wire).is_err());
+            assert!(serde_json::from_str::<StderrCaptureState>(wire).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_discriminators_reject_without_panicking() {
+        assert_eq!(
+            serde_json::from_str::<ModuleDeclaredProvenance>(r#"{"status":"unverifiable"}"#)
+                .unwrap(),
+            ModuleDeclaredProvenance::Unverifiable
+        );
+        match serde_json::from_str::<ModuleDeclaredProvenance>(r#"{"status":"future_thing"}"#)
+            .unwrap()
+        {
+            ModuleDeclaredProvenance::Unknown { tag, .. } => assert_eq!(tag, "future_thing"),
+            _ => panic!("future discriminator decoded as a known variant"),
+        }
+
+        let wires = [
+            r#"{"status":"reported","status":"unverifiable"}"#,
+            r#"{"status":"unverifiable","status":"reported"}"#,
+            r#"{"status":"reported","build":{},"status":"unverifiable"}"#,
+            r#"{"status":"unverifiable","build":{},"status":"reported"}"#,
+        ];
+
+        for wire in wires {
+            let result =
+                std::panic::catch_unwind(|| serde_json::from_str::<ModuleDeclaredProvenance>(wire));
+            assert!(result.is_ok(), "duplicate discriminator panicked: {wire}");
+            assert!(
+                result.unwrap().is_err(),
+                "duplicate discriminator decoded: {wire}"
+            );
+        }
+
+        let wire = r#"{"state":"captured","state":"incomplete","reason":"x"}"#;
+        let result = std::panic::catch_unwind(|| serde_json::from_str::<StderrCaptureState>(wire));
+        assert!(result.is_ok(), "duplicate discriminator panicked: {wire}");
+        assert!(
+            result.unwrap().is_err(),
+            "duplicate discriminator decoded: {wire}"
+        );
+    }
+
+    #[test]
+    fn nested_unknown_values_round_trip_without_normalizing_member_order() {
+        let known_wire =
+            r#"{"status":"match","evidence":{"method":"linux_proc_sha256","digest":"abc"}}"#;
+        let known: RunningImageAgreement = serde_json::from_str(known_wire).unwrap();
+        assert_eq!(serde_json::to_string(&known).unwrap(), known_wire);
+
+        for wire in [
+            r#"{"kind":"future_x","detail":{"zeta":1,"alpha":2}}"#,
+            r#"{"kind":"future_x","d":{"b":{"zz":1,"aa":2}}}"#,
+        ] {
+            let decoded: SupervisorRouteConsumer = serde_json::from_str(wire).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+        }
+
+        for wire in [
+            r#"{"status":"match","evidence":{"method":"future_probe","zz":1,"aa":2}}"#,
+            r#"{"status":"match","evidence":{"method":"future_probe","d":{"zz":1,"aa":2}}}"#,
+        ] {
+            let decoded: RunningImageAgreement = serde_json::from_str(wire).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+        }
+
+        let wire = r#"{"status":"mismatch","running":{"detail":{"z":1},"method":"future_running"},"disk":{"method":"future_disk","detail":{"z":1}}}"#;
+        let decoded: RunningImageAgreement = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+
+        let wire = r#"{"capture":{"state":"captured"},"entries":[{"detail":{"z":1,"a":2},"kind":"future_line"},{"kind":"future_restart","meta":{"b":{"zz":1,"aa":2}}}]}"#;
+        let decoded: StderrTail = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn tagged_unknown_member_does_not_discard_known_siblings() {
+        let body = serde_json::json!({
+            "modules": [{
+                "module_id": "target",
+                "routes": [
+                    {"consumer": {"kind": "future_consumer", "module_id": "m", "detail": {"retry": true}}, "age_ms": 0, "draining": false},
+                    {"consumer": {"kind": "direct", "connection_id": 7}, "age_ms": 0, "draining": false}
+                ]
+            }]
+        });
+        let decoded: ClientControlResponse = serde_json::from_value(
+            serde_json::json!({"op": "supervisor.routes", "modules": body["modules"]}),
+        )
+        .unwrap();
+        let ClientControlResponse::SupervisorRoutes { modules } = decoded else {
+            panic!("decoded wrong response variant");
+        };
+        assert_eq!(modules[0].routes.len(), 2);
+        assert_eq!(
+            modules[0].routes[1].consumer,
+            SupervisorRouteConsumer::Direct { connection_id: 7 }
+        );
     }
 }

@@ -11833,7 +11833,17 @@ explaining, so mention-counting is biased toward false positives precisely in
 the population it exists to exclude, and punishes the seats that documented
 their decision. Census rule: match the CONSTRUCT, never the name — and a
 wrong measurement travels further than a wrong conclusion, because it
-arrives as a fact rather than an argument.
+arrives as a fact rather than an argument. CKCRED's inversion completes it:
+the instrument's worst errors cluster on the BEST-documented modules (their
+undocumented twin would have scored lower and been classified correctly), so
+assume a mention-counter's misranking concentrates where the thinking was
+most careful, in the unsafe direction. Their same-day analyst-side specimen:
+55 PEM-marker blob matches in the flip sweep, 2 real keys, 53 parsing
+literals — a mention is not a construction, and a marker is not material.
+And the unification with the falsifier rule: a falsifier that GREPS would
+confirm the wrong answer with more confidence than the census — the carried
+check must interrogate the construct, or it inherits the same bias wearing
+more authority.
 
 Companion bound on derived checks (BROCA, 40a7e951): a derived verdict is
 only as complete as the artifact it derives from — a STALE pin is safe

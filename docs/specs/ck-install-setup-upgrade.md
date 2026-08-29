@@ -75,14 +75,33 @@ UFUK's shape ratified: notification + manual `ck upgrade`.
   machine (docs/specs/fleet-release-machine.md) lands, `ck upgrade` becomes a
   consumer of its published channel manifests — same verb, better source.
 
-## macOS signing (borrow MC's path)
+## macOS signing (MC's live path, answered from their workflow)
 
-MC's dashboard app already notarizes. Asked MC for their exact setup
-(cert type, notarytool auth custody, bare-binary vs wrapper stapling,
-round-trip time). Target: Developer ID + notarized zips for release assets,
-which retires both the quarantine-strip hack and the fresh-exec assessment
-class for end users. Until that lands, the install script strips quarantine
-with a printed, documented line.
+Canonical reference: magic-context `.github/workflows/dashboard-release.yml`
+(cert import ~L140-165, notary env ~L180-190). Adapted for a CLI binary set:
+
+- Cert: `Developer ID Application`, imported per-run from base64 PKCS12 into
+  a THROWAWAY keychain; the workflow HARD-FAILS if only `Apple Development`
+  resolves (keep MC's guard — it caught a real mis-provisioned secret).
+  Identity NAME resolves at runtime, never hardcoded.
+- Notary auth: App Store Connect API key (issuer + key id + .p8 body written
+  to $RUNNER_TEMP per run), never Apple-ID auth. Custody: repo secrets today;
+  claustrum custody with per-run minting is the fleet end-state — MC will
+  migrate to it when it exists.
+- CLI shape (differs from MC's app): bare Mach-O binaries CANNOT be stapled.
+  Sign all five with the SAME identity in one run (mixed identities reject
+  the whole submission — MC's scar), hardened runtime + timestamp
+  (`codesign --options runtime --timestamp`), `ditto -c -k` zip, `notarytool
+  submit --wait` (2-5 min typical, degrade path: submit-succeeded/staple-
+  pending on timeout), distribute binaries unstapled — Gatekeeper fetches
+  the ticket online at first run. Offline-verifiable install would need a
+  stapled .pkg; deferred until someone needs it.
+- Quarantine reality: curl-written files carry no quarantine xattr, so the
+  happy path never hits Gatekeeper; notarization is for the MDM/security-
+  tooling story and browser-download paths, not the curl flow. The script
+  therefore needs NO quarantine-strip line — delete that hack from r1.
+- House rule kept: ad-hoc dev binaries and notarized release binaries are
+  different artifacts; the dev identifier never flows into the release path.
 
 ## UFUK decision points
 

@@ -11870,3 +11870,14 @@ it convincing. A wrapper's condition is not its callee's condition: the
 scripts listing shows the wrapper, and the callee's signature
 (consumes-verified-results, never executes) was the walked-past tell. Check
 the callee before believing the stub's story about it.
+
+**A query that names its target is a hypothesis about the artifact's shape,
+and its failure mode is silence** (ENGRAM, twice in one hour): identifiers
+as strings-markers read 0/0 (compiler erased them); top-level field lookups
+on a nested surface read absent×4 — both are guessing the answer's shape and
+reading the guess back as a measurement, and silence is indistinguishable
+from the target being absent. Enumerate the artifact when you can afford to;
+carry a positive control when you cannot. The absent×4 case had no control
+and was caught only by refusing to believe four absents from a surface just
+proven live — a posture, not an instrument, which is why the rule prefers
+the other two.

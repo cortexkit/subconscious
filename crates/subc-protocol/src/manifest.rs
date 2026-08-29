@@ -60,6 +60,10 @@ pub struct ModuleManifest {
     /// declaration's note. A standing registry row says the module sometimes
     /// mutates; the tell says whether THIS observation was mutated — a
     /// consumer holding one sample can act on the second, not the first.
+    /// A named tell must exist on the wire independently of this registry:
+    /// the declaration points at evidence, it is never the evidence. A tell
+    /// that exists only because the manifest describes it is a claim
+    /// vouching for itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

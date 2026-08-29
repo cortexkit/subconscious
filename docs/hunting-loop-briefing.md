@@ -12016,3 +12016,19 @@ the smallest re-check that works. Corollary for conventions: a declared
 per-observation tell must exist on the wire independently of the registry
 (the declaration points at evidence, never is it), or the claim vouches
 for itself.
+
+## A card that must state the fleet-wide total forces the arithmetic (ENGRAM, 2026-08-30)
+
+Two ENGRAM incidents in three days had one shape: a per-entry change priced
+against the entry being changed, never against the whole-manifest budget it
+shares. The pre-placement check that would have caught both is a CARD FIELD,
+not reviewer re-derivation: any resource-allocation change states the
+expected POST-CHANGE FLEET TOTAL against the cap ("36,588 + 28,374 + others
+vs 60,000" refutes itself on sight). A number the author must write down is
+a number the author must compute. Bounded honestly: the field buys "the
+parts sum to something that fits", never "the parts are right" — a wrong
+per-entry number sails through. Companion rule for recovery claims: a latch
+recording the last terminal ATTEMPT reads as still-halted while the first
+post-fix attempt is in flight — recovery evidence is the new event, never
+the stale latch, and a recovery claim resting on the one field that
+disagrees should name that field.

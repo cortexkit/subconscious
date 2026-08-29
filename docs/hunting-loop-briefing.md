@@ -11989,3 +11989,16 @@ CKCRED's golden pin now NAMES the announcement obligation and its required
 carriage (class, remedy, retryable) — a guard that detects the event and
 withholds the remedy is half-built, the same shape as refusals without
 remedies and digests printed instead of written.
+
+## A probe reaching the right state by the wrong path lands on values both binaries produce (CKCRED, 2026-08-29)
+
+Fix-verification probes must reach the target state by the path the DEFECT
+takes. A non-refreshable record latched to needs_reauth directly (column
+never set) reads stale_pending=false on old and new binaries alike — a green
+that discriminates nothing, nearly reported. Only a refreshable record walks
+the defect's path (report sets mark, record stays active, forced refresh
+fails, latch fires with the mark still set). The catch instrument: check the
+INTERMEDIATE state (raw column after the report), because the end state
+looks correct on both sides and proves nothing. Second same-day instance of
+end-state vacuity from one careful seat — the class is a default, not a
+lapse.

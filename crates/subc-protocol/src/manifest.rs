@@ -44,6 +44,14 @@ pub struct ModuleManifest {
     /// Ephemeral signals are out of scope for v1 because they are not durably
     /// declarable, not because they are harmless. A v2 reader must not interpret
     /// this field's absence in a v1 manifest as a judgement about ephemerals.
+    ///
+    /// `None` and `Some(vec![])` are deliberately distinct on the wire: an
+    /// absent block means the module has not adopted this vocabulary (readers
+    /// treat it as zero signals but must not treat it as a survey answer),
+    /// while an empty list is an affirmative declaration that the module
+    /// examined its effects and claims none are declarable. Modules that mean
+    /// "no signals" should declare the empty list; `None` is what an
+    /// un-adopted manifest looks like, not a statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

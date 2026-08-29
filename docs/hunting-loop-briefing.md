@@ -11949,3 +11949,17 @@ two-axis split in a migration because a join broke — 26% of its rows have no
 slug and cannot; 54.6% of its ledger has no identity — so Optional is the
 majority case, and a mandatory field would have forced a sentinel (the same
 trap from the other direction).
+
+## A separation forced twice by unrelated pressures is probably structural (ASTRO, 2026-08-29)
+
+Astrocyte's observed-vs-vouched identity boundary turned out to already
+exist as a two-table split — built months earlier to protect DELETION
+AUTHORITY (an unresolved identity must never authorise pruning a labelled
+account), and rediscovered as exactly the boundary the provenance rule
+mandates. When two independent design pressures force the same line, the
+line is a property of the domain, not a convention. Two corollaries: a
+hazard flag aimed from an IMPRESSION of one's own code can be aimed at a
+closed hazard (read the code, not the memory of it — the safe state was
+unknowable from the impression); and a structurally-separated pair's
+remaining risk moves to the READ path — a union that flattens the tables
+re-manufactures the fabrication the schema prevents.

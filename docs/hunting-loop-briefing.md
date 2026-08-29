@@ -11898,3 +11898,23 @@ Rule: every refusal-capable check prints its failure explicitly and exits —
 cards: cite main-tip SHAs only — a mason-branch SHA squashed into main fails
 ancestry checks while its content ships, making the check unfalsifiable in
 the direction that matters.
+
+## A census that queries a relation without its discriminating key is wrong twice (2026-08-29)
+
+The provider-usage 0.8.0 wave miss had two independent failures, and the
+second survived correcting the first. Failure 1: announced the bump to seats
+with queued migrations instead of enumerating cargo consumers (list from
+search, not structure). Failure 2: the corrective census — grep manifests for
+the crate name — queried a one-to-many relation without the key that decides
+blast radius. A lockfile can hold the same crate as a PATH instance and a
+REGISTRY instance; only path consumers stale on a sibling bump, and both
+repos read "0.7.0" while only one broke. `head -1` on that relation returns
+whichever instance is listed first, wearing authority.
+
+Rule: a blast-radius census for a path bump enumerates PATH instances
+(`source` absent in the lock), states that key beside the result, and treats
+version equality as non-evidence. General form: before trusting a census,
+name the key that discriminates in-blast from out-of-blast — if the query
+never reads that key, the census answers a different question than the one
+asked. (E2E, who found it by committing the same defect first and catching
+the false question it produced.)

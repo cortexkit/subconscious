@@ -2343,6 +2343,23 @@ fn quota_entry_is_connected(entry: &Value) -> bool {
     entry.get("usage").is_some_and(Value::is_object)
 }
 
+/// A connected entry with money and no rate window: the balance cohort.
+///
+/// `usage.primary` absent + `spend` present identifies these structurally.
+/// Disconnected entries (no usage object) are NOT balance-only — they keep
+/// their own classification and ordering.
+fn quota_entry_is_balance_only(entry: &Value) -> bool {
+    let windowless = entry
+        .get("usage")
+        .and_then(Value::as_object)
+        .is_some_and(|usage| !usage.get("primary").is_some_and(Value::is_object));
+    let has_spend = entry
+        .get("spend")
+        .and_then(Value::as_array)
+        .is_some_and(|pools| !pools.is_empty());
+    windowless && has_spend
+}
+
 /// What, if anything, a reader should do about a disconnected provider.
 ///
 /// Not-connected used to be one number covering unrelated situations. A provider
@@ -2398,7 +2415,13 @@ fn quota_entries_for_table<'a>(
     verbose: bool,
 ) -> Vec<&'a Value> {
     let mut entries = providers.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| provider_id(entry));
+    // Balance-only providers (money, no rate window) sort AFTER the windowed
+    // cohort so credit lines group at the end instead of landing mid-column
+    // between percentages and reset timers. The cohort test is structural
+    // (window absence + spend presence), never a provider-name list: a name
+    // list is complete on the day it is written and silently wrong when the
+    // next balance provider lands — the world changes, the list does not.
+    entries.sort_by_key(|entry| (quota_entry_is_balance_only(entry), provider_id(entry)));
     entries
         .into_iter()
         .filter(|entry| {
@@ -4431,6 +4454,28 @@ impl From<serde_json::Error> for CkError {
 
 #[cfg(test)]
 mod tests {
+    /// Balance-only providers (spend, no primary window) sort AFTER windowed
+    /// ones; within each cohort the order stays alphabetical. The cohort test
+    /// is structural, so a NEW balance provider lands at the end without a
+    /// name list knowing about it.
+    #[test]
+    fn balance_only_providers_sort_to_the_end() {
+        let providers = vec![
+            serde_json::json!({"provider": "deepseek", "usage": {}, "spend": [{"amount": 2402, "unit": "CNY"}]}),
+            serde_json::json!({"provider": "claude", "usage": {"primary": {"usedPercent": 40}}}),
+            serde_json::json!({"provider": "zenmux-new", "usage": {}, "spend": [{"amount": 5, "unit": "USD"}]}),
+            serde_json::json!({"provider": "gemini", "usage": {"primary": {"usedPercent": 10}}}),
+        ];
+        let order: Vec<String> = quota_entries_for_table(&providers, None, false)
+            .iter()
+            .map(|entry| provider_id(entry))
+            .collect();
+        assert_eq!(order, ["claude", "gemini", "deepseek", "zenmux-new"]);
+        // Windowed entries are NOT balance-only even when a spend pool rides along:
+        let mixed = serde_json::json!({"provider": "x", "usage": {"primary": {"usedPercent": 1}}, "spend": [{"amount": 1}]});
+        assert!(!quota_entry_is_balance_only(&mixed));
+    }
+
     mod drain_override {
         use super::super::parse_drain_override;
         use std::ffi::OsString;

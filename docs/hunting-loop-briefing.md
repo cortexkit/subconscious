@@ -11963,3 +11963,16 @@ closed hazard (read the code, not the memory of it — the safe state was
 unknowable from the impression); and a structurally-separated pair's
 remaining risk moves to the READ path — a union that flattens the tables
 re-manufactures the fabrication the schema prevents.
+
+## When a refusal's meaning is "try something else", the probe tries the something else (CKCRED, 2026-08-29)
+
+`kind_not_gettable` claims the credential is serviceable through a DIFFERENT
+verb, not absent. Three probe legs (new code on signing key, not_found on
+unknown handle, status on resolved handle) confirm the refusal and its
+discrimination — none tests the claim INSIDE the refusal. The fourth leg
+signs with the very handle get refused, and the returned signature is the
+only evidence separating "get refuses this" from "get refuses this and the
+thing refused is alive". A refusal-only probe confirms the refusal and says
+nothing about the remedy it names. Pairs with the unchanged-leg control from
+the same probe: the changed leg alone cannot separate discrimination from a
+blanket rename; only the UNCHANGED leg proves the neighbor property survived.

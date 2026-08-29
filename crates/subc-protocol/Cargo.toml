@@ -1,6 +1,6 @@
 [package]
 name = "subc-protocol"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 publish = true
 description = "Shared wire contract for subc <-> modules: the 21-byte envelope, the Frame (header + opaque body), channel-0 control bodies, route.bind/RouteTarget session shapes, and the capability manifest. Single source of truth, depended on by subc-core and AFT."

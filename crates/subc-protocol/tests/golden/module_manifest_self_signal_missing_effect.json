@@ -1,0 +1,27 @@
+{
+  "bindings": {
+    "identity": {
+      "optional": [],
+      "requires": []
+    },
+    "storage": {
+      "kind": "sqlite",
+      "owns_schema": false,
+      "scope": "project"
+    },
+    "vault_grants": []
+  },
+  "consumes": [],
+  "module_id": "missing-effect",
+  "module_version": "0.14.0",
+  "protocol_ver": 2,
+  "provides": [],
+  "self_signals": [
+    {
+      "anchored_to": "fixed_interval",
+      "kind": "poller",
+      "name": "usage_poller"
+    }
+  ],
+  "trust_tier": "first_party"
+}

@@ -5387,6 +5387,7 @@ fn consumer_manifest(module_id: &str) -> ModuleManifest {
             },
         },
         capabilities: None,
+        self_signals: None,
         provenance: None,
     }
 }

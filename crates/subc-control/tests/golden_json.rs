@@ -15,7 +15,8 @@ use subc_protocol::{
         CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
         IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
         ManifestProvenance, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
-        PipelineStageKind, ProviderRole, Tool,
+        PipelineStageKind, ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind,
+        SignalAnchor, SignalCadence, Tool,
     },
     session::HealthStatus,
     BindIdentity, RouteTarget, PROTOCOL_VERSION,
@@ -35,6 +36,10 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         assert_golden(name, &push);
     }
     assert_golden("catalog_entry", &catalog_entry());
+    assert_golden(
+        "catalog_entry_with_self_signals",
+        &catalog_entry_with_self_signals(),
+    );
     assert_golden(
         "catalog_entry_without_operation_description",
         &catalog_entry_without_operation_description(),
@@ -706,6 +711,43 @@ fn catalog_entry() -> CatalogEntry {
             }],
             must_never_reach: vec!["federation-transport/v1".to_string()],
         }),
+        self_signals: None,
+    }
+}
+
+fn catalog_entry_with_self_signals() -> CatalogEntry {
+    CatalogEntry {
+        module_id: "signal-tools".to_string(),
+        module_version: Some("0.10.0".to_string()),
+        roles: Vec::new(),
+        control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
+        capabilities: None,
+        self_signals: Some(vec![
+            SelfSignalDeclaration {
+                name: "provider_usage_poller".to_string(),
+                kind: SelfSignalKind::Poller,
+                effect: SelfSignalEffect::Observe,
+                anchored_to: SignalAnchor::FixedInterval,
+                cadence: Some(SignalCadence::Literal {
+                    interval_ms: 300_000,
+                }),
+                domain: Some("provider-usage".to_string()),
+                note: None,
+            },
+            SelfSignalDeclaration {
+                name: "claude_keepalive".to_string(),
+                kind: SelfSignalKind::Keepalive,
+                effect: SelfSignalEffect::Mutate,
+                anchored_to: SignalAnchor::Event {
+                    event: "window_expiry".to_string(),
+                },
+                cadence: Some(SignalCadence::Derived {
+                    source: "capacity_runtime.effective_cadence_ms".to_string(),
+                }),
+                domain: Some("provider-usage".to_string()),
+                note: Some("Keeps the provider session alive at the window boundary.".to_string()),
+            },
+        ]),
     }
 }
 
@@ -716,6 +758,7 @@ fn catalog_entry_without_capabilities() -> CatalogEntry {
         roles: Vec::new(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
         capabilities: None,
+        self_signals: None,
     }
 }
 
@@ -736,6 +779,7 @@ fn catalog_entry_without_operation_description() -> CatalogEntry {
         }],
         control_ops: Vec::new(),
         capabilities: None,
+        self_signals: None,
     }
 }
 

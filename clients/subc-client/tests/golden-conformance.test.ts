@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
+import type { CatalogEntry } from "../src/client";
 import {
   buildFrame,
   decodeHeader,
@@ -300,6 +301,35 @@ describe("Rust golden fixtures", () => {
     expect(typeof identity.project_root).toBe("string");
     expect(typeof identity.harness).toBe("string");
     expect(typeof identity.session).toBe("string");
+  });
+
+  test("catalog self-signal declarations decode from the Rust manifest vector", () => {
+    const manifest = loadGolden("module_manifest_with_self_signals");
+    const entry = JSON.parse(
+      JSON.stringify({
+        module_id: manifest.module_id,
+        roles: [],
+        control_ops: [],
+        self_signals: manifest.self_signals,
+      }),
+    ) as CatalogEntry;
+
+    expect(entry.self_signals).toHaveLength(2);
+    expect(entry.self_signals?.[0]?.effect).toBe("observe");
+    expect(entry.self_signals?.[1]?.effect).toBe("mutate");
+    expect(entry.self_signals?.[1]?.anchored_to).toEqual({
+      event: { event: "window_expiry" },
+    });
+
+    const legacyManifest = loadGolden("module_manifest_without_self_signals");
+    const legacyEntry = JSON.parse(
+      JSON.stringify({
+        module_id: legacyManifest.module_id,
+        roles: [],
+        control_ops: [],
+      }),
+    ) as CatalogEntry;
+    expect(legacyEntry.self_signals).toBeUndefined();
   });
 
   test("the transcribed protocol constants match the Rust originals", () => {

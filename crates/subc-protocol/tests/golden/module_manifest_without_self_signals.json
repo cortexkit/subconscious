@@ -1,0 +1,22 @@
+{
+  "bindings": {
+    "identity": {
+      "optional": [],
+      "requires": [
+        "project"
+      ]
+    },
+    "storage": {
+      "kind": "sqlite",
+      "owns_schema": false,
+      "scope": "project"
+    },
+    "vault_grants": []
+  },
+  "consumes": [],
+  "module_id": "legacy-signal-tools",
+  "module_version": "0.13.0",
+  "protocol_ver": 2,
+  "provides": [],
+  "trust_tier": "first_party"
+}

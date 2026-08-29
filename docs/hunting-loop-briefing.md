@@ -11934,3 +11934,18 @@ a worker stopping on a dirty-tree-it-did-not-touch is detection working
 (the silent rewrite would otherwise ride inside an unrelated commit); and a
 nightly that goes red-at-HEAD-for-everyone VERIFIES a break but cannot
 diagnose one whose cause lives in another repository.
+
+## Option-with-a-stated-rule vs three-state: the discriminator is whether the producer can know (ASTRO, 2026-08-29)
+
+Same-shaped objection, two correct answers. Where NOBODY has established the
+fact for any row, Unknown is the true state of the world and a bare Option
+collapses it into "established absent" — three states are right (ASTRO/FUSI
+floor case). Where the populating producer KNOWS whether the fact exists at
+write time, null is an established finding and a documented null-means-X rule
+closes the ambiguity without a third state (AccountIdentity slug). Ask which
+world you are in before arguing the type. Supporting evidence that emerged
+from failure rather than design: astrocyte's capacity table grew the same
+two-axis split in a migration because a join broke — 26% of its rows have no
+slug and cannot; 54.6% of its ledger has no identity — so Optional is the
+majority case, and a mandatory field would have forced a sentinel (the same
+trap from the other direction).

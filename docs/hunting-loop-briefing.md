@@ -11976,3 +11976,16 @@ thing refused is alive". A refusal-only probe confirms the refusal and says
 nothing about the remedy it names. Pairs with the unchanged-leg control from
 the same probe: the changed leg alone cannot separate discrimination from a
 blanket rename; only the UNCHANGED leg proves the neighbor property survived.
+
+## The class set is the consumer's control flow (SYNAPSE, enforced by CKCRED, 2026-08-29)
+
+Where a contract instructs consumers to branch on CLASS and never on code,
+the class vocabulary IS downstream control flow: a new class with a
+reject-fast remedy sits safely-but-wrongly in every conservative
+unknown-class fallback until announced — so the announcement is not
+courtesy, it is the only thing converting a safe default into a correct
+one. Enforcement belongs at the assertion that already reddens on change:
+CKCRED's golden pin now NAMES the announcement obligation and its required
+carriage (class, remedy, retryable) — a guard that detects the event and
+withholds the remedy is half-built, the same shape as refusals without
+remedies and digests printed instead of written.

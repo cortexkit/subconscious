@@ -11881,3 +11881,20 @@ carry a positive control when you cannot. The absent×4 case had no control
 and was caught only by refusing to believe four absents from a surface just
 proven live — a posture, not an instrument, which is why the rule prefers
 the other two.
+
+## A verification that cannot print its failure is not a verification (2026-08-29)
+
+Three decorative checks between two seats in one hour, same mechanism wearing
+two syntaxes: `check && echo OK` under `set -e` (a failing command inside a
+`&&` list does not exit the script — only the final command's failure does),
+and `ancestor: $(check && echo YES)` (a failed interpolation prints an empty
+field and the surrounding echo succeeds). In both, failure renders as an
+ABSENT line the reader must notice, not a PRESENT refusal — and both authors
+read past their own missing output while the placement proceeded.
+
+Rule: every refusal-capable check prints its failure explicitly and exits —
+`if ! check; then echo "REFUSED: <why>"; exit 1; fi`. Bare `&&` chains and
+`$()`-interpolated asserts are display, not gates. Corollary for deploy
+cards: cite main-tip SHAs only — a mason-branch SHA squashed into main fails
+ancestry checks while its content ships, making the check unfalsifiable in
+the direction that matters.

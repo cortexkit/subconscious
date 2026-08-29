@@ -103,11 +103,20 @@ Canonical reference: magic-context `.github/workflows/dashboard-release.yml`
 - House rule kept: ad-hoc dev binaries and notarized release binaries are
   different artifacts; the dev identifier never flows into the release path.
 
-## UFUK decision points
+## Settled by operator (2026-08-29)
 
-1. Install URL: raw GitHub URL is enough for alpha (my default) vs minting a
-   domain (getcortexkit.sh-style) now.
-2. MC conversion in v1 setup, or aft-only first (my default: detect+offer for
-   BOTH, since detection is cheap and the offer is honest).
-3. Update-notification surface beyond bare `ck` (my default: bare-ck line
-   only for alpha; no other nagging).
+1. Install URL: `cortexkit.io` (already in Cloudflare). Endpoint shape:
+   `curl -fsSL https://cortexkit.io/install | sh` and
+   `irm https://cortexkit.io/install/win | iex` — a static route serving the
+   script (Worker or Pages), script content versioned in this repo; the
+   route deploy ceremony rides Cloudflare access (operator or CALLO's
+   worker path). The script itself stays repo-canonical so the domain is a
+   mirror, never a fork.
+2. Components are FIRST-CLASS: `ck setup` installs subc core and OFFERS
+   detected extras; any component installs later via `ck setup aft` /
+   `ck setup mc` (and `--with aft,mc` non-interactive). Only-subc,
+   only-aft, only-mc, and later-addition are all supported states; the
+   standalone-conversion offer is the same code path as a later add.
+3. Update-notification surface: bare-`ck` dashboard line + explicit
+   `ck upgrade --check`. No footers on other verbs, no OS notifications,
+   no agent-lane nagging in alpha.

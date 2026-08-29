@@ -52,6 +52,14 @@ pub struct ModuleManifest {
     /// examined its effects and claims none are declarable. Modules that mean
     /// "no signals" should declare the empty list; `None` is what an
     /// un-adopted manifest looks like, not a statement.
+    ///
+    /// Convention for mutate-effect entries: where the mutation leaves a
+    /// per-observation tell on the surface itself (insula publishes the
+    /// relaxed `usedPercent` beside the raw figure, so any single reading
+    /// self-reports whether it was touched), name that tell in the
+    /// declaration's note. A standing registry row says the module sometimes
+    /// mutates; the tell says whether THIS observation was mutated — a
+    /// consumer holding one sample can act on the second, not the first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1041,6 +1041,7 @@ fn tool_provider_manifest(module_id: &str, concurrency: Concurrency) -> ModuleMa
             },
         },
         capabilities: None,
+        self_signals: None,
         provenance: None,
     }
 }

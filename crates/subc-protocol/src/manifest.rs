@@ -30,6 +30,22 @@ pub struct ModuleManifest {
     /// the daemon validates before accepting a HELLO.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilityDeclarations>,
+    /// Periodic or event-driven behavior this module performs against an external
+    /// surface, so later analysts can account for the resulting self-shaped time
+    /// series.
+    ///
+    /// Declarations describe the EFFECTIVE values in force at HELLO time. In
+    /// particular, a compile-time cadence constant belongs in
+    /// [`SignalCadence::Literal`], while a cadence resolved from configuration
+    /// belongs in [`SignalCadence::Derived`] with a pointer to that effective
+    /// source. Both provenance stories are honest; copying a stale configured
+    /// value into a literal is not.
+    ///
+    /// Ephemeral signals are out of scope for v1 because they are not durably
+    /// declarable, not because they are harmless. A v2 reader must not interpret
+    /// this field's absence in a v1 manifest as a judgement about ephemerals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_signals: Option<Vec<SelfSignalDeclaration>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ManifestProvenance>,
 }
@@ -63,6 +79,8 @@ struct ModuleManifestWire {
     #[serde(default)]
     capabilities: Option<CapabilityDeclarations>,
     #[serde(default)]
+    self_signals: Option<Vec<SelfSignalDeclaration>>,
+    #[serde(default)]
     provenance: Option<ManifestProvenance>,
     // `runtime_computed` belongs to --manifest output rather than the retained
     // manifest model. Deserialize it only long enough to enforce that capability
@@ -88,6 +106,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             consumes: wire.consumes,
             bindings: wire.bindings,
             capabilities: wire.capabilities,
+            self_signals: wire.self_signals,
             provenance: wire.provenance,
         };
         manifest
@@ -95,6 +114,63 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             .map_err(D::Error::custom)?;
         Ok(manifest)
     }
+}
+
+/// A raw HELLO declaration error that can be reported before serde drops context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfSignalDeclarationError {
+    module_id: String,
+    entry_index: usize,
+    field: &'static str,
+}
+
+impl fmt::Display for SelfSignalDeclarationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "module_id '{}' self_signals[{}] is missing required field '{}'",
+            self.module_id.escape_debug(),
+            self.entry_index,
+            self.field
+        )
+    }
+}
+
+/// Reject raw HELLO self-signal declarations that omit `effect` or `anchored_to`.
+///
+/// Serde correctly rejects these omissions while decoding [`ModuleManifest`], but
+/// that decode does not retain the module id or list index needed for a useful
+/// daemon refusal. This preflight adds only that reporting context; it does not
+/// interpret a declaration's behavior.
+pub fn validate_hello_self_signal_declarations(
+    hello: &Value,
+) -> Result<(), SelfSignalDeclarationError> {
+    let Some(manifest) = hello.get("manifest").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let module_id = manifest
+        .get("module_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let Some(entries) = manifest.get("self_signals").and_then(Value::as_array) else {
+        return Ok(());
+    };
+
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        for field in ["effect", "anchored_to"] {
+            if !entry.contains_key(field) {
+                return Err(SelfSignalDeclarationError {
+                    module_id: module_id.to_string(),
+                    entry_index,
+                    field,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Static, versioned capabilities declared by a module.
@@ -107,6 +183,114 @@ pub struct CapabilityDeclarations {
     pub requires: Vec<CapabilityRequirement>,
     #[serde(default)]
     pub must_never_reach: Vec<String>,
+}
+
+/// A declared periodic or event-driven behavior that shapes an external surface.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SelfSignalDeclaration {
+    /// Stable identifier for this declared behavior, such as `codex_keepalive`.
+    pub name: String,
+    /// Informative classification only; it never substitutes for `effect` or
+    /// `anchored_to` when an analyst interprets the declaration.
+    pub kind: SelfSignalKind,
+    /// Whether the signal only observes the surface or changes it.
+    pub effect: SelfSignalEffect,
+    /// Whether the behavior follows its own interval or a surface event boundary.
+    pub anchored_to: SignalAnchor,
+    /// The effective cadence in force at HELLO time.
+    ///
+    /// Use [`SignalCadence::Literal`] when a compile-time constant is the
+    /// effective value. Use [`SignalCadence::Derived`] when configuration or
+    /// another runtime input resolves the effective value, naming the source so
+    /// the declaration cannot silently drift from that resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence: Option<SignalCadence>,
+    /// The external surface this behavior shapes, such as `provider-usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Informative class of a self-signal, tolerant of newer wire values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfSignalKind {
+    Keepalive,
+    Poller,
+    Cron,
+    Sweep,
+    Watchdog,
+    Heartbeat,
+    Other(String),
+}
+
+impl SelfSignalKind {
+    fn wire_name(&self) -> &str {
+        match self {
+            Self::Keepalive => "keepalive",
+            Self::Poller => "poller",
+            Self::Cron => "cron",
+            Self::Sweep => "sweep",
+            Self::Watchdog => "watchdog",
+            Self::Heartbeat => "heartbeat",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+impl Serialize for SelfSignalKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for SelfSignalKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "keepalive" => Self::Keepalive,
+            "poller" => Self::Poller,
+            "cron" => Self::Cron,
+            "sweep" => Self::Sweep,
+            "watchdog" => Self::Watchdog,
+            "heartbeat" => Self::Heartbeat,
+            _ => Self::Other(value),
+        })
+    }
+}
+
+/// The effect a self-signal has on the external surface it targets.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SelfSignalEffect {
+    Observe,
+    Mutate,
+}
+
+/// What establishes a self-signal's cadence relative to the external surface.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalAnchor {
+    /// The behavior follows its own periodic signature, so analysts can find it
+    /// without an external event grid.
+    FixedInterval,
+    /// The behavior follows an external event boundary, which can make its shape
+    /// indistinguishable from the surface mechanism without this declaration.
+    Event { event: String },
+}
+
+/// How a self-signal's effective cadence is declared.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalCadence {
+    Literal { interval_ms: u64 },
+    Derived { source: String },
 }
 
 /// Build facts a module DECLARES about its own binary at HELLO. The daemon
@@ -974,6 +1158,7 @@ mod tests {
                 },
             },
             capabilities: None,
+            self_signals: None,
             provenance: None,
         }
     }

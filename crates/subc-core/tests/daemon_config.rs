@@ -1513,6 +1513,7 @@ fn untrusted_hello_frame(module_id: &str, corr: u64) -> Frame {
             },
         },
         capabilities: None,
+        self_signals: None,
         provenance: None,
     };
     let body = serde_json::to_vec(&ModuleHelloBody {

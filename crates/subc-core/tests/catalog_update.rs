@@ -13,7 +13,8 @@ use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManifestProvenance,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        ModuleManifest, ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind,
+        SignalAnchor, SignalCadence, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{
         ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
@@ -217,6 +218,87 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
         .await;
     let routability_error = read_control_error(&mut supervision_only, 602).await;
     assert_eq!(routability_error.code, "catalog_update_frozen_field");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_self_signals_are_mirrored_and_missing_axes_are_refused() {
+    let server = TestServer::start().await;
+    let mut module = connect_endpoint(&server, "self-signal-module").await;
+    let mut manifest = supervision_only_manifest("self-signal-module");
+    let declarations = vec![
+        SelfSignalDeclaration {
+            name: "provider_usage_poller".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: Some(SignalCadence::Literal {
+                interval_ms: 300_000,
+            }),
+            domain: Some("provider-usage".to_string()),
+            note: None,
+        },
+        SelfSignalDeclaration {
+            name: "claude_keepalive".to_string(),
+            kind: SelfSignalKind::Keepalive,
+            effect: SelfSignalEffect::Mutate,
+            anchored_to: SignalAnchor::Event {
+                event: "window_expiry".to_string(),
+            },
+            cadence: Some(SignalCadence::Derived {
+                source: "capacity_runtime.effective_cadence_ms".to_string(),
+            }),
+            domain: Some("provider-usage".to_string()),
+            note: Some("Keeps the provider session alive at the window boundary.".to_string()),
+        },
+    ];
+    manifest.self_signals = Some(declarations.clone());
+    register_module(&server, &mut module, manifest, 701).await;
+
+    let (_, modules) = catalog_list(&server, Some("self-signal-module"), 702).await;
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].self_signals, Some(declarations));
+    assert_eq!(
+        modules[0]
+            .self_signals
+            .as_ref()
+            .expect("catalog entry keeps self-signal declarations")[1]
+            .effect,
+        SelfSignalEffect::Mutate,
+        "catalog.list must preserve a mutating signal's declared effect"
+    );
+
+    let mut invalid_module = connect_endpoint(&server, "invalid-self-signal-module").await;
+    let invalid_manifest = supervision_only_manifest("invalid-self-signal-module");
+    let mut body = serde_json::to_value(ModuleHelloBody {
+        manifest: invalid_manifest,
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: None,
+    })
+    .expect("invalid HELLO base serializes");
+    body["manifest"]["self_signals"] = serde_json::json!([{
+        "name": "missing_effect",
+        "kind": "poller",
+        "anchored_to": "fixed_interval"
+    }]);
+    invalid_module
+        .send(
+            &Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                703,
+                serde_json::to_vec(&body).expect("invalid HELLO serializes"),
+            )
+            .expect("invalid HELLO frame builds"),
+        )
+        .await;
+    let error = read_control_error(&mut invalid_module, 703).await;
+    assert_eq!(error.code, "invalid_manifest");
+    assert!(error.message.contains("invalid-self-signal-module"));
+    assert!(error.message.contains("self_signals[0]"));
+    assert!(error.message.contains("effect"));
 }
 
 async fn register_module(
@@ -447,6 +529,7 @@ fn supervision_only_manifest(module_id: &str) -> ModuleManifest {
             },
         },
         capabilities: None,
+        self_signals: None,
         provenance: None,
     }
 }

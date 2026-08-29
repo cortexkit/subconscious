@@ -11,8 +11,8 @@ repository = "https://github.com/cortexkit/subconscious"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-subc-control = { path = "../subc-control", version = "0.9" }
-subc-protocol = { path = "../subc-protocol", version = "0.13" }
+subc-control = { path = "../subc-control", version = "0.10" }
+subc-protocol = { path = "../subc-protocol", version = "0.14" }
 subc-transport = { path = "../subc-transport", version = "0.5" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -191,6 +191,7 @@ fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
             },
         },
         capabilities: None,
+        self_signals: None,
         provenance: None,
     }
 }

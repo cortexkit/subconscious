@@ -1979,6 +1979,7 @@ fn supervision_manifest(module_id: String) -> ModuleManifest {
         consumes: vec![ConsumerRole::ToolClient { of: Vec::new() }],
         bindings: supervision_bindings(),
         capabilities: None,
+        self_signals: None,
         provenance: None,
     }
 }
@@ -5557,6 +5558,7 @@ mod tests {
                 }],
                 control_ops: Vec::new(),
                 capabilities: None,
+                self_signals: None,
             }
         }
 

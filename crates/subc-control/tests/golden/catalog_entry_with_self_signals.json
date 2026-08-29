@@ -1,0 +1,40 @@
+{
+  "control_ops": [
+    "route.bind",
+    "route.status"
+  ],
+  "module_id": "signal-tools",
+  "module_version": "0.10.0",
+  "roles": [],
+  "self_signals": [
+    {
+      "anchored_to": "fixed_interval",
+      "cadence": {
+        "literal": {
+          "interval_ms": 300000
+        }
+      },
+      "domain": "provider-usage",
+      "effect": "observe",
+      "kind": "poller",
+      "name": "provider_usage_poller"
+    },
+    {
+      "anchored_to": {
+        "event": {
+          "event": "window_expiry"
+        }
+      },
+      "cadence": {
+        "derived": {
+          "source": "capacity_runtime.effective_cadence_ms"
+        }
+      },
+      "domain": "provider-usage",
+      "effect": "mutate",
+      "kind": "keepalive",
+      "name": "claude_keepalive",
+      "note": "Keeps the provider session alive at the window boundary."
+    }
+  ]
+}

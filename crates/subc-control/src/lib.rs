@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use subc_protocol::{
-    manifest::{CapabilityDeclarations, ManifestProvenance, ProviderRole},
+    manifest::{CapabilityDeclarations, ManifestProvenance, ProviderRole, SelfSignalDeclaration},
     session::HealthStatus,
     BindIdentity, RouteTarget,
 };
@@ -720,6 +720,10 @@ pub struct CatalogEntry {
     /// capability grammar retain their existing catalog decoding behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilityDeclarations>,
+    /// Self-signal declarations mirrored verbatim from the registering module's
+    /// manifest. The daemon relays these declarations without interpreting them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_signals: Option<Vec<SelfSignalDeclaration>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

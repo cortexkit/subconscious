@@ -7,8 +7,8 @@ use subc_protocol::{
     manifest::{
         Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
         IdentityScope, ManagementOperation, ManagementOperationKind, ManifestProvenance,
-        ModuleManifest, ObservabilityKind, ObservabilitySurface, ProviderRole, StorageBinding,
-        StorageKind, StorageScope, Tool, TrustTier,
+        ModuleManifest, ObservabilityKind, ObservabilitySurface, ProviderRole, SelfSignalEffect,
+        SelfSignalKind, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -153,6 +153,72 @@ fn manifest_without_provenance_preserves_the_existing_hello_wire_shape() {
         )
         .expect("existing HELLO golden is JSON"),
         "an absent provenance declaration must preserve the existing HELLO bytes"
+    );
+}
+
+#[test]
+fn self_signal_declaration_vectors_round_trip_and_refuse_missing_axes() {
+    let with_signals_bytes = fs::read(golden_path("module_manifest_with_self_signals"))
+        .expect("self-signal manifest vector is readable");
+    let with_signals: Value =
+        serde_json::from_slice(&with_signals_bytes).expect("self-signal manifest vector is JSON");
+    let manifest: ModuleManifest =
+        serde_json::from_value(with_signals.clone()).expect("self-signal manifest deserializes");
+    let signals = manifest
+        .self_signals
+        .as_ref()
+        .expect("present self_signals remain present");
+    assert_eq!(signals.len(), 2);
+    assert_eq!(signals[0].effect, SelfSignalEffect::Observe);
+    assert_eq!(signals[1].effect, SelfSignalEffect::Mutate);
+    assert_eq!(
+        serde_json::to_vec(&manifest).expect("self-signal manifest serializes"),
+        with_signals_bytes,
+        "the declaration vector must round-trip byte-for-byte"
+    );
+
+    let without_signals = read_manifest_vector("module_manifest_without_self_signals");
+    let manifest: ModuleManifest = serde_json::from_value(without_signals.clone())
+        .expect("legacy manifest without self_signals deserializes");
+    assert!(manifest.self_signals.is_none());
+    let reserialized = serde_json::to_value(manifest).expect("legacy manifest serializes");
+    assert!(
+        reserialized.get("self_signals").is_none(),
+        "an absent self_signals block must remain absent"
+    );
+    assert_eq!(reserialized, without_signals);
+
+    for (name, field) in [
+        ("module_manifest_self_signal_missing_effect", "effect"),
+        (
+            "module_manifest_self_signal_missing_anchored_to",
+            "anchored_to",
+        ),
+    ] {
+        let error = serde_json::from_value::<ModuleManifest>(read_manifest_vector(name))
+            .expect_err("missing self-signal analysis axis must refuse the manifest");
+        assert!(
+            error.to_string().contains(field),
+            "{name} refusal must name {field}: {error}"
+        );
+    }
+
+    let unknown_kind = read_manifest_vector("module_manifest_self_signal_unknown_kind");
+    let manifest: ModuleManifest = serde_json::from_value(unknown_kind.clone())
+        .expect("unknown self-signal kind remains skew-tolerant");
+    let signals = manifest
+        .self_signals
+        .as_ref()
+        .expect("unknown kind declaration remains present");
+    assert_eq!(signals[0].effect, SelfSignalEffect::Observe);
+    assert_eq!(
+        signals[0].kind,
+        SelfSignalKind::Other("provider_pulse".to_string())
+    );
+    assert_eq!(
+        serde_json::to_value(manifest).expect("unknown kind reserializes"),
+        unknown_kind,
+        "an unknown kind must survive re-serialization unchanged"
     );
 }
 
@@ -353,6 +419,13 @@ where
     );
 }
 
+fn read_manifest_vector(name: &str) -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(golden_path(name)).expect("self-signal vector is readable"),
+    )
+    .expect("self-signal vector is JSON")
+}
+
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -484,6 +557,7 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
             },
         },
         capabilities: None,
+        self_signals: None,
         provenance: None,
     }
 }
@@ -522,6 +596,7 @@ fn management_surface_manifest(description: Option<&str>) -> ModuleManifest {
             },
         },
         capabilities: None,
+        self_signals: None,
         provenance: None,
     }
 }

@@ -123,12 +123,36 @@ export interface CatalogCapabilities {
   must_never_reach: string[];
 }
 
+/** A self-signal's anchor relative to the external surface it shapes. */
+export type CatalogSignalAnchor =
+  | "fixed_interval"
+  | { event: { event: string } };
+
+/** The source of a self-signal's effective cadence. */
+export type CatalogSignalCadence =
+  | { literal: { interval_ms: number } }
+  | { derived: { source: string } };
+
+/** A self-signal declaration mirrored from a registered module manifest. */
+export interface CatalogSelfSignalDeclaration {
+  name: string;
+  /** Open string for forward-compatible self-signal kinds. */
+  kind: string;
+  effect: "observe" | "mutate";
+  anchored_to: CatalogSignalAnchor;
+  cadence?: CatalogSignalCadence | null;
+  domain?: string | null;
+  note?: string | null;
+}
+
 export interface CatalogEntry {
   module_id: string;
   roles: unknown[];
   control_ops: string[];
   /** Static capability claims mirrored from the registered module manifest. */
   capabilities?: CatalogCapabilities | null;
+  /** Self-signal declarations mirrored verbatim from the registered manifest. */
+  self_signals?: CatalogSelfSignalDeclaration[] | null;
 }
 
 export interface RequestOptions {

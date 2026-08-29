@@ -1308,6 +1308,7 @@ fn manifest(
             },
         },
         capabilities,
+        self_signals: None,
         provenance: manifest_provenance(),
     }
 }

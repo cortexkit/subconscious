@@ -18,8 +18,8 @@ use subc_control::{
 use subc_protocol::{
     error_codes,
     manifest::{
-        validate_hello_capability_grammar, CapabilityDeclarations, Concurrency, ManifestProvenance,
-        ModuleManifest, ProviderRole,
+        validate_hello_capability_grammar, validate_hello_self_signal_declarations,
+        CapabilityDeclarations, Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -996,6 +996,13 @@ impl ControlHandler {
                 err.to_string(),
             )?]);
         }
+        if let Err(err) = validate_hello_self_signal_declarations(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_manifest",
+                err.to_string(),
+            )?]);
+        }
         if let Some(provenance) = hello_value
             .get("manifest")
             .and_then(|manifest| manifest.get("provenance"))
@@ -1476,6 +1483,7 @@ impl ControlHandler {
                     roles,
                     control_ops: registration.control_ops,
                     capabilities: registration.manifest.capabilities,
+                    self_signals: registration.manifest.self_signals,
                 }
             })
             .collect();
@@ -4199,6 +4207,7 @@ mod tests {
                 },
             },
             capabilities: None,
+            self_signals: None,
             provenance: None,
         }
     }

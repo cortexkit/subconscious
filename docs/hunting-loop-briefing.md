@@ -11918,3 +11918,19 @@ name the key that discriminates in-blast from out-of-blast — if the query
 never reads that key, the census answers a different question than the one
 asked. (E2E, who found it by committing the same defect first and catching
 the false question it produced.)
+
+## Lock waves need the mechanical consumer list, not the behavioural one (ASTRO, 2026-08-29)
+
+Path-dependency consumers are not notified-or-broken — they are SILENTLY
+REWRITTEN: cargo updates their lock on the next fresh build, and only a
+--locked gate turns that into a visible failure. Registry consumers do
+nothing until someone bumps a pin. So the population that needs a bump
+notice most is the one with the least visible failure mode, and any notice
+list built by asking "who has to change something" (the behavioural list —
+correct for decode obligations) selects almost exactly against it. Two
+lists, two questions: behavioural for wire-impact waves, mechanical (path
+instances in the lock) for lock waves. Corollaries from the same incident:
+a worker stopping on a dirty-tree-it-did-not-touch is detection working
+(the silent rewrite would otherwise ride inside an unrelated commit); and a
+nightly that goes red-at-HEAD-for-everyone VERIFIES a break but cannot
+diagnose one whose cause lives in another repository.

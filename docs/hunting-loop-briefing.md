@@ -12002,3 +12002,17 @@ INTERMEDIATE state (raw column after the report), because the end state
 looks correct on both sides and proves nothing. Second same-day instance of
 end-state vacuity from one careful seat — the class is a default, not a
 lapse.
+
+## A pinned distinction rewrites values chosen before it existed, silently (QTA, 2026-08-30)
+
+Pinning None-vs-empty semantics made a four-minute-old None wrong: the stub
+was examined-and-none, and None now claims never-asked. Nothing reddened —
+the pin shipped as documentation, and documentation does not fail a suite.
+Every value written in the window between a field landing and its semantics
+being pinned is a candidate whose meaning moved under it, distinguishable
+only by its author. Closing the window costs one line in the completion
+notice: name the semantics and ask each adopter to re-read their value —
+the smallest re-check that works. Corollary for conventions: a declared
+per-observation tell must exist on the wire independently of the registry
+(the declaration points at evidence, never is it), or the claim vouches
+for itself.

@@ -26,9 +26,13 @@ fn normalization_makes_comments_key_order_and_whitespace_digest_insignificant() 
     "#;
     let compact = r#"{"version":1,"trains":[]}"#;
 
+    let formatted_digest = parse(formatted).unwrap().digest;
+    let compact_digest = parse(compact).unwrap().digest;
+
+    assert_eq!(formatted_digest, compact_digest);
     assert_eq!(
-        parse(formatted).unwrap().digest,
-        parse(compact).unwrap().digest
+        formatted_digest.as_str(),
+        "bdb7da5b91024610c809316c37bd93cfef37fc25ab1c4260867d766299f19e0e"
     );
 }
 

@@ -167,6 +167,23 @@ fn empty_object() -> Value {
     Value::Object(Default::default())
 }
 
+fn sort_object_keys(value: &mut Value) {
+    // serde_json maps can preserve insertion order when another workspace package
+    // enables that feature, so rebuild every object in lexical order before hashing.
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(sort_object_keys),
+        Value::Object(object) => {
+            let mut entries: Vec<_> = std::mem::take(object).into_iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (_, value) in &mut entries {
+                sort_object_keys(value);
+            }
+            object.extend(entries);
+        }
+        _ => {}
+    }
+}
+
 /// Parses and validates a JSONC declaration from disk.
 pub fn load(path: impl AsRef<Path>) -> Result<ParsedDeclaration, DeclarationError> {
     let path = path.as_ref();
@@ -189,7 +206,7 @@ pub fn parse(source: &str) -> Result<ParsedDeclaration, DeclarationError> {
             source_location(source, "version"),
         )
     })?;
-    let value: Value = serde_json::from_str(&json).map_err(|error| {
+    let mut value: Value = serde_json::from_str(&json).map_err(|error| {
         DeclarationError::new(
             DeclarationRefusalCode::Parse,
             error.to_string(),
@@ -199,6 +216,7 @@ pub fn parse(source: &str) -> Result<ParsedDeclaration, DeclarationError> {
             }),
         )
     })?;
+    sort_object_keys(&mut value);
 
     let version = value
         .get("version")

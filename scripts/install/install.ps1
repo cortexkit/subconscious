@@ -16,7 +16,7 @@ function Refuse {
         [Parameter(Mandatory = $true)][string]$Evidence
     )
 
-    [Console]::Error.WriteLine("refusal: {0}: {1}" -f $Type, $Evidence)
+    [Console]::Error.WriteLine(("refusal: {0}: {1}" -f $Type, $Evidence))
     exit 1
 }
 
@@ -112,7 +112,7 @@ function Ensure-UserPath {
 
     $updatedPath = @($entries + $BinDir) -join ';'
     try {
-        Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -Type ExpandString -ErrorAction Stop
+        Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -ErrorAction Stop
     }
     catch {
         Refuse 'path-update-failed' "could not update HKCU\\Environment PATH ($($_.Exception.Message))"

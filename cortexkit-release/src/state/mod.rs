@@ -16,7 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Component, Path, PathBuf},
 };
@@ -640,9 +640,16 @@ thread_local! {
 }
 
 fn sync_directory(path: &Path) -> Result<(), StateError> {
-    File::open(path)
+    #[cfg(not(windows))]
+    std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| state_io(path, source))?;
+    #[cfg(windows)]
+    {
+        // Windows File::open cannot create a directory handle suitable for syncing.
+        // The record itself is flushed above; parent metadata sync is therefore a no-op.
+        let _ = path;
+    }
     #[cfg(test)]
     DIRECTORY_SYNC_COUNT.with(|count| count.set(count.get() + 1));
     Ok(())

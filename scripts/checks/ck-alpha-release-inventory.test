@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Exercise the release-inventory gate against local release directories.
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+gate="$repo_root/scripts/checks/ck-alpha-release-inventory.sh"
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+
+fail() {
+  printf 'test failure: %s\n' "$1" >&2
+  exit 1
+}
+
+write_asset() {
+  local directory="$1"
+  local name="$2"
+  local payload="fixture ${name}\n"
+  local digest
+
+  printf '%b' "$payload" >"${directory}/${name}"
+  digest=$(shasum -a 256 "${directory}/${name}" | awk '{print $1}')
+  printf '%s  %s\n' "$digest" "$name" >"${directory}/${name}.sha256"
+}
+
+write_release() {
+  local directory="$1"
+  shift
+  local component
+  local tuple
+  local os
+  local arch
+
+  mkdir -p "$directory"
+  for component in "$@"; do
+    for tuple in darwin-arm64 linux-x64 windows-x64; do
+      os="${tuple%-*}"
+      arch="${tuple#*-}"
+      write_asset "$directory" "${component}-${os}-${arch}.zip"
+    done
+  done
+}
+
+subconscious_release="$test_root/subconscious"
+aft_release="$test_root/aft"
+write_release "$subconscious_release" ck ck-subc ck-subc-mcp
+write_release "$aft_release" ck-aft
+
+pass_output="$test_root/pass-output"
+bash "$gate" \
+  --subconscious-release-url "file://${subconscious_release}" \
+  --aft-release-url "file://${aft_release}" >"$pass_output" 2>&1
+
+grep -Fq 'inventory-lane: name=subconscious' "$pass_output" \
+  || fail 'subconscious inventory lane was not recorded'
+grep -Fq 'inventory-lane: name=aft-external-dependency' "$pass_output" \
+  || fail 'external AFT dependency lane was not recorded'
+grep -Fq 'component=ck-subc-mcp lane=subconscious archive=ck-subc-mcp-windows-x64.zip sidecar=ck-subc-mcp-windows-x64.zip.sha256' "$pass_output" \
+  || fail 'subconscious Windows sidecar evidence was not recorded'
+grep -Fq 'component=ck-aft lane=aft-external-dependency archive=ck-aft-darwin-arm64.zip sidecar=ck-aft-darwin-arm64.zip.sha256' "$pass_output" \
+  || fail 'AFT archive and sidecar evidence was not recorded'
+grep -Fq 'release-inventory: passed; operator matrix may begin' "$pass_output" \
+  || fail 'complete inventory did not permit the matrix'
+
+rm -f "$aft_release/ck-aft-windows-x64.zip"
+missing_aft_output="$test_root/missing-aft-output"
+if bash "$gate" \
+  --subconscious-release-url "file://${subconscious_release}" \
+  --aft-release-url "file://${aft_release}" >"$missing_aft_output" 2>&1; then
+  fail 'missing external AFT archive unexpectedly passed'
+fi
+grep -Fq 'release-incomplete: component=ck-aft lane=aft-external-dependency missing=ck-aft-windows-x64.zip' "$missing_aft_output" \
+  || fail 'missing external AFT archive did not name its convention-derived asset'
+grep -Fq 'release-inventory: release-incomplete; do not begin the operator matrix' "$missing_aft_output" \
+  || fail 'missing AFT archive did not block the matrix'
+
+write_asset "$aft_release" 'ck-aft-windows-x64.zip'
+rm -f "$aft_release/ck-aft-linux-x64.zip.sha256"
+missing_sidecar_output="$test_root/missing-sidecar-output"
+if bash "$gate" \
+  --subconscious-release-url "file://${subconscious_release}" \
+  --aft-release-url "file://${aft_release}" >"$missing_sidecar_output" 2>&1; then
+  fail 'missing external AFT sidecar unexpectedly passed'
+fi
+grep -Fq 'release-incomplete: component=ck-aft lane=aft-external-dependency missing=ck-aft-linux-x64.zip.sha256' "$missing_sidecar_output" \
+  || fail 'missing external AFT sidecar did not name its convention-derived sidecar'
+write_asset "$aft_release" 'ck-aft-linux-x64.zip'
+printf 'tampered archive\n' >>"$subconscious_release/ck-linux-x64.zip"
+digest_mismatch_output="$test_root/digest-mismatch-output"
+if bash "$gate" \
+  --subconscious-release-url "file://${subconscious_release}" \
+  --aft-release-url "file://${aft_release}" >"$digest_mismatch_output" 2>&1; then
+  fail 'tampered archive unexpectedly passed digest verification'
+fi
+grep -Fq 'inventory-invalid: component=ck lane=subconscious archive=ck-linux-x64.zip sidecar=ck-linux-x64.zip.sha256 reason=sha256-mismatch' "$digest_mismatch_output" \
+  || fail 'digest mismatch did not identify the archive and matching sidecar'
+write_asset "$subconscious_release" 'ck-linux-x64.zip'
+printf 'not-a-sidecar\n' >"$subconscious_release/ck-linux-x64.zip.sha256"
+invalid_sidecar_output="$test_root/invalid-sidecar-output"
+if bash "$gate" \
+  --subconscious-release-url "file://${subconscious_release}" \
+  --aft-release-url "file://${aft_release}" >"$invalid_sidecar_output" 2>&1; then
+  fail 'malformed digest sidecar unexpectedly passed'
+fi
+grep -Fq 'inventory-invalid: component=ck lane=subconscious archive=ck-linux-x64.zip sidecar=ck-linux-x64.zip.sha256 reason=sidecar-is-not-a-matching-shasum-record' "$invalid_sidecar_output" \
+  || fail 'malformed sidecar did not identify the affected archive and sidecar'
+
+printf 'ck alpha release inventory tests passed\n'

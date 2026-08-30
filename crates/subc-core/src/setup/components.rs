@@ -337,14 +337,8 @@ fn platform_binary(binary: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        path::PathBuf,
-        process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
     #[derive(Default)]
     struct FakeSource;
@@ -356,12 +350,8 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        env::temp_dir().join(format!("ck-components-{name}-{}-{nonce}", process::id()))
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     #[test]
@@ -378,7 +368,6 @@ mod tests {
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
         assert_eq!(inventory.paths_for_kind("managed-binary").len(), 2);
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]

@@ -489,41 +489,14 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         process::Command,
-        sync::atomic::{AtomicU64, Ordering},
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::Duration,
     };
 
     use serde_json::{json, Map, Value};
     use subc_protocol::PROTOCOL_VERSION;
 
     use super::{lint_with_timeout, LintOutcome, OperationalClass, MANIFEST_TIMEOUT};
-
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("subc-fleet-lint-{name}-{stamp}-{nonce}"));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::TestTempDir as TempDir;
 
     #[derive(serde::Serialize)]
     struct FixtureSpec {

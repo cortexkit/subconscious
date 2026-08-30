@@ -478,16 +478,12 @@ fn unix_now_secs() -> u64 {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        future, process,
-        sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc, Mutex,
-        },
+        future,
+        sync::{Arc, Mutex},
     };
 
     use super::*;
-
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    use subc_core::test_support::TestTempDir;
 
     #[derive(Clone)]
     struct StaticSource {
@@ -592,12 +588,10 @@ mod tests {
         }
     }
 
-    fn cache(name: &str) -> UpdateCache {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        UpdateCache::new(std::env::temp_dir().join(format!(
-            "ck-update-check-{name}-{}-{counter}.json",
-            process::id()
-        )))
+    fn cache(name: &str) -> (TestTempDir, UpdateCache) {
+        let dir = TestTempDir::new(name);
+        let cache = UpdateCache::new(dir.path().join("update-metadata.json"));
+        (dir, cache)
     }
 
     fn installed(version: &str) -> BTreeMap<String, String> {
@@ -609,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_cache_is_consumed_without_a_release_request() {
-        let cache = cache("fresh");
+        let (_dir, cache) = cache("fresh");
         cache.write(&metadata(10_000, "0.12.0")).unwrap();
         let source = StaticSource::failing(ReleaseSourceError::Offline("must not run".to_string()));
 
@@ -629,12 +623,11 @@ mod tests {
             }
         );
         assert!(source.calls().is_empty());
-        let _ = std::fs::remove_file(cache.path());
     }
 
     #[tokio::test]
     async fn expired_cache_refreshes_and_reports_newer_artifacts() {
-        let cache = cache("expired");
+        let (_dir, cache) = cache("expired");
         cache.write(&metadata(1, "0.12.0")).unwrap();
         let source = StaticSource::successful("0.13.0");
         let now = 1 + super::super::update_cache::UPDATE_CACHE_TTL.as_secs();
@@ -653,12 +646,11 @@ mod tests {
         );
         assert_eq!(cache.load(), CacheRead::Present(metadata(now, "0.13.0")));
         assert_eq!(source.calls(), UpgradeTarget::ORDERED.to_vec());
-        let _ = std::fs::remove_file(cache.path());
     }
 
     #[tokio::test]
     async fn absent_cache_is_populated_by_a_successful_user_check() {
-        let cache = cache("absent");
+        let (_dir, cache) = cache("absent");
         let source = StaticSource::successful("0.13.0");
 
         let update = dashboard_update_at(
@@ -672,12 +664,11 @@ mod tests {
 
         assert!(matches!(update, DashboardUpdate::Available { .. }));
         assert!(matches!(cache.load(), CacheRead::Present(_)));
-        let _ = std::fs::remove_file(cache.path());
     }
 
     #[tokio::test]
     async fn malformed_cache_does_not_block_a_failed_refresh() {
-        let cache = cache("malformed");
+        let (_dir, cache) = cache("malformed");
         std::fs::write(cache.path(), b"malformed").unwrap();
         let source = StaticSource::failing(ReleaseSourceError::Offline("network down".to_string()));
 
@@ -692,7 +683,6 @@ mod tests {
 
         assert_eq!(update, DashboardUpdate::NotChecked { cache_age: None });
         assert_eq!(update.render(), "updates: not checked (cache unavailable)");
-        let _ = std::fs::remove_file(cache.path());
     }
 
     #[tokio::test]
@@ -701,7 +691,7 @@ mod tests {
             ReleaseSourceError::Offline("offline".to_string()),
             ReleaseSourceError::RateLimited,
         ] {
-            let cache = cache("failed-refresh");
+            let (_dir, cache) = cache("failed-refresh");
             cache.write(&metadata(100, "0.13.0")).unwrap();
             let source = StaticSource::failing(error);
             let now =
@@ -727,14 +717,13 @@ mod tests {
             assert!(update
                 .render()
                 .starts_with("updates: not checked (cache 4d old)"));
-            let _ = std::fs::remove_file(cache.path());
         }
     }
 
     #[tokio::test]
     async fn hanging_bare_refresh_returns_stale_output_inside_its_budget() {
         assert_eq!(BARE_REFRESH_BUDGET, Duration::from_millis(800));
-        let cache = cache("hanging-bare");
+        let (_dir, cache) = cache("hanging-bare");
         cache.write(&metadata(100, "0.13.0")).unwrap();
         let source = HangingSource {
             immediate_before: UpgradeTarget::SubcMcp,
@@ -754,13 +743,12 @@ mod tests {
                 )),
             }
         );
-        let _ = std::fs::remove_file(cache.path());
     }
 
     #[tokio::test(start_paused = true)]
     async fn explicit_check_times_out_each_target_independently_and_names_the_expired_target() {
         assert_eq!(TARGET_CHECK_BUDGET, Duration::from_secs(10));
-        let cache = cache("check-timeout");
+        let (_dir, cache) = cache("check-timeout");
         let source = HangingSource {
             immediate_before: UpgradeTarget::SubcMcp,
         };

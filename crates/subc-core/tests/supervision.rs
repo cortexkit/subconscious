@@ -2,6 +2,7 @@ use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use subc_core::{
     stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
+    test_support::TestTempDir,
     ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
     SupervisedModule, Supervisor,
 };
@@ -200,10 +201,10 @@ async fn set_enabled_current_value_returns_false_without_state_mutation() {
 async fn failed_spawn_during_enable_allows_a_later_retry() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
-    let missing_program = std::env::temp_dir().join(format!(
-        "subc-missing-enable-program-{}",
-        std::process::id()
-    ));
+    // A path that must NOT exist: the spawn is made to fail for real. The guard
+    // owns the parent dir; the program path itself is a never-created child.
+    let _dir = TestTempDir::new("missing-enable-program");
+    let missing_program = _dir.path().join("missing-program");
     assert!(!missing_program.exists());
     let module = supervisor
         .supervise_configured(
@@ -379,16 +380,10 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
     let supervisor = supervisor(&server, 3, Duration::from_millis(10));
     let module_id = "fake-aft-restart-spawn-fail";
 
-    // Per-test copy of the stub so deleting it cannot affect parallel tests
-    // (pid+nonce naming per the house temp convention; no tempfile dep here).
-    let stub_copy = std::env::temp_dir().join(format!(
-        "fake-aft-stub-copy-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    // Per-test copy of the stub so deleting it cannot affect parallel tests.
+    // The guard owns the parent dir; the stub copy is a file inside it.
+    let _dir = TestTempDir::new("fake-aft-stub-copy");
+    let stub_copy = _dir.path().join("fake-aft-stub");
     std::fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &stub_copy).unwrap();
     #[cfg(unix)]
     {

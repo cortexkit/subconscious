@@ -1074,6 +1074,7 @@ impl Error for BootstrapError {
 mod tests {
     use super::*;
     use crate::server::ServerAuth;
+    use crate::test_support::TestTempDir;
     use std::sync::Mutex;
     use subc_transport::MIN_KEY_LEN;
     use tokio::io::AsyncReadExt;
@@ -1129,27 +1130,14 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir(name: &str) -> PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        env::temp_dir().join(format!("subc-core-{name}-{}-{nonce}", process::id()))
+    fn unique_temp_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
-    fn temp_connection_file_path(name: &str) -> PathBuf {
+    fn temp_connection_file_path(name: &str) -> (TestTempDir, PathBuf) {
         let dir = unique_temp_dir(name);
-        fs::create_dir_all(&dir).unwrap();
-        dir.join("conn.json")
-    }
-
-    fn cleanup_connection_file_path(path: &Path) {
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(start_lock_path(path));
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        let path = dir.join("conn.json");
+        (dir, path)
     }
 
     fn auth_for(info: &ConnectionInfo) -> ServerAuth {
@@ -1218,15 +1206,12 @@ mod tests {
     fn connection_file_path_uses_xdg_runtime_dir_when_set() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let runtime_dir = unique_temp_dir("xdg-runtime");
-        fs::create_dir_all(&runtime_dir).unwrap();
-        let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+        let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", runtime_dir.path());
 
         assert_eq!(
             connection_file_path(),
             runtime_dir.join(CONNECTION_FILE_NAME)
         );
-
-        let _ = fs::remove_dir_all(runtime_dir);
     }
 
     #[test]
@@ -1278,8 +1263,8 @@ mod tests {
     #[test]
     fn configured_port_uses_default_config_and_env_override() {
         let _env_lock = ENV_LOCK.lock().unwrap();
-        let config_path =
-            temp_connection_file_path("daemon-config-port").with_file_name("subc.jsonc");
+        let (_dir, conn_path) = temp_connection_file_path("daemon-config-port");
+        let config_path = conn_path.with_file_name("subc.jsonc");
 
         let _port = EnvGuard::unset(SUBC_PORT_ENV);
         assert_eq!(
@@ -1304,13 +1289,11 @@ mod tests {
                 .port,
             9012
         );
-
-        cleanup_connection_file_path(&config_path);
     }
 
     #[tokio::test]
     async fn second_singleton_probe_against_served_tcp_daemon_reports_already_running() {
-        let path = temp_connection_file_path("already-running");
+        let (_dir, path) = temp_connection_file_path("already-running");
 
         let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
         let server = start_server(bound);
@@ -1320,12 +1303,11 @@ mod tests {
 
         server.abort();
         let _ = server.await;
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
     async fn daemon_connection_file_publishes_protocol_wire_version() {
-        let path = temp_connection_file_path("wire-version");
+        let (_dir, path) = temp_connection_file_path("wire-version");
         let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
         assert_eq!(bound.connection_info.wire_version, Some(PROTOCOL_VERSION));
         assert_eq!(
@@ -1334,12 +1316,11 @@ mod tests {
         );
 
         drop(bound.listeners);
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
     async fn stale_unbound_connection_file_is_reclaimed() {
-        let path = temp_connection_file_path("stale-reclaim");
+        let (_dir, path) = temp_connection_file_path("stale-reclaim");
         let stale = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let stale_port = stale.local_addr().unwrap().port();
         drop(stale);
@@ -1349,13 +1330,12 @@ mod tests {
         let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
         assert_ne!(bound.connection_info.key, stale_info.key);
         drop(bound.listeners);
-        cleanup_connection_file_path(&path);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn ensure_singleton_reclaims_insecure_connection_file() {
-        let path = temp_connection_file_path("insecure-reclaim");
+        let (_dir, path) = temp_connection_file_path("insecure-reclaim");
         let stale = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let stale_port = stale.local_addr().unwrap().port();
         drop(stale);
@@ -1369,12 +1349,11 @@ mod tests {
         assert_owner_only_connection_file(&path);
 
         drop(bound.listeners);
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
     async fn ensure_singleton_reclaims_non_loopback_connection_file() {
-        let path = temp_connection_file_path("non-loopback-reclaim");
+        let (_dir, path) = temp_connection_file_path("non-loopback-reclaim");
         let mut stale_info = make_connection_info(8757);
         stale_info.endpoints = vec![Endpoint {
             host: "192.0.2.10".to_owned(),
@@ -1393,7 +1372,6 @@ mod tests {
         assert_owner_only_connection_file(&path);
 
         drop(bound.listeners);
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
@@ -1427,7 +1405,7 @@ mod tests {
         ];
 
         for (label, contents, old_info) in cases {
-            let path = temp_connection_file_path(label);
+            let (_dir, path) = temp_connection_file_path(label);
             write_raw_owner_only_connection_file(&path, &contents);
 
             let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
@@ -1443,13 +1421,12 @@ mod tests {
             assert_owner_only_connection_file(&path);
 
             drop(bound.listeners);
-            cleanup_connection_file_path(&path);
         }
     }
 
     #[tokio::test]
     async fn foreign_reused_port_connection_file_is_reclaimed_after_auth_probe_fails() {
-        let path = temp_connection_file_path("foreign-reclaim");
+        let (_dir, path) = temp_connection_file_path("foreign-reclaim");
         let foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let foreign_port = foreign.local_addr().unwrap().port();
         write_atomic(&path, &make_connection_info(foreign_port)).unwrap();
@@ -1469,12 +1446,11 @@ mod tests {
 
         drop(bound.listeners);
         let _ = foreign_task.await;
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
     async fn stale_start_lock_file_is_reclaimable() {
-        let path = temp_connection_file_path("start-lock-stale-file");
+        let (_dir, path) = temp_connection_file_path("start-lock-stale-file");
         let lock_path = start_lock_path(&path);
         drop(open_owner_only_lock(&lock_path).unwrap());
         assert!(lock_path.is_file());
@@ -1484,12 +1460,11 @@ mod tests {
 
         drop(lock);
         assert!(lock_path.is_file());
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
     async fn held_start_lock_blocks_second_acquire_until_release() {
-        let path = temp_connection_file_path("start-lock-held");
+        let (_dir, path) = temp_connection_file_path("start-lock-held");
         let lock_path = start_lock_path(&path);
         let first = StartLock::acquire(&path).await.unwrap();
 
@@ -1511,12 +1486,11 @@ mod tests {
             .await
             .expect("released advisory lock should be reclaimable");
         drop(second);
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
     async fn bind_conflict_on_fixed_port_fails_loud_without_reselecting() {
-        let path = temp_connection_file_path("bind-conflict");
+        let (_dir, path) = temp_connection_file_path("bind-conflict");
         let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let occupied_port = occupied.local_addr().unwrap().port();
 
@@ -1528,12 +1502,11 @@ mod tests {
         assert!(err.to_string().contains("set the port in config"));
 
         drop(occupied);
-        cleanup_connection_file_path(&path);
     }
 
     #[tokio::test]
     async fn key_rotation_republishes_new_material_and_old_file_fails_auth() {
-        let path = temp_connection_file_path("key-rotation");
+        let (_dir, path) = temp_connection_file_path("key-rotation");
         let first = expect_bound(ensure_singleton(&path, 0).await.unwrap());
         let old_info = first.connection_info.clone();
         let fixed_port = old_info.endpoints[0].port;
@@ -1560,19 +1533,17 @@ mod tests {
 
         server.abort();
         let _ = server.await;
-        cleanup_connection_file_path(&path);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn published_connection_file_permissions_are_owner_only() {
-        let path = temp_connection_file_path("permissions");
+        let (_dir, path) = temp_connection_file_path("permissions");
         let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
         drop(bound.listeners);
-        cleanup_connection_file_path(&path);
     }
 }

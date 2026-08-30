@@ -4839,6 +4839,7 @@ mod tests {
 
     use super::*;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
+    use subc_core::test_support::TestTempDir;
 
     #[test]
     fn provenance_value_escapes_terminal_controls() {
@@ -5758,17 +5759,8 @@ mod tests {
         assert!(top_help().contains("upgrade"));
     }
 
-    fn triage_fixture_dir(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!(
-            "ck-triage-{name}-{}-{}",
-            process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn triage_fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     fn write_triage_connection(path: &Path, pid: u32, key: &str) {
@@ -5802,7 +5794,6 @@ mod tests {
             "no pid recovered from connection file or start-lock"
         );
         assert_eq!(report.json["log_tail"]["finding"], "log absent");
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -5818,7 +5809,6 @@ mod tests {
         ])
         .await;
         assert!(matches!(result, Err(CkError::TriageExit { exit_code: 2 })));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5830,7 +5820,6 @@ mod tests {
         assert_eq!(report.exit_code, 0);
         assert_eq!(report.json["verdict"]["status"], "daemon-appears-live");
         assert_eq!(report.json["process_liveness"]["status"], "live");
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5857,7 +5846,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("dead pid"));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5872,7 +5860,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("JSON parse failure"));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5893,7 +5880,6 @@ mod tests {
         let rendered = serde_json::to_string(log_fact).unwrap();
         assert!(rendered.contains("newest-line"));
         assert!(!rendered.contains("oldest-line"));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5931,7 +5917,6 @@ mod tests {
         assert!(report.json["connection_file"]["candidates"][0]
             .get("skipped")
             .is_none());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5944,7 +5929,6 @@ mod tests {
         let json_output = serde_json::to_string(&report.json).unwrap();
         assert!(!json_output.contains(key));
         assert!(!report.text.contains(key));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

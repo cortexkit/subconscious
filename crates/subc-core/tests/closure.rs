@@ -1,20 +1,15 @@
 use std::{
     collections::BTreeSet,
-    fs,
     ops::Deref,
-    path::PathBuf,
-    process,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use subc_control::{ops, ClientControlRequest, ClientControlResponse, PollKind};
 use subc_core::{
-    read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, SupervisedModule, Supervisor,
-    SupervisorHandle, SupervisorProcessLiveness,
+    read_frame, test_support::TestTempDir, write_frame, Frame, ModuleSpec, RestartPolicy,
+    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{
     BindIdentity, ErrorBody, Flags, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
@@ -29,7 +24,6 @@ use common::{
     connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
 };
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Sized for the slowest acceptable runner, not the typical one: 2s passed on
 // Blacksmith and this machine by speed-coincidence and failed twice in a row
 // on GitHub-hosted runners. The timeout exists to bound a HUNG read, not to
@@ -543,7 +537,7 @@ where
     let request = ClientControlRequest::RouteOpen {
         target,
         identity: BindIdentity {
-            project_root: project.path.clone(),
+            project_root: project.path().to_path_buf(),
             harness: "opencode".to_string(),
             session: format!("closure-{}", corr),
         },
@@ -805,24 +799,17 @@ fn embedding_payload() -> Vec<u8> {
 }
 
 struct TestProject {
-    path: PathBuf,
+    temp: TestTempDir,
 }
 
 impl TestProject {
     fn new(label: &str) -> Self {
-        let path = unique_temp_dir(label);
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
+        Self {
+            temp: TestTempDir::new(label),
+        }
     }
-}
 
-impl Drop for TestProject {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+    fn path(&self) -> &Path {
+        self.temp.path()
     }
-}
-
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("sc-closure-{label}-{}-{nonce}", process::id()))
 }

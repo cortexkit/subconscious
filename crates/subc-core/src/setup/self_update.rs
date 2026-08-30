@@ -118,29 +118,20 @@ fn current_windows_manifest() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, fs,
-        path::PathBuf,
-        process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::fs;
 
     use serde_json::{Map, Value};
 
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after Unix epoch")
-            .as_nanos();
-        env::temp_dir().join(format!("ck-self-update-{name}-{}-{nonce}", process::id()))
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     #[test]
     fn refuses_to_replace_an_unowned_destination() {
         let root = fixture_dir("unowned");
-        fs::create_dir_all(&root).expect("fixture directory");
         let destination = root.join(if cfg!(windows) { "ck.exe" } else { "ck" });
         let candidate = root.join("candidate");
         let manifest = root.join("installer-manifest.json");
@@ -157,14 +148,12 @@ mod tests {
             "user-owned"
         );
         assert!(!destination.with_extension("exe.old").exists());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn replacement_updates_only_the_owned_destination_digest() {
         let root = fixture_dir("manifest");
-        fs::create_dir_all(&root).expect("fixture directory");
         let destination = root.join(if cfg!(windows) { "ck.exe" } else { "ck" });
         let candidate = root.join("candidate");
         let unrelated = root.join("user-notes.txt");
@@ -200,6 +189,5 @@ mod tests {
                 .and_then(Value::as_str),
             Some(replacement_digest.as_str())
         );
-        fs::remove_dir_all(root).expect("cleanup");
     }
 }

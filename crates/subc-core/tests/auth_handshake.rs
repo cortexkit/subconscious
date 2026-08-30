@@ -1,12 +1,6 @@
-use std::{
-    error::Error,
-    fs, io,
-    path::{Path, PathBuf},
-    process,
-    time::Duration,
-};
+use std::{error::Error, io, path::PathBuf, process, time::Duration};
 
-use subc_core::{read_frame, write_frame, Frame};
+use subc_core::{read_frame, test_support::TestTempDir as TestDir, write_frame, Frame};
 use subc_protocol::{Flags, FrameType, Priority};
 use subc_transport::{
     authenticate_client, authenticate_server, generate_daemon_id, generate_key,
@@ -67,7 +61,7 @@ async fn happy_path_authenticates_then_round_trips_envelope_frame() -> TestResul
 async fn listener_with_connection_file(
     name: &str,
 ) -> TestResult<(TestDir, TcpListener, PathBuf, ConnectionInfo)> {
-    let dir = TestDir::new(name)?;
+    let dir = TestDir::new(name);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let conn = make_connection_info(port, generate_key()?, generate_daemon_id()?);
@@ -97,41 +91,4 @@ async fn connect_from_info(conn: &ConnectionInfo) -> io::Result<TcpStream> {
         .first()
         .expect("test connection file should have an endpoint");
     TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(name: &str) -> TestResult<Self> {
-        let suffix = generate_daemon_id()?;
-        let path = std::env::temp_dir().join(format!(
-            "subc-auth-handshake-{name}-{}-{}",
-            process::id(),
-            hex(&suffix)
-        ));
-        fs::create_dir(&path)?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }

@@ -174,25 +174,16 @@ fn insert_value(document: &mut Value, dotted_key: &str, desired: Value) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
-    fn fixture_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        env::temp_dir().join(format!("ck-setup-{name}-{}-{nonce}", process::id()))
+    fn fixture_path(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     #[test]
     fn adding_mc_preserves_the_existing_aft_configuration() {
         let root = fixture_path("config-additive");
-        fs::create_dir_all(&root).expect("fixture directory");
         let config = root.join("subc.jsonc");
         fs::write(
             &config,
@@ -214,13 +205,11 @@ mod tests {
             written.pointer("/cortexkit/components/mc"),
             Some(&Value::Bool(true))
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
     fn conflicting_user_value_refuses_without_writing_a_byte() {
         let root = fixture_path("config-conflict");
-        fs::create_dir_all(&root).expect("fixture directory");
         let config = root.join("subc.jsonc");
         let original = "{\n  // user-owned version\n  \"version\": 2\n}\n";
         fs::write(&config, original).expect("write fixture");
@@ -231,6 +220,5 @@ mod tests {
             fs::read_to_string(&config).expect("read unchanged"),
             original
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 }

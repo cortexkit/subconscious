@@ -186,25 +186,16 @@ impl Inventory {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
-    fn fixture_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        env::temp_dir().join(format!("ck-setup-{name}-{}-{nonce}", process::id()))
+    fn fixture_path(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     #[test]
     fn replacement_digest_updates_an_existing_managed_entry() {
         let root = fixture_path("replacement-digest");
-        fs::create_dir_all(&root).expect("fixture directory");
         let manifest = root.join("installer-manifest.json");
         let binary = root.join("ck-aft");
         let mut inventory = Inventory::load(&manifest, "linux-x64").expect("load inventory");
@@ -224,13 +215,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some("after")
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
     fn setup_entries_extend_installer_inventory_without_losing_installer_ownership() {
         let root = fixture_path("inventory");
-        fs::create_dir_all(&root).expect("fixture directory");
         let manifest = root.join("installer-manifest.json");
         fs::write(
             &manifest,
@@ -246,6 +235,5 @@ mod tests {
         let inventory = Inventory::load(&manifest, "linux-x64").expect("reload inventory");
         assert!(inventory.owns_path("binary-placement", Path::new("/managed/ck")));
         assert!(inventory.owns_path("runtime-definition", &runtime));
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 }

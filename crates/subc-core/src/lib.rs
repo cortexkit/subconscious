@@ -24,6 +24,8 @@ pub mod server;
 pub mod stderr_tail;
 pub mod supervise;
 pub mod terminal_ring;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod watchdog;
 
 #[cfg(feature = "bench-harness")]

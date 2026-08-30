@@ -6,10 +6,7 @@ use std::{sync::Arc, time::Duration};
 // unavailable arm, neither writes files — so these imports gate with it or
 // the other platforms clippy-fail them as unused under -D warnings.
 #[cfg(target_os = "linux")]
-use std::{
-    fs,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::fs;
 
 // Used by the linux AND macos match arms of assert_running_image_matches.
 #[cfg(not(target_os = "windows"))]
@@ -19,6 +16,8 @@ use subc_control::RunningImageUnavailableReason;
 use subc_control::{
     ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, RunningImageAgreement,
 };
+#[cfg(target_os = "linux")]
+use subc_core::test_support::TestTempDir;
 use subc_core::{
     read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
@@ -36,8 +35,6 @@ use common::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(target_os = "linux")]
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
@@ -207,7 +204,6 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
         .with_drain_timeout(Duration::from_millis(25))
         .with_connection_file_path(daemon.connection_file_path.clone());
     let temp_dir = unique_temp_dir("provenance-replacement");
-    fs::create_dir_all(&temp_dir).unwrap();
     let copied_stub = temp_dir.join("fake-aft-stub");
     fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &copied_stub).unwrap();
     let module = supervisor
@@ -237,7 +233,6 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
         RunningImageAgreement::Mismatch { .. }
     ));
     module.stop().await.unwrap();
-    fs::remove_dir_all(temp_dir).unwrap();
 }
 
 fn stub_spec(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
@@ -327,12 +322,8 @@ fn assert_running_image_matches(result: &RunningImageAgreement) {
 }
 
 #[cfg(target_os = "linux")]
-fn unique_temp_dir(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "subc-{label}-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ))
+fn unique_temp_dir(label: &str) -> TestTempDir {
+    TestTempDir::new(label)
 }
 
 fn unix_ms() -> u64 {

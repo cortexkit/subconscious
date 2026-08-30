@@ -44,46 +44,12 @@ use subc_protocol::{
 };
 pub use subc_protocol::{
     manifest::{
-        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, ExecutionMode,
-        ManifestProvenance, ProviderRole, Tool,
+        build_provenance, CapabilityDeclarations, CapabilityNeed, CapabilityRequirement,
+        ExecutionMode, ManifestProvenance, ProviderRole, Tool, PROVENANCE_SENTINELS,
     },
     session::{HealthReport, HealthStatus},
     AdmissionClass, SUBC_PROTOCOL_CRATE_VERSION,
 };
-
-pub fn build_provenance(
-    build_git_sha: Option<&str>,
-    build_lock_digest: Option<&str>,
-    store_schema_version: Option<&str>,
-) -> ManifestProvenance {
-    ManifestProvenance {
-        build_git_sha: normalize_provenance_fact(build_git_sha),
-        build_lock_digest: normalize_provenance_fact(build_lock_digest),
-        wire_crate_version: Some(SUBC_PROTOCOL_CRATE_VERSION.to_string()),
-        store_schema_version: normalize_provenance_fact(store_schema_version),
-    }
-}
-
-/// Sentinel strings that build tooling emits where it means "no value": shell
-/// fallbacks and Makefile defaults produce `unknown`, wire vocabulary uses
-/// `unavailable`, and `git describe` failures surface as `none`. Publishing
-/// any of them as a fact is the well-formed-lie shape the provenance contract
-/// warns against — a present, well-formed field stops the reader asking — so
-/// the helper maps them all to field omission. Matched case-insensitively
-/// because `UNKNOWN`/`Unknown` are equally common from shell fallbacks.
-const PROVENANCE_SENTINELS: [&str; 3] = ["unknown", "unavailable", "none"];
-
-fn normalize_provenance_fact(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let lowered = value.to_ascii_lowercase();
-    if PROVENANCE_SENTINELS.contains(&lowered.as_str()) {
-        return None;
-    }
-    Some(value.to_string())
-}
 
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
@@ -1551,110 +1517,10 @@ mod tests {
 
     use serde_json::json;
 
-    /// Builder sentinels are the strings tooling emits where it means "no
-    /// value" (shell fallbacks say `unknown`, not `unavailable`); publishing
-    /// one as a build fact is the well-formed lie the provenance contract
-    /// names. The helper must map every sentinel, any casing, to field
-    /// omission — and must keep real values intact (the control arm, so the
-    /// filter cannot pass by refusing everything).
-    #[test]
-    fn provenance_builder_sentinels_become_field_omission() {
-        for sentinel in [
-            "unknown",
-            "UNKNOWN",
-            "Unknown",
-            "unavailable",
-            "none",
-            "None",
-            "  unknown  ",
-            "",
-        ] {
-            let p = super::build_provenance(Some(sentinel), Some(sentinel), Some(sentinel));
-            assert_eq!(
-                (p.build_git_sha, p.build_lock_digest, p.store_schema_version),
-                (None, None, None),
-                "sentinel {sentinel:?} must be omitted, not published"
-            );
-        }
-        let real = super::build_provenance(Some("9f3c2ab"), None, Some("9"));
-        assert_eq!(real.build_git_sha.as_deref(), Some("9f3c2ab"));
-        assert_eq!(real.store_schema_version.as_deref(), Some("9"));
-        // The always-knowable fact: an SDK-built block is never empty, which
-        // is why the contract's target shape is FIELD omission (#78).
-        assert_eq!(
-            real.wire_crate_version.as_deref(),
-            Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
-        );
-    }
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, Tool};
     use tokio::{sync::Notify, time::timeout};
 
     use super::*;
-
-    #[test]
-    fn build_provenance_normalizes_clean_build_facts() {
-        let provenance = build_provenance(
-            Some(" 0123456789abcdef0123456789abcdef01234567 "),
-            Some(" lock-digest "),
-            Some(" schema-v3 "),
-        );
-
-        assert_eq!(
-            provenance,
-            ManifestProvenance {
-                build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-                build_lock_digest: Some("lock-digest".to_string()),
-                wire_crate_version: Some(SUBC_PROTOCOL_CRATE_VERSION.to_string()),
-                store_schema_version: Some("schema-v3".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn build_provenance_preserves_a_dirty_revision_verbatim() {
-        let provenance = build_provenance(
-            Some("0123456789abcdef0123456789abcdef01234567-dirty"),
-            Some("lock-digest"),
-            None,
-        );
-
-        assert_eq!(
-            provenance.build_git_sha,
-            Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string())
-        );
-        assert_eq!(
-            provenance.build_lock_digest,
-            Some("lock-digest".to_string())
-        );
-    }
-
-    #[test]
-    fn build_provenance_keeps_a_lock_digest_when_identity_is_unavailable() {
-        let provenance = build_provenance(Some("unavailable"), Some("lock-digest"), None);
-
-        assert_eq!(provenance.build_git_sha, None);
-        assert_eq!(
-            provenance.build_lock_digest,
-            Some("lock-digest".to_string())
-        );
-        assert_eq!(
-            provenance.wire_crate_version,
-            Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())
-        );
-    }
-
-    #[test]
-    fn build_provenance_omits_fully_unavailable_inputs() {
-        let provenance = build_provenance(None, Some(" unavailable "), Some("   "));
-
-        assert_eq!(provenance.build_git_sha, None);
-        assert_eq!(provenance.build_lock_digest, None);
-        assert_eq!(provenance.store_schema_version, None);
-        assert_eq!(
-            provenance.wire_crate_version,
-            Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())
-        );
-    }
 
     struct EchoHandler;
 

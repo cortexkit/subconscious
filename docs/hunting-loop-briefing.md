@@ -12032,3 +12032,16 @@ recording the last terminal ATTEMPT reads as still-halted while the first
 post-fix attempt is in flight — recovery evidence is the new event, never
 the stale latch, and a recovery claim resting on the one field that
 disagrees should name that field.
+
+## Absorbed-on-a-non-default-branch, and probes that collapse absent with elsewhere (E2E, 2026-08-30)
+
+Third wave-ledger failure mode, distinct from notice-missed and owner-lagging:
+the absorb lands on a non-default branch. Both sides then hold honest,
+contradicting evidence forever — the owner's green is real on their ref, the
+gate's red is real on master, and they never meet. Notices must STATE THE
+BRANCH the reconcile lands on (a repo mid-rewrite has an obvious wrong place
+to put it). The companion instrument rule from the same incident: E2E's
+first probe (`merge-base --is-ancestor`) printed one label for "commit
+absent" and "commit elsewhere" — a probe that collapses absent and elsewhere
+is the same defect as one that collapses failed and not-measured;
+`cat-file -t` + `branch -r --contains` separates them in one command.

@@ -6,6 +6,18 @@ blockers converged on one blind spot — the journal's own trust boundary under
 time, identity, and concurrency; panel caveat honestly noted: shared evidence
 corpus, so convergence is consistency, not independent replication). Next:
 spec campaign.
+
+## Campaign normative anchor
+
+The `cortexkit-release` campaign incorporates this specification only through
+its immutable anchored reference:
+`docs/specs/fleet-release-machine.md@41cb2be4`. The reference does not float
+with later edits or working-tree state. Closed sets—including phase types,
+artifact identity channels, signing profiles, staging backends, load classes,
+and rerun-budget forms—are incorporated only by that anchored reference. A
+campaign declaration or implementation may select from those sets but must not
+restate, expand, or redefine them.
+
 Chartered by Ufuk via MC (2026-08-26) after MC's 11-attempt release saga.
 Evidence base: `docs/research/release-machinery-census.md` (18 repos, 162
 verified citations). MC is first adopter.
@@ -29,8 +41,8 @@ that already exist somewhere in the fleet.
 
 ## Shape
 
-One shared implementation, homed in commons (`cortexkit-release` crate,
-`ck-release` binary), driven by a small per-repo declaration
+One shared implementation, homed in commons (Cargo package
+`cortexkit-release`, binary `ck-release`), driven by a small per-repo declaration
 (`.cortexkit/release.jsonc`). The state machine is shared; the phase LIST per
 repo is data. No repo writes release logic again — a repo declares artifacts,
 trains, and gates, and the machine supplies ordering, journaling, resume,
@@ -42,15 +54,11 @@ machines sharing the repo declaration.
 
 ### Artifact identity channels (Athena blockers 6+7)
 
-Every declared artifact KIND names its IDENTITY CHANNEL: `embedded_stamp`
-(Mach-O/ELF with compiler-emitted build-sha), `manifest_field` (readable
-metadata surface), `content_digest` (sha against a destination that exposes
-the digest for readback), or — later — `oci_digest` (manifest digest +
-provenance annotation). A no-tag train declaring an artifact kind with NO
-decidable identity channel is REFUSED AT DECLARATION TIME, not mid-release:
-the embedded-stamp probe quietly generalizes only to stamped binaries, and
-npm tarballs / wasm / docker images need their channel named or they have no
-done-probe at all.
+Every declared artifact kind selects an identity channel from the closed set
+incorporated by `docs/specs/fleet-release-machine.md@41cb2be4`. A declaration
+with no decidable identity channel for an artifact kind is refused at
+declaration time, not mid-release: without a declared channel, the artifact has
+no authoritative completion probe.
 
 ### The no-tag train is first-class (ALF, no-path-seat review)
 
@@ -67,19 +75,14 @@ Under this reading the ladder-centric repos are ADOPTERS, not exceptions —
 and the ten-no-path-repos adoption claim gets cheaper: most of those repos
 release exactly this way today, without the discipline.
 
-## Phase vocabulary (closed set; per-train subset of INSTANCES)
+## Phase vocabulary (closed set; per-train subset of instances)
 
-    preflight -> gates_local -> bump -> lock -> commit -> tag -> push
-    -> ci_watch -> publish -> assets -> stage -> verify -> notify
-    (place is deliberately NOT a phase — see Boundaries)
-
-Phases are PARAMETERIZED INSTANCES, not singleton slots (AFT finding 1): a
-train may instantiate a phase more than once with parameters — AFT's real
-pipeline runs TWO ci_watch instances of different kinds (pre-tag: the Tests
-workflow at the release-commit SHA must be green BEFORE tag; post-tag: the
-tag's own release workflow). `ci_watch` takes (workflow, ref-expression);
-without instance parameterization the machine cannot represent the fleet's
-biggest matrix.
+Phase types are a closed set incorporated only by
+`docs/specs/fleet-release-machine.md@41cb2be4`; this campaign does not repeat
+the list. Phases are parameterized instances, not singleton slots (AFT finding
+1): a train may instantiate a phase more than once with distinct parameters.
+AFT's real pipeline, for example, has independent pre-tag and post-tag
+`ci_watch` instances. `place` is deliberately not a phase; see Boundaries.
 
 `publish` and `assets` carry PER-ARTIFACT sub-probes (AFT finding 2): each
 registry package and each asset has its own exists/sha probe, and resume
@@ -102,13 +105,15 @@ month on one seat is a lane, not an anomaly.
 
 ### ci_watch internals
 
-Blocking poll, run-id journaled at entry, fail-at-first-FAILED-job with
-phase+job named, three-valued conclusions, transport-drop = retry. Plus a
-declared per-train RERUN BUDGET (AFT): N journaled `rerun --failed` attempts
-before the phase reports failure — on real matrices a single flake-family
-job failure per run is the NORM, and without a budget every release becomes
-operator intervention at the first flake. The primitive encodes both rerun
-forms: `rerun --failed` SKIPS cancelled jobs; cancelled needs rerun-by-job-id.
+Each parameterized `ci_watch` instance captures and journals its run ID at
+entry, performs a blocking poll, and reports three-valued conclusions. It
+names the phase and first failed job on a decided failure; a transport drop is
+a retry, never a verdict. Each instance declares and journals its own rerun
+budget. Every retry records the form used: `rerun --failed` for eligible
+failed jobs, or rerun-by-job-id for a cancelled job that `rerun --failed`
+skips. The instance never borrows another watcher's budget. Exhausting its
+budget produces that instance's failure conclusion, not an unbounded retry or
+an implicit operator handoff.
 
 Each phase declares, in the shared machine (not per repo):
 
@@ -145,27 +150,31 @@ trains — Athena's cleanest catch: r4 made no-tag trains first-class and
 versionless while keying the journal on version, so prefrontal's
 multiple-per-day deploys either collide on one ledger or cannot be named.
 
-Entries: phase entered, phase done (with the done-probe's evidence), refusal
-(with reason). Crash anywhere → rerun the same command → preflight replays
-the journal AND re-runs every done-probe; the resume point is the first phase
-whose probe fails (with UNDECIDABLE settling first — see done-probes).
-Leftovers are recognized, never re-executed and never treated as corruption.
-tag-exists and already-published are resume points, not errors (MC
-constraint 2 — the aft/subconscious behaviour, now the only behaviour;
+Entries follow the engram declared-format pattern: every record has an
+explicit journal-format version and readers fail closed on an unknown version.
+They record phase entry, phase done (with done-probe evidence), and refusal
+(with reason). Crash anywhere → rerun the same command → preflight replays the
+journal and re-runs every done-probe; the resume point is the first phase whose
+probe fails (with undecidable settling first—see done-probes). Leftovers are
+recognized, never re-executed, and never treated as corruption. Tag-exists and
+already-published are resume points, not errors
+(MC constraint 2—the aft/subconscious behaviour, now the only behaviour;
 magic-context's hard-error shape is retired by adoption).
 
 ### Durability and reconciliation (Athena blocker 2)
 
-Intent precedes effect DURABLY: the train-start record and every
-phase/artifact intent line are appended, flushed, and fsynced — each line
-checksummed — BEFORE the effect executes. Irreversible per-artifact calls
-(each `cargo publish`, each asset upload) get their own write-ahead intent
-line carrying a stable operation key and the expected result identity
-("attempting crates.io subc@0.53.0, expect sha X"), so a crash after the
-call but before any response is reconcilable: resume treats
-attempted-plus-undecidable as settle-and-re-probe, never re-fire, and
-attempted-plus-absent-after-budget as a typed refusal for the operator. On
-reopen, a torn FINAL JSONL record (checksum fails, nothing after it) is
+Intent precedes effect durably: the train-start record and every phase/artifact
+intent line are appended, flushed, and fsynced—each line checksummed—before the
+effect executes. Every irreversible per-artifact call gets its own write-ahead
+intent line carrying a stable operation key and expected result identity.
+
+An irreversible executor may fire only when no attempted intent exists and its
+authoritative completion probe reports `absent`. An attempted intent paired
+with `undecidable` waits and re-probes within the declared settle budget; it
+never re-fires the executor. An attempted intent paired with authoritative
+`absent` after that budget is exhausted produces a typed operator refusal,
+never an automatic retry. `present` reconciles the intent without firing. On
+reopen, a torn final JSONL record (checksum fails, nothing after it) is
 truncated as a non-event; a checksum failure anywhere earlier is corruption
 and fails loud.
 
@@ -181,13 +190,19 @@ design).
 
 ### Declaration pinning (Athena blocker 5)
 
-The train-start record journals the EFFECTIVE-DECLARATION DIGEST (content
-hash of `release.jsonc` after JSONC normalization). Resume refuses on digest
-mismatch with a typed refusal offering exactly two exits — abandon the
-journal, or explicitly rebind to the new declaration — because a silently
-re-planned resume can drop a newly-inserted pre-publish gate or misalign
-parameterized phase instances, violating the ordering law across attempts.
-The Drift section covers sibling-lock drift; this covers SELF-drift.
+The train-start record journals the effective declaration digest (the content
+hash of `release.jsonc` after JSONC normalization). Resume refuses on a digest
+mismatch because silently re-planning could drop a newly inserted pre-publish
+gate or misalign parameterized phase instances.
+
+The refusal names both callable recovery ceremonies. The
+`ck-release abandon <train-id>` command terminalizes the journal while
+retaining it and its evidence. `ck-release rebind <train-id>` displays the
+normalized declaration diff,
+requires explicit confirmation, and then re-pins the digest while retaining
+the prior evidence. Ordinary `resume` performs neither ceremony and its
+diagnostic names both commands. The Drift section covers sibling-lock drift;
+this section covers declaration self-drift.
 
 Notification-as-contract (constraint 4) falls out of the journal: phase
 transitions are observable lines as they happen, a failure surfaces at failure
@@ -211,52 +226,29 @@ Never handled mid-release. `preflight` runs the sibling-lock check
 dirty lock state, naming the wave that fixes it. Drift repair belongs to
 fire-from-the-bump and the nightly lane; a release never absorbs it.
 
-## Signing and staging (invariant pipeline, per-artifact profiles)
+## Signing and staging (anchored closed sets)
 
-- Signing POLICY is a closed per-artifact PROFILE set, not one form — the
-  census contradicts single-form (Athena blocker 8): magic-context's
-  dashboard requires Developer ID distribution signing plus a Tauri updater
-  key, which Apple-Development-only cannot express. Profiles: `adhoc_pinned`
-  (no TCC surface), `apple_dev_tcc` (topology v2: Apple Development identity
-  + pinned per-binary identifier — the supervised-fleet default),
-  `developer_id_dist` (with notarization requirements), `tauri_updater`.
-  Each profile carries its own verification form. Per-artifact
-  ORDER IS LAW: build → strip → sign → sidecar-from-signed-bytes →
-  verify-readback → upload, and upload's done-probe compares the PUBLISHED
-  asset's sha against the sidecar. Any mutation after sign is the AFT #238
-  class (strip ran post-codesign; macOS SIGKILL on launch); the machine makes
-  the order the only expressible one. `verify` includes raw-asset
-  verification where the train publishes executables: download the published
-  bytes, `codesign --verify --strict`, execute unmodified — seat memory
-  promoted to machine phase.
-- The PIPELINE ORDER stays invariant across all profiles: build → strip →
-  sign → sidecar-from-signed-bytes → verify-readback → upload.
-- Staging BACKEND is `directory` (revision-keyed, outside cargo target
-  trees — claustrum's shape; pruned by count with the deployed revision
-  retained) or `gh_draft` (magic-context's dashboard uses a single GH draft
-  release as its matrix rendezvous — draft-then-undraft owned by
-  assets/publish). `/tmp` staging is retired (OS reboot loses the handoff —
-  house rule).
-- Placement of staged binaries is by atomic rename, never cp-in-place.
+Signing profiles, their verification requirements, the invariant signing
+pipeline, artifact identity channels, staging backends, and load classes are
+closed sets incorporated solely by
+`docs/specs/fleet-release-machine.md@41cb2be4`. This campaign neither repeats
+nor extends those definitions. Implementations select only anchored members and
+use their anchored verification and ordering rules.
 
 ## Boundaries (what the machine refuses to own)
 
-- **place** into a live supervised fleet stays an operator ceremony with its
-  own ladder (markers, inode verification, drain gates). The machine ENDS at a
-  verified staged artifact + instructions; it never restarts modules. (The
-  attestor/mutator split from #58: the thing that verifies must not be the
-  thing that mutates production.)
-- Public side effects (crates.io/npm publish, GH release, tags that trigger
-  publishing workflows) remain hard-gated on explicit user approval per
-  standing rule. The gate sits on the FIRST public trigger in the train —
-  which for tag-triggered trains is tag/push, not the publish phase (Athena
-  blocker 4) — and the approval record BINDS to (repo, train, version or
-  no-tag run id, intended commit, declaration digest, artifact digest set
-  where available, and the exact public-effect list). Any changed commit,
-  plan, digest, or retag generation INVALIDATES the approval and requires
-  re-approval: the retag lane deliberately reuses a version, so a
-  train-scoped token would let a materially different release ride an
-  earlier yes.
+- **place** is neither a phase nor a machine action. It remains a separate
+  operator ceremony with its own ladder. Execution terminates at verified
+  staged artifacts plus emitted placement instructions; it requests no
+  placement confirmation and performs no placement, restart, or other fleet
+  mutation. The verifier must remain distinct from the production mutator.
+- Exactly one explicit approval is required at the first public trigger in a
+  train—tag or push for a tag-triggered train, not a later publication phase.
+  Its durable subject binds the repository, train, commit, declaration digest,
+  artifact digests, version-or-run-id, and the exact ordered public-effect
+  list. Any material change to those values, including retagging, invalidates
+  the approval and requires fresh approval; a later effect cannot reuse an
+  earlier confirmation.
 - No auto-bump-guessing: the version is an input; the machine validates it
   against manifests (subconscious's tag/version assertion, generalized).
 
@@ -269,7 +261,11 @@ a bespoke script and its private grammar. The ten no-path repos gain releases
 by writing only the declaration. Existing entry-point names can stay as
 one-line wrappers (`scripts/release.sh` → `ck-release run crate-train`).
 
-## Resolved questions (MC first-adopter review, r1→r2)
+## Resolved campaign decisions (no owner-gated questions)
+
+The `clarify-…-n1` decisions settle the package home in commons, the single
+journal root, runtime-minted test repositories, and the GitHub-only v1 provider
+seam. No open question may gate a `cortexkit-release` implementation slice.
 
 1. **Journal home: per-user data dir, settled.** The repo tree is exactly
    where crash residue does damage — MC's r8 corpse left dirty leftovers that
@@ -306,14 +302,11 @@ one-line wrappers (`scripts/release.sh` → `ck-release run crate-train`).
   lock — focused/lint legs must not queue behind a 40-minute gate — and
   holder liveness is PID+start-time so a crashed holder reclaims early
   instead of waiting out the 2h staleness window.
-  The lock's POPULATION is load-affected local phases of ANYTHING, not
-  phases-of-releases (ALF): prefrontal's CI-migrated gates take the lock as
-  participants despite never releasing by tag — their gate storms killed
-  MC's attempts before the convention and wedged the whole box this week.
-  The load-class taxonomy names ASSESSMENT-STORM as a distinct class: a
-  phase that mints many fresh Mach-Os is load-affected through the macOS
-  validator queue (amfid depth — 97 fresh binaries in ALF's postmortem), a
-  resource no CPU metric shows; two seats discovered it independently.
+   The lock's population is load-affected local phases of anything, not just
+   releases (ALF): prefrontal's CI-migrated gates take the lock as participants
+   despite never releasing by tag—their gate storms killed MC's attempts before
+   the convention and wedged the whole box. The applicable load classification
+   and its resource rationale come only from the anchored closed set.
 - **tag-at-HEAD probes compare against the INTENDED release commit recorded
   at train start**, never live branch HEAD — the retag lane moves HEAD
   between attempts, and a live-HEAD probe would false-resume (AFT).
@@ -322,32 +315,43 @@ one-line wrappers (`scripts/release.sh` → `ck-release run crate-train`).
   governed-manifest chains, dist-freshness for plugin packages — the class
   that cost AFT two tag re-cuts); a schema without the distinction forces
   those back into bespoke scripts.
-- **MC's per-leg load-class taxonomy seeds the first phase declaration** —
-  which legs carry wall-clock budgets, readiness windows, and perf p95s is
-  already measured on MC's master; the MC train adopts it rather than
-  re-deriving.
+- **Load classification is selected only from the anchored closed set** —
+  phase declarations use the appropriate anchored class and its associated
+  budget and readiness rules rather than inventing a local category.
 
 ## Acceptance
 
-MC's 11 saga failure modes, each mapped to a journal resume or a typed
-refusal — the mapping table is drafted on MC's side from the saga ledger. Any
-mode mapping to neither indicts the spec, not the release.
+MC's 11 saga failure modes must each map to a journal resume or typed refusal;
+a mode mapping to neither indicts the specification, not the release. The
+adopter-case manifest at `docs/specs/release-adopter-cases.md` is required
+before implementation: it must enumerate the synthetic train, all 11 MC cases,
+the ALF no-tag case, and both independent AFT `ci_watch` cases by stable ID.
+Later tests reference those IDs rather than replacing them with local examples.
 
-Manual baseline, executed end-to-end (AFT v0.54.0, 2026-08-28): published
-GitHub release asset -> raw-asset verification (checksums.sha256 +
-codesign --verify --strict on the unmodified asset + exec self-report) ->
-pin-identifier re-sign for placement -> postsign sidecar -> staging seam ->
-supersession proof (tag resolves to expected commit AND the running image's
-commit proven contained via merge-base) -> temp+mv place -> drain-aware
-restart -> inode verify -> two-sided behavioral acceptance (release-delta
-feature serving from the placed binary; absent arm witnessed by the placing
-seat's own tool lane riding the bounce). Every phase above maps 1:1 onto
-this spec's phase vocabulary; the machine's job is to make this walkthrough
-the cheap default instead of the practiced exception.
+Automated tests mint hermetic throwaway Git repositories at runtime. They may
+mint valid and failure-shaped repositories, but no committed fixture repository
+or committed `.git` directory is permitted. A future-version journal fixture
+produces a typed refusal before execution. The harness also proves that the
+full replay matrix is preserved: never-attempted plus authoritative `absent`
+may execute;
+never-attempted plus `present` reconciles; either never-attempted or attempted
+plus `undecidable` waits; attempted plus `present` reconciles; and attempted
+plus authoritative `absent` after settle-budget exhaustion is a typed operator
+refusal. No test may reach a public provider.
+
+Every `ci_watch` adopter case proves that its declared per-instance rerun budget
+is journaled and isolated. It records both `rerun --failed` and rerun-by-job-id
+when their respective failure shapes apply, and it concludes failure when that
+instance's budget is exhausted.
+
+Manual baseline, executed end-to-end (AFT v0.54.0, 2026-08-28), established
+that a published asset could be verified and staged with the intended revision
+before handoff. The later placement, restart, inode verification, and
+behavioural acceptance were a separate operator ceremony. The machine's
+acceptance endpoint is the verified staged artifact plus emitted placement
+instructions, not confirmation that placement occurred.
 
 Second adoption case (ALF, committed): prefrontal writes its `release.jsonc`
-against the no-tag train as the no-path acceptance test — gates_local (cheap
-tiers), ci_watch (their authoritative ladder, gaining the journaled run-id +
-three-valued reads their hand-rolled loop lacks), stage, verify (inode +
-provenance stamp; their binaries already carry `ModuleManifest.provenance`),
-with place correctly outside the machine.
+against the no-tag train as the no-path acceptance test, with a journaled
+`ci_watch`, artifact staging, and provenance verification. Its live-fleet
+placement remains outside the machine.

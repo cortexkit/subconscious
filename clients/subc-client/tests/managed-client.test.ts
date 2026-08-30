@@ -445,6 +445,11 @@ describe("SubcClient managed call", () => {
       await expect(client.call("managed-provider", "explode", {})).rejects.toMatchObject({
         kind: "terminal",
         code: "module_boom",
+        // The wire ErrorBody.detail payload must survive the parse verbatim:
+        // typed refusal reasons (e.g. synapse certification refusals) ride it,
+        // and consumers classify on it. Dropping it strands those reasons at
+        // the transport boundary.
+        detail: { reason: "certification_refused", lane: "embed" },
       });
       expect(stats.dataRequests).toBe(1);
     } finally {
@@ -981,7 +986,7 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       await new Promise((resolve) => setTimeout(resolve, options.delayBodyMs ?? 30));
       await writeAll(socket, full.subarray(HEADER_LEN), deadline);
     } else if (options.dataMode === "error") {
-      await writeFrame(socket, errorFrame(frame, { code: "module_boom", message: "boom" }), deadline);
+      await writeFrame(socket, errorFrame(frame, { code: "module_boom", message: "boom", detail: { reason: "certification_refused", lane: "embed" } }), deadline);
     } else if (
       options.dataMode === "unknown-channel-always" ||
       (options.dataMode === "unknown-channel-once" && options.stats.dataRequests === 1)
@@ -1032,7 +1037,7 @@ function responseFrame(request: Frame, body: unknown): Frame {
   return buildFrame(FrameType.Response, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
 }
 
-function errorFrame(request: Frame, body: { code: string; message: string }): Frame {
+function errorFrame(request: Frame, body: { code: string; message: string; detail?: unknown }): Frame {
   return buildFrame(FrameType.Error, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
 }
 

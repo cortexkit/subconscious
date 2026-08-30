@@ -245,6 +245,16 @@ export class SubcCallError extends Error {
     super(message);
     this.name = "SubcCallError";
   }
+
+  /**
+   * Machine-parsable payload from the wire `ErrorBody.detail`, surfaced from
+   * the underlying Error frame when one caused this failure. Typed refusal
+   * reasons (for example certification refusals) ride this field; consumers
+   * classify on it and must not have to reach into `cause`.
+   */
+  get detail(): unknown {
+    return this.cause instanceof SubcError ? this.cause.detail : undefined;
+  }
 }
 
 /**
@@ -265,6 +275,13 @@ export class SubcError extends Error {
   constructor(
     message: string,
     readonly code?: string,
+    /**
+     * Machine-parsable payload from the wire `ErrorBody.detail` field, carried
+     * verbatim. Providers use it for typed refusal reasons (for example
+     * synapse's certification-refusal reasons); dropping it here would strand
+     * those reasons at the transport boundary.
+     */
+    readonly detail?: unknown,
   ) {
     super(message);
   }
@@ -1468,8 +1485,9 @@ export class SubcClient {
       const parsed = JSON.parse(Buffer.from(frame.body).toString("utf8")) as {
         code?: string;
         message?: string;
+        detail?: unknown;
       };
-      return new SubcError(parsed.message ?? "subc error", parsed.code);
+      return new SubcError(parsed.message ?? "subc error", parsed.code, parsed.detail);
     } catch {
       return new SubcError(Buffer.from(frame.body).toString("utf8") || "subc error");
     }

@@ -352,6 +352,8 @@ export class SubcProviderError extends Error {
     message: string,
     readonly code?: string,
     readonly kind: SubcCallErrorKind = "terminal",
+    /** Wire `ErrorBody.detail` carried verbatim (typed refusal payloads). */
+    readonly detail?: unknown,
   ) {
     super(message);
   }
@@ -1222,11 +1224,12 @@ function routeKey(handle: RouteHandle, corr: bigint): string {
 
 function providerErrorFromFrame(frame: Frame): SubcProviderError {
   try {
-    const body = parseJson(frame.body) as { code?: string; message?: string };
+    const body = parseJson(frame.body) as { code?: string; message?: string; detail?: unknown };
     return new SubcProviderError(
       body.message ?? "subc error",
       body.code,
       body.code === "stale_route_epoch" || body.code === "unknown_channel" ? "not_sent" : "terminal",
+      body.detail,
     );
   } catch {
     return new SubcProviderError(Buffer.from(frame.body).toString("utf8") || "subc error");

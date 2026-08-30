@@ -167,7 +167,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return fleet_lint_command(config.as_deref(), *verbose).await;
     }
     if let Command::Setup(request) = &args.command {
-        return setup_command(request);
+        return setup_command(&args.program, request);
     }
     if let Command::Upgrade { check } = &args.command {
         return upgrade_command(*check).await;
@@ -3976,10 +3976,15 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn setup_command(request: &setup::SetupRequest) -> Result<(), CkError> {
-    let observed = setup::SetupObserved::unconfigured_current_host();
+fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), CkError> {
+    let mut backend =
+        setup::SetupBackend::current(program.to_path_buf()).map_err(CkError::Message)?;
+    let observed = backend.observe(request).map_err(CkError::Message)?;
     let plan = setup::plan_setup(&observed, request);
     print_setup_plan(&plan);
+    backend
+        .print_proposed_diffs(&plan)
+        .map_err(CkError::Message)?;
     if !plan.is_authorized() {
         return Err(CkError::Rejected(
             "setup plan refused; no mutations were applied".to_string(),
@@ -3990,26 +3995,7 @@ fn setup_command(request: &setup::SetupRequest) -> Result<(), CkError> {
         println!("dry-run: {planned_mutations} mutation(s) planned; none were applied");
         return Ok(());
     }
-
-    // The planner is intentionally independent from the later filesystem and
-    // service-manager backend. Refusing here is safer than presenting its pure
-    // plan as a completed installation before that backend is linked.
-    let mut executor = UnavailableSetupExecutor;
-    setup::execute_setup(&plan, setup::ExecutionMode::Apply, &mut executor)
-        .map_err(CkError::Message)?;
-    Ok(())
-}
-
-struct UnavailableSetupExecutor;
-
-impl setup::SetupExecutor for UnavailableSetupExecutor {
-    type Error = String;
-
-    fn apply(&mut self, operation: &setup::SetupOperation) -> Result<(), Self::Error> {
-        Err(format!(
-            "setup execution backend is unavailable before applying '{operation}'; use --dry-run to inspect the plan"
-        ))
-    }
+    backend.apply_plan(&plan, request).map_err(CkError::Message)
 }
 
 async fn upgrade_command(check: bool) -> Result<(), CkError> {

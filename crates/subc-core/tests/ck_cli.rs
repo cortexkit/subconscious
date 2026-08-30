@@ -148,9 +148,105 @@ fn bare_ck_degrades_to_domains_when_daemon_is_unreachable() {
         stdout.contains(&missing.display().to_string()),
         "stdout:\n{stdout}"
     );
+    assert!(stdout.contains("updates: not checked"), "stdout:\n{stdout}");
     assert!(stdout.contains("domains:"), "stdout:\n{stdout}");
     assert!(stdout.contains("module"), "stdout:\n{stdout}");
     assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
+    let temp = TempDir::new("ck-update-timeout");
+    let cache_path = temp.path().join("update-metadata.json");
+    fs::write(&cache_path, r#"{"checked_at_unix_secs":0,"targets":{}}"#).unwrap();
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let source_base = format!("http://{}", listener.local_addr().unwrap());
+    let (release_done_tx, release_done_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        let _ = release_done_rx.recv_timeout(Duration::from_secs(2));
+    });
+
+    let missing = temp.path().join("subc-connection.json");
+    let started = std::time::Instant::now();
+    let output = ck_command()
+        .args(["--subc"])
+        .arg(&missing)
+        .env("CK_UPDATE_CACHE_PATH", &cache_path)
+        .env("CK_UPDATE_SOURCE_BASE_URL", source_base)
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    release_done_tx.send(()).unwrap();
+    server.join().unwrap();
+
+    assert_exit(&output, 0);
+    assert!(
+        elapsed < Duration::from_millis(1_500),
+        "bare ck exceeded its bounded refresh envelope: {elapsed:?}"
+    );
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("updates: not checked (cache"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn upgrade_check_refreshes_the_user_cache_from_each_release_target() {
+    let temp = TempDir::new("ck-upgrade-check");
+    let cache_path = temp.path().join("update-metadata.json");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let source_base = format!("http://{}", listener.local_addr().unwrap());
+    let assets = ["ck", "ck-subc", "ck-subc-mcp", "ck-aft"]
+        .into_iter()
+        .flat_map(|binary| {
+            ["darwin-arm64", "linux-x64", "windows-x64"]
+                .into_iter()
+                .map(move |platform| format!(r#"{{"name":"{binary}-{platform}.zip"}}"#))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!(
+        r#"{{"tag_name":"subc-core-v{}","assets":[{assets}]}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let server = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        }
+    });
+
+    let output = ck_command()
+        .args(["upgrade", "--check"])
+        .env("CK_UPDATE_CACHE_PATH", &cache_path)
+        .env("CK_UPDATE_SOURCE_BASE_URL", source_base)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("upgrade plan:"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("upgrade check: 0 mutation(s)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        text(&fs::read(&cache_path).unwrap()).contains(env!("CARGO_PKG_VERSION")),
+        "cache did not retain the checked release metadata"
+    );
 }
 
 #[test]
@@ -763,7 +859,16 @@ fn discovery_failure_lists_tried_paths_and_exits_2() {
 }
 
 fn ck_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ck"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck"));
+    // Every CLI test gets an isolated update cache and a closed local endpoint.
+    // This proves dashboard output without reaching public release infrastructure.
+    command
+        .env(
+            "CK_UPDATE_CACHE_PATH",
+            unique_temp_dir("ck-update-cache").join("update-metadata.json"),
+        )
+        .env("CK_UPDATE_SOURCE_BASE_URL", "http://127.0.0.1:0");
+    command
 }
 
 fn ck_with_subc<const N: usize>(connection_file: &Path, args: [&str; N]) -> Output {

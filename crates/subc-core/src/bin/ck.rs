@@ -170,7 +170,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return setup_command(request);
     }
     if let Command::Upgrade { check } = &args.command {
-        return upgrade_command(*check);
+        return upgrade_command(*check).await;
     }
     if matches!(&args.command, Command::DaemonTriage) {
         return daemon_triage(args.subc.as_deref(), args.json);
@@ -281,27 +281,44 @@ async fn fleet_lint_command(config: Option<&Path>, verbose: bool) -> Result<(), 
 }
 
 async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
-    let resolved = match discover_connection_file(args.subc.as_deref()) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            print_degraded_dashboard(&args.program, &error);
-            return Ok(());
+    // Start release refresh beside the dashboard probe. `bare_update_line` uses
+    // a fixed 800 ms deadline, so waiting for its output cannot add unbounded latency.
+    let update_task = tokio::spawn(bare_update_line());
+    let result = match discover_connection_file(args.subc.as_deref()) {
+        Ok(resolved) => {
+            let path = resolved.path.clone();
+            match time::timeout(DASHBOARD_PROBE_TIMEOUT, dashboard_probe(resolved)).await {
+                Ok(result) => result,
+                Err(_) => Err(CkError::Connection {
+                    path,
+                    source: format!("dashboard probe timed out after {DASHBOARD_PROBE_TIMEOUT:?}"),
+                }),
+            }
         }
+        Err(error) => Err(error),
     };
-    let path = resolved.path.clone();
-    let result = match time::timeout(DASHBOARD_PROBE_TIMEOUT, dashboard_probe(resolved)).await {
-        Ok(result) => result,
-        Err(_) => Err(CkError::Connection {
-            path,
-            source: format!("dashboard probe timed out after {DASHBOARD_PROBE_TIMEOUT:?}"),
-        }),
-    };
+    let update_line = update_task
+        .await
+        .unwrap_or_else(|_| "updates: not checked (cache unavailable)".to_string());
 
     match result {
-        Ok(snapshot) => print_dashboard(&args.program, &snapshot, args.subc.as_deref()),
-        Err(error) => print_degraded_dashboard(&args.program, &error),
+        Ok(snapshot) => {
+            print_dashboard(&args.program, &snapshot, args.subc.as_deref(), &update_line)
+        }
+        Err(error) => print_degraded_dashboard(&args.program, &error, &update_line),
     }
     Ok(())
+}
+
+async fn bare_update_line() -> String {
+    let cache = setup::UpdateCache::from_environment();
+    let source = match setup::GitHubReleaseSource::from_environment() {
+        Ok(source) => source,
+        Err(_) => return setup::not_checked_from_cache(&cache).render(),
+    };
+    setup::dashboard_update(&cache, &source, &setup::compiled_installed_versions())
+        .await
+        .render()
 }
 
 async fn dashboard_probe(resolved: ResolvedConnection) -> Result<DashboardSnapshot, CkError> {
@@ -327,7 +344,12 @@ async fn dashboard_probe(resolved: ResolvedConnection) -> Result<DashboardSnapsh
     })
 }
 
-fn print_dashboard(program: &Path, snapshot: &DashboardSnapshot, subc: Option<&Path>) {
+fn print_dashboard(
+    program: &Path,
+    snapshot: &DashboardSnapshot,
+    subc: Option<&Path>,
+    update_line: &str,
+) {
     print_dashboard_identity(program);
     let build = snapshot
         .describe
@@ -345,6 +367,7 @@ fn print_dashboard(program: &Path, snapshot: &DashboardSnapshot, subc: Option<&P
         snapshot.daemon_ver, snapshot.pid
     );
     print_dashboard_module_summary(&snapshot.modules, &snapshot.health, &snapshot.describe);
+    println!("{update_line}");
     print_static_domains();
     let footer = [
         next_step("ck health <id>", "for one module's metrics", subc),
@@ -353,9 +376,10 @@ fn print_dashboard(program: &Path, snapshot: &DashboardSnapshot, subc: Option<&P
     print_help_footer(&footer);
 }
 
-fn print_degraded_dashboard(program: &Path, error: &CkError) {
+fn print_degraded_dashboard(program: &Path, error: &CkError, update_line: &str) {
     print_dashboard_identity(program);
     println!("daemon: unreachable — {}", dashboard_error_text(error));
+    println!("{update_line}");
     print_static_domains();
     print_help_footer(&[
         "Check the connection file path above, then run `ck daemon --subc <connection-file>`",
@@ -3988,8 +4012,18 @@ impl setup::SetupExecutor for UnavailableSetupExecutor {
     }
 }
 
-fn upgrade_command(check: bool) -> Result<(), CkError> {
-    let observed = setup::UpgradeObserved::no_updates_on_current_host();
+async fn upgrade_command(check: bool) -> Result<(), CkError> {
+    let observed = if check {
+        let cache = setup::UpdateCache::from_environment();
+        let source = setup::GitHubReleaseSource::from_environment()
+            .map_err(|error| CkError::Message(error.to_string()))?;
+        let metadata = setup::check_update_metadata(&cache, &source)
+            .await
+            .map_err(CkError::UpdateCheck)?;
+        setup::observed_from_metadata(&metadata, &setup::compiled_installed_versions())
+    } else {
+        setup::UpgradeObserved::no_updates_on_current_host()
+    };
     let plan = setup::plan_upgrade(&observed);
     print_upgrade_plan(&plan);
     if !plan.is_authorized() {
@@ -4639,6 +4673,7 @@ enum CkError {
     },
     Message(String),
     FleetLintConfig(String),
+    UpdateCheck(setup::UpdateCheckError),
     /// The report was written to stdout; exit silently with lint's classification.
     FleetLintExit {
         exit_code: i32,
@@ -4655,7 +4690,7 @@ impl CkError {
         match self {
             Self::Usage(_) | Self::Discovery { .. } => 2,
             Self::Connection { .. } => 3,
-            Self::Rejected(_) | Self::Message(_) | Self::Json(_) => 1,
+            Self::Rejected(_) | Self::Message(_) | Self::Json(_) | Self::UpdateCheck(_) => 1,
             Self::FleetLintConfig(_) => 2,
             Self::FleetLintExit { exit_code } | Self::TriageExit { exit_code } => *exit_code,
             Self::WithFooter { error, .. } => error.exit_code(),
@@ -4685,6 +4720,7 @@ impl fmt::Display for CkError {
             Self::Rejected(message) => write!(f, "{message}"),
             Self::Message(message) => write!(f, "{message}"),
             Self::FleetLintConfig(message) => write!(f, "ck fleet lint: {message}"),
+            Self::UpdateCheck(error) => error.fmt(f),
             Self::FleetLintExit { .. } | Self::TriageExit { .. } => Ok(()),
             Self::Json(source) => write!(f, "json: {source}"),
             Self::WithFooter { error, footer } => {

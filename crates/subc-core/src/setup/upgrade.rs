@@ -13,6 +13,7 @@ use subc_transport::connection_file;
 use super::{
     inventory::Inventory,
     model::{AlphaTarget, UpgradeObserved, UpgradeState, UpgradeTarget},
+    self_update,
     update_cache::UpdateMetadata,
     update_check::observed_from_metadata,
     upgrade_assets::{
@@ -476,6 +477,16 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .prepared
             .remove(target.label())
             .ok_or_else(|| format!("no verified candidate was prepared for {target}"))?;
+        if target == UpgradeTarget::Ck {
+            let result = self_update::replace_verified_candidate(
+                &destination,
+                &prepared.candidate,
+                &mut self.inventory,
+            );
+            prepared.cleanup();
+            return result.map(|evidence| evidence.to_string());
+        }
+
         let parent = destination.parent().ok_or_else(|| {
             format!(
                 "managed destination {} has no parent",
@@ -495,19 +506,6 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)).map_err(
                 |error| format!("could not mark {} executable: {error}", temporary.display()),
             )?;
-        }
-        #[cfg(windows)]
-        {
-            if target == UpgradeTarget::Ck && destination.exists() {
-                let old = destination.with_extension("exe.old");
-                fs::rename(&destination, &old).map_err(|error| {
-                    format!(
-                        "could not rename the running ck executable {} to {}: {error}",
-                        destination.display(),
-                        old.display()
-                    )
-                })?;
-            }
         }
         fs::rename(&temporary, &destination).map_err(|error| {
             format!(

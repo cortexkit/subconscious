@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+installer="$repo_root/scripts/install/install.sh"
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+stub_dir="$test_root/stubs"
+mkdir -p "$stub_dir"
+
+fail() {
+  printf 'test failure: %s\n' "$1" >&2
+  exit 1
+}
+
+cat >"$stub_dir/uname" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -s) printf '%s\n' "${CK_TEST_OS:-Linux}" ;;
+  -m) printf '%s\n' "${CK_TEST_ARCH:-x86_64}" ;;
+  -r) printf '%s\n' "${CK_TEST_KERNEL:-generic}" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat >"$stub_dir/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+url=""
+while (($# > 0)); do
+  case "$1" in
+    --output)
+      out="$2"
+      shift 2
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+printf '%s\n' "$url" >>"$CK_TEST_REQUEST_LOG"
+case "$url" in
+  *.sha256)
+    if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "sidecar" ]]; then
+      exit 22
+    fi
+    if [[ "${CK_TEST_DIGEST_MISMATCH:-}" == "1" ]]; then
+      archive_name="${url##*/}"
+      archive_name="${archive_name%.sha256}"
+      printf '%064d  %s\n' 0 "$archive_name" >"$out"
+    else
+      archive_name="${url##*/}"
+      archive_name="${archive_name%.sha256}"
+      digest=$(printf 'fixture archive\n' | shasum -a 256 | awk '{print $1}')
+      printf '%s  %s\n' "$digest" "$archive_name" >"$out"
+    fi
+    ;;
+  *)
+    if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "archive" ]]; then
+      exit 22
+    fi
+    printf 'fixture archive\n' >"$out"
+    ;;
+esac
+EOF
+cat >"$stub_dir/unzip" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${CK_TEST_EXTRACTION_FAILURE:-}" == "1" ]]; then
+  exit 9
+fi
+while (($# > 0)); do
+  case "$1" in
+    -d)
+      destination="$2"
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$destination"
+cat >"$destination/ck" <<'CK'
+#!/usr/bin/env bash
+printf 'setup process started\n' >"$CK_TEST_SETUP_MARKER"
+CK
+EOF
+cat >"$stub_dir/systemctl" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${CK_TEST_SYSTEMD_RESULT:-0}" == "0" ]]; then
+  printf 'systemd user session\n'
+  exit 0
+fi
+printf 'systemd user session is unavailable\n' >&2
+exit 1
+EOF
+chmod +x "$stub_dir/uname" "$stub_dir/curl" "$stub_dir/unzip" "$stub_dir/systemctl"
+
+run_installer() {
+  local home="$1"
+  local output_file="$2"
+  shift 2
+  if ! env \
+    HOME="$home" \
+    SHELL=/bin/bash \
+    PATH="$stub_dir:$PATH" \
+    CK_RELEASE_BASE_URL=https://release.fixture.example/download \
+    CK_TEST_REQUEST_LOG="$home/requests.log" \
+    CK_TEST_SETUP_MARKER="$home/setup-called" \
+    "$@" \
+    bash "$installer" >"$output_file" 2>&1; then
+    return 1
+  fi
+}
+
+linux_home="$test_root/linux-home"
+mkdir -p "$linux_home"
+linux_output="$test_root/linux-output"
+run_installer "$linux_home" "$linux_output" \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic
+
+grep -Fq 'ck-linux-x64.zip' "$linux_home/requests.log" || fail 'Linux archive name was not requested'
+grep -Fq 'ck-linux-x64.zip.sha256' "$linux_home/requests.log" || fail 'Linux sidecar name was not requested'
+grep -Fq 'Next: ck setup' "$linux_output" || fail 'installer did not print the setup command'
+[[ ! -e "$linux_home/setup-called" ]] || fail 'installer started the extracted ck process'
+[[ -x "$linux_home/.local/share/cortexkit/bin/ck" ]] || fail 'installer did not place ck'
+[[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'PATH block was not recorded exactly once'
+grep -Fq 'installer-manifest.json' "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'installer manifest did not record itself'
+
+rerun_output="$test_root/linux-rerun-output"
+run_installer "$linux_home" "$rerun_output" \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic
+grep -Fq 'already matches verified download' "$rerun_output" || fail 'identical destination was not reported as a no-op'
+grep -Fq 'Next: ck setup' "$rerun_output" || fail 'no-op installer did not print the setup command'
+[[ ! -e "$linux_home/setup-called" ]] || fail 'no-op installer started the extracted ck process'
+[[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'no-op installer duplicated the PATH block'
+
+darwin_home="$test_root/darwin-home"
+mkdir -p "$darwin_home"
+darwin_output="$test_root/darwin-output"
+run_installer "$darwin_home" "$darwin_output" \
+  CK_TEST_OS=Darwin CK_TEST_ARCH=arm64 CK_TEST_KERNEL=generic
+grep -Fq 'ck-darwin-arm64.zip' "$darwin_home/requests.log" || fail 'Darwin archive name was not requested'
+[[ ! -e "$darwin_home/setup-called" ]] || fail 'Darwin installer started the extracted ck process'
+
+expect_refusal() {
+  local name="$1"
+  local expected="$2"
+  shift 2
+  local home="$test_root/$name-home"
+  local output="$test_root/$name-output"
+  mkdir -p "$home"
+  if run_installer "$home" "$output" "$@"; then
+    fail "$name unexpectedly succeeded"
+  fi
+  grep -Fq "refusal: $expected" "$output" || {
+    cat "$output" >&2
+    fail "$name did not emit $expected"
+  }
+}
+
+expect_refusal unsupported-platform unsupported-platform \
+  CK_TEST_OS=Linux CK_TEST_ARCH=aarch64 CK_TEST_KERNEL=generic
+expect_refusal missing-archive release-incomplete \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_DOWNLOAD_FAILURE=archive
+expect_refusal missing-sidecar release-incomplete \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_DOWNLOAD_FAILURE=sidecar
+expect_refusal digest-mismatch digest-mismatch \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_DIGEST_MISMATCH=1
+expect_refusal extraction-failed extraction-failed \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_EXTRACTION_FAILURE=1
+expect_refusal wsl-systemd-user-unavailable wsl-systemd-user-unavailable \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=microsoft CK_TEST_SYSTEMD_RESULT=1
+
+printf 'shell installer tests passed\n'

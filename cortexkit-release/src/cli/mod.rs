@@ -4,6 +4,10 @@
 //! deliberately construct no credential-bearing provider, while execution uses
 //! the hermetic synthetic provider solely when a caller explicitly requests it.
 
+// CLI failures flow once per process toward the exit path; boxing the error
+// to satisfy result_large_err would touch every construction site to save
+// bytes freed microseconds later at exit.
+#![allow(clippy::result_large_err)]
 use crate::{
     approval::{build_approval_subject, ApprovalError, ApprovalStore, ApprovalSubject},
     ceremony::{self, CeremonyError, RebindConfirmation},

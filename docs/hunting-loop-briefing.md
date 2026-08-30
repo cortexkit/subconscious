@@ -12073,3 +12073,20 @@ owner. Companion diagnostic for ENOSPC: the first casualty of a full disk
 names a temp or cache path you did not choose (/var/folders lock write),
 reading as a tool bug — when a failure names a path you did not pick, check
 df before debugging the tool.
+
+## The hidden variable was the feature graph, not the commit (2026-08-30)
+
+A digest test failed in worker trees ("stale base", I concluded), passed on my
+master, failed on ubuntu CI at the same commit ("platform divergence", I
+concluded). Both conclusions wrong. The variable was INVOCATION SCOPE:
+`--workspace` unifies serde_json's preserve_order feature from a sibling crate
+into cortexkit-release, changing Value iteration order and thus the digest;
+`-p cortexkit-release` does not. Same commit, same platform, different feature
+graph. Two rules: (1) when a test's verdict differs across environments, list
+the FEATURE GRAPH beside commit and platform as a candidate variable — cargo
+feature unification means "the same package at the same commit" is not one
+build; (2) a digest over serde_json::Value insertion order is latently
+feature-dependent — canonicalize (sort keys) before hashing, and pin the digest
+of a fixed input as a constant so divergence reds by name. This was also the
+PR82 piggyback class (a sibling's feature silently changing four crates that
+never opted in) biting six days after it was named.

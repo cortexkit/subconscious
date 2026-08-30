@@ -53,6 +53,9 @@ fn state(plan: &ReleasePlan) -> (TempDir, JournalStore, ApprovalStore) {
     let identity =
         TrainJournalIdentity::new(plan.repository.clone(), plan.train.clone(), "run-1").unwrap();
     let journal = JournalStore::new(root.path(), identity.clone()).unwrap();
+    journal
+        .pin_declaration(&parse(DECLARATION).unwrap())
+        .unwrap();
     let approvals = ApprovalStore::new(root.path(), identity).unwrap();
     (root, journal, approvals)
 }
@@ -206,7 +209,7 @@ fn replay_matrix_covers_attempted_and_never_attempted_for_every_probe_result() {
             (false, ProbeResult::Absent(_)) => {
                 assert_eq!(result.unwrap(), EffectOutcome::Executed(evidence()));
                 assert_eq!(executor.calls, 1);
-                assert_eq!(journal.read_journal().unwrap().len(), 1);
+                assert_eq!(journal.read_journal().unwrap().len(), 2);
             }
             (false, ProbeResult::Undecidable(_)) => {
                 assert_eq!(result.unwrap(), EffectOutcome::AwaitingProbe);

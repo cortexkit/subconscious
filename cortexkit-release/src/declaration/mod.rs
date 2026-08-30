@@ -89,6 +89,8 @@ impl DeclarationError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedDeclaration {
     pub declaration: ReleaseDeclaration,
+    /// The canonical JSON value whose digest identifies this declaration.
+    pub normalized: Value,
     pub digest: DeclarationDigest,
 }
 
@@ -232,6 +234,7 @@ pub fn parse(source: &str) -> Result<ParsedDeclaration, DeclarationError> {
     let digest = DeclarationDigest::new(format!("{:x}", Sha256::digest(canonical)));
     Ok(ParsedDeclaration {
         declaration,
+        normalized: value,
         digest,
     })
 }

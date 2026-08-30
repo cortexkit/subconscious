@@ -10,6 +10,7 @@
 
 pub mod approval;
 pub mod artifact;
+pub mod ceremony;
 pub mod declaration;
 pub mod executor;
 pub mod lease;

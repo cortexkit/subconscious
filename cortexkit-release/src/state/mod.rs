@@ -6,10 +6,12 @@
 //! pending intent exists before the executor can run.
 
 use crate::{
-    ApprovalSubject, ArtifactId, CommitId, DeclarationDigest, EffectRequest, IrreversibleExecutor,
-    OperationId, PhaseInstanceId, ProbeEvidence, RepositoryId, SeamError, TrainId,
+    declaration::ParsedDeclaration, ApprovalSubject, ArtifactId, CommitId, DeclarationDigest,
+    EffectRequest, IrreversibleExecutor, OperationId, PhaseInstanceId, ProbeEvidence, RepositoryId,
+    SeamError, TrainId,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env,
@@ -106,12 +108,151 @@ impl JournalStore {
         append_record(&self.journal_path(), record)
     }
 
+    /// Returns the durable `<train>-<id>` identifier used by operator ceremonies.
+    pub fn train_journal_id(&self) -> String {
+        self.identity.file_stem()
+    }
+
+    /// Returns the declaration currently bound to this train, if train creation pinned one.
+    pub fn pinned_declaration(&self) -> Result<Option<DeclarationBinding>, StateError> {
+        let mut binding = None;
+        for record in self.read_journal()? {
+            match record {
+                JournalRecord::DeclarationPinned { binding: candidate } => {
+                    binding = Some(candidate)
+                }
+                JournalRecord::DeclarationRebound {
+                    replacement: candidate,
+                    ..
+                } => binding = Some(candidate),
+                JournalRecord::Completion { .. } | JournalRecord::Terminalized { .. } => {}
+            }
+        }
+        Ok(binding)
+    }
+
+    /// Pins the active normalized declaration when the train is first created.
+    pub fn pin_declaration(
+        &self,
+        declaration: &ParsedDeclaration,
+    ) -> Result<DeclarationBinding, StateError> {
+        self.ensure_active()?;
+        if let Some(binding) = self.pinned_declaration()? {
+            if binding.digest == declaration.digest {
+                return Ok(binding);
+            }
+            return Err(StateError::DeclarationDigestMismatch {
+                pinned: binding.digest.to_string(),
+                active: declaration.digest.to_string(),
+            });
+        }
+
+        let binding = DeclarationBinding {
+            digest: declaration.digest.clone(),
+            normalized: declaration.normalized.clone(),
+        };
+        self.append_journal(JournalRecord::DeclarationPinned {
+            binding: binding.clone(),
+        })?;
+        Ok(binding)
+    }
+
+    /// Refuses mutation unless the active declaration digest equals the durable pin.
+    pub fn ensure_declaration_digest(
+        &self,
+        active_digest: &DeclarationDigest,
+    ) -> Result<(), StateError> {
+        self.ensure_active()?;
+        let binding = self
+            .pinned_declaration()?
+            .ok_or(StateError::DeclarationNotPinned)?;
+        if binding.digest != *active_digest {
+            return Err(StateError::DeclarationDigestMismatch {
+                pinned: binding.digest.to_string(),
+                active: active_digest.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the terminal journal state, if an operator has abandoned the train.
+    pub fn terminal_state(&self) -> Result<Option<TrainTerminalState>, StateError> {
+        Ok(self
+            .read_journal()?
+            .into_iter()
+            .find_map(|record| match record {
+                JournalRecord::Terminalized { state } => Some(state),
+                JournalRecord::DeclarationPinned { .. }
+                | JournalRecord::DeclarationRebound { .. }
+                | JournalRecord::Completion { .. } => None,
+            }))
+    }
+
+    /// Appends the durable abandonment terminal record without deleting earlier evidence.
+    pub fn abandon(&self) -> Result<TrainTerminalState, StateError> {
+        self.ensure_active()?;
+        let binding = self
+            .pinned_declaration()?
+            .ok_or(StateError::DeclarationNotPinned)?;
+        let state = TrainTerminalState::Abandoned {
+            declaration_digest: binding.digest,
+        };
+        self.append_journal(JournalRecord::Terminalized {
+            state: state.clone(),
+        })?;
+        Ok(state)
+    }
+
+    /// Replaces the bound declaration after an operator has reviewed and confirmed the change.
+    pub fn rebind_declaration(
+        &self,
+        expected_pinned_digest: &DeclarationDigest,
+        replacement: &ParsedDeclaration,
+    ) -> Result<DeclarationBinding, StateError> {
+        self.ensure_active()?;
+        let current = self
+            .pinned_declaration()?
+            .ok_or(StateError::DeclarationNotPinned)?;
+        if current.digest != *expected_pinned_digest {
+            return Err(StateError::DeclarationBindingChanged {
+                expected: expected_pinned_digest.to_string(),
+                actual: current.digest.to_string(),
+            });
+        }
+        if current.digest == replacement.digest {
+            return Err(StateError::DeclarationDigestUnchanged {
+                digest: current.digest.to_string(),
+            });
+        }
+
+        let binding = DeclarationBinding {
+            digest: replacement.digest.clone(),
+            normalized: replacement.normalized.clone(),
+        };
+        self.append_journal(JournalRecord::DeclarationRebound {
+            previous_digest: current.digest,
+            replacement: binding.clone(),
+        })?;
+        Ok(binding)
+    }
+
+    /// Refuses public train mutation after an abandonment record has terminalized the journal.
+    pub fn ensure_active(&self) -> Result<(), StateError> {
+        if let Some(state) = self.terminal_state()? {
+            return Err(StateError::TrainTerminal {
+                state: state.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Appends and synchronizes a pending intent before an irreversible call.
     pub fn append_intent(
         &self,
         request: &EffectRequest,
         approval_subject: ApprovalSubject,
     ) -> Result<PendingIntent, StateError> {
+        self.ensure_declaration_digest(&request.declaration_digest)?;
         if request.repository != self.identity.repository || request.train != self.identity.train {
             return Err(StateError::IntentDoesNotMatchTrain);
         }
@@ -151,6 +292,7 @@ impl JournalStore {
         intent: &PendingIntent,
         evidence: ProbeEvidence,
     ) -> Result<(), StateError> {
+        self.ensure_active()?;
         append_record(
             &self.journal_path(),
             JournalRecord::Completion {
@@ -184,6 +326,9 @@ impl JournalStore {
                     JournalRecord::Completion {
                         intent: completed, ..
                     } => completed == intent,
+                    JournalRecord::DeclarationPinned { .. }
+                    | JournalRecord::DeclarationRebound { .. }
+                    | JournalRecord::Terminalized { .. } => false,
                 })
             })
             .collect())
@@ -204,10 +349,44 @@ impl JournalStore {
     }
 }
 
+/// The normalized declaration bound to a train journal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeclarationBinding {
+    pub digest: DeclarationDigest,
+    pub normalized: Value,
+}
+
+/// The terminal state that prevents a train journal from being resumed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TrainTerminalState {
+    /// The operator deliberately stopped this train and retained its journal as evidence.
+    Abandoned {
+        declaration_digest: DeclarationDigest,
+    },
+}
+
+impl std::fmt::Display for TrainTerminalState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Abandoned { .. } => formatter.write_str("abandoned"),
+        }
+    }
+}
+
 /// A versioned journal record.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JournalRecord {
+    /// The declaration pinned when the train was first created.
+    DeclarationPinned { binding: DeclarationBinding },
+    /// A confirmed ceremony replaced the pinned declaration.
+    DeclarationRebound {
+        previous_digest: DeclarationDigest,
+        replacement: DeclarationBinding,
+    },
+    /// An operator terminalized the journal without deleting its earlier evidence.
+    Terminalized { state: TrainTerminalState },
     /// Reconciliation confirmed that one write-ahead intent has completed.
     Completion {
         intent: PendingIntent,
@@ -258,6 +437,16 @@ pub enum StateError {
     TornTail { offset: u64 },
     #[error("intent request does not match this journal's repository and train")]
     IntentDoesNotMatchTrain,
+    #[error("train declaration is not pinned in the journal")]
+    DeclarationNotPinned,
+    #[error("active declaration digest `{active}` differs from pinned digest `{pinned}`")]
+    DeclarationDigestMismatch { pinned: String, active: String },
+    #[error("declaration binding changed from `{expected}` to `{actual}` before confirmation")]
+    DeclarationBindingChanged { expected: String, actual: String },
+    #[error("declaration digest `{digest}` is already pinned")]
+    DeclarationDigestUnchanged { digest: String },
+    #[error("train journal is terminal: {state}")]
+    TrainTerminal { state: String },
     #[error("irreversible executor failed: {0}")]
     Executor(SeamError),
 }
@@ -551,6 +740,7 @@ mod tests {
     #[test]
     fn intent_is_durable_before_the_irreversible_executor_can_run() {
         let (_home, store) = store();
+        pin_declaration_for_request(&store);
         assert!(store.pending_intents().unwrap().is_empty());
         let mut executor = IntentCheckingExecutor {
             intent_path: store.intent_path(),
@@ -568,6 +758,7 @@ mod tests {
     #[test]
     fn completion_resolves_only_the_matching_pending_intent() {
         let (_home, store) = store();
+        pin_declaration_for_request(&store);
         let intent = store.append_intent(&request(), approval_subject()).unwrap();
         store
             .append_completion(&intent, ProbeEvidence::default())
@@ -586,6 +777,17 @@ mod tests {
             TrainJournalIdentity::new(RepositoryId::new("../repo"), TrainId::new("release"), "id"),
             Err(StateError::UnsafeIdentity(_))
         ));
+    }
+
+    fn pin_declaration_for_request(store: &JournalStore) {
+        store
+            .append_journal(JournalRecord::DeclarationPinned {
+                binding: DeclarationBinding {
+                    digest: request().declaration_digest,
+                    normalized: Value::Null,
+                },
+            })
+            .unwrap();
     }
 
     fn pending_intent() -> PendingIntent {

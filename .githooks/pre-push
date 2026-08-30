@@ -9,7 +9,11 @@
 # working tree) is the property that matters.
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
-if git archive HEAD Cargo.toml Cargo.lock crates clients 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
+# Archive the WHOLE tree: a hardcoded path roster here decayed the day a new
+# top-level crate dir (cortexkit-release) appeared — the extraction lacked a
+# declared workspace member and cargo metadata failed on a phantom, refusing
+# a correct push. Whole-HEAD costs a moment more and cannot rot.
+if git archive HEAD 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
   if ! (cd "$tmp" && cargo metadata --locked --format-version 1 >/dev/null 2>&1); then
     echo "pre-push: HEAD's Cargo.lock does not match its manifests (run cargo update -w or commit the lock)" >&2
     exit 1

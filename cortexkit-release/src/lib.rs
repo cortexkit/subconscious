@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
+pub mod state;
+
 /// The immutable release-machine specification incorporated by this package.
 pub const NORMATIVE_SPEC_REFERENCE: &str = "docs/specs/fleet-release-machine.md@41cb2be4";
 

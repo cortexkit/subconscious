@@ -159,6 +159,10 @@ impl LeaseStore {
             .read(true)
             .write(true)
             .create(true)
+            // Deliberately not truncating at open: the current holder's record
+            // must survive until try_lock decides ownership. write_holder
+            // truncates after the lock is held.
+            .truncate(false)
             .open(&path)
             .map_err(|source| lease_io(&path, source))?;
         if let Err(source) = FileExt::try_lock(&file) {

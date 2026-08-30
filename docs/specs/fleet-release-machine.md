@@ -84,6 +84,19 @@ the list. Phases are parameterized instances, not singleton slots (AFT finding
 AFT's real pipeline, for example, has independent pre-tag and post-tag
 `ci_watch` instances. `place` is deliberately not a phase; see Boundaries.
 
+### Precheck detector closed-set amendment
+
+The cortexkit-release precheck-detector slice amends the anchored phase vocabulary
+with exactly six refusal-capable phase types: `precheck-format-dirty`,
+`precheck-stale-residue`, `precheck-sibling-drift`, `precheck-context-fitness`,
+`precheck-tool-pinning`, and `precheck-residue-sweep`. Their parameters are closed,
+declaration-owned schemas; none may first execute after an irreversible phase.
+Only `precheck-residue-sweep` may mutate, and only by removing paths declared
+clearable while appending a `ResidueSwept` journal record. This amendment is
+incorporated as
+`docs/specs/fleet-release-machine.md@41cb2be4#precheck-detectors-v1`; it does not
+open the phase vocabulary to undeclared detector names.
+
 `publish` and `assets` carry PER-ARTIFACT sub-probes (AFT finding 2): each
 registry package and each asset has its own exists/sha probe, and resume
 re-enters the phase skipping per-artifact by probe. Live specimen: crates.io

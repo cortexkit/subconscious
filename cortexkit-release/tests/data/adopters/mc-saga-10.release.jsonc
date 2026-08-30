@@ -5,6 +5,11 @@
     "id": "mc-unpinned-tool",
     "intended_commit": "mc10",
     "signing_profile": "none",
-    "artifacts": [{"id": "tool", "kind": "archive", "identity_channel": "outside_declared_pins"}]
+    "artifacts": [{"id": "tool", "kind": "archive", "identity_channel": "asset_sha256"}],
+    "phases": [{
+      "id": "tool-pin-precheck",
+      "type": "precheck-tool-pinning",
+      "params": {"tools": [{"name": "cargo", "command": "cargo"}]}
+    }]
   }]
 }

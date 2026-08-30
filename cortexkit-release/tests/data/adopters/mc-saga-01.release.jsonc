@@ -9,8 +9,12 @@
     "operator_gates": ["first_public_trigger"],
     "artifacts": [{"id": "crate", "kind": "crate", "identity_channel": "registry_version"}],
     "phases": [
-      {"id": "push-tag", "type": "tag"},
-      {"id": "format-precheck", "type": "preflight"}
+      {
+        "id": "format-precheck",
+        "type": "precheck-format-dirty",
+        "params": {"tool": "git diff --check", "command": ["git", "diff", "--check"]}
+      },
+      {"id": "push-tag", "type": "tag"}
     ]
   }]
 }

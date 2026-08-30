@@ -18,7 +18,7 @@ use crate::{
     lease::LeaseError,
     orchestrator::{
         EffectOutcome, FirstPublicTriggerGate, OrchestrationError, OrchestrationRefusalCode,
-        Orchestrator, PhaseRunner,
+        Orchestrator,
     },
     plan::{self, FinalizedArtifact, PlanError, ReleasePlan},
     state::{self, JournalRecord, JournalStore, StateError, TrainJournalIdentity},
@@ -236,6 +236,7 @@ impl CliFailure {
 }
 
 struct PreparedRepository {
+    root: PathBuf,
     id: RepositoryId,
     declaration: ParsedDeclaration,
 }
@@ -492,7 +493,7 @@ fn execute_train(
         }
     }
 
-    let mut runner = NoopPhaseRunner;
+    let mut runner = crate::phases::precheck::PrecheckRunner::new(&prepared.root, &journal);
     let mut gate = SyntheticApprovalGate {
         confirmed: arguments.confirm_first_public_trigger,
     };
@@ -705,6 +706,7 @@ fn load_repository(
         .map_err(|error| map_declaration_error(command, error))?;
     let digest = Sha256::digest(path.to_string_lossy().as_bytes());
     Ok(PreparedRepository {
+        root: path,
         id: RepositoryId::new(format!("repo-{:x}", digest)),
         declaration,
     })
@@ -842,6 +844,8 @@ fn phase_state(
             | JournalRecord::DeclarationRebound { .. }
             | JournalRecord::PhaseEntered { .. }
             | JournalRecord::Refused { .. }
+            | JournalRecord::WorkingTreeMutation { .. }
+            | JournalRecord::ResidueSwept { .. }
             | JournalRecord::Terminalized { .. } => None,
         })
         .collect::<BTreeSet<_>>();
@@ -934,14 +938,6 @@ fn effect_outcome(outcome: &EffectOutcome) -> &'static str {
         EffectOutcome::Executed(_) => "executed",
         EffectOutcome::Reconciled(_) => "reconciled",
         EffectOutcome::AwaitingProbe => "awaiting_probe",
-    }
-}
-
-struct NoopPhaseRunner;
-
-impl PhaseRunner for NoopPhaseRunner {
-    fn run(&mut self, _phase: &crate::plan::PlannedPhase) -> Result<(), SeamError> {
-        Ok(())
     }
 }
 
@@ -1229,6 +1225,16 @@ fn map_orchestration_error(command: &str, error: OrchestrationError) -> CliFailu
             };
             CliFailure::refusal_with_context(command, code, message, json!({"phase": phase}))
         }
+        OrchestrationError::PrecheckRefusal {
+            code,
+            phase,
+            message,
+        } => CliFailure::refusal_with_context(
+            command,
+            code.to_string().to_ascii_lowercase(),
+            message,
+            json!({"phase": phase}),
+        ),
         OrchestrationError::Lease(error) => map_lease_error(command, error),
         OrchestrationError::State(error) => map_state_error(command, error),
         OrchestrationError::Approval(error) => map_approval_error(command, error),

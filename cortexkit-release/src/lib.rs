@@ -4,7 +4,7 @@
 //!
 //! The machine's supported phases, provider operations, artifact identity
 //! channels, and signing profiles are incorporated only from
-//! `docs/specs/fleet-release-machine.md@41cb2be4`. This crate deliberately
+//! `docs/specs/fleet-release-machine.md@41cb2be4#precheck-detectors-v1`. This crate deliberately
 //! carries opaque identifiers at that boundary instead of duplicating those
 //! closed sets in Rust enums.
 
@@ -18,6 +18,7 @@ pub mod lease;
 pub mod orchestrator;
 pub mod phases {
     pub mod ci_watch;
+    pub mod precheck;
 }
 pub mod plan;
 pub mod provider;
@@ -28,7 +29,8 @@ use std::{error::Error, fmt};
 pub mod state;
 
 /// The immutable release-machine specification incorporated by this package.
-pub const NORMATIVE_SPEC_REFERENCE: &str = "docs/specs/fleet-release-machine.md@41cb2be4";
+pub const NORMATIVE_SPEC_REFERENCE: &str =
+    "docs/specs/fleet-release-machine.md@41cb2be4#precheck-detectors-v1";
 
 macro_rules! opaque_identifier {
     ($name:ident, $description:literal) => {

@@ -25,6 +25,12 @@ const PHASE_TYPES: &[&str] = &[
     "assets",
     "stage",
     "notify",
+    crate::phases::precheck::FORMAT_DIRTY,
+    crate::phases::precheck::STALE_RESIDUE,
+    crate::phases::precheck::SIBLING_DRIFT,
+    crate::phases::precheck::CONTEXT_FITNESS,
+    crate::phases::precheck::TOOL_PINNING,
+    crate::phases::precheck::RESIDUE_SWEEP,
 ];
 const IDENTITY_CHANNELS: &[&str] = &[
     "tag_at_commit",
@@ -477,6 +483,14 @@ fn validate_phase_parameters(
             "params",
         )
     })?;
+    if let Err(message) = crate::phases::precheck::validate_parameters(phase) {
+        return Err(refusal(
+            DeclarationRefusalCode::InvalidPhaseParameters,
+            format!("phase `{}` has invalid parameters: {message}", phase.id),
+            source,
+            "params",
+        ));
+    }
     if phase.phase_type == "ci_watch" {
         let workflow = params.get("workflow").and_then(Value::as_str);
         let selector = params.get("selector").and_then(Value::as_str);

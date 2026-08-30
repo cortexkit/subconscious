@@ -36,9 +36,18 @@ impl PhaseRegistry {
     /// Returns the execution class for one supported phase type.
     pub fn classify(&self, phase_type: &str) -> Option<PhaseClass> {
         match phase_type {
-            "preflight" | "gates_local" | "ci_watch" | "build" | "stamp" | "verify_readback" => {
-                Some(PhaseClass::RefusalCapable)
-            }
+            "preflight"
+            | "gates_local"
+            | "ci_watch"
+            | "build"
+            | "stamp"
+            | "verify_readback"
+            | crate::phases::precheck::FORMAT_DIRTY
+            | crate::phases::precheck::STALE_RESIDUE
+            | crate::phases::precheck::SIBLING_DRIFT
+            | crate::phases::precheck::CONTEXT_FITNESS
+            | crate::phases::precheck::TOOL_PINNING
+            | crate::phases::precheck::RESIDUE_SWEEP => Some(PhaseClass::RefusalCapable),
             "tag" | "publish" | "assets" => Some(PhaseClass::Irreversible),
             "stage" | "notify" => Some(PhaseClass::PostBoundary),
             _ => None,
@@ -75,9 +84,53 @@ impl PhaseRegistry {
     }
 }
 
+/// Stable refusal codes emitted by declared precheck detectors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrecheckRefusalCode {
+    PrecheckDirty,
+    StaleRunResidue,
+    EnvDrift,
+    ContextUnfit,
+    ToolUnpinned,
+    ToolMismatch,
+    ResiduePresent,
+}
+
+impl std::fmt::Display for PrecheckRefusalCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = match self {
+            Self::PrecheckDirty => "PRECHECK_DIRTY",
+            Self::StaleRunResidue => "STALE_RUN_RESIDUE",
+            Self::EnvDrift => "ENV_DRIFT",
+            Self::ContextUnfit => "CONTEXT_UNFIT",
+            Self::ToolUnpinned => "TOOL_UNPINNED",
+            Self::ToolMismatch => "TOOL_MISMATCH",
+            Self::ResiduePresent => "RESIDUE_PRESENT",
+        };
+        formatter.write_str(code)
+    }
+}
+
+/// A typed local phase result kept distinct from an infrastructure seam failure.
+#[derive(Debug)]
+pub enum PhaseExecutionError {
+    Refusal {
+        code: PrecheckRefusalCode,
+        phase: PhaseInstanceId,
+        message: String,
+    },
+    Seam(SeamError),
+}
+
+impl From<SeamError> for PhaseExecutionError {
+    fn from(error: SeamError) -> Self {
+        Self::Seam(error)
+    }
+}
+
 /// Executes a registered non-public phase instance in declaration order.
 pub trait PhaseRunner {
-    fn run(&mut self, phase: &PlannedPhase) -> Result<(), SeamError>;
+    fn run(&mut self, phase: &PlannedPhase) -> Result<(), PhaseExecutionError>;
 }
 
 /// Requests the one operator confirmation that admits the public-effect list.
@@ -124,6 +177,12 @@ pub enum OrchestrationError {
     Approval(#[from] crate::approval::ApprovalError),
     #[error("publication admission failed: {0}")]
     Executor(#[from] ExecutorError),
+    #[error("{code}: {message}")]
+    PrecheckRefusal {
+        code: PrecheckRefusalCode,
+        phase: PhaseInstanceId,
+        message: String,
+    },
     #[error("phase or provider seam failed: {0}")]
     Seam(#[from] SeamError),
 }
@@ -228,7 +287,18 @@ impl Orchestrator {
                 PhaseClass::RefusalCapable | PhaseClass::PostBoundary => runner
                     .run(phase)
                     .map(|()| Vec::new())
-                    .map_err(OrchestrationError::from),
+                    .map_err(|error| match error {
+                        PhaseExecutionError::Refusal {
+                            code,
+                            phase,
+                            message,
+                        } => OrchestrationError::PrecheckRefusal {
+                            code,
+                            phase,
+                            message,
+                        },
+                        PhaseExecutionError::Seam(error) => OrchestrationError::Seam(error),
+                    }),
                 PhaseClass::Irreversible => (|| {
                     let subject = approval.get_or_insert_with(|| {
                         build_approval_subject(plan)
@@ -502,6 +572,8 @@ fn completion_exists(
         | JournalRecord::PhaseEntered { .. }
         | JournalRecord::PhaseDone { .. }
         | JournalRecord::Refused { .. }
+        | JournalRecord::WorkingTreeMutation { .. }
+        | JournalRecord::ResidueSwept { .. }
         | JournalRecord::Terminalized { .. } => false,
     }))
 }

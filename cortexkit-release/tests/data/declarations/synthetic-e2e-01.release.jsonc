@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "trains": [{
+    "id": "synthetic",
+    "intended_commit": "abc123",
+    "tag": "v1.0.0",
+    "signing_profile": "none",
+    "operator_gates": ["first_public_trigger"],
+    "artifacts": [{
+      "id": "archive",
+      "kind": "archive",
+      "identity_channel": "asset_sha256"
+    }],
+    "phases": [
+      {"id": "preflight", "type": "preflight"},
+      {"id": "publish-assets", "type": "assets"}
+    ]
+  }]
+}

@@ -1,0 +1,5 @@
+{
+  // Version 2 is deliberately unsupported by the v1 reader.
+  "version": 2,
+  "trains": []
+}

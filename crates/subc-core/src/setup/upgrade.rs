@@ -731,15 +731,20 @@ fn process_id() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::{
         process,
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    #[cfg(unix)]
     use serde_json::Map;
 
     use super::*;
 
+    // Used only by the unix-gated tests below; gate it with them so windows
+    // clippy under -D warnings does not read it as dead code.
+    #[cfg(unix)]
     fn fixture_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

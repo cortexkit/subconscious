@@ -9,6 +9,10 @@
 //! closed sets in Rust enums.
 
 pub mod declaration;
+pub mod provider;
+pub mod phases {
+    pub mod ci_watch;
+}
 
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};

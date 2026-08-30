@@ -4579,25 +4579,11 @@ async fn run_raw_provider(
 }
 
 fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_owned(),
-        module_version: "0.0.0-raw-test".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: vec![ProviderTool {
-                name: tool_name.to_owned(),
-                description: None,
-                execution_mode: ExecutionMode::Pure,
-                schema: json!({"type": "object"}),
-            }],
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: true,
-            sub_supervises: true,
-        }],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        module_id,
+        "0.0.0-raw-test",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -4609,10 +4595,20 @@ fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .provides(vec![ProviderRole::ToolProvider {
+        tools: vec![ProviderTool {
+            name: tool_name.to_owned(),
+            description: None,
+            execution_mode: ExecutionMode::Pure,
+            schema: json!({"type": "object"}),
+        }],
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: true,
+        sub_supervises: true,
+    }])
+    .build()
 }
 
 async fn read_len_prefixed_json<R, T>(reader: &mut R, max_len: u32) -> Result<Option<T>, String>

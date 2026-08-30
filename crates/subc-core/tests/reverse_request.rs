@@ -1010,25 +1010,11 @@ fn control_flags() -> Flags {
 }
 
 fn tool_provider_manifest(module_id: &str, concurrency: Concurrency) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: "0.0.0-reverse-test".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "read".to_string(),
-                description: None,
-                execution_mode: ExecutionMode::Pure,
-                schema: serde_json::json!({"type": "object"}),
-            }],
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency,
-            emits_push: true,
-            sub_supervises: true,
-        }],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        module_id,
+        "0.0.0-reverse-test",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -1040,10 +1026,20 @@ fn tool_provider_manifest(module_id: &str, concurrency: Concurrency) -> ModuleMa
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .provides(vec![ProviderRole::ToolProvider {
+        tools: vec![Tool {
+            name: "read".to_string(),
+            description: None,
+            execution_mode: ExecutionMode::Pure,
+            schema: serde_json::json!({"type": "object"}),
+        }],
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency,
+        emits_push: true,
+        sub_supervises: true,
+    }])
+    .build()
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {

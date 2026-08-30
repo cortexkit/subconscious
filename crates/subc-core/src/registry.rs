@@ -279,14 +279,11 @@ mod path_hazard_tests {
     };
 
     fn manifest(module_id: &str) -> ModuleManifest {
-        ModuleManifest {
-            module_id: module_id.to_string(),
-            module_version: "0.1.0".to_string(),
-            protocol_ver: 1,
-            trust_tier: TrustTier::FirstParty,
-            provides: Vec::new(),
-            consumes: Vec::new(),
-            bindings: Bindings {
+        ModuleManifest::builder(
+            module_id,
+            "0.1.0",
+            TrustTier::FirstParty,
+            Bindings {
                 storage: StorageBinding {
                     kind: StorageKind::Sqlite,
                     scope: StorageScope::Project,
@@ -298,10 +295,9 @@ mod path_hazard_tests {
                     optional: Vec::new(),
                 },
             },
-            capabilities: None,
-            self_signals: None,
-            provenance: None,
-        }
+        )
+        .protocol_ver(1)
+        .build()
     }
 
     #[test]

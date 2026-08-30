@@ -1970,18 +1970,14 @@ fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
 }
 
 fn supervision_manifest(module_id: String) -> ModuleManifest {
-    ModuleManifest {
+    ModuleManifest::builder(
         module_id,
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: Vec::new(),
-        consumes: vec![ConsumerRole::ToolClient { of: Vec::new() }],
-        bindings: supervision_bindings(),
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+        env!("CARGO_PKG_VERSION"),
+        TrustTier::FirstParty,
+        supervision_bindings(),
+    )
+    .consumes(vec![ConsumerRole::ToolClient { of: Vec::new() }])
+    .build()
 }
 
 fn supervision_bindings() -> Bindings {

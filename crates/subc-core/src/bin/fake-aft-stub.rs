@@ -1288,14 +1288,11 @@ fn manifest(
     tools: &[String],
     capabilities: Option<CapabilityDeclarations>,
 ) -> subc_protocol::manifest::ModuleManifest {
-    subc_protocol::manifest::ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: "0.0.0-fake".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![provider_role(role, concurrency, tools)],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    subc_protocol::manifest::ModuleManifest::builder(
+        module_id,
+        "0.0.0-fake",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -1307,10 +1304,11 @@ fn manifest(
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities,
-        self_signals: None,
-        provenance: manifest_provenance(),
-    }
+    )
+    .provides(vec![provider_role(role, concurrency, tools)])
+    .capabilities(capabilities)
+    .provenance(manifest_provenance())
+    .build()
 }
 
 fn manifest_provenance() -> Option<ManifestProvenance> {

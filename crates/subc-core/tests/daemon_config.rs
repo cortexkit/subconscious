@@ -1493,14 +1493,11 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
 }
 
 fn untrusted_hello_frame(module_id: &str, corr: u64) -> Frame {
-    let manifest = ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: "0.0.0-test".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: Vec::new(),
-        consumes: Vec::new(),
-        bindings: Bindings {
+    let manifest = ModuleManifest::builder(
+        module_id,
+        "0.0.0-test",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -1512,10 +1509,8 @@ fn untrusted_hello_frame(module_id: &str, corr: u64) -> Frame {
                 optional: vec![IdentityScope::Project],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    };
+    )
+    .build();
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,

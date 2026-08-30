@@ -100,6 +100,12 @@ impl JournalStore {
             .join(format!("{}.journal", self.identity.file_stem()))
     }
 
+    /// Returns the directory containing durable output artifacts for this train journal.
+    pub fn evidence_dir(&self) -> PathBuf {
+        self.repository_dir()
+            .join(format!("{}.evidence", self.identity.file_stem()))
+    }
+
     /// Returns the append-only write-ahead intent stream path.
     pub fn intent_path(&self) -> PathBuf {
         self.repository_dir()
@@ -176,6 +182,7 @@ impl JournalStore {
                 | JournalRecord::Refused { .. }
                 | JournalRecord::WorkingTreeMutation { .. }
                 | JournalRecord::ResidueSwept { .. }
+                | JournalRecord::LocalCommandAttempt { .. }
                 | JournalRecord::Terminalized { .. } => {}
             }
         }
@@ -240,6 +247,7 @@ impl JournalStore {
                 | JournalRecord::Refused { .. }
                 | JournalRecord::WorkingTreeMutation { .. }
                 | JournalRecord::ResidueSwept { .. }
+                | JournalRecord::LocalCommandAttempt { .. }
                 | JournalRecord::Completion { .. } => None,
             }))
     }
@@ -392,6 +400,7 @@ impl JournalStore {
                     | JournalRecord::Refused { .. }
                     | JournalRecord::WorkingTreeMutation { .. }
                     | JournalRecord::ResidueSwept { .. }
+                    | JournalRecord::LocalCommandAttempt { .. }
                     | JournalRecord::Terminalized { .. } => false,
                 })
             })
@@ -455,6 +464,14 @@ pub enum JournalRecord {
     Refused {
         phase: PhaseInstanceId,
         reason: String,
+    },
+    /// One completed local-command attempt with its captured output artifact.
+    LocalCommandAttempt {
+        phase: PhaseInstanceId,
+        attempt: u64,
+        exit_code: Option<i32>,
+        output_path: PathBuf,
+        load_class: String,
     },
     /// Paths changed by this train, used to distinguish live work from stale dirt.
     WorkingTreeMutation {

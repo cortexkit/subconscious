@@ -514,7 +514,10 @@ impl<'a> PrecheckRunner<'a> {
 }
 
 impl PhaseRunner for PrecheckRunner<'_> {
-    fn run(&mut self, phase: &PlannedPhase) -> Result<(), PhaseExecutionError> {
+    fn run(
+        &mut self,
+        phase: &PlannedPhase,
+    ) -> Result<Vec<crate::ProbeEvidence>, PhaseExecutionError> {
         match phase.phase_type.as_str() {
             FORMAT_DIRTY => self.run_format_dirty(phase),
             STALE_RESIDUE => self.run_stale_residue(phase),
@@ -524,6 +527,7 @@ impl PhaseRunner for PrecheckRunner<'_> {
             RESIDUE_SWEEP => self.run_residue_sweep(phase),
             _ => Ok(()),
         }
+        .map(|()| Vec::new())
     }
 }
 

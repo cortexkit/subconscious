@@ -18,6 +18,7 @@ pub mod lease;
 pub mod orchestrator;
 pub mod phases {
     pub mod ci_watch;
+    pub mod command;
     pub mod precheck;
 }
 pub mod plan;

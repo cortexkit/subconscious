@@ -130,7 +130,8 @@ impl From<SeamError> for PhaseExecutionError {
 
 /// Executes a registered non-public phase instance in declaration order.
 pub trait PhaseRunner {
-    fn run(&mut self, phase: &PlannedPhase) -> Result<(), PhaseExecutionError>;
+    /// Returns the durable evidence produced by the completed local phase.
+    fn run(&mut self, phase: &PlannedPhase) -> Result<Vec<ProbeEvidence>, PhaseExecutionError>;
 }
 
 /// Requests the one operator confirmation that admits the public-effect list.
@@ -286,7 +287,7 @@ impl Orchestrator {
             let phase_result = match class {
                 PhaseClass::RefusalCapable | PhaseClass::PostBoundary => runner
                     .run(phase)
-                    .map(|()| Vec::new())
+                    .map(|evidence| (Vec::new(), evidence))
                     .map_err(|error| match error {
                         PhaseExecutionError::Refusal {
                             code,
@@ -327,32 +328,31 @@ impl Orchestrator {
                             &durable_approval.subject,
                         )?);
                     }
-                    Ok(phase_outcomes)
+                    Ok((phase_outcomes, Vec::new()))
                 })(),
             };
 
             let phase_result = match (phase_result, repository_lease) {
-                (result, Some(lease)) => result.and_then(|outcomes| {
+                (result, Some(lease)) => result.and_then(|phase_result| {
                     lease.release()?;
-                    Ok(outcomes)
+                    Ok(phase_result)
                 }),
                 (result, None) => result,
             };
 
             match phase_result {
-                Ok(phase_outcomes) => {
+                Ok((phase_outcomes, mut evidence)) => {
                     let awaiting_probe = phase_outcomes
                         .iter()
                         .any(|outcome| matches!(outcome, EffectOutcome::AwaitingProbe));
                     if !awaiting_probe {
-                        let evidence = phase_outcomes
-                            .iter()
-                            .filter_map(|outcome| match outcome {
+                        evidence.extend(phase_outcomes.iter().filter_map(
+                            |outcome| match outcome {
                                 EffectOutcome::Executed(evidence)
                                 | EffectOutcome::Reconciled(evidence) => Some(evidence.clone()),
                                 EffectOutcome::AwaitingProbe => None,
-                            })
-                            .collect();
+                            },
+                        ));
                         journal.append_journal(JournalRecord::PhaseDone {
                             phase: phase.instance.clone(),
                             evidence,
@@ -574,6 +574,7 @@ fn completion_exists(
         | JournalRecord::Refused { .. }
         | JournalRecord::WorkingTreeMutation { .. }
         | JournalRecord::ResidueSwept { .. }
+        | JournalRecord::LocalCommandAttempt { .. }
         | JournalRecord::Terminalized { .. } => false,
     }))
 }

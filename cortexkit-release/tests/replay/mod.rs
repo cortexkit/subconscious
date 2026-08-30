@@ -410,9 +410,9 @@ impl Trace {
 struct RecordingRunner(Trace);
 
 impl PhaseRunner for RecordingRunner {
-    fn run(&mut self, phase: &PlannedPhase) -> Result<(), PhaseExecutionError> {
+    fn run(&mut self, phase: &PlannedPhase) -> Result<Vec<ProbeEvidence>, PhaseExecutionError> {
         self.0.push(phase.instance.to_string());
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -648,7 +648,7 @@ fn irreversible_tree_mutating_phase_requires_repository_lease() {
 struct RefusingRunner;
 
 impl PhaseRunner for RefusingRunner {
-    fn run(&mut self, phase: &PlannedPhase) -> Result<(), PhaseExecutionError> {
+    fn run(&mut self, phase: &PlannedPhase) -> Result<Vec<ProbeEvidence>, PhaseExecutionError> {
         Err(SeamError::new(format!("{} refused its precondition", phase.instance)).into())
     }
 }

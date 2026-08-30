@@ -1,0 +1,420 @@
+//! Ordered phase execution and durable irreversible-effect reconciliation.
+//!
+//! The registry is intentionally machine-owned: declarations select an instance
+//! of a supported phase but cannot supply implementation code.  Reconciliation
+//! probes before every public effect, including effects already marked complete,
+//! because provider evidence is authoritative over local journal history.
+
+use crate::{
+    approval::{build_approval_subject, ApprovalStore, ApprovalSubject},
+    lease::LeaseStore,
+    plan::{PlannedPhase, PublicEffect, ReleasePlan},
+    state::{IntentRecord, JournalRecord, JournalStore, PendingIntent},
+    ApprovalToken, ArtifactDigest, ArtifactId, CompletionProbe, EffectRequest,
+    IrreversibleExecutor, OperationId, PhaseInstanceId, ProbeEvidence, ProbeResult, SeamError,
+};
+use std::collections::HashSet;
+use thiserror::Error;
+
+/// The only execution classes accepted by the machine-owned phase registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhaseClass {
+    /// A phase that may refuse and must have its first execution before publication.
+    RefusalCapable,
+    /// A phase that performs one or more irreversible public effects.
+    Irreversible,
+    /// A phase allowed after publication because it only performs admitted work or bookkeeping.
+    PostBoundary,
+}
+
+/// A closed registry that classifies all declaration-supported phase types.
+#[derive(Clone, Debug, Default)]
+pub struct PhaseRegistry;
+
+impl PhaseRegistry {
+    /// Returns the execution class for one supported phase type.
+    pub fn classify(&self, phase_type: &str) -> Option<PhaseClass> {
+        match phase_type {
+            "preflight" | "gates_local" | "ci_watch" | "build" | "stamp" | "verify_readback" => {
+                Some(PhaseClass::RefusalCapable)
+            }
+            "tag" | "publish" | "assets" => Some(PhaseClass::Irreversible),
+            "stage" | "notify" => Some(PhaseClass::PostBoundary),
+            _ => None,
+        }
+    }
+
+    /// Rejects an unregistered phase and unsafe first-run ordering before execution begins.
+    pub fn validate_plan(&self, plan: &ReleasePlan) -> Result<(), OrchestrationError> {
+        let mut irreversible_phase: Option<&PhaseInstanceId> = None;
+        for phase in &plan.phases {
+            let class = self.classify(&phase.phase_type).ok_or_else(|| {
+                OrchestrationError::refusal(
+                    OrchestrationRefusalCode::UnknownPhase,
+                    Some(phase.instance.clone()),
+                    format!("phase type `{}` is not registered", phase.phase_type),
+                )
+            })?;
+            match (irreversible_phase.as_ref(), class) {
+                (Some(earlier), PhaseClass::RefusalCapable) => {
+                    return Err(OrchestrationError::refusal(
+                        OrchestrationRefusalCode::UnsafeOrdering,
+                        Some(phase.instance.clone()),
+                        format!(
+                            "refusal-capable phase `{}` first executes after irreversible phase `{earlier}`",
+                            phase.instance
+                        ),
+                    ));
+                }
+                (None, PhaseClass::Irreversible) => irreversible_phase = Some(&phase.instance),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Executes a registered non-public phase instance in declaration order.
+pub trait PhaseRunner {
+    fn run(&mut self, phase: &PlannedPhase) -> Result<(), SeamError>;
+}
+
+/// Requests the one operator confirmation that admits the public-effect list.
+pub trait FirstPublicTriggerGate {
+    fn confirm(&mut self, subject: &ApprovalSubject) -> Result<ApprovalToken, SeamError>;
+}
+
+/// Durable result for one public effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectOutcome {
+    /// A first attempt was admitted, journaled, and completed.
+    Executed(ProbeEvidence),
+    /// A probe established that an existing effect is complete without invoking the executor.
+    Reconciled(ProbeEvidence),
+    /// The provider cannot yet decide, so resume must probe again before any call.
+    AwaitingProbe,
+}
+
+/// Typed refusals and failures returned by the orchestrator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrchestrationRefusalCode {
+    UnknownPhase,
+    UnsafeOrdering,
+    AttemptedIntentAbsent,
+    ContradictoryEvidence,
+    MissingPublicEffect,
+}
+
+/// An execution failure that does not erase the durable intent needed for replay.
+#[derive(Debug, Error)]
+pub enum OrchestrationError {
+    #[error("{code:?}: {message}")]
+    Refusal {
+        code: OrchestrationRefusalCode,
+        phase: Option<PhaseInstanceId>,
+        message: String,
+    },
+    #[error("lease failure: {0}")]
+    Lease(#[from] crate::lease::LeaseError),
+    #[error("journal failure: {0}")]
+    State(#[from] crate::state::StateError),
+    #[error("approval failure: {0}")]
+    Approval(#[from] crate::approval::ApprovalError),
+    #[error("phase or provider seam failed: {0}")]
+    Seam(#[from] SeamError),
+}
+
+impl OrchestrationError {
+    fn refusal(
+        code: OrchestrationRefusalCode,
+        phase: Option<PhaseInstanceId>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Refusal {
+            code,
+            phase,
+            message: message.into(),
+        }
+    }
+}
+
+/// Executes a validated plan through the closed registry.
+#[derive(Clone, Debug, Default)]
+pub struct Orchestrator {
+    registry: PhaseRegistry,
+}
+
+impl Orchestrator {
+    pub fn new(registry: PhaseRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn registry(&self) -> &PhaseRegistry {
+        &self.registry
+    }
+
+    /// Runs phase instances in declaration order while holding the train lease.
+    ///
+    /// Tree-mutating phases additionally hold the repository lease.  The operator
+    /// gate is requested and persisted before the first irreversible effect; this
+    /// API has no placement operation or placement-confirmation path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute<R, G, P, E>(
+        &self,
+        plan: &ReleasePlan,
+        leases: &LeaseStore,
+        journal: &JournalStore,
+        approvals: &ApprovalStore,
+        runner: &mut R,
+        gate: &mut G,
+        probe: &mut P,
+        executor: &mut E,
+    ) -> Result<Vec<EffectOutcome>, OrchestrationError>
+    where
+        R: PhaseRunner,
+        G: FirstPublicTriggerGate,
+        P: CompletionProbe,
+        E: IrreversibleExecutor,
+    {
+        self.registry.validate_plan(plan)?;
+        let train_lease = leases.acquire_train(plan.repository.clone(), plan.train.clone())?;
+        let mut outcomes = Vec::new();
+        let mut approval: Option<ApprovalSubject> = None;
+
+        for phase in &plan.phases {
+            match self
+                .registry
+                .classify(&phase.phase_type)
+                .expect("validated registry phase must remain registered")
+            {
+                PhaseClass::RefusalCapable | PhaseClass::PostBoundary => {
+                    if phase.tree_mutating {
+                        let repository_lease =
+                            leases.acquire_repository(plan.repository.clone())?;
+                        runner.run(phase)?;
+                        repository_lease.release()?;
+                    } else {
+                        runner.run(phase)?;
+                    }
+                }
+                PhaseClass::Irreversible => {
+                    let subject = approval.get_or_insert_with(|| {
+                        build_approval_subject(plan)
+                            .expect("a plan with an irreversible phase has a public trigger")
+                    });
+                    let approval_record = match approvals.require_current(subject) {
+                        Ok(record) => record,
+                        Err(crate::approval::ApprovalError::NoCurrentApproval)
+                        | Err(crate::approval::ApprovalError::SubjectMismatch) => {
+                            approvals.invalidate_if_stale(subject)?;
+                            let token = gate.confirm(subject)?;
+                            approvals.persist_confirmed(subject.clone(), token)?
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    let _token = approval_record.token;
+                    for effect in effects_for_phase(plan, &phase.instance) {
+                        outcomes.push(reconcile_effect(
+                            plan, journal, &effect, probe, executor, subject,
+                        )?);
+                    }
+                }
+            }
+        }
+        train_lease.release()?;
+        Ok(outcomes)
+    }
+}
+
+/// Reconciles or admits exactly one irreversible effect.
+///
+/// The executor is reachable only from the never-attempted + authoritative-absent
+/// matrix cell.  Existing intents, including completed journal history, always
+/// force a done-probe instead of allowing a duplicate call.
+pub fn reconcile_effect<P, E>(
+    plan: &ReleasePlan,
+    journal: &JournalStore,
+    effect: &PublicEffect,
+    probe: &mut P,
+    executor: &mut E,
+    approval_subject: &ApprovalSubject,
+) -> Result<EffectOutcome, OrchestrationError>
+where
+    P: CompletionProbe,
+    E: IrreversibleExecutor,
+{
+    let request = effect_request(plan, effect)?;
+    let expected_identity = expected_identity(plan, effect)?;
+    let attempted = attempted_intent(journal, &request)?;
+    let completed = completion_exists(journal, &request)?;
+
+    match probe.probe(&request)? {
+        ProbeResult::Present(evidence) => {
+            ensure_matching_evidence(&request, &expected_identity, &evidence)?;
+            if let Some(intent) = attempted {
+                journal.append_completion(&intent, evidence.clone())?;
+            }
+            Ok(EffectOutcome::Reconciled(evidence))
+        }
+        ProbeResult::Undecidable(_) => Ok(EffectOutcome::AwaitingProbe),
+        ProbeResult::Absent(evidence) => {
+            if completed {
+                return Err(OrchestrationError::refusal(
+                    OrchestrationRefusalCode::ContradictoryEvidence,
+                    Some(request.phase.clone()),
+                    format!(
+                        "done-probe reports `{}` absent although journal records its completion",
+                        request.operation
+                    ),
+                ));
+            }
+            if attempted.is_some() {
+                return Err(OrchestrationError::refusal(
+                    OrchestrationRefusalCode::AttemptedIntentAbsent,
+                    Some(request.phase.clone()),
+                    format!(
+                        "attempted operation `{}` is authoritatively absent; operator recovery is required",
+                        request.operation
+                    ),
+                ));
+            }
+            ensure_matching_evidence(&request, &expected_identity, &evidence)?;
+            let intent =
+                journal.append_intent(&request, durable_approval_subject(approval_subject))?;
+            let evidence = executor.execute(&request)?;
+            ensure_matching_evidence(&request, &expected_identity, &evidence)?;
+            journal.append_completion(&intent, evidence.clone())?;
+            Ok(EffectOutcome::Executed(evidence))
+        }
+    }
+}
+
+fn durable_approval_subject(subject: &ApprovalSubject) -> crate::ApprovalSubject {
+    crate::ApprovalSubject {
+        repository: subject.repository.clone(),
+        train: subject.train.clone(),
+        intended_commit: subject.intended_commit.clone(),
+        declaration_digest: subject.declaration_digest.clone(),
+        artifact_digests: subject
+            .artifacts
+            .iter()
+            .map(|artifact| ArtifactDigest {
+                artifact: artifact.artifact.clone(),
+                digest: artifact.digest.clone(),
+            })
+            .collect(),
+        public_effects: subject
+            .public_effects
+            .iter()
+            .map(|effect| effect.operation.clone())
+            .collect(),
+    }
+}
+
+fn effects_for_phase(plan: &ReleasePlan, phase: &PhaseInstanceId) -> Vec<PublicEffect> {
+    plan.public_effects
+        .iter()
+        .filter(|effect| effect.phase == *phase)
+        .cloned()
+        .collect()
+}
+
+fn effect_request(
+    plan: &ReleasePlan,
+    effect: &PublicEffect,
+) -> Result<EffectRequest, OrchestrationError> {
+    let artifact = effect
+        .artifact
+        .clone()
+        .unwrap_or_else(|| ArtifactId::new("tag"));
+    Ok(EffectRequest {
+        repository: plan.repository.clone(),
+        train: plan.train.clone(),
+        phase: effect.phase.clone(),
+        artifact,
+        operation: effect.operation.clone(),
+        intended_commit: plan.intended_commit.clone(),
+        declaration_digest: plan.declaration_digest.clone(),
+    })
+}
+
+fn expected_identity(
+    plan: &ReleasePlan,
+    effect: &PublicEffect,
+) -> Result<String, OrchestrationError> {
+    match &effect.artifact {
+        Some(artifact) => plan
+            .artifacts
+            .iter()
+            .find(|candidate| candidate.artifact == *artifact)
+            .map(|artifact| artifact.identity.clone())
+            .ok_or_else(|| {
+                OrchestrationError::refusal(
+                    OrchestrationRefusalCode::MissingPublicEffect,
+                    Some(effect.phase.clone()),
+                    format!(
+                        "public effect `{}` references an unknown artifact",
+                        effect.operation
+                    ),
+                )
+            }),
+        None => Ok(plan.intended_commit.to_string()),
+    }
+}
+
+fn attempted_intent(
+    journal: &JournalStore,
+    request: &EffectRequest,
+) -> Result<Option<PendingIntent>, OrchestrationError> {
+    Ok(journal
+        .read_intents()?
+        .into_iter()
+        .map(|record| match record {
+            IntentRecord::Pending(intent) => intent,
+        })
+        .find(|intent| intent_matches(intent, request)))
+}
+
+fn completion_exists(
+    journal: &JournalStore,
+    request: &EffectRequest,
+) -> Result<bool, OrchestrationError> {
+    Ok(journal.read_journal()?.iter().any(|record| match record {
+        JournalRecord::Completion { intent, .. } => intent_matches(intent, request),
+    }))
+}
+
+fn intent_matches(intent: &PendingIntent, request: &EffectRequest) -> bool {
+    intent.train == request.train
+        && intent.phase == request.phase
+        && intent.artifact == request.artifact
+        && intent.operation == request.operation
+        && intent.intended_commit == request.intended_commit
+        && intent.declaration_digest == request.declaration_digest
+}
+
+fn ensure_matching_evidence(
+    request: &EffectRequest,
+    expected_identity: &str,
+    evidence: &ProbeEvidence,
+) -> Result<(), OrchestrationError> {
+    if evidence.identity == expected_identity {
+        return Ok(());
+    }
+    Err(OrchestrationError::refusal(
+        OrchestrationRefusalCode::ContradictoryEvidence,
+        Some(request.phase.clone()),
+        format!(
+            "operation `{}` expected identity `{expected_identity}`, observed `{}`",
+            request.operation, evidence.identity
+        ),
+    ))
+}
+
+/// Returns the public operations that can ever be admitted by this module.
+pub fn admitted_operations(plan: &ReleasePlan) -> HashSet<OperationId> {
+    plan.public_effects
+        .iter()
+        .map(|effect| effect.operation.clone())
+        .collect()
+}

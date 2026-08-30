@@ -160,7 +160,7 @@ mod tests {
             &mut SuccessfulRunner,
             &mut inventory,
             &config,
-            &[store.clone()],
+            std::slice::from_ref(&store),
         )
         .expect("uninstall");
         assert!(!managed.exists());

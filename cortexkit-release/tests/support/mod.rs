@@ -9,8 +9,9 @@
 #![allow(dead_code)]
 
 use cortexkit_release::{
-    ApprovalGate, ApprovalSubject, ApprovalToken, CompletionProbe, DurableState, DurableWrite,
-    EffectRequest, IrreversibleExecutor, ProbeEvidence, ProbeResult, SeamError,
+    executor::AdmittedEffect, ApprovalGate, ApprovalSubject, ApprovalToken, CompletionProbe,
+    DurableState, DurableWrite, EffectRequest, IrreversibleExecutor, ProbeEvidence, ProbeResult,
+    SeamError,
 };
 use std::{
     collections::VecDeque,
@@ -413,7 +414,8 @@ impl RecordingExecutor {
 }
 
 impl IrreversibleExecutor for RecordingExecutor {
-    fn execute(&mut self, request: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, admitted: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
+        let request = admitted.effect();
         self.recorder.record(RecordedCall::Execute(request.clone()));
         let outcome = self
             .outcomes
@@ -558,6 +560,9 @@ fn command_result(output: Output) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use cortexkit_release::{
+        approval::{ApprovalSubject as PlanApprovalSubject, ApprovedArtifact},
+        artifact::artifact_digest,
+        plan::{FinalizedArtifact, PublicEffect, ReleaseIdentity},
         ArtifactId, CommitId, DeclarationDigest, EffectRequest, OperationId, PhaseInstanceId,
         RepositoryId, TrainId,
     };
@@ -632,7 +637,35 @@ mod tests {
             ProbeResult::Absent(_)
         ));
         durable.append(&write).unwrap();
-        executor.execute(&operation).unwrap();
+        let planned_effect = PublicEffect {
+            phase: operation.phase.clone(),
+            operation: operation.operation.clone(),
+            artifact: Some(operation.artifact.clone()),
+        };
+        let admitted = AdmittedEffect::new_unfenced_for_tests(
+            operation.clone(),
+            &planned_effect,
+            Some(FinalizedArtifact {
+                artifact: operation.artifact.clone(),
+                identity: "abc123".to_owned(),
+                bytes: b"fake final bytes".to_vec(),
+            }),
+            PlanApprovalSubject {
+                repository: operation.repository.clone(),
+                train: operation.train.clone(),
+                intended_commit: operation.intended_commit.clone(),
+                declaration_digest: operation.declaration_digest.clone(),
+                artifacts: vec![ApprovedArtifact {
+                    artifact: operation.artifact.clone(),
+                    identity: "abc123".to_owned(),
+                    digest: artifact_digest(b"fake final bytes"),
+                }],
+                version_or_run_id: ReleaseIdentity::RunId("test-run".to_owned()),
+                public_effects: vec![planned_effect.clone()],
+            },
+        )
+        .unwrap();
+        executor.execute(&admitted).unwrap();
 
         recorder.assert_call_order(&[
             RecordedCall::Probe(operation.clone()),

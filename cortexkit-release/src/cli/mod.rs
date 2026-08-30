@@ -14,6 +14,7 @@ use crate::{
     declaration::{
         self, DeclarationError, DeclarationRefusalCode, ParsedDeclaration, TrainDeclaration,
     },
+    executor::AdmittedEffect,
     lease::LeaseError,
     orchestrator::{
         EffectOutcome, FirstPublicTriggerGate, OrchestrationError, OrchestrationRefusalCode,
@@ -836,8 +837,11 @@ fn phase_state(
         .into_iter()
         .filter_map(|record| match record {
             JournalRecord::Completion { intent, .. } => Some(intent.phase.to_string()),
+            JournalRecord::PhaseDone { phase, .. } => Some(phase.to_string()),
             JournalRecord::DeclarationPinned { .. }
             | JournalRecord::DeclarationRebound { .. }
+            | JournalRecord::PhaseEntered { .. }
+            | JournalRecord::Refused { .. }
             | JournalRecord::Terminalized { .. } => None,
         })
         .collect::<BTreeSet<_>>();
@@ -1049,8 +1053,9 @@ impl CompletionProbe for SyntheticProvider {
 }
 
 impl IrreversibleExecutor for SyntheticProvider {
-    fn execute(&mut self, request: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, admitted: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
         self.calls += 1;
+        let request = admitted.effect();
         let expected_identity = self.expected_identity(request)?;
         if let Some(effect) = self.read_effect(request)? {
             return Ok(ProbeEvidence {
@@ -1157,6 +1162,7 @@ fn map_state_error(command: &str, error: StateError) -> CliFailure {
         StateError::DeclarationBindingChanged { .. } => "declaration_binding_changed",
         StateError::DeclarationDigestUnchanged { .. } => "declaration_digest_unchanged",
         StateError::TrainTerminal { .. } => "train_terminal",
+        StateError::ExecutorAdmission(_) => "approval_binding",
         StateError::Executor(_) => "executor_failure",
     };
     CliFailure::refusal(command, code, error.to_string())
@@ -1226,6 +1232,9 @@ fn map_orchestration_error(command: &str, error: OrchestrationError) -> CliFailu
         OrchestrationError::Lease(error) => map_lease_error(command, error),
         OrchestrationError::State(error) => map_state_error(command, error),
         OrchestrationError::Approval(error) => map_approval_error(command, error),
+        OrchestrationError::Executor(error) => {
+            CliFailure::refusal(command, "approval_binding", error.to_string())
+        }
         OrchestrationError::Seam(error) => map_seam_error(command, error),
     }
 }

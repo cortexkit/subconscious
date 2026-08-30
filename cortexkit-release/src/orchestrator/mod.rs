@@ -7,11 +7,12 @@
 
 use crate::{
     approval::{build_approval_subject, ApprovalStore, ApprovalSubject},
+    executor::{AdmittedEffect, ExecutorError},
     lease::LeaseStore,
     plan::{PlannedPhase, PublicEffect, ReleasePlan},
     state::{IntentRecord, JournalRecord, JournalStore, PendingIntent, StateError},
-    ApprovalToken, ArtifactDigest, ArtifactId, CompletionProbe, EffectRequest,
-    IrreversibleExecutor, OperationId, PhaseInstanceId, ProbeEvidence, ProbeResult, SeamError,
+    ApprovalToken, ArtifactId, CompletionProbe, EffectRequest, IrreversibleExecutor, OperationId,
+    PhaseInstanceId, ProbeEvidence, ProbeResult, SeamError,
 };
 use std::collections::HashSet;
 use thiserror::Error;
@@ -121,6 +122,8 @@ pub enum OrchestrationError {
     State(#[from] crate::state::StateError),
     #[error("approval failure: {0}")]
     Approval(#[from] crate::approval::ApprovalError),
+    #[error("publication admission failed: {0}")]
+    Executor(#[from] ExecutorError),
     #[error("phase or provider seam failed: {0}")]
     Seam(#[from] SeamError),
 }
@@ -156,7 +159,7 @@ impl Orchestrator {
 
     /// Runs phase instances in declaration order while holding the train lease.
     ///
-    /// Tree-mutating phases additionally hold the repository lease.  The operator
+    /// Tree-mutating phases additionally hold the repository lease. The operator
     /// gate is requested and persisted before the first irreversible effect; this
     /// API has no placement operation or placement-confirmation path.
     #[allow(clippy::too_many_arguments)]
@@ -178,48 +181,121 @@ impl Orchestrator {
         E: IrreversibleExecutor,
     {
         ensure_matching_declaration(journal, plan)?;
-        self.registry.validate_plan(plan)?;
         let train_lease = leases.acquire_train(plan.repository.clone(), plan.train.clone())?;
+        if let Err(error) = self.registry.validate_plan(plan) {
+            if let OrchestrationError::Refusal {
+                phase: Some(phase), ..
+            } = &error
+            {
+                journal.append_journal(JournalRecord::Refused {
+                    phase: phase.clone(),
+                    reason: error.to_string(),
+                })?;
+            }
+            train_lease.release()?;
+            return Err(error);
+        }
+
         let mut outcomes = Vec::new();
         let mut approval: Option<ApprovalSubject> = None;
 
         for phase in &plan.phases {
-            match self
+            let class = self
                 .registry
                 .classify(&phase.phase_type)
-                .expect("validated registry phase must remain registered")
-            {
-                PhaseClass::RefusalCapable | PhaseClass::PostBoundary => {
-                    if phase.tree_mutating {
-                        let repository_lease =
-                            leases.acquire_repository(plan.repository.clone())?;
-                        runner.run(phase)?;
-                        repository_lease.release()?;
-                    } else {
-                        runner.run(phase)?;
+                .expect("validated registry phase must remain registered");
+            let repository_lease = if phase.tree_mutating {
+                match leases.acquire_repository(plan.repository.clone()) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        let error = OrchestrationError::Lease(error);
+                        journal.append_journal(JournalRecord::Refused {
+                            phase: phase.instance.clone(),
+                            reason: error.to_string(),
+                        })?;
+                        train_lease.release()?;
+                        return Err(error);
                     }
                 }
-                PhaseClass::Irreversible => {
+            } else {
+                None
+            };
+            journal.append_journal(JournalRecord::PhaseEntered {
+                phase: phase.instance.clone(),
+            })?;
+
+            let phase_result = match class {
+                PhaseClass::RefusalCapable | PhaseClass::PostBoundary => runner
+                    .run(phase)
+                    .map(|()| Vec::new())
+                    .map_err(OrchestrationError::from),
+                PhaseClass::Irreversible => (|| {
                     let subject = approval.get_or_insert_with(|| {
                         build_approval_subject(plan)
                             .expect("a plan with an irreversible phase has a public trigger")
                     });
-                    let approval_record = match approvals.require_current(subject) {
-                        Ok(record) => record,
+                    match approvals.require_current(subject) {
+                        Ok(_) => {}
                         Err(crate::approval::ApprovalError::NoCurrentApproval)
                         | Err(crate::approval::ApprovalError::SubjectMismatch) => {
                             approvals.invalidate_if_stale(subject)?;
                             let token = gate.confirm(subject)?;
-                            approvals.persist_confirmed(subject.clone(), token)?
+                            approvals.persist_confirmed(subject.clone(), token)?;
                         }
                         Err(error) => return Err(error.into()),
-                    };
-                    let _token = approval_record.token;
+                    }
+
+                    let mut phase_outcomes = Vec::new();
                     for effect in effects_for_phase(plan, &phase.instance) {
-                        outcomes.push(reconcile_effect(
-                            plan, journal, &effect, probe, executor, subject,
+                        let durable_approval = approvals.require_current(subject)?;
+                        phase_outcomes.push(reconcile_effect(
+                            plan,
+                            journal,
+                            &effect,
+                            probe,
+                            executor,
+                            &durable_approval.subject,
                         )?);
                     }
+                    Ok(phase_outcomes)
+                })(),
+            };
+
+            let phase_result = match (phase_result, repository_lease) {
+                (result, Some(lease)) => result.and_then(|outcomes| {
+                    lease.release()?;
+                    Ok(outcomes)
+                }),
+                (result, None) => result,
+            };
+
+            match phase_result {
+                Ok(phase_outcomes) => {
+                    let awaiting_probe = phase_outcomes
+                        .iter()
+                        .any(|outcome| matches!(outcome, EffectOutcome::AwaitingProbe));
+                    if !awaiting_probe {
+                        let evidence = phase_outcomes
+                            .iter()
+                            .filter_map(|outcome| match outcome {
+                                EffectOutcome::Executed(evidence)
+                                | EffectOutcome::Reconciled(evidence) => Some(evidence.clone()),
+                                EffectOutcome::AwaitingProbe => None,
+                            })
+                            .collect();
+                        journal.append_journal(JournalRecord::PhaseDone {
+                            phase: phase.instance.clone(),
+                            evidence,
+                        })?;
+                    }
+                    outcomes.extend(phase_outcomes);
+                }
+                Err(error) => {
+                    journal.append_journal(JournalRecord::Refused {
+                        phase: phase.instance.clone(),
+                        reason: error.to_string(),
+                    })?;
+                    return Err(error);
                 }
             }
         }
@@ -230,10 +306,10 @@ impl Orchestrator {
 
 /// Reconciles or admits exactly one irreversible effect.
 ///
-/// The executor is reachable only from the never-attempted + authoritative-absent
-/// matrix cell.  Existing intents, including completed journal history, always
-/// force a done-probe instead of allowing a duplicate call.
-pub fn reconcile_effect<P, E>(
+/// The executor runs only when no prior intent exists and the authoritative
+/// probe reports the effect absent. Existing intents, including completed
+/// journal history, require reconciliation instead of a duplicate call.
+fn reconcile_effect<P, E>(
     plan: &ReleasePlan,
     journal: &JournalStore,
     effect: &PublicEffect,
@@ -254,8 +330,10 @@ where
     match probe.probe(&request)? {
         ProbeResult::Present(evidence) => {
             ensure_matching_evidence(&request, &expected_identity, &evidence)?;
-            if let Some(intent) = attempted {
-                journal.append_completion(&intent, evidence.clone())?;
+            if !completed {
+                if let Some(intent) = attempted {
+                    journal.append_completion(&intent, evidence.clone())?;
+                }
             }
             Ok(EffectOutcome::Reconciled(evidence))
         }
@@ -282,14 +360,51 @@ where
                 ));
             }
             ensure_matching_evidence(&request, &expected_identity, &evidence)?;
-            let intent =
-                journal.append_intent(&request, durable_approval_subject(approval_subject))?;
-            let evidence = executor.execute(&request)?;
+            let finalized_artifact = effect
+                .artifact
+                .as_ref()
+                .and_then(|artifact| plan.finalized_artifact(artifact))
+                .cloned();
+            let admitted = AdmittedEffect::new(
+                request.clone(),
+                effect,
+                finalized_artifact,
+                approval_subject.clone(),
+            )?;
+            let (intent, evidence) =
+                journal
+                    .execute_with_intent(&admitted, executor)
+                    .map_err(|error| match error {
+                        StateError::Executor(error) => OrchestrationError::Seam(error),
+                        StateError::ExecutorAdmission(error) => OrchestrationError::Executor(error),
+                        error => OrchestrationError::State(error),
+                    })?;
             ensure_matching_evidence(&request, &expected_identity, &evidence)?;
             journal.append_completion(&intent, evidence.clone())?;
             Ok(EffectOutcome::Executed(evidence))
         }
     }
+}
+
+/// Unfenced reconciliation harness for external acceptance tests.
+///
+/// Production callers must use [`Orchestrator::execute`], which acquires leases,
+/// validates the complete plan, and reloads durable approval before every effect.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_effect_unfenced_for_tests<P, E>(
+    plan: &ReleasePlan,
+    journal: &JournalStore,
+    effect: &PublicEffect,
+    probe: &mut P,
+    executor: &mut E,
+    approval_subject: &ApprovalSubject,
+) -> Result<EffectOutcome, OrchestrationError>
+where
+    P: CompletionProbe,
+    E: IrreversibleExecutor,
+{
+    reconcile_effect(plan, journal, effect, probe, executor, approval_subject)
 }
 
 fn ensure_matching_declaration(
@@ -309,28 +424,6 @@ fn ensure_matching_declaration(
             ))
         }
         Err(error) => Err(error.into()),
-    }
-}
-
-fn durable_approval_subject(subject: &ApprovalSubject) -> crate::ApprovalSubject {
-    crate::ApprovalSubject {
-        repository: subject.repository.clone(),
-        train: subject.train.clone(),
-        intended_commit: subject.intended_commit.clone(),
-        declaration_digest: subject.declaration_digest.clone(),
-        artifact_digests: subject
-            .artifacts
-            .iter()
-            .map(|artifact| ArtifactDigest {
-                artifact: artifact.artifact.clone(),
-                digest: artifact.digest.clone(),
-            })
-            .collect(),
-        public_effects: subject
-            .public_effects
-            .iter()
-            .map(|effect| effect.operation.clone())
-            .collect(),
     }
 }
 
@@ -406,6 +499,9 @@ fn completion_exists(
         JournalRecord::Completion { intent, .. } => intent_matches(intent, request),
         JournalRecord::DeclarationPinned { .. }
         | JournalRecord::DeclarationRebound { .. }
+        | JournalRecord::PhaseEntered { .. }
+        | JournalRecord::PhaseDone { .. }
+        | JournalRecord::Refused { .. }
         | JournalRecord::Terminalized { .. } => false,
     }))
 }

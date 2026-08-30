@@ -6,20 +6,81 @@
 use crate::{
     approval::{ApprovalSubject, ApprovedArtifact},
     artifact::{
-        verify_provider_evidence, ArtifactError, ArtifactReleaseIdentity, FinalizedArtifact,
-        ProviderArtifactEvidence,
+        artifact_digest, verify_provider_evidence, ArtifactError, ArtifactReleaseIdentity,
+        FinalizedArtifact, ProviderArtifactEvidence,
     },
-    plan::{PublicEffect, ReleaseIdentity},
-    ArtifactId, EffectRequest,
+    plan::{FinalizedArtifact as PlannedFinalizedArtifact, PublicEffect, ReleaseIdentity},
+    ArtifactDigest, ArtifactId, EffectRequest,
 };
 use std::collections::VecDeque;
 use thiserror::Error;
+
+/// Final artifact material accepted by the shared publication request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationArtifact {
+    /// Material finalized through the anchored transformation pipeline.
+    Anchored(FinalizedArtifact),
+    /// Material retained by the credential-free release plan.
+    Planned(PlannedFinalizedArtifact),
+}
+
+impl PublicationArtifact {
+    pub fn artifact(&self) -> &ArtifactId {
+        match self {
+            Self::Anchored(artifact) => artifact.identity().artifact(),
+            Self::Planned(artifact) => &artifact.artifact,
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Anchored(artifact) => artifact.bytes(),
+            Self::Planned(artifact) => &artifact.bytes,
+        }
+    }
+
+    fn approval_identity(&self) -> String {
+        match self {
+            Self::Anchored(artifact) => artifact.identity().approval_identity(),
+            Self::Planned(artifact) => artifact.identity.clone(),
+        }
+    }
+
+    fn digest(&self) -> String {
+        match self {
+            Self::Anchored(artifact) => artifact.digest().to_owned(),
+            Self::Planned(artifact) => artifact_digest(&artifact.bytes),
+        }
+    }
+
+    fn validate(&self, approval: &ApprovalSubject) -> Result<(), ExecutorError> {
+        match self {
+            Self::Anchored(artifact) => {
+                artifact.verify_digest()?;
+                validate_release_binding(&approval.version_or_run_id, artifact.identity().release())
+            }
+            Self::Planned(_) => Ok(()),
+        }
+    }
+}
+
+impl From<FinalizedArtifact> for PublicationArtifact {
+    fn from(artifact: FinalizedArtifact) -> Self {
+        Self::Anchored(artifact)
+    }
+}
+
+impl From<PlannedFinalizedArtifact> for PublicationArtifact {
+    fn from(artifact: PlannedFinalizedArtifact) -> Self {
+        Self::Planned(artifact)
+    }
+}
 
 /// The exact final artifact and approval binding admitted for one publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationRequest {
     pub effect: EffectRequest,
-    pub artifact: FinalizedArtifact,
+    pub artifact: PublicationArtifact,
     pub approval: ApprovalSubject,
 }
 
@@ -27,12 +88,12 @@ impl PublicationRequest {
     /// Admits a request only when the approval covers the exact bytes to publish.
     pub fn new(
         effect: EffectRequest,
-        artifact: FinalizedArtifact,
+        artifact: impl Into<PublicationArtifact>,
         approval: ApprovalSubject,
     ) -> Result<Self, ExecutorError> {
         let request = Self {
             effect,
-            artifact,
+            artifact: artifact.into(),
             approval,
         };
         request.validate_approval_binding()?;
@@ -41,8 +102,8 @@ impl PublicationRequest {
 
     /// Rechecks the approval-to-byte binding before invoking an executor.
     pub fn validate_approval_binding(&self) -> Result<(), ExecutorError> {
-        self.artifact.verify_digest()?;
-        let artifact_id = self.artifact.identity().artifact();
+        self.artifact.validate(&self.approval)?;
+        let artifact_id = self.artifact.artifact();
         if self.effect.artifact != *artifact_id {
             return Err(ExecutorError::ApprovalBinding {
                 reason: format!(
@@ -51,42 +112,120 @@ impl PublicationRequest {
                 ),
             });
         }
-        if self.approval.repository != self.effect.repository
-            || self.approval.train != self.effect.train
-            || self.approval.intended_commit != self.effect.intended_commit
-            || self.approval.declaration_digest != self.effect.declaration_digest
-        {
-            return Err(ExecutorError::ApprovalBinding {
-                reason: "approval subject does not match the publication effect identity"
-                    .to_owned(),
-            });
-        }
-        validate_release_binding(
-            &self.approval.version_or_run_id,
-            self.artifact.identity().release(),
-        )?;
+        validate_effect_identity(&self.effect, &self.approval)?;
+        let approval_identity = self.artifact.approval_identity();
+        let digest = self.artifact.digest();
         validate_approved_artifact(
             &self.approval.artifacts,
             artifact_id,
-            self.artifact.identity().approval_identity().as_str(),
-            self.artifact.digest(),
+            &approval_identity,
+            &digest,
         )?;
-        if !self.approval.public_effects.iter().any(|effect| {
-            public_effect_matches(
-                effect,
-                &self.effect.phase,
-                &self.effect.operation,
-                artifact_id,
-            )
-        }) {
-            return Err(ExecutorError::ApprovalBinding {
-                reason: format!(
-                    "approval subject does not include public operation `{}` for artifact `{artifact_id}`",
-                    self.effect.operation
-                ),
-            });
+        validate_public_effect(
+            &self.approval.public_effects,
+            &self.effect,
+            Some(artifact_id),
+        )
+    }
+}
+
+/// An effect that passed approval checks and is allowed to trigger an irreversible action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedEffect {
+    effect: EffectRequest,
+    approval: ApprovalSubject,
+    publication: Option<PublicationRequest>,
+}
+
+impl AdmittedEffect {
+    pub(crate) fn new(
+        effect: EffectRequest,
+        planned_effect: &PublicEffect,
+        artifact: Option<PlannedFinalizedArtifact>,
+        approval: ApprovalSubject,
+    ) -> Result<Self, ExecutorError> {
+        validate_effect_identity(&effect, &approval)?;
+        validate_public_effect(
+            &approval.public_effects,
+            &effect,
+            planned_effect.artifact.as_ref(),
+        )?;
+        let publication = match (planned_effect.artifact.as_ref(), artifact) {
+            (Some(_), Some(artifact)) => Some(PublicationRequest::new(
+                effect.clone(),
+                artifact,
+                approval.clone(),
+            )?),
+            (Some(artifact), None) => {
+                return Err(ExecutorError::MissingFinalizedArtifact {
+                    artifact: artifact.to_string(),
+                })
+            }
+            (None, None) => None,
+            (None, Some(artifact)) => {
+                return Err(ExecutorError::UnexpectedFinalizedArtifact {
+                    artifact: artifact.artifact.to_string(),
+                })
+            }
+        };
+        Ok(Self {
+            effect,
+            approval,
+            publication,
+        })
+    }
+
+    /// Unfenced witness constructor for external seam fakes and acceptance tests.
+    /// Production code must obtain this witness through the orchestrator.
+    #[doc(hidden)]
+    pub fn new_unfenced_for_tests(
+        effect: EffectRequest,
+        planned_effect: &PublicEffect,
+        artifact: Option<PlannedFinalizedArtifact>,
+        approval: ApprovalSubject,
+    ) -> Result<Self, ExecutorError> {
+        Self::new(effect, planned_effect, artifact, approval)
+    }
+
+    pub fn effect(&self) -> &EffectRequest {
+        &self.effect
+    }
+
+    pub fn publication(&self) -> Option<&PublicationRequest> {
+        self.publication.as_ref()
+    }
+
+    pub fn validate_approval_binding(&self) -> Result<(), ExecutorError> {
+        validate_effect_identity(&self.effect, &self.approval)?;
+        if let Some(publication) = &self.publication {
+            publication.validate_approval_binding()
+        } else {
+            validate_public_effect(&self.approval.public_effects, &self.effect, None)
         }
-        Ok(())
+    }
+
+    pub(crate) fn durable_approval_subject(&self) -> crate::ApprovalSubject {
+        crate::ApprovalSubject {
+            repository: self.approval.repository.clone(),
+            train: self.approval.train.clone(),
+            intended_commit: self.approval.intended_commit.clone(),
+            declaration_digest: self.approval.declaration_digest.clone(),
+            artifact_digests: self
+                .approval
+                .artifacts
+                .iter()
+                .map(|artifact| ArtifactDigest {
+                    artifact: artifact.artifact.clone(),
+                    digest: artifact.digest.clone(),
+                })
+                .collect(),
+            public_effects: self
+                .approval
+                .public_effects
+                .iter()
+                .map(|effect| effect.operation.clone())
+                .collect(),
+        }
     }
 }
 
@@ -130,6 +269,14 @@ pub trait StagingExecutor {
 pub enum ExecutorError {
     #[error("approval binding is invalid: {reason}")]
     ApprovalBinding { reason: String },
+    #[error(
+        "public effect references finalized artifact `{artifact}` that is absent from the plan"
+    )]
+    MissingFinalizedArtifact { artifact: String },
+    #[error(
+        "public effect without an artifact received unexpected finalized artifact `{artifact}`"
+    )]
+    UnexpectedFinalizedArtifact { artifact: String },
     #[error("staging evidence {field} mismatch: expected `{expected}`, observed `{observed}`")]
     StagingEvidenceMismatch {
         field: &'static str,
@@ -149,7 +296,21 @@ pub fn publish_finalized_artifact(
 ) -> Result<ProviderArtifactEvidence, ExecutorError> {
     request.validate_approval_binding()?;
     let evidence = executor.publish(request)?;
-    verify_provider_evidence(request.artifact.identity(), &evidence)?;
+    match &request.artifact {
+        PublicationArtifact::Anchored(artifact) => {
+            verify_provider_evidence(artifact.identity(), &evidence)?;
+        }
+        PublicationArtifact::Planned(artifact) => {
+            if evidence.artifact != artifact.artifact
+                || evidence.commit != request.effect.intended_commit
+            {
+                return Err(ExecutorError::ApprovalBinding {
+                    reason: "provider evidence does not match the planned publication identity"
+                        .to_owned(),
+                });
+            }
+        }
+    }
     Ok(evidence)
 }
 
@@ -167,6 +328,45 @@ pub fn stage_finalized_artifact(
     )?;
     compare_staging_evidence("digest", request.artifact.digest(), &evidence.digest)?;
     Ok(evidence)
+}
+
+fn validate_effect_identity(
+    effect: &EffectRequest,
+    approval: &ApprovalSubject,
+) -> Result<(), ExecutorError> {
+    if approval.repository == effect.repository
+        && approval.train == effect.train
+        && approval.intended_commit == effect.intended_commit
+        && approval.declaration_digest == effect.declaration_digest
+    {
+        Ok(())
+    } else {
+        Err(ExecutorError::ApprovalBinding {
+            reason: "approval subject does not match the publication effect identity".to_owned(),
+        })
+    }
+}
+
+fn validate_public_effect(
+    approved_effects: &[PublicEffect],
+    effect: &EffectRequest,
+    artifact: Option<&ArtifactId>,
+) -> Result<(), ExecutorError> {
+    if approved_effects.iter().any(|approved| {
+        approved.phase == effect.phase
+            && approved.operation == effect.operation
+            && approved.artifact.as_ref() == artifact
+    }) {
+        Ok(())
+    } else {
+        Err(ExecutorError::ApprovalBinding {
+            reason: format!(
+                "approval subject does not include public operation `{}` for artifact `{}`",
+                effect.operation,
+                artifact.map_or("<none>", ArtifactId::as_str)
+            ),
+        })
+    }
 }
 
 fn validate_release_binding(
@@ -238,17 +438,6 @@ fn validate_approved_artifact(
         });
     }
     Ok(())
-}
-
-fn public_effect_matches(
-    effect: &PublicEffect,
-    phase: &crate::PhaseInstanceId,
-    operation: &crate::OperationId,
-    artifact: &ArtifactId,
-) -> bool {
-    effect.phase == *phase
-        && effect.operation == *operation
-        && effect.artifact.as_ref() == Some(artifact)
 }
 
 fn compare_staging_evidence(

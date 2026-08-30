@@ -1,21 +1,15 @@
 name: Release
 
-# Per-crate release. Tag format: `<crate>-v<version>` (e.g. subc-transport-v0.1.0).
-# Each PUBLISHABLE crate (subc-protocol, subc-transport) versions and publishes
-# independently — they are leaf crates with no inter-crate publish-order
-# dependency. subc-core is publish=false (the daemon, never published to
-# crates.io) — its release lane instead uploads BINARY artifacts (ck-subc,
-# subc-probe, ck, fake-aft-stub, ck-subc-mcp) to a GitHub release so sibling repos'
-# CI (e.g. AFT's subc e2e lane) can fetch a pinned daemon without a source
-# checkout. Tag `subc-core-v<version>` to cut one.
+# Per-crate release. Tag format: `<crate>-v<version>` (for example,
+# `subc-transport-v0.1.0`). `subc-core` is publish=false: its tags publish the
+# installable subconscious archives below rather than a crates.io package.
 on:
   push:
     tags:
       - "*-v*"
 
 concurrency:
-  # Include SHA so a retag at a different commit gets its own group and won't
-  # block behind a stuck queued run.
+  # A retag at a different commit must not wait behind a stale release run.
   group: release-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
@@ -26,40 +20,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Same fmt/clippy/test matrix as PR-time CI. Reused (not copied) so a release
-  # can never ship code that wouldn't pass CI — including the cross-platform
-  # transport tests.
+  # Use the same verification matrix as pull requests before publishing any
+  # release asset.
   verify:
     uses: ./.github/workflows/ci.yml
 
-  # Daemon binary artifacts for sibling-repo CI. Runs only for subc-core tags;
-  # the crates.io publish job below skips those (subc-core is publish=false).
-  binaries:
-    name: Binary artifacts (${{ matrix.target.name }})
+  create-subconscious-release:
+    name: Create subconscious release
     if: startsWith(github.ref_name, 'subc-core-v')
     needs: verify
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    # linux-x64 only in CI: Blacksmith has no macOS runners and GitHub-hosted
-    # macOS is billing-blocked for this free-plan private org (see ci.yml).
-    # darwin-arm64 assets are built + uploaded from the dev box by
-    # scripts/release-darwin-binaries.sh against the same tag.
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - name: linux-x64
-            # 22.04 deliberately: the binary's glibc floor is set by the BUILD
-            # image (24.04 produced GLIBC_2.39-requiring assets that failed on
-            # GitHub's default ubuntu-22.04 runners, glibc 2.35). Consumers run
-            # these binaries on arbitrary CI images; keep the floor low.
-            runner: ubuntu-latest
-    runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Version-match guard
+      - name: Verify tag version and create release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#subc-core-v}"
@@ -69,48 +47,140 @@ jobs:
             exit 1
           fi
 
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes "Subconscious alpha archives: ck, ck-subc, and ck-subc-mcp."
+          fi
+
+  linux-binaries:
+    name: Subconscious archives (linux-x64)
+    if: startsWith(github.ref_name, 'subc-core-v')
+    needs: create-subconscious-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Build release binaries
-        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck-subc --bin subc-probe --bin ck --bin fake-aft-stub --bin ck-subc-mcp
+        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
 
-      # Asset naming: <bin>-<target>.tar.gz containing the bare binary, plus a
-      # .sha256 sidecar per asset — consumers pin the tag and verify the digest.
-      - name: Package + checksum
-        run: |
-          mkdir -p dist
-          for bin in ck-subc subc-probe ck fake-aft-stub ck-subc-mcp; do
-            tar -C target/release -czf "dist/${bin}-${{ matrix.target.name }}.tar.gz" "$bin"
-            shasum -a 256 "dist/${bin}-${{ matrix.target.name }}.tar.gz" | awk '{print $1}' > "dist/${bin}-${{ matrix.target.name }}.tar.gz.sha256"
-          done
-          ls -la dist/
+      - name: Package convention-named archives and digest sidecars
+        run: bash scripts/release/package-unix-archives.sh linux x64 target/release dist
 
-      - name: Upload to GitHub release
+      - name: Upload release archives
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          # Create the release if it does not exist yet. A retag or recovery
-          # re-run finds it already present, which is success. Anything else --
-          # a permissions problem, a network failure, a malformed tag -- is a
-          # real failure and must reach the log. Discarding it makes the upload
-          # below fail with "release not found", which sends the reader after a
-          # missing release instead of the cause that actually stopped it.
-          #
-          # The benign case is distinguished by asking whether the release now
-          # EXISTS, not by matching text in the failure. Error wording is not a
-          # contract -- gh has rendered this as both "already exists" and
-          # "already_exists" -- and a pattern that stops matching sends a
-          # successful retag down the failure path. The state query cannot drift.
-          if ! out=$(gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-                --title "${GITHUB_REF_NAME}" \
-                --notes "subc daemon binaries for sibling-repo CI (ck-subc, subc-probe, ck, fake-aft-stub, ck-subc-mcp)." 2>&1); then
-            if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              echo "release ${GITHUB_REF_NAME} already exists; uploading into it"
-            else
-              echo "::error::gh release create failed and no such release exists: ${out}"
-              exit 1
-            fi
-          fi
-          gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
+  windows-binaries:
+    name: Subconscious archives (windows-x64)
+    if: startsWith(github.ref_name, 'subc-core-v')
+    needs: create-subconscious-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+
+      # Alpha deliberately ships these native Windows binaries unsigned. This is
+      # an accepted alpha limitation, not a fallback to a development certificate.
+      - name: Package unsigned convention-named archives and digest sidecars
+        shell: pwsh
+        run: ./scripts/release/package-windows-archives.ps1 -SourceDirectory target/release -DistDirectory dist
+
+      - name: Upload release archives
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$env:GITHUB_REF_NAME" dist/* --repo "$env:GITHUB_REPOSITORY" --clobber
+
+  macos-binaries:
+    name: Signed and notarized subconscious archives (darwin-arm64)
+    if: startsWith(github.ref_name, 'subc-core-v')
+    needs: create-subconscious-release
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+
+      - name: Import Developer ID Application certificate
+        env:
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64" ]; then
+            echo "::error::Developer ID Application certificate secret is required"
+            exit 1
+          fi
+          if [ -z "$DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" ]; then
+            echo "::error::Developer ID Application certificate password secret is required"
+            exit 1
+          fi
+
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-application.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/developer-id-application.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          export CERTIFICATE_PATH DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path(os.environ["CERTIFICATE_PATH"]).write_bytes(
+              base64.b64decode(os.environ["DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64"])
+          )
+          PY
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" -A
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Write App Store Connect API key
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          if [ -z "$APP_STORE_CONNECT_API_KEY" ] || [ -z "$APP_STORE_CONNECT_API_KEY_ID" ] || [ -z "$APP_STORE_CONNECT_API_ISSUER_ID" ]; then
+            echo "::error::App Store Connect API-key credentials are required for notarization"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+
+      - name: Sign, notarize, and package macOS archives
+        env:
+          APP_STORE_CONNECT_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: bash scripts/release/macos-sign-notarize.sh target/release dist
+
+      - name: Upload release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ck-aft is intentionally absent: its publication is a named cross-repository
+  # dependency owned by the AFT repository's release lane.
   publish:
     name: Publish to crates.io
     # subc-core tags cut binary releases (above), never a crates.io publish.

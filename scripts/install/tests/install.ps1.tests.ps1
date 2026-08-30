@@ -1,6 +1,6 @@
 # Requires -Version 5.1
 # Run with: Invoke-Pester ./scripts/install/tests/install.ps1.tests.ps1
-$installer = Join-Path $PSScriptRoot '..\install.ps1'
+$script:installer = Join-Path $PSScriptRoot '..\install.ps1'
 
 Describe 'native ck installer' {
     BeforeEach {
@@ -49,7 +49,7 @@ Describe 'native ck installer' {
     }
 
     It 'derives, verifies, installs, records, and prints setup without starting it' {
-        $output = & $installer -ReleaseBaseUrl 'https://release.fixture.example/download'
+        $output = & $script:installer -ReleaseBaseUrl 'https://release.fixture.example/download'
 
         $output | Should -Contain 'Next: ck setup'
         Assert-MockCalled Invoke-WebRequest -Times 1 -ParameterFilter {
@@ -71,9 +71,9 @@ Describe 'native ck installer' {
     }
 
     It 'reports an identical extracted candidate as a placement no-op' {
-        & $installer -ReleaseBaseUrl 'https://release.fixture.example/download' | Out-Null
+        & $script:installer -ReleaseBaseUrl 'https://release.fixture.example/download' | Out-Null
 
-        $output = & $installer -ReleaseBaseUrl 'https://release.fixture.example/download'
+        $output = & $script:installer -ReleaseBaseUrl 'https://release.fixture.example/download'
 
         $output | Should -Contain "ck already matches verified download at $(Join-Path $env:LOCALAPPDATA 'cortexkit\bin\ck.exe'); skipping placement."
         $output | Should -Contain 'Next: ck setup'

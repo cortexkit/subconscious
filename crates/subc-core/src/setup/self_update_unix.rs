@@ -94,9 +94,11 @@ fn unique_sibling(destination: &Path) -> Result<PathBuf, String> {
 mod tests {
     use std::{
         env, fs,
+        io::{BufRead, BufReader, Write},
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
-        process::{self, Command},
+        process::{self, Command, Stdio},
+        sync::mpsc::{self, Receiver},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -109,6 +111,9 @@ mod tests {
     const TEST_NAME: &str =
         "setup::self_update_unix::tests::unix_self_update_keeps_running_process_on_original_inode";
     const TEST_MODE: &str = "CK_SELF_UPDATE_TEST_MODE";
+    const HELPER_READY_PREFIX: &str = "CK_SELF_UPDATE_TEST_READY:";
+    const HELPER_RESULT_PREFIX: &str = "CK_SELF_UPDATE_TEST_RESULT:";
+    const HELPER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn fixture_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -125,14 +130,40 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("mark executable");
     }
 
-    fn wait_for(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !path.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {}",
-                path.display()
-            );
+    fn wait_for_helper_line(receiver: &Receiver<String>, prefix: &str) -> String {
+        let deadline = Instant::now() + HELPER_WAIT_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_else(|| {
+                    panic!("timed out waiting for helper output beginning with {prefix}")
+                });
+            match receiver.recv_timeout(remaining) {
+                Ok(line) => {
+                    if let Some(value) = line.strip_prefix(prefix) {
+                        return value.to_owned();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("timed out waiting for helper output beginning with {prefix}");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("helper exited before writing output beginning with {prefix}");
+                }
+            }
+        }
+    }
+
+    fn wait_for_holder_exit(holder: &mut process::Child) -> process::ExitStatus {
+        let deadline = Instant::now() + HELPER_WAIT_TIMEOUT;
+        loop {
+            match holder.try_wait().expect("check holder exit") {
+                Some(status) => return status,
+                None => assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for holder exit"
+                ),
+            }
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -141,15 +172,12 @@ mod tests {
         let Ok(mode) = env::var(TEST_MODE) else {
             return false;
         };
-        let ready = PathBuf::from(env::var("CK_SELF_UPDATE_TEST_READY").expect("ready path"));
-        let release = PathBuf::from(env::var("CK_SELF_UPDATE_TEST_RELEASE").expect("release path"));
-        let result = PathBuf::from(env::var("CK_SELF_UPDATE_TEST_RESULT").expect("result path"));
         let destination = PathBuf::from(
             env::var("CK_SELF_UPDATE_TEST_DESTINATION").expect("running destination path"),
         );
-        // The helper is launched from `destination` before its parent replaces
-        // that name. Holding the original file descriptor proves the still-live
-        // process retains the prior inode after the destination name moves on.
+        // The helper starts from `destination` before its parent replaces that
+        // name. Keeping this handle open proves the live process retains the
+        // original inode after the destination is atomically renamed.
         let running_image = fs::File::open(&destination).expect("running executable handle");
         let original_inode = running_image
             .metadata()
@@ -157,17 +185,29 @@ mod tests {
             .ino();
         match mode.as_str() {
             "hold" => {
-                fs::write(&ready, original_inode.to_string()).expect("ready evidence");
-                wait_for(&release);
+                println!("{HELPER_READY_PREFIX}{original_inode}");
+                std::io::stdout().flush().expect("flush ready evidence");
+
+                let mut release = String::new();
+                std::io::stdin()
+                    .read_line(&mut release)
+                    .expect("read release signal");
+                assert_eq!(release.trim(), "release", "unexpected release signal");
+
                 let retained_inode = running_image
                     .metadata()
                     .expect("retained executable metadata")
                     .ino();
-                fs::write(&result, format!("{original_inode}:{retained_inode}"))
-                    .expect("running inode evidence");
+                println!("{HELPER_RESULT_PREFIX}{original_inode}:{retained_inode}");
+                std::io::stdout()
+                    .flush()
+                    .expect("flush retained inode evidence");
             }
             "probe" => {
-                fs::write(&result, original_inode.to_string()).expect("probe evidence");
+                println!("{HELPER_RESULT_PREFIX}{original_inode}");
+                std::io::stdout()
+                    .flush()
+                    .expect("flush probe inode evidence");
             }
             _ => panic!("unknown self-update helper mode: {mode}"),
         }
@@ -185,10 +225,6 @@ mod tests {
         let destination = root.join("ck");
         let candidate = root.join("candidate");
         let manifest = root.join("installer-manifest.json");
-        let ready = root.join("ready");
-        let release = root.join("release");
-        let held_result = root.join("held-result");
-        let probe_result = root.join("probe-result");
         let test_binary = env::current_exe().expect("test executable");
         fs::copy(&test_binary, &destination).expect("copy installed ck");
         fs::copy(&test_binary, &candidate).expect("copy replacement ck");
@@ -204,15 +240,23 @@ mod tests {
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "hold")
             .env("CK_SELF_UPDATE_TEST_DESTINATION", &destination)
-            .env("CK_SELF_UPDATE_TEST_READY", &ready)
-            .env("CK_SELF_UPDATE_TEST_RELEASE", &release)
-            .env("CK_SELF_UPDATE_TEST_RESULT", &held_result)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .expect("start original ck");
-        wait_for(&ready);
+        let holder_stdout = holder.stdout.take().expect("capture holder output");
+        let (helper_output_tx, helper_output_rx) = mpsc::channel();
+        let output_reader = thread::spawn(move || {
+            for line in BufReader::new(holder_stdout).lines() {
+                let line = line.expect("read holder output");
+                if helper_output_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
         assert_eq!(
-            fs::read_to_string(&ready).expect("ready inode").trim(),
-            prior_inode
+            wait_for_helper_line(&helper_output_rx, HELPER_READY_PREFIX),
+            prior_inode.to_string()
         );
 
         self_update::replace_verified_candidate(&destination, &candidate, &mut inventory)
@@ -220,30 +264,37 @@ mod tests {
         let replacement_inode = destination_inode(&destination).expect("replacement inode");
         assert_ne!(replacement_inode, prior_inode);
 
-        fs::write(&release, "continue").expect("release original ck");
-        assert!(holder.wait().expect("holder exit").success());
+        let mut holder_stdin = holder.stdin.take().expect("capture holder input");
+        holder_stdin
+            .write_all(b"release\n")
+            .expect("release original ck");
+        holder_stdin.flush().expect("flush release signal");
+        drop(holder_stdin);
         assert_eq!(
-            fs::read_to_string(&held_result)
-                .expect("holder evidence")
-                .trim(),
+            wait_for_helper_line(&helper_output_rx, HELPER_RESULT_PREFIX),
             format!("{prior_inode}:{prior_inode}")
         );
+        assert!(wait_for_holder_exit(&mut holder).success());
+        output_reader.join().expect("finish holder output reader");
 
         let probe = Command::new(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "probe")
             .env("CK_SELF_UPDATE_TEST_DESTINATION", &destination)
-            .env("CK_SELF_UPDATE_TEST_READY", &ready)
-            .env("CK_SELF_UPDATE_TEST_RELEASE", &release)
-            .env("CK_SELF_UPDATE_TEST_RESULT", &probe_result)
-            .status()
+            .output()
             .expect("start replacement ck");
-        assert!(probe.success());
+        assert!(
+            probe.status.success(),
+            "replacement probe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let probe_output = String::from_utf8(probe.stdout).expect("probe output is UTF-8");
         assert_eq!(
-            fs::read_to_string(&probe_result)
-                .expect("probe inode")
-                .trim(),
-            replacement_inode
+            probe_output
+                .lines()
+                .find_map(|line| line.strip_prefix(HELPER_RESULT_PREFIX))
+                .expect("probe inode evidence"),
+            replacement_inode.to_string()
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

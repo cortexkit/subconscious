@@ -4,11 +4,7 @@ use std::{
     net::Shutdown,
     ops::Deref,
     path::{Path, PathBuf},
-    process,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -17,9 +13,9 @@ use subc_control::{
     ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind, SupervisorHealthStatus,
 };
 use subc_core::{
-    read_frame, write_frame, ExitKind, ForwardingTable, Frame, HealthAction, HealthConfig,
-    ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SupervisedModule, Supervisor,
-    SupervisorHandle, SupervisorProcessLiveness,
+    read_frame, test_support::TestTempDir, write_frame, ExitKind, ForwardingTable, Frame,
+    HealthAction, HealthConfig, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy,
+    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{
     manifest::{
@@ -43,7 +39,6 @@ use common::{
     start_test_daemon_with_route_bind_relay_overrides, TestDaemon,
 };
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// Deadline for setup hang-guards (poll-until-subc-observable-state helpers:
 /// registration, binding count, stub events, status). These are deadlock
@@ -524,7 +519,7 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
     // subc canonicalizes project_root via cortexkit-paths (ProjectRootId) before
     // relaying — NOT raw fs::canonicalize, which keeps Windows' verbatim \\?\ prefix.
     // Assert against the same canonicalization subc uses so this holds on every OS.
-    let canonical_project = subc_core::ProjectRootId::from_path(&project.path)
+    let canonical_project = subc_core::ProjectRootId::from_path(project.path())
         .unwrap()
         .as_path()
         .to_path_buf();
@@ -3049,7 +3044,7 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
     // then delete it. Minting BEFORE deletion is the whole point: the assertion
     // below is that a cancel arriving afterwards addresses that same identity.
     let project = TestProject::new();
-    let vanished_root = project.path.join("worktree");
+    let vanished_root = project.path().join("worktree");
     std::fs::create_dir(&vanished_root).unwrap();
     let identity_while_present = subc_core::ProjectRootId::from_path(&vanished_root)
         .unwrap()
@@ -3115,7 +3110,7 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
         spawn_stub_with_events_path(&server, &supervisor, module_id, "invalid-project-root").await;
 
     let project = TestProject::new();
-    let unreconstructable = project.path.join("definitely").join("missing").join("..");
+    let unreconstructable = project.path().join("definitely").join("missing").join("..");
     let mut client = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
@@ -5463,7 +5458,7 @@ fn attach_request_with_consumer_identity(
             module_id: module_id.to_string(),
         },
         identity: BindIdentity {
-            project_root: project.path.clone(),
+            project_root: project.path().to_path_buf(),
             harness: "opencode".to_string(),
             session: session.to_string(),
         },
@@ -6281,26 +6276,19 @@ fn stub_events(path: &Path) -> Vec<Value> {
 }
 
 struct TestProject {
-    path: PathBuf,
+    temp: TestTempDir,
 }
 
 impl TestProject {
     fn new() -> Self {
-        let path = unique_temp_dir("forwarding-project");
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
+        Self {
+            temp: TestTempDir::new("forwarding-project"),
+        }
     }
-}
 
-impl Drop for TestProject {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+    fn path(&self) -> &Path {
+        self.temp.path()
     }
-}
-
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("sc-{label}-{}-{nonce}", process::id()))
 }
 
 /// Arm 2 of the forwarding contention benchmark: loopback TCP + fake-aft-stub.

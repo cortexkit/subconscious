@@ -116,24 +116,10 @@ fn non_empty_os_var(key: &str) -> Option<std::ffi::OsString> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::{collections::BTreeMap, fs};
 
     use super::*;
-
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temporary_cache_path(name: &str) -> PathBuf {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "ck-update-cache-{name}-{}-{counter}.json",
-            process::id()
-        ))
-    }
+    use subc_core::test_support::TestTempDir;
 
     fn metadata(checked_at_unix_secs: u64) -> UpdateMetadata {
         UpdateMetadata {
@@ -157,7 +143,8 @@ mod tests {
 
     #[test]
     fn absent_and_malformed_cache_files_are_distinct_from_valid_metadata() {
-        let path = temporary_cache_path("read-states");
+        let _dir = TestTempDir::new("read-states");
+        let path = _dir.path().join("update-metadata.json");
         let cache = UpdateCache::new(&path);
         assert_eq!(cache.load(), CacheRead::Absent);
 
@@ -167,6 +154,5 @@ mod tests {
         let expected = metadata(1_000);
         cache.write(&expected).unwrap();
         assert_eq!(cache.load(), CacheRead::Present(expected));
-        let _ = fs::remove_file(path);
     }
 }

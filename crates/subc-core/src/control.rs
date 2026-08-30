@@ -3957,6 +3957,7 @@ mod tests {
         router::FrameSink,
         stderr_tail::DEFAULT_MAX_LINE_BYTES,
         supervise::{ModuleSpec, ModuleState, RestartPolicy, Supervisor, SupervisorHandle},
+        test_support::TestTempDir,
         RouteCtx, Router,
     };
     use tokio::{
@@ -4349,14 +4350,14 @@ mod tests {
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
     }
 
-    fn route_open_frame(corr: u64, module_id: &str, project_root: std::path::PathBuf) -> Frame {
+    fn route_open_frame(corr: u64, module_id: &str, project_root: TestTempDir) -> Frame {
         route_open_frame_with_consumer_capabilities(corr, module_id, project_root, None)
     }
 
     fn route_open_frame_with_consumer_capabilities(
         corr: u64,
         module_id: &str,
-        project_root: std::path::PathBuf,
+        project_root: TestTempDir,
         consumer_capabilities: Option<Vec<String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
@@ -4364,7 +4365,7 @@ mod tests {
                 module_id: module_id.to_string(),
             },
             identity: BindIdentity {
-                project_root,
+                project_root: project_root.path().to_path_buf(),
                 harness: "unit".to_string(),
                 session: "session".to_string(),
             },
@@ -4379,6 +4380,7 @@ mod tests {
     fn route_open_frame_with_admission_facts(
         corr: u64,
         module_id: &str,
+        project_root: TestTempDir,
         consumer_identity: Option<subc_control::ConsumerIdentity>,
         facts: Option<Value>,
     ) -> Frame {
@@ -4387,7 +4389,7 @@ mod tests {
                 module_id: module_id.to_string(),
             },
             identity: BindIdentity {
-                project_root: unique_project_root("admission-facts"),
+                project_root: project_root.path().to_path_buf(),
                 harness: "unit".to_string(),
                 session: format!("session-{corr}"),
             },
@@ -4414,17 +4416,8 @@ mod tests {
         Frame::build(FrameType::Response, control_flags(), 0, 0, corr, body).unwrap()
     }
 
-    fn unique_project_root(label: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "subc-control-{label}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    fn unique_project_root(label: &str) -> TestTempDir {
+        TestTempDir::new(label)
     }
 
     fn assert_route_poll_liveness(frame: &Frame, expected_live: bool) {
@@ -5351,6 +5344,7 @@ mod tests {
                 route_open_frame_with_admission_facts(
                     20,
                     "target",
+                    unique_project_root("admission-facts"),
                     Some(subc_control::ConsumerIdentity {
                         module_id: "fed".to_string(),
                         launch_nonce: "not-the-real-nonce".to_string(),
@@ -5375,6 +5369,7 @@ mod tests {
                 route_open_frame_with_admission_facts(
                     21,
                     "target",
+                    unique_project_root("admission-facts"),
                     Some(subc_control::ConsumerIdentity {
                         module_id: "never-spawned".to_string(),
                         launch_nonce: "any-nonce".to_string(),
@@ -5438,6 +5433,7 @@ mod tests {
                     route_open_frame_with_admission_facts(
                         30,
                         "target",
+                        unique_project_root("admission-facts"),
                         Some(subc_control::ConsumerIdentity {
                             module_id: "fed".to_string(),
                             launch_nonce: "fed-nonce".to_string(),
@@ -5535,6 +5531,7 @@ mod tests {
                     route_open_frame_with_admission_facts(
                         3,
                         "target",
+                        unique_project_root("admission-facts"),
                         Some(ConsumerIdentity {
                             module_id: "fed".to_string(),
                             launch_nonce: "fed-nonce".to_string(),
@@ -5713,6 +5710,7 @@ mod tests {
                         route_open_frame_with_admission_facts(
                             20,
                             "target",
+                            unique_project_root("admission-facts"),
                             Some(subc_control::ConsumerIdentity {
                                 module_id: "fed".to_string(),
                                 launch_nonce: "fed-nonce".to_string(),
@@ -5783,6 +5781,7 @@ mod tests {
                     route_open_frame_with_admission_facts(
                         10,
                         "target",
+                        unique_project_root("admission-facts"),
                         Some(subc_control::ConsumerIdentity {
                             module_id: "fed".to_string(),
                             launch_nonce: "fed-nonce".to_string(),
@@ -5816,7 +5815,13 @@ mod tests {
         let direct = handler
             .handle_control_frame(
                 &route_ctx(ConnectionId::new(73)).0,
-                route_open_frame_with_admission_facts(11, "target", None, Some(json!({"x": 1}))),
+                route_open_frame_with_admission_facts(
+                    11,
+                    "target",
+                    unique_project_root("admission-facts"),
+                    None,
+                    Some(json!({"x": 1})),
+                ),
             )
             .await
             .unwrap();
@@ -5831,6 +5836,7 @@ mod tests {
                 route_open_frame_with_admission_facts(
                     15,
                     "target",
+                    unique_project_root("admission-facts"),
                     Some(subc_control::ConsumerIdentity {
                         module_id: "other".to_string(),
                         launch_nonce: "other-nonce".to_string(),
@@ -5851,6 +5857,7 @@ mod tests {
                 route_open_frame_with_admission_facts(
                     12,
                     "other",
+                    unique_project_root("admission-facts"),
                     Some(subc_control::ConsumerIdentity {
                         module_id: "fed".to_string(),
                         launch_nonce: "fed-nonce".to_string(),
@@ -5868,7 +5875,13 @@ mod tests {
         let nonexistent = handler
             .handle_control_frame(
                 &route_ctx(ConnectionId::new(75)).0,
-                route_open_frame_with_admission_facts(13, "missing", None, Some(json!({"x": 1}))),
+                route_open_frame_with_admission_facts(
+                    13,
+                    "missing",
+                    unique_project_root("admission-facts"),
+                    None,
+                    Some(json!({"x": 1})),
+                ),
             )
             .await
             .unwrap();
@@ -5913,7 +5926,13 @@ mod tests {
         let responses = handler
             .handle_control_frame(
                 &route_ctx(ConnectionId::new(79)).0,
-                route_open_frame_with_admission_facts(16, "target", None, Some(json!({"x": 1}))),
+                route_open_frame_with_admission_facts(
+                    16,
+                    "target",
+                    unique_project_root("admission-facts"),
+                    None,
+                    Some(json!({"x": 1})),
+                ),
             )
             .await
             .unwrap();
@@ -7005,6 +7024,7 @@ mod tests {
                     route_open_frame_with_admission_facts(
                         corr,
                         &target_module_id,
+                        unique_project_root("admission-facts"),
                         consumer_identity,
                         None,
                     ),
@@ -7083,6 +7103,7 @@ mod tests {
                 route_open_frame_with_admission_facts(
                     3,
                     "target",
+                    unique_project_root("admission-facts"),
                     Some(ConsumerIdentity {
                         module_id: "opener".to_string(),
                         launch_nonce: "opener-nonce".to_string(),
@@ -7383,6 +7404,7 @@ mod tests {
                 route_open_frame_with_admission_facts(
                     2,
                     "self-provider",
+                    unique_project_root("admission-facts"),
                     Some(ConsumerIdentity {
                         module_id: "self-provider".to_string(),
                         launch_nonce: "self-nonce".to_string(),

@@ -18,6 +18,11 @@ path = "src/main.rs"
 [features]
 bench-harness = []
 loom = []
+# Test-only: enables the `test_support` module (the `TestTempDir` RAII guard)
+# for the crate's integration tests. The crate's own unit tests get the module
+# via `#[cfg(test)]`; integration tests (a separate crate) enable this feature
+# through the self dev-dependency below. Never enabled in a production build.
+test-support = []
 
 [[bench]]
 name = "forwarding_contention"
@@ -47,6 +52,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 loom = "0.7"
 tokio = { version = "1", features = ["test-util"] }
+# Self dev-dependency: lets the integration tests (a separate crate) enable the
+# `test-support` feature on the library, sharing `test_support::TestTempDir`
+# with the crate's own unit tests. Cargo supports a crate depending on itself
+# as a dev-dependency for exactly this test-utility-sharing purpose.
+subc-core = { path = ".", features = ["test-support"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

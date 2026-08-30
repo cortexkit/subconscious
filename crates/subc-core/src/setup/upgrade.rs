@@ -732,25 +732,17 @@ fn process_id() -> u32 {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::{
-        process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    #[cfg(unix)]
     use serde_json::Map;
 
     use super::*;
+    #[cfg(unix)]
+    use subc_core::test_support::TestTempDir;
 
     // Used only by the unix-gated tests below; gate it with them so windows
     // clippy under -D warnings does not read it as dead code.
     #[cfg(unix)]
-    fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        env::temp_dir().join(format!("ck-upgrade-{name}-{}-{nonce}", process::id()))
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     #[cfg(unix)]
@@ -764,7 +756,6 @@ mod tests {
     #[test]
     fn discovery_uses_inventory_and_version_outputs_and_excludes_mc() {
         let root = fixture_dir("discovery");
-        fs::create_dir_all(&root).expect("root");
         let ck = root.join("ck");
         let mcp = root.join("ck-subc-mcp");
         let aft = root.join("ck-aft");
@@ -799,7 +790,6 @@ mod tests {
         assert_eq!(targets[1].installed_version, "1.2.0");
         assert_eq!(targets[2].installed_version, "1.3.0");
         assert_eq!(targets[3].installed_version, "1.0.0");
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

@@ -278,35 +278,24 @@ impl ImageDigestCache {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
     // Only the linux sha256 tests open files directly, and only non-linux
     // platforms assert the unavailable arm; each import gates with its users
     // so the other platforms' clippy does not fail them as unused.
+    #[cfg(target_os = "linux")]
+    use std::fs;
     #[cfg(target_os = "linux")]
     use std::fs::File;
     #[cfg(target_os = "linux")]
     use tokio::process::Command;
 
     use super::*;
+    use crate::test_support::TestTempDir;
     use subc_control::RunningImageAgreement;
     #[cfg(target_os = "linux")]
     use subc_control::RunningImageUnavailableReason;
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "subc-provenance-{label}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn temp_dir(label: &str) -> TestTempDir {
+        TestTempDir::new(label)
     }
 
     #[cfg(target_os = "linux")]
@@ -322,7 +311,6 @@ mod tests {
         let agreement = compare_opened_paths(&mut cache, &left, &right);
 
         assert!(matches!(agreement, RunningImageAgreement::Match { .. }));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -342,7 +330,6 @@ mod tests {
             RunningImageAgreement::Mismatch { running, disk } => assert_ne!(running, disk),
             other => panic!("expected distinct digests after mutation, got {other:?}"),
         }
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -361,7 +348,6 @@ mod tests {
                 reason: RunningImageUnavailableReason::SpawnedPathUnreadable,
             }
         );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -380,7 +366,6 @@ mod tests {
                 reason: RunningImageUnavailableReason::RunningExecutableUnreadable,
             }
         );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -412,7 +397,6 @@ mod tests {
                 },
             }
         );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -510,7 +494,6 @@ mod tests {
         let changed = digest_open_file(&mut cache, File::open(&image).unwrap()).unwrap();
         assert_ne!(first, changed);
         assert_eq!(cache.digest_computations(), computations_after_first + 1);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]

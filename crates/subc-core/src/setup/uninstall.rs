@@ -97,14 +97,10 @@ fn remove_owned_path(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     use serde_json::Map;
 
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
     #[derive(Default)]
     struct SuccessfulRunner;
@@ -121,18 +117,13 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        env::temp_dir().join(format!("ck-uninstall-{name}-{}-{nonce}", process::id()))
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     #[test]
     fn uninstall_removes_only_inventory_paths_and_retains_configuration_and_stores() {
         let root = fixture_dir("owned-only");
-        fs::create_dir_all(&root).expect("fixture directory");
         let managed = root.join("ck-subc");
         let unrelated = root.join("notes.txt");
         let config = root.join("subc.jsonc");
@@ -172,6 +163,5 @@ mod tests {
             .iter()
             .any(|line| line.contains("configuration")));
         assert!(report.retained.iter().any(|line| line.contains("store")));
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 }

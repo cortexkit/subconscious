@@ -151,28 +151,22 @@ mod tests {
     use std::{
         env, fs,
         path::PathBuf,
-        process::{self, Command},
+        process::Command,
         thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant},
     };
 
     use serde_json::Map;
 
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
     const TEST_NAME: &str =
         "setup::self_update_windows::tests::replacement_preserves_old_until_a_successful_next_invocation_cleans_it";
     const TEST_MODE: &str = "CK_SELF_UPDATE_WINDOWS_TEST_MODE";
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after Unix epoch")
-            .as_nanos();
-        env::temp_dir().join(format!(
-            "ck-self-update-windows-{name}-{}-{nonce}",
-            process::id()
-        ))
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     fn wait_for(path: &Path) {
@@ -216,7 +210,6 @@ mod tests {
         }
 
         let root = fixture_dir("rename-replace-cleanup");
-        fs::create_dir_all(&root).expect("fixture directory");
         let destination = root.join("ck.exe");
         let candidate = root.join("candidate.exe");
         let manifest = root.join("installer-manifest.json");
@@ -282,13 +275,11 @@ mod tests {
         assert!(!previous.exists());
         let inventory = Inventory::load(&manifest, "windows-x64").expect("reloaded inventory");
         assert!(!inventory.owns_path("self-update-rollback", &previous));
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn cleanup_refuses_to_delete_an_unowned_old_executable() {
         let root = fixture_dir("unowned-old");
-        fs::create_dir_all(&root).expect("fixture directory");
         let destination = root.join("ck.exe");
         let previous = destination.with_extension("exe.old");
         let manifest = root.join("installer-manifest.json");
@@ -303,6 +294,5 @@ mod tests {
             fs::read_to_string(&previous).expect("old bytes"),
             "user evidence"
         );
-        fs::remove_dir_all(root).expect("cleanup");
     }
 }

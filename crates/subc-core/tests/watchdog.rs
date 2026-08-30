@@ -1,20 +1,19 @@
 use std::{
-    fs, io,
+    io,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use subc_control::ClientControlRequest;
 use subc_core::{
     bootstrap::{run_with_config, BootstrapConfig, BootstrapError},
-    read_frame, serve_listener, write_frame, ControlHandler, DaemonSelfWatchdog,
-    DaemonSelfWatchdogConfig, Frame, Registry, Router, ServerAuth,
+    read_frame, serve_listener,
+    test_support::TestTempDir,
+    write_frame, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig, Frame, Registry,
+    Router, ServerAuth,
 };
 use subc_protocol::{Flags, FrameType, Priority, PROTOCOL_VERSION};
 use subc_transport::{
@@ -32,7 +31,6 @@ use tracing_subscriber::fmt::MakeWriter;
 mod common;
 use common::connect_authed_client;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOG_TIMEOUT: Duration = Duration::from_secs(2);
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -64,7 +62,6 @@ async fn watchdog_tick_against_live_daemon_succeeds_silently() {
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_detects_wire_version_divergence() {
     let temp_dir = unique_temp_dir("watchdog-wire-version");
-    fs::create_dir_all(&temp_dir).unwrap();
     let connection_file_path = temp_dir.join("subc-conn.json");
     let port = reserve_free_port().await;
     let live_info = test_connection_info(port);
@@ -82,13 +79,11 @@ async fn watchdog_detects_wire_version_divergence() {
     assert!(err.to_string().contains("wire_version"), "error: {err}");
 
     server_task.abort();
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_detects_daemon_id_divergence() {
     let temp_dir = unique_temp_dir("watchdog-daemon-id");
-    fs::create_dir_all(&temp_dir).unwrap();
     let connection_file_path = temp_dir.join("subc-conn.json");
     let port = reserve_free_port().await;
     let live_info = test_connection_info(port);
@@ -107,7 +102,6 @@ async fn watchdog_detects_daemon_id_divergence() {
     assert!(err.to_string().contains("daemon_id"), "error: {err}");
 
     server_task.abort();
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -145,7 +139,6 @@ async fn watchdog_rejects_a_daemon_that_answers_the_wrong_control_response() {
     let port = reserve_free_port().await;
     let live_info = test_connection_info(port);
     let temp_dir = unique_temp_dir("watchdog-wrong-reply");
-    fs::create_dir_all(&temp_dir).unwrap();
     let connection_file_path = temp_dir.join("subc-conn.json");
     write_atomic(&connection_file_path, &live_info).unwrap();
 
@@ -171,7 +164,6 @@ async fn watchdog_rejects_a_daemon_that_answers_the_wrong_control_response() {
     );
 
     server_task.abort();
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -179,7 +171,6 @@ async fn watchdog_failed_tick_logs_stage_and_recovery_streak() {
     let capture = LogCapture::default();
     let _guard = tracing::subscriber::set_default(capture.subscriber());
     let temp_dir = unique_temp_dir("watchdog-recovery");
-    fs::create_dir_all(&temp_dir).unwrap();
     let connection_file_path = temp_dir.join("subc-conn.json");
     let port = reserve_free_port().await;
     let live_info = ConnectionInfo {
@@ -231,19 +222,20 @@ async fn watchdog_failed_tick_logs_stage_and_recovery_streak() {
 
     watchdog_task.abort();
     server_task.abort();
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 struct RunningDaemon {
     connection_file_path: PathBuf,
-    temp_dir: PathBuf,
+    // Held for RAII lifetime only: the guard's `Drop` removes the tree (or
+    // preserves it on panic). Never read directly.
+    #[allow(dead_code)]
+    temp_dir: TestTempDir,
     task: JoinHandle<Result<(), BootstrapError>>,
 }
 
 impl RunningDaemon {
     async fn start(name: &str, watchdog_config: DaemonSelfWatchdogConfig) -> Self {
         let temp_dir = unique_temp_dir(name);
-        fs::create_dir_all(&temp_dir).unwrap();
         let connection_file_path = temp_dir.join("subc-conn.json");
         let task = tokio::spawn(run_with_config(
             BootstrapConfig::new(&connection_file_path, 0).with_watchdog_config(watchdog_config),
@@ -261,7 +253,8 @@ impl RunningDaemon {
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = fs::remove_dir_all(&self.temp_dir);
+        // The temp dir is owned by the `TestTempDir` guard, whose `Drop` removes
+        // the tree (or preserves it on panic).
     }
 }
 
@@ -474,9 +467,8 @@ fn test_connection_info(port: u16) -> ConnectionInfo {
     }
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("sc-{name}-{}-{nonce}", process::id()))
+fn unique_temp_dir(name: &str) -> TestTempDir {
+    TestTempDir::new(name)
 }
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {

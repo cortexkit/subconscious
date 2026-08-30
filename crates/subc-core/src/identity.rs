@@ -87,53 +87,15 @@ impl RequestIdentity {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::HashMap, fs};
 
     use super::*;
-
-    static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
-
-    struct TestDir {
-        path: PathBuf,
-    }
-
-    impl TestDir {
-        fn new(label: &str) -> Self {
-            let unique = format!(
-                "subc-core-identity-{label}-{}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system time should not be before the Unix epoch")
-                    .as_nanos(),
-                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
-            );
-            let path = std::env::temp_dir().join(unique);
-            fs::create_dir(&path).expect("create temporary identity test directory");
-            Self { path }
-        }
-
-        fn child(&self, name: &str) -> PathBuf {
-            self.path.join(name)
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::test_support::TestTempDir as TestDir;
 
     #[test]
     fn request_identity_is_hashable_as_hash_map_key() {
         let temp = TestDir::new("hashmap");
-        let root = temp.child("project");
+        let root = temp.path().join("project");
         fs::create_dir(&root).expect("create project root");
 
         let identity = RequestIdentity::from_path("ses_a", &root).expect("build request identity");

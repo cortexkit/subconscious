@@ -377,24 +377,13 @@ fn percent_encode_uri_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs, process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::fs;
 
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let directory = env::temp_dir().join(format!(
-            "ck-mc-detection-{name}-{}-{}",
-            process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        directory
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     fn fixture_environment(directory: &Path) -> McEnvironment {
@@ -513,14 +502,14 @@ mod tests {
         let directory = fixture_dir("tier-two");
         let (_database, connection) = create_database(&directory, true);
         drop(connection);
-        let before = fs::read_dir(&directory)
+        let before = fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
 
-        let detection = detect(&fixture_environment(&directory), McPlatform::Unix);
+        let detection = detect(&fixture_environment(directory.path()), McPlatform::Unix);
 
-        let after = fs::read_dir(&directory)
+        let after = fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
@@ -536,22 +525,20 @@ mod tests {
             .is_some_and(|uri| uri.ends_with("?mode=ro")));
         assert_eq!(detection.evidence.durable_row_counts["memories"], 1);
         assert_eq!(before, after);
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn tier_one_empty_is_not_tier_two() {
         let directory = fixture_dir("tier-one-empty");
-        let (_database, connection) = create_database(&directory, false);
+        let (_database, connection) = create_database(directory.path(), false);
         drop(connection);
 
-        let detection = detect(&fixture_environment(&directory), McPlatform::Unix);
+        let detection = detect(&fixture_environment(directory.path()), McPlatform::Unix);
 
         assert_eq!(detection.classification, McClassification::Tier1Empty);
         assert_eq!(detection.evidence.durable_row_counts["compartments"], 0);
         assert_eq!(detection.evidence.durable_row_counts["memories"], 0);
         assert_eq!(detection.evidence.durable_row_counts["tags"], 0);
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -562,7 +549,10 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
             .unwrap();
-        let foreign = detect(&fixture_environment(&foreign_directory), McPlatform::Unix);
+        let foreign = detect(
+            &fixture_environment(foreign_directory.path()),
+            McPlatform::Unix,
+        );
         assert_eq!(foreign.classification, McClassification::ForeignSqlite);
 
         let malformed_directory = fixture_dir("malformed");
@@ -571,17 +561,20 @@ mod tests {
             "not a sqlite database",
         )
         .unwrap();
-        let malformed = detect(&fixture_environment(&malformed_directory), McPlatform::Unix);
+        let malformed = detect(
+            &fixture_environment(malformed_directory.path()),
+            McPlatform::Unix,
+        );
         assert_eq!(malformed.classification, McClassification::Malformed);
-
-        fs::remove_dir_all(foreign_directory).unwrap();
-        fs::remove_dir_all(malformed_directory).unwrap();
     }
 
     #[test]
     fn directory_and_wal_or_shm_sidecars_without_a_database_are_not_installation_evidence() {
         let empty_directory = fixture_dir("directory-only");
-        let empty = detect(&fixture_environment(&empty_directory), McPlatform::Unix);
+        let empty = detect(
+            &fixture_environment(empty_directory.path()),
+            McPlatform::Unix,
+        );
         assert_eq!(empty.classification, McClassification::Absent);
 
         let config_only_root = fixture_dir("config-only");
@@ -602,27 +595,25 @@ mod tests {
 
         let torn_directory = fixture_dir("torn-wal");
         fs::write(torn_directory.join("context.db-wal"), []).unwrap();
-        let torn = detect(&fixture_environment(&torn_directory), McPlatform::Unix);
+        let torn = detect(
+            &fixture_environment(torn_directory.path()),
+            McPlatform::Unix,
+        );
         assert_eq!(torn.classification, McClassification::TornState);
         assert!(torn.evidence.wal_present == Some(true));
-
-        fs::remove_dir_all(empty_directory).unwrap();
-        fs::remove_dir_all(config_only_root).unwrap();
-        fs::remove_dir_all(torn_directory).unwrap();
     }
 
     #[test]
     fn sqlite_busy_is_installed_and_live_without_an_automatic_offer() {
         let directory = fixture_dir("busy");
-        let (_database, connection) = create_database(&directory, true);
+        let (_database, connection) = create_database(directory.path(), true);
         connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-        let detection = detect(&fixture_environment(&directory), McPlatform::Unix);
+        let detection = detect(&fixture_environment(directory.path()), McPlatform::Unix);
 
         assert_eq!(detection.classification, McClassification::InstalledAndLive);
         connection.execute_batch("ROLLBACK").unwrap();
         drop(connection);
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

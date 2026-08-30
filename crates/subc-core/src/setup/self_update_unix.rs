@@ -100,13 +100,14 @@ mod tests {
         process::{self, Command, Stdio},
         sync::mpsc::{self, Receiver},
         thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant},
     };
 
     use serde_json::Map;
 
     use super::*;
     use crate::setup::{inventory::Inventory, self_update};
+    use subc_core::test_support::TestTempDir;
 
     const TEST_NAME: &str =
         "setup::self_update_unix::tests::unix_self_update_keeps_running_process_on_original_inode";
@@ -115,15 +116,8 @@ mod tests {
     const HELPER_RESULT_PREFIX: &str = "CK_SELF_UPDATE_TEST_RESULT:";
     const HELPER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after Unix epoch")
-            .as_nanos();
-        env::temp_dir().join(format!(
-            "ck-self-update-unix-{name}-{}-{nonce}",
-            process::id()
-        ))
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     fn executable(path: &Path) {
@@ -221,7 +215,6 @@ mod tests {
         }
 
         let root = fixture_dir("running-inode");
-        fs::create_dir_all(&root).expect("fixture directory");
         let destination = root.join("ck");
         let candidate = root.join("candidate");
         let manifest = root.join("installer-manifest.json");
@@ -296,6 +289,5 @@ mod tests {
                 .expect("probe inode evidence"),
             replacement_inode.to_string()
         );
-        fs::remove_dir_all(root).expect("cleanup");
     }
 }

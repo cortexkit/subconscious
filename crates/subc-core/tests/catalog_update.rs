@@ -1,15 +1,7 @@
-use std::{
-    collections::VecDeque,
-    fs,
-    ops::Deref,
-    path::PathBuf,
-    process,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{collections::VecDeque, ops::Deref, path::Path, time::Duration};
 
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-use subc_core::{read_frame, write_frame, Frame};
+use subc_core::{read_frame, test_support::TestTempDir, write_frame, Frame};
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManifestProvenance,
@@ -37,7 +29,6 @@ use tokio::{
 mod common;
 use common::{connect_authed_client, TestDaemon};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct TestServer {
@@ -369,7 +360,7 @@ async fn open_route(
                     module_id: module_id.to_string(),
                 },
                 identity: BindIdentity {
-                    project_root: project.path.clone(),
+                    project_root: project.path().to_path_buf(),
                     harness: "opencode".to_string(),
                     session: "catalog-update-session".to_string(),
                 },
@@ -690,24 +681,17 @@ impl Drop for FrameInbox {
 }
 
 struct TestProject {
-    path: PathBuf,
+    temp: TestTempDir,
 }
 
 impl TestProject {
     fn new(name: &str) -> Self {
-        let path = unique_temp_dir(name);
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
+        Self {
+            temp: TestTempDir::new(name),
+        }
     }
-}
 
-impl Drop for TestProject {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+    fn path(&self) -> &Path {
+        self.temp.path()
     }
-}
-
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("subc-core-{name}-{}-{nonce}", process::id()))
 }

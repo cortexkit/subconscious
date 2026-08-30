@@ -1,20 +1,17 @@
 #![allow(dead_code)]
 
 use std::{
-    fs, io,
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use subc_core::{
-    serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
-    Registry, Router, ServerAuth, SupervisorHandle,
+    serve_listener, test_support::TestTempDir, ConnectedClients, ControlHandler, ForwardingTable,
+    ModuleProcessLiveness, Registry, Router, ServerAuth, SupervisorHandle,
 };
 use subc_protocol::PROTOCOL_VERSION;
 use subc_transport::{
@@ -26,7 +23,6 @@ use tokio::{
     task::JoinHandle,
 };
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TEST_DAEMON_VER: &str = "test-subc";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -34,7 +30,7 @@ pub struct TestDaemon {
     pub registry: Arc<Registry>,
     pub forwarding: Arc<ForwardingTable>,
     pub connection_file_path: PathBuf,
-    pub temp_dir: PathBuf,
+    pub temp_dir: TestTempDir,
     pub task: JoinHandle<Result<(), subc_core::ServerError>>,
 }
 
@@ -47,7 +43,8 @@ impl TestDaemon {
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = fs::remove_dir_all(&self.temp_dir);
+        // The temp dir is owned by the `TestTempDir` guard, whose `Drop` removes
+        // the tree (or preserves it on panic).
     }
 }
 
@@ -124,7 +121,6 @@ async fn start_test_daemon_inner(
     per_module_bind_timeouts: Vec<(String, Duration)>,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
-    fs::create_dir_all(&temp_dir).unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let connection_file_path = temp_dir.join("subc-conn.json");
@@ -203,7 +199,6 @@ pub async fn connect_authed_client(path: impl AsRef<Path>) -> io::Result<TcpStre
     Ok(stream)
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("sc-{name}-{}-{nonce}", process::id()))
+fn unique_temp_dir(name: &str) -> TestTempDir {
+    TestTempDir::new(name)
 }

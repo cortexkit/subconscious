@@ -2,19 +2,16 @@ use std::{
     fs,
     ops::Deref,
     path::{Path, PathBuf},
-    process::{self, Command, Output},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    process::{Command, Output},
+    sync::Arc,
     time::Duration,
 };
 
 use serde_json::Value;
 use subc_control::{ClientControlRequest, ClientControlResponse, SupervisorEntry};
 use subc_core::{
-    read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, SupervisedModule, Supervisor,
-    SupervisorHandle, SupervisorProcessLiveness,
+    read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, ModuleSpec,
+    RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{Flags, FrameType, Priority};
 use tokio::{
@@ -27,7 +24,6 @@ use common::{
     connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
 };
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -60,28 +56,6 @@ impl Deref for TestServer {
 
     fn deref(&self) -> &Self::Target {
         &self.daemon
-    }
-}
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let path = unique_temp_dir(name);
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -1192,7 +1166,6 @@ where
     .expect("timed out waiting for frame")
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("subc-core-{name}-{}-{nonce}", process::id()))
+fn unique_temp_dir(name: &str) -> TempDir {
+    TempDir::new(name)
 }

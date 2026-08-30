@@ -388,13 +388,10 @@ fn current_uid() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        env, process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::collections::VecDeque;
 
     use super::*;
+    use subc_core::test_support::TestTempDir;
 
     #[derive(Default)]
     struct RecordingRunner {
@@ -412,12 +409,8 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        env::temp_dir().join(format!("ck-runtime-{name}-{}-{nonce}", process::id()))
+    fn fixture_dir(name: &str) -> TestTempDir {
+        TestTempDir::new(name)
     }
 
     #[test]
@@ -507,7 +500,6 @@ mod tests {
                 }
             }
             assert!(inventory.owns_path("runtime-definition", &paths.definition));
-            fs::remove_dir_all(root).expect("remove fixture");
         }
     }
 }

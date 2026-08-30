@@ -2,8 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{self, Command},
-    sync::atomic::{AtomicU64, Ordering},
+    process::Command,
     time::Duration,
 };
 
@@ -14,7 +13,9 @@ use subc_control::{
 };
 use subc_core::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
-    read_frame, write_frame, Frame,
+    read_frame,
+    test_support::TestTempDir,
+    write_frame, Frame,
 };
 use subc_protocol::{
     manifest::{
@@ -34,7 +35,6 @@ use tokio::{
 mod common;
 use common::connect_authed_client;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,14 +42,16 @@ const STATE_TIMEOUT: Duration = Duration::from_secs(10);
 struct RunningDaemon {
     connection_file_path: PathBuf,
     config_path: PathBuf,
-    temp_dir: PathBuf,
+    // Held for RAII lifetime only: the guard's `Drop` removes the tree (or
+    // preserves it on panic). Never read directly.
+    #[allow(dead_code)]
+    temp_dir: TestTempDir,
     task: JoinHandle<Result<(), subc_core::bootstrap::BootstrapError>>,
 }
 
 impl RunningDaemon {
     async fn start(name: &str, config_doc: Option<String>) -> Self {
         let temp_dir = unique_temp_dir(name);
-        fs::create_dir_all(&temp_dir).unwrap();
         let connection_file_path = temp_dir.join("subc-conn.json");
         let config_path = temp_dir.join("config").join("cortexkit").join("subc.jsonc");
         if let Some(config_doc) = config_doc {
@@ -77,7 +79,8 @@ impl RunningDaemon {
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = fs::remove_dir_all(&self.temp_dir);
+        // The temp dir is owned by the `TestTempDir` guard, whose `Drop` removes
+        // the tree (or preserves it on panic).
     }
 }
 
@@ -1091,7 +1094,6 @@ async fn absent_config_starts_bare_daemon_with_no_supervised_modules() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn present_invalid_config_fails_loud_before_daemon_starts() {
     let temp_dir = unique_temp_dir("daemon-config-invalid");
-    fs::create_dir_all(&temp_dir).unwrap();
     let connection_file_path = temp_dir.join("subc-conn.json");
     let config_path = temp_dir.join("subc.jsonc");
     fs::write(
@@ -1108,8 +1110,6 @@ async fn present_invalid_config_fails_loud_before_daemon_starts() {
     assert!(message.contains(&config_path.display().to_string()));
     assert!(message.contains("invalid daemon config"));
     assert!(!connection_file_path.exists());
-
-    let _ = fs::remove_dir_all(temp_dir);
 }
 
 fn config_doc<const N: usize>(modules: [Value; N]) -> String {
@@ -1393,7 +1393,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let project_root = unique_temp_dir("daemon-config-project");
-    fs::create_dir_all(&project_root).unwrap();
     match control_rpc_result_on_stream(
         stream,
         corr,
@@ -1402,7 +1401,7 @@ where
                 module_id: module_id.to_string(),
             },
             identity: BindIdentity {
-                project_root,
+                project_root: project_root.path().to_path_buf(),
                 harness: "daemon-config-test".to_string(),
                 session: format!("session-{corr}"),
             },
@@ -1573,7 +1572,6 @@ where
     .expect("timed out waiting for frame")
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("subc-core-{name}-{}-{nonce}", process::id()))
+fn unique_temp_dir(name: &str) -> TestTempDir {
+    TestTempDir::new(name)
 }

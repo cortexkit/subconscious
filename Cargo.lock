@@ -1728,6 +1728,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-control",
+ "subc-core",
  "subc-jsonc",
  "subc-protocol",
  "subc-transport",

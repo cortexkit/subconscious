@@ -12059,3 +12059,17 @@ v2-rewrite"), and wave notices name the branch the absorb lands on.
 Standing rule for rewrite periods: fleet-facing fixes land on the default
 branch first and merge forward — master is the fleet's artifact, the branch
 is the seat's.
+
+## Merged is not lossless, and the tell is the path (AVA, 2026-08-30)
+
+Janitor predicate correction, self-caught before anyone built on it: a
+fully-merged branch can sit in a worktree holding uncommitted work, so
+"merged into master" alone authorizes data loss. The safe predicate is
+merged AND clean — and the clean half comes free by not passing --force
+(bare `git worktree remove` refuses dirty trees), making safe the default
+and dangerous an explicit opt-in: the right polarity for anything
+unattended. Dirty-but-merged is left and reported, never decided for the
+owner. Companion diagnostic for ENOSPC: the first casualty of a full disk
+names a temp or cache path you did not choose (/var/folders lock write),
+reading as a tool bug — when a failure names a path you did not pick, check
+df before debugging the tool.

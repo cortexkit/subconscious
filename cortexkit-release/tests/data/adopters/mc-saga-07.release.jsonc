@@ -1,0 +1,14 @@
+{
+  // adopter case: mc-saga-07
+  "version": 1,
+  "trains": [{
+    "id": "mc-context-unfit",
+    "intended_commit": "mc07",
+    "signing_profile": "none",
+    "phases": [{
+      "id": "context-gate",
+      "type": "ci_watch",
+      "params": {"workflow": "Context Gate", "selector": "commit:mc07"}
+    }]
+  }]
+}

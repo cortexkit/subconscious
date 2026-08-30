@@ -1,0 +1,10 @@
+{
+  // adopter case: mc-saga-10
+  "version": 1,
+  "trains": [{
+    "id": "mc-unpinned-tool",
+    "intended_commit": "mc10",
+    "signing_profile": "none",
+    "artifacts": [{"id": "tool", "kind": "archive", "identity_channel": "outside_declared_pins"}]
+  }]
+}

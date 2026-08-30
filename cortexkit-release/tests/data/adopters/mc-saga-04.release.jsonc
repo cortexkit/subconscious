@@ -1,0 +1,13 @@
+{
+  // adopter case: mc-saga-04
+  "version": 1,
+  "trains": [{
+    "id": "mc-runner-vanished",
+    "intended_commit": "mc04",
+    "tag": "v0.40.4",
+    "signing_profile": "none",
+    "operator_gates": ["first_public_trigger"],
+    "artifacts": [{"id": "archive", "kind": "archive", "identity_channel": "asset_sha256"}],
+    "phases": [{"id": "publish-archive", "type": "assets"}]
+  }]
+}

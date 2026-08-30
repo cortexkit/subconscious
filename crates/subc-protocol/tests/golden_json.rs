@@ -537,14 +537,11 @@ fn module_control_request(
 }
 
 fn module_manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: "1.2.3".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: provider_roles(),
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        module_id,
+        "1.2.3",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -556,34 +553,17 @@ fn module_manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .provides(provider_roles())
+    .build()
 }
 
 fn management_surface_manifest(description: Option<&str>) -> ModuleManifest {
-    ModuleManifest {
-        module_id: "management-surface".to_string(),
-        module_version: "1.2.3".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ManagementSurface {
-            operations: vec![ManagementOperation {
-                name: "records.list".to_string(),
-                kind: ManagementOperationKind::Query,
-                description: description.map(ToOwned::to_owned),
-            }],
-            config_schema: serde_json::json!({"type": "object"}),
-            observability: vec![ObservabilitySurface {
-                name: "records.stats".to_string(),
-                kind: ObservabilityKind::Snapshot,
-            }],
-            identity_scope: vec![IdentityScope::Project],
-            concurrency: Concurrency::ModuleManaged,
-        }],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        "management-surface",
+        "1.2.3",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -595,10 +575,22 @@ fn management_surface_manifest(description: Option<&str>) -> ModuleManifest {
                 optional: Vec::new(),
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .provides(vec![ProviderRole::ManagementSurface {
+        operations: vec![ManagementOperation {
+            name: "records.list".to_string(),
+            kind: ManagementOperationKind::Query,
+            description: description.map(ToOwned::to_owned),
+        }],
+        config_schema: serde_json::json!({"type": "object"}),
+        observability: vec![ObservabilitySurface {
+            name: "records.stats".to_string(),
+            kind: ObservabilityKind::Snapshot,
+        }],
+        identity_scope: vec![IdentityScope::Project],
+        concurrency: Concurrency::ModuleManaged,
+    }])
+    .build()
 }
 
 fn provider_roles() -> Vec<ProviderRole> {

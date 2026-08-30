@@ -9,14 +9,10 @@ use mcp_stdio_adapter::{
 };
 use serde_json::json;
 use subc_client_rs::{serve_with_handle, ConsumerIdentity};
-use subc_protocol::manifest::ModuleManifest;
-use subc_protocol::{
-    manifest::{
-        Bindings, Concurrency, IdentityBinding, IdentityScope, ManagementOperation,
-        ManagementOperationKind, ObservabilityKind, ObservabilitySurface, ProviderRole,
-        StorageBinding, StorageKind, StorageScope, TrustTier,
-    },
-    PROTOCOL_VERSION,
+use subc_protocol::manifest::{
+    Bindings, Concurrency, IdentityBinding, IdentityScope, ManagementOperation,
+    ManagementOperationKind, ModuleManifest, ObservabilityKind, ObservabilitySurface, ProviderRole,
+    StorageBinding, StorageKind, StorageScope, TrustTier,
 };
 
 const MODULE_ID: &str = "mcp-stdio-adapter";
@@ -100,40 +96,11 @@ fn print_manifest(manifest: ModuleManifest) -> Result<()> {
 }
 
 fn manifest() -> ModuleManifest {
-    ModuleManifest {
-        module_id: MODULE_ID.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ManagementSurface {
-            operations: vec![
-                ManagementOperation {
-                    name: "tools/list".to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: Some(
-                        "List the MCP tools exposed by the configured child servers and return their names, descriptions, and input schemas."
-                            .to_string(),
-                    ),
-                },
-                ManagementOperation {
-                    name: "tools/call".to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: Some(
-                        "Invoke a named tool on a configured child server and return the child's MCP result."
-                            .to_string(),
-                    ),
-                },
-            ],
-            config_schema: json!({"type": "object"}),
-            observability: vec![ObservabilitySurface {
-                name: "health".to_string(),
-                kind: ObservabilityKind::Snapshot,
-            }],
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-        }],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        MODULE_ID,
+        env!("CARGO_PKG_VERSION"),
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -145,10 +112,35 @@ fn manifest() -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .provides(vec![ProviderRole::ManagementSurface {
+        operations: vec![
+            ManagementOperation {
+                name: "tools/list".to_string(),
+                kind: ManagementOperationKind::Query,
+                description: Some(
+                    "List the MCP tools exposed by the configured child servers and return their names, descriptions, and input schemas."
+                        .to_string(),
+                ),
+            },
+            ManagementOperation {
+                name: "tools/call".to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: Some(
+                    "Invoke a named tool on a configured child server and return the child's MCP result."
+                        .to_string(),
+                ),
+            },
+        ],
+        config_schema: json!({"type": "object"}),
+        observability: vec![ObservabilitySurface {
+            name: "health".to_string(),
+            kind: ObservabilityKind::Snapshot,
+        }],
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+    }])
+    .build()
 }
 
 #[derive(Debug, Default)]

@@ -509,14 +509,11 @@ fn tool_provider_manifest(
 }
 
 fn supervision_only_manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: "0.0.0-catalog-update-test".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: Vec::new(),
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        module_id,
+        "0.0.0-catalog-update-test",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -528,10 +525,8 @@ fn supervision_only_manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .build()
 }
 
 fn tool_provider_role(tools: &[&str], concurrency: Concurrency) -> ProviderRole {

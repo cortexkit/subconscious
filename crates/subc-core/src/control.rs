@@ -1373,13 +1373,11 @@ impl ControlHandler {
             )?]);
         }
 
-        let candidate = ModuleManifest {
-            provides: provides.clone(),
-            capabilities: capabilities
-                .clone()
-                .or_else(|| registration.manifest.capabilities.clone()),
-            ..registration.manifest.clone()
-        };
+        let mut candidate = registration.manifest.clone();
+        candidate.provides = provides.clone();
+        candidate.capabilities = capabilities
+            .clone()
+            .or_else(|| registration.manifest.capabilities.clone());
         if let Err(err) = candidate.validate_capability_grammar() {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -3632,10 +3630,8 @@ fn catalog_update_frozen_field_message(
     }
 
     let registered_concurrency = manifest_concurrency(registered);
-    let candidate = ModuleManifest {
-        provides: provides.to_vec(),
-        ..registered.clone()
-    };
+    let mut candidate = registered.clone();
+    candidate.provides = provides.to_vec();
     let candidate_concurrency = manifest_concurrency(&candidate);
     if candidate_concurrency != registered_concurrency {
         return Some(format!(
@@ -4176,25 +4172,11 @@ mod tests {
     }
 
     fn manifest(module_id: &str, protocol_ver: u8) -> ModuleManifest {
-        ModuleManifest {
-            module_id: module_id.to_string(),
-            module_version: "0.1.0".to_string(),
-            protocol_ver,
-            trust_tier: subc_protocol::manifest::TrustTier::FirstParty,
-            provides: vec![ProviderRole::ToolProvider {
-                tools: vec![Tool {
-                    name: "read".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Pure,
-                    schema: json!({"type": "object"}),
-                }],
-                identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-                concurrency: Concurrency::ModuleManaged,
-                emits_push: true,
-                sub_supervises: true,
-            }],
-            consumes: Vec::new(),
-            bindings: Bindings {
+        ModuleManifest::builder(
+            module_id,
+            "0.1.0",
+            subc_protocol::manifest::TrustTier::FirstParty,
+            Bindings {
                 storage: StorageBinding {
                     kind: StorageKind::Sqlite,
                     scope: StorageScope::Project,
@@ -4206,10 +4188,21 @@ mod tests {
                     optional: vec![IdentityScope::Session],
                 },
             },
-            capabilities: None,
-            self_signals: None,
-            provenance: None,
-        }
+        )
+        .protocol_ver(protocol_ver)
+        .provides(vec![ProviderRole::ToolProvider {
+            tools: vec![Tool {
+                name: "read".to_string(),
+                description: None,
+                execution_mode: ExecutionMode::Pure,
+                schema: json!({"type": "object"}),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: true,
+            sub_supervises: true,
+        }])
+        .build()
     }
 
     fn hello_frame(module_id: &str, protocol_ver: u8, corr: u64) -> Frame {

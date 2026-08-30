@@ -14,7 +14,7 @@ use subc_protocol::{
         Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ProviderRole,
         StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
-    ModuleHelloAckBody, PROTOCOL_VERSION,
+    ModuleHelloAckBody,
 };
 use tokio::time::{sleep, Duration};
 
@@ -160,25 +160,11 @@ fn append_json_line(path: &Path, event: Value) -> std::io::Result<()> {
 }
 
 fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
-    subc_protocol::manifest::ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "echo".to_string(),
-                description: None,
-                execution_mode: ExecutionMode::Pure,
-                schema: json!({"type": "object"}),
-            }],
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: true,
-            sub_supervises: true,
-        }],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    subc_protocol::manifest::ModuleManifest::builder(
+        module_id,
+        env!("CARGO_PKG_VERSION"),
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -190,8 +176,18 @@ fn manifest(module_id: &str) -> subc_protocol::manifest::ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .provides(vec![ProviderRole::ToolProvider {
+        tools: vec![Tool {
+            name: "echo".to_string(),
+            description: None,
+            execution_mode: ExecutionMode::Pure,
+            schema: json!({"type": "object"}),
+        }],
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: true,
+        sub_supervises: true,
+    }])
+    .build()
 }

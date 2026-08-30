@@ -26,7 +26,7 @@ use subc_protocol::{
         StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::HealthStatus,
-    BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget,
 };
 use subc_transport::{authenticate_client, read_frame, write_frame};
 use tokio::{
@@ -1586,14 +1586,11 @@ where
 }
 
 fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![tool_provider_role(tool_names)],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        module_id,
+        env!("CARGO_PKG_VERSION"),
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -1605,10 +1602,9 @@ fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifes
                 optional: vec![IdentityScope::Session],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .provides(vec![tool_provider_role(tool_names)])
+    .build()
 }
 
 fn inline_capability_module_manifest(module_id: &str, capability: Option<&str>) -> ModuleManifest {

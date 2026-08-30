@@ -5367,14 +5367,11 @@ fn active_tool_provider_module_id(registry: &Registry) -> String {
 }
 
 fn consumer_manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: "0.0.0-consumer".to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: Vec::new(),
-        consumes: Vec::new(),
-        bindings: Bindings {
+    ModuleManifest::builder(
+        module_id,
+        "0.0.0-consumer",
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -5386,10 +5383,8 @@ fn consumer_manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Project],
             },
         },
-        capabilities: None,
-        self_signals: None,
-        provenance: None,
-    }
+    )
+    .build()
 }
 
 fn tool_provider_manifest(module_id: &str) -> ModuleManifest {

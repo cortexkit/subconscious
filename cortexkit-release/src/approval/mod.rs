@@ -306,12 +306,21 @@ fn timestamp_millis() -> Result<u128, ApprovalError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), ApprovalError> {
-    File::open(path)
+    #[cfg(not(windows))]
+    return File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| ApprovalError::UnsupportedDurability {
             path: path.to_path_buf(),
             source,
-        })
+        });
+    // Windows cannot open a directory as a syncable File handle; the record
+    // file itself is flushed and NTFS metadata durability differs, so parent
+    // sync is a documented no-op (same policy as the journal store).
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn approval_io(path: &Path, source: io::Error) -> ApprovalError {

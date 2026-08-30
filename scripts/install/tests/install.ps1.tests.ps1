@@ -54,14 +54,14 @@ Describe 'native ck installer' {
         $output = & $installerPath -ReleaseBaseUrl 'https://release.fixture.example/download'
 
         $output | Should -Contain 'Next: ck setup'
-        Assert-MockCalled Invoke-WebRequest -Times 1 -ParameterFilter {
+        Should -Invoke Invoke-WebRequest -Times 1 -ParameterFilter {
             $Uri -eq 'https://release.fixture.example/download/ck-windows-x64.zip'
         }
-        Assert-MockCalled Invoke-WebRequest -Times 1 -ParameterFilter {
+        Should -Invoke Invoke-WebRequest -Times 1 -ParameterFilter {
             $Uri -eq 'https://release.fixture.example/download/ck-windows-x64.zip.sha256'
         }
-        Assert-MockCalled Expand-Archive -Times 1
-        Assert-MockCalled Set-ItemProperty -Times 1 -ParameterFilter {
+        Should -Invoke Expand-Archive -Times 1
+        Should -Invoke Set-ItemProperty -Times 1 -ParameterFilter {
             $Path -eq 'HKCU:\Environment' -and $Name -eq 'Path'
         }
 

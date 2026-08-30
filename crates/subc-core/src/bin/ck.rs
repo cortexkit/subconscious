@@ -137,7 +137,13 @@ const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nus
 #[tokio::main]
 async fn main() {
     match run(env::args_os()).await {
-        Ok(()) => process::exit(0),
+        Ok(()) => match cleanup_replaced_windows_ck() {
+            Ok(()) => process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                process::exit(error.exit_code());
+            }
+        },
         Err(CkError::FleetLintExit { exit_code } | CkError::TriageExit { exit_code }) => {
             process::exit(exit_code)
         }
@@ -146,6 +152,33 @@ async fn main() {
             process::exit(err.exit_code());
         }
     }
+}
+
+/// A Windows self-update leaves `ck.exe.old` until a later, successful process
+/// proves that the replacement starts normally. Unix replacement has no old-name
+/// artifact because rename keeps the running process on its original inode.
+#[cfg(windows)]
+fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
+    let executable = env::current_exe().map_err(|error| {
+        CkError::Message(format!(
+            "could not locate ck for self-update cleanup: {error}"
+        ))
+    })?;
+    let previous = executable.with_extension("exe.old");
+    if previous.exists() {
+        fs::remove_file(&previous).map_err(|error| {
+            CkError::Message(format!(
+                "could not delete prior self-update executable {}: {error}",
+                previous.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
+    Ok(())
 }
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
@@ -170,7 +203,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return setup_command(&args.program, request);
     }
     if let Command::Upgrade { check } = &args.command {
-        return upgrade_command(*check).await;
+        return upgrade_command(&args.program, args.subc.as_deref(), *check).await;
     }
     if matches!(&args.command, Command::DaemonTriage) {
         return daemon_triage(args.subc.as_deref(), args.json);
@@ -3998,23 +4031,36 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
     backend.apply_plan(&plan, request).map_err(CkError::Message)
 }
 
-async fn upgrade_command(check: bool) -> Result<(), CkError> {
-    let observed = if check {
-        let cache = setup::UpdateCache::from_environment();
-        let source = setup::GitHubReleaseSource::from_environment()
-            .map_err(|error| CkError::Message(error.to_string()))?;
-        let metadata = setup::check_update_metadata(&cache, &source)
-            .await
-            .map_err(CkError::UpdateCheck)?;
-        setup::observed_from_metadata(&metadata, &setup::compiled_installed_versions())
-    } else {
-        setup::UpgradeObserved::no_updates_on_current_host()
-    };
+async fn upgrade_command(
+    executable: &Path,
+    subc: Option<&Path>,
+    check: bool,
+) -> Result<(), CkError> {
+    // The daemon connection file is the daemon catalog build evidence. It is
+    // optional while no inventory-owned daemon exists; discovery turns its
+    // absence into a refusal only when an owned daemon actually needs a version.
+    let daemon_catalog =
+        discover_connection_file(subc)
+            .ok()
+            .map(|connection| setup::DaemonCatalogBuild {
+                pid: connection.info.pid,
+                version: connection.info.daemon_ver,
+            });
+    let discovered = setup::discover_current_upgrade_targets(executable, daemon_catalog.as_ref())
+        .map_err(CkError::Rejected)?;
+    let cache = setup::UpdateCache::from_environment();
+    let source = setup::GitHubReleaseSource::from_environment()
+        .map_err(|error| CkError::Message(error.to_string()))?;
+    let metadata = setup::check_update_metadata(&cache, &source)
+        .await
+        .map_err(CkError::UpdateCheck)?;
+    let observed = setup::observed_upgrade_targets(&metadata, &discovered);
     let plan = setup::plan_upgrade(&observed);
     print_upgrade_plan(&plan);
     if !plan.is_authorized() {
         return Err(CkError::Rejected(
-            "upgrade plan refused; no mutations were applied".to_string(),
+            "upgrade plan refused; no binaries were replaced and no runtime was restarted"
+                .to_string(),
         ));
     }
     let planned_mutations = plan
@@ -4026,14 +4072,31 @@ async fn upgrade_command(check: bool) -> Result<(), CkError> {
         println!(
             "upgrade check: {planned_mutations} mutation(s) planned; no binaries were replaced and no runtime was restarted"
         );
-    } else if planned_mutations == 0 {
-        println!("upgrade: no action was needed");
-    } else {
-        return Err(CkError::Message(
-            "upgrade execution backend is unavailable; use --check to inspect the plan".to_string(),
-        ));
+        return Ok(());
     }
-    Ok(())
+    if planned_mutations == 0 {
+        println!("upgrade: no action was needed");
+        return Ok(());
+    }
+
+    let mut backend =
+        setup::SystemUpgradeBackend::new(executable, subc.map(Path::to_path_buf), discovered)
+            .map_err(CkError::Rejected)?;
+    for target in setup::UpgradeTarget::ORDERED {
+        if let setup::UpgradeState::UpdateAvailable { to, .. } = observed.target_state(target) {
+            backend.set_expected_version(target, to);
+        }
+    }
+    match setup::execute_upgrade(&plan, &mut backend) {
+        Ok(report) => {
+            setup::render_execution_report(&report);
+            Ok(())
+        }
+        Err(failure) => {
+            setup::render_execution_report(&failure.report);
+            Err(CkError::Rejected(failure.to_string()))
+        }
+    }
 }
 
 fn print_setup_plan(plan: &setup::SetupPlan) {

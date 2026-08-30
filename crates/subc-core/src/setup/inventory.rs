@@ -101,6 +101,35 @@ impl Inventory {
         self.changed |= mutations.len() != before;
     }
 
+    /// Keep the ownership digest aligned with a managed replacement. Without
+    /// this update, uninstall would correctly see a changed file but would
+    /// mistake the upgrade's own replacement for a user modification.
+    pub fn update_owned_string(
+        &mut self,
+        kind: &str,
+        path: &Path,
+        key: &str,
+        value: String,
+    ) -> Result<(), String> {
+        let path_text = path.to_string_lossy();
+        let entry = self.mutations_mut().iter_mut().find(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some(kind)
+                && entry.get("path").and_then(Value::as_str) == Some(path_text.as_ref())
+        });
+        let Some(entry) = entry else {
+            return Err(format!(
+                "inventory has no {kind} entry for managed path {}",
+                path.display()
+            ));
+        };
+        let object = entry
+            .as_object_mut()
+            .expect("inventory mutation entries are objects written by record");
+        object.insert(key.to_string(), Value::String(value));
+        self.changed = true;
+        Ok(())
+    }
+
     pub fn save(&mut self) -> Result<(), String> {
         if !self.changed {
             return Ok(());
@@ -170,6 +199,32 @@ mod tests {
             .expect("clock after epoch")
             .as_nanos();
         env::temp_dir().join(format!("ck-setup-{name}-{}-{nonce}", process::id()))
+    }
+
+    #[test]
+    fn replacement_digest_updates_an_existing_managed_entry() {
+        let root = fixture_path("replacement-digest");
+        fs::create_dir_all(&root).expect("fixture directory");
+        let manifest = root.join("installer-manifest.json");
+        let binary = root.join("ck-aft");
+        let mut inventory = Inventory::load(&manifest, "linux-x64").expect("load inventory");
+        let mut fields = Map::new();
+        fields.insert("sha256".to_string(), Value::String("before".to_string()));
+        inventory.record("managed-binary", &binary, fields);
+        inventory
+            .update_owned_string("managed-binary", &binary, "sha256", "after".to_string())
+            .expect("update digest");
+        inventory.save().expect("save inventory");
+
+        let reloaded = Inventory::load(&manifest, "linux-x64").expect("reload inventory");
+        assert_eq!(
+            reloaded
+                .entry_for_path("managed-binary", &binary)
+                .and_then(|entry| entry.get("sha256"))
+                .and_then(Value::as_str),
+            Some("after")
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]

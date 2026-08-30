@@ -12045,3 +12045,17 @@ first probe (`merge-base --is-ancestor`) printed one label for "commit
 absent" and "commit elsewhere" — a probe that collapses absent and elsewhere
 is the same defect as one that collapses failed and not-measured;
 `cat-file -t` + `branch -r --contains` separates them in one command.
+
+## The instrument is honest about its own subject; the reader supplies one it never claimed (ASTRO, 2026-08-30)
+
+The non-default-branch absorb sharpened to its general form: "201 green
+under --locked" and "astrocyte fails to build" were both true of different
+refs, and neither mentioned a branch because for most modules there is only
+one — a build claim carries no ref by default, so the reader supplies their
+own. Same family as lsof reporting the open-time path and checkpoints
+reporting tracked files when asked about untracked ones. Cheap fix, both
+directions: cross-seat gate reports NAME THE REF ("green at 59a6fb6 on
+v2-rewrite"), and wave notices name the branch the absorb lands on.
+Standing rule for rewrite periods: fleet-facing fixes land on the default
+branch first and merge forward — master is the fleet's artifact, the branch
+is the seat's.

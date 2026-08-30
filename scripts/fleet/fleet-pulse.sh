@@ -123,6 +123,25 @@ except Exception:
     fi
   done
   [ -n "$layout_bad" ] && printf '  LAYOUT ANOMALY:%s -- see docs/module-rename-runbook.md data-layout section\n' "$layout_bad"
+  # SYNAPSE CERTIFICATION (2026-08-30, SYNAPSE nomination after the Aug 25-29
+  # four-day silent refusal): certification_stale=true means synapse FAIL-CLOSED
+  # refuses the affected model class while process health reads ok -- the exact
+  # healthy-but-refusing shape no process gauge can see. Alarm on the field, and
+  # keep the three states distinct: false (fine, say nothing), true (alarm),
+  # ABSENT (older binary or probe failure -- say so; absence must not read as
+  # false, that is the absent-arm rule).
+  cert_line=$(ck health synapse 2>/dev/null | grep -m1 'certification_stale')
+  if [ -n "$cert_line" ]; then
+    case "$cert_line" in
+      *true*)
+        since=$(ck health synapse 2>/dev/null | sed -n 's/.*stale_since_ms[": ]*\([0-9]*\).*/\1/p' | head -1)
+        printf '  SYNAPSE CERTIFICATION STALE: fail-closed refusals active while process health reads ok%s\n' "${since:+ (since_ms $since)}"
+        ck health synapse 2>/dev/null | grep 'certified=false' | head -4 | sed 's/^/    /'
+        ;;
+    esac
+  else
+    printf '  synapse certification field ABSENT (pre-gen-72 binary or probe failure -- cert outage detection is blind)\n'
+  fi
   if [ -n "$cfg_ids" ]; then
     absent=$(printf '%s\n' "$cfg_ids" | while IFS= read -r mid; do
       printf '%s\n' "$health" | grep -q "[[:space:]●]$mid[[:space:]]\|^$mid[[:space:]]\|● $mid\b" || printf '%s ' "$mid"

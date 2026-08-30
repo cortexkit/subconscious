@@ -207,6 +207,23 @@ impl ApprovalStore {
         Ok(true)
     }
 
+    /// Removes any approval so a changed declaration must construct and confirm a new subject.
+    ///
+    /// Rebinding a declaration always calls this method even if another part of
+    /// the subject happens to match. The old confirmation was made for a
+    /// different bound declaration and therefore cannot admit future public work.
+    pub fn invalidate(&self) -> Result<bool, ApprovalError> {
+        let path = self.approval_path();
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_directory(&self.repository_dir())?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(approval_io(&path, source)),
+        }
+    }
+
     /// Persists a confirmed approval before any public executor may be invoked.
     ///
     /// Replacing an older record is safe only because callers must use

@@ -9,7 +9,7 @@ use crate::{
     approval::{build_approval_subject, ApprovalStore, ApprovalSubject},
     lease::LeaseStore,
     plan::{PlannedPhase, PublicEffect, ReleasePlan},
-    state::{IntentRecord, JournalRecord, JournalStore, PendingIntent},
+    state::{IntentRecord, JournalRecord, JournalStore, PendingIntent, StateError},
     ApprovalToken, ArtifactDigest, ArtifactId, CompletionProbe, EffectRequest,
     IrreversibleExecutor, OperationId, PhaseInstanceId, ProbeEvidence, ProbeResult, SeamError,
 };
@@ -103,6 +103,7 @@ pub enum OrchestrationRefusalCode {
     AttemptedIntentAbsent,
     ContradictoryEvidence,
     MissingPublicEffect,
+    DeclarationDigestMismatch,
 }
 
 /// An execution failure that does not erase the durable intent needed for replay.
@@ -176,6 +177,7 @@ impl Orchestrator {
         P: CompletionProbe,
         E: IrreversibleExecutor,
     {
+        ensure_matching_declaration(journal, plan)?;
         self.registry.validate_plan(plan)?;
         let train_lease = leases.acquire_train(plan.repository.clone(), plan.train.clone())?;
         let mut outcomes = Vec::new();
@@ -243,6 +245,7 @@ where
     P: CompletionProbe,
     E: IrreversibleExecutor,
 {
+    ensure_matching_declaration(journal, plan)?;
     let request = effect_request(plan, effect)?;
     let expected_identity = expected_identity(plan, effect)?;
     let attempted = attempted_intent(journal, &request)?;
@@ -286,6 +289,26 @@ where
             journal.append_completion(&intent, evidence.clone())?;
             Ok(EffectOutcome::Executed(evidence))
         }
+    }
+}
+
+fn ensure_matching_declaration(
+    journal: &JournalStore,
+    plan: &ReleasePlan,
+) -> Result<(), OrchestrationError> {
+    match journal.ensure_declaration_digest(&plan.declaration_digest) {
+        Ok(()) => Ok(()),
+        Err(StateError::DeclarationDigestMismatch { pinned, active }) => {
+            let train_journal_id = journal.train_journal_id();
+            Err(OrchestrationError::refusal(
+                OrchestrationRefusalCode::DeclarationDigestMismatch,
+                None,
+                format!(
+                    "active declaration digest `{active}` differs from pinned digest `{pinned}`; run `ck-release abandon {train_journal_id}` or `ck-release rebind {train_journal_id}` before resuming"
+                ),
+            ))
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -381,6 +404,9 @@ fn completion_exists(
 ) -> Result<bool, OrchestrationError> {
     Ok(journal.read_journal()?.iter().any(|record| match record {
         JournalRecord::Completion { intent, .. } => intent_matches(intent, request),
+        JournalRecord::DeclarationPinned { .. }
+        | JournalRecord::DeclarationRebound { .. }
+        | JournalRecord::Terminalized { .. } => false,
     }))
 }
 

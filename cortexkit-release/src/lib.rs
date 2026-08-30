@@ -13,6 +13,7 @@ pub mod artifact;
 pub mod declaration;
 pub mod executor;
 pub mod lease;
+pub mod orchestrator;
 pub mod phases {
     pub mod ci_watch;
 }
@@ -224,6 +225,10 @@ pub trait ApprovalGate {
 // and lockfile verification cannot accidentally invoke a release operation.
 #[allow(dead_code)]
 fn main() {}
+
+#[cfg(test)]
+#[path = "../tests/replay/mod.rs"]
+mod replay;
 
 #[cfg(test)]
 mod tests {

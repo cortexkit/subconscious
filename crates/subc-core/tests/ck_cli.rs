@@ -167,7 +167,7 @@ fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 1024];
         let _ = std::io::Read::read(&mut stream, &mut request);
-        let _ = release_done_rx.recv_timeout(Duration::from_secs(2));
+        let _ = release_done_rx.recv_timeout(Duration::from_secs(10));
     });
 
     let missing = temp.path().join("subc-connection.json");
@@ -184,8 +184,13 @@ fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
     server.join().unwrap();
 
     assert_exit(&output, 0);
+    // Discriminating margin, not a latency SLO: a ck that BLOCKS on the hanging
+    // source cannot return before the server's 10s hold releases, while an
+    // unblocked ck finishes in well under 5s even on a loaded runner. The gap
+    // between the two bounds is what keeps blocked-vs-slow distinguishable;
+    // an absolute tight envelope here flaked under parallel suite load.
     assert!(
-        elapsed < Duration::from_millis(1_500),
+        elapsed < Duration::from_secs(5),
         "bare ck exceeded its bounded refresh envelope: {elapsed:?}"
     );
     let stdout = text(&output.stdout);

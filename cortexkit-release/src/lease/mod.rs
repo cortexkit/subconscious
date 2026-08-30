@@ -10,7 +10,7 @@ use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process,
     sync::OnceLock,
@@ -156,16 +156,19 @@ impl LeaseStore {
         })?;
         sync_directory(parent)?;
 
-        let mut file = OpenOptions::new()
+        // The OS lock lives on a zero-byte sibling, never on the holder record:
+        // Windows file locks are mandatory, so locking the record itself would
+        // make the holder unreadable exactly when a conflicting caller needs to
+        // report who holds it. The lock file decides ownership; the record file
+        // stays plain and is replaced atomically below.
+        let lock_path = lock_path_for(&path);
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            // Deliberately not truncating at open: the current holder's record
-            // must survive until try_lock decides ownership. write_holder
-            // truncates after the lock is held.
             .truncate(false)
-            .open(&path)
-            .map_err(|source| lease_io(&path, source))?;
+            .open(&lock_path)
+            .map_err(|source| lease_io(&lock_path, source))?;
         if let Err(source) = FileExt::try_lock(&file) {
             return Err(lock_failure(&path, scope, source));
         }
@@ -174,11 +177,11 @@ impl LeaseStore {
             process_id: process::id(),
             process_started_at_ms: process_started_at_millis()?,
         };
-        write_holder(&mut file, &path, &holder)?;
+        write_holder(&path, &holder)?;
         sync_directory(parent)?;
         Ok(LeaseGuard {
             file: Some(file),
-            path,
+            path: lock_path,
             scope,
         })
     }
@@ -218,21 +221,30 @@ impl Drop for LeaseGuard {
     }
 }
 
-fn write_holder(file: &mut File, path: &Path, holder: &LeaseHolder) -> Result<(), LeaseError> {
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .expect("a lease path always names a file")
+        .to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn write_holder(path: &Path, holder: &LeaseHolder) -> Result<(), LeaseError> {
     let bytes = serde_json::to_vec(holder).map_err(|error| LeaseError::CorruptHolder {
         path: path.to_path_buf(),
         reason: format!("could not encode holder: {error}"),
     })?;
-    file.set_len(0).map_err(|source| lease_io(path, source))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| lease_io(path, source))?;
+    let temp = path.with_extension("lease.tmp");
+    let mut file = File::create(&temp).map_err(|source| lease_io(&temp, source))?;
     file.write_all(&bytes)
-        .map_err(|source| lease_io(path, source))?;
+        .map_err(|source| lease_io(&temp, source))?;
     file.sync_all()
         .map_err(|source| LeaseError::UnsupportedDurability {
-            path: path.to_path_buf(),
+            path: temp.clone(),
             source,
-        })
+        })?;
+    fs::rename(&temp, path).map_err(|source| lease_io(path, source))
 }
 
 fn lock_failure(path: &Path, scope: LeaseScope, source: TryLockError) -> LeaseError {
@@ -423,9 +435,14 @@ mod tests {
         assert!(matches!(locking, LeaseError::UnsupportedLocking { .. }));
 
         let durability = sync_directory(Path::new("/path-that-does-not-exist"));
+        #[cfg(not(windows))]
         assert!(matches!(
             durability,
             Err(LeaseError::UnsupportedDurability { .. })
         ));
+        // On Windows directory sync is a documented no-op, so the refusal arm
+        // has nothing to refuse; assert the documented behavior instead.
+        #[cfg(windows)]
+        assert!(durability.is_ok());
     }
 }

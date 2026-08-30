@@ -1,0 +1,164 @@
+name: CK alpha verification
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/ck-alpha-ci.yml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/subc-core/**
+      - scripts/install/**
+  pull_request:
+    paths:
+      - .github/workflows/ck-alpha-ci.yml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/subc-core/**
+      - scripts/install/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ck-alpha-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+
+      - name: ShellCheck installer scripts
+        run: shellcheck --shell=bash scripts/install/install.sh scripts/install/tests/install.sh.test
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy alpha distribution code
+        run: cargo clippy -p subc-core --all-targets --locked -- -D warnings
+
+  shell-installer:
+    name: Shell installer contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prove Unix installer contract
+        run: bash scripts/install/tests/install.sh.test
+
+  powershell-installer:
+    name: PowerShell installer contract
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PowerShell analysis and test modules
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module -Name Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: PSScriptAnalyzer installer scripts
+        shell: pwsh
+        run: |
+          $findings = Invoke-ScriptAnalyzer -Path scripts/install -Recurse -Severity Error
+          $findings | Format-Table -AutoSize
+          if ($findings) {
+            throw 'PSScriptAnalyzer reported error-level findings.'
+          }
+
+      - name: Prove native Windows installer contract
+        shell: pwsh
+        run: |
+          $result = Invoke-Pester -Path scripts/install/tests/install.ps1.tests.ps1 -CI -PassThru
+          if ($result.FailedCount -ne 0) {
+            throw "Pester reported $($result.FailedCount) failing installer tests."
+          }
+
+  alpha-contract:
+    name: Setup, runtime, MC, and upgrade (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-latest
+          - platform: linux
+            runner: ubuntu-latest
+          - platform: windows
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Prove setup, runtime, MC detection, and upgrade contracts
+        if: ${{ matrix.platform != 'windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p subc-core --bin ck --locked setup:: 2>&1 | tee "$RUNNER_TEMP/alpha-contract.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/alpha-contract.log"
+
+      - name: Prove setup, runtime, MC detection, and upgrade contracts
+        if: ${{ matrix.platform == 'windows' }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'alpha-contract.log'
+          & cargo test -p subc-core --bin ck --locked setup:: 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (-not (Select-String -Path $log -Pattern 'test result: ok\. [1-9][0-9]* passed;')) {
+            throw 'The alpha setup contract test selection did not execute.'
+          }
+
+      - name: Prove CLI update-check contract
+        run: cargo test -p subc-core --test ck_cli --locked
+
+  self-update-unix:
+    name: Unix self-update inode contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Prove atomic inode replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p subc-core --bin ck --locked \
+            setup::self_update_unix::tests::unix_self_update_keeps_running_process_on_original_inode \
+            -- --exact 2>&1 | tee "$RUNNER_TEMP/self-update-unix.log"
+          grep -Fq 'test result: ok. 1 passed;' "$RUNNER_TEMP/self-update-unix.log"
+
+  self-update-windows:
+    name: Windows self-update cleanup contract
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Prove ck.exe.old replacement and cleanup lifecycle
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'self-update-windows.log'
+          & cargo test -p subc-core --bin ck --locked setup::self_update_windows::tests::replacement_preserves_old_until_a_successful_next_invocation_cleans_it -- --exact 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (-not (Select-String -Path $log -SimpleMatch 'test result: ok. 1 passed;')) {
+            throw 'The Windows self-update test did not execute exactly once.'
+          }

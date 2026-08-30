@@ -1,3 +1,6 @@
+mod conversion;
+mod detection;
+mod mc_detection;
 mod model;
 mod planner;
 

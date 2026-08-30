@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
-
-use super::model::{
-    Component, ComponentState, ConfigurationState, DetectionOutcome, PlanOutcome,
-    PlatformObservation, ReleaseAvailability, RuntimeState, SetupObserved, SetupOperation,
-    SetupRequest, UpgradeObserved, UpgradeOperation, UpgradeState, UpgradeTarget,
+use super::{
+    conversion::{explicit_conversion_requires_confirmation, selected_components},
+    model::{
+        Component, ComponentState, ConfigurationState, DetectionOutcome, PlanOutcome,
+        PlatformObservation, ReleaseAvailability, RuntimeState, SetupObserved, SetupOperation,
+        SetupRequest, UpgradeObserved, UpgradeOperation, UpgradeState, UpgradeTarget,
+    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,7 +58,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     if let Some(component) = request.convert {
         plan.operations
             .push(SetupOperation::ConfirmConversion { component });
-        if !request.conversion_confirmed {
+        if explicit_conversion_requires_confirmation(request) {
             plan.outcomes.push(PlanOutcome::Refusal {
                 reason: format!(
                     "explicit {component} conversion requires confirmation; re-run with --confirm"
@@ -123,15 +124,6 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     plan
 }
 
-fn selected_components(request: &SetupRequest) -> BTreeSet<Component> {
-    let mut selected = BTreeSet::from([Component::Core]);
-    selected.extend(request.optional_components.iter().copied());
-    if let Some(component) = request.convert {
-        selected.insert(component);
-    }
-    selected
-}
-
 fn record_detection_outcomes(observed: &SetupObserved, plan: &mut SetupPlan) {
     for (component, outcome) in &observed.detections {
         match outcome {
@@ -142,7 +134,7 @@ fn record_detection_outcomes(observed: &SetupObserved, plan: &mut SetupPlan) {
                 });
             }
             DetectionOutcome::OfferConversion => {
-                plan.operations.push(SetupOperation::ConfirmConversion {
+                plan.operations.push(SetupOperation::OfferConversion {
                     component: *component,
                 });
             }
@@ -343,6 +335,7 @@ mod tests {
             releases,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
+            mc_detection: None,
             detections: BTreeMap::new(),
         }
     }
@@ -474,6 +467,80 @@ mod tests {
                 missing_asset,
             } if missing_asset == "ck-aft-linux-x64.zip.sha256"
         )));
+    }
+
+    #[test]
+    fn automatic_mc_offer_does_not_install_or_configure_mc() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed.runtime = RuntimeState::Correct;
+        observed
+            .detections
+            .insert(Component::Mc, DetectionOutcome::OfferConversion);
+
+        let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
+
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::OfferConversion {
+                component: Component::Mc
+            }
+        )));
+        assert!(!plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::InstallComponent {
+                component: Component::Mc
+            } | SetupOperation::ConfigureComponent {
+                component: Component::Mc
+            }
+        )));
+        let mut executor = RecordingExecutor::default();
+        let report = execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
+        assert!(report.applied.is_empty());
+        assert!(executor.applied.is_empty());
+    }
+
+    #[test]
+    fn confirmed_mc_conversion_reuses_component_addition_and_declining_applies_nothing() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed.runtime = RuntimeState::Correct;
+
+        let mut accepted = SetupRequest::install(Vec::new());
+        accepted.convert = Some(Component::Mc);
+        accepted.conversion_confirmed = true;
+        let accepted_plan = plan_setup(&observed, &accepted);
+        assert!(accepted_plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::ConfirmConversion {
+                component: Component::Mc
+            }
+        )));
+        assert!(accepted_plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::InstallComponent {
+                component: Component::Mc
+            }
+        )));
+        assert!(accepted_plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::ConfigureComponent {
+                component: Component::Mc
+            }
+        )));
+
+        let mut declined = accepted.clone();
+        declined.conversion_confirmed = false;
+        let declined_plan = plan_setup(&observed, &declined);
+        assert!(!declined_plan.is_authorized());
+        let mut executor = RecordingExecutor::default();
+        let report = execute_setup(&declined_plan, ExecutionMode::Apply, &mut executor).unwrap();
+        assert!(report.applied.is_empty());
+        assert!(executor.applied.is_empty());
     }
 
     #[test]

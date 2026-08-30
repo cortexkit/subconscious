@@ -1,5 +1,10 @@
 use std::{collections::BTreeMap, fmt};
 
+use super::{
+    detection,
+    mc_detection::{self, McDetection},
+};
+
 /// The independently selectable pieces of an alpha CortexKit installation.
 ///
 /// Core owns the daemon and MCP bridge. AFT and MC are optional so adding one
@@ -163,14 +168,17 @@ pub struct SetupObserved {
     pub releases: BTreeMap<Component, ReleaseAvailability>,
     pub runtime: RuntimeState,
     pub configuration: ConfigurationState,
+    /// Retains the MC database probe result so the planner can distinguish an
+    /// absent installation from a state that is unsafe for automatic conversion.
+    pub mc_detection: Option<McDetection>,
     pub detections: BTreeMap<Component, DetectionOutcome>,
 }
 
 impl SetupObserved {
     /// A safe host snapshot for the command surface before the installation
-    /// backend supplies manifest and filesystem probes. It reads only compile-time
-    /// host facts and deliberately assumes no managed state rather than inferring
-    /// ownership from user configuration or stores.
+    /// backend supplies manifest and filesystem probes. It reads host facts and
+    /// the MC database through the non-mutating detector, then deliberately
+    /// assumes no managed state rather than inferring ownership from user data.
     pub fn unconfigured_current_host() -> Self {
         let mut components = BTreeMap::new();
         let mut releases = BTreeMap::new();
@@ -185,6 +193,7 @@ impl SetupObserved {
                 },
             );
         }
+        let mc_detection = mc_detection::detect_current();
         let mut detections = BTreeMap::new();
         detections.insert(
             Component::Aft,
@@ -193,13 +202,17 @@ impl SetupObserved {
                     .to_string(),
             },
         );
-        detections.insert(Component::Mc, DetectionOutcome::None);
+        detections.insert(
+            Component::Mc,
+            detection::mc_detection_outcome(&mc_detection),
+        );
         Self {
             platform: PlatformObservation::current(),
             components,
             releases,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
+            mc_detection: Some(mc_detection),
             detections,
         }
     }
@@ -298,6 +311,7 @@ impl fmt::Display for PlanOutcome {
 pub enum SetupOperation {
     ObservePlatform,
     OfferOptionalComponents,
+    OfferConversion { component: Component },
     ConfirmConversion { component: Component },
     InstallComponent { component: Component },
     ConfigureComponent { component: Component },
@@ -329,6 +343,9 @@ impl fmt::Display for SetupOperation {
             Self::ObservePlatform => formatter.write_str("observe alpha platform support"),
             Self::OfferOptionalComponents => {
                 formatter.write_str("offer optional components: aft, mc")
+            }
+            Self::OfferConversion { component } => {
+                write!(formatter, "offer standalone {component} conversion")
             }
             Self::ConfirmConversion { component } => {
                 write!(formatter, "confirm explicit {component} conversion")

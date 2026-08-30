@@ -6,10 +6,14 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+use cortexkit_release::executor;
 use cortexkit_release::{
     approval::{build_approval_subject, ApprovalError, ApprovalStore, ApprovalSubject},
     declaration::{parse, DeclarationRefusalCode, ParsedDeclaration},
-    orchestrator::{reconcile_effect, EffectOutcome, OrchestrationError, OrchestrationRefusalCode},
+    orchestrator::{
+        reconcile_effect_unfenced_for_tests as reconcile_effect, EffectOutcome, OrchestrationError,
+        OrchestrationRefusalCode,
+    },
     phases::ci_watch::{
         CiWatch, CiWatchConclusion, CiWatchConfig, CiWatchError, CiWatchJournal,
         CiWatchJournalRecord,
@@ -20,7 +24,7 @@ use cortexkit_release::{
         WorkflowJob, WorkflowJobId, WorkflowJobState, WorkflowRun, WorkflowRunCapture,
         WorkflowRunId, WorkflowRunPoll, WorkflowRunRequest,
     },
-    state::{JournalStore, StateError, TrainJournalIdentity},
+    state::{JournalRecord, JournalStore, StateError, TrainJournalIdentity, TrainTerminalState},
     ApprovalSubject as DurableApprovalSubject, ArtifactDigest, ArtifactId, CompletionProbe,
     EffectRequest, IrreversibleExecutor, ProbeEvidence, ProbeResult, RepositoryId, SeamError,
 };
@@ -199,7 +203,7 @@ struct CountingExecutor {
 }
 
 impl IrreversibleExecutor for CountingExecutor {
-    fn execute(&mut self, _: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, _: &executor::AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
         self.calls += 1;
         Err(SeamError::new(
             "recording executor must not receive an irreversible re-fire",
@@ -267,7 +271,7 @@ impl InterruptAfterRecordedEffect {
 }
 
 impl IrreversibleExecutor for InterruptAfterRecordedEffect {
-    fn execute(&mut self, _: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, _: &executor::AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
         self.calls += 1;
         fs::create_dir_all(
             self.effect_path
@@ -804,16 +808,27 @@ fn adopter_case_mc_saga_11_residue_swept_or_refused_mechanism_pending() {
     let journal = JournalStore::new(root.path(), identity).unwrap();
     fs::write(journal.journal_path(), b"{\"version\":1,\"record\":").unwrap();
 
-    assert!(matches!(
-        journal.read_journal(),
-        Err(StateError::TornTail { .. })
-    ));
-    assert!(journal.recover_torn_journal_tail().unwrap().is_empty());
+    // Core remediation made torn-tail recovery automatic on read: a torn final
+    // record is truncated as a non-event and the read succeeds empty, per the
+    // normative rule this test previously pinned the pre-fix error for.
+    assert!(journal.read_journal().unwrap().is_empty());
     assert!(fs::read(journal.journal_path()).unwrap().is_empty());
 
     journal.pin_declaration(&declaration).unwrap();
+    let pinned_len = fs::read(journal.journal_path()).unwrap().len();
+    journal
+        .append_journal(JournalRecord::Terminalized {
+            state: TrainTerminalState::Abandoned {
+                declaration_digest: declaration.digest.clone(),
+            },
+        })
+        .unwrap();
+    // Corrupt the FIRST record while a valid record follows it: mid-stream
+    // corruption must refuse and never truncate. (A corrupt FINAL record with
+    // nothing after it is now recoverable as a non-event, so this arm needs
+    // the trailing record to keep testing what it always meant.)
     let mut corrupted = fs::read(journal.journal_path()).unwrap();
-    let offset = corrupted
+    let offset = corrupted[..pinned_len]
         .windows(b"mc-residue-sweep".len())
         .position(|window| window == b"mc-residue-sweep")
         .unwrap();

@@ -7,8 +7,11 @@
 //! a small `<domain> <verb>` dispatcher so future domains such as `ck vault ...`,
 //! `ck quota ...`, and `ck account ...` can be added without reshaping the CLI.
 
+#[path = "../setup/mod.rs"]
+mod setup;
+
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
     error::Error,
     ffi::{OsStr, OsString},
@@ -48,7 +51,7 @@ const CK_HARNESS: &str = "ck";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, connection info, and offline triage";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, connection info, and offline triage";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -127,6 +130,10 @@ const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info
 
 const FLEET_HELP: &str = "ck fleet — offline configured-module inspection\n\nusage:\n  ck fleet lint [<config>] [--verbose]\n\n`lint` reads module manifests without connecting to the daemon.";
 
+const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc] [--with aft,mc] [--dry-run]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without calling an installation mutator. --convert is explicit\n  and requires --confirm before it can apply a conversion plan.";
+
+const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade\n  ck upgrade --check\n\n  --check prints target availability and ordered operations without replacing\n  binaries or restarting a runtime. MC is wiring-only in alpha and is not an\n  upgrade target.";
+
 #[tokio::main]
 async fn main() {
     match run(env::args_os()).await {
@@ -158,6 +165,12 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     }
     if let Command::FleetLint { config, verbose } = &args.command {
         return fleet_lint_command(config.as_deref(), *verbose).await;
+    }
+    if let Command::Setup(request) = &args.command {
+        return setup_command(request);
+    }
+    if let Command::Upgrade { check } = &args.command {
+        return upgrade_command(*check);
     }
     if matches!(&args.command, Command::DaemonTriage) {
         return daemon_triage(args.subc.as_deref(), args.json);
@@ -229,9 +242,11 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             )
             .await
         }
-        Command::FleetLint { .. } | Command::Help(_) | Command::External { .. } => {
-            unreachable!("handled before connect")
-        }
+        Command::FleetLint { .. }
+        | Command::Setup(_)
+        | Command::Upgrade { .. }
+        | Command::Help(_)
+        | Command::External { .. } => unreachable!("handled before connect"),
     };
     result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
 }
@@ -560,6 +575,10 @@ struct CkArgs {
 
 enum Command {
     Dashboard,
+    Setup(setup::SetupRequest),
+    Upgrade {
+        check: bool,
+    },
     Module(ModuleCommand),
     Routes {
         module_id: Option<String>,
@@ -3933,6 +3952,210 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn setup_command(request: &setup::SetupRequest) -> Result<(), CkError> {
+    let observed = setup::SetupObserved::unconfigured_current_host();
+    let plan = setup::plan_setup(&observed, request);
+    print_setup_plan(&plan);
+    if !plan.is_authorized() {
+        return Err(CkError::Rejected(
+            "setup plan refused; no mutations were applied".to_string(),
+        ));
+    }
+    if request.dry_run {
+        let planned_mutations = plan.mutation_count();
+        println!("dry-run: {planned_mutations} mutation(s) planned; none were applied");
+        return Ok(());
+    }
+
+    // The planner is intentionally independent from the later filesystem and
+    // service-manager backend. Refusing here is safer than presenting its pure
+    // plan as a completed installation before that backend is linked.
+    let mut executor = UnavailableSetupExecutor;
+    setup::execute_setup(&plan, setup::ExecutionMode::Apply, &mut executor)
+        .map_err(CkError::Message)?;
+    Ok(())
+}
+
+struct UnavailableSetupExecutor;
+
+impl setup::SetupExecutor for UnavailableSetupExecutor {
+    type Error = String;
+
+    fn apply(&mut self, operation: &setup::SetupOperation) -> Result<(), Self::Error> {
+        Err(format!(
+            "setup execution backend is unavailable before applying '{operation}'; use --dry-run to inspect the plan"
+        ))
+    }
+}
+
+fn upgrade_command(check: bool) -> Result<(), CkError> {
+    let observed = setup::UpgradeObserved::no_updates_on_current_host();
+    let plan = setup::plan_upgrade(&observed);
+    print_upgrade_plan(&plan);
+    if !plan.is_authorized() {
+        return Err(CkError::Rejected(
+            "upgrade plan refused; no mutations were applied".to_string(),
+        ));
+    }
+    let planned_mutations = plan
+        .operations
+        .iter()
+        .filter(|operation| operation.mutates())
+        .count();
+    if check {
+        println!(
+            "upgrade check: {planned_mutations} mutation(s) planned; no binaries were replaced and no runtime was restarted"
+        );
+    } else if planned_mutations == 0 {
+        println!("upgrade: no action was needed");
+    } else {
+        return Err(CkError::Message(
+            "upgrade execution backend is unavailable; use --check to inspect the plan".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn print_setup_plan(plan: &setup::SetupPlan) {
+    println!("setup plan:");
+    for (index, operation) in plan.operations.iter().enumerate() {
+        println!("  {}. {operation}", index + 1);
+    }
+    for outcome in &plan.outcomes {
+        println!("  outcome: {outcome}");
+    }
+}
+
+fn print_upgrade_plan(plan: &setup::UpgradePlan) {
+    println!("upgrade plan:");
+    for (index, operation) in plan.operations.iter().enumerate() {
+        println!("  {}. {operation}", index + 1);
+    }
+    for outcome in &plan.outcomes {
+        println!("  outcome: {outcome}");
+    }
+}
+
+fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError> {
+    let mut optional = BTreeSet::new();
+    let mut explicit_component = None;
+    let mut used_with = false;
+    let mut uninstall = false;
+    let mut dry_run = false;
+    let mut convert = false;
+    let mut conversion_confirmed = false;
+    let mut index = 0;
+
+    while let Some(argument) = tail.get(index) {
+        let argument = argument.to_string_lossy();
+        match argument.as_ref() {
+            "--with" => {
+                let Some(value) = tail.get(index + 1) else {
+                    return Err(CkError::Usage(format!(
+                        "ck setup --with requires a comma-separated component list\n\n{SETUP_HELP}"
+                    )));
+                };
+                if used_with || explicit_component.is_some() {
+                    return Err(CkError::Usage(format!(
+                        "ck setup accepts either one explicit component or one --with list\n\n{SETUP_HELP}"
+                    )));
+                }
+                used_with = true;
+                let value = value.to_string_lossy();
+                if value.is_empty() {
+                    return Err(CkError::Usage(format!(
+                        "ck setup --with requires at least one component\n\n{SETUP_HELP}"
+                    )));
+                }
+                for component in value.split(',') {
+                    let component = parse_setup_component(component)?;
+                    if !optional.insert(component) {
+                        return Err(CkError::Usage(format!(
+                            "ck setup --with repeats component '{component}'\n\n{SETUP_HELP}"
+                        )));
+                    }
+                }
+                index += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
+            "--uninstall" => {
+                uninstall = true;
+                index += 1;
+            }
+            "--convert" => {
+                convert = true;
+                index += 1;
+            }
+            "--confirm" => {
+                conversion_confirmed = true;
+                index += 1;
+            }
+            value if value.starts_with('-') => {
+                return Err(CkError::Usage(format!(
+                    "unknown setup flag '{value}'\n\n{SETUP_HELP}"
+                )));
+            }
+            value => {
+                if used_with || explicit_component.is_some() {
+                    return Err(CkError::Usage(format!(
+                        "ck setup accepts one optional component\n\n{SETUP_HELP}"
+                    )));
+                }
+                let component = parse_setup_component(value)?;
+                optional.insert(component);
+                explicit_component = Some(component);
+                index += 1;
+            }
+        }
+    }
+
+    if uninstall && (!optional.is_empty() || convert || conversion_confirmed) {
+        return Err(CkError::Usage(format!(
+            "ck setup --uninstall cannot be combined with component installation or conversion\n\n{SETUP_HELP}"
+        )));
+    }
+    if convert && explicit_component.is_none() {
+        return Err(CkError::Usage(format!(
+            "ck setup --convert requires 'aft' or 'mc'\n\n{SETUP_HELP}"
+        )));
+    }
+    if conversion_confirmed && !convert {
+        return Err(CkError::Usage(format!(
+            "ck setup --confirm is only valid with --convert\n\n{SETUP_HELP}"
+        )));
+    }
+
+    let mut request = setup::SetupRequest::install(optional.into_iter().collect());
+    request.uninstall = uninstall;
+    request.dry_run = dry_run;
+    request.convert = if convert { explicit_component } else { None };
+    request.conversion_confirmed = conversion_confirmed;
+    Ok(request)
+}
+
+fn parse_setup_component(value: &str) -> Result<setup::Component, CkError> {
+    match value {
+        "aft" => Ok(setup::Component::Aft),
+        "mc" => Ok(setup::Component::Mc),
+        _ => Err(CkError::Usage(format!(
+            "unknown setup component '{value}'; expected aft or mc\n\n{SETUP_HELP}"
+        ))),
+    }
+}
+
+fn parse_upgrade_command(tail: &[OsString]) -> Result<Command, CkError> {
+    match tail {
+        [] => Ok(Command::Upgrade { check: false }),
+        [flag] if flag == "--check" => Ok(Command::Upgrade { check: true }),
+        _ => Err(CkError::Usage(format!(
+            "ck upgrade accepts only --check\n\n{UPGRADE_HELP}"
+        ))),
+    }
+}
+
 fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkError> {
     let mut args = argv.into_iter();
     let program = args
@@ -4032,7 +4255,16 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
 fn is_builtin_domain(domain: &str) -> bool {
     matches!(
         domain,
-        "module" | "routes" | "provenance" | "health" | "daemon" | "quota" | "fleet" | "help"
+        "setup"
+            | "upgrade"
+            | "module"
+            | "routes"
+            | "provenance"
+            | "health"
+            | "daemon"
+            | "quota"
+            | "fleet"
+            | "help"
     )
 }
 
@@ -4043,6 +4275,8 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         "help" => {
             let topic = tail.first().map(|t| t.to_string_lossy());
             Ok(Command::Help(match topic.as_deref() {
+                Some("setup") => SETUP_HELP.into(),
+                Some("upgrade") => UPGRADE_HELP.into(),
                 Some("module") => MODULE_HELP.into(),
                 Some("routes") => ROUTES_HELP.into(),
                 Some("provenance") => PROVENANCE_HELP.into(),
@@ -4053,6 +4287,22 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 _ => top_help(),
             }))
         }
+        "setup"
+            if tail
+                .iter()
+                .any(|arg| arg == "-h" || arg == "--help" || arg == "help") =>
+        {
+            Ok(Command::Help(SETUP_HELP.into()))
+        }
+        "setup" => parse_setup_command(tail).map(Command::Setup),
+        "upgrade"
+            if tail
+                .iter()
+                .any(|arg| arg == "-h" || arg == "--help" || arg == "help") =>
+        {
+            Ok(Command::Help(UPGRADE_HELP.into()))
+        }
+        "upgrade" => parse_upgrade_command(tail),
         "module" => {
             let verb = match tail.first() {
                 None => return Ok(Command::Help(MODULE_HELP.into())),
@@ -5358,6 +5608,78 @@ mod tests {
                 module_id: Some(module_id)
             } if module_id == "aft"
         ));
+    }
+
+    #[test]
+    fn setup_and_upgrade_command_surfaces_are_parsed_and_documented() {
+        let test_tail = |tokens: &[&str]| tokens.iter().map(OsString::from).collect::<Vec<_>>();
+        let bare = parse_command("setup", &[]).unwrap();
+        assert!(matches!(
+            bare,
+            Command::Setup(setup::SetupRequest {
+                optional_components,
+                uninstall: false,
+                dry_run: false,
+                convert: None,
+                conversion_confirmed: false,
+            }) if optional_components.is_empty()
+        ));
+
+        for component in ["aft", "mc"] {
+            let command = parse_command("setup", &test_tail(&[component])).unwrap();
+            assert!(matches!(
+                command,
+                Command::Setup(setup::SetupRequest {
+                    optional_components,
+                    ..
+                }) if optional_components == [parse_setup_component(component).unwrap()]
+            ));
+        }
+
+        let with = parse_command("setup", &test_tail(&["--with", "aft,mc"])).unwrap();
+        assert!(matches!(
+            with,
+            Command::Setup(setup::SetupRequest {
+                optional_components,
+                ..
+            }) if optional_components == [setup::Component::Aft, setup::Component::Mc]
+        ));
+
+        for component in ["aft", "mc"] {
+            let command = parse_command("setup", &test_tail(&[component, "--convert"])).unwrap();
+            assert!(matches!(
+                command,
+                Command::Setup(setup::SetupRequest {
+                    convert: Some(convert),
+                    conversion_confirmed: false,
+                    ..
+                }) if convert == parse_setup_component(component).unwrap()
+            ));
+        }
+
+        let uninstall = parse_command("setup", &test_tail(&["--uninstall"])).unwrap();
+        assert!(matches!(
+            uninstall,
+            Command::Setup(setup::SetupRequest {
+                uninstall: true,
+                ..
+            })
+        ));
+        let dry_run = parse_command("setup", &test_tail(&["--dry-run"])).unwrap();
+        assert!(matches!(
+            dry_run,
+            Command::Setup(setup::SetupRequest { dry_run: true, .. })
+        ));
+        assert!(matches!(
+            parse_command("upgrade", &[]).unwrap(),
+            Command::Upgrade { check: false }
+        ));
+        assert!(matches!(
+            parse_command("upgrade", &test_tail(&["--check"])).unwrap(),
+            Command::Upgrade { check: true }
+        ));
+        assert!(top_help().contains("setup"));
+        assert!(top_help().contains("upgrade"));
     }
 
     fn triage_fixture_dir(name: &str) -> PathBuf {

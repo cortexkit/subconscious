@@ -12090,3 +12090,15 @@ feature-dependent — canonicalize (sort keys) before hashing, and pin the diges
 of a fixed input as a constant so divergence reds by name. This was also the
 PR82 piggyback class (a sibling's feature silently changing four crates that
 never opted in) biting six days after it was named.
+
+- **Growth-across-identical-runs (CEREB, browser journal sizing):** a per-X cost
+  measurement must be taken at least twice with identical X. A number that GROWS
+  across identical runs (11→17→21 for "one call") means the instrument is
+  integrating a running total, not sampling a per-call cost — and the tell is
+  invisible to any passing test run once. Corollary specimen: the fixture reached
+  the operator's real on-disk journal through a defaulted constructor parameter;
+  the fix is a separate in-memory binding so production wiring is unconstructable
+  from a fixture (same class as QTA's journal-migration near-miss). Second
+  corollary: never-executed is a different risk class from unwired-in-production —
+  zero-caller builders mean every downstream refactor was written against a path
+  that had never run once; coverage precedes wiring.

@@ -9,7 +9,9 @@
 //! closed sets in Rust enums.
 
 pub mod approval;
+pub mod artifact;
 pub mod declaration;
+pub mod executor;
 pub mod lease;
 pub mod phases {
     pub mod ci_watch;

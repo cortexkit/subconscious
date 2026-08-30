@@ -15,6 +15,10 @@ bench = false
 name = "release-test-support"
 path = "tests/support/mod.rs"
 
+[[test]]
+name = "release-artifacts"
+path = "tests/artifacts/mod.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 cortexkit-paths = "0.1.1"

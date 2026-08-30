@@ -7,8 +7,13 @@
     "signing_profile": "none",
     "phases": [{
       "id": "load-gate",
-      "type": "ci_watch",
-      "params": {"workflow": "Load Gate", "selector": "commit:mc03", "rerun_budget": 1}
+      "type": "gates_local",
+      "params": {
+        "command": "sh",
+        "args": ["-c", "if test -e .mc-saga-03-retry; then printf recovered; else : > .mc-saga-03-retry; printf transient >&2; exit 75; fi"],
+        "retry_budget": 1,
+        "load_class": "shared-host-contention"
+      }
     }]
   }]
 }

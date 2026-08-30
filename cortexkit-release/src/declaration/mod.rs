@@ -483,7 +483,9 @@ fn validate_phase_parameters(
             "params",
         )
     })?;
-    if let Err(message) = crate::phases::precheck::validate_parameters(phase) {
+    if let Err(message) = crate::phases::precheck::validate_parameters(phase)
+        .and_then(|()| crate::phases::command::validate_parameters(phase))
+    {
         return Err(refusal(
             DeclarationRefusalCode::InvalidPhaseParameters,
             format!("phase `{}` has invalid parameters: {message}", phase.id),

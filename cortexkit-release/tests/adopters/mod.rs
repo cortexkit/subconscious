@@ -20,6 +20,7 @@ use cortexkit_release::{
             CiWatch, CiWatchConclusion, CiWatchConfig, CiWatchError, CiWatchJournal,
             CiWatchJournalRecord,
         },
+        command::CommandPhaseRunner,
         precheck::PrecheckRunner,
     },
     plan::{build_dry_run_plan, FinalizedArtifact, ReleaseIdentity, ReleasePlan},
@@ -211,6 +212,51 @@ fn execute_prechecks_after(
         &mut executor,
     );
     (result, journal.read_journal().unwrap(), executor.calls)
+}
+
+fn execute_local_gates(
+    case_id: &str,
+    repository: &support::MintedRepo,
+    declaration: &ParsedDeclaration,
+    plan: &ReleasePlan,
+) -> (
+    TempDir,
+    Result<Vec<EffectOutcome>, OrchestrationError>,
+    Vec<JournalRecord>,
+    usize,
+) {
+    let (state_home, journal) = journal_for(case_id, declaration, plan);
+    let approvals = ApprovalStore::new(
+        state_home.path(),
+        TrainJournalIdentity::new(
+            plan.repository.clone(),
+            plan.train.clone(),
+            format!("{case_id}-runtime"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let leases = LeaseStore::new(state_home.path()).unwrap();
+    let mut runner = CommandPhaseRunner::new(repository.path(), &journal);
+    let mut gate = UnexpectedGate;
+    let mut probe = ScriptedProbe::new([]);
+    let mut executor = CountingExecutor::default();
+    let result = Orchestrator::default().execute(
+        plan,
+        &leases,
+        &journal,
+        &approvals,
+        &mut runner,
+        &mut gate,
+        &mut probe,
+        &mut executor,
+    );
+    (
+        state_home,
+        result,
+        journal.read_journal().unwrap(),
+        executor.calls,
+    )
 }
 
 fn assert_precheck_refusal(
@@ -672,33 +718,48 @@ fn adopter_case_mc_saga_02_defect_terminal_no_retry() {
 }
 
 #[test]
-fn adopter_case_mc_saga_03_load_flake_retry_with_lock_mechanism_pending() {
-    let mut watch = watch_from_fixture(MC_SAGA_03, MC_SAGA_03_FIXTURE);
-    let run = workflow_run(&watch, "mc03-run");
-    let mut provider = ScriptedGitHubProvider::new(
-        [Ok(WorkflowRunCapture::Captured(run))],
-        [Ok(failed_poll("mc03-run", "mc03"))],
-        [Ok(Some(failed_job(
-            "load-gate",
-            WorkflowJobState::Cancelled,
-        )))],
-    );
-    let mut journal = RecordingCiJournal::default();
+fn adopter_case_mc_saga_03_load_flake_retries_declared_leg() {
+    let (repository, declaration, plan) = planned_case(MC_SAGA_03, MC_SAGA_03_FIXTURE, &[]);
 
-    assert!(matches!(
-        watch.step(&mut provider, &mut journal).unwrap(),
-        CiWatchConclusion::Undecidable(_)
-    ));
-    assert_eq!(watch.reruns_used(), 1);
+    let (_state_home, result, records, executor_calls) =
+        execute_local_gates(MC_SAGA_03, &repository, &declaration, &plan);
+
+    assert!(result.is_ok(), "unexpected result: {result:?}");
+    assert_eq!(executor_calls, 0);
+    let attempts = records
+        .iter()
+        .filter_map(|record| match record {
+            JournalRecord::LocalCommandAttempt {
+                phase,
+                attempt,
+                exit_code,
+                output_path,
+                load_class,
+            } => Some((
+                phase.as_str(),
+                *attempt,
+                *exit_code,
+                output_path.clone(),
+                load_class.as_str(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        provider.rerun_job_calls,
-        [("mc03-run".to_owned(), "load-gate".to_owned())]
+        attempts
+            .iter()
+            .map(|(phase, attempt, exit_code, _, load_class)| {
+                (*phase, *attempt, *exit_code, *load_class)
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("load-gate", 1, Some(75), "shared-host-contention"),
+            ("load-gate", 2, Some(0), "shared-host-contention"),
+        ]
     );
-    assert!(journal.0.iter().any(|record| matches!(
-        record,
-        CiWatchJournalRecord::RerunByJobId { instance, run_id, job_id, rerun_number: 1 }
-            if instance.as_str() == "load-gate" && run_id == "mc03-run" && job_id == "load-gate"
-    )));
+    assert_ne!(attempts[0].3, attempts[1].3);
+    assert_eq!(fs::read_to_string(&attempts[0].3).unwrap(), "transient");
+    assert_eq!(fs::read_to_string(&attempts[1].3).unwrap(), "recovered");
 }
 
 #[test]

@@ -493,7 +493,7 @@ fn execute_train(
         }
     }
 
-    let mut runner = crate::phases::precheck::PrecheckRunner::new(&prepared.root, &journal);
+    let mut runner = crate::phases::command::CommandPhaseRunner::new(&prepared.root, &journal);
     let mut gate = SyntheticApprovalGate {
         confirmed: arguments.confirm_first_public_trigger,
     };
@@ -846,6 +846,7 @@ fn phase_state(
             | JournalRecord::Refused { .. }
             | JournalRecord::WorkingTreeMutation { .. }
             | JournalRecord::ResidueSwept { .. }
+            | JournalRecord::LocalCommandAttempt { .. }
             | JournalRecord::Terminalized { .. } => None,
         })
         .collect::<BTreeSet<_>>();

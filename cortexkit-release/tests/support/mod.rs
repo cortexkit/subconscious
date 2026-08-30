@@ -28,8 +28,24 @@ pub enum RepositoryShape {
     Valid,
     DirtyTree,
     DivergedRemote,
+    SiblingCheckoutDrift,
+    StaleWorkingTreeResidue,
+    RuntimeResidueFiles,
     MissingDeclaration,
     TornJournalTail,
+}
+
+/// A separately minted checkout whose HEAD moved after the recorded pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SiblingCheckoutDrift {
+    pub path: PathBuf,
+    pub pinned_commit: String,
+    pub current_commit: String,
+}
+
+struct MintedSibling {
+    directory: TempDir,
+    checkout: SiblingCheckoutDrift,
 }
 
 /// A runtime-minted repository and a separate temporary home for durable state.
@@ -37,6 +53,8 @@ pub struct MintedRepo {
     repository: TempDir,
     journal_home: TempDir,
     remote: Option<TempDir>,
+    sibling: Option<MintedSibling>,
+    residue_paths: Vec<PathBuf>,
 }
 
 impl MintedRepo {
@@ -69,12 +87,17 @@ impl MintedRepo {
             repository,
             journal_home,
             remote: None,
+            sibling: None,
+            residue_paths: Vec::new(),
         };
 
         match shape {
             RepositoryShape::Valid => {}
             RepositoryShape::DirtyTree => minted.make_dirty_tree()?,
             RepositoryShape::DivergedRemote => minted.make_diverged_remote()?,
+            RepositoryShape::SiblingCheckoutDrift => minted.make_sibling_checkout_drift()?,
+            RepositoryShape::StaleWorkingTreeResidue => minted.make_stale_working_tree_residue()?,
+            RepositoryShape::RuntimeResidueFiles => minted.make_runtime_residue_files()?,
             RepositoryShape::MissingDeclaration => {
                 fs::remove_file(minted.declaration_path())?;
             }
@@ -105,6 +128,16 @@ impl MintedRepo {
             .join("release/test-repository/test-train.journal")
     }
 
+    /// Returns a sibling checkout whose current commit differs from its recorded pin.
+    pub fn sibling_checkout_drift(&self) -> Option<&SiblingCheckoutDrift> {
+        self.sibling.as_ref().map(|sibling| &sibling.checkout)
+    }
+
+    /// Returns the files that represent incomplete state left by a prior run.
+    pub fn residue_paths(&self) -> &[PathBuf] {
+        &self.residue_paths
+    }
+
     /// Writes a custom declaration without hiding that the working tree changed.
     pub fn write_declaration(&self, declaration: impl AsRef<str>) -> io::Result<()> {
         fs::create_dir_all(
@@ -130,6 +163,61 @@ impl MintedRepo {
             self.path().join("README.md"),
             "minted test repository\ndirty change\n",
         )
+    }
+
+    fn make_sibling_checkout_drift(&mut self) -> io::Result<()> {
+        let sibling = tempfile::tempdir()?;
+        let path = sibling.path();
+        run_git(path, ["init"])?;
+        run_git(path, ["config", "user.name", "ck-release test"])?;
+        run_git(
+            path,
+            ["config", "user.email", "ck-release-test@example.invalid"],
+        )?;
+        fs::write(path.join("API.md"), "api=v1\n")?;
+        run_git(path, ["add", "API.md"])?;
+        run_git(path, ["commit", "-m", "pinned sibling API"])?;
+        let pinned_commit = git_stdout(path, ["rev-parse", "HEAD"])?;
+
+        fs::write(path.join("API.md"), "api=v2\n")?;
+        run_git(path, ["add", "API.md"])?;
+        run_git(path, ["commit", "-m", "sibling API drift"])?;
+        let current_commit = git_stdout(path, ["rev-parse", "HEAD"])?;
+        let checkout_path = path.to_path_buf();
+        self.sibling = Some(MintedSibling {
+            directory: sibling,
+            checkout: SiblingCheckoutDrift {
+                path: checkout_path,
+                pinned_commit,
+                current_commit,
+            },
+        });
+        Ok(())
+    }
+
+    fn make_stale_working_tree_residue(&mut self) -> io::Result<()> {
+        let version_bump = self.path().join("VERSION");
+        let lockfile = self.path().join("Cargo.lock");
+        fs::write(&version_bump, "0.40.5-aborted\n")?;
+        fs::write(&lockfile, "# incomplete lockfile from aborted release\n")?;
+        self.residue_paths = vec![version_bump, lockfile];
+        Ok(())
+    }
+
+    fn make_runtime_residue_files(&mut self) -> io::Result<()> {
+        let process = self
+            .path()
+            .join(".cortexkit/release-residue/process-1234.pid");
+        let port = self
+            .path()
+            .join(".cortexkit/release-residue/port-49152.lock");
+        let temporary_root = self.path().join("target/release-residue/session.tmp");
+        for path in [&process, &port, &temporary_root] {
+            fs::create_dir_all(path.parent().expect("residue path has a parent"))?;
+            fs::write(path, "left by interrupted release\n")?;
+        }
+        self.residue_paths = vec![process, port, temporary_root];
+        Ok(())
     }
 
     fn make_diverged_remote(&mut self) -> io::Result<()> {

@@ -24,7 +24,12 @@ use cortexkit_release::{
     ApprovalSubject as DurableApprovalSubject, ArtifactDigest, ArtifactId, CompletionProbe,
     EffectRequest, IrreversibleExecutor, ProbeEvidence, ProbeResult, RepositoryId, SeamError,
 };
-use std::{collections::VecDeque, fs};
+use std::{
+    collections::VecDeque,
+    fs,
+    io::{ErrorKind, Write},
+    path::PathBuf,
+};
 use tempfile::TempDir;
 
 const SYNTHETIC_E2E_01: &str = "synthetic-e2e-01";
@@ -62,11 +67,16 @@ const AFT_CIW_02_FIXTURE: &str =
     include_str!("../data/adopters/aft-ciw-02-post-tag-release.release.jsonc");
 
 fn parsed_case(case_id: &str, fixture: &str) -> (support::MintedRepo, ParsedDeclaration) {
-    let repository =
-        support::MintedRepo::mint_with_declaration(support::RepositoryShape::Valid, fixture)
-            .unwrap_or_else(|error| {
-                panic!("{case_id}: could not mint hermetic repository: {error}")
-            });
+    parsed_case_with_shape(case_id, support::RepositoryShape::Valid, fixture)
+}
+
+fn parsed_case_with_shape(
+    case_id: &str,
+    shape: support::RepositoryShape,
+    fixture: &str,
+) -> (support::MintedRepo, ParsedDeclaration) {
+    let repository = support::MintedRepo::mint_with_declaration(shape, fixture)
+        .unwrap_or_else(|error| panic!("{case_id}: could not mint hermetic repository: {error}"));
     let source = fs::read_to_string(repository.declaration_path())
         .unwrap_or_else(|error| panic!("{case_id}: could not read minted declaration: {error}"));
     let declaration =
@@ -79,7 +89,21 @@ fn planned_case(
     fixture: &str,
     artifact_material: &[(&str, &str)],
 ) -> (support::MintedRepo, ParsedDeclaration, ReleasePlan) {
-    let (repository, declaration) = parsed_case(case_id, fixture);
+    planned_case_with_shape(
+        case_id,
+        support::RepositoryShape::Valid,
+        fixture,
+        artifact_material,
+    )
+}
+
+fn planned_case_with_shape(
+    case_id: &str,
+    shape: support::RepositoryShape,
+    fixture: &str,
+    artifact_material: &[(&str, &str)],
+) -> (support::MintedRepo, ParsedDeclaration, ReleasePlan) {
+    let (repository, declaration) = parsed_case_with_shape(case_id, shape, fixture);
     let artifacts = artifact_material
         .iter()
         .map(|(artifact, identity)| FinalizedArtifact {
@@ -183,16 +207,95 @@ impl IrreversibleExecutor for CountingExecutor {
     }
 }
 
-#[derive(Default)]
-struct InterruptAfterRecordedEffect {
+struct FileEffectProbe {
+    effect_path: PathBuf,
+    absent_evidence: ProbeEvidence,
     calls: usize,
+}
+
+impl FileEffectProbe {
+    fn new(effect_path: PathBuf, absent_evidence: ProbeEvidence) -> Self {
+        Self {
+            effect_path,
+            absent_evidence,
+            calls: 0,
+        }
+    }
+}
+
+impl CompletionProbe for FileEffectProbe {
+    fn probe(&mut self, _: &EffectRequest) -> Result<ProbeResult, SeamError> {
+        self.calls += 1;
+        match fs::read_to_string(&self.effect_path) {
+            Ok(record) => {
+                let (reference, identity) = record.split_once('\n').ok_or_else(|| {
+                    SeamError::new(format!(
+                        "durable public-effect record {} is incomplete",
+                        self.effect_path.display()
+                    ))
+                })?;
+                Ok(ProbeResult::Present(ProbeEvidence {
+                    reference: reference.to_owned(),
+                    identity: identity.to_owned(),
+                }))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Ok(ProbeResult::Absent(self.absent_evidence.clone()))
+            }
+            Err(error) => Err(SeamError::new(format!(
+                "could not read durable public-effect record {}: {error}",
+                self.effect_path.display()
+            ))),
+        }
+    }
+}
+
+struct InterruptAfterRecordedEffect {
+    effect_path: PathBuf,
+    effect_evidence: ProbeEvidence,
+    calls: usize,
+}
+
+impl InterruptAfterRecordedEffect {
+    fn new(effect_path: PathBuf, effect_evidence: ProbeEvidence) -> Self {
+        Self {
+            effect_path,
+            effect_evidence,
+            calls: 0,
+        }
+    }
 }
 
 impl IrreversibleExecutor for InterruptAfterRecordedEffect {
     fn execute(&mut self, _: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
         self.calls += 1;
+        fs::create_dir_all(
+            self.effect_path
+                .parent()
+                .expect("public-effect record path has a parent"),
+        )
+        .map_err(|error| {
+            SeamError::new(format!(
+                "could not create durable public-effect directory: {error}"
+            ))
+        })?;
+        let mut record = fs::File::create(&self.effect_path).map_err(|error| {
+            SeamError::new(format!(
+                "could not create durable public-effect record {}: {error}",
+                self.effect_path.display()
+            ))
+        })?;
+        write!(
+            record,
+            "{}\n{}",
+            self.effect_evidence.reference, self.effect_evidence.identity
+        )
+        .map_err(|error| SeamError::new(format!("could not write public effect: {error}")))?;
+        record
+            .sync_all()
+            .map_err(|error| SeamError::new(format!("could not sync public effect: {error}")))?;
         Err(SeamError::new(
-            "interrupted after recording fake public effect before completion append",
+            "interrupted after recording durable public effect before completion append",
         ))
     }
 }
@@ -314,7 +417,7 @@ fn failed_job(job_id: &str, state: WorkflowJobState) -> WorkflowJob {
 
 #[test]
 fn adopter_case_synthetic_e2e_01_reconciles_interrupted_train() {
-    let (_repository, declaration, plan) = planned_case(
+    let (repository, declaration, plan) = planned_case(
         SYNTHETIC_E2E_01,
         SYNTHETIC_FIXTURE,
         &[("archive", "archive-v1.0.0")],
@@ -322,8 +425,14 @@ fn adopter_case_synthetic_e2e_01_reconciles_interrupted_train() {
     let (_state_home, journal) = journal_for(SYNTHETIC_E2E_01, &declaration, &plan);
     let subject = build_approval_subject(&plan).unwrap();
     let effect = plan.public_effects.first().unwrap();
-    let mut absent_probe = ScriptedProbe::new([ProbeResult::Absent(evidence("archive-v1.0.0"))]);
-    let mut interrupted = InterruptAfterRecordedEffect::default();
+    let effect_evidence = evidence("archive-v1.0.0");
+    let effect_path = repository
+        .path()
+        .join("public-effects")
+        .join(effect.operation.to_string());
+    let mut absent_probe = FileEffectProbe::new(effect_path.clone(), effect_evidence.clone());
+    let mut interrupted =
+        InterruptAfterRecordedEffect::new(effect_path.clone(), effect_evidence.clone());
 
     assert!(reconcile_effect(
         &plan,
@@ -336,8 +445,15 @@ fn adopter_case_synthetic_e2e_01_reconciles_interrupted_train() {
     .is_err());
     assert_eq!(interrupted.calls, 1);
     assert_eq!(journal.pending_intents().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(&effect_path).unwrap(),
+        format!(
+            "{}\n{}",
+            effect_evidence.reference, effect_evidence.identity
+        )
+    );
 
-    let mut present_probe = ScriptedProbe::new([ProbeResult::Present(evidence("archive-v1.0.0"))]);
+    let mut present_probe = FileEffectProbe::new(effect_path, effect_evidence.clone());
     let mut never_refired = CountingExecutor::default();
     assert_eq!(
         reconcile_effect(
@@ -349,7 +465,7 @@ fn adopter_case_synthetic_e2e_01_reconciles_interrupted_train() {
             &subject,
         )
         .unwrap(),
-        EffectOutcome::Reconciled(evidence("archive-v1.0.0"))
+        EffectOutcome::Reconciled(effect_evidence)
     );
     assert_eq!(present_probe.calls, 1);
     assert_eq!(never_refired.calls, 0);
@@ -357,9 +473,9 @@ fn adopter_case_synthetic_e2e_01_reconciles_interrupted_train() {
 }
 
 #[test]
-fn adopter_case_mc_saga_01_precheck_dirty_before_mutation() {
+fn adopter_case_mc_saga_01_precheck_dirty_before_mutation_mechanism_pending() {
     let repository = support::MintedRepo::mint_with_declaration(
-        support::RepositoryShape::Valid,
+        support::RepositoryShape::DirtyTree,
         MC_SAGA_01_FIXTURE,
     )
     .unwrap();
@@ -371,7 +487,10 @@ fn adopter_case_mc_saga_01_precheck_dirty_before_mutation() {
     assert_eq!(error.code, DeclarationRefusalCode::UnsafePhaseOrdering);
     assert!(error.message.contains("format-precheck"));
     assert!(error.message.contains("push-tag"));
-    assert!(repository.path().join(".git").is_dir());
+    assert_eq!(
+        fs::read_to_string(repository.path().join("README.md")).unwrap(),
+        "minted test repository\ndirty change\n"
+    );
 }
 
 #[test]
@@ -412,7 +531,7 @@ fn adopter_case_mc_saga_02_defect_terminal_no_retry() {
 }
 
 #[test]
-fn adopter_case_mc_saga_03_load_flake_retry_with_lock() {
+fn adopter_case_mc_saga_03_load_flake_retry_with_lock_mechanism_pending() {
     let mut watch = watch_from_fixture(MC_SAGA_03, MC_SAGA_03_FIXTURE);
     let run = workflow_run(&watch, "mc03-run");
     let mut provider = ScriptedGitHubProvider::new(
@@ -443,7 +562,7 @@ fn adopter_case_mc_saga_03_load_flake_retry_with_lock() {
 
 #[test]
 fn adopter_case_mc_saga_04_runner_vanished_resume_exactly_once() {
-    let (_repository, declaration, plan) = planned_case(
+    let (repository, declaration, plan) = planned_case(
         MC_SAGA_04,
         MC_SAGA_04_FIXTURE,
         &[("archive", "archive-mc04")],
@@ -451,8 +570,14 @@ fn adopter_case_mc_saga_04_runner_vanished_resume_exactly_once() {
     let (_state_home, journal) = journal_for(MC_SAGA_04, &declaration, &plan);
     let subject = build_approval_subject(&plan).unwrap();
     let effect = plan.public_effects.first().unwrap();
-    let mut absent = ScriptedProbe::new([ProbeResult::Absent(evidence("archive-mc04"))]);
-    let mut interrupted = InterruptAfterRecordedEffect::default();
+    let effect_evidence = evidence("archive-mc04");
+    let effect_path = repository
+        .path()
+        .join("public-effects")
+        .join(effect.operation.to_string());
+    let mut absent = FileEffectProbe::new(effect_path.clone(), effect_evidence.clone());
+    let mut interrupted =
+        InterruptAfterRecordedEffect::new(effect_path.clone(), effect_evidence.clone());
     let _ = reconcile_effect(
         &plan,
         &journal,
@@ -462,7 +587,14 @@ fn adopter_case_mc_saga_04_runner_vanished_resume_exactly_once() {
         &subject,
     );
 
-    let mut present = ScriptedProbe::new([ProbeResult::Present(evidence("archive-mc04"))]);
+    assert_eq!(
+        fs::read_to_string(&effect_path).unwrap(),
+        format!(
+            "{}\n{}",
+            effect_evidence.reference, effect_evidence.identity
+        )
+    );
+    let mut present = FileEffectProbe::new(effect_path, effect_evidence);
     let mut never_refired = CountingExecutor::default();
     assert!(matches!(
         reconcile_effect(
@@ -480,12 +612,15 @@ fn adopter_case_mc_saga_04_runner_vanished_resume_exactly_once() {
 }
 
 #[test]
-fn adopter_case_mc_saga_05_stale_residue_reconciles() {
-    let (_repository, declaration, plan) = planned_case(
+fn adopter_case_mc_saga_05_stale_residue_reconciles_mechanism_pending() {
+    let (repository, declaration, plan) = planned_case_with_shape(
         MC_SAGA_05,
+        support::RepositoryShape::StaleWorkingTreeResidue,
         MC_SAGA_05_FIXTURE,
         &[("archive", "archive-mc05")],
     );
+    assert_eq!(repository.residue_paths().len(), 2);
+    assert!(repository.residue_paths().iter().all(|path| path.exists()));
     let (_state_home, journal) = journal_for(MC_SAGA_05, &declaration, &plan);
     let subject = build_approval_subject(&plan).unwrap();
     let effect = plan.public_effects.first().unwrap();
@@ -523,12 +658,16 @@ fn adopter_case_mc_saga_05_stale_residue_reconciles() {
 }
 
 #[test]
-fn adopter_case_mc_saga_06_sibling_drift_env_named() {
-    let (_repository, declaration, plan) = planned_case(
+fn adopter_case_mc_saga_06_sibling_drift_env_named_mechanism_pending() {
+    let (repository, declaration, plan) = planned_case_with_shape(
         MC_SAGA_06,
+        support::RepositoryShape::SiblingCheckoutDrift,
         MC_SAGA_06_FIXTURE,
         &[("archive", "archive-mc06")],
     );
+    let sibling = repository.sibling_checkout_drift().unwrap();
+    assert!(sibling.path.join(".git").is_dir());
+    assert_ne!(sibling.pinned_commit, sibling.current_commit);
     let (_state_home, journal) = journal_for(MC_SAGA_06, &declaration, &plan);
     let replacement = parse(&MC_SAGA_06_FIXTURE.replace(
         "\"signing_profile\": \"none\"",
@@ -570,7 +709,7 @@ fn adopter_case_mc_saga_06_sibling_drift_env_named() {
 }
 
 #[test]
-fn adopter_case_mc_saga_07_context_unfit_refuses_precheck() {
+fn adopter_case_mc_saga_07_context_unfit_refuses_precheck_mechanism_pending() {
     let repository = support::MintedRepo::mint_with_declaration(
         support::RepositoryShape::Valid,
         MC_SAGA_07_FIXTURE,
@@ -611,7 +750,7 @@ fn adopter_case_mc_saga_08_remote_ci_red_blocks() {
 }
 
 #[test]
-fn adopter_case_mc_saga_09_skip_cascade_publish_incomplete() {
+fn adopter_case_mc_saga_09_skip_cascade_publish_incomplete_mechanism_pending() {
     let (_repository, declaration) = parsed_case(MC_SAGA_09, MC_SAGA_09_FIXTURE);
     let train = &declaration.declaration.trains[0];
 
@@ -628,7 +767,7 @@ fn adopter_case_mc_saga_09_skip_cascade_publish_incomplete() {
 }
 
 #[test]
-fn adopter_case_mc_saga_10_unpinned_tool_refuses() {
+fn adopter_case_mc_saga_10_unpinned_tool_refuses_mechanism_pending() {
     let repository = support::MintedRepo::mint_with_declaration(
         support::RepositoryShape::Valid,
         MC_SAGA_10_FIXTURE,
@@ -647,8 +786,14 @@ fn adopter_case_mc_saga_10_unpinned_tool_refuses() {
 }
 
 #[test]
-fn adopter_case_mc_saga_11_residue_swept_or_refused() {
-    let (_repository, declaration) = parsed_case(MC_SAGA_11, MC_SAGA_11_FIXTURE);
+fn adopter_case_mc_saga_11_residue_swept_or_refused_mechanism_pending() {
+    let (repository, declaration) = parsed_case_with_shape(
+        MC_SAGA_11,
+        support::RepositoryShape::RuntimeResidueFiles,
+        MC_SAGA_11_FIXTURE,
+    );
+    assert_eq!(repository.residue_paths().len(), 3);
+    assert!(repository.residue_paths().iter().all(|path| path.exists()));
     let root = tempfile::tempdir().unwrap();
     let identity = TrainJournalIdentity::new(
         RepositoryId::new("adopter-mc-saga-11"),

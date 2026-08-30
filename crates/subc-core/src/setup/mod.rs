@@ -8,6 +8,11 @@ mod mc_detection;
 mod model;
 mod planner;
 mod runtime;
+mod self_update;
+#[cfg(unix)]
+mod self_update_unix;
+#[cfg(windows)]
+mod self_update_windows;
 mod uninstall;
 mod update_cache;
 mod update_check;
@@ -20,6 +25,8 @@ mod validation;
 pub use apply::SetupBackend;
 pub use model::{Component, SetupRequest, UpgradeState, UpgradeTarget};
 pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
+#[cfg(windows)]
+pub(crate) use self_update::cleanup_replaced_windows_ck;
 pub use update_cache::UpdateCache;
 pub use update_check::{
     check_update_metadata, compiled_installed_versions, dashboard_update, not_checked_from_cache,

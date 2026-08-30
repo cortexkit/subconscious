@@ -164,16 +164,7 @@ fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
             "could not locate ck for self-update cleanup: {error}"
         ))
     })?;
-    let previous = executable.with_extension("exe.old");
-    if previous.exists() {
-        fs::remove_file(&previous).map_err(|error| {
-            CkError::Message(format!(
-                "could not delete prior self-update executable {}: {error}",
-                previous.display()
-            ))
-        })?;
-    }
-    Ok(())
+    setup::cleanup_replaced_windows_ck(&executable).map_err(CkError::Message)
 }
 
 #[cfg(not(windows))]

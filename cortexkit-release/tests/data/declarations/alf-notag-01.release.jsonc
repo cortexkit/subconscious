@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "trains": [{
+    "id": "alf-deploy",
+    "intended_commit": "a1b2c3d4",
+    "signing_profile": "none",
+    "artifacts": [{
+      "id": "prefrontal-app",
+      "kind": "application",
+      "identity_channel": "embedded_build_sha"
+    }],
+    "phases": [
+      {
+        "id": "deployment-ci",
+        "type": "ci_watch",
+        "params": {
+          "workflow": "Tests",
+          "selector": "commit:a1b2c3d4",
+          "rerun_budget": 1
+        }
+      },
+      {"id": "stage", "type": "stage"}
+    ]
+  }]
+}

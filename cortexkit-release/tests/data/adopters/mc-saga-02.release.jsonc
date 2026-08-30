@@ -1,0 +1,14 @@
+{
+  // adopter case: mc-saga-02
+  "version": 1,
+  "trains": [{
+    "id": "mc-product-defect",
+    "intended_commit": "mc02",
+    "signing_profile": "none",
+    "phases": [{
+      "id": "product-gate",
+      "type": "ci_watch",
+      "params": {"workflow": "Product Gate", "selector": "commit:mc02", "rerun_budget": 0}
+    }]
+  }]
+}

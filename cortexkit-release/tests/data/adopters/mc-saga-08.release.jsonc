@@ -1,0 +1,13 @@
+{
+  // adopter case: mc-saga-08
+  "version": 1,
+  "trains": [{
+    "id": "mc-remote-ci",
+    "intended_commit": "mc08",
+    "signing_profile": "none",
+    "phases": [{
+      "id": "remote-ci", "type": "ci_watch",
+      "params": {"workflow": "Remote CI", "selector": "commit:mc08", "rerun_budget": 0}
+    }]
+  }]
+}

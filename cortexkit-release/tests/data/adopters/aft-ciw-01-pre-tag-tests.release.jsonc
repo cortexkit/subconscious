@@ -1,0 +1,16 @@
+{
+  // adopter case: aft-ciw-01
+  "version": 1,
+  "trains": [{
+    "id": "aft-pre-tag",
+    "intended_commit": "deadbeef",
+    "tag": "v1.2.3",
+    "signing_profile": "minisign",
+    "operator_gates": ["first_public_trigger"],
+    "artifacts": [{"id": "crate", "kind": "crate", "identity_channel": "registry_version"}],
+    "phases": [
+      {"id": "tests-before-tag", "type": "ci_watch", "params": {"workflow": "Tests", "selector": "commit:deadbeef", "rerun_budget": 2}},
+      {"id": "push-tag", "type": "tag"}
+    ]
+  }]
+}

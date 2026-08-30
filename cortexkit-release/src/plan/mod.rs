@@ -48,6 +48,7 @@ pub struct PlannedArtifact {
 pub struct PlannedPhase {
     pub instance: PhaseInstanceId,
     pub phase_type: String,
+    pub params: serde_json::Value,
     pub tree_mutating: bool,
 }
 
@@ -153,6 +154,7 @@ pub fn build_dry_run_plan(
         .map(|phase| PlannedPhase {
             instance: phase.instance_id(),
             phase_type: phase.phase_type.clone(),
+            params: phase.params.clone(),
             tree_mutating: tree_mutating(phase),
         })
         .collect::<Vec<_>>();
@@ -258,7 +260,10 @@ fn release_identity(train: &TrainDeclaration) -> ReleaseIdentity {
 }
 
 fn tree_mutating(phase: &PhaseDeclaration) -> bool {
-    matches!(phase.phase_type.as_str(), "stamp" | "tag")
+    matches!(
+        phase.phase_type.as_str(),
+        "stamp" | "tag" | crate::phases::precheck::RESIDUE_SWEEP
+    )
 }
 
 fn resolve_public_effects(

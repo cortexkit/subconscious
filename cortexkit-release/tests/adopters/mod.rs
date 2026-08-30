@@ -9,14 +9,18 @@ mod support;
 use cortexkit_release::executor;
 use cortexkit_release::{
     approval::{build_approval_subject, ApprovalError, ApprovalStore, ApprovalSubject},
-    declaration::{parse, DeclarationRefusalCode, ParsedDeclaration},
+    declaration::{parse, ParsedDeclaration},
+    lease::LeaseStore,
     orchestrator::{
-        reconcile_effect_unfenced_for_tests as reconcile_effect, EffectOutcome, OrchestrationError,
-        OrchestrationRefusalCode,
+        reconcile_effect_unfenced_for_tests as reconcile_effect, EffectOutcome,
+        FirstPublicTriggerGate, OrchestrationError, Orchestrator, PrecheckRefusalCode,
     },
-    phases::ci_watch::{
-        CiWatch, CiWatchConclusion, CiWatchConfig, CiWatchError, CiWatchJournal,
-        CiWatchJournalRecord,
+    phases::{
+        ci_watch::{
+            CiWatch, CiWatchConclusion, CiWatchConfig, CiWatchError, CiWatchJournal,
+            CiWatchJournalRecord,
+        },
+        precheck::PrecheckRunner,
     },
     plan::{build_dry_run_plan, FinalizedArtifact, ReleaseIdentity, ReleasePlan},
     provider::{
@@ -24,9 +28,10 @@ use cortexkit_release::{
         WorkflowJob, WorkflowJobId, WorkflowJobState, WorkflowRun, WorkflowRunCapture,
         WorkflowRunId, WorkflowRunPoll, WorkflowRunRequest,
     },
-    state::{JournalRecord, JournalStore, StateError, TrainJournalIdentity, TrainTerminalState},
-    ApprovalSubject as DurableApprovalSubject, ArtifactDigest, ArtifactId, CompletionProbe,
-    EffectRequest, IrreversibleExecutor, ProbeEvidence, ProbeResult, RepositoryId, SeamError,
+    state::{JournalRecord, JournalStore, TrainJournalIdentity, TrainTerminalState},
+    ApprovalSubject as DurableApprovalSubject, ApprovalToken, ArtifactDigest, ArtifactId,
+    CompletionProbe, EffectRequest, IrreversibleExecutor, ProbeEvidence, ProbeResult, RepositoryId,
+    SeamError,
 };
 use std::{
     collections::VecDeque,
@@ -142,6 +147,88 @@ fn journal_for(
     let journal = JournalStore::new(root.path(), identity).unwrap();
     journal.pin_declaration(declaration).unwrap();
     (root, journal)
+}
+
+struct UnexpectedGate;
+
+impl FirstPublicTriggerGate for UnexpectedGate {
+    fn confirm(&mut self, _: &ApprovalSubject) -> Result<ApprovalToken, SeamError> {
+        Err(SeamError::new(
+            "precheck refusal test reached the public trigger",
+        ))
+    }
+}
+
+fn execute_prechecks(
+    case_id: &str,
+    repository: &support::MintedRepo,
+    declaration: &ParsedDeclaration,
+    plan: &ReleasePlan,
+) -> (
+    Result<Vec<EffectOutcome>, OrchestrationError>,
+    Vec<JournalRecord>,
+    usize,
+) {
+    execute_prechecks_after(case_id, repository, declaration, plan, |_, _| {})
+}
+
+fn execute_prechecks_after(
+    case_id: &str,
+    repository: &support::MintedRepo,
+    declaration: &ParsedDeclaration,
+    plan: &ReleasePlan,
+    setup: impl FnOnce(&std::path::Path, &JournalStore),
+) -> (
+    Result<Vec<EffectOutcome>, OrchestrationError>,
+    Vec<JournalRecord>,
+    usize,
+) {
+    let (state_home, journal) = journal_for(case_id, declaration, plan);
+    setup(state_home.path(), &journal);
+    let approvals = ApprovalStore::new(
+        state_home.path(),
+        TrainJournalIdentity::new(
+            plan.repository.clone(),
+            plan.train.clone(),
+            format!("{case_id}-runtime"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let leases = LeaseStore::new(state_home.path()).unwrap();
+    let mut runner = PrecheckRunner::new(repository.path(), &journal);
+    let mut gate = UnexpectedGate;
+    let mut probe = ScriptedProbe::new([]);
+    let mut executor = CountingExecutor::default();
+    let result = Orchestrator::default().execute(
+        plan,
+        &leases,
+        &journal,
+        &approvals,
+        &mut runner,
+        &mut gate,
+        &mut probe,
+        &mut executor,
+    );
+    (result, journal.read_journal().unwrap(), executor.calls)
+}
+
+fn assert_precheck_refusal(
+    result: &Result<Vec<EffectOutcome>, OrchestrationError>,
+    records: &[JournalRecord],
+    code: PrecheckRefusalCode,
+) {
+    assert!(
+        matches!(
+            result,
+            Err(OrchestrationError::PrecheckRefusal { code: observed, .. }) if *observed == code
+        ),
+        "unexpected precheck result: {result:?}"
+    );
+    assert!(records.iter().any(|record| matches!(
+        record,
+        JournalRecord::Refused { reason, .. } if reason.contains(&code.to_string())
+    )));
 }
 
 fn durable_subject(subject: &ApprovalSubject) -> DurableApprovalSubject {
@@ -477,24 +564,74 @@ fn adopter_case_synthetic_e2e_01_reconciles_interrupted_train() {
 }
 
 #[test]
-fn adopter_case_mc_saga_01_precheck_dirty_before_mutation_mechanism_pending() {
-    let repository = support::MintedRepo::mint_with_declaration(
+fn adopter_case_mc_saga_01_precheck_dirty_before_mutation_refuses() {
+    let (repository, declaration, plan) = planned_case_with_shape(
+        MC_SAGA_01,
         support::RepositoryShape::DirtyTree,
         MC_SAGA_01_FIXTURE,
-    )
-    .unwrap();
-    let source = fs::read_to_string(repository.declaration_path()).unwrap();
-    let error = parse(&source).expect_err(&format!(
-        "{MC_SAGA_01}: late format precheck must be refused before execution"
-    ));
+        &[("crate", "v0.40.1")],
+    );
+    let before = fs::read_to_string(repository.path().join("README.md")).unwrap();
 
-    assert_eq!(error.code, DeclarationRefusalCode::UnsafePhaseOrdering);
-    assert!(error.message.contains("format-precheck"));
-    assert!(error.message.contains("push-tag"));
+    let (result, records, executor_calls) =
+        execute_prechecks(MC_SAGA_01, &repository, &declaration, &plan);
+
+    assert_precheck_refusal(&result, &records, PrecheckRefusalCode::PrecheckDirty);
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("README.md"));
+    assert!(message.contains("git diff --check"));
+    assert_eq!(executor_calls, 0);
     assert_eq!(
         fs::read_to_string(repository.path().join("README.md")).unwrap(),
-        "minted test repository\ndirty change\n"
+        before
     );
+}
+
+#[test]
+fn precheck_format_dirty_passes_current_live_train_mutation() {
+    let fixture = r#"{
+      "version": 1,
+      "trains": [{
+        "id": "mc-format-own-live",
+        "intended_commit": "mc01-live",
+        "signing_profile": "none",
+        "phases": [{
+          "id": "format-precheck",
+          "type": "precheck-format-dirty",
+          "params": {"tool": "git diff --check", "command": ["git", "diff", "--check"]}
+        }]
+      }]
+    }"#;
+    let (repository, declaration, plan) = planned_case_with_shape(
+        "mc-saga-01-own-live",
+        support::RepositoryShape::DirtyTree,
+        fixture,
+        &[],
+    );
+    let (result, records, executor_calls) = execute_prechecks_after(
+        "mc-saga-01-own-live",
+        &repository,
+        &declaration,
+        &plan,
+        |_, journal| {
+            journal
+                .append_journal(JournalRecord::WorkingTreeMutation {
+                    phase: "version-bump".into(),
+                    paths: vec![PathBuf::from("README.md")],
+                })
+                .unwrap();
+        },
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(executor_calls, 0);
+    assert!(records.iter().any(|record| matches!(
+        record,
+        JournalRecord::PhaseDone { phase, .. } if phase.as_str() == "format-precheck"
+    )));
+    assert!(fs::read_to_string(repository.path().join("README.md"))
+        .unwrap()
+        .contains("dirty change"));
 }
 
 #[test]
@@ -616,116 +753,163 @@ fn adopter_case_mc_saga_04_runner_vanished_resume_exactly_once() {
 }
 
 #[test]
-fn adopter_case_mc_saga_05_stale_residue_reconciles_mechanism_pending() {
+fn adopter_case_mc_saga_05_stale_residue_refuses() {
     let (repository, declaration, plan) = planned_case_with_shape(
         MC_SAGA_05,
         support::RepositoryShape::StaleWorkingTreeResidue,
         MC_SAGA_05_FIXTURE,
-        &[("archive", "archive-mc05")],
+        &[],
     );
-    assert_eq!(repository.residue_paths().len(), 2);
-    assert!(repository.residue_paths().iter().all(|path| path.exists()));
-    let (_state_home, journal) = journal_for(MC_SAGA_05, &declaration, &plan);
-    let subject = build_approval_subject(&plan).unwrap();
-    let effect = plan.public_effects.first().unwrap();
-    let request = EffectRequest {
-        repository: plan.repository.clone(),
-        train: plan.train.clone(),
-        phase: effect.phase.clone(),
-        artifact: effect.artifact.clone().unwrap(),
-        operation: effect.operation.clone(),
-        intended_commit: plan.intended_commit.clone(),
-        declaration_digest: plan.declaration_digest.clone(),
-    };
-    journal
-        .append_intent(&request, durable_subject(&subject))
-        .unwrap();
-    let mut absent = ScriptedProbe::new([ProbeResult::Absent(evidence("archive-mc05"))]);
-    let mut never_refired = CountingExecutor::default();
+    let before = repository
+        .residue_paths()
+        .iter()
+        .map(|path| (path.clone(), fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
 
-    assert!(matches!(
-        reconcile_effect(
-            &plan,
-            &journal,
-            effect,
-            &mut absent,
-            &mut never_refired,
-            &subject,
-        ),
-        Err(OrchestrationError::Refusal {
-            code: OrchestrationRefusalCode::AttemptedIntentAbsent,
-            ..
-        })
-    ));
-    assert_eq!(never_refired.calls, 0);
-    assert_eq!(journal.pending_intents().unwrap().len(), 1);
+    let (result, records, executor_calls) =
+        execute_prechecks(MC_SAGA_05, &repository, &declaration, &plan);
+
+    assert_precheck_refusal(&result, &records, PrecheckRefusalCode::StaleRunResidue);
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("VERSION"));
+    assert!(message.contains("Cargo.lock"));
+    assert_eq!(executor_calls, 0);
+    for (path, bytes) in before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
 }
 
 #[test]
-fn adopter_case_mc_saga_06_sibling_drift_env_named_mechanism_pending() {
+fn precheck_stale_residue_passes_current_live_train_mutations() {
     let (repository, declaration, plan) = planned_case_with_shape(
-        MC_SAGA_06,
+        "mc-saga-05-own-live",
+        support::RepositoryShape::StaleWorkingTreeResidue,
+        MC_SAGA_05_FIXTURE,
+        &[],
+    );
+    let (result, records, executor_calls) = execute_prechecks_after(
+        "mc-saga-05-own-live",
+        &repository,
+        &declaration,
+        &plan,
+        |_, journal| {
+            journal
+                .append_journal(JournalRecord::WorkingTreeMutation {
+                    phase: "version-bump".into(),
+                    paths: vec![PathBuf::from("VERSION"), PathBuf::from("Cargo.lock")],
+                })
+                .unwrap();
+        },
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(executor_calls, 0);
+    assert!(records.iter().any(|record| matches!(
+        record,
+        JournalRecord::PhaseDone { phase, .. } if phase.as_str() == "stale-residue-precheck"
+    )));
+    assert!(repository.residue_paths().iter().all(|path| path.exists()));
+}
+
+#[test]
+fn precheck_stale_residue_refuses_dead_train_mutations_by_train_id() {
+    let (repository, declaration, plan) = planned_case_with_shape(
+        "mc-saga-05-dead-r9",
+        support::RepositoryShape::StaleWorkingTreeResidue,
+        MC_SAGA_05_FIXTURE,
+        &[],
+    );
+    let (result, records, executor_calls) = execute_prechecks_after(
+        "mc-saga-05-dead-r9",
+        &repository,
+        &declaration,
+        &plan,
+        |state_home, _| {
+            let predecessor = JournalStore::new(
+                state_home,
+                TrainJournalIdentity::new(plan.repository.clone(), plan.train.clone(), "r9-dead")
+                    .unwrap(),
+            )
+            .unwrap();
+            predecessor.pin_declaration(&declaration).unwrap();
+            predecessor
+                .append_journal(JournalRecord::WorkingTreeMutation {
+                    phase: "version-bump".into(),
+                    paths: vec![PathBuf::from("VERSION"), PathBuf::from("Cargo.lock")],
+                })
+                .unwrap();
+            predecessor
+                .append_journal(JournalRecord::Terminalized {
+                    state: TrainTerminalState::Abandoned {
+                        declaration_digest: declaration.digest.clone(),
+                    },
+                })
+                .unwrap();
+        },
+    );
+
+    assert_precheck_refusal(&result, &records, PrecheckRefusalCode::StaleRunResidue);
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("mc-stale-residue-r9-dead"));
+    assert_eq!(executor_calls, 0);
+    assert!(repository.residue_paths().iter().all(|path| path.exists()));
+}
+
+#[test]
+fn adopter_case_mc_saga_06_sibling_drift_refuses() {
+    let repository = support::MintedRepo::mint_with_declaration(
         support::RepositoryShape::SiblingCheckoutDrift,
         MC_SAGA_06_FIXTURE,
-        &[("archive", "archive-mc06")],
-    );
-    let sibling = repository.sibling_checkout_drift().unwrap();
-    assert!(sibling.path.join(".git").is_dir());
-    assert_ne!(sibling.pinned_commit, sibling.current_commit);
-    let (_state_home, journal) = journal_for(MC_SAGA_06, &declaration, &plan);
-    let replacement = parse(&MC_SAGA_06_FIXTURE.replace(
-        "\"signing_profile\": \"none\"",
-        "\"signing_profile\": \"minisign\"",
-    ))
-    .unwrap();
-    let replacement_plan = build_dry_run_plan(
-        plan.repository.clone(),
-        &replacement,
-        "mc-environment-drift",
-        &[FinalizedArtifact {
-            artifact: ArtifactId::new("archive"),
-            identity: "archive-mc06".to_owned(),
-            bytes: b"changed declaration must not execute".to_vec(),
-        }],
     )
     .unwrap();
-    let subject = build_approval_subject(&replacement_plan).unwrap();
-    let effect = replacement_plan.public_effects.first().unwrap();
-    let mut probe = ScriptedProbe::new([ProbeResult::Absent(evidence("archive-mc06"))]);
-    let mut executor = CountingExecutor::default();
+    let sibling = repository.sibling_checkout_drift().unwrap();
+    let escaped_path = serde_json::to_string(&sibling.path).unwrap();
+    let source = MC_SAGA_06_FIXTURE
+        .replace("\"__SIBLING_PATH__\"", &escaped_path)
+        .replace("__EXPECTED_REF__", &sibling.pinned_commit);
+    repository.write_declaration(&source).unwrap();
+    let declaration = parse(&source).unwrap();
+    let plan = build_dry_run_plan(
+        RepositoryId::new("adopter-mc-saga-06"),
+        &declaration,
+        "mc-environment-drift",
+        &[],
+    )
+    .unwrap();
+    let before = fs::read_to_string(sibling.path.join("API.md")).unwrap();
 
-    assert!(matches!(
-        reconcile_effect(
-            &replacement_plan,
-            &journal,
-            effect,
-            &mut probe,
-            &mut executor,
-            &subject,
-        ),
-        Err(OrchestrationError::Refusal {
-            code: OrchestrationRefusalCode::DeclarationDigestMismatch,
-            ..
-        })
-    ));
-    assert_eq!(probe.calls, 0);
-    assert_eq!(executor.calls, 0);
+    let (result, records, executor_calls) =
+        execute_prechecks(MC_SAGA_06, &repository, &declaration, &plan);
+
+    assert_precheck_refusal(&result, &records, PrecheckRefusalCode::EnvDrift);
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("mc-api"));
+    assert!(message.contains(&sibling.pinned_commit));
+    assert!(message.contains(&sibling.current_commit));
+    assert_eq!(executor_calls, 0);
+    assert_eq!(
+        fs::read_to_string(sibling.path.join("API.md")).unwrap(),
+        before
+    );
 }
 
 #[test]
-fn adopter_case_mc_saga_07_context_unfit_refuses_precheck_mechanism_pending() {
-    let repository = support::MintedRepo::mint_with_declaration(
-        support::RepositoryShape::Valid,
-        MC_SAGA_07_FIXTURE,
-    )
-    .unwrap();
-    let source = fs::read_to_string(repository.declaration_path()).unwrap();
-    let error = parse(&source).expect_err(&format!(
-        "{MC_SAGA_07}: incomplete context gate parameters must fail closed"
-    ));
+fn adopter_case_mc_saga_07_context_unfit_refuses_precheck() {
+    let (repository, declaration, plan) = planned_case(MC_SAGA_07, MC_SAGA_07_FIXTURE, &[]);
+    let before = fs::read(repository.declaration_path()).unwrap();
 
-    assert_eq!(error.code, DeclarationRefusalCode::InvalidPhaseParameters);
-    assert!(error.message.contains("context-gate"));
+    let (result, records, executor_calls) =
+        execute_prechecks(MC_SAGA_07, &repository, &declaration, &plan);
+
+    assert_precheck_refusal(&result, &records, PrecheckRefusalCode::ContextUnfit);
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("CK_RELEASE_MC_CONTEXT_READY"));
+    assert_eq!(executor_calls, 0);
+    assert_eq!(fs::read(repository.declaration_path()).unwrap(), before);
 }
 
 #[test]
@@ -755,91 +939,157 @@ fn adopter_case_mc_saga_08_remote_ci_red_blocks() {
 
 #[test]
 fn adopter_case_mc_saga_09_skip_cascade_publish_incomplete_mechanism_pending() {
-    let (_repository, declaration) = parsed_case(MC_SAGA_09, MC_SAGA_09_FIXTURE);
-    let train = &declaration.declaration.trains[0];
-
-    assert!(matches!(
-        build_dry_run_plan(
-            RepositoryId::new("adopter-mc-saga-09"),
-            &declaration,
-            &train.id,
-            &[]
-        ),
-        Err(cortexkit_release::plan::PlanError::MissingArtifact { artifact, .. })
-            if artifact == "release-archive"
-    ));
-}
-
-#[test]
-fn adopter_case_mc_saga_10_unpinned_tool_refuses_mechanism_pending() {
-    let repository = support::MintedRepo::mint_with_declaration(
-        support::RepositoryShape::Valid,
-        MC_SAGA_10_FIXTURE,
-    )
-    .unwrap();
-    let source = fs::read_to_string(repository.declaration_path()).unwrap();
-    let error = parse(&source).expect_err(&format!(
-        "{MC_SAGA_10}: unsupported identity channel must not plan"
-    ));
-
-    assert_eq!(
-        error.code,
-        DeclarationRefusalCode::InvalidArtifactIdentityChannel
+    let (_repository, declaration, plan) = planned_case(
+        MC_SAGA_09,
+        MC_SAGA_09_FIXTURE,
+        &[
+            ("registry-crate", "v0.40.9"),
+            ("release-archive", "archive-mc09"),
+        ],
     );
-    assert!(error.message.contains("outside_declared_pins"));
+    assert_eq!(plan.public_effects.len(), 2);
+    assert_ne!(
+        plan.public_effects[0].artifact,
+        plan.public_effects[1].artifact
+    );
+
+    let (_state_home, journal) = journal_for(MC_SAGA_09, &declaration, &plan);
+    let subject = build_approval_subject(&plan).unwrap();
+    let mut present = ScriptedProbe::new([ProbeResult::Present(evidence("v0.40.9"))]);
+    let mut never_for_present = CountingExecutor::default();
+    assert!(matches!(
+        reconcile_effect(
+            &plan,
+            &journal,
+            &plan.public_effects[0],
+            &mut present,
+            &mut never_for_present,
+            &subject,
+        ),
+        Ok(EffectOutcome::Reconciled(_))
+    ));
+
+    let mut absent = ScriptedProbe::new([ProbeResult::Absent(evidence("archive-mc09"))]);
+    let mut missing_effect = CountingExecutor::default();
+    assert!(reconcile_effect(
+        &plan,
+        &journal,
+        &plan.public_effects[1],
+        &mut absent,
+        &mut missing_effect,
+        &subject,
+    )
+    .is_err());
+    assert_eq!(never_for_present.calls, 0);
+    assert_eq!(missing_effect.calls, 1);
 }
 
 #[test]
-fn adopter_case_mc_saga_11_residue_swept_or_refused_mechanism_pending() {
-    let (repository, declaration) = parsed_case_with_shape(
+fn adopter_case_mc_saga_10_unpinned_tool_refuses() {
+    let (repository, declaration, plan) =
+        planned_case(MC_SAGA_10, MC_SAGA_10_FIXTURE, &[("tool", "tool-mc10")]);
+    let before = fs::read(repository.declaration_path()).unwrap();
+
+    let (result, records, executor_calls) =
+        execute_prechecks(MC_SAGA_10, &repository, &declaration, &plan);
+
+    assert_precheck_refusal(&result, &records, PrecheckRefusalCode::ToolUnpinned);
+    assert!(result.unwrap_err().to_string().contains("cargo"));
+    assert_eq!(executor_calls, 0);
+    assert_eq!(fs::read(repository.declaration_path()).unwrap(), before);
+}
+
+#[test]
+fn precheck_tool_pinning_refuses_observed_version_mismatch() {
+    let fixture = MC_SAGA_10_FIXTURE.replace(
+        "\"command\": \"cargo\"",
+        "\"command\": \"cargo\", \"exact_version\": \"0.0.0\"",
+    );
+    let (repository, declaration, plan) =
+        planned_case("mc-saga-10-mismatch", &fixture, &[("tool", "tool-mc10")]);
+
+    let (result, records, executor_calls) =
+        execute_prechecks("mc-saga-10-mismatch", &repository, &declaration, &plan);
+
+    assert_precheck_refusal(&result, &records, PrecheckRefusalCode::ToolMismatch);
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("expected 0.0.0"));
+    assert!(message.contains("observed"));
+    assert_eq!(executor_calls, 0);
+}
+
+#[test]
+fn adopter_case_mc_saga_11_residue_swept_or_refused() {
+    let (repository, declaration, plan) = planned_case_with_shape(
         MC_SAGA_11,
         support::RepositoryShape::RuntimeResidueFiles,
         MC_SAGA_11_FIXTURE,
+        &[],
     );
-    assert_eq!(repository.residue_paths().len(), 3);
-    assert!(repository.residue_paths().iter().all(|path| path.exists()));
-    let root = tempfile::tempdir().unwrap();
-    let identity = TrainJournalIdentity::new(
-        RepositoryId::new("adopter-mc-saga-11"),
-        declaration.declaration.trains[0].train_id(),
-        "runtime-residue",
-    )
-    .unwrap();
-    let journal = JournalStore::new(root.path(), identity).unwrap();
-    fs::write(journal.journal_path(), b"{\"version\":1,\"record\":").unwrap();
+    let process = repository.residue_paths()[0].clone();
+    let foreign_lock = repository.residue_paths()[1].clone();
+    let temporary = repository.residue_paths()[2].clone();
 
-    // Core remediation made torn-tail recovery automatic on read: a torn final
-    // record is truncated as a non-event and the read succeeds empty, per the
-    // normative rule this test previously pinned the pre-fix error for.
-    assert!(journal.read_journal().unwrap().is_empty());
-    assert!(fs::read(journal.journal_path()).unwrap().is_empty());
+    let (refused, records, executor_calls) =
+        execute_prechecks("mc-saga-11-refused", &repository, &declaration, &plan);
+    assert_precheck_refusal(&refused, &records, PrecheckRefusalCode::ResiduePresent);
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("release-port-owner"));
+    assert_eq!(executor_calls, 0);
+    assert!(process.exists());
+    assert!(temporary.exists());
 
-    journal.pin_declaration(&declaration).unwrap();
-    let pinned_len = fs::read(journal.journal_path()).unwrap().len();
-    journal
-        .append_journal(JournalRecord::Terminalized {
-            state: TrainTerminalState::Abandoned {
-                declaration_digest: declaration.digest.clone(),
-            },
-        })
-        .unwrap();
-    // Corrupt the FIRST record while a valid record follows it: mid-stream
-    // corruption must refuse and never truncate. (A corrupt FINAL record with
-    // nothing after it is now recoverable as a non-event, so this arm needs
-    // the trailing record to keep testing what it always meant.)
-    let mut corrupted = fs::read(journal.journal_path()).unwrap();
-    let offset = corrupted[..pinned_len]
-        .windows(b"mc-residue-sweep".len())
-        .position(|window| window == b"mc-residue-sweep")
-        .unwrap();
-    corrupted[offset] = b'x';
-    fs::write(journal.journal_path(), &corrupted).unwrap();
+    fs::remove_file(&foreign_lock).unwrap();
+    let (swept, records, executor_calls) =
+        execute_prechecks("mc-saga-11-swept", &repository, &declaration, &plan);
+    assert!(swept.is_ok());
+    assert_eq!(executor_calls, 0);
+    assert!(!process.exists());
+    assert!(!temporary.exists());
+    assert!(records.iter().any(|record| matches!(
+        record,
+        JournalRecord::ResidueSwept { paths, .. }
+            if paths.iter().any(|path| path.ends_with("process-1234.pid"))
+                && paths.iter().any(|path| path.ends_with("session.tmp"))
+    )));
+}
 
-    assert!(matches!(
-        journal.recover_torn_journal_tail(),
-        Err(StateError::CorruptRecord { .. })
-    ));
-    assert_eq!(fs::read(journal.journal_path()).unwrap(), corrupted);
+#[test]
+fn precheck_residue_sweep_passes_current_live_train_residue() {
+    let (repository, declaration, plan) = planned_case_with_shape(
+        "mc-saga-11-own-live",
+        support::RepositoryShape::RuntimeResidueFiles,
+        MC_SAGA_11_FIXTURE,
+        &[],
+    );
+    fs::remove_file(&repository.residue_paths()[1]).unwrap();
+    let (result, records, executor_calls) = execute_prechecks_after(
+        "mc-saga-11-own-live",
+        &repository,
+        &declaration,
+        &plan,
+        |_, journal| {
+            journal
+                .append_journal(JournalRecord::WorkingTreeMutation {
+                    phase: "runtime-start".into(),
+                    paths: vec![
+                        PathBuf::from(".cortexkit/release-residue/process-1234.pid"),
+                        PathBuf::from("target/release-residue/session.tmp"),
+                    ],
+                })
+                .unwrap();
+        },
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(executor_calls, 0);
+    assert!(repository.residue_paths()[0].exists());
+    assert!(repository.residue_paths()[2].exists());
+    assert!(!records
+        .iter()
+        .any(|record| matches!(record, JournalRecord::ResidueSwept { .. })));
 }
 
 #[test]

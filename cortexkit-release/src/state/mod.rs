@@ -116,6 +116,48 @@ impl JournalStore {
         self.identity.file_stem()
     }
 
+    /// Finds predecessor journals that recorded mutations of the supplied repository paths.
+    pub(crate) fn predecessor_mutation_origins(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<String>, StateError> {
+        let expected = paths.iter().collect::<std::collections::HashSet<_>>();
+        let mut origins = Vec::new();
+        for entry in fs::read_dir(self.repository_dir()).map_err(|source| StateError::Io {
+            path: self.repository_dir(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| StateError::Io {
+                path: self.repository_dir(),
+                source,
+            })?;
+            let path = entry.path();
+            if path == self.journal_path()
+                || path.extension().and_then(|value| value.to_str()) != Some("journal")
+            {
+                continue;
+            }
+            let records = read_records::<JournalRecord>(&path)?;
+            let overlaps = records.iter().any(|record| match record {
+                JournalRecord::WorkingTreeMutation { paths, .. } => {
+                    paths.iter().any(|path| expected.contains(path))
+                }
+                _ => false,
+            });
+            if overlaps {
+                origins.push(
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("unknown-train")
+                        .to_owned(),
+                );
+            }
+        }
+        origins.sort();
+        origins.dedup();
+        Ok(origins)
+    }
+
     /// Returns the declaration currently bound to this train, if train creation pinned one.
     pub fn pinned_declaration(&self) -> Result<Option<DeclarationBinding>, StateError> {
         let mut binding = None;
@@ -132,6 +174,8 @@ impl JournalStore {
                 | JournalRecord::PhaseEntered { .. }
                 | JournalRecord::PhaseDone { .. }
                 | JournalRecord::Refused { .. }
+                | JournalRecord::WorkingTreeMutation { .. }
+                | JournalRecord::ResidueSwept { .. }
                 | JournalRecord::Terminalized { .. } => {}
             }
         }
@@ -194,6 +238,8 @@ impl JournalStore {
                 | JournalRecord::PhaseEntered { .. }
                 | JournalRecord::PhaseDone { .. }
                 | JournalRecord::Refused { .. }
+                | JournalRecord::WorkingTreeMutation { .. }
+                | JournalRecord::ResidueSwept { .. }
                 | JournalRecord::Completion { .. } => None,
             }))
     }
@@ -344,6 +390,8 @@ impl JournalStore {
                     | JournalRecord::PhaseEntered { .. }
                     | JournalRecord::PhaseDone { .. }
                     | JournalRecord::Refused { .. }
+                    | JournalRecord::WorkingTreeMutation { .. }
+                    | JournalRecord::ResidueSwept { .. }
                     | JournalRecord::Terminalized { .. } => false,
                 })
             })
@@ -407,6 +455,16 @@ pub enum JournalRecord {
     Refused {
         phase: PhaseInstanceId,
         reason: String,
+    },
+    /// Paths changed by this train, used to distinguish live work from stale dirt.
+    WorkingTreeMutation {
+        phase: PhaseInstanceId,
+        paths: Vec<PathBuf>,
+    },
+    /// Clearable startup residue removed by a declared sweep.
+    ResidueSwept {
+        phase: PhaseInstanceId,
+        paths: Vec<String>,
     },
     /// A confirmed ceremony replaced the pinned declaration. Boxed: the
     /// binding carries the full normalized declaration, dwarfing the other

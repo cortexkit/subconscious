@@ -143,3 +143,28 @@ fn semantic_validation_refuses_invalid_identity_signing_and_watch_parameters() {
         DeclarationRefusalCode::InvalidPhaseParameters
     );
 }
+
+#[test]
+fn precheck_parameter_schemas_reject_unknown_fields() {
+    let declaration = r#"{
+      "version": 1,
+      "trains": [{
+        "id": "strict-precheck",
+        "intended_commit": "abc123",
+        "signing_profile": "none",
+        "phases": [{
+          "id": "dirty",
+          "type": "precheck-format-dirty",
+          "params": {
+            "tool": "cargo fmt",
+            "command": ["cargo", "fmt", "--check"],
+            "invented": true
+          }
+        }]
+      }]
+    }"#;
+
+    let error = parse(declaration).expect_err("precheck params are a closed schema");
+    assert_eq!(error.code, DeclarationRefusalCode::InvalidPhaseParameters);
+    assert!(error.message.contains("unknown field `invented`"));
+}

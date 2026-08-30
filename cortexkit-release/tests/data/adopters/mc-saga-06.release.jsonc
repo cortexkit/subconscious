@@ -1,13 +1,19 @@
 {
-  // adopter case: mc-saga-06
+  // adopter case: mc-saga-06; tests replace the runtime-minted sibling facts.
   "version": 1,
   "trains": [{
     "id": "mc-environment-drift",
     "intended_commit": "mc06",
-    "tag": "v0.40.6",
     "signing_profile": "none",
-    "operator_gates": ["first_public_trigger"],
-    "artifacts": [{"id": "archive", "kind": "archive", "identity_channel": "asset_sha256"}],
-    "phases": [{"id": "publish-archive", "type": "assets"}]
+    "phases": [{
+      "id": "sibling-drift-precheck",
+      "type": "precheck-sibling-drift",
+      "params": {"siblings": [{
+        "name": "mc-api",
+        "path": "__SIBLING_PATH__",
+        "expected_ref": "__EXPECTED_REF__",
+        "clean": true
+      }]}
+    }]
   }]
 }

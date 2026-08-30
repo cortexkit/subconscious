@@ -5,7 +5,8 @@ use crate::{
     lease::LeaseStore,
     orchestrator::{
         reconcile_effect_unfenced_for_tests, EffectOutcome, FirstPublicTriggerGate,
-        OrchestrationError, OrchestrationRefusalCode, Orchestrator, PhaseRegistry, PhaseRunner,
+        OrchestrationError, OrchestrationRefusalCode, Orchestrator, PhaseExecutionError,
+        PhaseRegistry, PhaseRunner,
     },
     plan::{build_dry_run_plan, FinalizedArtifact, PlannedPhase, ReleasePlan},
     state::{JournalRecord, JournalStore, TrainJournalIdentity},
@@ -409,7 +410,7 @@ impl Trace {
 struct RecordingRunner(Trace);
 
 impl PhaseRunner for RecordingRunner {
-    fn run(&mut self, phase: &PlannedPhase) -> Result<(), SeamError> {
+    fn run(&mut self, phase: &PlannedPhase) -> Result<(), PhaseExecutionError> {
         self.0.push(phase.instance.to_string());
         Ok(())
     }
@@ -647,11 +648,8 @@ fn irreversible_tree_mutating_phase_requires_repository_lease() {
 struct RefusingRunner;
 
 impl PhaseRunner for RefusingRunner {
-    fn run(&mut self, phase: &PlannedPhase) -> Result<(), SeamError> {
-        Err(SeamError::new(format!(
-            "{} refused its precondition",
-            phase.instance
-        )))
+    fn run(&mut self, phase: &PlannedPhase) -> Result<(), PhaseExecutionError> {
+        Err(SeamError::new(format!("{} refused its precondition", phase.instance)).into())
     }
 }
 
@@ -755,6 +753,7 @@ fn declaration_and_registry_keep_post_tag_ci_watch_inexpressible() {
         PlannedPhase {
             instance: "post-tag-ci".into(),
             phase_type: "ci_watch".to_owned(),
+            params: serde_json::json!({"workflow": "release.yml", "selector": "tag", "rerun_budget": 0}),
             tree_mutating: false,
         },
     ];

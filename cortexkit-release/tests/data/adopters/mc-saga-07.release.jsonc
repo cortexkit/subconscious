@@ -7,8 +7,8 @@
     "signing_profile": "none",
     "phases": [{
       "id": "context-gate",
-      "type": "ci_watch",
-      "params": {"workflow": "Context Gate", "selector": "commit:mc07"}
+      "type": "precheck-context-fitness",
+      "params": {"requirements": [{"kind": "env", "name": "CK_RELEASE_MC_CONTEXT_READY"}]}
     }]
   }]
 }

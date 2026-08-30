@@ -4,10 +4,14 @@
   "trains": [{
     "id": "mc-residue-sweep",
     "intended_commit": "mc11",
-    "tag": "v0.40.11",
     "signing_profile": "none",
-    "operator_gates": ["first_public_trigger"],
-    "artifacts": [{"id": "archive", "kind": "archive", "identity_channel": "asset_sha256"}],
-    "phases": [{"id": "publish-archive", "type": "assets"}]
+    "phases": [{
+      "id": "runtime-residue-precheck",
+      "type": "precheck-residue-sweep",
+      "params": {
+        "clearable_globs": ["target/release-residue/*.tmp", ".cortexkit/release-residue/*.pid"],
+        "foreign_locks": [{"name": "release-port-owner", "path": ".cortexkit/release-residue/port-49152.lock"}]
+      }
+    }]
   }]
 }

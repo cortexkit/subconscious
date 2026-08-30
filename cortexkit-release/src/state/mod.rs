@@ -124,7 +124,7 @@ impl JournalStore {
                 JournalRecord::DeclarationRebound {
                     replacement: candidate,
                     ..
-                } => binding = Some(candidate),
+                } => binding = Some(candidate.as_ref()),
                 JournalRecord::Completion { .. } | JournalRecord::Terminalized { .. } => {}
             }
         }
@@ -231,7 +231,7 @@ impl JournalStore {
         };
         self.append_journal(JournalRecord::DeclarationRebound {
             previous_digest: current.digest,
-            replacement: binding.clone(),
+            replacement: Box::new(binding.clone()),
         })?;
         Ok(binding)
     }
@@ -380,10 +380,12 @@ impl std::fmt::Display for TrainTerminalState {
 pub enum JournalRecord {
     /// The declaration pinned when the train was first created.
     DeclarationPinned { binding: DeclarationBinding },
-    /// A confirmed ceremony replaced the pinned declaration.
+    /// A confirmed ceremony replaced the pinned declaration. Boxed: the
+    /// binding carries the full normalized declaration, dwarfing the other
+    /// variants (clippy large_enum_variant on the journal's common type).
     DeclarationRebound {
         previous_digest: DeclarationDigest,
-        replacement: DeclarationBinding,
+        replacement: Box<DeclarationBinding>,
     },
     /// An operator terminalized the journal without deleting its earlier evidence.
     Terminalized { state: TrainTerminalState },

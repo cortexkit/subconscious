@@ -240,12 +240,14 @@ impl CallRecorder {
     pub fn assert_no_forbidden_calls(&self, forbidden: &[CallKind]) {
         let calls = self.calls();
         let unexpected = calls.iter().find(|call| {
-            forbidden.iter().any(|kind| match (kind, call) {
-                (CallKind::Probe, RecordedCall::Probe(_))
-                | (CallKind::Execute, RecordedCall::Execute(_))
-                | (CallKind::DurableAppend, RecordedCall::DurableAppend(_))
-                | (CallKind::Approval, RecordedCall::Approval(_)) => true,
-                _ => false,
+            forbidden.iter().any(|kind| {
+                matches!(
+                    (kind, call),
+                    (CallKind::Probe, RecordedCall::Probe(_))
+                        | (CallKind::Execute, RecordedCall::Execute(_))
+                        | (CallKind::DurableAppend, RecordedCall::DurableAppend(_))
+                        | (CallKind::Approval, RecordedCall::Approval(_))
+                )
             })
         });
         assert!(
@@ -457,14 +459,11 @@ fn command_result(output: Output) -> io::Result<Vec<u8>> {
         return Ok(output.stdout);
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "git command failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    ))
+    Err(io::Error::other(format!(
+        "git command failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
 }
 
 #[cfg(test)]

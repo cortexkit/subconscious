@@ -124,7 +124,7 @@ impl JournalStore {
                 JournalRecord::DeclarationRebound {
                     replacement: candidate,
                     ..
-                } => binding = Some(candidate.as_ref()),
+                } => binding = Some(*candidate),
                 JournalRecord::Completion { .. } | JournalRecord::Terminalized { .. } => {}
             }
         }
@@ -296,8 +296,8 @@ impl JournalStore {
         append_record(
             &self.journal_path(),
             JournalRecord::Completion {
-                intent: intent.clone(),
-                evidence,
+                intent: Box::new(intent.clone()),
+                evidence: Box::new(evidence),
             },
         )
     }
@@ -325,7 +325,7 @@ impl JournalStore {
                 !completions.iter().any(|record| match record {
                     JournalRecord::Completion {
                         intent: completed, ..
-                    } => completed == intent,
+                    } => completed.as_ref() == intent,
                     JournalRecord::DeclarationPinned { .. }
                     | JournalRecord::DeclarationRebound { .. }
                     | JournalRecord::Terminalized { .. } => false,
@@ -390,9 +390,11 @@ pub enum JournalRecord {
     /// An operator terminalized the journal without deleting its earlier evidence.
     Terminalized { state: TrainTerminalState },
     /// Reconciliation confirmed that one write-ahead intent has completed.
+    /// Boxed for the same reason as the rebind variant: intent and evidence
+    /// together dwarf the marker variants of this common journal type.
     Completion {
-        intent: PendingIntent,
-        evidence: ProbeEvidence,
+        intent: Box<PendingIntent>,
+        evidence: Box<ProbeEvidence>,
     },
 }
 
@@ -661,8 +663,8 @@ mod tests {
     fn future_version_is_refused_before_the_record_is_accepted() {
         let (_home, store) = store();
         let record = JournalRecord::Completion {
-            intent: pending_intent(),
-            evidence: ProbeEvidence::default(),
+            intent: Box::new(pending_intent()),
+            evidence: Box::default(),
         };
         let record_bytes = serde_json::to_vec(&record).unwrap();
         let future = Envelope {
@@ -690,8 +692,8 @@ mod tests {
         let (_home, store) = store();
         store
             .append_journal(JournalRecord::Completion {
-                intent: pending_intent(),
-                evidence: ProbeEvidence::default(),
+                intent: Box::new(pending_intent()),
+                evidence: Box::default(),
             })
             .unwrap();
         let verified_len = fs::metadata(store.journal_path()).unwrap().len();
@@ -718,8 +720,8 @@ mod tests {
         for _ in 0..2 {
             store
                 .append_journal(JournalRecord::Completion {
-                    intent: pending_intent(),
-                    evidence: ProbeEvidence::default(),
+                    intent: Box::new(pending_intent()),
+                    evidence: Box::default(),
                 })
                 .unwrap();
         }

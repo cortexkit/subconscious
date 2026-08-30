@@ -22,8 +22,10 @@ public provider call.
 
 `ready` means the row has a specified declaration, observable outcome, and
 future test name. `deferred-by-owner` identifies an unavailable case and the
-specific owner action required to complete it. Every row has one of these
-explicit statuses; no row is left unresolved or owner-gated without a recorded
+specific owner action required to complete it. `deferred-by-machine` identifies
+a specified behavior that the current machine cannot express; the completeness
+ledger records the missing mechanism. Every row has one of these explicit
+statuses; no row is left unresolved or owner-gated without a recorded
 disposition.
 
 ## Synthetic end-to-end train
@@ -47,17 +49,17 @@ the effect.
 
 | Case ID | Declaration fixture path | Expected refusal or reconciliation effect | Eventual test name | Status |
 | --- | --- | --- | --- | --- |
-| `mc-saga-01` | `tests/fixtures/adopters/mc-saga-01.release.jsonc` | Format drift at gate time: the merge train leaves lint/format drift that surfaces only when the release starts. Typed `PRECHECK_DIRTY` refusal naming the files and tool BEFORE any version mutation; zero side effects; the journal records the refusal. (needs: precheck phase strictly ordered before all mutating phases) | `adopter_case_mc_saga_01_precheck_dirty_before_mutation` | ready |
+| `mc-saga-01` | `tests/fixtures/adopters/mc-saga-01.release.jsonc` | Format drift at gate time: the merge train leaves lint/format drift that surfaces only when the release starts. Typed `PRECHECK_DIRTY` refusal naming the files and tool BEFORE any version mutation; zero side effects; the journal records the refusal. (needs: precheck phase strictly ordered before all mutating phases) | `adopter_case_mc_saga_01_precheck_dirty_before_mutation_mechanism_pending` | deferred-by-machine |
 | `mc-saga-02` | `tests/fixtures/adopters/mc-saga-02.release.jsonc` | Real product defect in a gate leg (the one mode that must die). Terminal `FAILED` carrying the leg's own diagnostic (tests assert the (outcome, diagnostic) pair, never bare exit codes); a re-run mints a NEW run id — no resume into a defect; the machine never retries this class. (needs: diagnostic capture; no-retry classification) | `adopter_case_mc_saga_02_defect_terminal_no_retry` | ready |
-| `mc-saga-03` | `tests/fixtures/adopters/mc-saga-03.release.jsonc` | Load-class flake on a shared host (CPU contention: wall-clock budgets, spawn busy-spin, parallel cargo). Leg classified by the declared load taxonomy and retried under box-gate exclusivity; the journal shows retry-with-lock, not a run failure. (needs: load-class leg taxonomy + box-gate lock + per-leg retry policy) | `adopter_case_mc_saga_03_load_flake_retry_with_lock` | ready |
+| `mc-saga-03` | `tests/fixtures/adopters/mc-saga-03.release.jsonc` | Load-class flake on a shared host (CPU contention: wall-clock budgets, spawn busy-spin, parallel cargo). Leg classified by the declared load taxonomy and retried under box-gate exclusivity; the journal shows retry-with-lock, not a run failure. (needs: load-class leg taxonomy + box-gate lock + per-leg retry policy) | `adopter_case_mc_saga_03_load_flake_retry_with_lock_mechanism_pending` | deferred-by-machine |
 | `mc-saga-04` | `tests/fixtures/adopters/mc-saga-04.release.jsonc` | Runner erased mid-run (sweep, bridge restart, host sleep). kill -9 at phase N then re-invoke: the run COMPLETES with every completed phase executed exactly once (journal resume, idempotent phases — publish never repeated); an external observer fires `RUNNER_VANISHED` instead of silence. (needs: durable journal + idempotent resume + liveness observer with tombstone-fire) | `adopter_case_mc_saga_04_runner_vanished_resume_exactly_once` | ready |
-| `mc-saga-05` | `tests/fixtures/adopters/mc-saga-05.release.jsonc` | Stale residue from an aborted run (half-applied version bumps, uncommitted lockfile). Typed `STALE_RUN_RESIDUE` reconciliation: the machine diffs residue against its own journal and rolls back or adopts with provenance named — never a bare tree-dirty error. (needs: journal records every mutation before/after + abort cleanup) | `adopter_case_mc_saga_05_stale_residue_reconciles` | ready |
-| `mc-saga-06` | `tests/fixtures/adopters/mc-saga-06.release.jsonc` | Cross-repo sibling drift (path deps whose API moved mid-saga; sibling checkout behind or ahead). Precheck pins sibling SHAs into the journal; mid-run drift classifies `ENV_DRIFT` naming the sibling and delta, not a generic leg red. (needs: sibling-pin declaration (repo, path, floor SHA) verified at precheck) | `adopter_case_mc_saga_06_sibling_drift_env_named` | ready |
-| `mc-saga-07` | `tests/fixtures/adopters/mc-saga-07.release.jsonc` | Unfit execution context (QoS throttling perf budgets, PATH missing governed binaries, readiness stalls). `CONTEXT_UNFIT` typed refusal at precheck (QoS class, declared-binary resolution, session class asserted before any leg); QoS-sensitive legs skip loudly in throttled contexts. (needs: execution-context declaration block per leg) | `adopter_case_mc_saga_07_context_unfit_refuses_precheck` | ready |
+| `mc-saga-05` | `tests/fixtures/adopters/mc-saga-05.release.jsonc` | Stale residue from an aborted run (half-applied version bumps, uncommitted lockfile). Typed `STALE_RUN_RESIDUE` reconciliation: the machine diffs residue against its own journal and rolls back or adopts with provenance named — never a bare tree-dirty error. (needs: journal records every mutation before/after + abort cleanup) | `adopter_case_mc_saga_05_stale_residue_reconciles_mechanism_pending` | deferred-by-machine |
+| `mc-saga-06` | `tests/fixtures/adopters/mc-saga-06.release.jsonc` | Cross-repo sibling drift (path deps whose API moved mid-saga; sibling checkout behind or ahead). Precheck pins sibling SHAs into the journal; mid-run drift classifies `ENV_DRIFT` naming the sibling and delta, not a generic leg red. (needs: sibling-pin declaration (repo, path, floor SHA) verified at precheck) | `adopter_case_mc_saga_06_sibling_drift_env_named_mechanism_pending` | deferred-by-machine |
+| `mc-saga-07` | `tests/fixtures/adopters/mc-saga-07.release.jsonc` | Unfit execution context (QoS throttling perf budgets, PATH missing governed binaries, readiness stalls). `CONTEXT_UNFIT` typed refusal at precheck (QoS class, declared-binary resolution, session class asserted before any leg); QoS-sensitive legs skip loudly in throttled contexts. (needs: execution-context declaration block per leg) | `adopter_case_mc_saga_07_context_unfit_refuses_precheck_mechanism_pending` | deferred-by-machine |
 | `mc-saga-08` | `tests/fixtures/adopters/mc-saga-08.release.jsonc` | Local green while remote CI is silently red. The machine blocks on the remote run resolved by head SHA to a terminal state and exits with CI's status; notification fires on the FIRST failure line, not only at terminal. Forced CI red yields non-zero exit plus a notification record. (needs: dual ci_watch declaration (local pipeline + remote run)) | `adopter_case_mc_saga_08_remote_ci_red_blocks` | ready |
-| `mc-saga-09` | `tests/fixtures/adopters/mc-saga-09.release.jsonc` | Job-graph skip cascade: a deliberate leg skip transitively skips publish jobs, so a green run publishes nothing. Post-CI reconciliation asserts a declared ARTIFACT MANIFEST (registry versions live, release exists, announce sent); any missing artifact is `PUBLISH_INCOMPLETE` even on green CI. A zero-artifact green run is never success. (needs: artifact manifest + post-publish verification phase) | `adopter_case_mc_saga_09_skip_cascade_publish_incomplete` | ready |
-| `mc-saga-10` | `tests/fixtures/adopters/mc-saga-10.release.jsonc` | Environment-coupled test dependence (CI sqlite feature gaps, unpinned tool fetch). Legs run with tool paths scoped to project pins; `UNPINNED_TOOL` typed refusal when a leg resolves outside them; capability-gated tests probe and skip loudly with the machine PARSING gate-output counts (skipped>0 soft flag, executed==0 hard fail). (needs: tool-pin declaration + gate-count parsing) | `adopter_case_mc_saga_10_unpinned_tool_refuses` | ready |
-| `mc-saga-11` | `tests/fixtures/adopters/mc-saga-11.release.jsonc` | Orphaned processes and state from prior attempts (surviving serve PIDs, port conflicts, shared target-dir contamination). Startup sweep detects declared residue and raises typed `RESIDUE_PRESENT` with pids/ports, then clears or refuses; a mid-leg kill test asserts the next run's precheck detects and clears; legs get isolated target/tmp roots. (needs: residue manifest (ports, process patterns, temp roots) + startup sweep + teardown assertion) | `adopter_case_mc_saga_11_residue_swept_or_refused` (fixture must exercise BOTH arms: clearable residue → swept, unclearable → refused; a single-arm fixture cannot distinguish the policies) | ready |
+| `mc-saga-09` | `tests/fixtures/adopters/mc-saga-09.release.jsonc` | Job-graph skip cascade: a deliberate leg skip transitively skips publish jobs, so a green run publishes nothing. Post-CI reconciliation asserts a declared ARTIFACT MANIFEST (registry versions live, release exists, announce sent); any missing artifact is `PUBLISH_INCOMPLETE` even on green CI. A zero-artifact green run is never success. (needs: artifact manifest + post-publish verification phase) | `adopter_case_mc_saga_09_skip_cascade_publish_incomplete_mechanism_pending` | deferred-by-machine |
+| `mc-saga-10` | `tests/fixtures/adopters/mc-saga-10.release.jsonc` | Environment-coupled test dependence (CI sqlite feature gaps, unpinned tool fetch). Legs run with tool paths scoped to project pins; `UNPINNED_TOOL` typed refusal when a leg resolves outside them; capability-gated tests probe and skip loudly with the machine PARSING gate-output counts (skipped>0 soft flag, executed==0 hard fail). (needs: tool-pin declaration + gate-count parsing) | `adopter_case_mc_saga_10_unpinned_tool_refuses_mechanism_pending` | deferred-by-machine |
+| `mc-saga-11` | `tests/fixtures/adopters/mc-saga-11.release.jsonc` | Orphaned processes and state from prior attempts (surviving serve PIDs, port conflicts, shared target-dir contamination). Startup sweep detects declared residue and raises typed `RESIDUE_PRESENT` with pids/ports, then clears or refuses; a mid-leg kill test asserts the next run's precheck detects and clears; legs get isolated target/tmp roots. (needs: residue manifest (ports, process patterns, temp roots) + startup sweep + teardown assertion) | `adopter_case_mc_saga_11_residue_swept_or_refused_mechanism_pending` (fixture must exercise BOTH arms: clearable residue → swept, unclearable → refused; a single-arm fixture cannot distinguish the policies) | deferred-by-machine |
 
 ## ALF no-tag train
 
@@ -78,10 +80,23 @@ budget between them is not coverage for either row.
 
 ## Completeness ledger
 
-| Inventory | Required rows | Listed rows | Deferred-by-owner rows | Unresolved owner-gated rows |
-| --- | ---: | ---: | ---: | ---: |
-| Synthetic end-to-end train | 1 | 1 | 0 | 0 |
-| MC saga failure modes | 11 | 11 | 0 | 0 |
-| ALF no-tag train | 1 | 1 | 0 | 0 |
-| AFT `ci_watch` instances | 2 | 2 | 0 | 0 |
-| **Total** | **15** | **15** | **0** | **0** |
+| Inventory | Required rows | Listed rows | Deferred-by-machine rows | Deferred-by-owner rows | Unresolved owner-gated rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Synthetic end-to-end train | 1 | 1 | 0 | 0 | 0 |
+| MC saga failure modes | 11 | 11 | 8 | 0 | 0 |
+| ALF no-tag train | 1 | 1 | 0 | 0 | 0 |
+| AFT `ci_watch` instances | 2 | 2 | 0 | 0 | 0 |
+| **Total** | **15** | **15** | **8** | **0** | **0** |
+
+### Deferred-by-machine detail
+
+| Case ID | Missing machine behavior |
+| --- | --- |
+| `mc-saga-01` | Runtime working-tree inspection that emits a typed `PRECHECK_DIRTY` refusal before mutation and records the refusal. |
+| `mc-saga-03` | Declared load taxonomy and a box-gate-exclusive retry lock recorded with the retry. |
+| `mc-saga-05` | Mutation provenance plus stale working-tree residue comparison, rollback, or adoption. |
+| `mc-saga-06` | Sibling-pin declaration fields, precheck pinning, and typed `ENV_DRIFT` detection. |
+| `mc-saga-07` | Execution-context declaration fields and runtime fitness probes that emit `CONTEXT_UNFIT`. |
+| `mc-saga-09` | Post-CI artifact-manifest reconciliation that emits `PUBLISH_INCOMPLETE` for a green zero-artifact run. |
+| `mc-saga-10` | Tool-pin declaration fields and a governed resolver that emits `UNPINNED_TOOL`. |
+| `mc-saga-11` | Residue manifest, startup sweep, typed `RESIDUE_PRESENT`, and clearable versus unclearable handling. |

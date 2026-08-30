@@ -2,7 +2,10 @@ use super::*;
 use crate::{
     approval::{build_approval_subject, ApprovalStore, ApprovalSubject},
     declaration::parse,
-    orchestrator::{reconcile_effect, OrchestrationError, OrchestrationRefusalCode},
+    executor::AdmittedEffect,
+    orchestrator::{
+        reconcile_effect_unfenced_for_tests, OrchestrationError, OrchestrationRefusalCode,
+    },
     plan::{build_dry_run_plan, FinalizedArtifact, PublicEffect, ReleaseIdentity, ReleasePlan},
     state::{IntentRecord, JournalRecord, TrainJournalIdentity},
     ApprovalToken, ArtifactId, CommitId, CompletionProbe, EffectRequest, IrreversibleExecutor,
@@ -154,7 +157,7 @@ impl CompletionProbe for CountingProbe {
 struct CountingExecutor(Cell<usize>);
 
 impl IrreversibleExecutor for CountingExecutor {
-    fn execute(&mut self, _: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, _: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
         self.0.set(self.0.get() + 1);
         Ok(ProbeEvidence::default())
     }
@@ -175,7 +178,7 @@ fn direct_reconciliation_refuses_digest_mismatch_before_any_provider_call() {
     let mut probe = CountingProbe(Cell::new(0));
     let mut executor = CountingExecutor(Cell::new(0));
 
-    let result = reconcile_effect(
+    let result = reconcile_effect_unfenced_for_tests(
         &active_plan,
         &journal,
         effect,

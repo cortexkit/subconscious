@@ -6,16 +6,17 @@
 //! pending intent exists before the executor can run.
 
 use crate::{
-    declaration::ParsedDeclaration, ApprovalSubject, ArtifactId, CommitId, DeclarationDigest,
-    EffectRequest, IrreversibleExecutor, OperationId, PhaseInstanceId, ProbeEvidence, RepositoryId,
-    SeamError, TrainId,
+    declaration::ParsedDeclaration,
+    executor::{AdmittedEffect, ExecutorError},
+    ApprovalSubject, ArtifactId, CommitId, DeclarationDigest, EffectRequest, IrreversibleExecutor,
+    OperationId, PhaseInstanceId, ProbeEvidence, RepositoryId, SeamError, TrainId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Component, Path, PathBuf},
 };
@@ -83,6 +84,8 @@ impl JournalStore {
             path: store.repository_dir(),
             source,
         })?;
+        recover_torn_tail::<JournalRecord>(&store.journal_path())?;
+        recover_torn_tail::<IntentRecord>(&store.intent_path())?;
         Ok(store)
     }
 
@@ -125,7 +128,11 @@ impl JournalStore {
                     replacement: candidate,
                     ..
                 } => binding = Some(*candidate),
-                JournalRecord::Completion { .. } | JournalRecord::Terminalized { .. } => {}
+                JournalRecord::Completion { .. }
+                | JournalRecord::PhaseEntered { .. }
+                | JournalRecord::PhaseDone { .. }
+                | JournalRecord::Refused { .. }
+                | JournalRecord::Terminalized { .. } => {}
             }
         }
         Ok(binding)
@@ -184,6 +191,9 @@ impl JournalStore {
                 JournalRecord::Terminalized { state } => Some(state),
                 JournalRecord::DeclarationPinned { .. }
                 | JournalRecord::DeclarationRebound { .. }
+                | JournalRecord::PhaseEntered { .. }
+                | JournalRecord::PhaseDone { .. }
+                | JournalRecord::Refused { .. }
                 | JournalRecord::Completion { .. } => None,
             }))
     }
@@ -276,14 +286,17 @@ impl JournalStore {
     ///
     /// A returned executor error deliberately leaves the pending intent durable. Resume must
     /// reconcile that intent instead of treating a missing completion as permission to retry.
-    pub fn execute_with_intent<E: IrreversibleExecutor>(
+    pub(crate) fn execute_with_intent<E: IrreversibleExecutor>(
         &self,
-        request: &EffectRequest,
-        approval_subject: ApprovalSubject,
+        request: &AdmittedEffect,
         executor: &mut E,
-    ) -> Result<ProbeEvidence, StateError> {
-        self.append_intent(request, approval_subject)?;
-        executor.execute(request).map_err(StateError::Executor)
+    ) -> Result<(PendingIntent, ProbeEvidence), StateError> {
+        request
+            .validate_approval_binding()
+            .map_err(StateError::ExecutorAdmission)?;
+        let intent = self.append_intent(request.effect(), request.durable_approval_subject())?;
+        let evidence = executor.execute(request).map_err(StateError::Executor)?;
+        Ok((intent, evidence))
     }
 
     /// Appends completion after reconciliation supplies matching evidence.
@@ -302,12 +315,12 @@ impl JournalStore {
         )
     }
 
-    /// Reads all verified journal records and reports an incomplete final record separately.
+    /// Reads all verified journal records, discarding an incomplete final record.
     pub fn read_journal(&self) -> Result<Vec<JournalRecord>, StateError> {
         read_records(&self.journal_path())
     }
 
-    /// Reads all verified write-ahead intent records.
+    /// Reads all verified write-ahead intent records, discarding an incomplete final record.
     pub fn read_intents(&self) -> Result<Vec<IntentRecord>, StateError> {
         read_records(&self.intent_path())
     }
@@ -328,6 +341,9 @@ impl JournalStore {
                     } => completed.as_ref() == intent,
                     JournalRecord::DeclarationPinned { .. }
                     | JournalRecord::DeclarationRebound { .. }
+                    | JournalRecord::PhaseEntered { .. }
+                    | JournalRecord::PhaseDone { .. }
+                    | JournalRecord::Refused { .. }
                     | JournalRecord::Terminalized { .. } => false,
                 })
             })
@@ -380,6 +396,18 @@ impl std::fmt::Display for TrainTerminalState {
 pub enum JournalRecord {
     /// The declaration pinned when the train was first created.
     DeclarationPinned { binding: DeclarationBinding },
+    /// Execution entered one declared phase after acquiring all required leases.
+    PhaseEntered { phase: PhaseInstanceId },
+    /// A phase completed with the authoritative evidence produced by its probes.
+    PhaseDone {
+        phase: PhaseInstanceId,
+        evidence: Vec<ProbeEvidence>,
+    },
+    /// A phase refused and retained the reason needed for operator recovery.
+    Refused {
+        phase: PhaseInstanceId,
+        reason: String,
+    },
     /// A confirmed ceremony replaced the pinned declaration. Boxed: the
     /// binding carries the full normalized declaration, dwarfing the other
     /// variants (clippy large_enum_variant on the journal's common type).
@@ -451,6 +479,8 @@ pub enum StateError {
     DeclarationDigestUnchanged { digest: String },
     #[error("train journal is terminal: {state}")]
     TrainTerminal { state: String },
+    #[error("irreversible executor admission failed: {0}")]
+    ExecutorAdmission(ExecutorError),
     #[error("irreversible executor failed: {0}")]
     Executor(SeamError),
 }
@@ -464,14 +494,26 @@ struct Envelope<T> {
 
 fn append_record<T: Serialize>(path: &Path, record: T) -> Result<(), StateError> {
     let bytes = encode_record(record)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|source| state_io(path, source))?;
+    let (mut file, created) = match OpenOptions::new().append(true).create_new(true).open(path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|source| state_io(path, source))?,
+            false,
+        ),
+        Err(source) => return Err(state_io(path, source)),
+    };
     file.write_all(&bytes)
         .map_err(|source| state_io(path, source))?;
     file.sync_data().map_err(|source| state_io(path, source))?;
+    if created {
+        let parent = path
+            .parent()
+            .expect("a durable stream path always has a parent directory");
+        sync_directory(parent)?;
+    }
     Ok(())
 }
 
@@ -497,12 +539,7 @@ fn read_records<T>(path: &Path) -> Result<Vec<T>, StateError>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(state_io(path, source)),
-    };
-    decode_records(&bytes)
+    recover_torn_tail(path)
 }
 
 fn recover_torn_tail<T>(path: &Path) -> Result<Vec<T>, StateError>
@@ -544,11 +581,25 @@ where
             });
         };
         let line = &tail[..newline];
+        let final_record = offset + newline + 1 == bytes.len();
         if line.is_empty() {
-            return Err(corrupt(offset, "empty records are not permitted"));
+            return if final_record {
+                Err(StateError::TornTail {
+                    offset: offset as u64,
+                })
+            } else {
+                Err(corrupt(offset, "empty records are not permitted"))
+            };
         }
-        let envelope: Envelope<T> = serde_json::from_slice(line)
-            .map_err(|error| corrupt(offset, format!("invalid record framing: {error}")))?;
+        let envelope: Envelope<T> = match serde_json::from_slice(line) {
+            Ok(envelope) => envelope,
+            Err(_) if final_record => {
+                return Err(StateError::TornTail {
+                    offset: offset as u64,
+                })
+            }
+            Err(error) => return Err(corrupt(offset, format!("invalid record framing: {error}"))),
+        };
         if envelope.version != STREAM_FORMAT_VERSION {
             return Err(StateError::UnsupportedFormatVersion {
                 version: envelope.version,
@@ -558,7 +609,13 @@ where
         let encoded_record = serde_json::to_vec(&envelope.record)
             .map_err(|error| corrupt(offset, format!("could not re-encode record: {error}")))?;
         if envelope.checksum != checksum(&encoded_record) {
-            return Err(corrupt(offset, "record checksum does not match"));
+            return if final_record {
+                Err(StateError::TornTail {
+                    offset: offset as u64,
+                })
+            } else {
+                Err(corrupt(offset, "record checksum does not match"))
+            };
         }
         records.push(envelope.record);
         offset += newline + 1;
@@ -575,6 +632,20 @@ fn corrupt(offset: usize, reason: impl Into<String>) -> StateError {
         offset: offset as u64,
         reason: reason.into(),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_SYNC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn sync_directory(path: &Path) -> Result<(), StateError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| state_io(path, source))?;
+    #[cfg(test)]
+    DIRECTORY_SYNC_COUNT.with(|count| count.set(count.get() + 1));
+    Ok(())
 }
 
 fn state_io(path: &Path, source: io::Error) -> StateError {
@@ -626,9 +697,43 @@ mod tests {
             train: TrainId::new("release"),
             intended_commit: CommitId::new("a1b2c3"),
             declaration_digest: DeclarationDigest::new("declaration-sha256"),
-            artifact_digests: Vec::new(),
+            artifact_digests: vec![crate::ArtifactDigest {
+                artifact: ArtifactId::new("cortexkit-release"),
+                digest: crate::artifact::artifact_digest(b"final bytes"),
+            }],
             public_effects: vec![OperationId::new("publish")],
         }
+    }
+
+    fn admitted_effect() -> AdmittedEffect {
+        let effect = crate::plan::PublicEffect {
+            phase: PhaseInstanceId::new("publish-crate"),
+            artifact: Some(ArtifactId::new("cortexkit-release")),
+            operation: OperationId::new("publish"),
+        };
+        AdmittedEffect::new(
+            request(),
+            &effect,
+            Some(crate::plan::FinalizedArtifact {
+                artifact: ArtifactId::new("cortexkit-release"),
+                identity: "a1b2c3".to_owned(),
+                bytes: b"final bytes".to_vec(),
+            }),
+            crate::approval::ApprovalSubject {
+                repository: RepositoryId::new("example-repository"),
+                train: TrainId::new("release"),
+                intended_commit: CommitId::new("a1b2c3"),
+                declaration_digest: DeclarationDigest::new("declaration-sha256"),
+                artifacts: vec![crate::approval::ApprovedArtifact {
+                    artifact: ArtifactId::new("cortexkit-release"),
+                    identity: "a1b2c3".to_owned(),
+                    digest: crate::artifact::artifact_digest(b"final bytes"),
+                }],
+                version_or_run_id: crate::plan::ReleaseIdentity::RunId("release-a1b2c3".to_owned()),
+                public_effects: vec![effect.clone()],
+            },
+        )
+        .unwrap()
     }
 
     fn request() -> EffectRequest {
@@ -701,17 +806,58 @@ mod tests {
         bytes.extend_from_slice(b"{\"version\":1,\"record\":");
         fs::write(store.journal_path(), bytes).unwrap();
 
-        assert!(matches!(
-            store.read_journal(),
-            Err(StateError::TornTail { offset }) if offset == verified_len
-        ));
-        let recovered = store.recover_torn_journal_tail().unwrap();
-        assert_eq!(recovered.len(), 1);
+        assert_eq!(store.read_journal().unwrap().len(), 1);
         assert_eq!(
             fs::metadata(store.journal_path()).unwrap().len(),
             verified_len
         );
-        assert!(store.read_journal().is_ok());
+    }
+
+    #[test]
+    fn failed_final_record_is_automatically_recovered_as_a_non_event() {
+        let (_home, store) = store();
+        store
+            .append_journal(JournalRecord::Completion {
+                intent: Box::new(pending_intent()),
+                evidence: Box::default(),
+            })
+            .unwrap();
+        let verified_len = fs::metadata(store.journal_path()).unwrap().len();
+        let mut failed = encode_record(JournalRecord::PhaseEntered {
+            phase: PhaseInstanceId::new("publish-crate"),
+        })
+        .unwrap();
+        let checksum_prefix = b"\"checksum\":\"";
+        let checksum = failed
+            .windows(checksum_prefix.len())
+            .position(|window| window == checksum_prefix)
+            .unwrap()
+            + checksum_prefix.len();
+        failed[checksum] = if failed[checksum] == b'0' { b'1' } else { b'0' };
+        let mut bytes = fs::read(store.journal_path()).unwrap();
+        bytes.extend_from_slice(&failed);
+        fs::write(store.journal_path(), bytes).unwrap();
+
+        assert_eq!(store.read_journal().unwrap().len(), 1);
+        assert_eq!(
+            fs::metadata(store.journal_path()).unwrap().len(),
+            verified_len
+        );
+    }
+
+    #[test]
+    fn first_created_intent_syncs_parent_directory() {
+        let (_home, store) = store();
+        pin_declaration_for_request(&store);
+        let before = DIRECTORY_SYNC_COUNT.with(std::cell::Cell::get);
+
+        store.append_intent(&request(), approval_subject()).unwrap();
+        let after_first = DIRECTORY_SYNC_COUNT.with(std::cell::Cell::get);
+        store.append_intent(&request(), approval_subject()).unwrap();
+        let after_second = DIRECTORY_SYNC_COUNT.with(std::cell::Cell::get);
+
+        assert_eq!(after_first, before + 1);
+        assert_eq!(after_second, after_first);
     }
 
     #[test]
@@ -752,7 +898,7 @@ mod tests {
         };
 
         store
-            .execute_with_intent(&request(), approval_subject(), &mut executor)
+            .execute_with_intent(&admitted_effect(), &mut executor)
             .unwrap();
 
         assert!(executor.called);
@@ -813,7 +959,7 @@ mod tests {
     }
 
     impl IrreversibleExecutor for IntentCheckingExecutor {
-        fn execute(&mut self, _request: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+        fn execute(&mut self, _request: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
             let bytes =
                 fs::read(&self.intent_path).map_err(|error| SeamError::new(error.to_string()))?;
             if !bytes.ends_with(b"\n") || bytes.is_empty() {

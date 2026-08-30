@@ -13,6 +13,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process,
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -33,7 +34,7 @@ pub enum LeaseScope {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LeaseHolder {
     pub process_id: u32,
-    pub acquired_at_ms: u128,
+    pub process_started_at_ms: u128,
 }
 
 /// Fail-closed lease errors suitable for typed execution refusals.
@@ -171,7 +172,7 @@ impl LeaseStore {
 
         let holder = LeaseHolder {
             process_id: process::id(),
-            acquired_at_ms: timestamp_millis()?,
+            process_started_at_ms: process_started_at_millis()?,
         };
         write_holder(&mut file, &path, &holder)?;
         sync_directory(parent)?;
@@ -258,6 +259,18 @@ fn read_holder(path: &Path) -> Result<LeaseHolder, LeaseError> {
     })
 }
 
+fn process_started_at_millis() -> Result<u128, LeaseError> {
+    static PROCESS_STARTED_AT_MS: OnceLock<u128> = OnceLock::new();
+    if let Some(started_at) = PROCESS_STARTED_AT_MS.get() {
+        return Ok(*started_at);
+    }
+    let started_at = timestamp_millis()?;
+    let _ = PROCESS_STARTED_AT_MS.set(started_at);
+    Ok(*PROCESS_STARTED_AT_MS
+        .get()
+        .expect("process start time is initialized before it is read"))
+}
+
 fn timestamp_millis() -> Result<u128, LeaseError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -330,6 +343,38 @@ mod tests {
                 holder: Some(LeaseHolder { process_id, .. }),
             } if process_id == process::id()
         ));
+    }
+
+    #[test]
+    fn lease_holder_uses_pid_and_process_start_identity() {
+        let root = tempdir().unwrap();
+        let leases = LeaseStore::new(root.path()).unwrap();
+        let train_scope = LeaseScope::RepositoryTrain {
+            repository: repository(),
+            train: train("release"),
+        };
+        let train_lease = leases
+            .acquire_train(repository(), train("release"))
+            .unwrap();
+        let train_holder = read_holder(&leases.path_for(&train_scope).unwrap()).unwrap();
+        train_lease.release().unwrap();
+
+        let repository_scope = LeaseScope::Repository {
+            repository: repository(),
+        };
+        let repository_lease = leases.acquire_repository(repository()).unwrap();
+        let repository_holder = read_holder(&leases.path_for(&repository_scope).unwrap()).unwrap();
+
+        assert_eq!(train_holder.process_id, process::id());
+        assert_eq!(repository_holder.process_id, process::id());
+        assert_eq!(
+            train_holder.process_started_at_ms,
+            repository_holder.process_started_at_ms
+        );
+        let encoded = serde_json::to_value(repository_holder).unwrap();
+        assert!(encoded.get("process_started_at_ms").is_some());
+        assert!(encoded.get("acquired_at_ms").is_none());
+        repository_lease.release().unwrap();
     }
 
     #[test]

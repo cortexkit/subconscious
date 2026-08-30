@@ -99,6 +99,17 @@ pub struct ReleasePlan {
     pub first_public_trigger: Option<PublicEffect>,
     pub public_effects: Vec<PublicEffect>,
     pub placement_instructions: PlacementInstructions,
+    /// Exact final material retained in-memory for the irreversible publication seam.
+    #[serde(skip)]
+    pub(crate) finalized_artifacts: Vec<FinalizedArtifact>,
+}
+
+impl ReleasePlan {
+    pub(crate) fn finalized_artifact(&self, artifact: &ArtifactId) -> Option<&FinalizedArtifact> {
+        self.finalized_artifacts
+            .iter()
+            .find(|candidate| candidate.artifact == *artifact)
+    }
 }
 
 /// A typed refusal while resolving a plan without provider access.
@@ -173,6 +184,7 @@ pub fn build_dry_run_plan(
             instruction: "Run the separate operator placement ceremony; ck-release does not place, restart, or mutate the live fleet."
                 .to_owned(),
         },
+        finalized_artifacts: finalized_artifacts.to_vec(),
     })
 }
 

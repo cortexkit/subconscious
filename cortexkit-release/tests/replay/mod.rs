@@ -1,17 +1,18 @@
 use crate::{
     approval::{build_approval_subject, ApprovalStore},
     declaration::parse,
+    executor::AdmittedEffect,
     lease::LeaseStore,
     orchestrator::{
-        reconcile_effect, EffectOutcome, FirstPublicTriggerGate, OrchestrationError,
-        OrchestrationRefusalCode, Orchestrator, PhaseRegistry, PhaseRunner,
+        reconcile_effect_unfenced_for_tests, EffectOutcome, FirstPublicTriggerGate,
+        OrchestrationError, OrchestrationRefusalCode, Orchestrator, PhaseRegistry, PhaseRunner,
     },
     plan::{build_dry_run_plan, FinalizedArtifact, PlannedPhase, ReleasePlan},
-    state::{JournalStore, TrainJournalIdentity},
+    state::{JournalRecord, JournalStore, TrainJournalIdentity},
     ApprovalToken, ArtifactId, CompletionProbe, EffectRequest, IrreversibleExecutor, ProbeEvidence,
     ProbeResult, SeamError,
 };
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, fs, rc::Rc};
 use tempfile::TempDir;
 
 const DECLARATION: &str = r#"
@@ -147,7 +148,7 @@ impl ScriptedExecutor {
 }
 
 impl IrreversibleExecutor for ScriptedExecutor {
-    fn execute(&mut self, _: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, _: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
         self.calls += 1;
         self.outcomes
             .pop_front()
@@ -162,7 +163,7 @@ struct InterruptAfterEffect {
 }
 
 impl IrreversibleExecutor for InterruptAfterEffect {
-    fn execute(&mut self, _: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, _: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
         self.effects += 1;
         Err(SeamError::new(
             "interrupted after fake public effect before completion append",
@@ -191,7 +192,7 @@ fn replay_matrix_covers_attempted_and_never_attempted_for_every_probe_result() {
         }
         let mut probe = ScriptedProbe::new([Ok(probe_result.clone())]);
         let mut executor = ScriptedExecutor::new([Ok(evidence())]);
-        let result = reconcile_effect(
+        let result = reconcile_effect_unfenced_for_tests(
             &plan,
             &journal,
             &effect,
@@ -250,7 +251,7 @@ fn interruption_after_public_effect_resumes_with_probe_without_duplicate_executi
     let mut first_probe = ScriptedProbe::new([Ok(ProbeResult::Absent(evidence()))]);
     let mut interrupted_executor = InterruptAfterEffect::default();
 
-    assert!(reconcile_effect(
+    assert!(reconcile_effect_unfenced_for_tests(
         &plan,
         &journal,
         &effect,
@@ -265,7 +266,7 @@ fn interruption_after_public_effect_resumes_with_probe_without_duplicate_executi
     let mut resume_probe = ScriptedProbe::new([Ok(ProbeResult::Present(evidence()))]);
     let mut never_called = ScriptedExecutor::default();
     assert_eq!(
-        reconcile_effect(
+        reconcile_effect_unfenced_for_tests(
             &plan,
             &journal,
             &effect,
@@ -278,6 +279,77 @@ fn interruption_after_public_effect_resumes_with_probe_without_duplicate_executi
     );
     assert_eq!(never_called.calls, 0);
     assert_eq!(journal.pending_intents().unwrap().len(), 0);
+}
+
+#[test]
+fn two_interruptions_do_not_append_duplicate_completion() {
+    let plan = plan();
+    let (_root, journal, _) = state(&plan);
+    let effect = effect(&plan);
+    let subject = build_approval_subject(&plan).unwrap();
+    let mut first_probe = ScriptedProbe::new([Ok(ProbeResult::Absent(evidence()))]);
+    let mut interrupted = InterruptAfterEffect::default();
+    assert!(reconcile_effect_unfenced_for_tests(
+        &plan,
+        &journal,
+        &effect,
+        &mut first_probe,
+        &mut interrupted,
+        &subject,
+    )
+    .is_err());
+
+    for _ in 0..2 {
+        let mut present_probe = ScriptedProbe::new([Ok(ProbeResult::Present(evidence()))]);
+        let mut never_called = ScriptedExecutor::default();
+        assert_eq!(
+            reconcile_effect_unfenced_for_tests(
+                &plan,
+                &journal,
+                &effect,
+                &mut present_probe,
+                &mut never_called,
+                &subject,
+            )
+            .unwrap(),
+            EffectOutcome::Reconciled(evidence())
+        );
+        assert_eq!(never_called.calls, 0);
+    }
+
+    let completions = journal
+        .read_journal()
+        .unwrap()
+        .into_iter()
+        .filter(|record| matches!(record, JournalRecord::Completion { .. }))
+        .count();
+    assert_eq!(completions, 1);
+}
+
+#[test]
+fn torn_tail_is_recovered_automatically_before_reconcile() {
+    let plan = plan();
+    let (_root, journal, _) = state(&plan);
+    fs::write(journal.intent_path(), b"{\"version\":1,\"record\":").unwrap();
+    let effect = effect(&plan);
+    let subject = build_approval_subject(&plan).unwrap();
+    let mut probe = ScriptedProbe::new([Ok(ProbeResult::Absent(evidence()))]);
+    let mut executor = ScriptedExecutor::new([Ok(evidence())]);
+
+    assert_eq!(
+        reconcile_effect_unfenced_for_tests(
+            &plan,
+            &journal,
+            &effect,
+            &mut probe,
+            &mut executor,
+            &subject,
+        )
+        .unwrap(),
+        EffectOutcome::Executed(evidence())
+    );
+    assert_eq!(executor.calls, 1);
+    assert_eq!(journal.read_intents().unwrap().len(), 1);
 }
 
 #[test]
@@ -294,7 +366,7 @@ fn done_probe_overrides_completion_history_but_contradictions_fail_closed() {
     let mut absent_probe = ScriptedProbe::new([Ok(ProbeResult::Absent(evidence()))]);
     let mut executor = ScriptedExecutor::default();
     assert!(matches!(
-        reconcile_effect(
+        reconcile_effect_unfenced_for_tests(
             &plan,
             &journal,
             &effect,
@@ -311,7 +383,7 @@ fn done_probe_overrides_completion_history_but_contradictions_fail_closed() {
 
     let mut present_probe = ScriptedProbe::new([Ok(ProbeResult::Present(evidence()))]);
     assert_eq!(
-        reconcile_effect(
+        reconcile_effect_unfenced_for_tests(
             &plan,
             &journal,
             &effect,
@@ -359,10 +431,61 @@ struct TracingExecutor {
     trace: Trace,
 }
 
+#[derive(Default)]
+struct TypedWitnessExecutor {
+    calls: usize,
+    publication_calls: usize,
+}
+
+impl IrreversibleExecutor for TypedWitnessExecutor {
+    fn execute(&mut self, admitted: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
+        admitted
+            .validate_approval_binding()
+            .map_err(|error| SeamError::new(error.to_string()))?;
+        self.calls += 1;
+        if let Some(publication) = admitted.publication() {
+            self.publication_calls += 1;
+            assert_eq!(publication.artifact.bytes(), b"final archive bytes");
+            Ok(evidence())
+        } else {
+            Ok(ProbeEvidence {
+                reference: "tag/v1.2.3".to_owned(),
+                identity: "commit-a".to_owned(),
+            })
+        }
+    }
+}
+
+struct ApprovalTamperingExecutor {
+    approvals: ApprovalStore,
+    stale_subject: crate::approval::ApprovalSubject,
+    calls: usize,
+}
+
+impl IrreversibleExecutor for ApprovalTamperingExecutor {
+    fn execute(&mut self, admitted: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
+        self.calls += 1;
+        self.approvals
+            .persist_confirmed(
+                self.stale_subject.clone(),
+                ApprovalToken::new("stale-after-first-effect"),
+            )
+            .map_err(|error| SeamError::new(error.to_string()))?;
+        if admitted.effect().artifact.as_str() == "tag" {
+            Ok(ProbeEvidence {
+                reference: "tag/v1.2.3".to_owned(),
+                identity: "commit-a".to_owned(),
+            })
+        } else {
+            Ok(evidence())
+        }
+    }
+}
+
 impl IrreversibleExecutor for TracingExecutor {
-    fn execute(&mut self, request: &EffectRequest) -> Result<ProbeEvidence, SeamError> {
+    fn execute(&mut self, admitted: &AdmittedEffect) -> Result<ProbeEvidence, SeamError> {
         self.trace.push("execute");
-        if request.artifact.as_str() == "tag" {
+        if admitted.effect().artifact.as_str() == "tag" {
             Ok(ProbeEvidence {
                 reference: "tag/v1.2.3".to_owned(),
                 identity: "commit-a".to_owned(),
@@ -374,7 +497,7 @@ impl IrreversibleExecutor for TracingExecutor {
 }
 
 #[test]
-fn execute_uses_registry_declaration_order_and_train_repository_leases() {
+fn exactly_once_api_boundary_runs_full_ladder_with_typed_admitted_effects() {
     let plan = plan();
     let (root, journal, approvals) = state(&plan);
     let leases = LeaseStore::new(root.path()).unwrap();
@@ -409,6 +532,239 @@ fn execute_uses_registry_declaration_order_and_train_repository_leases() {
         trace.0.borrow().as_slice(),
         ["preflight", "gate", "execute", "execute", "stage"]
     );
+}
+
+#[test]
+fn approval_digest_binding_rejects_substituted_finalized_bytes_before_executor() {
+    let mut plan = plan();
+    plan.finalized_artifacts[0].bytes = b"substituted after approval planning".to_vec();
+    let (root, journal, approvals) = state(&plan);
+    let leases = LeaseStore::new(root.path()).unwrap();
+    let trace = Trace(Rc::new(RefCell::new(Vec::new())));
+    let mut runner = RecordingRunner(trace.clone());
+    let mut gate = RecordingGate(trace);
+    let mut probe = ScriptedProbe::new([
+        Ok(ProbeResult::Absent(ProbeEvidence {
+            identity: "commit-a".to_owned(),
+            reference: "tag/v1.2.3".to_owned(),
+        })),
+        Ok(ProbeResult::Absent(evidence())),
+    ]);
+    let mut executor = TypedWitnessExecutor::default();
+
+    assert!(matches!(
+        Orchestrator::default().execute(
+            &plan,
+            &leases,
+            &journal,
+            &approvals,
+            &mut runner,
+            &mut gate,
+            &mut probe,
+            &mut executor,
+        ),
+        Err(OrchestrationError::Executor(_))
+    ));
+    assert_eq!(executor.calls, 1);
+    assert_eq!(executor.publication_calls, 0);
+}
+
+#[test]
+fn current_durable_approval_is_reloaded_before_every_effect() {
+    let mut plan = plan();
+    plan.phases.retain(|phase| phase.phase_type != "tag");
+    plan.public_effects
+        .retain(|effect| effect.artifact.is_some());
+    let mut second_effect = plan.public_effects[0].clone();
+    second_effect.operation = "publish:archive-again".into();
+    plan.public_effects.push(second_effect);
+    plan.first_public_trigger = plan.public_effects.first().cloned();
+    let (root, journal, approvals) = state(&plan);
+    let leases = LeaseStore::new(root.path()).unwrap();
+    let trace = Trace(Rc::new(RefCell::new(Vec::new())));
+    let mut runner = RecordingRunner(trace.clone());
+    let mut gate = RecordingGate(trace);
+    let mut probe = ScriptedProbe::new([
+        Ok(ProbeResult::Absent(evidence())),
+        Ok(ProbeResult::Absent(evidence())),
+    ]);
+    let mut stale_subject = build_approval_subject(&plan).unwrap();
+    stale_subject.artifacts[0].digest = "stale-digest".to_owned();
+    let mut executor = ApprovalTamperingExecutor {
+        approvals: approvals.clone(),
+        stale_subject,
+        calls: 0,
+    };
+
+    assert!(matches!(
+        Orchestrator::default().execute(
+            &plan,
+            &leases,
+            &journal,
+            &approvals,
+            &mut runner,
+            &mut gate,
+            &mut probe,
+            &mut executor,
+        ),
+        Err(OrchestrationError::Approval(
+            crate::approval::ApprovalError::SubjectMismatch
+        ))
+    ));
+    assert_eq!(executor.calls, 1);
+}
+
+#[test]
+fn irreversible_tree_mutating_phase_requires_repository_lease() {
+    let plan = plan();
+    let (root, journal, approvals) = state(&plan);
+    let leases = LeaseStore::new(root.path()).unwrap();
+    let held_repository_lease = leases.acquire_repository(plan.repository.clone()).unwrap();
+    let trace = Trace(Rc::new(RefCell::new(Vec::new())));
+    let mut runner = RecordingRunner(trace.clone());
+    let mut gate = RecordingGate(trace.clone());
+    let mut probe = ScriptedProbe::new([]);
+    let mut executor = TypedWitnessExecutor::default();
+
+    assert!(matches!(
+        Orchestrator::default().execute(
+            &plan,
+            &leases,
+            &journal,
+            &approvals,
+            &mut runner,
+            &mut gate,
+            &mut probe,
+            &mut executor,
+        ),
+        Err(OrchestrationError::Lease(_))
+    ));
+    assert_eq!(trace.0.borrow().as_slice(), ["preflight"]);
+    assert_eq!(executor.calls, 0);
+    held_repository_lease.release().unwrap();
+}
+
+struct RefusingRunner;
+
+impl PhaseRunner for RefusingRunner {
+    fn run(&mut self, phase: &PlannedPhase) -> Result<(), SeamError> {
+        Err(SeamError::new(format!(
+            "{} refused its precondition",
+            phase.instance
+        )))
+    }
+}
+
+#[test]
+fn orchestrator_journals_phase_entry_done_and_refusal_records() {
+    let plan = plan();
+    let (root, journal, approvals) = state(&plan);
+    let leases = LeaseStore::new(root.path()).unwrap();
+    let trace = Trace(Rc::new(RefCell::new(Vec::new())));
+    let mut runner = RecordingRunner(trace.clone());
+    let mut gate = RecordingGate(trace);
+    let mut probe = ScriptedProbe::new([
+        Ok(ProbeResult::Absent(ProbeEvidence {
+            identity: "commit-a".to_owned(),
+            reference: "tag/v1.2.3".to_owned(),
+        })),
+        Ok(ProbeResult::Absent(evidence())),
+    ]);
+    let mut executor = TypedWitnessExecutor::default();
+    Orchestrator::default()
+        .execute(
+            &plan,
+            &leases,
+            &journal,
+            &approvals,
+            &mut runner,
+            &mut gate,
+            &mut probe,
+            &mut executor,
+        )
+        .unwrap();
+
+    let records = journal.read_journal().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, JournalRecord::PhaseEntered { .. }))
+            .count(),
+        4
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, JournalRecord::PhaseDone { .. }))
+            .count(),
+        4
+    );
+    assert!(records.iter().any(|record| matches!(
+        record,
+        JournalRecord::PhaseDone { phase, evidence: phase_evidence }
+            if phase.as_str() == "publish" && phase_evidence == &vec![evidence()]
+    )));
+
+    let (refusal_root, refusal_journal, refusal_approvals) = state(&plan);
+    let refusal_leases = LeaseStore::new(refusal_root.path()).unwrap();
+    let mut refusing_runner = RefusingRunner;
+    let mut unused_gate = RecordingGate(Trace(Rc::new(RefCell::new(Vec::new()))));
+    let mut unused_probe = ScriptedProbe::new([]);
+    let mut unused_executor = TypedWitnessExecutor::default();
+    assert!(Orchestrator::default()
+        .execute(
+            &plan,
+            &refusal_leases,
+            &refusal_journal,
+            &refusal_approvals,
+            &mut refusing_runner,
+            &mut unused_gate,
+            &mut unused_probe,
+            &mut unused_executor,
+        )
+        .is_err());
+    assert!(refusal_journal
+        .read_journal()
+        .unwrap()
+        .iter()
+        .any(|record| {
+            matches!(
+                record,
+                JournalRecord::Refused { phase, reason }
+                    if phase.as_str() == "preflight" && reason.contains("refused its precondition")
+            )
+        }));
+}
+
+#[test]
+fn declaration_and_registry_keep_post_tag_ci_watch_inexpressible() {
+    let late_ci = DECLARATION.replace(
+        "{\"id\": \"publish\", \"type\": \"publish\"}",
+        "{\"id\": \"post-tag-ci\", \"type\": \"ci_watch\", \"params\": {\"workflow\": \"release.yml\", \"selector\": \"tag\", \"rerun_budget\": 0}}",
+    );
+    assert!(parse(&late_ci).is_err());
+
+    let mut late_ci_plan = plan();
+    late_ci_plan.phases = vec![
+        late_ci_plan
+            .phases
+            .iter()
+            .find(|phase| phase.phase_type == "tag")
+            .unwrap()
+            .clone(),
+        PlannedPhase {
+            instance: "post-tag-ci".into(),
+            phase_type: "ci_watch".to_owned(),
+            tree_mutating: false,
+        },
+    ];
+    assert!(matches!(
+        PhaseRegistry.validate_plan(&late_ci_plan),
+        Err(OrchestrationError::Refusal {
+            code: OrchestrationRefusalCode::UnsafeOrdering,
+            ..
+        })
+    ));
 }
 
 #[test]

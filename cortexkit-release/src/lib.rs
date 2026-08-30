@@ -208,8 +208,11 @@ pub trait CompletionProbe {
 }
 
 /// Performs one irreversible external effect after admission by the machine.
+///
+/// The executor receives only the machine-minted witness, so artifact publication
+/// cannot be reached with a raw effect request that bypasses approval binding.
 pub trait IrreversibleExecutor {
-    fn execute(&mut self, request: &EffectRequest) -> Result<ProbeEvidence, SeamError>;
+    fn execute(&mut self, request: &executor::AdmittedEffect) -> Result<ProbeEvidence, SeamError>;
 }
 
 /// Persists an already-encoded journal or intent write.

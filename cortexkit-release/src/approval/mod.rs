@@ -12,7 +12,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     process,
@@ -307,7 +307,7 @@ fn timestamp_millis() -> Result<u128, ApprovalError> {
 
 fn sync_directory(path: &Path) -> Result<(), ApprovalError> {
     #[cfg(not(windows))]
-    return File::open(path)
+    return fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| ApprovalError::UnsupportedDurability {
             path: path.to_path_buf(),

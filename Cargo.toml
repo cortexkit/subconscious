@@ -10,6 +10,7 @@ members = [
     "crates/subc-mcp",
     "crates/mcp-stdio-adapter",
     "crates/agent-token-vectors",
+    "cortexkit-release",
 ]
 
 # subc monorepo.

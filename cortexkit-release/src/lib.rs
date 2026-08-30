@@ -11,6 +11,7 @@
 pub mod approval;
 pub mod artifact;
 pub mod ceremony;
+pub mod cli;
 pub mod declaration;
 pub mod executor;
 pub mod lease;
@@ -220,12 +221,6 @@ pub trait DurableState {
 pub trait ApprovalGate {
     fn approve(&mut self, subject: &ApprovalSubject) -> Result<ApprovalToken, SeamError>;
 }
-
-// The package publishes the `ck-release` binary before command handling is
-// introduced. Keeping this placeholder side-effect-free means early package
-// and lockfile verification cannot accidentally invoke a release operation.
-#[allow(dead_code)]
-fn main() {}
 
 #[cfg(test)]
 #[path = "../tests/replay/mod.rs"]

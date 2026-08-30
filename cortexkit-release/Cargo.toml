@@ -7,7 +7,7 @@ description = "Shared, journaled release state machine for CortexKit repositorie
 
 [[bin]]
 name = "ck-release"
-path = "src/lib.rs"
+path = "src/main.rs"
 test = false
 bench = false
 

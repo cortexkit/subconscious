@@ -8,7 +8,10 @@
 //! carries opaque identifiers at that boundary instead of duplicating those
 //! closed sets in Rust enums.
 
+pub mod approval;
 pub mod declaration;
+pub mod lease;
+pub mod plan;
 
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};

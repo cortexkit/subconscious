@@ -12102,3 +12102,6 @@ never opted in) biting six days after it was named.
   corollary: never-executed is a different risk class from unwired-in-production —
   zero-caller builders mean every downstream refactor was written against a path
   that had never run once; coverage precedes wiring.
+
+- **A stale "expect N findings" line converts a working alarm into a silenced one while looking like diligence** (QTA, deployed-sanity window): a runbook count correct on day one teaches the reader to tick past the real finding on day two. Any written expected-count must carry its retirement condition in the same edit. (Derived expectations — rosters diffed from config — age safely; written numbers do not.)
+- **Optional builder setters lose declarations silently** (QTA, ModuleManifest builder migration): dropping `.self_signals(...)` compiles clean and every habitual surface reads normal, and a consumer census cannot distinguish silent loss from honest non-adoption. Adopters pin declarations with a survives-construction test (assert the signals present AND their classification, mutation-proved); the structural close is a lint that re-derives declared signals from source and diffs the manifest.

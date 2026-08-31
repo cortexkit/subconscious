@@ -512,7 +512,8 @@ mod tests {
             1,
             "the 65th identity clears the 64-entry cache"
         );
-        fs::remove_dir_all(dir).unwrap();
+        // No manual cleanup: the TestTempDir guard removes the tree on drop and
+        // deliberately preserves it when the test panics.
     }
 
     #[test]

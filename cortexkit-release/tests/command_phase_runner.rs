@@ -279,9 +279,14 @@ fn malformed_gates_local_parameters_refuse_before_an_output_artifact_can_exist()
 
 #[test]
 fn gates_local_resolves_relative_cwd_and_adds_declared_environment() {
+    // The cwd arm asserts by EFFECT (the child drops a marker file into its
+    // working directory) rather than by comparing path renderings: a shell's
+    // $PWD on Windows runners is a Git-Bash POSIX rendering while the parent
+    // sees native (or \\?\-extended) paths, so string equality over the same
+    // directory fails across platforms even when the resolution is correct.
     let execution = execute(
         &declaration(
-            r#"{"id":"environment","type":"gates_local","params":{"command":"sh","args":["-c","printf '%s|%s' \"$PWD\" \"$GATES_LOCAL_TEST_ENV\""],"cwd":"child","env":{"GATES_LOCAL_TEST_ENV":"declared-value"},"load_class":"cpu"}}"#,
+            r#"{"id":"environment","type":"gates_local","params":{"command":"sh","args":["-c","printf '%s' \"$GATES_LOCAL_TEST_ENV\" > cwd-proof.txt; printf 'ran|%s' \"$GATES_LOCAL_TEST_ENV\""],"cwd":"child","env":{"GATES_LOCAL_TEST_ENV":"declared-value"},"load_class":"cpu"}}"#,
         ),
         |repository| fs::create_dir(repository.join("child")).unwrap(),
     );
@@ -289,13 +294,22 @@ fn gates_local_resolves_relative_cwd_and_adds_declared_environment() {
     assert!(execution.result.is_ok(), "{:?}", execution.result);
     let attempts = command_attempts(&execution.journal.read_journal().unwrap());
     assert_eq!(attempts.len(), 1);
+    // Env arm: the declared variable reached the child (captured output).
     assert_eq!(
         fs::read_to_string(&attempts[0].3).unwrap(),
-        format!(
-            "{}|declared-value",
-            fs::canonicalize(execution.repository.path().join("child"))
-                .unwrap()
-                .display()
+        "ran|declared-value"
+    );
+    // Cwd arm: the marker landed inside the declared relative cwd, with the
+    // declared env value as its content (one file proves both resolutions).
+    assert_eq!(
+        fs::read_to_string(
+            execution
+                .repository
+                .path()
+                .join("child")
+                .join("cwd-proof.txt")
         )
+        .unwrap(),
+        "declared-value"
     );
 }

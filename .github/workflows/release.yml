@@ -56,10 +56,19 @@ jobs:
           fi
 
   linux-binaries:
-    name: Subconscious archives (linux-x64)
+    name: Subconscious archives (linux-${{ matrix.arch }})
     if: startsWith(github.ref_name, 'subc-core-v')
     needs: create-subconscious-release
-    runs-on: ubuntu-latest
+    # arm64 rides GitHub's hosted arm runners: real ARM VPS users (and ARM
+    # Linux VMs on Apple hosts) cannot execute the x64 assets.
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
     steps:
@@ -70,7 +79,7 @@ jobs:
         run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
 
       - name: Package convention-named archives and digest sidecars
-        run: bash scripts/release/package-unix-archives.sh linux x64 target/release dist
+        run: bash scripts/release/package-unix-archives.sh linux ${{ matrix.arch }} target/release dist
 
       - name: Upload release archives
         env:

@@ -159,8 +159,10 @@ expect_refusal() {
   }
 }
 
+# linux-arm64 became a supported tuple when the arm runner leg shipped; the
+# refusal fixture keeps a genuinely unsupported architecture.
 expect_refusal unsupported-platform unsupported-platform \
-  CK_TEST_OS=Linux CK_TEST_ARCH=aarch64 CK_TEST_KERNEL=generic
+  CK_TEST_OS=Linux CK_TEST_ARCH=riscv64 CK_TEST_KERNEL=generic
 expect_refusal missing-archive release-incomplete \
   CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_DOWNLOAD_FAILURE=archive
 expect_refusal missing-sidecar release-incomplete \

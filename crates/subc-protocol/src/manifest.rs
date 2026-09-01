@@ -422,6 +422,13 @@ pub enum SignalCadence {
 /// overlays process-identity evidence it alone can attest; the two halves are
 /// served together via `supervisor.provenance` and never merged.
 ///
+/// The canonical constructor form is a full 40-character lowercase hexadecimal
+/// `build_git_sha` and a full 64-character lowercase hexadecimal
+/// `build_lock_digest`; abbreviations are not conforming. The daemon's HELLO
+/// decoder intentionally remains lenient enough to relay older declarations,
+/// so this construction contract is enforced by [`build_provenance`] rather
+/// than by wire deserialization.
+///
 /// Honesty contract for constructors (ruled with the first adopters):
 /// - Every field is a VERIFIED-AT-BUILD claim. No field is required: a module
 ///   may declare any subset, and omitting an inapplicable field is the honest
@@ -440,12 +447,12 @@ pub enum SignalCadence {
 ///   dropped from the wire and reads `unavailable`. So omitting a field never
 ///   costs a module its `Reported` status -- declaration is decided by
 ///   whether the manifest carried a block, not by which fields it filled.
-/// - Dirty-tree stamps, where a pipeline chooses to emit them, append
-///   `-dirty` to the sha (the reader must treat that as commit-match-only,
-///   code-match unproven — the same downgrade `ck`'s skew detector applies).
-///   Stricter is better: cerebellum's build.rs reports the commit ONLY when
-///   the tree was clean, on the argument that dirty bytes match no commit and
-///   a precise-looking wrong answer beats absence at being believed.
+/// - Dirty-tree stamps are not canonical `build_git_sha` values. A pipeline
+///   that emits `-dirty` must omit the affected field rather than pass that
+///   stamp to the canonical constructor. Stricter is better: cerebellum's
+///   build.rs reports the commit ONLY when the tree was clean, on the argument
+///   that dirty bytes match no commit and a precise-looking wrong answer beats
+///   absence at being believed.
 /// - Two silent-when-wrong checks for any build-rev embedder (CEREB): does
 ///   the builder know whether the tree was clean, and can its no-git sentinel
 ///   (source-tarball builds) escape into a field parsed as a sha? Sentinels
@@ -503,6 +510,8 @@ pub struct ManifestProvenance {
 }
 
 const MAX_PROVENANCE_VALUE_BYTES: usize = 128;
+const BUILD_GIT_SHA_CANONICAL_FORM: &str = "exactly 40 lowercase hexadecimal characters";
+const BUILD_LOCK_DIGEST_CANONICAL_FORM: &str = "exactly 64 lowercase hexadecimal characters";
 
 #[derive(Deserialize)]
 struct ManifestProvenanceWire {
@@ -532,6 +541,51 @@ impl<'de> Deserialize<'de> for ManifestProvenance {
         Ok(provenance)
     }
 }
+
+/// A declared build fact did not use its canonical form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceFormError {
+    field: &'static str,
+    length: usize,
+    canonical_form: &'static str,
+}
+
+impl ProvenanceFormError {
+    fn new(field: &'static str, length: usize, canonical_form: &'static str) -> Self {
+        Self {
+            field,
+            length,
+            canonical_form,
+        }
+    }
+
+    /// The provenance field whose value was not canonical.
+    pub fn field(&self) -> &str {
+        self.field
+    }
+
+    /// The offending value's length in bytes.
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    /// The canonical form required for this field.
+    pub fn canonical_form(&self) -> &str {
+        self.canonical_form
+    }
+}
+
+impl fmt::Display for ProvenanceFormError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid manifest provenance form: field {} has length {}; canonical form is {}",
+            self.field, self.length, self.canonical_form
+        )
+    }
+}
+
+impl std::error::Error for ProvenanceFormError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestProvenanceError {
@@ -582,6 +636,10 @@ impl ManifestProvenance {
                     "must not be empty",
                 ));
             }
+            // HELLO decoding checks only wire safety here. Canonical build forms
+            // belong to build_provenance; the daemon is a non-adjudicating relayer
+            // and must continue accepting legacy declarations such as 12-hex
+            // module revisions rather than breaking a fleet on daemon upgrade.
             if value.len() > MAX_PROVENANCE_VALUE_BYTES {
                 return Err(ManifestProvenanceError::new(
                     field,
@@ -602,7 +660,13 @@ impl ManifestProvenance {
 }
 
 /// Build a [`ManifestProvenance`] from raw build facts, normalizing sentinel
-/// and empty values to field omission.
+/// and empty values to field omission, then validating canonical declared forms.
+/// A `build_git_sha` must be exactly 40 lowercase hexadecimal characters and a
+/// `build_lock_digest` exactly 64 lowercase hexadecimal characters. Abbreviations
+/// are not conforming; a real value in the wrong form returns a
+/// [`ProvenanceFormError`] instead of being discarded as if it were absent.
+/// Sentinel values are filtered before form validation, so they remain honest
+/// omission rather than becoming form errors.
 ///
 /// OWNERSHIP RULE: a helper that constructs a wire type lives in the crate
 /// that owns the type. This helper constructs `ManifestProvenance`, so it
@@ -612,13 +676,46 @@ pub fn build_provenance(
     build_git_sha: Option<&str>,
     build_lock_digest: Option<&str>,
     store_schema_version: Option<&str>,
-) -> ManifestProvenance {
-    ManifestProvenance {
-        build_git_sha: normalize_provenance_fact(build_git_sha),
-        build_lock_digest: normalize_provenance_fact(build_lock_digest),
+) -> Result<ManifestProvenance, ProvenanceFormError> {
+    let build_git_sha = normalize_provenance_fact(build_git_sha);
+    validate_provenance_form(
+        "build_git_sha",
+        build_git_sha.as_deref(),
+        BUILD_GIT_SHA_CANONICAL_FORM,
+        40,
+    )?;
+
+    let build_lock_digest = normalize_provenance_fact(build_lock_digest);
+    validate_provenance_form(
+        "build_lock_digest",
+        build_lock_digest.as_deref(),
+        BUILD_LOCK_DIGEST_CANONICAL_FORM,
+        64,
+    )?;
+
+    Ok(ManifestProvenance {
+        build_git_sha,
+        build_lock_digest,
         wire_crate_version: Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
         store_schema_version: normalize_provenance_fact(store_schema_version),
+    })
+}
+
+fn validate_provenance_form(
+    field: &'static str,
+    value: Option<&str>,
+    canonical_form: &'static str,
+    expected_length: usize,
+) -> Result<(), ProvenanceFormError> {
+    let Some(value) = value else { return Ok(()) };
+    if value.len() != expected_length
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ProvenanceFormError::new(field, value.len(), canonical_form));
     }
+    Ok(())
 }
 
 /// Sentinel strings that build tooling emits where it means "no value": shell
@@ -1553,8 +1650,8 @@ mod tests {
     /// value" (shell fallbacks say `unknown`, not `unavailable`); publishing
     /// one as a build fact is the well-formed lie the provenance contract
     /// names. The helper must map every sentinel, any casing, to field
-    /// omission — and must keep real values intact (the control arm, so the
-    /// filter cannot pass by refusing everything).
+    /// omission — and must keep a canonical real value intact (the control arm,
+    /// so the filter cannot pass by refusing everything).
     #[test]
     fn provenance_builder_sentinels_become_field_omission() {
         for sentinel in [
@@ -1567,15 +1664,24 @@ mod tests {
             "  unknown  ",
             "",
         ] {
-            let p = build_provenance(Some(sentinel), Some(sentinel), Some(sentinel));
+            let p = build_provenance(Some(sentinel), Some(sentinel), Some(sentinel))
+                .expect("sentinels are omitted before form validation");
             assert_eq!(
                 (p.build_git_sha, p.build_lock_digest, p.store_schema_version),
                 (None, None, None),
                 "sentinel {sentinel:?} must be omitted, not published"
             );
         }
-        let real = build_provenance(Some("9f3c2ab"), None, Some("9"));
-        assert_eq!(real.build_git_sha.as_deref(), Some("9f3c2ab"));
+        let real = build_provenance(
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            None,
+            Some("9"),
+        )
+        .expect("canonical build revision is accepted");
+        assert_eq!(
+            real.build_git_sha.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
         assert_eq!(real.store_schema_version.as_deref(), Some("9"));
         // The always-knowable fact: an SDK-built block always carries a crate
         // version, so it is never empty; that is why the contract omits a
@@ -1587,18 +1693,21 @@ mod tests {
     }
 
     #[test]
-    fn build_provenance_normalizes_clean_build_facts() {
+    fn build_provenance_accepts_canonical_sha_and_lock_digest() {
         let provenance = build_provenance(
             Some(" 0123456789abcdef0123456789abcdef01234567 "),
-            Some(" lock-digest "),
+            Some(" abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 "),
             Some(" schema-v3 "),
-        );
+        )
+        .expect("canonical build facts are accepted");
 
         assert_eq!(
             provenance,
             ManifestProvenance {
                 build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-                build_lock_digest: Some("lock-digest".to_string()),
+                build_lock_digest: Some(
+                    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+                ),
                 wire_crate_version: Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
                 store_schema_version: Some("schema-v3".to_string()),
             }
@@ -1606,31 +1715,67 @@ mod tests {
     }
 
     #[test]
-    fn build_provenance_preserves_a_dirty_revision_verbatim() {
-        let provenance = build_provenance(
-            Some("0123456789abcdef0123456789abcdef01234567-dirty"),
-            Some("lock-digest"),
-            None,
-        );
+    fn build_provenance_refuses_an_abbreviated_git_sha() {
+        let error = build_provenance(Some("0123456789ab"), None, None)
+            .expect_err("a 12-character abbreviation is not canonical");
 
+        assert_eq!(error.field(), "build_git_sha");
+        assert_eq!(error.length(), 12);
+        assert_eq!(error.canonical_form(), BUILD_GIT_SHA_CANONICAL_FORM);
         assert_eq!(
-            provenance.build_git_sha,
-            Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string())
-        );
-        assert_eq!(
-            provenance.build_lock_digest,
-            Some("lock-digest".to_string())
+            error.to_string(),
+            "invalid manifest provenance form: field build_git_sha has length 12; canonical form is exactly 40 lowercase hexadecimal characters"
         );
     }
 
     #[test]
+    fn build_provenance_refuses_an_abbreviated_lock_digest() {
+        let error = build_provenance(None, Some("0123456789abcdef"), None)
+            .expect_err("a 16-character digest is not canonical");
+
+        assert_eq!(error.field(), "build_lock_digest");
+        assert_eq!(error.length(), 16);
+        assert_eq!(error.canonical_form(), BUILD_LOCK_DIGEST_CANONICAL_FORM);
+    }
+
+    #[test]
+    fn build_provenance_refuses_uppercase_hex() {
+        let uppercase_sha = "A".repeat(40);
+        let error = build_provenance(Some(&uppercase_sha), None, None)
+            .expect_err("uppercase hexadecimal is not canonical");
+
+        assert_eq!(error.field(), "build_git_sha");
+        assert_eq!(error.length(), 40);
+        assert_eq!(error.canonical_form(), BUILD_GIT_SHA_CANONICAL_FORM);
+    }
+
+    #[test]
+    fn build_provenance_refuses_dirty_revision_stamp() {
+        let error = build_provenance(
+            Some("0123456789abcdef0123456789abcdef01234567-dirty"),
+            None,
+            None,
+        )
+        .expect_err("a dirty stamp is not a canonical build revision");
+
+        assert_eq!(error.field(), "build_git_sha");
+        assert_eq!(error.length(), 46);
+        assert_eq!(error.canonical_form(), BUILD_GIT_SHA_CANONICAL_FORM);
+    }
+
+    #[test]
     fn build_provenance_keeps_a_lock_digest_when_identity_is_unavailable() {
-        let provenance = build_provenance(Some("unavailable"), Some("lock-digest"), None);
+        let provenance = build_provenance(
+            Some("unavailable"),
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+            None,
+        )
+        .expect("sentinel SHA is omitted before the valid lock digest is checked");
 
         assert_eq!(provenance.build_git_sha, None);
         assert_eq!(
             provenance.build_lock_digest,
-            Some("lock-digest".to_string())
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string())
         );
         assert_eq!(
             provenance.wire_crate_version,
@@ -1640,7 +1785,8 @@ mod tests {
 
     #[test]
     fn build_provenance_omits_fully_unavailable_inputs() {
-        let provenance = build_provenance(None, Some(" unavailable "), Some("   "));
+        let provenance = build_provenance(None, Some(" unavailable "), Some("   "))
+            .expect("omitted and sentinel inputs are not form errors");
 
         assert_eq!(provenance.build_git_sha, None);
         assert_eq!(provenance.build_lock_digest, None);

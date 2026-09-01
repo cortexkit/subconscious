@@ -45,7 +45,8 @@ use subc_protocol::{
 pub use subc_protocol::{
     manifest::{
         build_provenance, CapabilityDeclarations, CapabilityNeed, CapabilityRequirement,
-        ExecutionMode, ManifestProvenance, ProviderRole, Tool, PROVENANCE_SENTINELS,
+        ExecutionMode, ManifestProvenance, ProvenanceFormError, ProviderRole, Tool,
+        PROVENANCE_SENTINELS,
     },
     session::{HealthReport, HealthStatus},
     AdmissionClass, SUBC_PROTOCOL_CRATE_VERSION,

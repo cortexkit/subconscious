@@ -5,6 +5,12 @@ use super::{
     mc_detection::{self, McDetection},
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseResolutionStrategy {
+    Latest,
+    TagPrefix(&'static str),
+}
+
 /// The independently selectable pieces of an alpha CortexKit installation.
 ///
 /// Core owns the daemon and MCP bridge. Every other entry is independently
@@ -59,6 +65,15 @@ impl Component {
             Self::Insula => "insula",
             Self::Claustrum => "claustrum",
             Self::Synapse => "synapse",
+        }
+    }
+
+    pub const fn release_resolution_strategy(self) -> ReleaseResolutionStrategy {
+        match self {
+            Self::Mc => ReleaseResolutionStrategy::TagPrefix("ck-mc-"),
+            Self::Core | Self::Aft | Self::Insula | Self::Claustrum | Self::Synapse => {
+                ReleaseResolutionStrategy::Latest
+            }
         }
     }
 

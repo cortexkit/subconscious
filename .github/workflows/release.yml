@@ -117,7 +117,31 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
 
+      # Alpha arm, explicit by repository variable: package adhoc-signed archives
+      # when the Developer ID secrets are not provisioned in this repo. The
+      # Developer ID identity currently lives only in magic-context's CI; signed
+      # and notarized replacements are produced through its sign-notarize
+      # dispatch workflow and re-uploaded over these assets. This arm never
+      # engages silently: it requires ALPHA_DARWIN_UNSIGNED=true and stamps the
+      # asset provenance into the release notes.
+      - name: Package adhoc-signed archives (declared alpha arm)
+        if: vars.ALPHA_DARWIN_UNSIGNED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          for bin in ck ck-subc ck-subc-mcp; do
+            codesign --force --sign - --identifier "$bin" "target/release/$bin"
+            (cd target/release && zip -q -X "../../dist/$bin-darwin-arm64.zip" "$bin")
+            shasum -a 256 "dist/$bin-darwin-arm64.zip" | awk '{print $1}' > "dist/$bin-darwin-arm64.zip.sha256"
+          done
+          ls -la dist/
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --notes "Subconscious alpha archives: ck, ck-subc, and ck-subc-mcp. darwin-arm64 assets are adhoc-signed pending notarized replacements via the signing dispatch."
+
       - name: Import Developer ID Application certificate
+        if: vars.ALPHA_DARWIN_UNSIGNED != 'true'
         env:
           DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
           DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
@@ -155,6 +179,7 @@ jobs:
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
       - name: Write App Store Connect API key
+        if: vars.ALPHA_DARWIN_UNSIGNED != 'true'
         env:
           APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
@@ -168,6 +193,7 @@ jobs:
           printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
 
       - name: Sign, notarize, and package macOS archives
+        if: vars.ALPHA_DARWIN_UNSIGNED != 'true'
         env:
           APP_STORE_CONNECT_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
@@ -175,6 +201,7 @@ jobs:
         run: bash scripts/release/macos-sign-notarize.sh target/release dist
 
       - name: Upload release archives
+        if: vars.ALPHA_DARWIN_UNSIGNED != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber

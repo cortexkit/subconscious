@@ -133,7 +133,9 @@ jobs:
           for bin in ck ck-subc ck-subc-mcp; do
             codesign --force --sign - --identifier "$bin" "target/release/$bin"
             (cd target/release && zip -q -X "../../dist/$bin-darwin-arm64.zip" "$bin")
-            shasum -a 256 "dist/$bin-darwin-arm64.zip" | awk '{print $1}' > "dist/$bin-darwin-arm64.zip.sha256"
+            # shasum output format (hex, two spaces, filename) per the sidecar
+            # grammar; bare hex breaks `shasum -c` consumers.
+            (cd dist && shasum -a 256 "$bin-darwin-arm64.zip" > "$bin-darwin-arm64.zip.sha256")
           done
           ls -la dist/
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber

@@ -70,6 +70,11 @@ impl Component {
 
     pub const fn release_resolution_strategy(self) -> ReleaseResolutionStrategy {
         match self {
+            // Owner-ruled: magic-context's releases/latest surface belongs to
+            // its standalone npm product and its users' tooling. A fleet
+            // channel must not squat on a repo's public Latest surface, so mc
+            // module releases are prerelease-tagged and resolved by tag
+            // pattern. Do not "simplify" this back to latest-resolution.
             Self::Mc => ReleaseResolutionStrategy::TagPrefix("ck-mc-"),
             Self::Core | Self::Aft | Self::Insula | Self::Claustrum | Self::Synapse => {
                 ReleaseResolutionStrategy::Latest

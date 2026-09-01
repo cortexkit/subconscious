@@ -35,10 +35,22 @@ impl ConfigChange {
 
 /// Inspect one component's exact leaf values without changing the file. Existing
 /// values are never authorization to replace a different user-owned value.
+#[allow(dead_code)]
 pub fn plan_component(
     path: impl Into<PathBuf>,
     component: Component,
     binary_home: &Path,
+) -> Result<Option<ConfigChange>, ConfigConflict> {
+    plan_component_with_key(path, component, binary_home, None)
+}
+
+/// Plans one component using the same claustrum key path for its generated
+/// environment entry that bootstrap receives.
+pub fn plan_component_with_key(
+    path: impl Into<PathBuf>,
+    component: Component,
+    binary_home: &Path,
+    claustrum_key_path: Option<&Path>,
 ) -> Result<Option<ConfigChange>, ConfigConflict> {
     let path = path.into();
     let before = match fs::read_to_string(&path) {
@@ -66,7 +78,7 @@ pub fn plan_component(
         });
     }
 
-    let additions = desired_values(component, binary_home);
+    let additions = desired_values_with_key(component, binary_home, claustrum_key_path);
     let mut changed = false;
     for (key, desired) in additions {
         match existing_value(&document, &key) {
@@ -81,10 +93,13 @@ pub fn plan_component(
     if !changed {
         return Ok(None);
     }
-    let after = format!(
+    let mut after = format!(
         "{}\n",
         serde_json::to_string_pretty(&document).expect("JSON values always serialize")
     );
+    if component == Component::Claustrum {
+        insert_claustrum_reserved_comment(&mut after);
+    }
     Ok(Some(ConfigChange {
         path,
         before,
@@ -116,28 +131,79 @@ pub fn apply(change: &ConfigChange) -> Result<(), String> {
     })
 }
 
+#[allow(dead_code)]
 pub fn desired_values(component: Component, binary_home: &Path) -> BTreeMap<String, Value> {
+    desired_values_with_key(component, binary_home, None)
+}
+
+fn desired_values_with_key(
+    component: Component,
+    binary_home: &Path,
+    claustrum_key_path: Option<&Path>,
+) -> BTreeMap<String, Value> {
     let mut values = BTreeMap::new();
     match component {
         Component::Core => {
             values.insert("version".to_string(), Value::from(1));
         }
-        Component::Aft => {
+        Component::Aft | Component::Mc | Component::Insula | Component::Synapse => {
+            let module_id = component.module_id().expect("non-core modules have an id");
+            let binary = match component {
+                Component::Aft => "aft",
+                Component::Mc => "ck-mc",
+                Component::Insula => "ck-insula",
+                Component::Synapse => "ck-synapse",
+                _ => unreachable!("the match only admits single-daemon modules"),
+            };
             values.insert(
-                "modules.aft".to_string(),
+                format!("modules.{module_id}"),
                 serde_json::json!({
-                    "program": binary_home.join(platform_binary("ck-aft")).to_string_lossy(),
-                    "reserved": true,
+                    "program": binary_home.join(platform_binary(binary)).to_string_lossy(),
                 }),
             );
         }
-        // MC has no alpha archive. This declaration wires its selected state
-        // without inventing a daemon process or changing another module's entry.
-        Component::Mc => {
-            values.insert("cortexkit.components.mc".to_string(), Value::Bool(true));
+        Component::Claustrum => {
+            let mut entry = Map::new();
+            entry.insert(
+                "program".to_string(),
+                Value::String(
+                    binary_home
+                        .join(platform_binary("ck-claustrum"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
+            entry.insert("reserved".to_string(), Value::Bool(true));
+            if let Some(key_path) = claustrum_key_path {
+                entry.insert(
+                    "env".to_string(),
+                    serde_json::json!({
+                        "CK_MASTER_KEY_PATH": key_path.to_string_lossy(),
+                    }),
+                );
+            }
+            values.insert("modules.claustrum".to_string(), Value::Object(entry));
         }
     }
     values
+}
+
+fn insert_claustrum_reserved_comment(rendered: &mut String) {
+    let Some(claustrum) = rendered.find("\"claustrum\": {") else {
+        return;
+    };
+    let Some(reserved) = rendered[claustrum..].find("\"reserved\": true") else {
+        return;
+    };
+    let reserved = claustrum + reserved;
+    let line_start = rendered[..reserved].rfind('\n').unwrap_or(0) + 1;
+    let indentation = &rendered[line_start..reserved];
+    rendered.insert_str(
+        line_start,
+        &format!(
+            "{indentation}// without it any local process completing the handshake can claim the vault's module id and be handed bearer capability handles\n"
+        ),
+    );
 }
 
 fn platform_binary(name: &str) -> String {
@@ -202,9 +268,28 @@ mod tests {
             Some(&serde_json::json!({"program":"/user/aft","reserved":true}))
         );
         assert_eq!(
-            written.pointer("/cortexkit/components/mc"),
-            Some(&Value::Bool(true))
+            written.pointer("/modules/magic-context/program"),
+            Some(&Value::String(
+                root.join(platform_binary("ck-mc"))
+                    .to_string_lossy()
+                    .into_owned()
+            ))
         );
+    }
+
+    #[test]
+    fn claustrum_uses_one_key_path_for_the_generated_environment() {
+        let root = fixture_path("claustrum-key");
+        let config = root.join("subc.jsonc");
+        let key_path = root.join("keys/master.key");
+        let change = plan_component_with_key(&config, Component::Claustrum, &root, Some(&key_path))
+            .expect("claustrum configuration is additive")
+            .expect("claustrum entry is absent");
+        assert!(change.after.contains("CK_MASTER_KEY_PATH"));
+        assert!(change.after.contains(&*key_path.to_string_lossy()));
+        assert!(change
+            .after
+            .contains("without it any local process completing the handshake"));
     }
 
     #[test]

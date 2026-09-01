@@ -1,60 +1,163 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{self, Command},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::{config, inventory::Inventory, model::Component};
+use super::{
+    config,
+    inventory::Inventory,
+    model::{AlphaTarget, Component, ReleaseAvailability},
+};
 
 pub trait ArtifactSource {
-    fn install(&mut self, binary: &str, destination: &Path) -> Result<String, String>;
+    fn install(
+        &mut self,
+        component: Component,
+        binary: &str,
+        destination: &Path,
+    ) -> Result<String, String>;
+
+    fn expected_version(&mut self, component: Component) -> Result<String, String>;
 }
 
 /// Downloads only convention-derived archives and verifies each archive against
 /// its matching sidecar before extracting the binary into the managed home.
 pub struct ReleaseArtifactSource {
-    target: &'static str,
-    subc_base_url: String,
-    aft_base_url: String,
+    target: AlphaTarget,
+    api_base: String,
+    release_bases: BTreeMap<Component, String>,
+    manifests: BTreeMap<Component, ReleaseManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReleaseManifest {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReleaseAsset {
+    name: String,
 }
 
 impl ReleaseArtifactSource {
     pub fn current() -> Self {
+        let mut release_bases = BTreeMap::new();
+        for component in Component::ALL {
+            let key = if component == Component::Core {
+                "CK_RELEASE_BASE_URL".to_string()
+            } else {
+                format!(
+                    "CK_{}_RELEASE_BASE_URL",
+                    component.label().to_ascii_uppercase().replace('-', "_")
+                )
+            };
+            release_bases.insert(
+                component,
+                std::env::var(key).unwrap_or_else(|_| {
+                    format!(
+                        "https://github.com/cortexkit/{}/releases/latest/download",
+                        component.repository()
+                    )
+                }),
+            );
+        }
         Self {
             target: if cfg!(target_os = "macos") {
-                "darwin-arm64"
+                AlphaTarget::DarwinArm64
             } else if cfg!(windows) {
-                "windows-x64"
+                AlphaTarget::WindowsX64
             } else {
-                "linux-x64"
+                AlphaTarget::LinuxX64
             },
-            subc_base_url: std::env::var("CK_RELEASE_BASE_URL").unwrap_or_else(|_| {
-                "https://github.com/cortexkit/subconscious/releases/latest/download".to_string()
-            }),
-            aft_base_url: std::env::var("CK_AFT_RELEASE_BASE_URL").unwrap_or_else(|_| {
-                "https://github.com/cortexkit/aft/releases/latest/download".to_string()
-            }),
+            api_base: std::env::var("CK_RELEASE_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.github.com".to_string()),
+            release_bases,
+            manifests: BTreeMap::new(),
         }
     }
 
-    fn release_base(&self, binary: &str) -> &str {
-        if binary == "ck-aft" {
-            &self.aft_base_url
-        } else {
-            &self.subc_base_url
+    pub fn release_availability(
+        &mut self,
+        component: Component,
+    ) -> Result<ReleaseAvailability, String> {
+        let target = self.target;
+        let manifest = self.manifest(component)?;
+        let assets = manifest
+            .assets
+            .iter()
+            .map(|asset| asset.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing_asset = component_binaries_for_target(component, target)
+            .iter()
+            .flat_map(|binary| {
+                let archive = format!("{}-{}.zip", binary, target.label());
+                [archive.clone(), format!("{archive}.sha256")]
+            })
+            .find(|asset| !assets.contains(asset.as_str()));
+        Ok(match missing_asset {
+            Some(missing_asset) => ReleaseAvailability::NotYetPublished {
+                release_tag: manifest.tag_name.clone(),
+                missing_asset,
+            },
+            None => ReleaseAvailability::Available,
+        })
+    }
+
+    fn release_base(&self, component: Component) -> &str {
+        self.release_bases
+            .get(&component)
+            .expect("all setup components have a release base")
+    }
+
+    fn manifest(&mut self, component: Component) -> Result<&ReleaseManifest, String> {
+        if !self.manifests.contains_key(&component) {
+            let temporary = temporary_path("release.json");
+            let api_base = self.api_base.trim_end_matches('/');
+            let url = format!(
+                "{api_base}/repos/cortexkit/{}/releases/latest",
+                component.repository()
+            );
+            download(&url, &temporary).map_err(|error| {
+                format!("could not resolve latest {} release: {error}", component)
+            })?;
+            let manifest = fs::read_to_string(&temporary)
+                .map_err(|error| format!("could not read latest {} release: {error}", component))
+                .and_then(|contents| {
+                    serde_json::from_str::<ReleaseManifest>(&contents).map_err(|error| {
+                        format!("could not parse latest {} release: {error}", component)
+                    })
+                })?;
+            let _ = fs::remove_file(&temporary);
+            if manifest.tag_name.trim().is_empty() {
+                return Err(format!("latest {component} release has no tag"));
+            }
+            self.manifests.insert(component, manifest);
         }
+        Ok(self
+            .manifests
+            .get(&component)
+            .expect("manifest was inserted for the requested component"))
     }
 }
 
 impl ArtifactSource for ReleaseArtifactSource {
-    fn install(&mut self, binary: &str, destination: &Path) -> Result<String, String> {
-        let (os, arch) = self.target.split_once('-').expect("fixed alpha target");
+    fn install(
+        &mut self,
+        component: Component,
+        binary: &str,
+        destination: &Path,
+    ) -> Result<String, String> {
         let binary_name = platform_binary(binary);
-        let archive_name = format!("{binary}-{os}-{arch}.zip");
+        let archive_name = format!("{}-{}.zip", binary, self.target.label());
         let sidecar_name = format!("{archive_name}.sha256");
         let temp = std::env::temp_dir().join(format!(
             "ck-setup-{binary}-{}-{}",
@@ -72,7 +175,7 @@ impl ArtifactSource for ReleaseArtifactSource {
         })?;
         let archive = temp.join(&archive_name);
         let sidecar = temp.join(&sidecar_name);
-        let base = self.release_base(binary).trim_end_matches('/');
+        let base = self.release_base(component).trim_end_matches('/');
         download(&format!("{base}/{archive_name}"), &archive)?;
         download(&format!("{base}/{sidecar_name}"), &sidecar)?;
         let expected = parse_sidecar(
@@ -139,13 +242,54 @@ impl ArtifactSource for ReleaseArtifactSource {
         let _ = fs::remove_dir_all(temp);
         Ok(digest)
     }
+
+    fn expected_version(&mut self, component: Component) -> Result<String, String> {
+        let tag = self.manifest(component)?.tag_name.trim();
+        let version = tag.trim_start_matches('v');
+        if version.is_empty() || version == tag {
+            return Err(format!(
+                "latest {component} release tag '{tag}' must be v<crate-version>"
+            ));
+        }
+        Ok(version.to_string())
+    }
 }
 
 pub fn component_binaries(component: Component) -> &'static [&'static str] {
-    match component {
-        Component::Core => &["ck-subc", "ck-subc-mcp"],
-        Component::Aft => &["ck-aft"],
-        Component::Mc => &[],
+    let target = if cfg!(target_os = "macos") {
+        AlphaTarget::DarwinArm64
+    } else if cfg!(windows) {
+        AlphaTarget::WindowsX64
+    } else {
+        AlphaTarget::LinuxX64
+    };
+    component_binaries_for_target(component, target)
+}
+
+/// Release asset sets are data, not filesystem discovery, so setup never loses
+/// a synapse worker merely because a different worker happens to be installed.
+pub fn component_binaries_for_target(
+    component: Component,
+    target: AlphaTarget,
+) -> &'static [&'static str] {
+    match (component, target) {
+        (Component::Core, _) => &["ck-subc", "ck-subc-mcp"],
+        (Component::Aft, _) => &["aft"],
+        (Component::Mc, AlphaTarget::DarwinArm64 | AlphaTarget::LinuxX64) => &["ck-mc"],
+        (Component::Mc, AlphaTarget::WindowsX64) => &[],
+        (Component::Insula, _) => &["ck-insula"],
+        (Component::Claustrum, _) => &["ck-claustrum", "ck-auth"],
+        (Component::Synapse, AlphaTarget::DarwinArm64) => &[
+            "ck-synapse",
+            "ck-synapse-opctl",
+            "ck-synapse-worker-llama",
+            "ck-synapse-worker-mlx",
+            "ck-synapse-worker-ane",
+            "ck-synapse-worker-decode",
+        ],
+        (Component::Synapse, AlphaTarget::LinuxX64 | AlphaTarget::WindowsX64) => {
+            &["ck-synapse", "ck-synapse-opctl", "ck-synapse-worker-llama"]
+        }
     }
 }
 
@@ -173,7 +317,8 @@ pub fn install_component<S: ArtifactSource>(
                 destination.display()
             ));
         }
-        let digest = source.install(binary, &destination)?;
+        let digest = source.install(component, binary, &destination)?;
+        verify_version(&destination, &source.expected_version(component)?)?;
         let mut fields = Map::new();
         fields.insert(
             "component".to_string(),
@@ -189,16 +334,18 @@ pub fn configure_component(
     component: Component,
     config_path: &Path,
     binary_home: &Path,
+    claustrum_key_path: Option<&Path>,
     inventory: &mut Inventory,
 ) -> Result<Option<config::ConfigChange>, String> {
     let change =
-        config::plan_component(config_path, component, binary_home).map_err(|conflict| {
-            format!(
-                "refusal: conflicting user-owned configuration key '{}'; {} was not changed",
-                conflict.key,
-                config_path.display()
-            )
-        })?;
+        config::plan_component_with_key(config_path, component, binary_home, claustrum_key_path)
+            .map_err(|conflict| {
+                format!(
+                    "refusal: conflicting user-owned configuration key '{}'; {} was not changed",
+                    conflict.key,
+                    config_path.display()
+                )
+            })?;
     if let Some(change) = &change {
         println!("proposed configuration diff:\n{}", change.render_diff());
         config::apply(change)?;
@@ -216,12 +363,53 @@ pub fn configuration_is_correct(
     component: Component,
     config_path: &Path,
     binary_home: &Path,
+    claustrum_key_path: Option<&Path>,
 ) -> Result<bool, String> {
-    match config::plan_component(config_path, component, binary_home) {
+    match config::plan_component_with_key(config_path, component, binary_home, claustrum_key_path) {
         Ok(None) => Ok(true),
         Ok(Some(_)) => Ok(false),
         Err(conflict) => Err(format!("configuration conflict at {}", conflict.key)),
     }
+}
+
+fn temporary_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "ck-setup-{name}-{}-{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_nanos()
+    ))
+}
+
+/// The release tag is the expected crate version. Running the placed binary
+/// before configuration prevents a valid archive for the wrong release from
+/// becoming a supervised module.
+fn verify_version(path: &Path, expected: &str) -> Result<(), String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("could not run {} --version: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "refusal: {} --version exited {}: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    if reported
+        .split_whitespace()
+        .all(|token| token.trim_start_matches('v') != expected)
+    {
+        return Err(format!(
+            "refusal: {} --version did not report release version {expected}: {reported:?}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn download(url: &str, destination: &Path) -> Result<(), String> {
@@ -344,9 +532,25 @@ mod tests {
     struct FakeSource;
 
     impl ArtifactSource for FakeSource {
-        fn install(&mut self, binary: &str, destination: &Path) -> Result<String, String> {
-            fs::write(destination, binary).map_err(|error| error.to_string())?;
+        fn install(
+            &mut self,
+            _component: Component,
+            binary: &str,
+            destination: &Path,
+        ) -> Result<String, String> {
+            fs::write(destination, format!("#!/bin/sh\necho {binary} 1.2.3\n"))
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(destination, fs::Permissions::from_mode(0o755))
+                    .map_err(|error| error.to_string())?;
+            }
             digest_file(destination)
+        }
+
+        fn expected_version(&mut self, _component: Component) -> Result<String, String> {
+            Ok("1.2.3".to_string())
         }
     }
 
@@ -368,6 +572,25 @@ mod tests {
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
         assert_eq!(inventory.paths_for_kind("managed-binary").len(), 2);
+    }
+
+    #[test]
+    fn synapse_uses_the_full_declared_platform_asset_sets() {
+        assert_eq!(
+            component_binaries_for_target(Component::Synapse, AlphaTarget::DarwinArm64),
+            [
+                "ck-synapse",
+                "ck-synapse-opctl",
+                "ck-synapse-worker-llama",
+                "ck-synapse-worker-mlx",
+                "ck-synapse-worker-ane",
+                "ck-synapse-worker-decode",
+            ]
+        );
+        assert_eq!(
+            component_binaries_for_target(Component::Synapse, AlphaTarget::LinuxX64),
+            ["ck-synapse", "ck-synapse-opctl", "ck-synapse-worker-llama"]
+        );
     }
 
     #[test]

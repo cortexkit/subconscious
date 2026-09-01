@@ -22,7 +22,7 @@ mod upgrade_executor;
 mod upgrade_verification;
 mod validation;
 
-pub use apply::SetupBackend;
+pub use apply::{default_claustrum_key_path, SetupBackend};
 pub use model::{Component, SetupRequest, UpgradeState, UpgradeTarget};
 pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
 #[cfg(windows)]

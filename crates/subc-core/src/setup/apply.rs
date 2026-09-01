@@ -11,8 +11,8 @@ use super::{
     conversion::selected_components,
     inventory::Inventory,
     model::{
-        Component, ComponentState, ConfigurationState, DetectionOutcome, PlatformObservation,
-        ReleaseAvailability, RuntimeState, SetupObserved, SetupOperation, SetupRequest,
+        Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
+        RuntimeState, SetupObserved, SetupOperation, SetupRequest,
     },
     planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
     runtime::{self, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
@@ -35,6 +35,7 @@ struct SetupPaths {
     data_dir: PathBuf,
     binary_home: PathBuf,
     config_path: PathBuf,
+    claustrum_key_path: Option<PathBuf>,
     runtime_paths: runtime::RuntimePaths,
 }
 
@@ -53,9 +54,16 @@ impl SetupBackend {
         Ok(Self {
             executable,
             paths: SetupPaths {
-                data_dir,
+                data_dir: data_dir.clone(),
                 binary_home,
                 config_path: subc_core::daemon_config::default_config_path(),
+                // One default is retained and reused for bootstrap and generated
+                // module environment so the vault never receives mismatched keys.
+                claustrum_key_path: if cfg!(target_os = "macos") {
+                    None
+                } else {
+                    Some(data_dir.join("claustrum").join("master.key"))
+                },
                 runtime_paths,
             },
             platform,
@@ -70,13 +78,26 @@ impl SetupBackend {
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
         self.runtime_status = runtime::observe(self.platform, &mut self.runner)?;
         let selected = selected_components(request);
+        let claustrum_key_path = request
+            .claustrum_key_path
+            .as_deref()
+            .or(self.paths.claustrum_key_path.as_deref());
         let mut components = BTreeMap::new();
         let mut releases = BTreeMap::new();
         for component in Component::ALL {
+            if matches!(
+                PlatformObservation::current(),
+                PlatformObservation::Supported(target) if component.is_declared_unsupported_on(target)
+            ) {
+                components.insert(component, ComponentState::Missing);
+                releases.insert(component, ReleaseAvailability::NotRequired);
+                continue;
+            }
             let config_ok = match components::configuration_is_correct(
                 component,
                 &self.paths.config_path,
                 &self.paths.binary_home,
+                claustrum_key_path,
             ) {
                 Ok(correct) => correct,
                 // A component outside this request may have a user-owned value
@@ -95,23 +116,17 @@ impl SetupBackend {
                     ComponentState::Missing
                 },
             );
-            releases.insert(
-                component,
-                if component == Component::Mc {
-                    ReleaseAvailability::NotRequired
-                } else {
-                    ReleaseAvailability::Available
-                },
-            );
+            releases.insert(component, self.artifacts.release_availability(component)?);
         }
         let configuration = selected
             .iter()
             .copied()
             .find_map(|component| {
-                match config::plan_component(
+                match config::plan_component_with_key(
                     &self.paths.config_path,
                     component,
                     &self.paths.binary_home,
+                    claustrum_key_path,
                 ) {
                     Err(conflict) => Some(ConfigurationState::Conflict { key: conflict.key }),
                     Ok(_) => None,
@@ -132,32 +147,36 @@ impl SetupBackend {
             RuntimeState::Missing
         };
         observed.configuration = configuration;
-        observed
-            .detections
-            .retain(|component, _| *component != Component::Aft);
-        observed.detections.insert(
-            Component::Aft,
-            DetectionOutcome::OwnerGated {
-                reason: "automatic AFT detection is disabled until its owner supplies a detector contract".to_string(),
-            },
-        );
+        // AFT automatic detection is disabled for alpha until its owner supplies
+        // a marker contract with false-positive classification rules.
+        observed.detections.remove(&Component::Aft);
         Ok(observed)
     }
 
-    pub fn print_proposed_diffs(&self, plan: &SetupPlan) -> Result<(), String> {
+    pub fn print_proposed_diffs(
+        &self,
+        plan: &SetupPlan,
+        request: &SetupRequest,
+    ) -> Result<(), String> {
         for operation in &plan.operations {
             let SetupOperation::ConfigureComponent { component } = operation else {
                 continue;
             };
-            if let Some(change) =
-                config::plan_component(&self.paths.config_path, *component, &self.paths.binary_home)
-                    .map_err(|conflict| {
-                        format!(
-                            "refusal: conflicting user-owned configuration key '{}'",
-                            conflict.key
-                        )
-                    })?
-            {
+            if let Some(change) = config::plan_component_with_key(
+                &self.paths.config_path,
+                *component,
+                &self.paths.binary_home,
+                request
+                    .claustrum_key_path
+                    .as_deref()
+                    .or(self.paths.claustrum_key_path.as_deref()),
+            )
+            .map_err(|conflict| {
+                format!(
+                    "refusal: conflicting user-owned configuration key '{}'",
+                    conflict.key
+                )
+            })? {
                 println!("proposed configuration diff:\n{}", change.render_diff());
             }
         }
@@ -165,6 +184,9 @@ impl SetupBackend {
     }
 
     pub fn apply_plan(&mut self, plan: &SetupPlan, request: &SetupRequest) -> Result<(), String> {
+        if let Some(key_path) = &request.claustrum_key_path {
+            self.paths.claustrum_key_path = Some(key_path.clone());
+        }
         execute_setup(plan, ExecutionMode::Apply, self)?;
         self.inventory.save()?;
         if request.uninstall {
@@ -195,6 +217,39 @@ impl SetupBackend {
         println!("{}", validation::MCP_HARNESS_SNIPPET);
         Ok(())
     }
+
+    fn run_ck(&self, args: &[&str]) -> Result<(), String> {
+        let status = Command::new(&self.executable)
+            .args(args)
+            .status()
+            .map_err(|error| format!("could not run ck {}: {error}", args.join(" ")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("ck {} failed with {status}", args.join(" ")))
+        }
+    }
+
+    fn bootstrap_claustrum(&self, key_path: Option<&Path>) -> Result<(), String> {
+        let auth = self.paths.binary_home.join(if cfg!(windows) {
+            "ck-auth.exe"
+        } else {
+            "ck-auth"
+        });
+        let mut command = Command::new(auth);
+        command.arg("bootstrap");
+        if let Some(key_path) = key_path {
+            command.arg("--key-path").arg(key_path);
+        }
+        let status = command
+            .status()
+            .map_err(|error| format!("could not run ck auth bootstrap: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("ck auth bootstrap failed with {status}"))
+        }
+    }
 }
 
 impl SetupExecutor for SetupBackend {
@@ -213,10 +268,22 @@ impl SetupExecutor for SetupBackend {
                     *component,
                     &self.paths.config_path,
                     &self.paths.binary_home,
+                    self.paths.claustrum_key_path.as_deref(),
                     &mut self.inventory,
                 )?;
                 Ok(())
             }
+            SetupOperation::BootstrapClaustrum { key_path } => {
+                self.bootstrap_claustrum(key_path.as_deref())
+            }
+            SetupOperation::RescanComponent { .. } => self.run_ck(&["module", "rescan"]),
+            SetupOperation::EnableComponent { component } => self.run_ck(&[
+                "module",
+                "start",
+                component
+                    .module_id()
+                    .expect("only modules are enabled by setup"),
+            ]),
             SetupOperation::RegisterRuntime => runtime::ensure(
                 self.platform,
                 &self.paths.runtime_paths,
@@ -263,6 +330,14 @@ impl Validator for CkValidator<'_> {
             .status()
             .map_err(|error| format!("could not run {label} {}: {error}", args.join(" ")))?;
         Ok(status.success())
+    }
+}
+
+pub fn default_claustrum_key_path() -> Result<Option<PathBuf>, String> {
+    if cfg!(target_os = "macos") {
+        Ok(None)
+    } else {
+        Ok(Some(data_directory()?.join("claustrum").join("master.key")))
     }
 }
 

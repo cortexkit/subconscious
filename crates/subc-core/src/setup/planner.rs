@@ -35,7 +35,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         outcomes: Vec::new(),
     };
 
-    let PlatformObservation::Supported(_) = &observed.platform else {
+    let PlatformObservation::Supported(target) = &observed.platform else {
         if let PlatformObservation::Unsupported(target) = &observed.platform {
             plan.outcomes.push(PlanOutcome::UnsupportedPlatform {
                 target: target.clone(),
@@ -67,11 +67,31 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         }
     }
 
+    let mut newly_configured_modules = Vec::new();
     for component in selected {
+        if let Some(message) = component.unavailable_message(*target) {
+            plan.outcomes.push(PlanOutcome::DeclaredUnavailable {
+                component,
+                message: message.to_string(),
+            });
+            continue;
+        }
         match observed.release(component) {
+            ReleaseAvailability::NotYetPublished {
+                release_tag,
+                missing_asset,
+            } => {
+                plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                    component,
+                    release_tag,
+                    missing_asset,
+                });
+                continue;
+            }
             ReleaseAvailability::Incomplete { missing_asset } => {
                 plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
                     component,
+                    release_tag: "the resolved release".to_string(),
                     missing_asset,
                 });
                 continue;
@@ -88,6 +108,14 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                     .push(SetupOperation::InstallComponent { component });
                 plan.operations
                     .push(SetupOperation::ConfigureComponent { component });
+                if component == Component::Claustrum {
+                    plan.operations.push(SetupOperation::BootstrapClaustrum {
+                        key_path: request.claustrum_key_path.clone(),
+                    });
+                }
+                if component.module_id().is_some() {
+                    newly_configured_modules.push(component);
+                }
             }
         }
     }
@@ -108,6 +136,13 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         plan.outcomes.push(PlanOutcome::Noop {
             scope: "per-user runtime is already registered and live".to_string(),
         });
+    }
+
+    for component in newly_configured_modules {
+        plan.operations
+            .push(SetupOperation::RescanComponent { component });
+        plan.operations
+            .push(SetupOperation::EnableComponent { component });
     }
 
     plan.operations.extend([
@@ -253,6 +288,17 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                 ReleaseAvailability::Incomplete { missing_asset } => {
                     plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
                         component: upgrade_target_component(target),
+                        release_tag: "the resolved release".to_string(),
+                        missing_asset,
+                    });
+                }
+                ReleaseAvailability::NotYetPublished {
+                    release_tag,
+                    missing_asset,
+                } => {
+                    plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                        component: upgrade_target_component(target),
+                        release_tag,
                         missing_asset,
                     });
                 }
@@ -455,18 +501,21 @@ mod tests {
         let mut incomplete = observed_setup();
         incomplete.releases.insert(
             Component::Aft,
-            ReleaseAvailability::Incomplete {
-                missing_asset: "ck-aft-linux-x64.zip.sha256".to_string(),
+            ReleaseAvailability::NotYetPublished {
+                release_tag: "v0.1.0".to_string(),
+                missing_asset: "aft-linux-x64.zip".to_string(),
             },
         );
         let incomplete_plan = plan_setup(&incomplete, &SetupRequest::install(vec![Component::Aft]));
-        assert!(incomplete_plan.outcomes.iter().any(|outcome| matches!(
-            outcome,
-            PlanOutcome::ReleaseIncomplete {
-                component: Component::Aft,
-                missing_asset,
-            } if missing_asset == "ck-aft-linux-x64.zip.sha256"
-        )));
+        let outcome = incomplete_plan
+            .outcomes
+            .iter()
+            .find(|outcome| matches!(outcome, PlanOutcome::ReleaseIncomplete { .. }))
+            .expect("typed temporal release outcome");
+        assert_eq!(
+            outcome.to_string(),
+            "aft: no aft-linux-x64.zip asset in v0.1.0 yet — the module's owner has not published this platform"
+        );
     }
 
     #[test]
@@ -541,6 +590,56 @@ mod tests {
         let report = execute_setup(&declined_plan, ExecutionMode::Apply, &mut executor).unwrap();
         assert!(report.applied.is_empty());
         assert!(executor.applied.is_empty());
+    }
+
+    #[test]
+    fn claustrum_bootstraps_before_it_is_enabled_with_one_key_path() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed.runtime = RuntimeState::Correct;
+        observed
+            .components
+            .insert(Component::Claustrum, ComponentState::Missing);
+        let key_path = std::path::PathBuf::from("/keys/claustrum.key");
+        let mut request = SetupRequest::install(vec![Component::Claustrum]);
+        request.claustrum_key_path = Some(key_path.clone());
+        let operations = plan_setup(&observed, &request).operations;
+        let bootstrap = operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    SetupOperation::BootstrapClaustrum { key_path: Some(path) } if path == &key_path
+                )
+            })
+            .expect("bootstrap operation");
+        let enable = operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    SetupOperation::EnableComponent {
+                        component: Component::Claustrum
+                    }
+                )
+            })
+            .expect("enable operation");
+        assert!(bootstrap < enable);
+    }
+
+    #[test]
+    fn mc_windows_is_stated_as_declared_unavailable() {
+        let mut observed = observed_setup();
+        observed.platform = PlatformObservation::Supported(AlphaTarget::WindowsX64);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Mc]));
+        assert!(plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::DeclaredUnavailable { message, .. }
+                if message == "magic-context: not available on windows in alpha"
+        )));
+        assert!(plan.is_authorized());
     }
 
     #[test]

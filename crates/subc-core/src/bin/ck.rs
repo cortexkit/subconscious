@@ -130,7 +130,7 @@ const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info
 
 const FLEET_HELP: &str = "ck fleet — offline configured-module inspection\n\nusage:\n  ck fleet lint [<config>] [--verbose]\n\n`lint` reads module manifests without connecting to the daemon.";
 
-const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc] [--with aft,mc] [--dry-run]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without calling an installation mutator. --convert is explicit\n  and requires --confirm before it can apply a conversion plan.";
+const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without calling an installation mutator. --convert is explicit\n  and requires --confirm before it can apply a conversion plan.";
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade\n  ck upgrade --check\n\n  --check prints target availability and ordered operations without replacing\n  binaries or restarting a runtime. MC is wiring-only in alpha and is not an\n  upgrade target.";
 
@@ -4007,7 +4007,7 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
     let plan = setup::plan_setup(&observed, request);
     print_setup_plan(&plan);
     backend
-        .print_proposed_diffs(&plan)
+        .print_proposed_diffs(&plan, request)
         .map_err(CkError::Message)?;
     if !plan.is_authorized() {
         return Err(CkError::Rejected(
@@ -4118,6 +4118,7 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
     let mut dry_run = false;
     let mut convert = false;
     let mut conversion_confirmed = false;
+    let mut claustrum_key_path = None;
     let mut index = 0;
 
     while let Some(argument) = tail.get(index) {
@@ -4167,6 +4168,20 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
                 conversion_confirmed = true;
                 index += 1;
             }
+            "--key-path" => {
+                let Some(value) = tail.get(index + 1) else {
+                    return Err(CkError::Usage(format!(
+                        "ck setup --key-path requires a file path\n\n{SETUP_HELP}"
+                    )));
+                };
+                if claustrum_key_path.is_some() {
+                    return Err(CkError::Usage(format!(
+                        "ck setup accepts one --key-path\n\n{SETUP_HELP}"
+                    )));
+                }
+                claustrum_key_path = Some(PathBuf::from(value));
+                index += 2;
+            }
             value if value.starts_with('-') => {
                 return Err(CkError::Usage(format!(
                     "unknown setup flag '{value}'\n\n{SETUP_HELP}"
@@ -4201,12 +4216,28 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
             "ck setup --confirm is only valid with --convert\n\n{SETUP_HELP}"
         )));
     }
+    if claustrum_key_path.is_some()
+        && explicit_component != Some(setup::Component::Claustrum)
+        && !optional.contains(&setup::Component::Claustrum)
+    {
+        return Err(CkError::Usage(format!(
+            "ck setup --key-path is only valid for claustrum\n\n{SETUP_HELP}"
+        )));
+    }
 
+    let claustrum_selected = explicit_component == Some(setup::Component::Claustrum)
+        || optional.contains(&setup::Component::Claustrum);
     let mut request = setup::SetupRequest::install(optional.into_iter().collect());
     request.uninstall = uninstall;
     request.dry_run = dry_run;
     request.convert = if convert { explicit_component } else { None };
     request.conversion_confirmed = conversion_confirmed;
+    if claustrum_selected {
+        request.claustrum_key_path = match claustrum_key_path {
+            Some(path) => Some(path),
+            None => setup::default_claustrum_key_path().map_err(CkError::Message)?,
+        };
+    }
     Ok(request)
 }
 
@@ -4214,8 +4245,11 @@ fn parse_setup_component(value: &str) -> Result<setup::Component, CkError> {
     match value {
         "aft" => Ok(setup::Component::Aft),
         "mc" => Ok(setup::Component::Mc),
+        "insula" => Ok(setup::Component::Insula),
+        "claustrum" => Ok(setup::Component::Claustrum),
+        "synapse" => Ok(setup::Component::Synapse),
         _ => Err(CkError::Usage(format!(
-            "unknown setup component '{value}'; expected aft or mc\n\n{SETUP_HELP}"
+            "unknown setup component '{value}'; expected aft, mc, insula, claustrum, or synapse\n\n{SETUP_HELP}"
         ))),
     }
 }
@@ -5699,6 +5733,7 @@ mod tests {
                 dry_run: false,
                 convert: None,
                 conversion_confirmed: false,
+                ..
             }) if optional_components.is_empty()
         ));
 

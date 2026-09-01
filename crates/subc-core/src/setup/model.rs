@@ -7,23 +7,71 @@ use super::{
 
 /// The independently selectable pieces of an alpha CortexKit installation.
 ///
-/// Core owns the daemon and MCP bridge. AFT and MC are optional so adding one
-/// later can leave the other component's known-good state untouched.
+/// Core owns the daemon and MCP bridge. Every other entry is independently
+/// addable, so adding one cannot disturb another component's known-good state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Component {
     Core,
     Aft,
     Mc,
+    Insula,
+    Claustrum,
+    Synapse,
 }
 
 impl Component {
-    pub const ALL: [Self; 3] = [Self::Core, Self::Aft, Self::Mc];
+    pub const ALL: [Self; 6] = [
+        Self::Core,
+        Self::Aft,
+        Self::Mc,
+        Self::Insula,
+        Self::Claustrum,
+        Self::Synapse,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Core => "core",
             Self::Aft => "aft",
             Self::Mc => "mc",
+            Self::Insula => "insula",
+            Self::Claustrum => "claustrum",
+            Self::Synapse => "synapse",
+        }
+    }
+
+    pub const fn module_id(self) -> Option<&'static str> {
+        match self {
+            Self::Core => None,
+            Self::Aft => Some("aft"),
+            Self::Mc => Some("magic-context"),
+            Self::Insula => Some("insula"),
+            Self::Claustrum => Some("claustrum"),
+            Self::Synapse => Some("synapse"),
+        }
+    }
+
+    pub const fn repository(self) -> &'static str {
+        match self {
+            Self::Core => "subconscious",
+            Self::Aft => "aft",
+            Self::Mc => "magic-context",
+            Self::Insula => "insula",
+            Self::Claustrum => "claustrum",
+            Self::Synapse => "synapse",
+        }
+    }
+
+    pub const fn is_declared_unsupported_on(self, target: AlphaTarget) -> bool {
+        matches!((self, target), (Self::Mc, AlphaTarget::WindowsX64))
+    }
+
+    pub const fn unavailable_message(self, target: AlphaTarget) -> Option<&'static str> {
+        match (self, target) {
+            (Self::Mc, AlphaTarget::WindowsX64) => {
+                Some("magic-context: not available on windows in alpha")
+            }
+            _ => None,
         }
     }
 }
@@ -119,17 +167,20 @@ pub enum ComponentState {
     Correct,
 }
 
-// The platform-only observer cannot yet fetch release metadata, but the
-// planner keeps this state explicit so missing assets cannot be collapsed into
-// an unsupported-platform result when a release observer is connected.
-#[allow(dead_code)]
+/// Release resolution stays explicit so a missing archive is never reported as
+/// a broken installation or as a permanently unsupported host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseAvailability {
     Available,
     Incomplete {
         missing_asset: String,
     },
-    /// MC is wiring-only in alpha and must never acquire an archive.
+    NotYetPublished {
+        release_tag: String,
+        missing_asset: String,
+    },
+    /// A component can be intentionally unavailable on a host without querying
+    /// its release repository.
     NotRequired,
 }
 
@@ -184,24 +235,12 @@ impl SetupObserved {
         let mut releases = BTreeMap::new();
         for component in Component::ALL {
             components.insert(component, ComponentState::Missing);
-            releases.insert(
-                component,
-                if component == Component::Mc {
-                    ReleaseAvailability::NotRequired
-                } else {
-                    ReleaseAvailability::Available
-                },
-            );
+            releases.insert(component, ReleaseAvailability::Available);
         }
         let mc_detection = mc_detection::detect_current();
         let mut detections = BTreeMap::new();
-        detections.insert(
-            Component::Aft,
-            DetectionOutcome::OwnerGated {
-                reason: "automatic AFT detection is disabled until its owner supplies a detector contract"
-                    .to_string(),
-            },
-        );
+        // AFT automatic detection is disabled for alpha. Its owner has not
+        // supplied the marker contract needed to avoid false-positive conversion.
         detections.insert(
             Component::Mc,
             detection::mc_detection_outcome(&mc_detection),
@@ -239,6 +278,8 @@ pub struct SetupRequest {
     pub dry_run: bool,
     pub convert: Option<Component>,
     pub conversion_confirmed: bool,
+    /// The one key-file answer used for both claustrum bootstrap and daemon env.
+    pub claustrum_key_path: Option<std::path::PathBuf>,
 }
 
 impl SetupRequest {
@@ -249,6 +290,7 @@ impl SetupRequest {
             dry_run: false,
             convert: None,
             conversion_confirmed: false,
+            claustrum_key_path: None,
         }
     }
 }
@@ -260,7 +302,12 @@ pub enum PlanOutcome {
     },
     ReleaseIncomplete {
         component: Component,
+        release_tag: String,
         missing_asset: String,
+    },
+    DeclaredUnavailable {
+        component: Component,
+        message: String,
     },
     Refusal {
         reason: String,
@@ -293,11 +340,13 @@ impl fmt::Display for PlanOutcome {
             }
             Self::ReleaseIncomplete {
                 component,
+                release_tag,
                 missing_asset,
             } => write!(
                 formatter,
-                "release-incomplete: {component} is missing {missing_asset}"
+                "{component}: no {missing_asset} asset in {release_tag} yet — the module's owner has not published this platform"
             ),
+            Self::DeclaredUnavailable { message, .. } => formatter.write_str(message),
             Self::Refusal { reason } => write!(formatter, "refusal: {reason}"),
             Self::Noop { scope } => write!(formatter, "no-op: {scope}"),
             Self::OwnerGatedDetection { component, reason } => {
@@ -311,15 +360,36 @@ impl fmt::Display for PlanOutcome {
 pub enum SetupOperation {
     ObservePlatform,
     OfferOptionalComponents,
-    OfferConversion { component: Component },
-    ConfirmConversion { component: Component },
-    InstallComponent { component: Component },
-    ConfigureComponent { component: Component },
+    OfferConversion {
+        component: Component,
+    },
+    ConfirmConversion {
+        component: Component,
+    },
+    InstallComponent {
+        component: Component,
+    },
+    ConfigureComponent {
+        component: Component,
+    },
+    BootstrapClaustrum {
+        key_path: Option<std::path::PathBuf>,
+    },
+    RescanComponent {
+        component: Component,
+    },
+    EnableComponent {
+        component: Component,
+    },
     RegisterRuntime,
     StartRuntime,
-    Validate { instrument: &'static str },
+    Validate {
+        instrument: &'static str,
+    },
     DeregisterRuntime,
-    RemoveManagedComponent { component: Component },
+    RemoveManagedComponent {
+        component: Component,
+    },
     RetainUserData,
 }
 
@@ -329,6 +399,9 @@ impl SetupOperation {
             self,
             Self::InstallComponent { .. }
                 | Self::ConfigureComponent { .. }
+                | Self::BootstrapClaustrum { .. }
+                | Self::RescanComponent { .. }
+                | Self::EnableComponent { .. }
                 | Self::RegisterRuntime
                 | Self::StartRuntime
                 | Self::DeregisterRuntime
@@ -342,7 +415,16 @@ impl fmt::Display for SetupOperation {
         match self {
             Self::ObservePlatform => formatter.write_str("observe alpha platform support"),
             Self::OfferOptionalComponents => {
-                formatter.write_str("offer optional components: aft, mc")
+                // One line per component so a caveat reads against its owner
+                // rather than swallowing the components listed after it.
+                formatter.write_str(
+                    "offer optional components:\n\
+                     \x20 aft\n\
+                     \x20 mc\n\
+                     \x20 insula — browser-cookie providers dark by construction on Windows (Chrome App-Bound Encryption); file/API providers full; cookie lane via claustrum deposit\n\
+                     \x20 claustrum\n\
+                     \x20 synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives",
+                )
             }
             Self::OfferConversion { component } => {
                 write!(formatter, "offer standalone {component} conversion")
@@ -352,6 +434,20 @@ impl fmt::Display for SetupOperation {
             }
             Self::InstallComponent { component } => write!(formatter, "install {component}"),
             Self::ConfigureComponent { component } => write!(formatter, "configure {component}"),
+            Self::BootstrapClaustrum {
+                key_path: Some(key_path),
+            } => write!(
+                formatter,
+                "bootstrap claustrum with ck auth bootstrap --key-path {}",
+                key_path.display()
+            ),
+            Self::BootstrapClaustrum { key_path: None } => {
+                formatter.write_str("bootstrap claustrum with ck auth bootstrap")
+            }
+            Self::RescanComponent { component } => {
+                write!(formatter, "rescan {component} module entry")
+            }
+            Self::EnableComponent { component } => write!(formatter, "enable {component} module"),
             Self::RegisterRuntime => formatter.write_str("register the per-user daemon runtime"),
             Self::StartRuntime => formatter.write_str("start the per-user daemon runtime"),
             Self::Validate { instrument } => write!(formatter, "validate with {instrument}"),

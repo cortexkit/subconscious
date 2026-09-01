@@ -22,7 +22,10 @@ pub fn validate_selected<V: Validator>(
         let args = match component {
             Component::Core => vec!["health".to_string()],
             Component::Aft => vec!["health".to_string(), "aft".to_string()],
-            Component::Mc => vec!["health".to_string(), "mc".to_string()],
+            Component::Mc => vec!["health".to_string(), "magic-context".to_string()],
+            Component::Insula => vec!["health".to_string(), "insula".to_string()],
+            Component::Claustrum => vec!["health".to_string(), "claustrum".to_string()],
+            Component::Synapse => vec!["health".to_string(), "synapse".to_string()],
         };
         require(validator, "ck", &args)?;
     }

@@ -5,8 +5,16 @@
 //! duration of the test; it never copies or stages a `.git` directory. Diverged
 //! remotes are local bare repositories, so this helper never contacts a public
 //! release service.
+//!
+//! Ambient environment reaching a hermetic test is a recurring failure class.
+//! `SUBC_MODULE_ID`/`SUBC_LAUNCH_NONCE` inheritance is one example; Git's XDG
+//! configuration and ignore chain is another. Test-side Git commands therefore
+//! receive an isolated configuration home instead of inheriting the developer's.
 
 #![allow(dead_code)]
+
+#[path = "git.rs"]
+mod git;
 
 use cortexkit_release::{
     executor::AdmittedEffect, ApprovalGate, ApprovalSubject, ApprovalToken, CompletionProbe,
@@ -53,9 +61,75 @@ struct MintedSibling {
 pub struct MintedRepo {
     repository: TempDir,
     journal_home: TempDir,
+    git: GitEnvironment,
     remote: Option<TempDir>,
     sibling: Option<MintedSibling>,
     residue_paths: Vec<PathBuf>,
+}
+
+struct GitEnvironment {
+    config_home: TempDir,
+}
+
+impl GitEnvironment {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            config_home: tempfile::tempdir()?,
+        })
+    }
+
+    fn command(&self) -> Command {
+        git::git_command(self.config_home.path())
+    }
+
+    fn run<I, S>(&self, root: &Path, arguments: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self
+            .command()
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()?;
+        command_result(output).map(|_| ())
+    }
+
+    fn stdout<I, S>(&self, root: &Path, arguments: I) -> io::Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self
+            .command()
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()?;
+        String::from_utf8(command_result(output)?)
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn in_git_dir<I, S>(&self, git_dir: &Path, arguments: I) -> io::Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self
+            .command()
+            .arg(format!("--git-dir={}", git_dir.display()))
+            .args(arguments)
+            .env("GIT_AUTHOR_NAME", "ck-release test")
+            .env("GIT_AUTHOR_EMAIL", "ck-release-test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "ck-release test")
+            .env("GIT_COMMITTER_EMAIL", "ck-release-test@example.invalid")
+            .output()?;
+        String::from_utf8(command_result(output)?)
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
 }
 
 impl MintedRepo {
@@ -71,22 +145,24 @@ impl MintedRepo {
     ) -> io::Result<Self> {
         let repository = tempfile::tempdir()?;
         let journal_home = tempfile::tempdir()?;
+        let git = GitEnvironment::new()?;
         let root = repository.path();
 
-        run_git(root, ["init"])?;
-        run_git(root, ["config", "user.name", "ck-release test"])?;
-        run_git(
+        git.run(root, ["init"])?;
+        git.run(root, ["config", "user.name", "ck-release test"])?;
+        git.run(
             root,
             ["config", "user.email", "ck-release-test@example.invalid"],
         )?;
         fs::create_dir_all(root.join(".cortexkit"))?;
         fs::write(root.join("README.md"), "minted test repository\n")?;
         fs::write(root.join(".cortexkit/release.jsonc"), declaration.as_ref())?;
-        commit_baseline(root)?;
+        commit_baseline(&git, root)?;
 
         let mut minted = Self {
             repository,
             journal_home,
+            git,
             remote: None,
             sibling: None,
             residue_paths: Vec::new(),
@@ -111,6 +187,11 @@ impl MintedRepo {
     /// Returns the root of the Git working tree.
     pub fn path(&self) -> &Path {
         self.repository.path()
+    }
+
+    /// Builds a hermetic Git command for this repository's test setup.
+    pub fn git_command(&self) -> Command {
+        self.git.command()
     }
 
     /// Returns the declaration path in the minted repository.
@@ -169,21 +250,22 @@ impl MintedRepo {
     fn make_sibling_checkout_drift(&mut self) -> io::Result<()> {
         let sibling = tempfile::tempdir()?;
         let path = sibling.path();
-        run_git(path, ["init"])?;
-        run_git(path, ["config", "user.name", "ck-release test"])?;
-        run_git(
+        self.git.run(path, ["init"])?;
+        self.git
+            .run(path, ["config", "user.name", "ck-release test"])?;
+        self.git.run(
             path,
             ["config", "user.email", "ck-release-test@example.invalid"],
         )?;
         fs::write(path.join("API.md"), "api=v1\n")?;
-        run_git(path, ["add", "API.md"])?;
-        run_git(path, ["commit", "-m", "pinned sibling API"])?;
-        let pinned_commit = git_stdout(path, ["rev-parse", "HEAD"])?;
+        self.git.run(path, ["add", "API.md"])?;
+        self.git.run(path, ["commit", "-m", "pinned sibling API"])?;
+        let pinned_commit = self.git.stdout(path, ["rev-parse", "HEAD"])?;
 
         fs::write(path.join("API.md"), "api=v2\n")?;
-        run_git(path, ["add", "API.md"])?;
-        run_git(path, ["commit", "-m", "sibling API drift"])?;
-        let current_commit = git_stdout(path, ["rev-parse", "HEAD"])?;
+        self.git.run(path, ["add", "API.md"])?;
+        self.git.run(path, ["commit", "-m", "sibling API drift"])?;
+        let current_commit = self.git.stdout(path, ["rev-parse", "HEAD"])?;
         let checkout_path = path.to_path_buf();
         self.sibling = Some(MintedSibling {
             directory: sibling,
@@ -224,11 +306,11 @@ impl MintedRepo {
     fn make_diverged_remote(&mut self) -> io::Result<()> {
         let remote = tempfile::tempdir()?;
         let remote_path = remote.path();
-        run_git(remote_path, ["init", "--bare"])?;
+        self.git.run(remote_path, ["init", "--bare"])?;
 
-        let branch = git_stdout(self.path(), ["branch", "--show-current"])?;
-        let base_commit = git_stdout(self.path(), ["rev-parse", "HEAD"])?;
-        run_git(
+        let branch = self.git.stdout(self.path(), ["branch", "--show-current"])?;
+        let base_commit = self.git.stdout(self.path(), ["rev-parse", "HEAD"])?;
+        self.git.run(
             self.path(),
             [
                 "remote",
@@ -237,7 +319,7 @@ impl MintedRepo {
                 remote_path.to_string_lossy().as_ref(),
             ],
         )?;
-        run_git(
+        self.git.run(
             self.path(),
             ["push", "--set-upstream", "origin", branch.as_str()],
         )?;
@@ -246,11 +328,14 @@ impl MintedRepo {
             self.path().join("README.md"),
             "minted test repository\nlocal divergence\n",
         )?;
-        run_git(self.path(), ["add", "README.md"])?;
-        run_git(self.path(), ["commit", "-m", "local divergence"])?;
+        self.git.run(self.path(), ["add", "README.md"])?;
+        self.git
+            .run(self.path(), ["commit", "-m", "local divergence"])?;
 
-        let base_tree = git_stdout(self.path(), ["rev-parse", "HEAD~1^{tree}"])?;
-        let remote_commit = git_in_git_dir(
+        let base_tree = self
+            .git
+            .stdout(self.path(), ["rev-parse", "HEAD~1^{tree}"])?;
+        let remote_commit = self.git.in_git_dir(
             remote_path,
             [
                 "commit-tree",
@@ -261,7 +346,7 @@ impl MintedRepo {
                 "remote divergence",
             ],
         )?;
-        git_in_git_dir(
+        self.git.in_git_dir(
             remote_path,
             [
                 "update-ref",
@@ -269,7 +354,7 @@ impl MintedRepo {
                 remote_commit.as_str(),
             ],
         )?;
-        run_git(self.path(), ["fetch", "origin"])?;
+        self.git.run(self.path(), ["fetch", "origin"])?;
 
         self.remote = Some(remote);
         Ok(())
@@ -492,56 +577,10 @@ fn default_declaration() -> &'static str {
     "{\n  \"version\": 1,\n  \"trains\": []\n}\n"
 }
 
-fn commit_baseline(root: &Path) -> io::Result<()> {
+fn commit_baseline(git: &GitEnvironment, root: &Path) -> io::Result<()> {
     // The staged path list is explicit so test setup can never stage `.git`.
-    run_git(root, ["add", "README.md", ".cortexkit/release.jsonc"])?;
-    run_git(root, ["commit", "-m", "mint test baseline"])
-}
-
-fn run_git<I, S>(root: &Path, arguments: I) -> io::Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()?;
-    command_result(output).map(|_| ())
-}
-
-fn git_stdout<I, S>(root: &Path, arguments: I) -> io::Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()?;
-    String::from_utf8(command_result(output)?)
-        .map(|value| value.trim().to_owned())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn git_in_git_dir<I, S>(git_dir: &Path, arguments: I) -> io::Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new("git")
-        .arg(format!("--git-dir={}", git_dir.display()))
-        .args(arguments)
-        .env("GIT_AUTHOR_NAME", "ck-release test")
-        .env("GIT_AUTHOR_EMAIL", "ck-release-test@example.invalid")
-        .env("GIT_COMMITTER_NAME", "ck-release test")
-        .env("GIT_COMMITTER_EMAIL", "ck-release-test@example.invalid")
-        .output()?;
-    String::from_utf8(command_result(output)?)
-        .map(|value| value.trim().to_owned())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    git.run(root, ["add", "README.md", ".cortexkit/release.jsonc"])?;
+    git.run(root, ["commit", "-m", "mint test baseline"])
 }
 
 fn command_result(output: Output) -> io::Result<Vec<u8>> {
@@ -559,6 +598,30 @@ fn command_result(output: Output) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{env, ffi::OsString};
+
+    struct EnvironmentOverride {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvironmentOverride {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvironmentOverride {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
     use cortexkit_release::{
         approval::{ApprovalSubject as PlanApprovalSubject, ApprovedArtifact},
         artifact::artifact_digest,
@@ -580,9 +643,29 @@ mod tests {
     }
 
     #[test]
+    fn minting_scrubs_an_ambient_xdg_git_ignore() {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join("git")).unwrap();
+        fs::write(fixture.path().join("git/ignore"), ".cortexkit/\n").unwrap();
+        let _ambient_xdg_config_home = EnvironmentOverride::set("XDG_CONFIG_HOME", fixture.path());
+
+        let repository = MintedRepo::mint(RepositoryShape::Valid).unwrap();
+        let status = repository
+            .git_command()
+            .arg("-C")
+            .arg(repository.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty());
+    }
+
+    #[test]
     fn minting_shapes_and_recording_fakes_are_hermetic() {
         let valid = MintedRepo::mint(RepositoryShape::Valid).unwrap();
-        let status = Command::new("git")
+        let status = valid
+            .git_command()
             .arg("-C")
             .arg(valid.path())
             .args(["status", "--porcelain"])
@@ -598,7 +681,8 @@ mod tests {
         );
 
         let diverged = MintedRepo::mint(RepositoryShape::DivergedRemote).unwrap();
-        let divergence = Command::new("git")
+        let divergence = diverged
+            .git_command()
             .arg("-C")
             .arg(diverged.path())
             .args(["status", "--porcelain=v2", "--branch"])

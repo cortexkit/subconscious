@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::{
     config,
     inventory::Inventory,
-    model::{AlphaTarget, Component, ReleaseAvailability},
+    model::{AlphaTarget, Component, ReleaseAvailability, ReleaseResolutionStrategy},
 };
 
 pub trait ArtifactSource {
@@ -41,6 +41,16 @@ struct ReleaseManifest {
     tag_name: String,
     #[serde(default)]
     assets: Vec<ReleaseAsset>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "prereleases intentionally qualify for tag-pattern resolution"
+    )]
+    prerelease: bool,
+    #[serde(default)]
+    created_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -63,10 +73,16 @@ impl ReleaseArtifactSource {
             release_bases.insert(
                 component,
                 std::env::var(key).unwrap_or_else(|_| {
-                    format!(
-                        "https://github.com/cortexkit/{}/releases/latest/download",
-                        component.repository()
-                    )
+                    match component.release_resolution_strategy() {
+                        ReleaseResolutionStrategy::Latest => format!(
+                            "https://github.com/cortexkit/{}/releases/latest/download",
+                            component.repository()
+                        ),
+                        ReleaseResolutionStrategy::TagPrefix(_) => format!(
+                            "https://github.com/cortexkit/{}/releases/download",
+                            component.repository()
+                        ),
+                    }
                 }),
             );
         }
@@ -112,33 +128,63 @@ impl ReleaseArtifactSource {
         })
     }
 
-    fn release_base(&self, component: Component) -> &str {
-        self.release_bases
+    fn release_base(&self, component: Component, tag: &str) -> String {
+        let base = self
+            .release_bases
             .get(&component)
             .expect("all setup components have a release base")
+            .trim_end_matches('/');
+        match component.release_resolution_strategy() {
+            ReleaseResolutionStrategy::Latest => base.to_string(),
+            ReleaseResolutionStrategy::TagPrefix(_) => format!("{base}/{tag}"),
+        }
+    }
+
+    fn manifest_url(&self, component: Component) -> String {
+        let api_base = self.api_base.trim_end_matches('/');
+        match component.release_resolution_strategy() {
+            ReleaseResolutionStrategy::Latest => format!(
+                "{api_base}/repos/cortexkit/{}/releases/latest",
+                component.repository()
+            ),
+            ReleaseResolutionStrategy::TagPrefix(_) => format!(
+                "{api_base}/repos/cortexkit/{}/releases?per_page=100",
+                component.repository()
+            ),
+        }
     }
 
     fn manifest(&mut self, component: Component) -> Result<&ReleaseManifest, String> {
         if !self.manifests.contains_key(&component) {
             let temporary = temporary_path("release.json");
-            let api_base = self.api_base.trim_end_matches('/');
-            let url = format!(
-                "{api_base}/repos/cortexkit/{}/releases/latest",
-                component.repository()
-            );
-            download(&url, &temporary).map_err(|error| {
-                format!("could not resolve latest {} release: {error}", component)
-            })?;
-            let manifest = fs::read_to_string(&temporary)
-                .map_err(|error| format!("could not read latest {} release: {error}", component))
-                .and_then(|contents| {
+            let url = self.manifest_url(component);
+            download(&url, &temporary)
+                .map_err(|error| format!("could not resolve {} release: {error}", component))?;
+            let contents = fs::read_to_string(&temporary)
+                .map_err(|error| format!("could not read {} release: {error}", component))?;
+            let _ = fs::remove_file(&temporary);
+            let manifest = match component.release_resolution_strategy() {
+                ReleaseResolutionStrategy::Latest => {
                     serde_json::from_str::<ReleaseManifest>(&contents).map_err(|error| {
                         format!("could not parse latest {} release: {error}", component)
+                    })?
+                }
+                ReleaseResolutionStrategy::TagPrefix(prefix) => {
+                    let releases = serde_json::from_str::<Vec<ReleaseManifest>>(&contents)
+                        .map_err(|error| {
+                            format!("could not parse {} release list: {error}", component)
+                        })?;
+                    newest_matching_release(releases, prefix).unwrap_or_else(|| ReleaseManifest {
+                        tag_name: format!("{prefix}*"),
+                        assets: Vec::new(),
+                        draft: false,
+                        prerelease: false,
+                        created_at: String::new(),
                     })
-                })?;
-            let _ = fs::remove_file(&temporary);
+                }
+            };
             if manifest.tag_name.trim().is_empty() {
-                return Err(format!("latest {component} release has no tag"));
+                return Err(format!("{component} release has no tag"));
             }
             self.manifests.insert(component, manifest);
         }
@@ -175,7 +221,8 @@ impl ArtifactSource for ReleaseArtifactSource {
         })?;
         let archive = temp.join(&archive_name);
         let sidecar = temp.join(&sidecar_name);
-        let base = self.release_base(component).trim_end_matches('/');
+        let tag = self.manifest(component)?.tag_name.clone();
+        let base = self.release_base(component, &tag);
         download(&format!("{base}/{archive_name}"), &archive)?;
         download(&format!("{base}/{sidecar_name}"), &sidecar)?;
         let expected = parse_sidecar(
@@ -515,6 +562,16 @@ pub fn digest_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn newest_matching_release(
+    releases: impl IntoIterator<Item = ReleaseManifest>,
+    tag_prefix: &str,
+) -> Option<ReleaseManifest> {
+    releases
+        .into_iter()
+        .filter(|release| !release.draft && release.tag_name.starts_with(tag_prefix))
+        .max_by(|left, right| left.created_at.cmp(&right.created_at))
+}
+
 fn platform_binary(binary: &str) -> String {
     if cfg!(windows) {
         format!("{binary}.exe")
@@ -603,6 +660,127 @@ mod tests {
             )
             .expect("valid sidecar"),
             digest
+        );
+    }
+
+    fn release(tag: &str, created_at: &str, draft: bool, prerelease: bool) -> ReleaseManifest {
+        ReleaseManifest {
+            tag_name: tag.to_string(),
+            assets: vec![
+                ReleaseAsset {
+                    name: "ck-mc-linux-x64.zip".to_string(),
+                },
+                ReleaseAsset {
+                    name: "ck-mc-linux-x64.zip.sha256".to_string(),
+                },
+            ],
+            draft,
+            prerelease,
+            created_at: created_at.to_string(),
+        }
+    }
+
+    fn source_with_manifest(
+        component: Component,
+        manifest: ReleaseManifest,
+    ) -> ReleaseArtifactSource {
+        ReleaseArtifactSource {
+            target: AlphaTarget::LinuxX64,
+            api_base: "https://api.example.test".to_string(),
+            release_bases: BTreeMap::new(),
+            manifests: BTreeMap::from([(component, manifest)]),
+        }
+    }
+
+    #[test]
+    fn newest_matching_release_uses_created_at_not_tag_order() {
+        let newest = newest_matching_release(
+            [
+                release("ck-mc-alpha.ffffffff", "2026-01-01T00:00:00Z", false, true),
+                release("ck-mc-alpha.00000000", "2026-02-01T00:00:00Z", false, true),
+                release("v0.41.1", "2026-03-01T00:00:00Z", false, false),
+            ],
+            "ck-mc-",
+        )
+        .expect("matching release");
+        assert_eq!(newest.tag_name, "ck-mc-alpha.00000000");
+    }
+
+    #[test]
+    fn prerelease_qualifies_for_mc_resolution() {
+        let selected = newest_matching_release(
+            [release(
+                "ck-mc-alpha.1234abcd",
+                "2026-02-01T00:00:00Z",
+                false,
+                true,
+            )],
+            "ck-mc-",
+        )
+        .expect("prerelease qualifies");
+        assert_eq!(selected.tag_name, "ck-mc-alpha.1234abcd");
+        assert!(selected.prerelease);
+    }
+
+    #[test]
+    fn draft_matching_release_is_excluded() {
+        let selected = newest_matching_release(
+            [
+                release("ck-mc-alpha.11111111", "2026-01-01T00:00:00Z", false, true),
+                release("ck-mc-alpha.22222222", "2026-02-01T00:00:00Z", true, true),
+            ],
+            "ck-mc-",
+        )
+        .expect("published matching release");
+        assert_eq!(selected.tag_name, "ck-mc-alpha.11111111");
+    }
+
+    #[test]
+    fn no_matching_release_uses_not_yet_published_arm() {
+        let manifest = newest_matching_release(
+            [release("v0.41.1", "2026-03-01T00:00:00Z", false, false)],
+            "ck-mc-",
+        )
+        .unwrap_or_else(|| ReleaseManifest {
+            tag_name: "ck-mc-*".to_string(),
+            assets: Vec::new(),
+            draft: false,
+            prerelease: false,
+            created_at: String::new(),
+        });
+        let mut source = source_with_manifest(Component::Mc, manifest);
+        assert_eq!(
+            source
+                .release_availability(Component::Mc)
+                .expect("availability"),
+            ReleaseAvailability::NotYetPublished {
+                release_tag: "ck-mc-*".to_string(),
+                missing_asset: "ck-mc-linux-x64.zip".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn only_mc_uses_tag_pattern_resolution() {
+        let source = source_with_manifest(
+            Component::Mc,
+            release("ck-mc-alpha.1234abcd", "2026-01-01T00:00:00Z", false, true),
+        );
+        assert!(matches!(
+            Component::Mc.release_resolution_strategy(),
+            ReleaseResolutionStrategy::TagPrefix("ck-mc-")
+        ));
+        assert_eq!(
+            Component::Aft.release_resolution_strategy(),
+            ReleaseResolutionStrategy::Latest
+        );
+        assert_eq!(
+            source.manifest_url(Component::Aft),
+            "https://api.example.test/repos/cortexkit/aft/releases/latest"
+        );
+        assert_eq!(
+            source.manifest_url(Component::Mc),
+            "https://api.example.test/repos/cortexkit/magic-context/releases?per_page=100"
         );
     }
 }

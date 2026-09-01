@@ -44,6 +44,13 @@ for binary in "${BINARIES[@]}"; do
   codesign --force --options runtime --timestamp --sign "$identity" "$binary_path"
   codesign --verify --strict --verbose=2 "$binary_path"
 
+  # Execute the signed binary: the hardened runtime can break a binary whose
+  # signature still verifies perfectly, and nothing else runs the bytes that
+  # actually ship.
+  version_output="$("$binary_path" --version)" || fail "signed binary refuses to run: ${binary}"
+  [[ -n "$version_output" ]] || fail "signed binary produced no --version output: ${binary}"
+  echo "signed ${binary} runs: ${version_output}"
+
   signed_identity="$(
     codesign -dv --verbose=4 "$binary_path" 2>&1 |
       awk -F= '$1 == "Authority" && $2 ~ /^Developer ID Application:/ { print $2; exit }'
@@ -90,4 +97,9 @@ for binary in "${BINARIES[@]}"; do
   if ! xcrun stapler staple "$archive"; then
     record_staple_pending "$archive"
   fi
+
+  # Recompute the digest sidecar from the bytes that will actually publish:
+  # stapling mutates the archive when it succeeds, and a sidecar computed at
+  # package time would then describe bytes nobody receives.
+  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
 done

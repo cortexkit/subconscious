@@ -22,3 +22,5 @@
 /ARCHITECTURE.md
 /STRUCTURE.md
 docs/private/
+.build/
+.wrangler/

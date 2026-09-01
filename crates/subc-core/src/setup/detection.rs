@@ -5,8 +5,6 @@ use super::{
 
 const WINDOWS_MC_OWNER_GATE: &str = "automatic MC conversion on Windows is disabled until the MC owner confirms standalone installs use the owner-pinned path";
 
-/// Converts the read-only MC classification into the planner's mutation-neutral
-/// offer state. SQLite busy means a live installation, but it never grants an
 /// automatic conversion offer.
 pub fn mc_detection_outcome(detection: &McDetection) -> DetectionOutcome {
     match detection.classification {

@@ -415,7 +415,16 @@ impl fmt::Display for SetupOperation {
         match self {
             Self::ObservePlatform => formatter.write_str("observe alpha platform support"),
             Self::OfferOptionalComponents => {
-                formatter.write_str("offer optional components: aft, mc, insula — browser-cookie providers dark by construction on Windows (Chrome App-Bound Encryption); file/API providers full; cookie lane via claustrum deposit; claustrum; synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives")
+                // One line per component so a caveat reads against its owner
+                // rather than swallowing the components listed after it.
+                formatter.write_str(
+                    "offer optional components:\n\
+                     \x20 aft\n\
+                     \x20 mc\n\
+                     \x20 insula — browser-cookie providers dark by construction on Windows (Chrome App-Bound Encryption); file/API providers full; cookie lane via claustrum deposit\n\
+                     \x20 claustrum\n\
+                     \x20 synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives",
+                )
             }
             Self::OfferConversion { component } => {
                 write!(formatter, "offer standalone {component} conversion")
@@ -425,7 +434,9 @@ impl fmt::Display for SetupOperation {
             }
             Self::InstallComponent { component } => write!(formatter, "install {component}"),
             Self::ConfigureComponent { component } => write!(formatter, "configure {component}"),
-            Self::BootstrapClaustrum { key_path: Some(key_path) } => write!(
+            Self::BootstrapClaustrum {
+                key_path: Some(key_path),
+            } => write!(
                 formatter,
                 "bootstrap claustrum with ck auth bootstrap --key-path {}",
                 key_path.display()
@@ -433,7 +444,9 @@ impl fmt::Display for SetupOperation {
             Self::BootstrapClaustrum { key_path: None } => {
                 formatter.write_str("bootstrap claustrum with ck auth bootstrap")
             }
-            Self::RescanComponent { component } => write!(formatter, "rescan {component} module entry"),
+            Self::RescanComponent { component } => {
+                write!(formatter, "rescan {component} module entry")
+            }
             Self::EnableComponent { component } => write!(formatter, "enable {component} module"),
             Self::RegisterRuntime => formatter.write_str("register the per-user daemon runtime"),
             Self::StartRuntime => formatter.write_str("start the per-user daemon runtime"),

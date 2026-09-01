@@ -1,0 +1,10 @@
+name = "ck-install"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+
+# Custom domain (not a zone route): creates and owns the apex DNS record.
+# The apex carried no records before this; when a real site takes the apex,
+# convert this back to a zone route on cortexkit.io/install*.
+routes = [
+  { pattern = "cortexkit.io", custom_domain = true }
+]

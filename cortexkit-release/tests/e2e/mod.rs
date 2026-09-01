@@ -1,5 +1,8 @@
+#[path = "../support/git.rs"]
+mod git_support;
+
 use super::*;
-use std::{fs, path::Path, process::Command as ProcessCommand};
+use std::{fs, path::Path};
 use tempfile::TempDir;
 
 const DECLARATION: &str = r#"{
@@ -25,10 +28,16 @@ const DECLARATION: &str = r#"{
 
 fn mint_repository() -> TempDir {
     let repository = tempfile::tempdir().unwrap();
+    let git_config_home = tempfile::tempdir().unwrap();
     let root = repository.path();
-    run_git(root, ["init"]);
-    run_git(root, ["config", "user.name", "ck-release e2e"]);
+    run_git(git_config_home.path(), root, ["init"]);
     run_git(
+        git_config_home.path(),
+        root,
+        ["config", "user.name", "ck-release e2e"],
+    );
+    run_git(
+        git_config_home.path(),
         root,
         ["config", "user.email", "ck-release-e2e@example.invalid"],
     );
@@ -40,13 +49,17 @@ fn mint_repository() -> TempDir {
     )
     .unwrap();
     fs::write(root.join("README.md"), "runtime-minted repository\n").unwrap();
-    run_git(root, ["add", "."]);
-    run_git(root, ["commit", "-m", "mint synthetic release repository"]);
+    run_git(git_config_home.path(), root, ["add", "."]);
+    run_git(
+        git_config_home.path(),
+        root,
+        ["commit", "-m", "mint synthetic release repository"],
+    );
     repository
 }
 
-fn run_git<const N: usize>(root: &Path, arguments: [&str; N]) {
-    let result = ProcessCommand::new("git")
+fn run_git<const N: usize>(config_home: &Path, root: &Path, arguments: [&str; N]) {
+    let result = git_support::git_command(config_home)
         .args(arguments)
         .current_dir(root)
         .output()

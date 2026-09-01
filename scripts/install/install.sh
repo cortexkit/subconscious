@@ -224,8 +224,8 @@ case "$raw_arch" in
   *) arch="$raw_arch" ;;
 esac
 case "${os}-${arch}" in
-  darwin-arm64|linux-x64) ;;
-  *) refuse "unsupported-platform" "${os}-${arch}; supported tuples are darwin-arm64, linux-x64, windows-x64" ;;
+  darwin-arm64|linux-x64|linux-arm64) ;;
+  *) refuse "unsupported-platform" "${os}-${arch}; supported tuples are darwin-arm64, linux-x64, linux-arm64, windows-x64" ;;
 esac
 
 if [[ "$os" == "linux" ]]; then

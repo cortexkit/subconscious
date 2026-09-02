@@ -33,9 +33,6 @@ use crate::{
 };
 use std::sync::Arc;
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
 pub const DEFAULT_SUBC_PORT: u16 = 8757;
 pub const SUBC_PORT_ENV: &str = "SUBC_PORT";
 const CONNECTION_FILE_NAME: &str = "subc-connection.json";
@@ -900,43 +897,31 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
 /// symptom would be "no daemon running" rather than anything pointing at a
 /// naming mismatch.
 pub fn user_connection_token() -> String {
+    // On unix the token is the real uid, read from the kernel. An earlier
+    // version probed it by creating a temp file and reading the file's owner;
+    // any transient failure of that probe (fd exhaustion, a same-tick name
+    // collision) silently sent the caller down the env-derived fallback with a
+    // DIFFERENT token for the same user, so ck would look for a connection
+    // file the daemon never wrote. Identity must not depend on a filesystem
+    // operation succeeding.
     #[cfg(unix)]
-    if let Some(uid) = unix_uid_token() {
-        return uid;
+    {
+        rustix::process::getuid().as_raw().to_string()
     }
 
-    for key in ["USER", "USERNAME", "HOME", "USERPROFILE"] {
-        if let Some(value) = non_empty_os_var(key) {
-            return sanitize_token(&value.to_string_lossy());
+    #[cfg(not(unix))]
+    {
+        for key in ["USER", "USERNAME", "HOME", "USERPROFILE"] {
+            if let Some(value) = non_empty_os_var(key) {
+                return sanitize_token(&value.to_string_lossy());
+            }
         }
+
+        "unknown".to_string()
     }
-
-    "unknown".to_string()
 }
 
-#[cfg(unix)]
-fn unix_uid_token() -> Option<String> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let probe_path = env::temp_dir().join(format!(".subc-uid-probe-{}-{nonce}", process::id()));
-
-    let uid = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe_path)
-        .ok()
-        .and_then(|file| {
-            let uid = file.metadata().ok().map(|metadata| metadata.uid());
-            drop(file);
-            let _ = fs::remove_file(&probe_path);
-            uid
-        });
-
-    uid.map(|uid| uid.to_string())
-}
-
+#[cfg(not(unix))]
 fn sanitize_token(raw: &str) -> String {
     let mut token = String::new();
     for ch in raw.chars() {
@@ -1247,6 +1232,25 @@ mod tests {
             env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
         );
         assert_eq!(source, ConnectionFileSource::TempDirFallback);
+    }
+
+    /// Concurrent callers must derive one token. The former temp-file uid probe
+    /// could fail transiently (same-tick name collision, fd exhaustion) and send
+    /// the loser down the env-derived fallback with a different identity for the
+    /// same user; this fence keeps identity independent of filesystem luck.
+    #[test]
+    fn user_connection_token_is_stable_under_concurrent_callers() {
+        let expected = user_connection_token();
+        let workers: Vec<_> = (0..32)
+            .map(|_| {
+                std::thread::spawn(|| (0..40).map(|_| user_connection_token()).collect::<Vec<_>>())
+            })
+            .collect();
+        for worker in workers {
+            for token in worker.join().expect("probe thread") {
+                assert_eq!(token, expected, "token diverged under concurrent probes");
+            }
+        }
     }
 
     #[test]

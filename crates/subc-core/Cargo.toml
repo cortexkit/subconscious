@@ -49,6 +49,10 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-uti
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(unix)'.dependencies]
+# Already in the tree via fs4; safe getuid without an unsafe block.
+rustix = { version = "1", default-features = false, features = ["process"] }
+
 [dev-dependencies]
 loom = "0.7"
 tokio = { version = "1", features = ["test-util"] }

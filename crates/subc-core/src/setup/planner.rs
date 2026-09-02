@@ -503,7 +503,7 @@ mod tests {
             Component::Aft,
             ReleaseAvailability::NotYetPublished {
                 release_tag: "v0.1.0".to_string(),
-                missing_asset: "aft-linux-x64.zip".to_string(),
+                missing_asset: "ck-aft-linux-x64.zip".to_string(),
             },
         );
         let incomplete_plan = plan_setup(&incomplete, &SetupRequest::install(vec![Component::Aft]));
@@ -514,7 +514,7 @@ mod tests {
             .expect("typed temporal release outcome");
         assert_eq!(
             outcome.to_string(),
-            "aft: no aft-linux-x64.zip asset in v0.1.0 yet — the module's owner has not published this platform"
+            "aft: no ck-aft-linux-x64.zip asset in v0.1.0 yet — the module's owner has not published this platform"
         );
     }
 

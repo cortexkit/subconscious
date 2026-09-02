@@ -321,7 +321,11 @@ pub fn component_binaries_for_target(
 ) -> &'static [&'static str] {
     match (component, target) {
         (Component::Core, _) => &["ck-subc", "ck-subc-mcp"],
-        (Component::Aft, _) => &["aft"],
+        // The managed name is the daemon-placed name (`ck-aft`), not the
+        // crate's own binary name: the spec inventory, `ck upgrade`, and the
+        // release inventory gate all key on it, so setup must too or an
+        // installed aft is never upgradable.
+        (Component::Aft, _) => &["ck-aft"],
         (Component::Mc, AlphaTarget::DarwinArm64 | AlphaTarget::LinuxX64) => &["ck-mc"],
         (Component::Mc, AlphaTarget::WindowsX64) => &[],
         (Component::Insula, _) => &["ck-insula"],

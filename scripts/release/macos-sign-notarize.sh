@@ -51,9 +51,12 @@ for binary in "${BINARIES[@]}"; do
   [[ -n "$version_output" ]] || fail "signed binary produced no --version output: ${binary}"
   echo "signed ${binary} runs: ${version_output}"
 
+  # awk must consume codesign's whole output: an early `exit` on the first
+  # match leaves codesign writing into a closed pipe, and under pipefail that
+  # SIGPIPE (141) aborts the release before notarization, timing-dependently.
   signed_identity="$(
     codesign -dv --verbose=4 "$binary_path" 2>&1 |
-      awk -F= '$1 == "Authority" && $2 ~ /^Developer ID Application:/ { print $2; exit }'
+      awk -F= '$1 == "Authority" && $2 ~ /^Developer ID Application:/ && !found { print $2; found = 1 }'
   )"
   if [[ "$signed_identity" != "$identity" ]]; then
     fail "refusing mixed signing identities before notarization: ${binary} has '${signed_identity:-no Developer ID Application authority}', expected '${identity}'"

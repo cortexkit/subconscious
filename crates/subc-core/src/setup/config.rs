@@ -286,7 +286,16 @@ mod tests {
             .expect("claustrum configuration is additive")
             .expect("claustrum entry is absent");
         assert!(change.after.contains("CK_MASTER_KEY_PATH"));
-        assert!(change.after.contains(&*key_path.to_string_lossy()));
+        // Compare the JSON-encoded form: on Windows the path's separators are
+        // escaped in the written text, so a raw substring check reads false
+        // against a correct file.
+        let encoded_key_path = serde_json::to_string(&*key_path.to_string_lossy())
+            .expect("path encodes as a JSON string");
+        assert!(
+            change.after.contains(&encoded_key_path),
+            "generated config does not carry the key path {encoded_key_path}: {}",
+            change.after
+        );
         assert!(change
             .after
             .contains("without it any local process completing the handshake"));

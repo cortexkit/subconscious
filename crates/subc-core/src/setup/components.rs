@@ -25,6 +25,14 @@ pub trait ArtifactSource {
     ) -> Result<String, String>;
 
     fn expected_version(&mut self, component: Component) -> Result<String, String>;
+
+    /// Confirm the placed binary self-reports `expected`. The default executes
+    /// `<destination> --version`, which is what every production source relies
+    /// on; a test source may answer from the bytes it wrote instead, because a
+    /// fake binary is not executable on every platform.
+    fn verify_version(&mut self, destination: &Path, expected: &str) -> Result<(), String> {
+        verify_version(destination, expected)
+    }
 }
 
 /// Downloads only convention-derived archives and verifies each archive against
@@ -375,7 +383,8 @@ pub fn install_component<S: ArtifactSource>(
             ));
         }
         let digest = source.install(component, binary, &destination)?;
-        verify_version(&destination, &source.expected_version(component)?)?;
+        let expected = source.expected_version(component)?;
+        source.verify_version(&destination, &expected)?;
         let mut fields = Map::new();
         fields.insert(
             "component".to_string(),
@@ -595,6 +604,11 @@ mod tests {
     use super::*;
     use subc_core::test_support::TestTempDir;
 
+    /// On unix the fake is a real shell script and the default `--version`
+    /// execution runs unchanged, so the install path is exercised end to end.
+    /// Windows cannot execute a script named `.exe`, so there the fake answers
+    /// from the bytes it wrote; the execution arm is covered by the alpha CI
+    /// workflow against real archives.
     #[derive(Default)]
     struct FakeSource;
 
@@ -618,6 +632,19 @@ mod tests {
 
         fn expected_version(&mut self, _component: Component) -> Result<String, String> {
             Ok("1.2.3".to_string())
+        }
+
+        #[cfg(windows)]
+        fn verify_version(&mut self, destination: &Path, expected: &str) -> Result<(), String> {
+            let content = fs::read_to_string(destination).map_err(|error| error.to_string())?;
+            if content.contains(expected) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "fake binary at {} does not carry version {expected}",
+                    destination.display()
+                ))
+            }
         }
     }
 
@@ -649,8 +676,8 @@ mod tests {
                 "ck-synapse",
                 "ck-synapse-opctl",
                 "ck-synapse-worker-llama",
-                "ck-synapse-worker-mlx",
                 "ck-synapse-worker-ane",
+                "ck-synapse-worker-ane-swift",
                 "ck-synapse-worker-decode",
             ]
         );

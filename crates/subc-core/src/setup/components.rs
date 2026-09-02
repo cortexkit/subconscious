@@ -330,12 +330,18 @@ pub fn component_binaries_for_target(
         (Component::Mc, AlphaTarget::WindowsX64) => &[],
         (Component::Insula, _) => &["ck-insula"],
         (Component::Claustrum, _) => &["ck-claustrum", "ck-auth"],
+        // ck-synapse-worker-mlx is deliberately absent: it is synapse's frozen
+        // reference engine, not a serving lane (production Metal embedding runs
+        // in-process in ck-synapse), and its metallib can only load from beside
+        // the executable, which the one-binary-per-archive contract cannot carry.
+        // ck-synapse-worker-ane-swift is the CoreML executable the ane launcher
+        // resolves as its sibling, so it ships as its own named asset.
         (Component::Synapse, AlphaTarget::DarwinArm64) => &[
             "ck-synapse",
             "ck-synapse-opctl",
             "ck-synapse-worker-llama",
-            "ck-synapse-worker-mlx",
             "ck-synapse-worker-ane",
+            "ck-synapse-worker-ane-swift",
             "ck-synapse-worker-decode",
         ],
         (Component::Synapse, AlphaTarget::LinuxX64 | AlphaTarget::WindowsX64) => {

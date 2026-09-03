@@ -188,10 +188,11 @@ Rules:
 ### Producer: the index worker
 
 The worker at `infra/cortexkit-io-worker` (the same worker that serves
-`/install`) owns the index. It ingests on the org `release` webhook
-(`published`, `edited`, `deleted` — HMAC-verified with the webhook secret) and
-on a daily cron, rebuilding the whole document from every component's
-releases using a server-side GitHub token (5,000 req/h; the per-user
+`/install`) owns the index. It HMAC-verifies and acknowledges accepted org
+`release` webhooks (`published`, `edited`, `deleted`) immediately; one Durable
+Object coordinator rebuilds the whole document once per burst after a
+30-second debounce, single-flight, including requests from the daily cron,
+using a server-side GitHub token (5,000 req/h; the per-user
 budget disappears from the design). Per component it resolves the current
 release by the owner's rule — `latest` non-draft for every component except
 mc, whose current release is the newest by `created_at` among

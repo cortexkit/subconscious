@@ -1,7 +1,10 @@
+import { rebuildStatus, requestRebuild } from "./coordinator";
 import type { Env } from "./env";
 import { timingSafeEqualString } from "./hex";
 import { verifyGitHubSignature } from "./hmac";
-import { KV_REFUSALS, loadIndexBundle, rebuild } from "./rebuild";
+import { KV_REFUSALS, loadIndexBundle } from "./rebuild";
+
+export { RebuildCoordinator } from "./coordinator";
 
 // Serves the canonical CortexKit install scripts at cortexkit.io/install.
 // The scripts stay repo-canonical in cortexkit/subconscious; this worker
@@ -17,7 +20,7 @@ const PATHS: Record<string, { file: string; type: string }> = {
 const RELEASE_ACTIONS = new Set(["published", "edited", "deleted"]);
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/$/, "");
 
@@ -31,20 +34,20 @@ export default {
       return serveRefusals(request, env);
     }
     if (path === "/releases/v1/reingest" && request.method === "POST") {
-      return handleReingest(request, env);
+      return handleReingest(request, env, ctx);
+    }
+    if (path === "/releases/v1/status" && request.method === "GET") {
+      return handleStatus(request, env);
     }
     if (path === "/webhooks/github" && request.method === "POST") {
-      return handleWebhook(request, env);
+      return handleWebhook(request, env, ctx);
     }
 
     return handleInstall(path);
   },
 
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    const result = await rebuild(env);
-    if (!result.ok) {
-      console.error(`scheduled rebuild failed: ${result.error}`);
-    }
+    await requestRebuild(env, "cron");
   },
 } satisfies ExportedHandler<Env>;
 
@@ -118,18 +121,22 @@ async function serveRefusals(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleReingest(request: Request, env: Env): Promise<Response> {
+async function handleReingest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   if (!adminAuthorized(request, env)) {
     return new Response("unauthorized\n", { status: 401 });
   }
-  const result = await rebuild(env);
-  if (!result.ok) {
-    return new Response(`${result.error}\n`, { status: 500 });
-  }
-  return new Response("ok\n", { status: 200 });
+  await queueRebuild(ctx, env, "admin", true);
+  return queuedResponse();
 }
 
-async function handleWebhook(request: Request, env: Env): Promise<Response> {
+async function handleStatus(request: Request, env: Env): Promise<Response> {
+  if (!adminAuthorized(request, env)) {
+    return new Response("unauthorized\n", { status: 401 });
+  }
+  return Response.json(await rebuildStatus(env));
+}
+
+async function handleWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const raw = await request.arrayBuffer();
   const ok = await verifyGitHubSignature(
     env.GITHUB_WEBHOOK_SECRET,
@@ -152,11 +159,32 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
   if (!RELEASE_ACTIONS.has(payload.action ?? "")) {
     return new Response(null, { status: 204 });
   }
-  const result = await rebuild(env);
-  if (!result.ok) {
-    return new Response(`${result.error}\n`, { status: 500 });
+  await queueRebuild(ctx, env, `release:${payload.action}`);
+  return queuedResponse();
+}
+
+async function queueRebuild(
+  ctx: ExecutionContext | undefined,
+  env: Env,
+  reason: string,
+  immediate = false,
+): Promise<void> {
+  const queued = requestRebuild(env, reason, immediate).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "unknown error";
+    console.error(`rebuild coordinator queue failed: ${message}`);
+  });
+  if (ctx) {
+    ctx.waitUntil(queued);
+    return;
   }
-  return new Response("ok\n", { status: 200 });
+  await queued;
+}
+
+function queuedResponse(): Response {
+  return new Response('{"queued":true}', {
+    status: 202,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function adminAuthorized(request: Request, env: Env): boolean {

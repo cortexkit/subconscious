@@ -1,5 +1,6 @@
 export interface Env {
   RELEASE_INDEX: KVNamespace;
+  REBUILD_COORDINATOR: DurableObjectNamespace;
   GITHUB_WEBHOOK_SECRET: string;
   ADMIN_TOKEN: string;
   RELEASE_INDEX_SIGNING_KEY: string;

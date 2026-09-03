@@ -228,6 +228,26 @@ pub fn component_binaries(component: Component) -> &'static [&'static str] {
     component_binaries_for_target(component, host_alpha_target())
 }
 
+/// The binary the daemon spawns for a module. Target-independent by name:
+/// what varies per target is the sidecar set beside it, never the program.
+/// Core is not a module the daemon spawns, so it has no program here.
+///
+/// This is the name the configuration writer records, so it must be the
+/// first managed binary on every target that carries the component at all
+/// — `module_program_leads_every_target_set` pins that against the
+/// per-target table. Two tables encoding one fact drift unless a test binds
+/// them; that test is what makes a second table admissible.
+pub fn module_program(component: Component) -> Option<&'static str> {
+    match component {
+        Component::Core => None,
+        Component::Aft => Some("ck-aft"),
+        Component::Mc => Some("ck-mc"),
+        Component::Insula => Some("ck-insula"),
+        Component::Claustrum => Some("ck-claustrum"),
+        Component::Synapse => Some("ck-synapse"),
+    }
+}
+
 /// Release asset sets are data, not filesystem discovery, so setup never loses
 /// a synapse worker merely because a different worker happens to be installed.
 pub fn component_binaries_for_target(
@@ -548,6 +568,38 @@ mod tests {
 
     fn fixture_dir(name: &str) -> TestTempDir {
         TestTempDir::new(name)
+    }
+
+    /// The program table and the per-target binary table encode one fact
+    /// twice; this is the binding that keeps them from drifting. Every
+    /// target that carries a module at all must list its program first, and
+    /// core — which the daemon does not spawn — has no program.
+    #[test]
+    fn module_program_leads_every_target_set() {
+        for component in Component::ALL {
+            for target in [
+                AlphaTarget::DarwinArm64,
+                AlphaTarget::LinuxX64,
+                AlphaTarget::WindowsX64,
+            ] {
+                let set = component_binaries_for_target(component, target);
+                match module_program(component) {
+                    None => assert_eq!(component, Component::Core, "{component} needs a program"),
+                    Some(program) => {
+                        if let Some(first) = set.first() {
+                            assert_eq!(
+                                *first, program,
+                                "{component} on {target:?}: the daemon-spawned program must lead the set"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The empty set is a real state (mc on Windows), and the program
+        // must still resolve there: the config is target-independent.
+        assert!(component_binaries_for_target(Component::Mc, AlphaTarget::WindowsX64).is_empty());
+        assert_eq!(module_program(Component::Mc), Some("ck-mc"));
     }
 
     #[test]

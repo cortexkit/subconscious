@@ -201,19 +201,16 @@ fn insert_claustrum_reserved_comment(rendered: &mut String) {
     );
 }
 
-/// The binary the daemon spawns for a module: the first entry of the
-/// component's managed set. Read from the one table that owns the names
-/// (`components::component_binaries`), never restated here — a second
-/// table pointed the config at `bin/aft` after the archive was corrected to
+/// The binary the daemon spawns for a module, read from the components
+/// table rather than restated here: a second copy of the names once
+/// pointed the config at `bin/aft` after the archive was corrected to
 /// install `ck-aft`, and the daemon failed to spawn a path that no longer
-/// existed. Two tables encoding one fact drift; one table cannot.
+/// existed. The name is target-independent (only the sidecar set varies),
+/// so writing a module's configuration never depends on the host — the
+/// per-target availability gate is the planner's, upstream of this.
 fn daemon_binary(component: Component) -> &'static str {
-    super::components::component_binaries(component)
-        .first()
-        .copied()
-        // The only empty set is mc on Windows, which the planner marks
-        // DeclaredUnavailable before any configure step can reach here.
-        .expect("every configurable module has at least one managed binary")
+    super::components::module_program(component)
+        .expect("only modules the daemon spawns are written into the configuration")
 }
 
 fn platform_binary(name: &str) -> String {
@@ -317,12 +314,16 @@ mod tests {
                 .pointer(&format!("/modules/{module_id}/program"))
                 .and_then(Value::as_str)
                 .expect("program written");
-            let installed = super::super::components::component_binaries(component);
-            let expected = root.join(platform_binary(installed[0]));
+            // The program is target-independent: on a target without the
+            // component (mc on Windows) the config is still writable, and
+            // the planner's availability gate is what refuses the install.
+            let expected = root.join(platform_binary(
+                super::super::components::module_program(component).expect("module program"),
+            ));
             assert_eq!(
                 Path::new(program),
                 expected.as_path(),
-                "{component}: config must spawn the first installed binary"
+                "{component}: config must spawn the module program"
             );
         }
     }

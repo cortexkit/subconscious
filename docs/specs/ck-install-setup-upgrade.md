@@ -104,13 +104,21 @@ assets* — is ours to answer.
 
 ```text
 https://cortexkit.io/releases/v1/index.json       the index (application/json)
-https://cortexkit.io/releases/v1/index.json.sig   detached Ed25519 signature (base64, one line)
+  response header  X-CortexKit-Signature-Ed25519: <base64>   Ed25519 over the exact response body
+https://cortexkit.io/releases/v1/index.json.sig   the same signature as a detached file, for tooling and humans
 ```
 
-The signature is over the exact bytes served as `index.json`. `ck` embeds the
-verifying public key (`RELEASE_INDEX_PUBKEY`, 32 bytes) and **refuses** an
-index whose signature is absent or does not verify — there is no unsigned
-mode and no GitHub fallback. Key custody: the private key is held as opaque
+The signature is over the exact bytes served as `index.json`. **`ck` reads
+the signature from the response header of the one request that fetched the
+index** — a body and a signature that arrived together are consistent by
+construction, whereas two URLs (or two KV keys) have independent cache and
+propagation clocks and can be read torn for up to a minute after every
+release, which would refuse a correct index as tampered. The producer
+stores body and signature as ONE KV value and serves both views from it;
+`.sig` exists for tooling, `ck` never fetches it. `ck` embeds the verifying
+public key (`RELEASE_INDEX_PUBKEY`, 32 bytes) and **refuses** an index whose
+signature header is absent or does not verify — there is no unsigned mode
+and no GitHub fallback. Key custody: the private key is held as opaque
 record `cortexkit:release-index-signing:1:ed25519-pem` in the claustrum
 vault and deployed to the index worker as a secret; rotation ships a new
 `ck` with the new key under generation `:2` before the worker switches.

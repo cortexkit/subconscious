@@ -669,11 +669,13 @@ mod tests {
             matches!(error, IndexRefusal::Unreachable { .. }),
             "a hang is unreachable, never a signature or parse verdict: {error}"
         );
-        // Discriminating margin: a transport that ignores its deadline cannot
-        // return before the 30 s hold; one that honors it is back in about a
-        // second even on a loaded runner.
+        // Discriminating margin, not a latency claim: a transport that ignores
+        // its deadline cannot return before the 30 s hold. One that honors it
+        // is back in about a second on unix; on Windows the bound starts only
+        // after powershell.exe itself has started, which on a cold runner is
+        // several seconds on its own.
         assert!(
-            elapsed < Duration::from_secs(8),
+            elapsed < Duration::from_secs(20),
             "transport ignored its deadline: {elapsed:?}"
         );
     }

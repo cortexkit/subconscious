@@ -51,6 +51,29 @@ pub struct RuntimeStatus {
 pub struct CommandResult {
     pub success: bool,
     pub stdout: String,
+    /// The service manager's own account of a refusal. Every registration
+    /// and start step that fails must carry this into its error: a bare
+    /// "could not register" sent the first macOS operator drive guessing at
+    /// launchctl when launchctl had already said why.
+    pub stderr: String,
+}
+
+impl CommandResult {
+    /// stderr, then stdout, whichever the tool used to explain itself;
+    /// `(no output)` when it said nothing, so the refusal never reads as if
+    /// the reason were withheld by us.
+    pub fn explanation(&self) -> String {
+        let text = if self.stderr.trim().is_empty() {
+            self.stdout.trim()
+        } else {
+            self.stderr.trim()
+        };
+        if text.is_empty() {
+            "(no output)".to_string()
+        } else {
+            text.to_string()
+        }
+    }
 }
 
 pub trait CommandRunner {
@@ -68,6 +91,7 @@ impl CommandRunner for SystemCommandRunner {
         Ok(CommandResult {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
 }
@@ -310,23 +334,31 @@ fn register<R: CommandRunner>(
             ],
         ),
     };
-    if !runner.run(program, &args)?.success {
-        return Err(format!("could not register {}", platform.identifier()));
+    let result = runner.run(program, &args)?;
+    if !result.success {
+        return Err(format!(
+            "could not register {}: `{program} {}` said: {}",
+            platform.identifier(),
+            args.join(" "),
+            result.explanation()
+        ));
     }
-    if platform == RuntimePlatform::Linux
-        && !runner
-            .run(
-                "systemctl",
-                &[
-                    "--user".to_string(),
-                    "enable".to_string(),
-                    "--now".to_string(),
-                    platform.identifier().to_string(),
-                ],
-            )?
-            .success
-    {
-        return Err("could not enable cortexkit-subc.service for the user session".to_string());
+    if platform == RuntimePlatform::Linux {
+        let result = runner.run(
+            "systemctl",
+            &[
+                "--user".to_string(),
+                "enable".to_string(),
+                "--now".to_string(),
+                platform.identifier().to_string(),
+            ],
+        )?;
+        if !result.success {
+            return Err(format!(
+                "could not enable cortexkit-subc.service for the user session: systemctl said: {}",
+                result.explanation()
+            ));
+        }
     }
     Ok(())
 }
@@ -364,10 +396,16 @@ fn start<R: CommandRunner>(
             ],
         ),
     };
-    if runner.run(program, &args)?.success {
+    let result = runner.run(program, &args)?;
+    if result.success {
         Ok(())
     } else {
-        Err(format!("could not start {}", platform.identifier()))
+        Err(format!(
+            "could not start {}: `{program} {}` said: {}",
+            platform.identifier(),
+            args.join(" "),
+            result.explanation()
+        ))
     }
 }
 
@@ -405,12 +443,65 @@ mod tests {
             Ok(CommandResult {
                 success: self.results.pop_front().unwrap_or(true),
                 stdout: "state = running\nStatus: Running".to_string(),
+                stderr: String::new(),
             })
         }
     }
 
     fn fixture_dir(name: &str) -> TestTempDir {
         TestTempDir::new(name)
+    }
+
+    /// Refuses every command with a reason on stderr, the way launchctl and
+    /// systemctl actually do.
+    struct RefusingRunner;
+
+    impl CommandRunner for RefusingRunner {
+        fn run(&mut self, _program: &str, _args: &[String]) -> Result<CommandResult, String> {
+            Ok(CommandResult {
+                success: false,
+                stdout: String::new(),
+                stderr: "Bootstrap failed: 5: Input/output error".to_string(),
+            })
+        }
+    }
+
+    /// Seventh finding of the macOS operator drive: registration failed with
+    /// a bare "could not register cortexkit.subc" while launchctl had said
+    /// exactly why on stderr and the runner threw it away. A service-manager
+    /// refusal must carry the manager's own words and the command that drew
+    /// them, so the operator (or the next drive) reads the cause instead of
+    /// reproducing the step by hand to see it.
+    #[test]
+    fn registration_and_start_refusals_carry_the_service_managers_words() {
+        let root = fixture_dir("refusal-words");
+        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        let error = register(RuntimePlatform::Macos, &paths, &mut RefusingRunner).unwrap_err();
+        assert!(
+            error.contains("Bootstrap failed: 5: Input/output error"),
+            "{error}"
+        );
+        assert!(error.contains("launchctl bootstrap"), "{error}");
+        let error = start(RuntimePlatform::Macos, &paths, &mut RefusingRunner).unwrap_err();
+        assert!(error.contains("Bootstrap failed"), "{error}");
+        assert!(error.contains("launchctl kickstart"), "{error}");
+    }
+
+    #[test]
+    fn explanation_prefers_stderr_and_never_reads_as_withheld() {
+        let both = CommandResult {
+            success: false,
+            stdout: "out".into(),
+            stderr: "err".into(),
+        };
+        assert_eq!(both.explanation(), "err");
+        let only_out = CommandResult {
+            success: false,
+            stdout: "out".into(),
+            stderr: "  ".into(),
+        };
+        assert_eq!(only_out.explanation(), "out");
+        assert_eq!(CommandResult::default().explanation(), "(no output)");
     }
 
     #[test]
@@ -463,6 +554,7 @@ mod tests {
                 } else {
                     self.inactive_output.clone()
                 },
+                stderr: String::new(),
             })
         }
     }

@@ -113,6 +113,7 @@ mod tests {
             Ok(super::super::runtime::CommandResult {
                 success: true,
                 stdout: String::new(),
+                stderr: String::new(),
             })
         }
     }

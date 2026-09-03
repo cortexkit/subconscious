@@ -284,6 +284,7 @@ mod tests {
                 super::super::model::UpgradeState::UpdateAvailable {
                     from: "1.0.0".to_string(),
                     to: "2.0.0".to_string(),
+                    reason: None,
                 },
             );
         }
@@ -327,6 +328,7 @@ mod tests {
             super::super::model::UpgradeState::UpdateAvailable {
                 from: "1.0.0".to_string(),
                 to: "2.0.0".to_string(),
+                reason: None,
             },
         );
         let mut backend = RecordingBackend {

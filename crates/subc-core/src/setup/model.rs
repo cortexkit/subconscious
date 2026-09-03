@@ -164,6 +164,9 @@ impl fmt::Display for PlatformObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComponentState {
     Missing,
+    /// The managed binaries and configuration agree, but a live daemon has not
+    /// registered and enabled this module yet.
+    Configured,
     Correct,
 }
 
@@ -226,6 +229,9 @@ pub struct SetupObserved {
     pub releases: BTreeMap<Component, ReleaseAvailability>,
     pub runtime: RuntimeState,
     pub configuration: ConfigurationState,
+    /// The bootstrap installer owns the running `ck` placement but setup has
+    /// not yet recorded its managed-binary identity.
+    pub running_ck_adoption: Option<std::path::PathBuf>,
     /// Retains the MC database probe result so the planner can distinguish an
     /// absent installation from a state that is unsafe for automatic conversion.
     pub mc_detection: Option<McDetection>,
@@ -258,6 +264,7 @@ impl SetupObserved {
             releases,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
+            running_ck_adoption: None,
             mc_detection: Some(mc_detection),
             detections,
         }
@@ -329,6 +336,17 @@ pub enum PlanOutcome {
     Noop {
         scope: String,
     },
+    /// A live daemon did not reconcile an otherwise managed module from its
+    /// configuration, so setup will request the existing control operations.
+    ConfiguredNotRegistered {
+        component: Component,
+    },
+    UpgradeAvailable {
+        target: UpgradeTarget,
+        from: String,
+        to: String,
+        reason: Option<String>,
+    },
     OwnerGatedDetection {
         component: Component,
         reason: String,
@@ -376,6 +394,21 @@ impl fmt::Display for PlanOutcome {
             Self::DeclaredUnavailable { message, .. } => formatter.write_str(message),
             Self::Refusal { reason } => write!(formatter, "refusal: {reason}"),
             Self::Noop { scope } => write!(formatter, "no-op: {scope}"),
+            Self::ConfiguredNotRegistered { component } => {
+                write!(formatter, "{component}: configured but not registered; registering")
+            }
+            Self::UpgradeAvailable {
+                target,
+                from,
+                to,
+                reason,
+            } => {
+                write!(formatter, "{target} {from} → {to}")?;
+                if let Some(reason) = reason {
+                    write!(formatter, "; {reason}")?;
+                }
+                Ok(())
+            }
             Self::OwnerGatedDetection { component, reason } => {
                 write!(formatter, "owner-gated detection: {component}: {reason}")
             }
@@ -399,8 +432,13 @@ pub enum SetupOperation {
     ConfigureComponent {
         component: Component,
     },
+    /// Bootstrap idempotence is provided by the vault owner's CLI: exit zero
+    /// means a key exists, and setup does not infer safe reuse from other codes.
     BootstrapClaustrum {
         key_path: Option<std::path::PathBuf>,
+    },
+    AdoptRunningCk {
+        path: std::path::PathBuf,
     },
     RescanComponent {
         component: Component,
@@ -427,6 +465,7 @@ impl SetupOperation {
             Self::InstallComponent { .. }
                 | Self::ConfigureComponent { .. }
                 | Self::BootstrapClaustrum { .. }
+                | Self::AdoptRunningCk { .. }
                 | Self::RescanComponent { .. }
                 | Self::EnableComponent { .. }
                 | Self::RegisterRuntime
@@ -434,6 +473,29 @@ impl SetupOperation {
                 | Self::DeregisterRuntime
                 | Self::RemoveManagedComponent { .. }
         )
+    }
+
+    /// Identifies the component whose completed setup steps must be removed if
+    /// a later operation for that same component refuses.
+    pub const fn component(&self) -> Option<Component> {
+        match self {
+            Self::InstallComponent { component }
+            | Self::ConfigureComponent { component }
+            | Self::RescanComponent { component }
+            | Self::EnableComponent { component } => Some(*component),
+            Self::BootstrapClaustrum { .. } => Some(Component::Claustrum),
+            Self::ObservePlatform
+            | Self::OfferOptionalComponents
+            | Self::OfferConversion { .. }
+            | Self::ConfirmConversion { .. }
+            | Self::AdoptRunningCk { .. }
+            | Self::RegisterRuntime
+            | Self::StartRuntime
+            | Self::Validate { .. }
+            | Self::DeregisterRuntime
+            | Self::RemoveManagedComponent { .. }
+            | Self::RetainUserData => None,
+        }
     }
 }
 
@@ -463,13 +525,17 @@ impl fmt::Display for SetupOperation {
             Self::ConfigureComponent { component } => write!(formatter, "configure {component}"),
             Self::BootstrapClaustrum {
                 key_path: Some(key_path),
+                ..
             } => write!(
                 formatter,
                 "bootstrap claustrum with ck auth bootstrap --key-path {}",
                 key_path.display()
             ),
-            Self::BootstrapClaustrum { key_path: None } => {
+            Self::BootstrapClaustrum { key_path: None, .. } => {
                 formatter.write_str("bootstrap claustrum with ck auth bootstrap")
+            }
+            Self::AdoptRunningCk { path } => {
+                write!(formatter, "adopt running ck binary at {}", path.display())
             }
             Self::RescanComponent { component } => {
                 write!(formatter, "rescan {component} module entry")
@@ -529,7 +595,13 @@ impl fmt::Display for UpgradeTarget {
 pub enum UpgradeState {
     NotInstalled,
     Current,
-    UpdateAvailable { from: String, to: String },
+    UpdateAvailable {
+        from: String,
+        to: String,
+        /// Missing placement digests require one replacement to establish the
+        /// future currency proof without treating display versions as authority.
+        reason: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -292,11 +292,17 @@ pub fn component_binaries_for_target(
     }
 }
 
+pub fn component_binary_paths(component: Component, binary_home: &Path) -> Vec<std::path::PathBuf> {
+    component_binaries(component)
+        .iter()
+        .map(|binary| binary_home.join(platform_binary(binary)))
+        .collect()
+}
+
 pub fn is_installed(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
-    component_binaries(component).iter().all(|binary| {
-        let path = binary_home.join(platform_binary(binary));
-        path.is_file() && inventory.owns_path("managed-binary", &path)
-    })
+    component_binary_paths(component, binary_home)
+        .iter()
+        .all(|path| path.is_file() && inventory.owns_path("managed-binary", path))
 }
 
 pub fn install_component<S: ArtifactSource>(
@@ -342,6 +348,12 @@ pub fn install_component<S: ArtifactSource>(
             Value::String(component.label().to_string()),
         );
         fields.insert("sha256".to_string(), Value::String(digest));
+        // Version text helps operators identify an update, but the digest is the
+        // only authority for currency because sibling binaries may not share the
+        // source release's crate version.
+        if let Ok(version) = super::upgrade::binary_version(&destination) {
+            fields.insert("version".to_string(), Value::String(version));
+        }
         inventory.record("managed-binary", &destination, fields);
         // The ownership record must be durable the moment the binary it
         // describes is. Deferring the save to the end of the whole plan meant

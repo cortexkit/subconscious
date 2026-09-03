@@ -134,7 +134,7 @@ fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
     let cache_path = temp.path().join("update-metadata.json");
     fs::write(
         &cache_path,
-        r#"{"format_version":2,"checked_at_unix_secs":0,"targets":{}}"#,
+        r#"{"format_version":3,"checked_at_unix_secs":0,"targets":{}}"#,
     )
     .unwrap();
 

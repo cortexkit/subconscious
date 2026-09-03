@@ -191,10 +191,10 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return fleet_lint_command(config.as_deref(), *verbose).await;
     }
     if let Command::Setup(request) = &args.command {
-        return setup_command(&args.program, request);
+        return setup_command(&running_executable()?, request);
     }
     if let Command::Upgrade { check } = &args.command {
-        return upgrade_command(&args.program, args.subc.as_deref(), *check).await;
+        return upgrade_command(&running_executable()?, args.subc.as_deref(), *check).await;
     }
     if matches!(&args.command, Command::DaemonTriage) {
         return daemon_triage(args.subc.as_deref(), args.json);
@@ -337,7 +337,8 @@ async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
 async fn bare_update_line() -> String {
     let cache = setup::UpdateCache::from_environment();
     let source = setup::IndexReleaseSource::from_environment(setup::BARE_REFRESH_BUDGET);
-    setup::dashboard_update(&cache, &source, &setup::compiled_installed_versions())
+    let installed = setup::dashboard_installed_binaries().unwrap_or_default();
+    setup::dashboard_update(&cache, &source, &installed)
         .await
         .render()
 }
@@ -445,6 +446,10 @@ fn print_dashboard_module_summary(modules: &Value, health: &Value, describe: &Va
         .filter(|module| dashboard_health_status(health_entries, module) == "ok")
         .count();
     println!("modules: {running} running, {ok} ok");
+    let warming = dashboard_warming_modules(module_entries, health_entries);
+    if !warming.is_empty() {
+        println!("warming: {}", warming.join(", "));
+    }
     println!(
         "{}",
         dashboard_alerts_line(module_entries, health_entries, describe)
@@ -457,7 +462,7 @@ fn dashboard_alerts_line(modules: &[Value], health: &[Value], describe: &Value) 
     let mut alerts = Vec::new();
     for module in modules {
         let status = dashboard_health_status(health, module);
-        if status != "ok" {
+        if status != "ok" && !dashboard_module_is_warming(health, module) {
             alerts.push(display_field(module, "module_id"));
         }
     }
@@ -523,6 +528,30 @@ fn dashboard_health_status(health_entries: &[Value], module: &Value) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn dashboard_warming_modules(modules: &[Value], health_entries: &[Value]) -> Vec<String> {
+    modules
+        .iter()
+        .filter(|module| dashboard_module_is_warming(health_entries, module))
+        .map(|module| display_field(module, "module_id"))
+        .collect()
+}
+
+/// `last_probe_ms: None` means the supervisor has never probed this module, so
+/// an unknown status is expected while its first probe is pending. A present
+/// stamp proves the probe ran; an unknown result after that is an alarm.
+fn dashboard_module_is_warming(health_entries: &[Value], module: &Value) -> bool {
+    if dashboard_health_status(health_entries, module) != "unknown" {
+        return false;
+    }
+    let module_id = display_field(module, "module_id");
+    health_entries
+        .iter()
+        .find(|entry| display_field(entry, "module_id") == module_id)
+        .and_then(|entry| entry.get("last_probe_ms"))
+        .or_else(|| module.get("last_probe_ms"))
+        .is_none()
+}
+
 fn print_static_domains() {
     const BUILTIN_DOMAINS: [&str; 6] = ["module", "routes", "health", "quota", "fleet", "daemon"];
     let mut domains = BUILTIN_DOMAINS
@@ -539,6 +568,19 @@ fn print_static_domains() {
 
 fn short_build_sha(sha: &str) -> String {
     sha.chars().take(8).collect()
+}
+
+/// Lifecycle mutations identify the executable inode, not argv[0]: a shell
+/// invocation through PATH commonly supplies only the bare display name `ck`.
+fn running_executable() -> Result<PathBuf, CkError> {
+    let path = env::current_exe()
+        .map_err(|error| CkError::Message(format!("could not identify the running ck: {error}")))?;
+    fs::canonicalize(&path).map_err(|error| {
+        CkError::Message(format!(
+            "could not canonicalize running ck {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn executable_identity(argv0: &Path) -> (PathBuf, Option<PathBuf>) {
@@ -4837,6 +4879,15 @@ mod tests {
     /// is structural, so a NEW balance provider lands at the end without a
     /// name list knowing about it.
     #[test]
+    fn setup_and_upgrade_identity_does_not_use_a_bare_argv_zero() {
+        let argv_zero = Path::new("ck");
+        let identity = running_executable().expect("test binary has an executable identity");
+
+        assert!(identity.is_absolute());
+        assert_ne!(identity, argv_zero);
+    }
+
+    #[test]
     fn balance_only_providers_sort_to_the_end() {
         let providers = vec![
             serde_json::json!({"provider": "deepseek", "usage": {}, "spend": [{"amount": 2402, "unit": "CNY"}]}),
@@ -4961,6 +5012,27 @@ mod tests {
         });
 
         assert_eq!(format_restart_budget(&module), "0/3 (2 lifetime)");
+    }
+
+    #[test]
+    fn unknown_without_a_probe_stamp_warms_but_unknown_after_a_probe_alerts() {
+        let modules = vec![
+            json!({"module_id": "aft", "state": "running"}),
+            json!({"module_id": "synapse", "state": "running"}),
+        ];
+        let health = vec![
+            json!({"module_id": "aft", "status": "unknown"}),
+            json!({"module_id": "synapse", "status": "unknown", "last_probe_ms": 1}),
+        ];
+
+        assert_eq!(
+            dashboard_warming_modules(&modules, &health),
+            vec!["aft".to_string()]
+        );
+        assert_eq!(
+            dashboard_alerts_line(&modules, &health, &json!({})),
+            "alerts: synapse"
+        );
     }
 
     #[test]

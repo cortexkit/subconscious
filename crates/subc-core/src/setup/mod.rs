@@ -31,7 +31,7 @@ pub(crate) use self_update::cleanup_replaced_windows_ck;
 pub use update_cache::UpdateCache;
 pub use update_check::{
     check_update_metadata, compiled_installed_versions, dashboard_update, not_checked_from_cache,
-    IndexReleaseSource, UpdateCheckError,
+    IndexReleaseSource, UpdateCheckError, BARE_REFRESH_BUDGET, TARGET_CHECK_BUDGET,
 };
 pub use upgrade::{
     discover_current_upgrade_targets, observed_upgrade_targets, render_execution_report,

@@ -336,7 +336,7 @@ async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
 
 async fn bare_update_line() -> String {
     let cache = setup::UpdateCache::from_environment();
-    let source = setup::IndexReleaseSource::from_environment();
+    let source = setup::IndexReleaseSource::from_environment(setup::BARE_REFRESH_BUDGET);
     setup::dashboard_update(&cache, &source, &setup::compiled_installed_versions())
         .await
         .render()
@@ -4043,7 +4043,7 @@ async fn upgrade_command(
     let discovered = setup::discover_current_upgrade_targets(executable, daemon_catalog.as_ref())
         .map_err(CkError::Rejected)?;
     let cache = setup::UpdateCache::from_environment();
-    let source = setup::IndexReleaseSource::from_environment();
+    let source = setup::IndexReleaseSource::from_environment(setup::TARGET_CHECK_BUDGET);
     let metadata = match setup::check_update_metadata(&cache, &source).await {
         Ok(metadata) => metadata,
         Err(error @ setup::UpdateCheckError::IndexStale { .. }) => {

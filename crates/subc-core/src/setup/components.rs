@@ -105,7 +105,10 @@ impl ReleaseArtifactSource {
 
     fn loaded_index(&mut self) -> Result<&ReleaseIndex, String> {
         if self.index.is_none() {
-            self.index = Some(release_index::fetch_index(&self.index_url));
+            self.index = Some(release_index::fetch_index(
+                &self.index_url,
+                release_index::INSTALL_INDEX_DEADLINE,
+            ));
         }
         match self.index.as_ref() {
             Some(Ok(index)) => Ok(index),
@@ -414,9 +417,7 @@ pub enum Acceptance {
 /// carries the wrong binary from becoming a supervised module, and pays the
 /// first-exec toll on the destination inode before the daemon spawns it.
 fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String> {
-    let output = Command::new(path)
-        .arg("--version")
-        .output()
+    let output = run_version_tolerating_text_busy(path)
         .map_err(|error| format!("could not run {} --version: {error}", path.display()))?;
     if !output.status.success() {
         return Err(format!(
@@ -433,6 +434,27 @@ fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String>
             path.display()
         )
     })
+}
+
+/// Executes `<path> --version`, retrying briefly on ETXTBSY. On Linux a
+/// `fork` in another thread of this process inherits every open descriptor,
+/// including the write end of a binary that a sibling thread is still
+/// finishing; until that child execs (which closes it), the kernel refuses
+/// to execute the file as "text busy". The window is microseconds but the
+/// error is real, and the fix belongs here rather than in a test because
+/// the same race exists for any multi-threaded caller of this acceptance.
+fn run_version_tolerating_text_busy(path: &Path) -> std::io::Result<std::process::Output> {
+    const TEXT_BUSY: i32 = 26;
+    let mut attempts = 0;
+    loop {
+        match Command::new(path).arg("--version").output() {
+            Err(error) if error.raw_os_error() == Some(TEXT_BUSY) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The pure half of acceptance, over the captured `--version` line.

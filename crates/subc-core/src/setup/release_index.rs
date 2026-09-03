@@ -106,9 +106,18 @@ pub fn index_url() -> String {
 /// Download `index.json` in one request, read the Ed25519 signature from the
 /// `X-CortexKit-Signature-Ed25519` response header, verify it against the
 /// embedded generation-1 key, parse, and refuse a stale document.
-pub fn fetch_index(url: &str) -> Result<ReleaseIndex, IndexRefusal> {
-    fetch_index_with_verifying_key(url, &RELEASE_INDEX_PUBKEY, RELEASE_INDEX_KEY_GENERATION)
+pub fn fetch_index(url: &str, deadline: Duration) -> Result<ReleaseIndex, IndexRefusal> {
+    fetch_index_with_verifying_key(
+        url,
+        &RELEASE_INDEX_PUBKEY,
+        RELEASE_INDEX_KEY_GENERATION,
+        deadline,
+    )
 }
+
+/// How long an installer may wait for the index. Generous: an install is an
+/// attended operation, and a slow link is not a reason to refuse it.
+pub const INSTALL_INDEX_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Same resolver `ck` uses, with an injected verifying key so tests can
 /// exercise the accept path without the production private key.
@@ -116,8 +125,9 @@ pub fn fetch_index_with_verifying_key(
     url: &str,
     pubkey: &[u8; 32],
     key_generation: u32,
+    deadline: Duration,
 ) -> Result<ReleaseIndex, IndexRefusal> {
-    fetch_index_at(url, pubkey, key_generation, unix_now_ms())
+    fetch_index_at(url, pubkey, key_generation, unix_now_ms(), deadline)
 }
 
 const SIGNATURE_HEADER: &str = "X-CortexKit-Signature-Ed25519";
@@ -127,10 +137,11 @@ fn fetch_index_at(
     pubkey: &[u8; 32],
     key_generation: u32,
     now_ms: u64,
+    deadline: Duration,
 ) -> Result<ReleaseIndex, IndexRefusal> {
     let index_path = temporary_path("index.json");
     let header_path = temporary_path("index.headers");
-    let signature = match download_index(url, &index_path, &header_path) {
+    let signature = match download_index(url, &index_path, &header_path, deadline) {
         Ok(signature) => signature,
         Err(reason) => {
             let _ = fs::remove_file(&index_path);
@@ -170,13 +181,23 @@ fn fetch_index_at(
     )
 }
 
+/// The transport enforces `deadline` itself. A caller that merely stops
+/// waiting (the dashboard's 800 ms budget) would leave the child fetching a
+/// hanging source until the source gives up; on Windows a child that
+/// outlives `ck` also keeps the inherited stdio handles open, so whoever ran
+/// `ck` waits with it. Bounding the child bounds everything downstream.
 fn download_index(
     url: &str,
     body_path: &Path,
     header_path: &Path,
+    deadline: Duration,
 ) -> Result<Option<String>, String> {
     let body = body_path.to_string_lossy().into_owned();
     let headers = header_path.to_string_lossy().into_owned();
+    // curl takes fractional seconds; Invoke-WebRequest takes whole seconds
+    // and treats 0 as infinite, so the floor is one second there.
+    let curl_seconds = format!("{:.3}", deadline.as_secs_f64().max(0.001));
+    let powershell_seconds = deadline.as_secs().max(1);
     let (program, args) = if cfg!(windows) {
         (
             "powershell.exe",
@@ -185,7 +206,7 @@ fn download_index(
                 "-NonInteractive".to_string(),
                 "-Command".to_string(),
                 format!(
-                    "$r = Invoke-WebRequest -Uri '{url}' -OutFile '{body}' -PassThru -UseBasicParsing; $lines = @(); foreach ($key in $r.Headers.Keys) {{ $lines += \"${{key}}: $($r.Headers[$key])\" }}; Set-Content -LiteralPath '{headers}' -Value ($lines -join \"`n\")"
+                    "$r = Invoke-WebRequest -Uri '{url}' -OutFile '{body}' -PassThru -UseBasicParsing -TimeoutSec {powershell_seconds}; $lines = @(); foreach ($key in $r.Headers.Keys) {{ $lines += \"${{key}}: $($r.Headers[$key])\" }}; Set-Content -LiteralPath '{headers}' -Value ($lines -join \"`n\")"
                 ),
             ],
         )
@@ -197,6 +218,8 @@ fn download_index(
                 "--location".to_string(),
                 "--silent".to_string(),
                 "--show-error".to_string(),
+                "--max-time".to_string(),
+                curl_seconds,
                 "--dump-header".to_string(),
                 headers,
                 "--output".to_string(),
@@ -513,6 +536,7 @@ mod tests {
             &format!("{base}/index.json"),
             &test_pubkey(&key),
             RELEASE_INDEX_KEY_GENERATION,
+            Duration::from_secs(10),
         )
         .unwrap_err();
         assert!(
@@ -573,6 +597,7 @@ mod tests {
             &format!("{base}/index.json"),
             &test_pubkey(&key),
             RELEASE_INDEX_KEY_GENERATION,
+            Duration::from_secs(10),
         )
         .expect("signed fixture");
         assert_eq!(index.components["core"].release, "subc-core-v0.16.0");
@@ -609,6 +634,48 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("index_signature_invalid"), "{rendered}");
         assert!(rendered.contains("generation 1"), "{rendered}");
+    }
+
+    /// The transport, not the caller, owns the deadline: a source that
+    /// accepts and then never answers must produce `index_unreachable`
+    /// within the deadline, with the fetch child gone. A caller that merely
+    /// stops awaiting leaves the child running against the hang — and on
+    /// Windows a child that outlives `ck` holds its inherited stdio open,
+    /// so whoever ran `ck` waits the whole hang with it. This is the CI
+    /// failure that made the dashboard's 800 ms budget read as 10 s.
+    #[test]
+    fn a_hanging_source_refuses_within_the_transport_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            // Hold the connection open, answering nothing, until released.
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            drop(stream);
+        });
+        let key = test_signing_key();
+        let started = std::time::Instant::now();
+        let error = fetch_index_with_verifying_key(
+            &format!("http://{addr}/index.json"),
+            &test_pubkey(&key),
+            RELEASE_INDEX_KEY_GENERATION,
+            Duration::from_millis(800),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        assert!(
+            matches!(error, IndexRefusal::Unreachable { .. }),
+            "a hang is unreachable, never a signature or parse verdict: {error}"
+        );
+        // Discriminating margin: a transport that ignores its deadline cannot
+        // return before the 30 s hold; one that honors it is back in about a
+        // second even on a loaded runner.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "transport ignored its deadline: {elapsed:?}"
+        );
     }
 
     #[test]

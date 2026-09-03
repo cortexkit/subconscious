@@ -105,13 +105,20 @@ impl Error for UpdateCheckError {}
 /// and every later target reads the cache.
 pub struct IndexReleaseSource {
     url: String,
+    /// The transport's own bound, so the fetch child dies with the budget
+    /// instead of surviving a caller that stopped waiting.
+    deadline: Duration,
     cached: std::sync::Mutex<Option<Result<ReleaseIndex, IndexRefusal>>>,
 }
 
 impl IndexReleaseSource {
-    pub fn from_environment() -> Self {
+    /// `deadline` is the budget of the command that will drive this source:
+    /// `BARE_REFRESH_BUDGET` for the dashboard, `TARGET_CHECK_BUDGET` for
+    /// `ck upgrade --check`.
+    pub fn from_environment(deadline: Duration) -> Self {
         Self {
             url: release_index::index_url(),
+            deadline,
             cached: std::sync::Mutex::new(None),
         }
     }
@@ -120,6 +127,7 @@ impl IndexReleaseSource {
     pub fn from_index(index: ReleaseIndex) -> Self {
         Self {
             url: String::new(),
+            deadline: Duration::ZERO,
             cached: std::sync::Mutex::new(Some(Ok(index))),
         }
     }
@@ -128,7 +136,7 @@ impl IndexReleaseSource {
         match self.cached.lock().unwrap().as_ref() {
             Some(Ok(index)) => Ok(index.clone()),
             Some(Err(refusal)) => Err(refusal.clone()),
-            None => release_index::fetch_index(&self.url),
+            None => release_index::fetch_index(&self.url, self.deadline),
         }
     }
 }
@@ -144,14 +152,16 @@ impl ReleaseSource for IndexReleaseSource {
                 result
             } else {
                 let url = self.url.clone();
-                let fetched = tokio::task::spawn_blocking(move || release_index::fetch_index(&url))
-                    .await
-                    .unwrap_or_else(|error| {
-                        Err(IndexRefusal::Unreachable {
-                            url: self.url.clone(),
-                            reason: error.to_string(),
-                        })
-                    });
+                let deadline = self.deadline;
+                let fetched =
+                    tokio::task::spawn_blocking(move || release_index::fetch_index(&url, deadline))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(IndexRefusal::Unreachable {
+                                url: self.url.clone(),
+                                reason: error.to_string(),
+                            })
+                        });
                 let mut guard = self.cached.lock().unwrap();
                 if guard.is_none() {
                     *guard = Some(fetched.clone());

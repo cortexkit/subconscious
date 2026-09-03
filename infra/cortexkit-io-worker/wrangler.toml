@@ -1,0 +1,27 @@
+name = "ck-install"
+main = "src/worker.ts"
+compatibility_date = "2026-08-01"
+
+# Custom domain (not a zone route): creates and owns the apex DNS record.
+# The apex carried no records before this; when a real site takes the apex,
+# convert this back to a zone route on cortexkit.io/install*.
+routes = [
+  { pattern = "cortexkit.io", custom_domain = true }
+]
+
+# Secrets (never valued here; set with `wrangler secret put <NAME>`):
+#   GITHUB_WEBHOOK_SECRET
+#   ADMIN_TOKEN
+#   RELEASE_INDEX_SIGNING_KEY
+#   GITHUB_APP_ID
+#   GITHUB_APP_INSTALLATION_ID
+#   GITHUB_APP_PRIVATE_KEY
+
+# Replace `id` with the output of `wrangler kv namespace create RELEASE_INDEX`
+# before the first production deploy. Local/test bindings ignore this value.
+[[kv_namespaces]]
+binding = "RELEASE_INDEX"
+id = "00000000000000000000000000000000"
+
+[triggers]
+crons = ["0 4 * * *"]

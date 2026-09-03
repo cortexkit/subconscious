@@ -166,7 +166,37 @@ impl ReleaseArtifactSource {
         if !self.manifests.contains_key(&component) {
             let temporary = temporary_path("release.json");
             let url = self.manifest_url(component);
-            download(&url, &temporary)
+            let download_result = download(&url, &temporary);
+            // GitHub answers `releases/latest` with 404 when a repository has
+            // no published (non-draft) release. That is the owner-has-not-
+            // published-yet state the temporal outcome exists for, not a
+            // resolution failure: an empty manifest lets availability report
+            // exactly which asset is missing under a `latest` that does not
+            // exist yet.
+            if let Err(error) = &download_result {
+                if matches!(
+                    component.release_resolution_strategy(),
+                    ReleaseResolutionStrategy::Latest
+                ) && http_status_from_download_error(error) == Some(404)
+                {
+                    let _ = fs::remove_file(&temporary);
+                    self.manifests.insert(
+                        component,
+                        ReleaseManifest {
+                            tag_name: "latest".to_string(),
+                            assets: Vec::new(),
+                            draft: false,
+                            prerelease: false,
+                            created_at: String::new(),
+                        },
+                    );
+                    return Ok(self
+                        .manifests
+                        .get(&component)
+                        .expect("manifest inserted above"));
+                }
+            }
+            download_result
                 .map_err(|error| format!("could not resolve {} release: {error}", component))?;
             let contents = fs::read_to_string(&temporary)
                 .map_err(|error| format!("could not read {} release: {error}", component))?;
@@ -498,21 +528,49 @@ fn download(url: &str, destination: &Path) -> Result<(), String> {
                 "--location".to_string(),
                 "--silent".to_string(),
                 "--show-error".to_string(),
+                // The status code is the only thing that distinguishes "no
+                // such release yet" from a broken host; write it where the
+                // error path can read it.
+                "--write-out".to_string(),
+                "http_status=%{http_code}".to_string(),
                 "--output".to_string(),
                 destination,
                 url.to_string(),
             ],
         )
     };
-    let status = Command::new(program)
+    let output = Command::new(program)
         .args(args)
-        .status()
+        .output()
         .map_err(|error| format!("could not download {url}: {error}"))?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("release-incomplete: could not download {url}"))
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(format!(
+            "release-incomplete: could not download {url}: {stderr} {stdout}"
+        ))
     }
+}
+
+/// Best-effort HTTP status recovered from a `download` error message. curl's
+/// arm stamps `http_status=NNN` explicitly; the PowerShell arm's exception
+/// text carries the code in prose (`(404) Not Found`, `status code ... 404`).
+fn http_status_from_download_error(error: &str) -> Option<u16> {
+    if let Some(rest) = error.split("http_status=").nth(1) {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(code) = digits.parse::<u16>() {
+            if code != 0 {
+                return Some(code);
+            }
+        }
+    }
+    error
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|token| token.len() == 3)
+        .filter_map(|token| token.parse::<u16>().ok())
+        .find(|code| (400..600).contains(code))
 }
 
 fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
@@ -794,6 +852,56 @@ mod tests {
                 release_tag: "ck-mc-*".to_string(),
                 missing_asset: "ck-mc-linux-x64.zip".to_string(),
             }
+        );
+    }
+
+    /// A repository whose only releases are drafts answers `releases/latest`
+    /// with 404. The resolver turns that into an empty `latest` manifest, and
+    /// availability must then report the owner-has-not-published state naming
+    /// the first missing archive — never a resolution error.
+    #[test]
+    fn latest_404_reports_not_yet_published_for_the_first_archive() {
+        let manifest = ReleaseManifest {
+            tag_name: "latest".to_string(),
+            assets: Vec::new(),
+            draft: false,
+            prerelease: false,
+            created_at: String::new(),
+        };
+        let mut source = source_with_manifest(Component::Synapse, manifest);
+        assert_eq!(
+            source
+                .release_availability(Component::Synapse)
+                .expect("availability"),
+            ReleaseAvailability::NotYetPublished {
+                release_tag: "latest".to_string(),
+                missing_asset: "ck-synapse-linux-x64.zip".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn download_error_status_is_recovered_from_both_download_arms() {
+        // curl arm: explicit stamp wins even when prose carries other digits.
+        assert_eq!(
+            http_status_from_download_error(
+                "release-incomplete: could not download https://x/releases/latest: curl: (22) The requested URL returned error: 404 http_status=404"
+            ),
+            Some(404)
+        );
+        // PowerShell arm: code only in prose.
+        assert_eq!(
+            http_status_from_download_error(
+                "release-incomplete: could not download https://x: The remote server returned an error: (404) Not Found."
+            ),
+            Some(404)
+        );
+        // A curl transport error stamps 000 and carries no HTTP code: not a 404.
+        assert_eq!(
+            http_status_from_download_error(
+                "release-incomplete: could not download https://x: curl: (6) Could not resolve host http_status=000"
+            ),
+            None
         );
     }
 

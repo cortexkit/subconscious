@@ -116,7 +116,18 @@ impl SetupBackend {
                     ComponentState::Missing
                 },
             );
-            releases.insert(component, self.artifacts.release_availability(component)?);
+            // A release that cannot be resolved is a fact about that component,
+            // never about the plan: one module whose owner has not published
+            // (or whose release host is unreachable) must not abort installing
+            // everything else. The planner renders the typed outcome per
+            // component and skips it.
+            let availability = match self.artifacts.release_availability(component) {
+                Ok(availability) => availability,
+                Err(error) => ReleaseAvailability::Incomplete {
+                    missing_asset: format!("release unresolvable: {error}"),
+                },
+            };
+            releases.insert(component, availability);
         }
         let configuration = selected
             .iter()

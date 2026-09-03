@@ -27,9 +27,12 @@ id = "83a3afbf5461461f8385000c8fba33fb"
 name = "REBUILD_COORDINATOR"
 class_name = "RebuildCoordinator"
 
+# SQLite-backed: new key-value Durable Object namespaces are refused on this
+# account (Cloudflare code 10099); the coordinator uses only get/put/alarm,
+# which both backends serve identically.
 [[migrations]]
 tag = "v1"
-new_classes = ["RebuildCoordinator"]
+new_sqlite_classes = ["RebuildCoordinator"]
 
 [triggers]
 crons = ["0 4 * * *"]

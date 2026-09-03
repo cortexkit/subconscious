@@ -16,6 +16,18 @@ use crate::{HealthAction, HealthConfig, ModuleSpec};
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
+/// Top-level daemon config sections that rescan cannot apply. The live daemon
+/// keeps the values it loaded at start for these; a later rescan reports them
+/// as `restart_required`. Setup intersects this set with the sections core
+/// configuration would write so dry-run can show a restart before the file
+/// exists on disk. Rescan itself reads the same table so the names cannot drift.
+pub const RESTART_REQUIRED_SECTIONS: &[&str] = &[
+    "port",
+    "storage",
+    "admission_facts_carrier_module_id",
+    "admission_facts_targets",
+];
+
 /// Refused at parse time by both layers (daemon-wide and per-module) — `0`
 /// would turn every affected bind into an instant failure, which is not a
 /// posture anyone deliberately configures. The asymmetry with
@@ -794,6 +806,19 @@ mod tests {
                 None => env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn restart_required_sections_are_the_rescan_cannot_apply_set() {
+        assert_eq!(
+            RESTART_REQUIRED_SECTIONS,
+            &[
+                "port",
+                "storage",
+                "admission_facts_carrier_module_id",
+                "admission_facts_targets",
+            ]
+        );
     }
 
     #[test]

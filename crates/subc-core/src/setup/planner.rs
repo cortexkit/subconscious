@@ -39,22 +39,6 @@ impl SetupPlan {
     }
 }
 
-/// Ask a live daemon what a rescan would need only when core configuration
-/// would change. The daemon keeps the config it loaded at start for some
-/// sections (storage is one); rescan says so via `restart_required`, and
-/// setup must act on that. A daemon that is not live is started later on
-/// the new file, so it must not be asked.
-pub fn collect_restart_required<E>(
-    runtime_live: bool,
-    core_config_would_change: bool,
-    mut preview: impl FnMut() -> Result<Vec<String>, E>,
-) -> Result<Vec<String>, E> {
-    if !runtime_live || !core_config_would_change {
-        return Ok(Vec::new());
-    }
-    preview()
-}
-
 /// Plans setup only from observations. The dry-run bit belongs to execution,
 /// not planning, which keeps a preview and an authorized execution equivalent
 /// when they begin with the same observed state.
@@ -1123,31 +1107,16 @@ mod tests {
         observed
     }
 
-    struct PreviewCounter {
-        calls: usize,
-        result: Vec<String>,
-    }
-
-    impl PreviewCounter {
-        fn preview(&mut self) -> Result<Vec<String>, ()> {
-            self.calls += 1;
-            Ok(self.result.clone())
-        }
-    }
-
     /// Dropping this ordering (restart after rescan) must fail this test by
     /// name: a rescan against a daemon that still holds its start-time config
     /// is the crash-loop this step exists to prevent.
     #[test]
     fn restart_runtime_is_planned_before_the_first_rescan() {
-        let mut preview = PreviewCounter {
-            calls: 0,
-            result: vec!["storage".to_string()],
-        };
+        let sections =
+            super::super::config::restart_required_from_pending_keys(true, ["storage.backend"]);
+        assert_eq!(sections, ["storage"]);
         let mut observed = live_runtime_adding_claustrum();
-        observed.restart_required =
-            collect_restart_required(true, true, || preview.preview()).unwrap();
-        assert_eq!(preview.calls, 1);
+        observed.restart_required = sections;
         let plan = plan_setup(
             &observed,
             &SetupRequest::install(vec![Component::Claustrum]),
@@ -1181,15 +1150,32 @@ mod tests {
     }
 
     #[test]
-    fn empty_preview_does_not_plan_restart_runtime() {
-        let mut preview = PreviewCounter {
-            calls: 0,
-            result: Vec::new(),
-        };
+    fn live_host_missing_storage_plans_restart_with_zero_preview_calls() {
+        let sections =
+            super::super::config::restart_required_from_pending_keys(true, ["storage.backend"]);
+        assert_eq!(sections, ["storage"]);
         let mut observed = live_runtime_adding_claustrum();
-        observed.restart_required =
-            collect_restart_required(true, true, || preview.preview()).unwrap();
-        assert_eq!(preview.calls, 1);
+        observed.restart_required = sections;
+        let plan = plan_setup(
+            &observed,
+            &SetupRequest::install(vec![Component::Claustrum]),
+        );
+        assert_eq!(
+            plan.operations
+                .iter()
+                .filter(|operation| matches!(operation, SetupOperation::RestartRuntime { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn live_host_already_carrying_storage_plans_no_restart_runtime() {
+        let sections =
+            super::super::config::restart_required_from_pending_keys(true, [] as [&str; 0]);
+        assert!(sections.is_empty());
+        let mut observed = live_runtime_adding_claustrum();
+        observed.restart_required = sections;
         let plan = plan_setup(
             &observed,
             &SetupRequest::install(vec![Component::Claustrum]),
@@ -1205,13 +1191,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_not_live_does_not_call_preview() {
-        let mut preview = PreviewCounter {
-            calls: 0,
-            result: vec!["storage".to_string()],
-        };
-        let sections = collect_restart_required(false, true, || preview.preview()).unwrap();
-        assert_eq!(preview.calls, 0);
+    fn runtime_not_live_plans_no_restart_even_when_storage_would_be_written() {
+        let sections =
+            super::super::config::restart_required_from_pending_keys(false, ["storage.backend"]);
         assert!(sections.is_empty());
     }
 
@@ -1250,17 +1232,6 @@ mod tests {
             ),
             "{rendered}"
         );
-    }
-
-    #[test]
-    fn core_config_unchanged_does_not_call_preview_even_when_live() {
-        let mut preview = PreviewCounter {
-            calls: 0,
-            result: vec!["storage".to_string()],
-        };
-        let sections = collect_restart_required(true, false, || preview.preview()).unwrap();
-        assert_eq!(preview.calls, 0);
-        assert!(sections.is_empty());
     }
 
     #[derive(Default)]

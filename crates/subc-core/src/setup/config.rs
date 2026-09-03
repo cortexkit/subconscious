@@ -78,20 +78,15 @@ pub fn plan_component_with_key(
         });
     }
 
-    let additions = desired_values_with_key(component, binary_home, claustrum_key_path);
-    let mut changed = false;
-    for (key, desired) in additions {
-        match existing_value(&document, &key) {
-            Some(actual) if actual == &desired => {}
-            Some(_) => return Err(ConfigConflict { key }),
-            None => {
-                insert_value(&mut document, &key, desired).map_err(|key| ConfigConflict { key })?;
-                changed = true;
-            }
-        }
-    }
-    if !changed {
+    let pending = pending_keys_against(&document, component, binary_home, claustrum_key_path)?;
+    if pending.is_empty() {
         return Ok(None);
+    }
+    let additions = desired_values_with_key(component, binary_home, claustrum_key_path);
+    for (key, desired) in additions {
+        if pending.iter().any(|pending_key| pending_key == &key) {
+            insert_value(&mut document, &key, desired).map_err(|key| ConfigConflict { key })?;
+        }
     }
     let mut after = format!(
         "{}\n",
@@ -105,6 +100,82 @@ pub fn plan_component_with_key(
         before,
         after,
     }))
+}
+
+/// Dotted keys core (or another component) would write. Empty when the file
+/// already carries every desired leaf.
+pub fn pending_dotted_keys(
+    path: impl Into<PathBuf>,
+    component: Component,
+    binary_home: &Path,
+    claustrum_key_path: Option<&Path>,
+) -> Result<Vec<String>, ConfigConflict> {
+    let path = path.into();
+    let before = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(_) => {
+            return Err(ConfigConflict {
+                key: path.display().to_string(),
+            })
+        }
+    };
+    let document = if before.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        let strict = jsonc_to_json(&before).map_err(|_| ConfigConflict {
+            key: path.display().to_string(),
+        })?;
+        serde_json::from_str::<Value>(&strict).map_err(|_| ConfigConflict {
+            key: path.display().to_string(),
+        })?
+    };
+    if !document.is_object() {
+        return Err(ConfigConflict {
+            key: "<root>".to_string(),
+        });
+    }
+    pending_keys_against(&document, component, binary_home, claustrum_key_path)
+}
+
+fn pending_keys_against(
+    document: &Value,
+    component: Component,
+    binary_home: &Path,
+    claustrum_key_path: Option<&Path>,
+) -> Result<Vec<String>, ConfigConflict> {
+    let mut pending = Vec::new();
+    for (key, desired) in desired_values_with_key(component, binary_home, claustrum_key_path) {
+        match existing_value(document, &key) {
+            Some(actual) if actual == &desired => {}
+            Some(_) => return Err(ConfigConflict { key }),
+            None => pending.push(key),
+        }
+    }
+    Ok(pending)
+}
+
+/// Sections a live daemon would have to restart to apply, derived locally from
+/// the keys core setup would write. No RPC: at dry-run time the new section is
+/// not on disk yet, so asking the daemon about the current file always answers
+/// empty. A stopped daemon starts later on the new file and needs no restart.
+pub fn restart_required_from_pending_keys(
+    runtime_live: bool,
+    pending_dotted_keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<String> {
+    if !runtime_live {
+        return Vec::new();
+    }
+    let mut sections = Vec::new();
+    for key in pending_dotted_keys {
+        let top = key.as_ref().split('.').next().unwrap_or("");
+        if subc_core::daemon_config::RESTART_REQUIRED_SECTIONS.contains(&top)
+            && !sections.iter().any(|section| section == top)
+        {
+            sections.push(top.to_string());
+        }
+    }
+    sections
 }
 
 pub fn apply(change: &ConfigChange) -> Result<(), String> {
@@ -514,5 +585,34 @@ mod tests {
             fs::read_to_string(&config).expect("read unchanged"),
             original
         );
+    }
+
+    #[test]
+    fn live_host_missing_storage_is_a_restart_required_section() {
+        let root = fixture_path("pending-storage-restart");
+        let config = root.join("subc.jsonc");
+        fs::write(&config, r#"{"version":1}"#).expect("write");
+        let keys =
+            pending_dotted_keys(&config, Component::Core, root.path(), None).expect("pending");
+        assert!(
+            keys.iter().any(|key| key == "storage.backend"),
+            "core would write storage.backend: {keys:?}"
+        );
+        assert_eq!(restart_required_from_pending_keys(true, &keys), ["storage"]);
+        assert!(
+            restart_required_from_pending_keys(false, &keys).is_empty(),
+            "a stopped daemon starts on the new file"
+        );
+    }
+
+    #[test]
+    fn live_host_already_carrying_storage_backend_needs_no_restart() {
+        let root = fixture_path("has-storage-restart");
+        let config = root.join("subc.jsonc");
+        fs::write(&config, r#"{"version":1,"storage":{"backend":"sqlite"}}"#).expect("write");
+        let keys =
+            pending_dotted_keys(&config, Component::Core, root.path(), None).expect("pending");
+        assert!(keys.is_empty(), "no core keys remain to write: {keys:?}");
+        assert!(restart_required_from_pending_keys(true, &keys).is_empty());
     }
 }

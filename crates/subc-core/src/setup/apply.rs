@@ -16,7 +16,7 @@ use super::{
         Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
         RuntimeState, SetupObserved, SetupOperation, SetupRequest,
     },
-    planner::{collect_restart_required, execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
+    planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
     runtime::{self, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
     uninstall,
     validation::{self, Validator},
@@ -176,22 +176,19 @@ impl SetupBackend {
         // AFT automatic detection is disabled for alpha until its owner supplies
         // a marker contract with false-positive classification rules.
         observed.detections.remove(&Component::Aft);
-        let core_config_would_change = matches!(
-            config::plan_component_with_key(
-                &self.paths.config_path,
-                Component::Core,
-                &self.paths.binary_home,
-                claustrum_key_path,
-            ),
-            Ok(Some(_)),
-        );
-        // A live daemon still holds the config it loaded at start. When core
-        // setup would change that file, ask what a rescan would need so dry-run
-        // can show the restart before consent, and so apply can plan it.
+        // Dry-run cannot ask the live daemon: the new section is not on disk
+        // yet, so a preview rescan always answers empty. Intersect the keys
+        // core would write with the sections rescan cannot apply. The apply
+        // path still previews after the write, when the file is the authority.
+        let pending_keys = config::pending_dotted_keys(
+            &self.paths.config_path,
+            Component::Core,
+            &self.paths.binary_home,
+            claustrum_key_path,
+        )
+        .unwrap_or_default();
         observed.restart_required =
-            collect_restart_required(self.runtime_status.live, core_config_would_change, || {
-                crate::preview_rescan_restart_required()
-            })?;
+            config::restart_required_from_pending_keys(self.runtime_status.live, &pending_keys);
         Ok(observed)
     }
 

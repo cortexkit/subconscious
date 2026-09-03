@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Bootstrap only ck from the latest subconscious GitHub Release. Setup owns all
-# runtime and configuration work, so this script must never invoke `ck setup`.
+# Bootstrap only ck from the CortexKit release index. Setup owns all runtime
+# and configuration work, so this script must never invoke `ck setup`. The
+# index signature is not checked here: bootstrap trust is TLS to the index
+# host, and the placed `ck` verifies the signed index on its first setup.
 set -euo pipefail
 
-readonly RELEASE_BASE_URL_DEFAULT="https://github.com/cortexkit/subconscious/releases/latest/download"
+readonly INDEX_URL_DEFAULT="https://cortexkit.io/releases/v1/index.json"
 readonly PATH_BLOCK_BEGIN="# cortexkit-managed PATH begin"
 readonly PATH_BLOCK_END="# cortexkit-managed PATH end"
 
@@ -250,16 +252,14 @@ if [[ "$os" == "linux" ]]; then
 fi
 
 if ! command -v curl >/dev/null 2>&1; then
-  refuse "download-tool-unavailable" "curl is required to download GitHub Release assets"
+  refuse "download-tool-unavailable" "curl is required to download the release index and archive"
 fi
 if ! command -v unzip >/dev/null 2>&1; then
   refuse "extraction-failed" "unzip is required to extract the release archive"
 fi
 
-release_base_url="${CK_RELEASE_BASE_URL:-$RELEASE_BASE_URL_DEFAULT}"
-release_base_url="${release_base_url%/}"
+index_url="${CK_RELEASE_INDEX_URL:-$INDEX_URL_DEFAULT}"
 archive_name="ck-${os}-${arch}.zip"
-sidecar_name="${archive_name}.sha256"
 data_dir="$HOME/.local/share/cortexkit"
 bin_dir="$data_dir/bin"
 destination="$bin_dir/ck"
@@ -270,43 +270,71 @@ if ! temp_dir=$(mktemp -d); then
 fi
 trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
 archive_path="$temp_dir/$archive_name"
-sidecar_path="$temp_dir/$sidecar_name"
 extract_dir="$temp_dir/extracted"
+index_path="$temp_dir/index.json"
 
 if ! curl --fail --location --retry 3 --silent --show-error \
-  "$release_base_url/$archive_name" --output "$archive_path"; then
-  refuse "release-incomplete" "ck archive unavailable: $archive_name from $release_base_url"
-fi
-if ! curl --fail --location --retry 3 --silent --show-error \
-  "$release_base_url/$sidecar_name" --output "$sidecar_path"; then
-  refuse "release-incomplete" "ck digest sidecar unavailable: $sidecar_name from $release_base_url"
+  "$index_url" --output "$index_path"; then
+  refuse "release-incomplete" "release index unavailable: $index_url"
 fi
 
-if ! expected_digest=$(awk -v expected_name="$archive_name" '
-  NR == 1 {
-    if (length($1) != 64 || $1 ~ /[^0-9A-Fa-f]/) {
-      invalid = 1
-      exit 1
+# jq is not present on a fresh machine. Brace-match nested objects so a later
+# component's same target cannot be mistaken for core's ck asset.
+ck_fields=$(awk -v target="${os}-${arch}" '
+  function extract_object(json, key,    start, i, depth, in_str, esc, c) {
+    start = index(json, "\"" key "\":")
+    if (start == 0) return ""
+    i = start + length(key) + 3
+    while (i <= length(json) && substr(json, i, 1) ~ /[ \t]/) i++
+    if (substr(json, i, 1) != "{") return ""
+    depth = 1; in_str = 0; esc = 0; i++
+    start = i
+    while (i <= length(json) && depth > 0) {
+      c = substr(json, i, 1)
+      if (in_str) {
+        if (esc) esc = 0
+        else if (c == "\\") esc = 1
+        else if (c == "\"") in_str = 0
+      } else {
+        if (c == "\"") in_str = 1
+        else if (c == "{") depth++
+        else if (c == "}") depth--
+      }
+      i++
     }
-    if (NF > 2) {
-      invalid = 1
-      exit 1
-    }
-    if (NF == 2 && $2 != expected_name && $2 != "*" expected_name) {
-      invalid = 1
-      exit 1
-    }
-    print tolower($1)
-    next
+    return substr(json, start, i - start - 1)
   }
-  { invalid = 1; exit 1 }
-  END {
-    if (invalid || NR != 1) {
-      exit 1
-    }
+  function json_string(obj, key,    rest) {
+    if (!index(obj, "\"" key "\":")) return ""
+    rest = substr(obj, index(obj, "\"" key "\":") + length(key) + 3)
+    while (substr(rest, 1, 1) ~ /[ \t]/) rest = substr(rest, 2)
+    if (substr(rest, 1, 1) != "\"") return ""
+    rest = substr(rest, 2)
+    return substr(rest, 1, index(rest, "\"") - 1)
   }
-' "$sidecar_path"); then
-  refuse "digest-sidecar-invalid" "$sidecar_name is not a single shasum-compatible record for $archive_name"
+  BEGIN { RS = "" }
+  {
+    core = extract_object($0, "core")
+    assets = extract_object(core, "assets")
+    host = extract_object(assets, target)
+    ck = extract_object(host, "ck")
+    url = json_string(ck, "url")
+    sha = json_string(ck, "sha256")
+    if (url == "" || sha == "") exit 1
+    print url
+    print sha
+  }
+' "$index_path") || refuse "release-incomplete" "ck asset for ${os}-${arch} is missing from $index_url"
+
+archive_url=$(printf '%s\n' "$ck_fields" | sed -n '1p')
+expected_digest=$(printf '%s\n' "$ck_fields" | sed -n '2p' | tr 'A-F' 'a-f')
+if [[ ${#expected_digest} -ne 64 || "$expected_digest" == *[!0-9a-f]* ]]; then
+  refuse "release-incomplete" "ck sha256 for ${os}-${arch} is missing from $index_url"
+fi
+
+if ! curl --fail --location --retry 3 --silent --show-error \
+  "$archive_url" --output "$archive_path"; then
+  refuse "release-incomplete" "ck archive unavailable: $archive_name from $archive_url"
 fi
 actual_digest=$(sha256_for "$archive_path")
 if [[ "$actual_digest" != "$expected_digest" ]]; then

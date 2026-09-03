@@ -7,6 +7,7 @@ mod inventory;
 mod mc_detection;
 mod model;
 mod planner;
+mod release_index;
 mod runtime;
 mod self_update;
 #[cfg(unix)]
@@ -30,7 +31,7 @@ pub(crate) use self_update::cleanup_replaced_windows_ck;
 pub use update_cache::UpdateCache;
 pub use update_check::{
     check_update_metadata, compiled_installed_versions, dashboard_update, not_checked_from_cache,
-    GitHubReleaseSource, UpdateCheckError,
+    IndexReleaseSource, UpdateCheckError,
 };
 pub use upgrade::{
     discover_current_upgrade_targets, observed_upgrade_targets, render_execution_report,

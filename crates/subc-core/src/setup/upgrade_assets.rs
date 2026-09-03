@@ -7,23 +7,23 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::model::{AlphaTarget, UpgradeTarget};
+use super::{
+    model::{AlphaTarget, UpgradeTarget},
+    release_index::{self, ReleaseIndex},
+    update_check::upgrade_target_index_path,
+};
 
-/// The two release names are derived together so an upgrade cannot accidentally
-/// pair an archive with a digest intended for a different host binary.
+/// Archive and binary names derived from the upgrade target and host tuple.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeAssetNames {
     pub archive: String,
-    pub sidecar: String,
     pub binary: String,
 }
 
 pub fn convention_asset_names(target: UpgradeTarget, platform: AlphaTarget) -> UpgradeAssetNames {
-    let archive = format!("{}-{}.zip", target.label(), platform.label());
     UpgradeAssetNames {
-        sidecar: format!("{archive}.sha256"),
+        archive: format!("{}-{}.zip", target.label(), platform.label()),
         binary: platform_binary(target.label()),
-        archive,
     }
 }
 
@@ -31,10 +31,6 @@ pub fn convention_asset_names(target: UpgradeTarget, platform: AlphaTarget) -> U
 pub enum UpgradeAssetError {
     ReleaseIncomplete {
         missing_asset: String,
-    },
-    DigestSidecar {
-        asset: String,
-        reason: String,
     },
     DigestMismatch {
         asset: String,
@@ -58,12 +54,6 @@ impl std::fmt::Display for UpgradeAssetError {
                 write!(
                     formatter,
                     "release-incomplete: missing asset {missing_asset}"
-                )
-            }
-            Self::DigestSidecar { asset, reason } => {
-                write!(
-                    formatter,
-                    "refusal: invalid digest sidecar {asset}: {reason}"
                 )
             }
             Self::DigestMismatch {
@@ -100,97 +90,52 @@ impl PreparedUpgradeAsset {
 }
 
 pub trait UpgradeAssetFetcher {
-    fn download(
+    /// Download the archive for `target` on `platform` and return the expected sha256.
+    fn fetch_archive(
         &mut self,
         target: UpgradeTarget,
-        asset: &str,
+        platform: AlphaTarget,
         destination: &Path,
-    ) -> Result<(), String>;
+    ) -> Result<String, UpgradeAssetError>;
 }
 
-/// Release downloads use separate repository bases, while their asset names stay
-/// convention-derived. The base overrides make a release mirror testable without
-/// adding a manifest or target-to-asset mapping table.
+/// Downloads the archive URL named by a previously fetched signed index.
 pub struct ReleaseUpgradeAssetFetcher {
-    subc_base_url: String,
-    aft_base_url: String,
+    index: ReleaseIndex,
 }
 
 impl ReleaseUpgradeAssetFetcher {
-    pub fn from_environment() -> Self {
-        Self {
-            subc_base_url: std::env::var("CK_RELEASE_BASE_URL").unwrap_or_else(|_| {
-                "https://github.com/cortexkit/subconscious/releases/latest/download".to_string()
-            }),
-            aft_base_url: std::env::var("CK_AFT_RELEASE_BASE_URL").unwrap_or_else(|_| {
-                "https://github.com/cortexkit/aft/releases/latest/download".to_string()
-            }),
-        }
-    }
-
-    fn release_base(&self, target: UpgradeTarget) -> &str {
-        match target {
-            UpgradeTarget::Aft => &self.aft_base_url,
-            UpgradeTarget::SubcMcp | UpgradeTarget::Daemon | UpgradeTarget::Ck => {
-                &self.subc_base_url
-            }
-        }
+    pub fn from_index(index: ReleaseIndex) -> Self {
+        Self { index }
     }
 }
 
 impl UpgradeAssetFetcher for ReleaseUpgradeAssetFetcher {
-    fn download(
+    fn fetch_archive(
         &mut self,
         target: UpgradeTarget,
-        asset: &str,
+        platform: AlphaTarget,
         destination: &Path,
-    ) -> Result<(), String> {
-        let url = format!(
-            "{}/{asset}",
-            self.release_base(target).trim_end_matches('/')
-        );
-        let destination = destination.to_string_lossy().into_owned();
-        let (program, args) = if cfg!(windows) {
-            (
-                "powershell.exe",
-                vec![
-                    "-NoProfile".to_string(),
-                    "-NonInteractive".to_string(),
-                    "-Command".to_string(),
-                    format!(
-                        "Invoke-WebRequest -Uri '{url}' -OutFile '{destination}' -UseBasicParsing"
-                    ),
-                ],
-            )
-        } else {
-            (
-                "curl",
-                vec![
-                    "--fail".to_string(),
-                    "--location".to_string(),
-                    "--silent".to_string(),
-                    "--show-error".to_string(),
-                    "--output".to_string(),
-                    destination,
-                    url,
-                ],
-            )
+    ) -> Result<String, UpgradeAssetError> {
+        let (component, binary) = upgrade_target_index_path(target);
+        let missing = || UpgradeAssetError::ReleaseIncomplete {
+            missing_asset: format!("{}-{}.zip", binary, platform.label()),
         };
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|error| format!("could not run {program}: {error}"))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-        }
+        let asset = self
+            .index
+            .components
+            .get(component)
+            .and_then(|entry| entry.assets.get(platform.label()))
+            .and_then(|assets| assets.get(binary))
+            .ok_or_else(missing)?;
+        release_index::download(&asset.url, destination).map_err(|_| missing())?;
+        Ok(asset.sha256.to_ascii_lowercase())
     }
 }
 
-/// Download a convention-derived archive and exactly its matching sidecar.
-/// Extraction is deliberately after the digest check: a corrupt archive must
-/// never reach an extractor or a managed destination.
+/// Download the archive named by the index and verify it against the index
+/// digest. Extraction is after the digest check: a corrupt archive must never
+/// reach an extractor or a managed destination.
 pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
     fetcher: &mut F,
     target: UpgradeTarget,
@@ -199,32 +144,8 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
     let names = convention_asset_names(target, platform);
     let workspace = temporary_workspace(target)?;
     let archive = workspace.join(&names.archive);
-    let sidecar = workspace.join(&names.sidecar);
 
-    fetcher
-        .download(target, &names.archive, &archive)
-        .map_err(|_| UpgradeAssetError::ReleaseIncomplete {
-            missing_asset: names.archive.clone(),
-        })?;
-    fetcher
-        .download(target, &names.sidecar, &sidecar)
-        .map_err(|_| UpgradeAssetError::ReleaseIncomplete {
-            missing_asset: names.sidecar.clone(),
-        })?;
-
-    let expected = fs::read_to_string(&sidecar)
-        .map_err(|error| UpgradeAssetError::Io {
-            asset: names.sidecar.clone(),
-            reason: error.to_string(),
-        })
-        .and_then(|contents| {
-            parse_sidecar(&contents, &names.archive).map_err(|reason| {
-                UpgradeAssetError::DigestSidecar {
-                    asset: names.sidecar.clone(),
-                    reason,
-                }
-            })
-        })?;
+    let expected = fetcher.fetch_archive(target, platform, &archive)?;
     let actual = sha256_file(&archive).map_err(|reason| UpgradeAssetError::Io {
         asset: names.archive.clone(),
         reason,
@@ -260,25 +181,6 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
-fn parse_sidecar(contents: &str, archive_name: &str) -> Result<String, String> {
-    let mut lines = contents.lines();
-    let line = lines.next().ok_or_else(|| "sidecar is empty".to_string())?;
-    if lines.next().is_some() {
-        return Err("sidecar has more than one digest record".to_string());
-    }
-    let mut fields = line.split_whitespace();
-    let digest = fields
-        .next()
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| "sidecar has no SHA-256 digest".to_string())?;
-    if let Some(recorded_name) = fields.next() {
-        if recorded_name.trim_start_matches('*') != archive_name || fields.next().is_some() {
-            return Err(format!("sidecar does not name {archive_name}"));
-        }
-    }
-    Ok(digest.to_ascii_lowercase())
 }
 
 fn temporary_workspace(target: UpgradeTarget) -> Result<PathBuf, UpgradeAssetError> {
@@ -358,22 +260,33 @@ mod tests {
     #[derive(Default)]
     struct MemoryFetcher {
         assets: BTreeMap<String, Vec<u8>>,
+        digests: BTreeMap<String, String>,
         calls: Vec<String>,
     }
 
     impl UpgradeAssetFetcher for MemoryFetcher {
-        fn download(
+        fn fetch_archive(
             &mut self,
-            _target: UpgradeTarget,
-            asset: &str,
+            target: UpgradeTarget,
+            platform: AlphaTarget,
             destination: &Path,
-        ) -> Result<(), String> {
-            self.calls.push(asset.to_string());
-            let bytes = self
-                .assets
-                .get(asset)
-                .ok_or_else(|| "not found".to_string())?;
-            fs::write(destination, bytes).map_err(|error| error.to_string())
+        ) -> Result<String, UpgradeAssetError> {
+            let names = convention_asset_names(target, platform);
+            self.calls.push(names.archive.clone());
+            let bytes = self.assets.get(&names.archive).ok_or_else(|| {
+                UpgradeAssetError::ReleaseIncomplete {
+                    missing_asset: names.archive.clone(),
+                }
+            })?;
+            fs::write(destination, bytes).map_err(|error| UpgradeAssetError::Io {
+                asset: names.archive.clone(),
+                reason: error.to_string(),
+            })?;
+            self.digests.get(&names.archive).cloned().ok_or({
+                UpgradeAssetError::ReleaseIncomplete {
+                    missing_asset: names.archive,
+                }
+            })
         }
     }
 
@@ -386,10 +299,6 @@ mod tests {
         ] {
             let names = convention_asset_names(UpgradeTarget::Aft, platform);
             assert_eq!(names.archive, format!("ck-aft-{}.zip", platform.label()));
-            assert_eq!(
-                names.sidecar,
-                format!("ck-aft-{}.zip.sha256", platform.label())
-            );
         }
     }
 
@@ -410,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_sidecar_is_a_typed_refusal_that_names_the_exact_asset() {
+    fn missing_index_digest_is_a_typed_refusal_that_names_the_exact_asset() {
         let mut fetcher = MemoryFetcher::default();
         let names = convention_asset_names(UpgradeTarget::Aft, AlphaTarget::LinuxX64);
         fetcher
@@ -418,14 +327,14 @@ mod tests {
             .insert(names.archive.clone(), b"archive".to_vec());
 
         let error = prepare_upgrade_asset(&mut fetcher, UpgradeTarget::Aft, AlphaTarget::LinuxX64)
-            .expect_err("missing sidecar must refuse");
+            .expect_err("missing digest must refuse");
         assert_eq!(
             error,
             UpgradeAssetError::ReleaseIncomplete {
-                missing_asset: names.sidecar.clone()
+                missing_asset: names.archive.clone()
             }
         );
-        assert_eq!(fetcher.calls, vec![names.archive, names.sidecar]);
+        assert_eq!(fetcher.calls, vec![names.archive]);
     }
 
     #[test]
@@ -435,15 +344,14 @@ mod tests {
         fetcher
             .assets
             .insert(names.archive.clone(), b"corrupted".to_vec());
-        fetcher.assets.insert(
-            names.sidecar.clone(),
-            format!("{}  {}\n", "0".repeat(64), names.archive).into_bytes(),
-        );
+        fetcher
+            .digests
+            .insert(names.archive.clone(), "0".repeat(64));
 
         let error =
             prepare_upgrade_asset(&mut fetcher, UpgradeTarget::SubcMcp, AlphaTarget::LinuxX64)
                 .expect_err("digest mismatch must refuse");
         assert!(matches!(error, UpgradeAssetError::DigestMismatch { .. }));
-        assert_eq!(fetcher.calls, vec![names.archive, names.sidecar]);
+        assert_eq!(fetcher.calls, vec![names.archive]);
     }
 }

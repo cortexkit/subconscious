@@ -541,7 +541,7 @@ mod tests {
         observed.releases.insert(
             Component::Aft,
             ReleaseAvailability::Unresolvable {
-                reason: "HTTP 403 from https://api.github.com/repos/cortexkit/aft/releases/latest"
+                reason: "index_unreachable: https://cortexkit.io/releases/v1/index.json: HTTP 503"
                     .to_string(),
             },
         );
@@ -556,7 +556,7 @@ mod tests {
             rendered.contains("could not resolve the release"),
             "{rendered}"
         );
-        assert!(rendered.contains("HTTP 403"), "{rendered}");
+        assert!(rendered.contains("index_unreachable"), "{rendered}");
         assert!(!rendered.contains("has not published"), "{rendered}");
         assert!(outcome.blocks_execution());
         // Core was resolvable and stays plannable: one component's host

@@ -13,6 +13,7 @@ use subc_transport::connection_file;
 use super::{
     inventory::Inventory,
     model::{AlphaTarget, UpgradeObserved, UpgradeState, UpgradeTarget},
+    release_index::ReleaseIndex,
     self_update,
     update_cache::UpdateMetadata,
     update_check::observed_from_metadata,
@@ -130,9 +131,7 @@ pub fn discover_managed_upgrade_targets(
     Ok(targets)
 }
 
-/// Combines inventory and running-version evidence with the release check. A
-/// sidecar is a required release asset in its own right, so a published archive
-/// with no matching digest remains a typed release-incomplete refusal.
+/// Combines inventory and running-version evidence with the release check.
 pub fn observed_upgrade_targets(
     metadata: &UpdateMetadata,
     discovered: &[ManagedUpgradeTarget],
@@ -152,28 +151,6 @@ pub fn observed_upgrade_targets(
             observed
                 .targets
                 .insert(target.label().to_string(), UpgradeState::NotInstalled);
-        }
-    }
-    let super::model::PlatformObservation::Supported(platform) = observed.platform else {
-        return observed;
-    };
-    for item in discovered {
-        let Some(release) = metadata.targets.get(item.target.label()) else {
-            continue;
-        };
-        let sidecar = format!("{}-{}.zip.sha256", item.target.label(), platform.label());
-        if !release.assets.iter().any(|asset| asset == &sidecar)
-            && matches!(
-                observed.target_state(item.target),
-                UpgradeState::UpdateAvailable { .. }
-            )
-        {
-            observed.releases.insert(
-                item.target.label().to_string(),
-                super::model::ReleaseAvailability::Incomplete {
-                    missing_asset: sidecar,
-                },
-            );
         }
     }
     observed
@@ -200,6 +177,7 @@ impl SystemUpgradeBackend {
         executable: impl Into<PathBuf>,
         subc: Option<PathBuf>,
         targets: Vec<ManagedUpgradeTarget>,
+        index: ReleaseIndex,
     ) -> Result<Self, String> {
         let platform = match super::model::PlatformObservation::current() {
             super::model::PlatformObservation::Supported(platform) => platform,
@@ -225,7 +203,7 @@ impl SystemUpgradeBackend {
                 .collect(),
             executable: executable.into(),
             subc,
-            assets: ReleaseUpgradeAssetFetcher::from_environment(),
+            assets: ReleaseUpgradeAssetFetcher::from_index(index),
             inventory,
             prepared: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
@@ -448,10 +426,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let prepared = prepare_upgrade_asset(&mut self.assets, target, self.platform)
             .map_err(|error| error.to_string())?;
-        let detail = format!(
-            "archive={} sidecar={} SHA-256=verified",
-            prepared.names.archive, prepared.names.sidecar
-        );
+        let detail = format!("archive={} SHA-256=verified", prepared.names.archive);
         self.prepared.insert(target.label().to_string(), prepared);
         Ok(detail)
     }
@@ -793,32 +768,28 @@ mod tests {
     }
 
     #[test]
-    fn missing_aft_sidecar_is_typed_release_incomplete() {
+    fn missing_aft_archive_is_typed_release_incomplete() {
         let target = ManagedUpgradeTarget {
             target: UpgradeTarget::Aft,
             destination: PathBuf::from("/managed/ck-aft"),
             installed_version: "1.0.0".to_string(),
         };
         let mut metadata = UpdateMetadata {
+            format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
             checked_at_unix_secs: 1,
             targets: BTreeMap::new(),
-        };
-        let platform = match super::super::model::PlatformObservation::current() {
-            super::super::model::PlatformObservation::Supported(platform) => platform,
-            super::super::model::PlatformObservation::Unsupported(_) => return,
         };
         metadata.targets.insert(
             UpgradeTarget::Aft.label().to_string(),
             super::super::update_cache::CachedRelease {
                 version: "2.0.0".to_string(),
-                assets: vec![format!("ck-aft-{}.zip", platform.label())],
+                assets: Vec::new(),
             },
         );
         let observed = observed_upgrade_targets(&metadata, &[target]);
         assert!(matches!(
             observed.release(UpgradeTarget::Aft),
-            super::super::model::ReleaseAvailability::Incomplete { missing_asset }
-                if missing_asset == format!("ck-aft-{}.zip.sha256", platform.label())
+            super::super::model::ReleaseAvailability::Incomplete { .. }
         ));
     }
 }

@@ -132,7 +132,11 @@ fn bare_ck_degrades_to_domains_when_daemon_is_unreachable() {
 fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
     let temp = TempDir::new("ck-update-timeout");
     let cache_path = temp.path().join("update-metadata.json");
-    fs::write(&cache_path, r#"{"checked_at_unix_secs":0,"targets":{}}"#).unwrap();
+    fs::write(
+        &cache_path,
+        r#"{"format_version":2,"checked_at_unix_secs":0,"targets":{}}"#,
+    )
+    .unwrap();
 
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let source_base = format!("http://{}", listener.local_addr().unwrap());
@@ -150,7 +154,7 @@ fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
         .args(["--subc"])
         .arg(&missing)
         .env("CK_UPDATE_CACHE_PATH", &cache_path)
-        .env("CK_UPDATE_SOURCE_BASE_URL", source_base)
+        .env("CK_RELEASE_INDEX_URL", format!("{source_base}/index.json"))
         .output()
         .unwrap();
     let elapsed = started.elapsed();
@@ -174,57 +178,95 @@ fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
     );
 }
 
-#[test]
-fn upgrade_check_refreshes_the_user_cache_from_each_release_target() {
-    let temp = TempDir::new("ck-upgrade-check");
-    let cache_path = temp.path().join("update-metadata.json");
+fn serve_index(body: &[u8], signature_header: Option<&str>) -> String {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let source_base = format!("http://{}", listener.local_addr().unwrap());
-    let assets = ["ck", "ck-subc", "ck-subc-mcp", "ck-aft"]
-        .into_iter()
-        .flat_map(|binary| {
-            ["darwin-arm64", "linux-x64", "windows-x64"]
-                .into_iter()
-                .map(move |platform| format!(r#"{{"name":"{binary}-{platform}.zip"}}"#))
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let body = format!(
-        r#"{{"tag_name":"subc-core-v{}","assets":[{assets}]}}"#,
-        env!("CARGO_PKG_VERSION")
-    );
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let server = std::thread::spawn(move || {
-        for _ in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
+    let addr = listener.local_addr().unwrap();
+    let body = body.to_vec();
+    let signature_header = signature_header.map(str::to_string);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut request = [0_u8; 2048];
             let _ = std::io::Read::read(&mut stream, &mut request);
-            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+            let mut header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                body.len()
+            );
+            if let Some(signature) = &signature_header {
+                header.push_str(&format!("X-CortexKit-Signature-Ed25519: {signature}\r\n"));
+            }
+            header.push_str("\r\n");
+            let _ = std::io::Write::write_all(&mut stream, header.as_bytes());
+            let _ = std::io::Write::write_all(&mut stream, &body);
         }
     });
+    format!("http://{addr}/index.json")
+}
 
+fn fixture_index_body() -> Vec<u8> {
+    format!(
+        r#"{{"schema":1,"channel":"alpha","generated_at_ms":{},"components":{{"core":{{"release":"subc-core-v{}","version":"{}","assets":{{}}}}}}}}"#,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .into_bytes()
+}
+
+/// RFC 8032 test-key signature over `{{"schema":1}}` — valid Ed25519, wrong key.
+const FOREIGN_SIGNATURE: &str =
+    "fjYZ87Tka7M+yJ+lmjD7vjSjflypCGi2KIvmSktgssO79FN8/mntGhobmTCwYDeQRAEAu7oDdv7zrAkI9N9uDA==";
+
+#[test]
+fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
+    let url = serve_index(&fixture_index_body(), None);
     let output = ck_command()
-        .args(["upgrade", "--check"])
-        .env("CK_UPDATE_CACHE_PATH", &cache_path)
-        .env("CK_UPDATE_SOURCE_BASE_URL", source_base)
+        .args(["setup", "--dry-run"])
+        .env("CK_RELEASE_INDEX_URL", &url)
         .output()
         .unwrap();
-    server.join().unwrap();
-
-    assert_exit(&output, 0);
-    let stdout = text(&output.stdout);
-    assert!(stdout.contains("upgrade plan:"), "stdout:\n{stdout}");
+    assert_ne!(output.status.code(), Some(0), "stripped header must refuse");
+    let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
     assert!(
-        stdout.contains("upgrade check: 0 mutation(s)"),
-        "stdout:\n{stdout}"
+        combined.contains("index_signature_invalid"),
+        "stdout+stderr:\n{combined}"
     );
     assert!(
-        text(&fs::read(&cache_path).unwrap()).contains(env!("CARGO_PKG_VERSION")),
-        "cache did not retain the checked release metadata"
+        combined.contains("generation 1"),
+        "stdout+stderr:\n{combined}"
+    );
+    assert!(
+        !combined.contains("setup plan:"),
+        "stripped header must plan nothing:\n{combined}"
+    );
+}
+
+#[test]
+fn setup_dry_run_refuses_a_test_key_signature_against_the_embedded_key() {
+    let url = serve_index(&fixture_index_body(), Some(FOREIGN_SIGNATURE));
+    let output = ck_command()
+        .args(["setup", "--dry-run"])
+        .env("CK_RELEASE_INDEX_URL", &url)
+        .output()
+        .unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "foreign signature must refuse"
+    );
+    let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(
+        combined.contains("index_signature_invalid"),
+        "stdout+stderr:\n{combined}"
+    );
+    assert!(
+        combined.contains("generation 1"),
+        "stdout+stderr:\n{combined}"
     );
 }
 
@@ -846,7 +888,7 @@ fn ck_command() -> Command {
             "CK_UPDATE_CACHE_PATH",
             unique_temp_dir("ck-update-cache").join("update-metadata.json"),
         )
-        .env("CK_UPDATE_SOURCE_BASE_URL", "http://127.0.0.1:0");
+        .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json");
     command
 }
 

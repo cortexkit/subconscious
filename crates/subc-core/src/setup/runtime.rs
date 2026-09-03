@@ -417,11 +417,19 @@ fn platform_binary(name: &str) -> String {
     }
 }
 
+/// The uid whose launchd GUI domain owns the agent. Read from the kernel:
+/// `$UID` is a shell variable that bash and zsh set for scripts and do not
+/// export, so a real `ck` process never sees it, and the old fallback of 0
+/// bootstrapped every macOS user's agent into root's domain
+/// (`Bootstrap failed: 125: Domain does not support specified action`).
+#[cfg(unix)]
 fn current_uid() -> u32 {
-    std::env::var("UID")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+    rustix::process::getuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
 }
 
 #[cfg(test)]
@@ -485,6 +493,31 @@ mod tests {
         let error = start(RuntimePlatform::Macos, &paths, &mut RefusingRunner).unwrap_err();
         assert!(error.contains("Bootstrap failed"), "{error}");
         assert!(error.contains("launchctl kickstart"), "{error}");
+    }
+
+    /// Eighth finding of the macOS operator drive: the agent was bootstrapped
+    /// into `gui/0` on every Mac because the uid came from `$UID`, a shell
+    /// variable no shell exports. The domain must be the real user's, and it
+    /// must not depend on anything in the environment.
+    #[cfg(unix)]
+    #[test]
+    fn macos_agent_domain_is_the_real_users_not_roots_and_not_from_the_environment() {
+        let root = fixture_dir("gui-domain");
+        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        let mut runner = RecordingRunner::default();
+        // Poison the environment the old code trusted; the kernel must win.
+        let previous = std::env::var_os("UID");
+        std::env::set_var("UID", "0");
+        let result = register(RuntimePlatform::Macos, &paths, &mut runner);
+        match previous {
+            Some(value) => std::env::set_var("UID", value),
+            None => std::env::remove_var("UID"),
+        }
+        result.expect("register");
+        let domain = &runner.calls[0].1[1];
+        let real = rustix::process::getuid().as_raw();
+        assert_eq!(domain, &format!("gui/{real}"));
+        assert_ne!(real, 0, "this test is meaningless as root");
     }
 
     #[test]

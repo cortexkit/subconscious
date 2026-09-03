@@ -445,7 +445,15 @@ mod tests {
         child.start_kill().unwrap();
         child.wait().await.unwrap();
 
-        assert!(matches!(agreement, RunningImageAgreement::Match { .. }));
+        // Name the variant on failure: this test failed once on a GitHub
+        // ubuntu runner on a docs-only commit and passed 70/70 on an arm64
+        // Ubuntu VM including under load, so the next failure must say what
+        // the probe actually returned rather than only that it was not Match.
+        assert!(
+            matches!(agreement, RunningImageAgreement::Match { .. }),
+            "expected Match for a live child spawned from {}, got {agreement:?}",
+            executable.display()
+        );
     }
 
     #[cfg(target_os = "linux")]

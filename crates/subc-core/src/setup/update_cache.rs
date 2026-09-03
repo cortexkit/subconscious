@@ -4,15 +4,19 @@ use serde::{Deserialize, Serialize};
 
 pub const UPDATE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Bumped when the cache document's meaning changed (signed index instead of
-/// GitHub latest-release payloads). Older files are treated as absent.
-pub const UPDATE_CACHE_FORMAT_VERSION: u32 = 2;
+/// Bumped when the cache document began retaining the host asset digest. Older
+/// files cannot decide currency and are treated as absent so one check rebuilds
+/// them from the signed release index.
+pub const UPDATE_CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Release evidence retained after a successful user-initiated update check.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CachedRelease {
+    /// Display-only release text; sibling binaries need not share it.
     pub version: String,
-    pub assets: Vec<String>,
+    /// Digest of this binary's asset for the invoking host, or `None` when the
+    /// signed index has no matching asset for that target.
+    pub sha256: Option<String>,
 }
 
 /// The on-disk, user-owned update metadata cache. Daemon code does not import
@@ -138,7 +142,7 @@ mod tests {
                 "ck".to_string(),
                 CachedRelease {
                     version: "0.13.0".to_string(),
-                    assets: vec!["ck-darwin-arm64.zip".to_string()],
+                    sha256: Some("ab".repeat(32)),
                 },
             )]),
         }

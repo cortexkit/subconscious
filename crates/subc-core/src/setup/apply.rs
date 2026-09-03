@@ -1,9 +1,11 @@
 use std::{
-    collections::BTreeMap,
-    env,
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
+
+use serde_json::{Map, Value};
 
 use super::{
     components::{self, ReleaseArtifactSource},
@@ -29,6 +31,16 @@ pub struct SetupBackend {
     artifacts: ReleaseArtifactSource,
     runtime_status: RuntimeStatus,
     uninstall_report: Option<uninstall::UninstallReport>,
+    /// Completed changes from this invocation, partitioned so a failure in one
+    /// module never rewinds another module or the daemon runtime.
+    component_steps: BTreeMap<Component, ComponentSteps>,
+}
+
+#[derive(Default)]
+struct ComponentSteps {
+    placed_binaries: Vec<PathBuf>,
+    configured: bool,
+    configuration_inventory_created: bool,
 }
 
 struct SetupPaths {
@@ -72,6 +84,7 @@ impl SetupBackend {
             artifacts: ReleaseArtifactSource::current(),
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
+            component_steps: BTreeMap::new(),
         })
     }
 
@@ -82,6 +95,7 @@ impl SetupBackend {
             .claustrum_key_path
             .as_deref()
             .or(self.paths.claustrum_key_path.as_deref());
+        let registered_modules = self.live_enabled_modules()?;
         let mut components = BTreeMap::new();
         let mut releases = BTreeMap::new();
         // A failed index is about the document, not a single component: setup
@@ -113,11 +127,12 @@ impl SetupBackend {
                 components::is_installed(component, &self.paths.binary_home, &self.inventory);
             components.insert(
                 component,
-                if config_ok && binary_ok {
-                    ComponentState::Correct
-                } else {
-                    ComponentState::Missing
-                },
+                observed_component_state(
+                    component,
+                    config_ok,
+                    binary_ok,
+                    registered_modules.as_ref(),
+                ),
             );
             // A component the index does not list is a fact about that
             // component, never about the plan: one unpublished module must not
@@ -157,6 +172,7 @@ impl SetupBackend {
             RuntimeState::Missing
         };
         observed.configuration = configuration;
+        observed.running_ck_adoption = self.running_ck_adoption();
         // AFT automatic detection is disabled for alpha until its owner supplies
         // a marker contract with false-positive classification rules.
         observed.detections.remove(&Component::Aft);
@@ -240,6 +256,78 @@ impl SetupBackend {
         }
     }
 
+    /// Returns enabled module ids only when the daemon is live. A stopped daemon
+    /// has no observable registry and will load the managed configuration on start.
+    fn live_enabled_modules(&self) -> Result<Option<BTreeSet<String>>, String> {
+        if !self.runtime_status.live {
+            return Ok(None);
+        }
+        let output = Command::new(&self.executable)
+            .args(["--json", "module", "list"])
+            .output()
+            .map_err(|error| format!("could not run ck module list --json: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ck module list --json failed with {}",
+                output.status
+            ));
+        }
+        let value: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("ck module list --json returned invalid JSON: {error}"))?;
+        let entries = value
+            .get("modules")
+            .and_then(Value::as_array)
+            .or_else(|| value.as_array())
+            .ok_or_else(|| "ck module list --json omitted modules".to_string())?;
+        Ok(Some(
+            entries
+                .iter()
+                .filter(|entry| entry.get("enabled").and_then(Value::as_bool) == Some(true))
+                .filter_map(|entry| entry.get("module_id").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect(),
+        ))
+    }
+
+    fn running_ck_adoption(&self) -> Option<PathBuf> {
+        let binary_home = fs::canonicalize(&self.paths.binary_home)
+            .unwrap_or_else(|_| self.paths.binary_home.clone());
+        self.executable
+            .starts_with(binary_home)
+            .then(|| self.executable.clone())
+            .filter(|path| path.is_file())
+            .filter(|path| !self.inventory.owns_path("managed-binary", path))
+    }
+
+    fn adopt_running_ck(&mut self, path: &Path) -> Result<(), String> {
+        if path != self.executable || self.running_ck_adoption().as_deref() != Some(path) {
+            return Err(format!(
+                "refusal: running ck at {} is not an unowned bootstrap placement",
+                path.display()
+            ));
+        }
+        let mut fields = Map::new();
+        fields.insert(
+            "component".to_string(),
+            Value::String(Component::Core.label().to_string()),
+        );
+        fields.insert(
+            "sha256".to_string(),
+            Value::String(components::digest_file(path)?),
+        );
+        fields.insert(
+            "version".to_string(),
+            Value::String(super::upgrade::binary_version(path)?),
+        );
+        self.inventory.record("managed-binary", path, fields);
+        self.inventory.save()?;
+        println!(
+            "adopted: {} (placed by the bootstrap installer)",
+            path.display()
+        );
+        Ok(())
+    }
+
     fn bootstrap_claustrum(&self, key_path: Option<&Path>) -> Result<(), String> {
         let auth = self.paths.binary_home.join(if cfg!(windows) {
             "ck-auth.exe"
@@ -267,25 +355,49 @@ impl SetupExecutor for SetupBackend {
 
     fn apply(&mut self, operation: &SetupOperation) -> Result<(), Self::Error> {
         match operation {
-            SetupOperation::InstallComponent { component } => components::install_component(
-                *component,
-                &self.paths.binary_home,
-                &mut self.inventory,
-                &mut self.artifacts,
-            ),
+            SetupOperation::InstallComponent { component } => {
+                let paths = components::component_binary_paths(*component, &self.paths.binary_home);
+                let owned_before = paths
+                    .iter()
+                    .map(|path| self.inventory.owns_path("managed-binary", path))
+                    .collect::<Vec<_>>();
+                components::install_component(
+                    *component,
+                    &self.paths.binary_home,
+                    &mut self.inventory,
+                    &mut self.artifacts,
+                )?;
+                let steps = self.component_steps.entry(*component).or_default();
+                for (path, owned_before) in paths.into_iter().zip(owned_before) {
+                    if !owned_before && self.inventory.owns_path("managed-binary", &path) {
+                        steps.placed_binaries.push(path);
+                    }
+                }
+                Ok(())
+            }
             SetupOperation::ConfigureComponent { component } => {
-                components::configure_component(
+                let configuration_inventory_created = !self
+                    .inventory
+                    .owns_path("configuration", &self.paths.config_path);
+                let changed = components::configure_component(
                     *component,
                     &self.paths.config_path,
                     &self.paths.binary_home,
                     self.paths.claustrum_key_path.as_deref(),
                     &mut self.inventory,
-                )?;
+                )?
+                .is_some();
+                if changed {
+                    let steps = self.component_steps.entry(*component).or_default();
+                    steps.configured = true;
+                    steps.configuration_inventory_created = configuration_inventory_created;
+                }
                 Ok(())
             }
             SetupOperation::BootstrapClaustrum { key_path } => {
                 self.bootstrap_claustrum(key_path.as_deref())
             }
+            SetupOperation::AdoptRunningCk { path } => self.adopt_running_ck(path),
             SetupOperation::RescanComponent { .. } => self.run_ck(&["module", "rescan"]),
             SetupOperation::EnableComponent { component } => self.run_ck(&[
                 "module",
@@ -327,6 +439,62 @@ impl SetupExecutor for SetupBackend {
             | SetupOperation::RetainUserData => Ok(()),
         }
     }
+
+    fn rollback_component(&mut self, component: Component) -> Result<(), Self::Error> {
+        let Some(steps) = self.component_steps.remove(&component) else {
+            return Ok(());
+        };
+        for path in steps.placed_binaries.into_iter().rev() {
+            if self.inventory.owns_path("managed-binary", &path) {
+                match fs::remove_file(&path) {
+                    Ok(()) => println!("rolled back: {}", path.display()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("could not roll back {}: {error}", path.display()))
+                    }
+                }
+                self.inventory.remove_owned_path("managed-binary", &path);
+            }
+        }
+        if steps.configured
+            && config::remove_component(
+                &self.paths.config_path,
+                component,
+                &self.paths.binary_home,
+                self.paths.claustrum_key_path.as_deref(),
+            )?
+        {
+            println!("rolled back: {}", self.paths.config_path.display());
+        }
+        if steps.configuration_inventory_created
+            && !self.component_steps.values().any(|other| other.configured)
+        {
+            self.inventory
+                .remove_owned_path("configuration", &self.paths.config_path);
+        }
+        self.inventory.save()
+    }
+}
+
+fn observed_component_state(
+    component: Component,
+    config_ok: bool,
+    binary_ok: bool,
+    registered_modules: Option<&BTreeSet<String>>,
+) -> ComponentState {
+    if !config_ok || !binary_ok {
+        return ComponentState::Missing;
+    }
+    if let (Some(module_id), Some(registered)) = (component.module_id(), registered_modules) {
+        return if registered.contains(module_id) {
+            ComponentState::Correct
+        } else {
+            ComponentState::Configured
+        };
+    }
+    // A daemon that is not live cannot report its in-memory module registry.
+    // Starting it will reconcile the already-correct file.
+    ComponentState::Correct
 }
 
 struct CkValidator<'a> {
@@ -369,4 +537,84 @@ fn user_home() -> Result<PathBuf, String> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| "the user home directory is unavailable for setup".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_daemon_missing_an_otherwise_correct_module_is_configured() {
+        let registered = BTreeSet::new();
+
+        assert_eq!(
+            observed_component_state(Component::Aft, true, true, Some(&registered)),
+            ComponentState::Configured
+        );
+        assert_eq!(
+            observed_component_state(Component::Aft, true, true, None),
+            ComponentState::Correct,
+            "a stopped daemon cannot expose its registry"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod adoption_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use subc_core::test_support::TestTempDir;
+
+    #[test]
+    fn bootstrap_placed_ck_is_adopted_as_managed_binary() {
+        let root = TestTempDir::new("setup-adopt-running-ck");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).unwrap();
+        let placed = binary_home.join("ck");
+        fs::write(&placed, "#!/bin/sh\necho 'ck 0.16.2'\n").unwrap();
+        fs::set_permissions(&placed, fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = fs::canonicalize(&placed).unwrap();
+        let platform = RuntimePlatform::current();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        inventory.record("binary-placement", &executable, Map::new());
+        let mut backend = SetupBackend {
+            executable: executable.clone(),
+            paths: SetupPaths {
+                data_dir: root.join("data"),
+                binary_home: binary_home.clone(),
+                config_path: root.join("subc.jsonc"),
+                claustrum_key_path: None,
+                runtime_paths: runtime::runtime_paths(platform, &binary_home, &root),
+            },
+            platform,
+            inventory,
+            runner: SystemCommandRunner,
+            artifacts: ReleaseArtifactSource::from_index(
+                super::super::release_index::ReleaseIndex {
+                    schema: 1,
+                    channel: "alpha".to_string(),
+                    generated_at_ms: 0,
+                    components: BTreeMap::new(),
+                },
+                super::super::model::AlphaTarget::LinuxX64,
+            ),
+            runtime_status: RuntimeStatus::default(),
+            uninstall_report: None,
+            component_steps: BTreeMap::new(),
+        };
+
+        backend.adopt_running_ck(&executable).unwrap();
+
+        assert!(backend.inventory.owns_path("managed-binary", &executable));
+        assert!(backend.inventory.owns_path("binary-placement", &executable));
+        assert_eq!(
+            backend
+                .inventory
+                .entry_for_path("managed-binary", &executable)
+                .and_then(|entry| entry.get("version"))
+                .and_then(Value::as_str),
+            Some("0.16.2")
+        );
+    }
 }

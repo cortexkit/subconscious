@@ -48,6 +48,11 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         return plan_uninstall(observed, plan);
     }
 
+    if let Some(path) = &observed.running_ck_adoption {
+        plan.operations
+            .push(SetupOperation::AdoptRunningCk { path: path.clone() });
+    }
+
     record_detection_outcomes(observed, &mut plan);
     let selected = selected_components(request);
     if request.optional_components.is_empty() {
@@ -113,6 +118,18 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                     .push(SetupOperation::InstallComponent { component });
                 plan.operations
                     .push(SetupOperation::ConfigureComponent { component });
+                if component == Component::Claustrum {
+                    plan.operations.push(SetupOperation::BootstrapClaustrum {
+                        key_path: request.claustrum_key_path.clone(),
+                    });
+                }
+                if component.module_id().is_some() {
+                    newly_configured_modules.push(component);
+                }
+            }
+            ComponentState::Configured => {
+                plan.outcomes
+                    .push(PlanOutcome::ConfiguredNotRegistered { component });
                 if component == Component::Claustrum {
                     plan.operations.push(SetupOperation::BootstrapClaustrum {
                         key_path: request.claustrum_key_path.clone(),
@@ -189,7 +206,7 @@ fn plan_uninstall(observed: &SetupObserved, mut plan: SetupPlan) -> SetupPlan {
         removals += 1;
     }
     for component in Component::ALL {
-        if observed.component_state(component) == ComponentState::Correct {
+        if observed.component_state(component) != ComponentState::Missing {
             plan.operations
                 .push(SetupOperation::RemoveManagedComponent { component });
             removals += 1;
@@ -208,6 +225,13 @@ pub trait SetupExecutor {
     type Error;
 
     fn apply(&mut self, operation: &SetupOperation) -> Result<(), Self::Error>;
+
+    /// Removes only the completed steps for `component` from this execution.
+    /// The default preserves simple executors that never create component-owned
+    /// state, while the filesystem executor records each applied step by component.
+    fn rollback_component(&mut self, _component: Component) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,7 +267,15 @@ pub fn execute_setup<E: SetupExecutor>(
         .iter()
         .filter(|operation| operation.mutates())
     {
-        executor.apply(operation)?;
+        if let Err(error) = executor.apply(operation) {
+            if let Some(component) = operation.component() {
+                // Rollback is deliberately driven from the executor's record of
+                // completed steps, rather than a compensating plan that could
+                // accidentally remove state owned before this run.
+                let _ = executor.rollback_component(component);
+            }
+            return Err(error);
+        }
         report.applied.push(operation.clone());
     }
     Ok(report)
@@ -286,35 +318,43 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
             UpgradeState::Current => plan.outcomes.push(PlanOutcome::Noop {
                 scope: format!("{target} is already current"),
             }),
-            UpgradeState::UpdateAvailable { .. } => match observed.release(target) {
-                ReleaseAvailability::Incomplete { missing_asset } => {
-                    plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
-                        component: upgrade_target_component(target),
-                        release_tag: "the resolved release".to_string(),
-                        missing_asset,
-                    });
-                }
-                ReleaseAvailability::NotYetPublished {
-                    release_tag,
-                    missing_asset,
-                } => {
-                    plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
-                        component: upgrade_target_component(target),
+            UpgradeState::UpdateAvailable { from, to, reason } => {
+                plan.outcomes.push(PlanOutcome::UpgradeAvailable {
+                    target,
+                    from,
+                    to,
+                    reason,
+                });
+                match observed.release(target) {
+                    ReleaseAvailability::Incomplete { missing_asset } => {
+                        plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                            component: upgrade_target_component(target),
+                            release_tag: "the resolved release".to_string(),
+                            missing_asset,
+                        });
+                    }
+                    ReleaseAvailability::NotYetPublished {
                         release_tag,
                         missing_asset,
-                    });
+                    } => {
+                        plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                            component: upgrade_target_component(target),
+                            release_tag,
+                            missing_asset,
+                        });
+                    }
+                    ReleaseAvailability::Unresolvable { reason } => {
+                        plan.outcomes.push(PlanOutcome::ReleaseUnresolvable {
+                            component: upgrade_target_component(target),
+                            reason,
+                        });
+                    }
+                    ReleaseAvailability::Available => plan_upgrade_target(&mut plan, target),
+                    ReleaseAvailability::NotRequired => plan.outcomes.push(PlanOutcome::Refusal {
+                        reason: format!("{target} has no alpha release archive"),
+                    }),
                 }
-                ReleaseAvailability::Unresolvable { reason } => {
-                    plan.outcomes.push(PlanOutcome::ReleaseUnresolvable {
-                        component: upgrade_target_component(target),
-                        reason,
-                    });
-                }
-                ReleaseAvailability::Available => plan_upgrade_target(&mut plan, target),
-                ReleaseAvailability::NotRequired => plan.outcomes.push(PlanOutcome::Refusal {
-                    reason: format!("{target} has no alpha release archive"),
-                }),
-            },
+            }
         }
     }
     plan
@@ -389,6 +429,7 @@ mod tests {
             releases,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
+            running_ck_adoption: None,
             mc_detection: None,
             detections: BTreeMap::new(),
         }
@@ -660,7 +701,7 @@ mod tests {
             .position(|operation| {
                 matches!(
                     operation,
-                    SetupOperation::BootstrapClaustrum { key_path: Some(path) } if path == &key_path
+                    SetupOperation::BootstrapClaustrum { key_path: Some(path), .. } if path == &key_path
                 )
             })
             .expect("bootstrap operation");
@@ -676,6 +717,217 @@ mod tests {
             })
             .expect("enable operation");
         assert!(bootstrap < enable);
+    }
+
+    #[derive(Default)]
+    struct FailingBootstrapExecutor {
+        managed_binary_rows: BTreeMap<Component, usize>,
+        config_entries: BTreeMap<Component, usize>,
+        rolled_back: Vec<Component>,
+        bootstrap_calls: usize,
+        bootstrap_succeeds: bool,
+        applied: Vec<SetupOperation>,
+    }
+
+    impl SetupExecutor for FailingBootstrapExecutor {
+        type Error = String;
+
+        fn apply(&mut self, operation: &SetupOperation) -> Result<(), Self::Error> {
+            match operation {
+                SetupOperation::InstallComponent { component } => {
+                    self.managed_binary_rows.insert(*component, 1);
+                    self.applied.push(operation.clone());
+                    Ok(())
+                }
+                SetupOperation::ConfigureComponent { component } => {
+                    self.config_entries.insert(*component, 1);
+                    self.applied.push(operation.clone());
+                    Ok(())
+                }
+                SetupOperation::BootstrapClaustrum { .. } => {
+                    self.bootstrap_calls += 1;
+                    if self.bootstrap_succeeds {
+                        self.applied.push(operation.clone());
+                        Ok(())
+                    } else {
+                        Err(
+                            "key store is not writable; ck auth bootstrap failed with exit status: 4"
+                                .to_string(),
+                        )
+                    }
+                }
+                _ => {
+                    self.applied.push(operation.clone());
+                    Ok(())
+                }
+            }
+        }
+
+        fn rollback_component(&mut self, component: Component) -> Result<(), Self::Error> {
+            self.managed_binary_rows.remove(&component);
+            self.config_entries.remove(&component);
+            self.rolled_back.push(component);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_claustrum_bootstrap_rolls_back_only_its_own_apply_steps() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed
+            .components
+            .insert(Component::Aft, ComponentState::Missing);
+        observed
+            .components
+            .insert(Component::Claustrum, ComponentState::Missing);
+        observed.runtime = RuntimeState::Correct;
+        let plan = plan_setup(
+            &observed,
+            &SetupRequest::install(vec![Component::Aft, Component::Claustrum]),
+        );
+        let mut executor = FailingBootstrapExecutor::default();
+
+        let error = execute_setup(&plan, ExecutionMode::Apply, &mut executor)
+            .expect_err("bootstrap refusal must fail setup");
+
+        assert_eq!(
+            error,
+            "key store is not writable; ck auth bootstrap failed with exit status: 4"
+        );
+        assert!(
+            !executor
+                .managed_binary_rows
+                .contains_key(&Component::Claustrum),
+            "claustrum binary inventory rows must be gone"
+        );
+        assert!(
+            !executor.config_entries.contains_key(&Component::Claustrum),
+            "claustrum configuration entry must be gone"
+        );
+        assert_eq!(
+            executor.managed_binary_rows.get(&Component::Aft),
+            Some(&1),
+            "sibling binary inventory row must survive"
+        );
+        assert_eq!(
+            executor.config_entries.get(&Component::Aft),
+            Some(&1),
+            "sibling configuration entry must survive"
+        );
+        assert_eq!(executor.rolled_back, [Component::Claustrum]);
+        assert_eq!(executor.bootstrap_calls, 1);
+    }
+
+    #[test]
+    fn configured_module_plans_only_registration_operations() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed
+            .components
+            .insert(Component::Aft, ComponentState::Configured);
+        observed.runtime = RuntimeState::Correct;
+
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        let component_operations = plan
+            .operations
+            .iter()
+            .filter(|operation| operation.component().is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            component_operations,
+            vec![
+                SetupOperation::RescanComponent {
+                    component: Component::Aft,
+                },
+                SetupOperation::EnableComponent {
+                    component: Component::Aft,
+                },
+            ]
+        );
+        assert!(plan.outcomes.iter().any(|outcome| {
+            outcome.to_string() == "aft: configured but not registered; registering"
+        }));
+    }
+
+    #[test]
+    fn configured_claustrum_bootstraps_before_rescan_and_enable() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed
+            .components
+            .insert(Component::Claustrum, ComponentState::Configured);
+        observed.runtime = RuntimeState::Correct;
+
+        let plan = plan_setup(
+            &observed,
+            &SetupRequest::install(vec![Component::Claustrum]),
+        );
+        let mut executor = FailingBootstrapExecutor {
+            bootstrap_succeeds: true,
+            ..Default::default()
+        };
+        execute_setup(&plan, ExecutionMode::Apply, &mut executor)
+            .expect("idempotent configured bootstrap must succeed");
+
+        assert_eq!(executor.bootstrap_calls, 1);
+        assert_eq!(
+            executor.applied,
+            vec![
+                SetupOperation::BootstrapClaustrum { key_path: None },
+                SetupOperation::RescanComponent {
+                    component: Component::Claustrum,
+                },
+                SetupOperation::EnableComponent {
+                    component: Component::Claustrum,
+                },
+            ]
+        );
+        assert!(plan.outcomes.iter().any(|outcome| {
+            outcome.to_string() == "claustrum: configured but not registered; registering"
+        }));
+    }
+
+    #[test]
+    fn configured_claustrum_bootstrap_failure_does_not_enable_the_module() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed
+            .components
+            .insert(Component::Claustrum, ComponentState::Configured);
+        observed.runtime = RuntimeState::Correct;
+        let plan = plan_setup(
+            &observed,
+            &SetupRequest::install(vec![Component::Claustrum]),
+        );
+        let mut executor = FailingBootstrapExecutor::default();
+
+        let error = execute_setup(&plan, ExecutionMode::Apply, &mut executor)
+            .expect_err("non-zero bootstrap must fail configured repair");
+
+        assert_eq!(executor.bootstrap_calls, 1);
+        assert_eq!(
+            error,
+            "key store is not writable; ck auth bootstrap failed with exit status: 4"
+        );
+        assert!(!executor.applied.iter().any(|operation| {
+            matches!(
+                operation,
+                SetupOperation::EnableComponent {
+                    component: Component::Claustrum
+                }
+            )
+        }));
     }
 
     #[test]
@@ -701,6 +953,7 @@ mod tests {
                 UpgradeState::UpdateAvailable {
                     from: "1.0.0".to_string(),
                     to: "1.1.0".to_string(),
+                    reason: None,
                 },
             );
             releases.insert(target.label().to_string(), ReleaseAvailability::Available);

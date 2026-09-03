@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     error::Error,
     fmt,
     future::Future,
@@ -23,12 +23,21 @@ pub const TARGET_CHECK_BUDGET: Duration = Duration::from_secs(10);
 type SourceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReleaseEvidence, ReleaseSourceError>> + Send + 'a>>;
 
-/// The release evidence needed to decide whether one managed artifact is newer
-/// and whether the convention-named archive exists for this host.
+/// The release evidence needed to decide whether one managed artifact is current
+/// and whether the signed index lists it for this host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseEvidence {
+    /// Display-only release text. It is intentionally not part of currency.
     pub version: String,
-    pub assets: BTreeSet<String>,
+    pub sha256: Option<String>,
+}
+
+/// State read from one inventory-owned binary. The placement digest is the only
+/// value that can decide currency; version text is retained only for rendering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledBinary {
+    pub version: String,
+    pub sha256: Option<String>,
 }
 
 pub trait ReleaseSource: Send + Sync {
@@ -190,17 +199,19 @@ fn evidence_from_index(
             let Some(entry) = index.components.get(component) else {
                 return Ok(ReleaseEvidence {
                     version: String::new(),
-                    assets: BTreeSet::new(),
+                    sha256: None,
                 });
             };
             let version = entry.version.clone().unwrap_or_default();
-            let mut assets = BTreeSet::new();
-            for (platform, binaries) in &entry.assets {
-                if binaries.contains_key(binary) {
-                    assets.insert(format!("{binary}-{platform}.zip"));
-                }
-            }
-            Ok(ReleaseEvidence { version, assets })
+            let sha256 = match PlatformObservation::current() {
+                PlatformObservation::Supported(platform) => entry
+                    .assets
+                    .get(platform.label())
+                    .and_then(|binaries| binaries.get(binary))
+                    .map(|asset| asset.sha256.clone()),
+                PlatformObservation::Unsupported(_) => None,
+            };
+            Ok(ReleaseEvidence { version, sha256 })
         }
     }
 }
@@ -218,12 +229,20 @@ pub(super) fn upgrade_target_index_path(target: UpgradeTarget) -> (&'static str,
 /// stale observation into an update claim, even if that stale cache contained a
 /// newer version before the release source became unavailable.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DashboardDelta {
+    pub target: UpgradeTarget,
+    pub from: String,
+    pub to: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DashboardUpdate {
     Current {
         cache_age: Duration,
     },
     Available {
-        updates: Vec<(UpgradeTarget, String)>,
+        updates: Vec<DashboardDelta>,
         cache_age: Duration,
     },
     NotChecked {
@@ -244,7 +263,10 @@ impl DashboardUpdate {
             Self::Available { updates, cache_age } => {
                 let updates = updates
                     .iter()
-                    .map(|(target, version)| format!("{target} {version}"))
+                    .map(|update| match &update.reason {
+                        Some(reason) => format!("{} {reason}", update.target),
+                        None => format!("{} {} → {}", update.target, update.from, update.to),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
@@ -283,12 +305,12 @@ pub fn not_checked_from_cache(cache: &UpdateCache) -> DashboardUpdate {
 pub async fn dashboard_update<S: ReleaseSource>(
     cache: &UpdateCache,
     source: &S,
-    installed_versions: &BTreeMap<String, String>,
+    installed: &BTreeMap<String, InstalledBinary>,
 ) -> DashboardUpdate {
     dashboard_update_at(
         cache,
         source,
-        installed_versions,
+        installed,
         unix_now_secs(),
         BARE_REFRESH_BUDGET,
     )
@@ -298,7 +320,7 @@ pub async fn dashboard_update<S: ReleaseSource>(
 pub async fn dashboard_update_at<S: ReleaseSource>(
     cache: &UpdateCache,
     source: &S,
-    installed_versions: &BTreeMap<String, String>,
+    installed: &BTreeMap<String, InstalledBinary>,
     now_unix_secs: u64,
     budget: Duration,
 ) -> DashboardUpdate {
@@ -308,7 +330,7 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
     };
     if let Some(metadata) = &cached {
         if metadata.is_fresh_at(now_unix_secs) {
-            return dashboard_state(metadata, installed_versions, now_unix_secs);
+            return dashboard_state(metadata, installed, now_unix_secs);
         }
     }
 
@@ -320,7 +342,7 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
                     cache_age: cached.map(|metadata| metadata.age_at(now_unix_secs)),
                 }
             } else {
-                dashboard_state(&metadata, installed_versions, now_unix_secs)
+                dashboard_state(&metadata, installed, now_unix_secs)
             }
         }
         Ok(Err(ReleaseSourceError::IndexStale { .. })) => DashboardUpdate::IndexStale,
@@ -355,7 +377,7 @@ pub async fn check_update_metadata<S: ReleaseSource>(
             target.label().to_string(),
             CachedRelease {
                 version: evidence.version,
-                assets: evidence.assets.into_iter().collect(),
+                sha256: evidence.sha256,
             },
         );
     }
@@ -370,26 +392,11 @@ pub async fn check_update_metadata<S: ReleaseSource>(
     Ok(metadata)
 }
 
-/// The current alpha planner remains independent of process discovery. Until
-/// the execution backend owns each binary probe, all managed artifacts share
-/// this build's version as their installed-version observation.
-pub fn compiled_installed_versions() -> BTreeMap<String, String> {
-    UpgradeTarget::ORDERED
-        .into_iter()
-        .map(|target| {
-            (
-                target.label().to_string(),
-                env!("CARGO_PKG_VERSION").to_string(),
-            )
-        })
-        .collect()
-}
-
-/// Applies release evidence to the existing upgrade planner's explicit state,
-/// preserving its ordering and release-incomplete refusal behavior.
+/// Applies host-specific release digests to the explicit upgrade planner state.
+/// Version strings remain in the rendered plan but never decide a replacement.
 pub fn observed_from_metadata(
     metadata: &UpdateMetadata,
-    installed_versions: &BTreeMap<String, String>,
+    installed: &BTreeMap<String, InstalledBinary>,
 ) -> UpgradeObserved {
     let mut observed = UpgradeObserved::no_updates_on_current_host();
     let platform = observed.platform.clone();
@@ -397,8 +404,8 @@ pub fn observed_from_metadata(
         let Some(release) = metadata.targets.get(target.label()) else {
             continue;
         };
-        if let Some(expected_asset) = expected_asset_name(target, &platform) {
-            if !release.assets.iter().any(|asset| asset == &expected_asset) {
+        let Some(release_digest) = release.sha256.as_deref() else {
+            if let Some(expected_asset) = expected_asset_name(target, &platform) {
                 observed.releases.insert(
                     target.label().to_string(),
                     ReleaseAvailability::Incomplete {
@@ -406,17 +413,26 @@ pub fn observed_from_metadata(
                     },
                 );
             }
-        }
-        let installed = installed_versions
-            .get(target.label())
-            .map(String::as_str)
-            .unwrap_or(env!("CARGO_PKG_VERSION"));
-        if is_newer_version(&release.version, installed) {
+            continue;
+        };
+        let Some(installed) = installed.get(target.label()) else {
+            continue;
+        };
+        let (needs_replacement, reason) = match installed.sha256.as_deref() {
+            Some(digest) if digest == release_digest => (false, None),
+            Some(_) => (true, None),
+            None => (
+                true,
+                Some("no recorded digest; replacing to establish one".to_string()),
+            ),
+        };
+        if needs_replacement {
             observed.targets.insert(
                 target.label().to_string(),
                 UpgradeState::UpdateAvailable {
-                    from: installed.to_string(),
+                    from: installed.version.clone(),
                     to: release.version.clone(),
+                    reason,
                 },
             );
         }
@@ -435,7 +451,7 @@ async fn refresh_all<S: ReleaseSource>(
             target.label().to_string(),
             CachedRelease {
                 version: evidence.version,
-                assets: evidence.assets.into_iter().collect(),
+                sha256: evidence.sha256,
             },
         );
     }
@@ -448,21 +464,30 @@ async fn refresh_all<S: ReleaseSource>(
 
 fn dashboard_state(
     metadata: &UpdateMetadata,
-    installed_versions: &BTreeMap<String, String>,
+    installed: &BTreeMap<String, InstalledBinary>,
     now_unix_secs: u64,
 ) -> DashboardUpdate {
     let updates = UpgradeTarget::ORDERED
         .into_iter()
         .filter_map(|target| {
             let release = metadata.targets.get(target.label())?;
-            let installed = installed_versions
-                .get(target.label())
-                .map(String::as_str)
-                .unwrap_or(env!("CARGO_PKG_VERSION"));
-            let expected_asset = expected_asset_name(target, &PlatformObservation::current())?;
-            (release.assets.iter().any(|asset| asset == &expected_asset)
-                && is_newer_version(&release.version, installed))
-            .then(|| (target, release.version.clone()))
+            let installed = installed.get(target.label())?;
+            let release_digest = release.sha256.as_deref()?;
+            match installed.sha256.as_deref() {
+                Some(digest) if digest == release_digest => None,
+                Some(_) => Some(DashboardDelta {
+                    target,
+                    from: installed.version.clone(),
+                    to: release.version.clone(),
+                    reason: None,
+                }),
+                None => Some(DashboardDelta {
+                    target,
+                    from: installed.version.clone(),
+                    to: release.version.clone(),
+                    reason: Some("no recorded digest; run ck upgrade to establish one".to_string()),
+                }),
+            }
         })
         .collect::<Vec<_>>();
     let cache_age = metadata.age_at(now_unix_secs);
@@ -478,36 +503,6 @@ fn expected_asset_name(target: UpgradeTarget, platform: &PlatformObservation) ->
         return None;
     };
     Some(format!("{}-{}.zip", target.label(), platform.label()))
-}
-
-fn normalize_release_version(tag: &str) -> Option<String> {
-    let version = tag.rsplit_once("-v").map_or(tag, |(_, version)| version);
-    let version = version.trim_start_matches('v');
-    (!version.is_empty()).then(|| version.to_string())
-}
-
-fn is_newer_version(candidate: &str, installed: &str) -> bool {
-    match (parse_version(candidate), parse_version(installed)) {
-        (Some(candidate), Some(installed)) => candidate > installed,
-        _ => false,
-    }
-}
-
-fn parse_version(version: &str) -> Option<[u64; 3]> {
-    let version = normalize_release_version(version)?;
-    let mut parts = version.split('.');
-    let major = parse_version_part(parts.next()?)?;
-    let minor = parse_version_part(parts.next()?)?;
-    let patch = parse_version_part(parts.next()?)?;
-    Some([major, minor, patch])
-}
-
-fn parse_version_part(part: &str) -> Option<u64> {
-    let digits = part
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
 fn format_cache_age(age: Duration) -> String {
@@ -533,7 +528,7 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::BTreeMap,
         future,
         sync::{Arc, Mutex},
     };
@@ -556,7 +551,7 @@ mod tests {
                         target,
                         Ok(ReleaseEvidence {
                             version: version.to_string(),
-                            assets: all_alpha_assets(target),
+                            sha256: Some(digest(target, version)),
                         }),
                     )
                 })
@@ -610,7 +605,7 @@ mod tests {
                 Box::pin(async move {
                     Ok(ReleaseEvidence {
                         version: "0.12.0".to_string(),
-                        assets: all_alpha_assets(target),
+                        sha256: Some(digest(target, "0.12.0")),
                     })
                 })
             } else {
@@ -619,11 +614,9 @@ mod tests {
         }
     }
 
-    fn all_alpha_assets(target: UpgradeTarget) -> BTreeSet<String> {
-        ["darwin-arm64", "linux-x64", "windows-x64"]
-            .into_iter()
-            .map(|platform| format!("{}-{platform}.zip", target.label()))
-            .collect()
+    fn digest(target: UpgradeTarget, version: &str) -> String {
+        let seed = format!("{}-{version}", target.label());
+        format!("{seed:0<64}")
     }
 
     fn metadata(checked_at_unix_secs: u64, version: &str) -> UpdateMetadata {
@@ -637,7 +630,7 @@ mod tests {
                         target.label().to_string(),
                         CachedRelease {
                             version: version.to_string(),
-                            assets: all_alpha_assets(target).into_iter().collect(),
+                            sha256: Some(digest(target, version)),
                         },
                     )
                 })
@@ -651,10 +644,18 @@ mod tests {
         (dir, cache)
     }
 
-    fn installed(version: &str) -> BTreeMap<String, String> {
+    fn installed(version: &str) -> BTreeMap<String, InstalledBinary> {
         UpgradeTarget::ORDERED
             .into_iter()
-            .map(|target| (target.label().to_string(), version.to_string()))
+            .map(|target| {
+                (
+                    target.label().to_string(),
+                    InstalledBinary {
+                        version: version.to_string(),
+                        sha256: Some(digest(target, version)),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -836,23 +837,88 @@ mod tests {
     }
 
     #[test]
-    fn metadata_maps_newer_versions_and_missing_archives_into_the_upgrade_planner() {
+    fn metadata_maps_digest_deltas_and_missing_archives_into_the_upgrade_planner() {
         let mut metadata = metadata(100, "0.13.0");
         metadata
             .targets
             .get_mut(UpgradeTarget::Aft.label())
             .unwrap()
-            .assets
-            .clear();
+            .sha256 = None;
         let observed = observed_from_metadata(&metadata, &installed("0.12.0"));
 
         assert!(matches!(
             observed.target_state(UpgradeTarget::Ck),
-            UpgradeState::UpdateAvailable { ref from, ref to } if from == "0.12.0" && to == "0.13.0"
+            UpgradeState::UpdateAvailable { ref from, ref to, .. } if from == "0.12.0" && to == "0.13.0"
         ));
         assert!(matches!(
             observed.release(UpgradeTarget::Aft),
             ReleaseAvailability::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn sibling_currency_uses_inventory_digest_not_release_version() {
+        let target = UpgradeTarget::SubcMcp;
+        let digest = "ab".repeat(32);
+        let mut metadata = metadata(100, "0.16.2");
+        metadata.targets.get_mut(target.label()).unwrap().sha256 = Some(digest.clone());
+        let installed = BTreeMap::from([(
+            target.label().to_string(),
+            InstalledBinary {
+                // ck-subc-mcp reports its own crate version, not core's release
+                // version. Equal verified bytes must still be current.
+                version: "0.1.0".to_string(),
+                sha256: Some(digest),
+            },
+        )]);
+
+        let observed = observed_from_metadata(&metadata, &installed);
+
+        assert_eq!(observed.target_state(target), UpgradeState::Current);
+    }
+
+    #[test]
+    fn changed_sibling_digest_plans_a_replacement() {
+        let target = UpgradeTarget::SubcMcp;
+        let mut metadata = metadata(100, "0.16.2");
+        metadata.targets.get_mut(target.label()).unwrap().sha256 = Some("ab".repeat(32));
+        let installed = BTreeMap::from([(
+            target.label().to_string(),
+            InstalledBinary {
+                version: "0.1.0".to_string(),
+                sha256: Some("cd".repeat(32)),
+            },
+        )]);
+
+        let observed = observed_from_metadata(&metadata, &installed);
+
+        assert!(matches!(
+            observed.target_state(target),
+            UpgradeState::UpdateAvailable { reason: None, .. }
+        ));
+    }
+
+    #[test]
+    fn sibling_without_a_recorded_digest_plans_one_replacement_to_establish_it() {
+        let target = UpgradeTarget::SubcMcp;
+        let mut metadata = metadata(100, "0.16.2");
+        metadata.targets.get_mut(target.label()).unwrap().sha256 = Some("ab".repeat(32));
+        let installed = BTreeMap::from([(
+            target.label().to_string(),
+            InstalledBinary {
+                version: "0.1.0".to_string(),
+                sha256: None,
+            },
+        )]);
+
+        let observed = observed_from_metadata(&metadata, &installed);
+
+        assert!(matches!(
+            observed.target_state(target),
+            UpgradeState::UpdateAvailable {
+                reason: Some(ref reason),
+                ..
+            } if reason == "no recorded digest; replacing to establish one"
         ));
     }
 
@@ -907,19 +973,5 @@ mod tests {
             super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION
         );
         assert!(matches!(cache.load(), CacheRead::Present(_)));
-    }
-
-    #[test]
-    fn release_version_normalization_accepts_the_tag_conventions() {
-        assert_eq!(
-            normalize_release_version("subc-core-v0.13.0"),
-            Some("0.13.0".to_string())
-        );
-        assert_eq!(
-            normalize_release_version("v0.13.0"),
-            Some("0.13.0".to_string())
-        );
-        assert!(is_newer_version("0.13.0", "0.12.9"));
-        assert!(!is_newer_version("unknown", "0.12.9"));
     }
 }

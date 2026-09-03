@@ -125,10 +125,54 @@ pub fn apply(change: &ConfigChange) -> Result<(), String> {
         .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
     fs::rename(&temporary, &change.path).map_err(|error| {
         format!(
-            "could not replace configuration {}: {error}",
-            change.path.display()
+            "could not replace configuration {} with {}: {error}",
+            change.path.display(),
+            temporary.display()
         )
     })
+}
+
+/// Removes only a component's values when setup must unwind a later failure.
+/// Matching the generated values prevents rollback from deleting a user edit
+/// that occurred after setup wrote the original component entry.
+pub fn remove_component(
+    path: &Path,
+    component: Component,
+    binary_home: &Path,
+    claustrum_key_path: Option<&Path>,
+) -> Result<bool, String> {
+    let before = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    let strict = jsonc_to_json(&before)
+        .map_err(|error| format!("could not parse {} for rollback: {error}", path.display()))?;
+    let mut document: Value = serde_json::from_str(&strict)
+        .map_err(|error| format!("could not parse {} for rollback: {error}", path.display()))?;
+    let Some(object) = document.as_object_mut() else {
+        return Err(format!(
+            "could not roll back non-object configuration {}",
+            path.display()
+        ));
+    };
+    let mut removed = false;
+    for (key, desired) in desired_values_with_key(component, binary_home, claustrum_key_path) {
+        removed |= remove_exact_value(object, &key, &desired);
+    }
+    if !removed {
+        return Ok(false);
+    }
+    let change = ConfigChange {
+        path: path.to_path_buf(),
+        before,
+        after: format!(
+            "{}\n",
+            serde_json::to_string_pretty(&document).expect("JSON values always serialize")
+        ),
+    };
+    apply(&change)?;
+    Ok(true)
 }
 
 #[allow(dead_code)]
@@ -245,6 +289,29 @@ fn insert_value(document: &mut Value, dotted_key: &str, desired: Value) -> Resul
     unreachable!("a desired configuration key always has a segment")
 }
 
+fn remove_exact_value(object: &mut Map<String, Value>, dotted_key: &str, desired: &Value) -> bool {
+    let keys = dotted_key.split('.').collect::<Vec<_>>();
+    remove_exact_value_at(object, &keys, desired)
+}
+
+fn remove_exact_value_at(object: &mut Map<String, Value>, keys: &[&str], desired: &Value) -> bool {
+    let Some((key, rest)) = keys.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return object.get(*key).is_some_and(|actual| actual == desired)
+            && object.remove(*key).is_some();
+    }
+    let Some(child) = object.get_mut(*key).and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let removed = remove_exact_value_at(child, rest, desired);
+    if removed && child.is_empty() {
+        object.remove(*key);
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +319,27 @@ mod tests {
 
     fn fixture_path(name: &str) -> TestTempDir {
         TestTempDir::new(name)
+    }
+
+    #[test]
+    fn rollback_removes_only_the_failed_component_configuration() {
+        let root = fixture_path("config-rollback-component");
+        let config = root.join("subc.jsonc");
+        let aft = plan_component(&config, Component::Aft, &root)
+            .expect("aft configuration")
+            .expect("aft missing");
+        apply(&aft).expect("write aft");
+        let claustrum = plan_component(&config, Component::Claustrum, &root)
+            .expect("claustrum configuration")
+            .expect("claustrum missing");
+        apply(&claustrum).expect("write claustrum");
+
+        assert!(remove_component(&config, Component::Claustrum, &root, None)
+            .expect("remove failed component"));
+
+        let written: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert!(written.pointer("/modules/aft").is_some());
+        assert!(written.pointer("/modules/claustrum").is_none());
     }
 
     #[test]

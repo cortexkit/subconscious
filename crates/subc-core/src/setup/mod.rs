@@ -30,11 +30,11 @@ pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
 pub(crate) use self_update::cleanup_replaced_windows_ck;
 pub use update_cache::UpdateCache;
 pub use update_check::{
-    check_update_metadata, compiled_installed_versions, dashboard_update, not_checked_from_cache,
-    IndexReleaseSource, UpdateCheckError, BARE_REFRESH_BUDGET, TARGET_CHECK_BUDGET,
+    check_update_metadata, dashboard_update, not_checked_from_cache, IndexReleaseSource,
+    UpdateCheckError, BARE_REFRESH_BUDGET, TARGET_CHECK_BUDGET,
 };
 pub use upgrade::{
-    discover_current_upgrade_targets, observed_upgrade_targets, render_execution_report,
-    DaemonCatalogBuild, SystemUpgradeBackend,
+    dashboard_installed_binaries, discover_current_upgrade_targets, observed_upgrade_targets,
+    render_execution_report, DaemonCatalogBuild, SystemUpgradeBackend,
 };
 pub use upgrade_executor::execute_upgrade;

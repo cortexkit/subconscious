@@ -16,7 +16,7 @@ use super::{
     release_index::ReleaseIndex,
     self_update,
     update_cache::UpdateMetadata,
-    update_check::observed_from_metadata,
+    update_check::{observed_from_metadata, InstalledBinary},
     upgrade_assets::{
         prepare_upgrade_asset, sha256_file, PreparedUpgradeAsset, ReleaseUpgradeAssetFetcher,
     },
@@ -36,7 +36,10 @@ pub struct DaemonCatalogBuild {
 pub struct ManagedUpgradeTarget {
     pub target: UpgradeTarget,
     pub destination: PathBuf,
+    /// Display-only version text from the binary or daemon catalog.
     pub installed_version: String,
+    /// Digest recorded at placement. Currency is undecidable without it.
+    pub installed_sha256: Option<String>,
 }
 
 /// Load the ownership record from the per-user data directory before discovery.
@@ -48,6 +51,42 @@ pub fn discover_current_upgrade_targets(
 ) -> Result<Vec<ManagedUpgradeTarget>, String> {
     let inventory = load_current_inventory()?;
     discover_managed_upgrade_targets(&inventory, executable, daemon_catalog)
+}
+
+/// Reads only inventory evidence for the dashboard. It avoids probing binaries:
+/// a bare `ck` must not assume every managed sibling shares its own crate version.
+pub fn dashboard_installed_binaries() -> Result<BTreeMap<String, InstalledBinary>, String> {
+    let inventory = load_current_inventory()?;
+    let mut installed = BTreeMap::new();
+    for target in UpgradeTarget::ORDERED {
+        let path = ["managed-binary", "binary-placement"]
+            .into_iter()
+            .flat_map(|kind| inventory.paths_for_kind(kind))
+            .find(|path| file_name_matches(path, target));
+        let Some(path) = path else {
+            continue;
+        };
+        let version =
+            inventory_string(&inventory, &path, "version").unwrap_or_else(|| "unknown".to_string());
+        let sha256 = inventory_string(&inventory, &path, "sha256");
+        installed.insert(
+            target.label().to_string(),
+            InstalledBinary { version, sha256 },
+        );
+    }
+    Ok(installed)
+}
+
+fn inventory_string(inventory: &Inventory, path: &Path, key: &str) -> Option<String> {
+    ["managed-binary", "binary-placement"]
+        .into_iter()
+        .filter_map(|kind| inventory.entry_for_path(kind, path))
+        .find_map(|entry| {
+            entry
+                .get(key)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn load_current_inventory() -> Result<Inventory, String> {
@@ -122,10 +161,12 @@ pub fn discover_managed_upgrade_targets(
                 .clone(),
             _ => binary_version(&destination)?,
         };
+        let installed_sha256 = inventory_string(inventory, &destination, "sha256");
         targets.push(ManagedUpgradeTarget {
             target,
             destination,
             installed_version,
+            installed_sha256,
         });
     }
     Ok(targets)
@@ -136,16 +177,19 @@ pub fn observed_upgrade_targets(
     metadata: &UpdateMetadata,
     discovered: &[ManagedUpgradeTarget],
 ) -> UpgradeObserved {
-    let installed_versions = discovered
+    let installed = discovered
         .iter()
         .map(|item| {
             (
                 item.target.label().to_string(),
-                item.installed_version.clone(),
+                InstalledBinary {
+                    version: item.installed_version.clone(),
+                    sha256: item.installed_sha256.clone(),
+                },
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut observed = observed_from_metadata(metadata, &installed_versions);
+    let mut observed = observed_from_metadata(metadata, &installed);
     for target in UpgradeTarget::ORDERED {
         if !discovered.iter().any(|item| item.target == target) {
             observed
@@ -401,6 +445,10 @@ impl SystemUpgradeBackend {
         destination: &Path,
     ) -> Result<(), String> {
         let digest = sha256_file(destination)?;
+        // A replacement changes the inode, so retain both its proof digest and
+        // its self-reported version for the next dashboard without treating the
+        // latter as an update decision.
+        let version = binary_version(destination).ok();
         let kinds = ["managed-binary", "binary-placement"]
             .into_iter()
             .filter(|kind| self.inventory.owns_path(kind, destination))
@@ -414,6 +462,14 @@ impl SystemUpgradeBackend {
         for kind in kinds {
             self.inventory
                 .update_owned_string(kind, destination, "sha256", digest.clone())?;
+            if let Some(version) = &version {
+                self.inventory.update_owned_string(
+                    kind,
+                    destination,
+                    "version",
+                    version.clone(),
+                )?;
+            }
         }
         self.inventory.save()
     }
@@ -574,7 +630,6 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn post_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let destination = &self.target(target)?.destination;
-        let expected_version = self.expected_version(target)?.to_string();
         let (pid, healthy, running_image_matches_destination, version) = match target {
             UpgradeTarget::SubcMcp | UpgradeTarget::Aft => {
                 let (pid, running_image_matches_destination) = self.module_provenance(target)?;
@@ -596,6 +651,13 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 (Some(info.pid), true, true, info.daemon_ver)
             }
             UpgradeTarget::Ck => (Some(process_id()), true, true, binary_version(destination)?),
+        };
+        // Module sibling crates may report a version unrelated to their source
+        // release. Their digest, destination inode, liveness, and health are the
+        // proof; preserve version text as evidence without making it a gate.
+        let expected_version = match target {
+            UpgradeTarget::SubcMcp | UpgradeTarget::Aft => version.clone(),
+            UpgradeTarget::Daemon | UpgradeTarget::Ck => self.expected_version(target)?.to_string(),
         };
         let expectation = expected_post_activation(
             destination,
@@ -777,6 +839,7 @@ mod tests {
             target: UpgradeTarget::Aft,
             destination: PathBuf::from("/managed/ck-aft"),
             installed_version: "1.0.0".to_string(),
+            installed_sha256: Some("ab".repeat(32)),
         };
         let mut metadata = UpdateMetadata {
             format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
@@ -787,7 +850,7 @@ mod tests {
             UpgradeTarget::Aft.label().to_string(),
             super::super::update_cache::CachedRelease {
                 version: "2.0.0".to_string(),
-                assets: Vec::new(),
+                sha256: None,
             },
         );
         let observed = observed_upgrade_targets(&metadata, &[target]);

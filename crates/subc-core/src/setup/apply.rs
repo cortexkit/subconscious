@@ -315,6 +315,21 @@ impl SetupBackend {
             "sha256".to_string(),
             Value::String(components::digest_file(path)?),
         );
+        // Bootstrap installers hash the extracted ck into `sha256` (ownership).
+        // Currency needs the zip digest, recorded as `archive_sha256` when the
+        // installer has started writing that field. Copy it when present; leave
+        // it absent otherwise so the next upgrade establishes it once.
+        if let Some(archive) = self
+            .inventory
+            .entry_for_path("binary-placement", path)
+            .and_then(|entry| entry.get("archive_sha256"))
+            .and_then(Value::as_str)
+        {
+            fields.insert(
+                "archive_sha256".to_string(),
+                Value::String(archive.to_string()),
+            );
+        }
         fields.insert(
             "version".to_string(),
             Value::String(super::upgrade::binary_version(path)?),
@@ -616,5 +631,76 @@ mod adoption_tests {
                 .and_then(Value::as_str),
             Some("0.16.2")
         );
+        assert!(
+            backend
+                .inventory
+                .entry_for_path("managed-binary", &executable)
+                .and_then(|entry| entry.get("archive_sha256"))
+                .is_none(),
+            "bootstrap row without archive_sha256 must not invent one"
+        );
+    }
+
+    #[test]
+    fn adoption_copies_bootstrap_archive_digest_when_present() {
+        let root = TestTempDir::new("setup-adopt-archive-digest");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).unwrap();
+        let placed = binary_home.join("ck");
+        fs::write(&placed, "#!/bin/sh\necho 'ck 0.16.2'\n").unwrap();
+        fs::set_permissions(&placed, fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = fs::canonicalize(&placed).unwrap();
+        let platform = RuntimePlatform::current();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        let archive_digest = "cd".repeat(32);
+        let mut bootstrap = Map::new();
+        bootstrap.insert(
+            "archive_sha256".to_string(),
+            Value::String(archive_digest.clone()),
+        );
+        inventory.record("binary-placement", &executable, bootstrap);
+        let mut backend = SetupBackend {
+            executable: executable.clone(),
+            paths: SetupPaths {
+                data_dir: root.join("data"),
+                binary_home: binary_home.clone(),
+                config_path: root.join("subc.jsonc"),
+                claustrum_key_path: None,
+                runtime_paths: runtime::runtime_paths(platform, &binary_home, &root),
+            },
+            platform,
+            inventory,
+            runner: SystemCommandRunner,
+            artifacts: ReleaseArtifactSource::from_index(
+                super::super::release_index::ReleaseIndex {
+                    schema: 1,
+                    channel: "alpha".to_string(),
+                    generated_at_ms: 0,
+                    components: BTreeMap::new(),
+                },
+                super::super::model::AlphaTarget::LinuxX64,
+            ),
+            runtime_status: RuntimeStatus::default(),
+            uninstall_report: None,
+            component_steps: BTreeMap::new(),
+        };
+
+        backend.adopt_running_ck(&executable).unwrap();
+
+        let adopted = backend
+            .inventory
+            .entry_for_path("managed-binary", &executable)
+            .expect("adopted row");
+        assert_eq!(
+            adopted.get("archive_sha256").and_then(Value::as_str),
+            Some(archive_digest.as_str())
+        );
+        let binary_digest = components::digest_file(&executable).unwrap();
+        assert_eq!(
+            adopted.get("sha256").and_then(Value::as_str),
+            Some(binary_digest.as_str())
+        );
+        assert_ne!(binary_digest, archive_digest);
     }
 }

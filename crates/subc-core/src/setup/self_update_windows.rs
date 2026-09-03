@@ -238,6 +238,7 @@ mod tests {
         super::super::self_update::replace_verified_candidate(
             &destination,
             &candidate,
+            &"aa".repeat(32),
             &mut inventory,
         )
         .expect("rename and replace while original ck runs");

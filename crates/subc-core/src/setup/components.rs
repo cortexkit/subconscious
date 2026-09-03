@@ -407,8 +407,25 @@ pub fn install_component<S: ArtifactSource>(
             ));
         }
         let digest = source.install(component, binary, &destination)?;
-        let expected = source.expected_version(component)?;
-        source.verify_version(&destination, &expected)?;
+        // Acceptance runs between placement and the inventory record. If it
+        // refuses, the placed file must not survive: it is owned by nobody, so
+        // the next `ck setup` would refuse it as a foreign binary at the
+        // managed destination, and the operator could never re-run setup
+        // without hand-deleting what setup itself left behind.
+        let accepted = source
+            .expected_version(component)
+            .and_then(|expected| source.verify_version(&destination, &expected));
+        if let Err(error) = accepted {
+            match fs::remove_file(&destination) {
+                Ok(()) => return Err(error),
+                Err(cleanup) => {
+                    return Err(format!(
+                    "{error}; additionally could not remove the unaccepted binary at {}: {cleanup}",
+                    destination.display()
+                ))
+                }
+            }
+        }
         let mut fields = Map::new();
         fields.insert(
             "component".to_string(),
@@ -753,6 +770,71 @@ mod tests {
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
         assert_eq!(inventory.paths_for_kind("managed-binary").len(), 2);
+    }
+
+    /// A source whose placed bytes never satisfy acceptance: the binary says
+    /// 1.2.3, the release says 9.9.9. Stands in for a wrong-release archive.
+    struct WrongReleaseSource;
+
+    impl ArtifactSource for WrongReleaseSource {
+        fn install(
+            &mut self,
+            component: Component,
+            binary: &str,
+            destination: &Path,
+        ) -> Result<String, String> {
+            FakeSource.install(component, binary, destination)
+        }
+
+        fn expected_version(&mut self, _component: Component) -> Result<String, String> {
+            Ok("9.9.9".to_string())
+        }
+
+        #[cfg(windows)]
+        fn verify_version(&mut self, destination: &Path, expected: &str) -> Result<(), String> {
+            FakeSource.verify_version(destination, expected)
+        }
+    }
+
+    /// Found on the first macOS operator drive: a refused acceptance left the
+    /// placed binary at the managed destination with no inventory row, and the
+    /// next `ck setup` refused it as a foreign file. The operator could not
+    /// re-run setup without deleting what setup had left. A refusal must leave
+    /// the destination exactly as it found it.
+    #[test]
+    fn refused_acceptance_removes_the_placed_binary_so_setup_can_rerun() {
+        let root = fixture_dir("refused-acceptance");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).expect("binary home");
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        let error = install_component(
+            Component::Core,
+            &binary_home,
+            &mut inventory,
+            &mut WrongReleaseSource,
+        )
+        .expect_err("wrong-release binary must be refused");
+        assert!(
+            error.contains("9.9.9"),
+            "refusal names the expected version: {error}"
+        );
+        let placed = binary_home.join(platform_binary("ck-subc"));
+        assert!(
+            !placed.exists(),
+            "refused binary must not survive at {}",
+            placed.display()
+        );
+        assert!(inventory.paths_for_kind("managed-binary").is_empty());
+        // The re-run is now the ordinary first-install path, not a foreign-file refusal.
+        install_component(
+            Component::Core,
+            &binary_home,
+            &mut inventory,
+            &mut FakeSource,
+        )
+        .expect("re-run after a refused acceptance installs cleanly");
+        assert!(is_installed(Component::Core, &binary_home, &inventory));
     }
 
     #[test]

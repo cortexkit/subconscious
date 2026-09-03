@@ -329,14 +329,8 @@ impl ArtifactSource for ReleaseArtifactSource {
     }
 
     fn expected_version(&mut self, component: Component) -> Result<String, String> {
-        let tag = self.manifest(component)?.tag_name.trim();
-        let version = tag.trim_start_matches('v');
-        if version.is_empty() || version == tag {
-            return Err(format!(
-                "latest {component} release tag '{tag}' must be v<crate-version>"
-            ));
-        }
-        Ok(version.to_string())
+        let tag = self.manifest(component)?.tag_name.trim().to_string();
+        expected_version_from_tag(component, &tag)
     }
 }
 
@@ -477,6 +471,41 @@ fn temporary_path(name: &str) -> PathBuf {
             .expect("system time is after the Unix epoch")
             .as_nanos()
     ))
+}
+
+/// The version a placed binary must self-report, derived from the resolved
+/// release tag. Owners tag in two shapes: bare `v<version>` (aft, insula,
+/// claustrum) and workspace-crate `subc-core-v<version>` (core, the release
+/// lane's convention for a multi-crate workspace). Both carry the crate
+/// version, so both derive it. A train-shaped tag (`ck-mc-alpha.<sha>`) carries
+/// no version at all; acceptance for that shape needs the binary to self-report
+/// the train sha, which is the owner's contract to provide — until it does, the
+/// refusal names the gap instead of claiming the tag is malformed.
+fn expected_version_from_tag(component: Component, tag: &str) -> Result<String, String> {
+    match component.release_resolution_strategy() {
+        ReleaseResolutionStrategy::TagPrefix(prefix) => Err(format!(
+            "{component} release tag '{tag}' is train-shaped ({prefix}<id>) and carries no \
+             version; placement acceptance needs the binary to self-report the train id, \
+             which its --version does not yet"
+        )),
+        ReleaseResolutionStrategy::Latest => {
+            let version = tag
+                .rsplit_once("-v")
+                .map(|(_, rest)| rest)
+                .unwrap_or(tag)
+                .trim_start_matches('v');
+            let looks_like_version = !version.is_empty()
+                && version != tag
+                && version.chars().next().is_some_and(|c| c.is_ascii_digit());
+            if !looks_like_version {
+                return Err(format!(
+                    "latest {component} release tag '{tag}' must be v<crate-version> or \
+                     <crate>-v<crate-version>"
+                ));
+            }
+            Ok(version.to_string())
+        }
+    }
 }
 
 /// The release tag is the expected crate version. Running the placed binary
@@ -878,6 +907,41 @@ mod tests {
                 missing_asset: "ck-synapse-linux-x64.zip".to_string(),
             }
         );
+    }
+
+    /// Owners publish two version-carrying tag shapes; both must derive the
+    /// version a placed binary self-reports. Found on the first macOS operator
+    /// drive: core's real tag `subc-core-v0.14.1` was refused as malformed, so
+    /// the alpha was never installable by `ck setup` on any OS while the CI
+    /// stub served bare `v<version>` tags the code assumed.
+    #[test]
+    fn expected_version_derives_from_both_owner_tag_shapes() {
+        assert_eq!(
+            expected_version_from_tag(Component::Core, "subc-core-v0.14.1").as_deref(),
+            Ok("0.14.1")
+        );
+        assert_eq!(
+            expected_version_from_tag(Component::Aft, "v0.55.0").as_deref(),
+            Ok("0.55.0")
+        );
+        assert_eq!(
+            expected_version_from_tag(Component::Claustrum, "v0.1.0").as_deref(),
+            Ok("0.1.0")
+        );
+    }
+
+    #[test]
+    fn expected_version_refuses_versionless_tags_by_shape() {
+        // Latest-resolved, but the tag carries no version: refuse, naming both accepted shapes.
+        let error = expected_version_from_tag(Component::Aft, "nightly").unwrap_err();
+        assert!(error.contains("v<crate-version>"), "{error}");
+        assert!(error.contains("<crate>-v<crate-version>"), "{error}");
+        // Train-shaped (mc): the tag has no version by design; the refusal must
+        // name the owner-side gap (self-reported train id), not call the tag malformed.
+        let error = expected_version_from_tag(Component::Mc, "ck-mc-alpha.22464bf2").unwrap_err();
+        assert!(error.contains("train-shaped"), "{error}");
+        assert!(error.contains("self-report the train id"), "{error}");
+        assert!(!error.contains("must be v<crate-version>"), "{error}");
     }
 
     #[test]

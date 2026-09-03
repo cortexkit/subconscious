@@ -264,7 +264,10 @@ pub fn component_binaries_for_target(
         // release inventory gate all key on it, so setup must too or an
         // installed aft is never upgradable.
         (Component::Aft, _) => &["ck-aft"],
-        (Component::Mc, AlphaTarget::DarwinArm64 | AlphaTarget::LinuxX64) => &["ck-mc"],
+        (
+            Component::Mc,
+            AlphaTarget::DarwinArm64 | AlphaTarget::LinuxX64 | AlphaTarget::LinuxArm64,
+        ) => &["ck-mc"],
         (Component::Mc, AlphaTarget::WindowsX64) => &[],
         (Component::Insula, _) => &["ck-insula"],
         (Component::Claustrum, _) => &["ck-claustrum", "ck-auth"],
@@ -282,9 +285,10 @@ pub fn component_binaries_for_target(
             "ck-synapse-worker-ane-swift",
             "ck-synapse-worker-decode",
         ],
-        (Component::Synapse, AlphaTarget::LinuxX64 | AlphaTarget::WindowsX64) => {
-            &["ck-synapse", "ck-synapse-opctl", "ck-synapse-worker-llama"]
-        }
+        (
+            Component::Synapse,
+            AlphaTarget::LinuxX64 | AlphaTarget::LinuxArm64 | AlphaTarget::WindowsX64,
+        ) => &["ck-synapse", "ck-synapse-opctl", "ck-synapse-worker-llama"],
     }
 }
 
@@ -599,11 +603,7 @@ mod tests {
     #[test]
     fn module_program_leads_every_target_set() {
         for component in Component::ALL {
-            for target in [
-                AlphaTarget::DarwinArm64,
-                AlphaTarget::LinuxX64,
-                AlphaTarget::WindowsX64,
-            ] {
+            for target in AlphaTarget::ALL {
                 let set = component_binaries_for_target(component, target);
                 match module_program(component) {
                     None => assert_eq!(component, Component::Core, "{component} needs a program"),

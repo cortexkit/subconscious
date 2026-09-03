@@ -77,6 +77,7 @@ impl fmt::Display for Component {
 pub enum AlphaTarget {
     DarwinArm64,
     LinuxX64,
+    LinuxArm64,
     WindowsX64,
 }
 
@@ -85,14 +86,24 @@ impl AlphaTarget {
         match self {
             Self::DarwinArm64 => "darwin-arm64",
             Self::LinuxX64 => "linux-x64",
+            Self::LinuxArm64 => "linux-arm64",
             Self::WindowsX64 => "windows-x64",
         }
     }
+
+    /// Every alpha tuple, for tables that must cover all of them.
+    pub const ALL: [Self; 4] = [
+        Self::DarwinArm64,
+        Self::LinuxX64,
+        Self::LinuxArm64,
+        Self::WindowsX64,
+    ];
 
     pub fn from_parts(os: &str, arch: &str) -> Option<Self> {
         match (os, arch) {
             ("macos" | "darwin", "aarch64" | "arm64") => Some(Self::DarwinArm64),
             ("linux", "x86_64" | "x64") => Some(Self::LinuxX64),
+            ("linux", "aarch64" | "arm64") => Some(Self::LinuxArm64),
             ("windows", "x86_64" | "x64") => Some(Self::WindowsX64),
             _ => None,
         }
@@ -340,7 +351,15 @@ impl fmt::Display for PlanOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedPlatform { target } => {
-                write!(formatter, "unsupported-platform: {target}")
+                // Name the tuples that would have worked: an operator on an
+                // unlisted host should not have to guess whether the refusal
+                // is about the OS, the architecture, or a typo in either.
+                let supported: Vec<&str> = AlphaTarget::ALL.iter().map(|t| t.label()).collect();
+                write!(
+                    formatter,
+                    "unsupported-platform: {target} (alpha supports: {})",
+                    supported.join(", ")
+                )
             }
             Self::ReleaseIncomplete {
                 component,

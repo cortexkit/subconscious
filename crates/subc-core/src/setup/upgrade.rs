@@ -182,7 +182,11 @@ impl SystemUpgradeBackend {
         let platform = match super::model::PlatformObservation::current() {
             super::model::PlatformObservation::Supported(platform) => platform,
             super::model::PlatformObservation::Unsupported(host) => {
-                return Err(format!("unsupported-platform: {host}"))
+                let supported: Vec<&str> = AlphaTarget::ALL.iter().map(|t| t.label()).collect();
+                return Err(format!(
+                    "unsupported-platform: {host} (alpha supports: {})",
+                    supported.join(", ")
+                ));
             }
         };
         let inventory = load_current_inventory()?;

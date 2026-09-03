@@ -6,7 +6,7 @@ set -uo pipefail
 
 readonly DEFAULT_SUBCONSCIOUS_RELEASE_URL="https://github.com/cortexkit/subconscious/releases/latest/download"
 readonly DEFAULT_AFT_RELEASE_URL="https://github.com/cortexkit/aft/releases/latest/download"
-readonly SUPPORTED_TUPLES=("darwin-arm64" "linux-x64" "windows-x64")
+readonly SUPPORTED_TUPLES=("darwin-arm64" "linux-x64" "linux-arm64" "windows-x64")
 readonly SUBCONSCIOUS_BINARIES=("ck" "ck-subc" "ck-subc-mcp")
 readonly AFT_BINARIES=("ck-aft")
 
@@ -241,7 +241,7 @@ if ! temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ck-alpha-release-inventory.XXXXXX"); 
 fi
 trap 'rm -rf "$temp_dir"' EXIT
 
-printf 'release-inventory: started supported-tuples=darwin-arm64,linux-x64,windows-x64\n'
+printf 'release-inventory: started supported-tuples=darwin-arm64,linux-x64,linux-arm64,windows-x64\n'
 check_lane "subconscious" "$subconscious_release_url" "${SUBCONSCIOUS_BINARIES[@]}"
 # AFT publication is owned by cortexkit/aft, not this repository. Keeping its
 # result in a separate lane makes the external dependency visible in the gate.

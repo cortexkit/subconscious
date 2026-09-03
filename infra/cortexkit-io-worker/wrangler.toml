@@ -23,5 +23,13 @@ routes = [
 binding = "RELEASE_INDEX"
 id = "83a3afbf5461461f8385000c8fba33fb"
 
+[[durable_objects.bindings]]
+name = "REBUILD_COORDINATOR"
+class_name = "RebuildCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RebuildCoordinator"]
+
 [triggers]
 crons = ["0 4 * * *"]

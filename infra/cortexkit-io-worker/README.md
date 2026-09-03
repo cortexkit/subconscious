@@ -20,7 +20,7 @@ wrangler secret put GITHUB_APP_PRIVATE_KEY
 | Secret | Source |
 | --- | --- |
 | `GITHUB_WEBHOOK_SECRET` | The secret configured on the org webhook below. |
-| `ADMIN_TOKEN` | Operator-chosen bearer for `/releases/v1/reingest` and `/releases/v1/refusals.json`. |
+| `ADMIN_TOKEN` | Operator-chosen bearer for `/releases/v1/reingest`, `/releases/v1/status`, and `/releases/v1/refusals.json`. |
 | `RELEASE_INDEX_SIGNING_KEY` | PKCS#8 Ed25519 PEM from claustrum vault record `cortexkit:release-index-signing:1:ed25519-pem`. |
 | `GITHUB_APP_ID` | GitHub App `cortexkit-ci` (4124360). |
 | `GITHUB_APP_INSTALLATION_ID` | Org installation 142118098. |
@@ -37,6 +37,12 @@ wrangler kv namespace create RELEASE_INDEX
 
 Put the returned id in `wrangler.toml` under the `RELEASE_INDEX` binding.
 
+## Durable Object migration
+
+The release-index coordinator is a Durable Object. The first deploy after this
+change must use `wrangler deploy` so Wrangler applies its `new_classes`
+migration; do not deploy from this checkout.
+
 ## Org webhook
 
 Create an organization webhook on `cortexkit`:
@@ -51,4 +57,6 @@ Create an organization webhook on `cortexkit`:
 ## Cron
 
 Daily rebuild at `0 4 * * *` (04:00 UTC), in addition to the webhook and
-`POST /releases/v1/reingest` (`Authorization: Bearer <ADMIN_TOKEN>`).
+`POST /releases/v1/reingest` (`Authorization: Bearer <ADMIN_TOKEN>`). All three
+sources queue the same single-flight coordinator; reingest starts immediately,
+while webhook and cron requests use a 30-second debounce.

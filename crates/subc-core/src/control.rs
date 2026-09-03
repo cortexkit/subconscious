@@ -37,7 +37,7 @@ use crate::{
         log_duplicate_claim_events, log_requirement_events, CapabilityRequirementEvaluator,
         DuplicateClaimSource, RegisteredModule, RequirementStatus, RuntimeModule,
     },
-    daemon_config::RESTART_REQUIRED_SECTIONS,
+    daemon_config::RestartRequiredSection,
     forwarding::{
         CloseReason, EndpointRoute, ForwardingError, ForwardingTable, GoodbyeTarget,
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
@@ -2378,20 +2378,19 @@ impl ControlHandler {
         // changed" sends the operator back to diffing their own file, which is
         // the work this is meant to save.
         let mut restart_required = Vec::new();
-        for section in RESTART_REQUIRED_SECTIONS {
-            let changed = match *section {
-                "port" => configured_port != context.configured_port,
-                "storage" => storage_config != context.storage_config,
-                "admission_facts_carrier_module_id" => {
+        for section in RestartRequiredSection::ALL {
+            let changed = match section {
+                RestartRequiredSection::Port => configured_port != context.configured_port,
+                RestartRequiredSection::Storage => storage_config != context.storage_config,
+                RestartRequiredSection::AdmissionFactsCarrierModuleId => {
                     admission_facts_carrier_module_id != context.admission_facts_carrier_module_id
                 }
-                "admission_facts_targets" => {
+                RestartRequiredSection::AdmissionFactsTargets => {
                     admission_facts_targets != context.admission_facts_targets
                 }
-                other => panic!("RESTART_REQUIRED_SECTIONS has {other} with no rescan comparison"),
             };
             if changed {
-                restart_required.push((*section).to_string());
+                restart_required.push(section.label().to_string());
             }
         }
         if !restart_required.is_empty() {

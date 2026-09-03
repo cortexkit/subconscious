@@ -169,7 +169,10 @@ pub fn restart_required_from_pending_keys(
     let mut sections = Vec::new();
     for key in pending_dotted_keys {
         let top = key.as_ref().split('.').next().unwrap_or("");
-        if subc_core::daemon_config::RESTART_REQUIRED_SECTIONS.contains(&top)
+        if subc_core::daemon_config::RestartRequiredSection::ALL
+            .iter()
+            .map(|section| section.label())
+            .any(|label| label == top)
             && !sections.iter().any(|section| section == top)
         {
             sections.push(top.to_string());

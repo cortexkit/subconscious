@@ -123,9 +123,7 @@ impl SetupBackend {
             // component and skips it.
             let availability = match self.artifacts.release_availability(component) {
                 Ok(availability) => availability,
-                Err(error) => ReleaseAvailability::Incomplete {
-                    missing_asset: format!("release unresolvable: {error}"),
-                },
+                Err(reason) => ReleaseAvailability::Unresolvable { reason },
             };
             releases.insert(component, availability);
         }

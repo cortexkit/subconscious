@@ -614,36 +614,63 @@ fn check_reported(reported: &str, acceptance: &Acceptance) -> Result<(), String>
     Ok(())
 }
 
+/// A GitHub token, when the operator has one in the environment. The release
+/// API's unauthenticated budget is 60 requests per hour per source address,
+/// shared by everyone behind the same NAT; one setup costs one request per
+/// component, so a handful of installs on one network exhausts it and every
+/// later install sees 403 for the rest of the hour. A token lifts that to
+/// 5,000. Never required, never stored, only read.
+fn github_token() -> Option<String> {
+    ["CK_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 fn download(url: &str, destination: &Path) -> Result<(), String> {
     let destination = destination.to_string_lossy().into_owned();
+    let token = if url.starts_with("https://api.github.com/") {
+        github_token()
+    } else {
+        None
+    };
     let (program, args) = if cfg!(windows) {
+        let headers = token
+            .as_deref()
+            .map(|token| format!(" -Headers @{{Authorization='Bearer {token}'}}"))
+            .unwrap_or_default();
         (
             "powershell.exe",
             vec![
                 "-NoProfile".to_string(),
                 "-NonInteractive".to_string(),
                 "-Command".to_string(),
-                format!("Invoke-WebRequest -Uri '{url}' -OutFile '{destination}' -UseBasicParsing"),
+                format!(
+                    "Invoke-WebRequest -Uri '{url}' -OutFile '{destination}' -UseBasicParsing{headers}"
+                ),
             ],
         )
     } else {
-        (
-            "curl",
-            vec![
-                "--fail".to_string(),
-                "--location".to_string(),
-                "--silent".to_string(),
-                "--show-error".to_string(),
-                // The status code is the only thing that distinguishes "no
-                // such release yet" from a broken host; write it where the
-                // error path can read it.
-                "--write-out".to_string(),
-                "http_status=%{http_code}".to_string(),
-                "--output".to_string(),
-                destination,
-                url.to_string(),
-            ],
-        )
+        let mut args = vec![
+            "--fail".to_string(),
+            "--location".to_string(),
+            "--silent".to_string(),
+            "--show-error".to_string(),
+            // The status code is the only thing that distinguishes "no
+            // such release yet" from a broken host; write it where the
+            // error path can read it.
+            "--write-out".to_string(),
+            "http_status=%{http_code}".to_string(),
+            "--output".to_string(),
+            destination,
+        ];
+        if let Some(token) = token.as_deref() {
+            args.push("--header".to_string());
+            args.push(format!("Authorization: Bearer {token}"));
+        }
+        args.push(url.to_string());
+        ("curl", args)
     };
     let output = Command::new(program)
         .args(args)

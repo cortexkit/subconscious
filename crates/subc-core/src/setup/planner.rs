@@ -96,6 +96,11 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                 });
                 continue;
             }
+            ReleaseAvailability::Unresolvable { reason } => {
+                plan.outcomes
+                    .push(PlanOutcome::ReleaseUnresolvable { component, reason });
+                continue;
+            }
             ReleaseAvailability::Available | ReleaseAvailability::NotRequired => {}
         }
 
@@ -300,6 +305,12 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                         component: upgrade_target_component(target),
                         release_tag,
                         missing_asset,
+                    });
+                }
+                ReleaseAvailability::Unresolvable { reason } => {
+                    plan.outcomes.push(PlanOutcome::ReleaseUnresolvable {
+                        component: upgrade_target_component(target),
+                        reason,
                     });
                 }
                 ReleaseAvailability::Available => plan_upgrade_target(&mut plan, target),
@@ -516,6 +527,47 @@ mod tests {
             outcome.to_string(),
             "aft: no ck-aft-linux-x64.zip asset in v0.1.0 yet — the module's owner has not published this platform"
         );
+    }
+
+    /// Fifth finding of the macOS operator drive: a 403 from the release API
+    /// (the unauthenticated rate limit, exhausted by earlier drives) was
+    /// rendered as "the module's owner has not published this platform" — a
+    /// false statement about the owner made from a fact about the request.
+    /// An unresolvable release names what happened, blocks that component
+    /// only, and never claims anything about publication.
+    #[test]
+    fn unresolvable_release_is_reported_as_the_request_failure_not_as_unpublished() {
+        let mut observed = observed_setup();
+        observed.releases.insert(
+            Component::Aft,
+            ReleaseAvailability::Unresolvable {
+                reason: "HTTP 403 from https://api.github.com/repos/cortexkit/aft/releases/latest"
+                    .to_string(),
+            },
+        );
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        let outcome = plan
+            .outcomes
+            .iter()
+            .find(|outcome| matches!(outcome, PlanOutcome::ReleaseUnresolvable { .. }))
+            .expect("typed unresolvable outcome");
+        let rendered = outcome.to_string();
+        assert!(
+            rendered.contains("could not resolve the release"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("HTTP 403"), "{rendered}");
+        assert!(!rendered.contains("has not published"), "{rendered}");
+        assert!(outcome.blocks_execution());
+        // Core was resolvable and stays plannable: one component's host
+        // failure must not silence the others.
+        assert!(!plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::ReleaseUnresolvable {
+                component: Component::Core,
+                ..
+            }
+        )));
     }
 
     #[test]

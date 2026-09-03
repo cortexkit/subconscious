@@ -199,6 +199,13 @@ pub enum ReleaseAvailability {
         release_tag: String,
         missing_asset: String,
     },
+    /// The release host could not be asked (rate limit, network, 5xx). This is
+    /// a fact about the request, never about the owner's release: rendering it
+    /// as "not yet published" would turn a transient 403 into a false claim
+    /// that the owner has not shipped.
+    Unresolvable {
+        reason: String,
+    },
     /// A component can be intentionally unavailable on a host without querying
     /// its release repository.
     NotRequired,
@@ -325,6 +332,13 @@ pub enum PlanOutcome {
         release_tag: String,
         missing_asset: String,
     },
+    /// The release host refused or failed the resolution request. Blocks
+    /// execution for that component like an incomplete release, but says
+    /// what happened instead of what the owner did not do.
+    ReleaseUnresolvable {
+        component: Component,
+        reason: String,
+    },
     DeclaredUnavailable {
         component: Component,
         message: String,
@@ -347,6 +361,7 @@ impl PlanOutcome {
             self,
             Self::UnsupportedPlatform { .. }
                 | Self::ReleaseIncomplete { .. }
+                | Self::ReleaseUnresolvable { .. }
                 | Self::Refusal { .. }
         )
     }
@@ -365,6 +380,10 @@ impl fmt::Display for PlanOutcome {
             } => write!(
                 formatter,
                 "{component}: no {missing_asset} asset in {release_tag} yet — the module's owner has not published this platform"
+            ),
+            Self::ReleaseUnresolvable { component, reason } => write!(
+                formatter,
+                "{component}: could not resolve the release: {reason} — retry later; nothing was installed"
             ),
             Self::DeclaredUnavailable { message, .. } => formatter.write_str(message),
             Self::Refusal { reason } => write!(formatter, "refusal: {reason}"),

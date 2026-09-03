@@ -87,6 +87,129 @@ required asset is **release-incomplete**, not unsupported. The pre-user matrix
 covers macOS, Windows 11 in Parallels, Ubuntu LTS, and Fedora, subject to the
 fixed architecture set above.
 
+## Release index (controlling, 2026-09-03)
+
+This section supersedes every clause below that resolves a component's release
+by querying the GitHub REST API. `ck setup`, `ck upgrade`, the update check,
+and the bootstrap installers resolve releases from **one signed document that
+CortexKit owns**, never from `api.github.com`. Operator ruling, 2026-09-03,
+after the first macOS operator drive: three findings were GitHub's release
+model disagreeing with ours (tag prefixes, train ids, sibling-crate versions
+that appear nowhere in a release) and a fourth was the API's unauthenticated
+rate limit, shared per source address. The question the installers ask —
+*what is the current release of each component, and what are its verified
+assets* — is ours to answer.
+
+### Document
+
+```text
+https://cortexkit.io/releases/v1/index.json       the index (application/json)
+https://cortexkit.io/releases/v1/index.json.sig   detached Ed25519 signature (base64, one line)
+```
+
+The signature is over the exact bytes served as `index.json`. `ck` embeds the
+verifying public key (`RELEASE_INDEX_PUBKEY`, 32 bytes) and **refuses** an
+index whose signature is absent or does not verify — there is no unsigned
+mode and no GitHub fallback. Key custody: the private key is held as opaque
+record `cortexkit:release-index-signing:1:ed25519-pem` in the claustrum
+vault and deployed to the index worker as a secret; rotation ships a new
+`ck` with the new key under generation `:2` before the worker switches.
+
+```jsonc
+{
+  "schema": 1,
+  "channel": "alpha",                       // one document per channel; alpha is the only channel today
+  "generated_at_ms": 1788425000000,
+  "components": {
+    "core": {
+      "repository": "cortexkit/subconscious",
+      "release": "subc-core-v0.14.1",       // the source release's tag, verbatim
+      "published_at_ms": 1788400000000,
+      "version": "0.14.1",                  // present when the tag carries one
+      "train": null,                         // present for train-tagged components (mc): the tag's build sha id
+      "assets": {
+        "darwin-arm64": {
+          "ck-subc": { "url": "https://github.com/cortexkit/subconscious/releases/download/subc-core-v0.14.1/ck-subc-darwin-arm64.zip",
+                       "sha256": "<64 hex, VERIFIED at ingest against the downloaded bytes>", "bytes": 6149696,
+                       "reports": "0.14.1" },   // substring `<binary> --version` must print; null when the release does not say
+          "ck-subc-mcp": { "url": "…", "sha256": "…", "bytes": 4100000, "reports": null }
+        },
+        "linux-x64": { … }, "linux-arm64": { … }, "windows-x64": { … }
+      }
+    },
+    "aft": { … }, "mc": { … }, "insula": { … }, "claustrum": { … }, "synapse": { … }
+  }
+}
+```
+
+Rules:
+
+- **Assets are listed, not chosen.** The index lists every `{name}-{os}-{arch}.zip`
+  the release carries. Which binaries a component needs on a target is `ck`'s
+  table (`component_binaries_for_target`); the index never restates it.
+- **A component absent from `components` has no published release** (the
+  owner has not shipped one, or the latest is a draft). A component present
+  but missing an asset for the host target is the `not yet published`
+  outcome for that target. A component whose release the ingester
+  **refused** (see below) is absent, with the refusal visible only to the
+  owner — a user never sees a half-ingested release.
+- **`reports`** is the placement acceptance: after placing a binary, `ck`
+  runs `<binary> --version` and requires the `reports` substring when it is
+  non-null; when null the binary must execute and print a name and a
+  version (`RunsAndReports`), and provenance rests on the verified sha256.
+  The ingester derives `reports` from the tag (`v<ver>` and
+  `<crate>-v<ver>` → the version for the tag-named binary only; a train tag
+  → the full build sha for every binary) and prefers an owner-published
+  `release-manifest.json` asset when present (`{"binaries": {"<name>": {"reports": "…"}}}`).
+- **Digests are verified at ingest.** The ingester downloads every listed
+  archive once, computes sha256, and compares it to the sidecar; a mismatch
+  refuses the whole release. `ck` still verifies the sidecar-equal digest
+  from the index against the bytes it downloads — the index is the source
+  of the expected digest, the sidecar files remain on the release for
+  humans and other tooling.
+- **Freshness.** `ck` treats an index older than 7 days
+  (`generated_at_ms`) as `index_stale` and refuses to install from it;
+  the update check renders it as `updates: index stale`. The worker
+  regenerates on every release event and on a daily cron, so a stale index
+  means the ingester is down, never that nothing was released.
+- **Typed refusals** in `ck`: `index_unreachable` (network/5xx),
+  `index_signature_invalid`, `index_malformed`, `index_stale`. None of them
+  install anything; all name the URL and, for signature failures, the key
+  generation `ck` expected.
+
+### Producer: the index worker
+
+The worker at `infra/cortexkit-io-worker` (the same worker that serves
+`/install`) owns the index. It ingests on the org `release` webhook
+(`published`, `edited`, `deleted` — HMAC-verified with the webhook secret) and
+on a daily cron, rebuilding the whole document from every component's
+releases using a server-side GitHub token (5,000 req/h; the per-user
+budget disappears from the design). Per component it resolves the current
+release by the owner's rule — `latest` non-draft for every component except
+mc, whose current release is the newest by `created_at` among
+`ck-mc-*`-prefixed prereleases (owner-ruled; the repo's Latest surface
+belongs to its npm product) — downloads each listed archive and sidecar,
+verifies, derives `reports`, canonicalizes (stable key order, no
+whitespace), signs, and writes `index.json` + `index.json.sig` to KV in one
+put. A release that fails verification is **refused**: the previous good
+entry for that component stays, the refusal is logged with the asset and
+the reason, and the owner is notified (a GitHub issue on the component's
+repository, opened once per offending tag). The serving path is
+`GET /releases/v1/index.json[.sig]` with `Cache-Control: public, max-age=60`;
+an admin `POST /releases/v1/reingest` (bearer) exists for bootstrap and
+operator repair.
+
+Bytes stay on GitHub release assets for alpha (CDN, sidecars, no new
+storage); mirroring archives to R2 is a later, independent step.
+
+### Bootstrap installers
+
+`install.sh` / `install.ps1` read `index.json` for `ck`'s asset url and
+sha256 and verify the downloaded archive against that sha256. They do not
+verify the index signature (no Ed25519 in a bootstrap shell); bootstrap
+trust is TLS to `cortexkit.io`, and the placed `ck` verifies the signed
+index on its first `ck setup`. This is stated, not hidden.
+
 ## Release assets and component availability
 
 Release assets use the direct convention:

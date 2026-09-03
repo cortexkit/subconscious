@@ -24,14 +24,15 @@ pub trait ArtifactSource {
         destination: &Path,
     ) -> Result<String, String>;
 
-    fn expected_version(&mut self, component: Component) -> Result<String, String>;
+    /// What `binary` of `component` must prove on its `--version` line.
+    fn acceptance(&mut self, component: Component, binary: &str) -> Result<Acceptance, String>;
 
-    /// Confirm the placed binary self-reports `expected`. The default executes
+    /// Confirm the placed binary meets `acceptance`. The default executes
     /// `<destination> --version`, which is what every production source relies
     /// on; a test source may answer from the bytes it wrote instead, because a
     /// fake binary is not executable on every platform.
-    fn verify_version(&mut self, destination: &Path, expected: &str) -> Result<(), String> {
-        verify_version(destination, expected)
+    fn verify(&mut self, destination: &Path, acceptance: &Acceptance) -> Result<(), String> {
+        verify_acceptance(destination, acceptance)
     }
 }
 
@@ -328,9 +329,9 @@ impl ArtifactSource for ReleaseArtifactSource {
         Ok(digest)
     }
 
-    fn expected_version(&mut self, component: Component) -> Result<String, String> {
+    fn acceptance(&mut self, component: Component, binary: &str) -> Result<Acceptance, String> {
         let tag = self.manifest(component)?.tag_name.trim().to_string();
-        expected_version_from_tag(component, &tag)
+        acceptance_for(component, binary, &tag)
     }
 }
 
@@ -413,8 +414,8 @@ pub fn install_component<S: ArtifactSource>(
         // managed destination, and the operator could never re-run setup
         // without hand-deleting what setup itself left behind.
         let accepted = source
-            .expected_version(component)
-            .and_then(|expected| source.verify_version(&destination, &expected));
+            .acceptance(component, binary)
+            .and_then(|acceptance| source.verify(&destination, &acceptance));
         if let Err(error) = accepted {
             match fs::remove_file(&destination) {
                 Ok(()) => return Err(error),
@@ -490,6 +491,52 @@ fn temporary_path(name: &str) -> PathBuf {
     ))
 }
 
+/// What a placed binary can prove about the release it came from, read off
+/// its `--version` line. The archive's sidecar already proves the bytes are
+/// the release's; this is the second, independent check that the release
+/// itself carries the binary it claims to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Acceptance {
+    /// The tag names this binary's crate version; `--version` must report it.
+    Version(String),
+    /// The tag is a build train; `--version` must carry the train id (mc's
+    /// `ck-mc <ver> (<full sha>)` where the tag id is that sha's prefix).
+    TrainId(String),
+    /// A sibling binary in a multi-crate workspace release: the tag names
+    /// another crate's version, and this crate's own version appears nowhere
+    /// in the release. It must execute and self-report (the run is the
+    /// first-exec toll paid before the daemon spawns it), and provenance rests
+    /// on the sidecar. Refusing it against the sibling's version would refuse
+    /// every correct release; accepting it on the sidecar is what the sidecar
+    /// is for.
+    RunsAndReports,
+}
+
+/// Per-binary acceptance. The core release ships `ck-subc` (the crate the tag
+/// names) beside `ck-subc-mcp` (its own crate, its own version); only the
+/// first can be held to the tag's version.
+fn acceptance_for(component: Component, binary: &str, tag: &str) -> Result<Acceptance, String> {
+    match component.release_resolution_strategy() {
+        ReleaseResolutionStrategy::TagPrefix(prefix) => {
+            let id = tag.strip_prefix(prefix).unwrap_or(tag).trim();
+            // `ck-mc-alpha.<sha8>`: the train id is the part after the channel dot.
+            let id = id.rsplit('.').next().unwrap_or(id);
+            if id.len() < 7 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "{component} release tag '{tag}' does not end in a build sha train id"
+                ));
+            }
+            Ok(Acceptance::TrainId(id.to_string()))
+        }
+        ReleaseResolutionStrategy::Latest => {
+            if component == Component::Core && binary != "ck-subc" {
+                return Ok(Acceptance::RunsAndReports);
+            }
+            expected_version_from_tag(component, tag).map(Acceptance::Version)
+        }
+    }
+}
+
 /// The version a placed binary must self-report, derived from the resolved
 /// release tag. Owners tag in two shapes: bare `v<version>` (aft, insula,
 /// claustrum) and workspace-crate `subc-core-v<version>` (core, the release
@@ -499,36 +546,28 @@ fn temporary_path(name: &str) -> PathBuf {
 /// the train sha, which is the owner's contract to provide — until it does, the
 /// refusal names the gap instead of claiming the tag is malformed.
 fn expected_version_from_tag(component: Component, tag: &str) -> Result<String, String> {
-    match component.release_resolution_strategy() {
-        ReleaseResolutionStrategy::TagPrefix(prefix) => Err(format!(
-            "{component} release tag '{tag}' is train-shaped ({prefix}<id>) and carries no \
-             version; placement acceptance needs the binary to self-report the train id, \
-             which its --version does not yet"
-        )),
-        ReleaseResolutionStrategy::Latest => {
-            let version = tag
-                .rsplit_once("-v")
-                .map(|(_, rest)| rest)
-                .unwrap_or(tag)
-                .trim_start_matches('v');
-            let looks_like_version = !version.is_empty()
-                && version != tag
-                && version.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if !looks_like_version {
-                return Err(format!(
-                    "latest {component} release tag '{tag}' must be v<crate-version> or \
-                     <crate>-v<crate-version>"
-                ));
-            }
-            Ok(version.to_string())
-        }
+    let version = tag
+        .rsplit_once("-v")
+        .map(|(_, rest)| rest)
+        .unwrap_or(tag)
+        .trim_start_matches('v');
+    let looks_like_version = !version.is_empty()
+        && version != tag
+        && version.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if !looks_like_version {
+        return Err(format!(
+            "latest {component} release tag '{tag}' must be v<crate-version> or \
+             <crate>-v<crate-version>"
+        ));
     }
+    Ok(version.to_string())
 }
 
-/// The release tag is the expected crate version. Running the placed binary
-/// before configuration prevents a valid archive for the wrong release from
-/// becoming a supervised module.
-fn verify_version(path: &Path, expected: &str) -> Result<(), String> {
+/// Runs the placed binary before configuration and checks its `--version`
+/// line against what the release lets it prove. Prevents a release that
+/// carries the wrong binary from becoming a supervised module, and pays the
+/// first-exec toll on the destination inode before the daemon spawns it.
+fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String> {
     let output = Command::new(path)
         .arg("--version")
         .output()
@@ -542,14 +581,35 @@ fn verify_version(path: &Path, expected: &str) -> Result<(), String> {
         ));
     }
     let reported = String::from_utf8_lossy(&output.stdout);
-    if reported
-        .split_whitespace()
-        .all(|token| token.trim_start_matches('v') != expected)
-    {
-        return Err(format!(
-            "refusal: {} --version did not report release version {expected}: {reported:?}",
+    check_reported(&reported, acceptance).map_err(|reason| {
+        format!(
+            "refusal: {} --version {reason}: {reported:?}",
             path.display()
-        ));
+        )
+    })
+}
+
+/// The pure half of acceptance, over the captured `--version` line.
+fn check_reported(reported: &str, acceptance: &Acceptance) -> Result<(), String> {
+    match acceptance {
+        Acceptance::Version(expected) => {
+            if reported
+                .split_whitespace()
+                .all(|token| token.trim_start_matches('v') != expected)
+            {
+                return Err(format!("did not report release version {expected}"));
+            }
+        }
+        Acceptance::TrainId(id) => {
+            if !reported.contains(id.as_str()) {
+                return Err(format!("did not report release train id {id}"));
+            }
+        }
+        Acceptance::RunsAndReports => {
+            if reported.split_whitespace().count() < 2 {
+                return Err("did not self-report a name and version".to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -734,21 +794,25 @@ mod tests {
             digest_file(destination)
         }
 
-        fn expected_version(&mut self, _component: Component) -> Result<String, String> {
-            Ok("1.2.3".to_string())
+        fn acceptance(
+            &mut self,
+            _component: Component,
+            _binary: &str,
+        ) -> Result<Acceptance, String> {
+            Ok(Acceptance::Version("1.2.3".to_string()))
         }
 
         #[cfg(windows)]
-        fn verify_version(&mut self, destination: &Path, expected: &str) -> Result<(), String> {
+        fn verify(&mut self, destination: &Path, acceptance: &Acceptance) -> Result<(), String> {
             let content = fs::read_to_string(destination).map_err(|error| error.to_string())?;
-            if content.contains(expected) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "fake binary at {} does not carry version {expected}",
-                    destination.display()
-                ))
-            }
+            // The fake writes `echo <name> <version>`; read the line the real
+            // binary would print and run the same pure check over it.
+            let reported = content
+                .lines()
+                .find_map(|line| line.strip_prefix("echo "))
+                .unwrap_or("");
+            check_reported(reported, acceptance)
+                .map_err(|reason| format!("fake binary at {} {reason}", destination.display()))
         }
     }
 
@@ -786,13 +850,17 @@ mod tests {
             FakeSource.install(component, binary, destination)
         }
 
-        fn expected_version(&mut self, _component: Component) -> Result<String, String> {
-            Ok("9.9.9".to_string())
+        fn acceptance(
+            &mut self,
+            _component: Component,
+            _binary: &str,
+        ) -> Result<Acceptance, String> {
+            Ok(Acceptance::Version("9.9.9".to_string()))
         }
 
         #[cfg(windows)]
-        fn verify_version(&mut self, destination: &Path, expected: &str) -> Result<(), String> {
-            FakeSource.verify_version(destination, expected)
+        fn verify(&mut self, destination: &Path, acceptance: &Acceptance) -> Result<(), String> {
+            FakeSource.verify(destination, acceptance)
         }
     }
 
@@ -1013,17 +1081,64 @@ mod tests {
     }
 
     #[test]
-    fn expected_version_refuses_versionless_tags_by_shape() {
-        // Latest-resolved, but the tag carries no version: refuse, naming both accepted shapes.
+    fn expected_version_refuses_versionless_latest_tags_naming_both_shapes() {
         let error = expected_version_from_tag(Component::Aft, "nightly").unwrap_err();
         assert!(error.contains("v<crate-version>"), "{error}");
         assert!(error.contains("<crate>-v<crate-version>"), "{error}");
-        // Train-shaped (mc): the tag has no version by design; the refusal must
-        // name the owner-side gap (self-reported train id), not call the tag malformed.
-        let error = expected_version_from_tag(Component::Mc, "ck-mc-alpha.22464bf2").unwrap_err();
-        assert!(error.contains("train-shaped"), "{error}");
-        assert!(error.contains("self-report the train id"), "{error}");
-        assert!(!error.contains("must be v<crate-version>"), "{error}");
+    }
+
+    /// Fourth finding of the macOS drive: the core release ships `ck-subc-mcp`
+    /// (crate 0.1.0) beside `ck-subc` (the crate the tag names, 0.14.1). One
+    /// version cannot hold both; the sibling proves it runs and reports, and
+    /// provenance rests on the sidecar.
+    #[test]
+    fn acceptance_is_per_binary_within_a_workspace_release() {
+        assert_eq!(
+            acceptance_for(Component::Core, "ck-subc", "subc-core-v0.14.1"),
+            Ok(Acceptance::Version("0.14.1".to_string()))
+        );
+        assert_eq!(
+            acceptance_for(Component::Core, "ck-subc-mcp", "subc-core-v0.14.1"),
+            Ok(Acceptance::RunsAndReports)
+        );
+        // Single-crate owners: every binary is the tag's crate.
+        assert_eq!(
+            acceptance_for(Component::Claustrum, "ck-auth", "v0.1.0"),
+            Ok(Acceptance::Version("0.1.0".to_string()))
+        );
+    }
+
+    /// mc's tag is a build train (`ck-mc-alpha.<sha8>`); its `--version`
+    /// self-reports the full build sha, of which the tag id is a prefix.
+    #[test]
+    fn train_tagged_components_are_accepted_on_the_train_id() {
+        assert_eq!(
+            acceptance_for(Component::Mc, "ck-mc", "ck-mc-alpha.22464bf2"),
+            Ok(Acceptance::TrainId("22464bf2".to_string()))
+        );
+        let error = acceptance_for(Component::Mc, "ck-mc", "ck-mc-alpha.nightly").unwrap_err();
+        assert!(error.contains("build sha train id"), "{error}");
+    }
+
+    #[test]
+    fn reported_line_check_covers_all_three_acceptance_arms() {
+        let version = Acceptance::Version("0.14.1".to_string());
+        assert!(check_reported("ck-subc 0.14.1\n", &version).is_ok());
+        assert!(check_reported("ck-subc v0.14.1\n", &version).is_ok());
+        assert!(check_reported("ck-subc 0.13.0\n", &version).is_err());
+
+        let train = Acceptance::TrainId("22464bf2".to_string());
+        assert!(check_reported(
+            "ck-mc 0.1.0 (22464bf2a1b2c3d4e5f60718293a4b5c6d7e8f90)\n",
+            &train
+        )
+        .is_ok());
+        // An unstamped dev build prints the crate version alone: refused.
+        let error = check_reported("ck-mc 0.1.0\n", &train).unwrap_err();
+        assert!(error.contains("train id 22464bf2"), "{error}");
+
+        assert!(check_reported("ck-subc-mcp 0.1.0\n", &Acceptance::RunsAndReports).is_ok());
+        assert!(check_reported("\n", &Acceptance::RunsAndReports).is_err());
     }
 
     #[test]

@@ -148,17 +148,12 @@ fn desired_values_with_key(
         }
         Component::Aft | Component::Mc | Component::Insula | Component::Synapse => {
             let module_id = component.module_id().expect("non-core modules have an id");
-            let binary = match component {
-                Component::Aft => "aft",
-                Component::Mc => "ck-mc",
-                Component::Insula => "ck-insula",
-                Component::Synapse => "ck-synapse",
-                _ => unreachable!("the match only admits single-daemon modules"),
-            };
             values.insert(
                 format!("modules.{module_id}"),
                 serde_json::json!({
-                    "program": binary_home.join(platform_binary(binary)).to_string_lossy(),
+                    "program": binary_home
+                        .join(platform_binary(daemon_binary(component)))
+                        .to_string_lossy(),
                 }),
             );
         }
@@ -168,7 +163,7 @@ fn desired_values_with_key(
                 "program".to_string(),
                 Value::String(
                     binary_home
-                        .join(platform_binary("ck-claustrum"))
+                        .join(platform_binary(daemon_binary(component)))
                         .to_string_lossy()
                         .into_owned(),
                 ),
@@ -204,6 +199,21 @@ fn insert_claustrum_reserved_comment(rendered: &mut String) {
             "{indentation}// without it any local process completing the handshake can claim the vault's module id and be handed bearer capability handles\n"
         ),
     );
+}
+
+/// The binary the daemon spawns for a module: the first entry of the
+/// component's managed set. Read from the one table that owns the names
+/// (`components::component_binaries`), never restated here — a second
+/// table pointed the config at `bin/aft` after the archive was corrected to
+/// install `ck-aft`, and the daemon failed to spawn a path that no longer
+/// existed. Two tables encoding one fact drift; one table cannot.
+fn daemon_binary(component: Component) -> &'static str {
+    super::components::component_binaries(component)
+        .first()
+        .copied()
+        // The only empty set is mc on Windows, which the planner marks
+        // DeclaredUnavailable before any configure step can reach here.
+        .expect("every configurable module has at least one managed binary")
 }
 
 fn platform_binary(name: &str) -> String {
@@ -275,6 +285,46 @@ mod tests {
                     .into_owned()
             ))
         );
+    }
+
+    /// Eleventh finding of the macOS operator drive: the archive installed
+    /// `ck-aft` (the corrected managed name) while the config pointed the
+    /// daemon at `bin/aft`, and the spawn failed on a path that did not
+    /// exist. The program the config names must be the first binary the
+    /// component installs — the same table, so they cannot disagree.
+    #[test]
+    fn configured_program_is_the_component_s_first_installed_binary() {
+        for component in [
+            Component::Aft,
+            Component::Mc,
+            Component::Insula,
+            Component::Claustrum,
+            Component::Synapse,
+        ] {
+            let root = fixture_path(&format!("program-name-{component}"));
+            let config = root.join("subc.jsonc");
+            let change = plan_component(&config, component, &root)
+                .expect("additive")
+                .expect("absent");
+            apply(&change).expect("apply");
+            // The written file is JSONC (claustrum's entry carries a comment
+            // explaining `reserved`); parse it the way the daemon does.
+            let stripped =
+                jsonc_to_json(&fs::read_to_string(&config).expect("read")).expect("jsonc strips");
+            let written: Value = serde_json::from_str(&stripped).expect("jsonc parses");
+            let module_id = component.module_id().expect("module");
+            let program = written
+                .pointer(&format!("/modules/{module_id}/program"))
+                .and_then(Value::as_str)
+                .expect("program written");
+            let installed = super::super::components::component_binaries(component);
+            let expected = root.join(platform_binary(installed[0]));
+            assert_eq!(
+                Path::new(program),
+                expected.as_path(),
+                "{component}: config must spawn the first installed binary"
+            );
+        }
     }
 
     #[test]

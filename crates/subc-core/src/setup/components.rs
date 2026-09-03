@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use super::{
     config,
     inventory::Inventory,
-    model::{AlphaTarget, Component, ReleaseAvailability},
+    model::{AlphaTarget, Component, PlatformObservation, ReleaseAvailability},
     release_index::{self, IndexAsset, IndexRefusal, ReleaseIndex},
 };
 
@@ -533,13 +533,19 @@ pub fn digest_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+/// The host tuple the artifact source fetches for. Derived from the SAME
+/// os/arch parse the planner's platform gate uses, never from a second
+/// os-only table: a second table mapped every Linux to linux-x64, so on an
+/// arm64 host the gate admitted the tuple, the fetch pulled the x64
+/// archive, and the placed daemon failed acceptance with "Exec format
+/// error" — rolled back, correctly, but for a reason the operator could
+/// not see. On a host the gate refuses, no asset lookup will succeed
+/// anyway; the fallback only has to be a real tuple so the refusal, not
+/// a panic, is what the operator reads.
 fn host_alpha_target() -> AlphaTarget {
-    if cfg!(target_os = "macos") {
-        AlphaTarget::DarwinArm64
-    } else if cfg!(windows) {
-        AlphaTarget::WindowsX64
-    } else {
-        AlphaTarget::LinuxX64
+    match PlatformObservation::current() {
+        PlatformObservation::Supported(target) => target,
+        PlatformObservation::Unsupported(_) => AlphaTarget::LinuxX64,
     }
 }
 

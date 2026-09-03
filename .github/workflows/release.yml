@@ -87,24 +87,40 @@ jobs:
         run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
   windows-binaries:
-    name: Subconscious archives (windows-x64)
+    name: Subconscious archives (windows-${{ matrix.arch }})
     if: startsWith(github.ref_name, 'subc-core-v')
     needs: create-subconscious-release
     runs-on: windows-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            source: target/release
+          # Windows on ARM (every Windows VM on Apple silicon, and the Snapdragon
+          # laptops) cannot install from an x64 archive: the bootstrap refuses
+          # by tuple rather than relying on emulation. Cross-built on the x64
+          # runner; the MSVC ARM64 toolchain ships with the image.
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            source: target/aarch64-pc-windows-msvc/release
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+        run: cargo build --release --locked --target ${{ matrix.target }} -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
 
       # Alpha deliberately ships these native Windows binaries unsigned. This is
       # an accepted alpha limitation, not a fallback to a development certificate.
       - name: Package unsigned convention-named archives and digest sidecars
         shell: pwsh
-        run: ./scripts/release/package-windows-archives.ps1 -SourceDirectory target/release -DistDirectory dist
+        run: ./scripts/release/package-windows-archives.ps1 -SourceDirectory ${{ matrix.source }} -DistDirectory dist -Arch ${{ matrix.arch }}
 
       - name: Upload release archives
         shell: pwsh

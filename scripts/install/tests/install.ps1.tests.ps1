@@ -32,6 +32,14 @@ Describe 'native ck installer' {
                             release = 'subc-core-v0.16.0'
                             version = '0.16.0'
                             assets = @{
+                                'windows-arm64' = @{
+                                    ck = @{
+                                        url = 'https://release.fixture.example/ck-windows-arm64.zip'
+                                        sha256 = $archiveDigest
+                                        bytes = 16
+                                        reports = '0.16.0'
+                                    }
+                                }
                                 'windows-x64' = @{
                                     ck = @{
                                         url = 'https://release.fixture.example/ck-windows-x64.zip'
@@ -93,6 +101,38 @@ Describe 'native ck installer' {
         Test-Path -LiteralPath $destination | Should -BeTrue
         Test-Path -LiteralPath $manifest | Should -BeTrue
         Test-Path -LiteralPath $setupMarker | Should -BeFalse
+    }
+
+    It 'installs the arm64 archive on Windows on ARM and records the tuple' {
+        $env:PROCESSOR_ARCHITECTURE = 'ARM64'
+        $env:CK_RELEASE_INDEX_URL = 'https://release.fixture.example/releases/v1/index.json'
+        $output = & $installerPath
+
+        $output | Should -Contain 'Next: ck setup'
+        Should -Invoke Invoke-WebRequest -Times 1 -ParameterFilter {
+            $Uri -eq 'https://release.fixture.example/ck-windows-arm64.zip'
+        }
+        $manifest = Join-Path $env:LOCALAPPDATA 'cortexkit\installer-manifest.json'
+        (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).platform | Should -Be 'windows-arm64'
+        $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+    }
+
+    It 'refuses an architecture the release does not ship before any fetch' {
+        # Windows re-derives PROCESSOR_ARCHITECTURE for every new process from
+        # the real machine, so a child cannot be told it is IA64; the arm runs
+        # in-process. Refuse writes the console error stream and exits the
+        # script, which yields no exception here, so the observable is what
+        # did NOT happen: no index fetch, no archive, no placement.
+        # Earlier arms in this Describe placed ck.exe under the same
+        # LOCALAPPDATA; clear it so the absence below is this arm's own.
+        Remove-Item -Recurse -Force (Join-Path $env:LOCALAPPDATA 'cortexkit') -ErrorAction SilentlyContinue
+        $env:PROCESSOR_ARCHITECTURE = 'IA64'
+        $env:CK_RELEASE_INDEX_URL = 'https://release.fixture.example/releases/v1/index.json'
+        & $installerPath 2>&1 | Out-Null
+        Should -Invoke Invoke-WebRequest -Times 0
+        Should -Invoke Expand-Archive -Times 0
+        Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'cortexkit\bin\ck.exe') | Should -BeFalse
+        $env:PROCESSOR_ARCHITECTURE = 'AMD64'
     }
 
     It 'reports an identical extracted candidate as a placement no-op' {

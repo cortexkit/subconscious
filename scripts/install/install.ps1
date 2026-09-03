@@ -96,13 +96,14 @@ function Write-InstallerManifest {
         [Parameter(Mandatory = $true)][string]$Manifest,
         [Parameter(Mandatory = $true)][string]$Binary,
         [Parameter(Mandatory = $true)][string]$BinaryDigest,
-        [Parameter(Mandatory = $true)][string]$BinDir
+        [Parameter(Mandatory = $true)][string]$BinDir,
+        [Parameter(Mandatory = $true)][string]$Arch
     )
 
     $manifestObject = [ordered]@{
         schema_version = 1
         installer = 'ck'
-        platform = 'windows-x64'
+        platform = "windows-$Arch"
         mutations = @(
             [ordered]@{
                 kind = 'binary-placement'
@@ -154,10 +155,12 @@ if ([string]::IsNullOrWhiteSpace($rawArchitecture)) {
 switch ($rawArchitecture.ToLowerInvariant()) {
     'amd64' { $arch = 'x64' }
     'x86_64' { $arch = 'x64' }
+    'arm64' { $arch = 'arm64' }
+    'aarch64' { $arch = 'arm64' }
     default { $arch = $rawArchitecture.ToLowerInvariant() }
 }
-if ($arch -ne 'x64') {
-    Refuse 'unsupported-platform' "windows-$arch; supported tuples are darwin-arm64, linux-x64, windows-x64"
+if ($arch -ne 'x64' -and $arch -ne 'arm64') {
+    Refuse 'unsupported-platform' "windows-$arch; supported tuples are darwin-arm64, linux-x64, linux-arm64, windows-x64, windows-arm64"
 }
 
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
@@ -185,15 +188,15 @@ try {
     }
     try {
         $index = Get-Content -LiteralPath $indexPath -Raw -ErrorAction Stop | ConvertFrom-Json
-        $asset = $index.components.core.assets.'windows-x64'.ck
+        $asset = $index.components.core.assets."windows-$arch".ck
         $archiveUrl = [string]$asset.url
         $expectedDigest = ([string]$asset.sha256).ToLowerInvariant()
     }
     catch {
-        Refuse 'release-incomplete' "ck asset for windows-x64 is missing from $IndexUrl ($($_.Exception.Message))"
+        Refuse 'release-incomplete' "ck asset for windows-$arch is missing from $IndexUrl ($($_.Exception.Message))"
     }
     if ([string]::IsNullOrWhiteSpace($archiveUrl) -or $expectedDigest.Length -ne 64) {
-        Refuse 'release-incomplete' "ck asset for windows-x64 is missing from $IndexUrl"
+        Refuse 'release-incomplete' "ck asset for windows-$arch is missing from $IndexUrl"
     }
     try {
         Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath -UseBasicParsing -ErrorAction Stop
@@ -235,7 +238,7 @@ try {
     }
 
     Ensure-UserPath -BinDir $binDir
-    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -BinDir $binDir
+    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -BinDir $binDir -Arch $arch
     Write-Output 'Next: ck setup'
 }
 finally {

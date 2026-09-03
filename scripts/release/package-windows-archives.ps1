@@ -4,7 +4,13 @@ param(
     [string]$SourceDirectory,
 
     [Parameter(Mandatory = $true)]
-    [string]$DistDirectory
+    [string]$DistDirectory,
+
+    # Asset tuple suffix. The x64 build lands in target/release; a cross-built
+    # arm64 lands in target/<triple>/release, and the archive name is the only
+    # thing that tells the two apart downstream.
+    [ValidateSet("x64", "arm64")]
+    [string]$Arch = "x64"
 )
 
 Set-StrictMode -Version Latest
@@ -15,7 +21,7 @@ New-Item -ItemType Directory -Force -Path $DistDirectory | Out-Null
 
 foreach ($binary in $binaries) {
     $sourcePath = Join-Path $SourceDirectory "$binary.exe"
-    $archiveName = "$binary-windows-x64.zip"
+    $archiveName = "$binary-windows-$Arch.zip"
     $archivePath = Join-Path $DistDirectory $archiveName
     $sidecarPath = "$archivePath.sha256"
 

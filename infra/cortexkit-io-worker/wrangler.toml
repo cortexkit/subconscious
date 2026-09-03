@@ -21,7 +21,7 @@ routes = [
 # before the first production deploy. Local/test bindings ignore this value.
 [[kv_namespaces]]
 binding = "RELEASE_INDEX"
-id = "00000000000000000000000000000000"
+id = "83a3afbf5461461f8385000c8fba33fb"
 
 [triggers]
 crons = ["0 4 * * *"]

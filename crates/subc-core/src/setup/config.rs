@@ -189,6 +189,22 @@ fn desired_values_with_key(
     match component {
         Component::Core => {
             values.insert("version".to_string(), Value::from(1));
+            // Without a storage section the daemon delivers no storage
+            // descriptor in HELLO_ACK. Modules that open their store from the
+            // descriptor (claustrum does; it is the honest shape) then refuse
+            // to start with "HELLO_ACK carried no storage descriptor", while
+            // modules that self-key from the environment run regardless — so
+            // the omission passed every drive until the first descriptor-
+            // honouring module was installed. `data_home` is left to the
+            // daemon's platform default so a config written on one machine
+            // carries no other machine's home directory. Keyed on the leaf,
+            // not the object: an operator config that already carries an
+            // explicit `data_home` matches on the backend and keeps its home,
+            // instead of conflicting on a whole-object comparison.
+            values.insert(
+                "storage.backend".to_string(),
+                Value::String("sqlite".to_string()),
+            );
         }
         Component::Aft | Component::Mc | Component::Insula | Component::Synapse => {
             let module_id = component.module_id().expect("non-core modules have an id");
@@ -438,6 +454,51 @@ mod tests {
         assert!(change
             .after
             .contains("without it any local process completing the handshake"));
+    }
+
+    /// The daemon delivers a storage descriptor in HELLO_ACK only when the
+    /// config has a storage section; modules that open their store from the
+    /// descriptor refuse to start without one. Core setup must write it, and
+    /// must not conflict with an operator's explicit `data_home`.
+    #[test]
+    fn core_configuration_declares_sqlite_storage_and_keeps_an_explicit_data_home() {
+        let root = fixture_path("core-storage");
+        let fresh = root.join("fresh.jsonc");
+        let change = plan_component(&fresh, Component::Core, root.path())
+            .expect("plan")
+            .expect("fresh config changes");
+        apply(&change).expect("apply");
+        let written: Value = serde_json::from_str(
+            &jsonc_to_json(&fs::read_to_string(&fresh).expect("read")).expect("jsonc"),
+        )
+        .expect("json");
+        assert_eq!(written["storage"]["backend"], "sqlite");
+        assert!(
+            written["storage"].get("data_home").is_none(),
+            "no host path is written"
+        );
+
+        let explicit = root.join("explicit.jsonc");
+        fs::write(
+            &explicit,
+            r#"{"version":1,"storage":{"backend":"sqlite","data_home":"/srv/ck"},"modules":{}}"#,
+        )
+        .expect("write");
+        assert!(
+            plan_component(&explicit, Component::Core, root.path())
+                .expect("plan")
+                .is_none(),
+            "an explicit data_home under the same backend is already correct"
+        );
+
+        let other = root.join("other.jsonc");
+        fs::write(
+            &other,
+            r#"{"version":1,"storage":{"backend":"postgres"},"modules":{}}"#,
+        )
+        .expect("write");
+        let conflict = plan_component(&other, Component::Core, root.path()).expect_err("conflict");
+        assert_eq!(conflict.key, "storage.backend");
     }
 
     #[test]

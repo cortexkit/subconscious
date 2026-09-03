@@ -4,8 +4,9 @@ import type { Env } from "../src/env";
 import { canonicalize } from "../src/canonicalize";
 import type { ComponentEntry } from "../src/components";
 import { resetInstallationTokenCache } from "../src/github";
-import { KV_INDEX, KV_INDEX_SIG, KV_REFUSALS, rebuild, type Refusal } from "../src/rebuild";
+import { KV_BUNDLE, KV_REFUSALS, parseIndexBundle, rebuild, type Refusal } from "../src/rebuild";
 import { verifyIndex } from "../src/sign";
+import worker from "../src/worker";
 import { downloadUrl, fakeGitHub, zipAsset, type FakeGitHubCapture } from "./fake-github";
 import { TEST_ED25519_PKCS8_PEM, TEST_INSTALLATION_TOKEN } from "./keys";
 
@@ -39,20 +40,24 @@ describe("rebuild", () => {
   beforeEach(async () => {
     resetInstallationTokenCache();
     const kv = testEnv().RELEASE_INDEX;
-    await kv.delete(KV_INDEX);
-    await kv.delete(KV_INDEX_SIG);
+    await kv.delete(KV_BUNDLE);
     await kv.delete(KV_REFUSALS);
+    await kv.delete("index.json");
+    await kv.delete("index.json.sig");
   });
 
   it("ingests a good release, keeps the previous entry on sidecar mismatch, and omits a draft-only repo", async () => {
     const e = testEnv();
     await e.RELEASE_INDEX.put(
-      KV_INDEX,
+      KV_BUNDLE,
       canonicalize({
-        schema: 1,
-        channel: "alpha",
-        generated_at_ms: 1,
-        components: { aft: PREVIOUS_AFT },
+        body: canonicalize({
+          schema: 1,
+          channel: "alpha",
+          generated_at_ms: 1,
+          components: { aft: PREVIOUS_AFT },
+        }),
+        sig: "placeholder-previous",
       }),
     );
 
@@ -141,14 +146,34 @@ describe("rebuild", () => {
     expect(capture.apiAuth.every((h) => h === `Bearer ${TEST_INSTALLATION_TOKEN}`)).toBe(true);
     expect(capture.apiAuth.length).toBeGreaterThan(0);
 
-    const raw = await e.RELEASE_INDEX.get(KV_INDEX);
-    expect(raw).not.toBeNull();
-    const sig = await e.RELEASE_INDEX.get(KV_INDEX_SIG);
-    expect(sig).not.toBeNull();
-    expect(await verifyIndex(TEST_ED25519_PKCS8_PEM, new TextEncoder().encode(raw!), sig!)).toBe(true);
-    expect(raw).toBe(canonicalize(JSON.parse(raw!)));
+    const rawBundle = await e.RELEASE_INDEX.get(KV_BUNDLE);
+    expect(rawBundle).not.toBeNull();
+    const bundle = parseIndexBundle(rawBundle!);
+    expect(bundle).not.toBeNull();
+    expect(Object.keys(JSON.parse(rawBundle!) as object).sort()).toEqual(["body", "sig"]);
+    expect(await verifyIndex(TEST_ED25519_PKCS8_PEM, new TextEncoder().encode(bundle!.body), bundle!.sig)).toBe(true);
+    expect(bundle!.body).toBe(canonicalize(JSON.parse(bundle!.body)));
 
-    const doc = JSON.parse(raw!) as {
+    const indexRes = await worker.fetch(new Request("https://cortexkit.io/releases/v1/index.json"), e);
+    const sigRes = await worker.fetch(new Request("https://cortexkit.io/releases/v1/index.json.sig"), e);
+    expect(indexRes.status).toBe(200);
+    expect(sigRes.status).toBe(200);
+    expect(indexRes.headers.get("content-type")).toBe("application/json");
+    expect(indexRes.headers.get("cache-control")).toBe("public, max-age=60");
+    expect(sigRes.headers.get("content-type")).toBe("text/plain");
+    expect(sigRes.headers.get("cache-control")).toBe("public, max-age=60");
+    const servedBody = await indexRes.text();
+    const headerSig = indexRes.headers.get("X-CortexKit-Signature-Ed25519");
+    const sigBody = await sigRes.text();
+    expect(servedBody).toBe(bundle!.body);
+    expect(headerSig).toBe(bundle!.sig);
+    expect(sigBody).toBe(bundle!.sig);
+    expect(headerSig).toBe(sigBody);
+    const servedBytes = new TextEncoder().encode(servedBody);
+    expect(await verifyIndex(TEST_ED25519_PKCS8_PEM, servedBytes, headerSig!)).toBe(true);
+    expect(await verifyIndex(TEST_ED25519_PKCS8_PEM, servedBytes, sigBody)).toBe(true);
+
+    const doc = JSON.parse(bundle!.body) as {
       schema: number;
       channel: string;
       generated_at_ms: number;
@@ -186,5 +211,19 @@ describe("rebuild", () => {
     const aftRefusal = refusals.find((r) => r.component === "aft" && r.reason === "sha256_mismatch");
     expect(aftRefusal?.tag).toBe(aftTag);
     expect(aftRefusal?.asset).toBe("ck-aft-linux-x64.zip");
+    expect(await e.RELEASE_INDEX.get("index.json")).toBeNull();
+    expect(await e.RELEASE_INDEX.get("index.json.sig")).toBeNull();
+  });
+
+  it("serves 503 index_inconsistent when the bundle signature does not verify the body", async () => {
+    const e = testEnv();
+    const body = canonicalize({ schema: 1, channel: "alpha", generated_at_ms: 1, components: {} });
+    await e.RELEASE_INDEX.put(KV_BUNDLE, canonicalize({ body, sig: "not-a-signature" }));
+    const res = await worker.fetch(new Request("https://cortexkit.io/releases/v1/index.json"), e);
+    expect(res.status).toBe(503);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    const text = await res.text();
+    expect(text).toBe('{"error":"index_inconsistent"}');
+    expect(text).not.toBe(body);
   });
 });

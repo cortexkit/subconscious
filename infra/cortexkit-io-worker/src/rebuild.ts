@@ -20,9 +20,17 @@ import {
 } from "./github";
 import { signIndex, verifyIndex } from "./sign";
 
-export const KV_INDEX = "index.json";
-export const KV_INDEX_SIG = "index.json.sig";
+export const KV_BUNDLE = "index.bundle";
 export const KV_REFUSALS = "refusals.json";
+
+/** Leftover two-key layout; deleted after a successful bundle write. */
+const KV_LEGACY_INDEX = "index.json";
+const KV_LEGACY_SIG = "index.json.sig";
+
+export interface IndexBundle {
+  body: string;
+  sig: string;
+}
 
 export interface ReleaseIndex {
   schema: number;
@@ -73,21 +81,31 @@ export async function rebuild(env: Env, fetchFn: FetchFn = fetch): Promise<Rebui
     return { ok: false, error: "index_sign_failed" };
   }
 
-  // KV has no multi-key transaction; put both documents then read them back
-  // and verify so a torn write cannot be reported as success.
-  await env.RELEASE_INDEX.put(KV_INDEX, canonical);
-  await env.RELEASE_INDEX.put(KV_INDEX_SIG, signature);
+  // Body and signature are one KV value so the two public URLs cannot be
+  // read torn against independent cache/propagation clocks.
+  const bundle = canonicalize({ body: canonical, sig: signature });
+  await env.RELEASE_INDEX.put(KV_BUNDLE, bundle);
   await env.RELEASE_INDEX.put(KV_REFUSALS, canonicalize(refusals.slice(0, 100)));
+  await env.RELEASE_INDEX.delete(KV_LEGACY_INDEX);
+  await env.RELEASE_INDEX.delete(KV_LEGACY_SIG);
 
-  const gotJson = await env.RELEASE_INDEX.get(KV_INDEX);
-  const gotSig = await env.RELEASE_INDEX.get(KV_INDEX_SIG);
-  if (gotJson !== canonical || gotSig !== signature) {
-    console.error("read-your-write mismatch after index put");
+  const got = await env.RELEASE_INDEX.get(KV_BUNDLE);
+  if (got !== bundle) {
+    console.error("read-your-write mismatch after index bundle put");
     return { ok: false, error: "index_read_your_write_failed" };
   }
-  const verified = await verifyIndex(env.RELEASE_INDEX_SIGNING_KEY, new TextEncoder().encode(gotJson), gotSig);
+  const parsed = parseIndexBundle(got);
+  if (!parsed) {
+    console.error("index bundle unparseable after put");
+    return { ok: false, error: "index_sign_verify_failed" };
+  }
+  const verified = await verifyIndex(
+    env.RELEASE_INDEX_SIGNING_KEY,
+    new TextEncoder().encode(parsed.body),
+    parsed.sig,
+  );
   if (!verified) {
-    console.error("signature verify failed after index put");
+    console.error("signature verify failed after index bundle put");
     return { ok: false, error: "index_sign_verify_failed" };
   }
   return { ok: true };
@@ -234,9 +252,45 @@ function refuse(
   });
 }
 
+export function parseIndexBundle(raw: string): IndexBundle | null {
+  try {
+    const parsed = JSON.parse(raw) as { body?: unknown; sig?: unknown };
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.body !== "string" || typeof parsed.sig !== "string") return null;
+    return { body: parsed.body, sig: parsed.sig };
+  } catch {
+    return null;
+  }
+}
+
+export async function loadIndexBundle(
+  env: Env,
+): Promise<{ ok: true; body: string; sig: string } | { ok: false; reason: "missing" | "inconsistent" }> {
+  const raw = await env.RELEASE_INDEX.get(KV_BUNDLE);
+  if (raw === null) return { ok: false, reason: "missing" };
+  const parsed = parseIndexBundle(raw);
+  if (!parsed) return { ok: false, reason: "inconsistent" };
+  const verified = await verifyIndex(
+    env.RELEASE_INDEX_SIGNING_KEY,
+    new TextEncoder().encode(parsed.body),
+    parsed.sig,
+  );
+  if (!verified) return { ok: false, reason: "inconsistent" };
+  return { ok: true, body: parsed.body, sig: parsed.sig };
+}
+
 export async function readIndex(kv: KVNamespace): Promise<ReleaseIndex | null> {
-  const raw = await kv.get(KV_INDEX);
-  if (raw === null) return null;
+  const bundled = await kv.get(KV_BUNDLE);
+  if (bundled !== null) {
+    const parsed = parseIndexBundle(bundled);
+    if (parsed) return parseReleaseIndex(parsed.body);
+  }
+  const legacy = await kv.get(KV_LEGACY_INDEX);
+  if (legacy === null) return null;
+  return parseReleaseIndex(legacy);
+}
+
+function parseReleaseIndex(raw: string): ReleaseIndex | null {
   try {
     const parsed = JSON.parse(raw) as ReleaseIndex;
     if (!parsed || typeof parsed !== "object" || typeof parsed.components !== "object" || parsed.components === null) {

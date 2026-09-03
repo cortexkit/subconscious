@@ -1,7 +1,7 @@
 import type { Env } from "./env";
 import { timingSafeEqualString } from "./hex";
 import { verifyGitHubSignature } from "./hmac";
-import { KV_INDEX, KV_INDEX_SIG, KV_REFUSALS, rebuild } from "./rebuild";
+import { KV_REFUSALS, loadIndexBundle, rebuild } from "./rebuild";
 
 // Serves the canonical CortexKit install scripts at cortexkit.io/install.
 // The scripts stay repo-canonical in cortexkit/subconscious; this worker
@@ -22,10 +22,10 @@ export default {
     const path = url.pathname.replace(/\/$/, "");
 
     if (path === "/releases/v1/index.json" && request.method === "GET") {
-      return serveKv(env, KV_INDEX, "application/json");
+      return serveIndex(env, "json");
     }
     if (path === "/releases/v1/index.json.sig" && request.method === "GET") {
-      return serveKv(env, KV_INDEX_SIG, "text/plain");
+      return serveIndex(env, "sig");
     }
     if (path === "/releases/v1/refusals.json" && request.method === "GET") {
       return serveRefusals(request, env);
@@ -72,19 +72,37 @@ async function handleInstall(path: string): Promise<Response> {
   });
 }
 
-async function serveKv(env: Env, key: string, contentType: string): Promise<Response> {
-  const body = await env.RELEASE_INDEX.get(key);
-  if (body === null) {
+async function serveIndex(env: Env, view: "json" | "sig"): Promise<Response> {
+  const loaded = await loadIndexBundle(env);
+  if (!loaded.ok && loaded.reason === "missing") {
     return new Response(JSON.stringify({ error: "index_not_built" }), {
       status: 404,
       headers: { "content-type": "application/json" },
     });
   }
-  return new Response(body, {
+  if (!loaded.ok) {
+    // Never serve an index body whose signature does not verify; a torn or
+    // corrupted KV value must fail closed rather than look like a current release.
+    return new Response(JSON.stringify({ error: "index_inconsistent" }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (view === "sig") {
+    return new Response(loaded.sig, {
+      status: 200,
+      headers: {
+        "content-type": "text/plain",
+        "cache-control": "public, max-age=60",
+      },
+    });
+  }
+  return new Response(loaded.body, {
     status: 200,
     headers: {
-      "content-type": contentType,
+      "content-type": "application/json",
       "cache-control": "public, max-age=60",
+      "X-CortexKit-Signature-Ed25519": loaded.sig,
     },
   });
 }

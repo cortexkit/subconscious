@@ -252,8 +252,13 @@ mod tests {
             prior_inode.to_string()
         );
 
-        self_update::replace_verified_candidate(&destination, &candidate, &mut inventory)
-            .expect("atomic self-update");
+        self_update::replace_verified_candidate(
+            &destination,
+            &candidate,
+            &"aa".repeat(32),
+            &mut inventory,
+        )
+        .expect("atomic self-update");
         let replacement_inode = destination_inode(&destination).expect("replacement inode");
         assert_ne!(replacement_inode, prior_inode);
 

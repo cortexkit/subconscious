@@ -32,6 +32,7 @@ impl fmt::Display for SelfUpdateEvidence {
 pub(crate) fn replace_verified_candidate(
     destination: &Path,
     candidate: &Path,
+    archive_sha256: &str,
     inventory: &mut Inventory,
 ) -> Result<SelfUpdateEvidence, String> {
     if !candidate.is_file() {
@@ -81,6 +82,19 @@ pub(crate) fn replace_verified_candidate(
     for kind in owned_kinds {
         inventory
             .update_owned_string(kind, destination, "sha256", digest.clone())
+            .map_err(|error| {
+                format!(
+                    "refusal: self-update installed {} but could not reconcile installer-manifest.json: {error}",
+                    destination.display()
+                )
+            })?;
+        inventory
+            .update_owned_string(
+                kind,
+                destination,
+                "archive_sha256",
+                archive_sha256.to_string(),
+            )
             .map_err(|error| {
                 format!(
                     "refusal: self-update installed {} but could not reconcile installer-manifest.json: {error}",
@@ -139,8 +153,9 @@ mod tests {
         fs::write(&candidate, "replacement").expect("candidate");
         let mut inventory = Inventory::load(&manifest, "linux-x64").expect("inventory");
 
-        let error = replace_verified_candidate(&destination, &candidate, &mut inventory)
-            .expect_err("unowned destination must refuse");
+        let error =
+            replace_verified_candidate(&destination, &candidate, &"aa".repeat(32), &mut inventory)
+                .expect_err("unowned destination must refuse");
 
         assert!(error.contains("installer-manifest.json does not own"));
         assert_eq!(
@@ -168,8 +183,10 @@ mod tests {
         inventory.record("binary-placement", &destination, fields);
         inventory.save().expect("save inventory");
 
-        let evidence = replace_verified_candidate(&destination, &candidate, &mut inventory)
-            .expect("owned replacement");
+        let archive_digest = "cd".repeat(32);
+        let evidence =
+            replace_verified_candidate(&destination, &candidate, &archive_digest, &mut inventory)
+                .expect("owned replacement");
         assert!(evidence.to_string().contains("SHA-256 reconciled"));
         assert_eq!(
             fs::read_to_string(&destination).expect("destination bytes"),
@@ -182,12 +199,20 @@ mod tests {
 
         let inventory = Inventory::load(&manifest, "linux-x64").expect("reloaded inventory");
         let replacement_digest = sha256_file(&destination).expect("replacement digest");
+        let entry = inventory
+            .entry_for_path("binary-placement", &destination)
+            .expect("owned entry");
         assert_eq!(
-            inventory
-                .entry_for_path("binary-placement", &destination)
-                .and_then(|entry| entry.get("sha256"))
-                .and_then(Value::as_str),
+            entry.get("sha256").and_then(Value::as_str),
             Some(replacement_digest.as_str())
+        );
+        assert_eq!(
+            entry.get("archive_sha256").and_then(Value::as_str),
+            Some(archive_digest.as_str())
+        );
+        assert_ne!(
+            replacement_digest, archive_digest,
+            "ownership digest and archive digest are hashes of different files"
         );
     }
 }

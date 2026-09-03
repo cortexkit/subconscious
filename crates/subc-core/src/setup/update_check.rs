@@ -32,12 +32,15 @@ pub struct ReleaseEvidence {
     pub sha256: Option<String>,
 }
 
-/// State read from one inventory-owned binary. The placement digest is the only
-/// value that can decide currency; version text is retained only for rendering.
+/// State read from one inventory-owned binary. Currency compares
+/// `archive_sha256` (the zip the binary was extracted from) to the index asset
+/// digest. `sha256` is the extracted binary — a different file — and is not a
+/// currency input; version text is retained only for rendering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledBinary {
     pub version: String,
     pub sha256: Option<String>,
+    pub archive_sha256: Option<String>,
 }
 
 pub trait ReleaseSource: Send + Sync {
@@ -418,7 +421,7 @@ pub fn observed_from_metadata(
         let Some(installed) = installed.get(target.label()) else {
             continue;
         };
-        let (needs_replacement, reason) = match installed.sha256.as_deref() {
+        let (needs_replacement, reason) = match installed.archive_sha256.as_deref() {
             Some(digest) if digest == release_digest => (false, None),
             Some(_) => (true, None),
             None => (
@@ -473,7 +476,7 @@ fn dashboard_state(
             let release = metadata.targets.get(target.label())?;
             let installed = installed.get(target.label())?;
             let release_digest = release.sha256.as_deref()?;
-            match installed.sha256.as_deref() {
+            match installed.archive_sha256.as_deref() {
                 Some(digest) if digest == release_digest => None,
                 Some(_) => Some(DashboardDelta {
                     target,
@@ -652,7 +655,8 @@ mod tests {
                     target.label().to_string(),
                     InstalledBinary {
                         version: version.to_string(),
-                        sha256: Some(digest(target, version)),
+                        sha256: Some(format!("binary-{}", digest(target, version))),
+                        archive_sha256: Some(digest(target, version)),
                     },
                 )
             })
@@ -857,18 +861,25 @@ mod tests {
     }
 
     #[test]
-    fn sibling_currency_uses_inventory_digest_not_release_version() {
+    fn release_placed_binary_is_current_when_archive_digest_matches_index() {
         let target = UpgradeTarget::SubcMcp;
-        let digest = "ab".repeat(32);
+        let binary_digest = "ab".repeat(32);
+        let archive_digest = "cd".repeat(32);
+        assert_ne!(
+            binary_digest, archive_digest,
+            "fixture must keep the two hashes distinct so currency cannot silently read the binary digest"
+        );
         let mut metadata = metadata(100, "0.16.2");
-        metadata.targets.get_mut(target.label()).unwrap().sha256 = Some(digest.clone());
+        metadata.targets.get_mut(target.label()).unwrap().sha256 = Some(archive_digest.clone());
         let installed = BTreeMap::from([(
             target.label().to_string(),
             InstalledBinary {
                 // ck-subc-mcp reports its own crate version, not core's release
-                // version. Equal verified bytes must still be current.
+                // version. Equal archive bytes must still be current even when
+                // the extracted binary hashes to something else.
                 version: "0.1.0".to_string(),
-                sha256: Some(digest),
+                sha256: Some(binary_digest),
+                archive_sha256: Some(archive_digest),
             },
         )]);
 
@@ -886,7 +897,8 @@ mod tests {
             target.label().to_string(),
             InstalledBinary {
                 version: "0.1.0".to_string(),
-                sha256: Some("cd".repeat(32)),
+                sha256: Some("ab".repeat(32)),
+                archive_sha256: Some("cd".repeat(32)),
             },
         )]);
 
@@ -907,7 +919,8 @@ mod tests {
             target.label().to_string(),
             InstalledBinary {
                 version: "0.1.0".to_string(),
-                sha256: None,
+                sha256: Some("ab".repeat(32)),
+                archive_sha256: None,
             },
         )]);
 

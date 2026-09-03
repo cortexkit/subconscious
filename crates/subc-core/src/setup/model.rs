@@ -236,6 +236,11 @@ pub struct SetupObserved {
     /// absent installation from a state that is unsafe for automatic conversion.
     pub mc_detection: Option<McDetection>,
     pub detections: BTreeMap<Component, DetectionOutcome>,
+    /// Sections a live daemon reported that rescan cannot apply. Empty when
+    /// the runtime is not live or the preview returned none. The daemon keeps
+    /// the config it loaded at start for some sections; setup must restart it
+    /// before a later rescan/enable can honour the new file.
+    pub restart_required: Vec<String>,
 }
 
 impl SetupObserved {
@@ -267,6 +272,7 @@ impl SetupObserved {
             running_ck_adoption: None,
             mc_detection: Some(mc_detection),
             detections,
+            restart_required: Vec::new(),
         }
     }
 
@@ -351,6 +357,10 @@ pub enum PlanOutcome {
         component: Component,
         reason: String,
     },
+    /// A live daemon cannot apply the core configuration change by rescan.
+    CoreRestartRequired {
+        sections: Vec<String>,
+    },
 }
 
 impl PlanOutcome {
@@ -412,6 +422,11 @@ impl fmt::Display for PlanOutcome {
             Self::OwnerGatedDetection { component, reason } => {
                 write!(formatter, "owner-gated detection: {component}: {reason}")
             }
+            Self::CoreRestartRequired { sections } => write!(
+                formatter,
+                "core: configuration change requires a daemon restart ({})",
+                sections.join(", ")
+            ),
         }
     }
 }
@@ -446,6 +461,10 @@ pub enum SetupOperation {
     EnableComponent {
         component: Component,
     },
+    /// Restart the live daemon so it reloads sections rescan cannot apply.
+    RestartRuntime {
+        sections: Vec<String>,
+    },
     RegisterRuntime,
     StartRuntime,
     Validate {
@@ -468,6 +487,7 @@ impl SetupOperation {
                 | Self::AdoptRunningCk { .. }
                 | Self::RescanComponent { .. }
                 | Self::EnableComponent { .. }
+                | Self::RestartRuntime { .. }
                 | Self::RegisterRuntime
                 | Self::StartRuntime
                 | Self::DeregisterRuntime
@@ -489,6 +509,7 @@ impl SetupOperation {
             | Self::OfferConversion { .. }
             | Self::ConfirmConversion { .. }
             | Self::AdoptRunningCk { .. }
+            | Self::RestartRuntime { .. }
             | Self::RegisterRuntime
             | Self::StartRuntime
             | Self::Validate { .. }
@@ -541,6 +562,11 @@ impl fmt::Display for SetupOperation {
                 write!(formatter, "rescan {component} module entry")
             }
             Self::EnableComponent { component } => write!(formatter, "enable {component} module"),
+            Self::RestartRuntime { sections } => write!(
+                formatter,
+                "restart daemon: config sections changed that rescan cannot apply: {}",
+                sections.join(", ")
+            ),
             Self::RegisterRuntime => formatter.write_str("register the per-user daemon runtime"),
             Self::StartRuntime => formatter.write_str("start the per-user daemon runtime"),
             Self::Validate { instrument } => write!(formatter, "validate with {instrument}"),

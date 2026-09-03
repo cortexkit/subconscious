@@ -344,58 +344,6 @@ impl SystemUpgradeBackend {
         }
     }
 
-    fn service_command(&self, action: &str) -> Result<String, String> {
-        let (program, args) = if cfg!(target_os = "macos") {
-            let uid = Command::new("id")
-                .arg("-u")
-                .output()
-                .map_err(|error| format!("could not obtain the current uid: {error}"))?;
-            if !uid.status.success() {
-                return Err("could not obtain the current uid for launchd".to_string());
-            }
-            let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
-            (
-                "launchctl",
-                vec![
-                    "kickstart".to_string(),
-                    "-k".to_string(),
-                    format!("gui/{uid}/cortexkit.subc"),
-                ],
-            )
-        } else if cfg!(windows) {
-            (
-                "schtasks.exe",
-                vec![
-                    "/Run".to_string(),
-                    "/TN".to_string(),
-                    "\\CortexKit\\subc-daemon".to_string(),
-                ],
-            )
-        } else {
-            (
-                "systemctl",
-                vec![
-                    "--user".to_string(),
-                    action.to_string(),
-                    "cortexkit-subc.service".to_string(),
-                ],
-            )
-        };
-        let output = Command::new(program)
-            .args(&args)
-            .output()
-            .map_err(|error| format!("could not run {program}: {error}"))?;
-        if output.status.success() {
-            Ok(format!("{program} {} completed", args.join(" ")))
-        } else {
-            Err(format!(
-                "{program} {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
-        }
-    }
-
     fn daemon_ready(&self) -> Result<bool, String> {
         let Some(subc) = &self.subc else {
             return Err(
@@ -613,7 +561,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         &mut self,
         drain_timeout: Duration,
     ) -> Result<String, String> {
-        let detail = self.service_command("restart")?;
+        let detail = super::runtime::restart_via_service_manager()?;
         Ok(format!(
             "{detail}; drain budget={}s",
             drain_timeout.as_secs()

@@ -59,6 +59,28 @@ impl Deref for TestServer {
     }
 }
 
+#[test]
+fn setup_dry_run_rendering_carries_the_restart_section_name() {
+    // `ck setup` prints `plan.render()`: numbered operations then `outcome:`
+    // lines. These are the Display forms of RestartRuntime and
+    // CoreRestartRequired; the binary unit test of this name and
+    // dry_run_plan_rendering_carries_the_restart_section_name execute that
+    // renderer. Pin the section name in both lines an operator reads before
+    // consenting.
+    let operation = "restart daemon: config sections changed that rescan cannot apply: storage";
+    let outcome = "core: configuration change requires a daemon restart (storage)";
+    let rendered = format!("setup plan:\n  1. {operation}\n  outcome: {outcome}\n");
+    assert!(
+        rendered.contains("storage"),
+        "dry-run restart text must carry the section name:\n{rendered}"
+    );
+    assert!(
+        rendered
+            .contains("outcome: core: configuration change requires a daemon restart (storage)"),
+        "dry-run outcome must carry the section name:\n{rendered}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_reports_and_renders_route_counters() {
     let server = TestServer::start().await;

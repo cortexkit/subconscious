@@ -4045,6 +4045,58 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// `supervisor.rescan { preview: true }` as `ck module rescan --dry-run` uses
+/// it, through this binary's existing client. Setup must not shell out to `ck`:
+/// that would recurse, and an older daemon that ignores `preview` would apply a
+/// real rescan. Absence of `preview: true` in the reply is therefore a failure.
+pub(crate) fn preview_rescan_restart_required() -> Result<Vec<String>, String> {
+    std::thread::Builder::new()
+        .name("ck-setup-rescan-preview".into())
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("could not start runtime for rescan preview: {error}"))?
+                .block_on(preview_rescan_restart_required_async())
+        })
+        .map_err(|error| format!("could not spawn rescan preview: {error}"))?
+        .join()
+        .map_err(|_| "rescan preview thread panicked".to_string())?
+}
+
+async fn preview_rescan_restart_required_async() -> Result<Vec<String>, String> {
+    let resolved = discover_connection_file(None).map_err(|error| error.to_string())?;
+    let mut client = CkClient::connect(resolved)
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = client
+        .rpc_value(ClientControlRequest::SupervisorRescan { preview: true })
+        .await
+        .map_err(|error| error.to_string())?;
+    let honoured = result
+        .get("preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !honoured {
+        return Err(
+            "this daemon does not support `rescan --dry-run` and IGNORED the flag: it may \
+             have applied a real reconciliation just now. Compare `ck module list` against \
+             your config, and upgrade the daemon before relying on setup to preview a restart."
+                .to_string(),
+        );
+    }
+    Ok(result
+        .get("restart_required")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), CkError> {
     let mut backend =
         setup::SetupBackend::current(program.to_path_buf()).map_err(CkError::Message)?;
@@ -4151,13 +4203,7 @@ async fn upgrade_command(
 }
 
 fn print_setup_plan(plan: &setup::SetupPlan) {
-    println!("setup plan:");
-    for (index, operation) in plan.operations.iter().enumerate() {
-        println!("  {}. {operation}", index + 1);
-    }
-    for outcome in &plan.outcomes {
-        println!("  outcome: {outcome}");
-    }
+    print!("{}", plan.render());
 }
 
 fn print_upgrade_plan(plan: &setup::UpgradePlan) {
@@ -5898,6 +5944,31 @@ mod tests {
         ));
         assert!(top_help().contains("setup"));
         assert!(top_help().contains("upgrade"));
+    }
+
+    #[test]
+    fn setup_dry_run_rendering_carries_the_restart_section_name() {
+        let plan = setup::SetupPlan {
+            operations: vec![setup::SetupOperation::RestartRuntime {
+                sections: vec!["storage".to_string()],
+            }],
+            outcomes: vec![setup::PlanOutcome::CoreRestartRequired {
+                sections: vec!["storage".to_string()],
+            }],
+        };
+        let rendered = plan.render();
+        assert!(
+            rendered.contains(
+                "restart daemon: config sections changed that rescan cannot apply: storage"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "outcome: core: configuration change requires a daemon restart (storage)"
+            ),
+            "{rendered}"
+        );
     }
 
     fn triage_fixture_dir(name: &str) -> TestTempDir {

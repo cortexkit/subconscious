@@ -428,6 +428,81 @@ fn platform_binary(name: &str) -> String {
     }
 }
 
+/// Kill-and-restart the per-user daemon through the platform service manager.
+///
+/// The daemon keeps the config it loaded at start for some sections; rescan
+/// reports those as restart_required and cannot apply them. Upgrade uses this
+/// after replacing the daemon binary; setup uses it when a live daemon must
+/// pick up a restart-required configuration change. One verb table so the two
+/// callers cannot drift.
+pub fn restart_via_service_manager() -> Result<String, String> {
+    restart_via_service_manager_on(RuntimePlatform::current())
+}
+
+fn restart_via_service_manager_on(platform: RuntimePlatform) -> Result<String, String> {
+    let mut details = Vec::new();
+    for (index, (program, args)) in restart_commands(platform).into_iter().enumerate() {
+        let output = Command::new(&program)
+            .args(&args)
+            .output()
+            .map_err(|error| format!("could not run {program}: {error}"))?;
+        if output.status.success() {
+            details.push(format!("{program} {} completed", args.join(" ")));
+            continue;
+        }
+        // Windows stop is best-effort: a task that is already stopped still
+        // needs /Run, and /End failing there must not block the restart.
+        if platform == RuntimePlatform::Windows && index == 0 {
+            continue;
+        }
+        return Err(format!(
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(details.join("; "))
+}
+
+fn restart_commands(platform: RuntimePlatform) -> Vec<(String, Vec<String>)> {
+    match platform {
+        RuntimePlatform::Macos => vec![(
+            "launchctl".to_string(),
+            vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                format!("gui/{}/{}", current_uid(), platform.identifier()),
+            ],
+        )],
+        RuntimePlatform::Linux => vec![(
+            "systemctl".to_string(),
+            vec![
+                "--user".to_string(),
+                "restart".to_string(),
+                platform.identifier().to_string(),
+            ],
+        )],
+        RuntimePlatform::Windows => vec![
+            (
+                "schtasks.exe".to_string(),
+                vec![
+                    "/End".to_string(),
+                    "/TN".to_string(),
+                    platform.identifier().to_string(),
+                ],
+            ),
+            (
+                "schtasks.exe".to_string(),
+                vec![
+                    "/Run".to_string(),
+                    "/TN".to_string(),
+                    platform.identifier().to_string(),
+                ],
+            ),
+        ],
+    }
+}
+
 /// The uid whose launchd GUI domain owns the agent. Read from the kernel:
 /// `$UID` is a shell variable that bash and zsh set for scripts and do not
 /// export, so a real `ck` process never sees it, and the old fallback of 0
@@ -787,5 +862,22 @@ mod tests {
             }
             assert!(inventory.owns_path("runtime-definition", &paths.definition));
         }
+    }
+
+    #[test]
+    fn restart_verbs_match_the_upgrade_daemon_target() {
+        let macos = restart_commands(RuntimePlatform::Macos);
+        assert_eq!(macos[0].0, "launchctl");
+        assert_eq!(macos[0].1[0], "kickstart");
+        assert_eq!(macos[0].1[1], "-k");
+        let linux = restart_commands(RuntimePlatform::Linux);
+        assert_eq!(linux[0].0, "systemctl");
+        assert_eq!(
+            linux[0].1[..2],
+            ["--user".to_string(), "restart".to_string()]
+        );
+        let windows = restart_commands(RuntimePlatform::Windows);
+        assert_eq!(windows[0].1[0], "/End");
+        assert_eq!(windows[1].1[0], "/Run");
     }
 }

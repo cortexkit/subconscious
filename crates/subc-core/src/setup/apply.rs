@@ -16,7 +16,7 @@ use super::{
         Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
         RuntimeState, SetupObserved, SetupOperation, SetupRequest,
     },
-    planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
+    planner::{collect_restart_required, execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
     runtime::{self, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
     uninstall,
     validation::{self, Validator},
@@ -176,6 +176,22 @@ impl SetupBackend {
         // AFT automatic detection is disabled for alpha until its owner supplies
         // a marker contract with false-positive classification rules.
         observed.detections.remove(&Component::Aft);
+        let core_config_would_change = matches!(
+            config::plan_component_with_key(
+                &self.paths.config_path,
+                Component::Core,
+                &self.paths.binary_home,
+                claustrum_key_path,
+            ),
+            Ok(Some(_)),
+        );
+        // A live daemon still holds the config it loaded at start. When core
+        // setup would change that file, ask what a rescan would need so dry-run
+        // can show the restart before consent, and so apply can plan it.
+        observed.restart_required =
+            collect_restart_required(self.runtime_status.live, core_config_would_change, || {
+                crate::preview_rescan_restart_required()
+            })?;
         Ok(observed)
     }
 
@@ -348,6 +364,14 @@ impl SetupBackend {
             Err(format!("ck auth bootstrap failed with {status}"))
         }
     }
+
+    fn restart_runtime(&mut self, sections: &[String]) -> Result<(), String> {
+        runtime::restart_via_service_manager()?;
+        let mut validator = CkValidator {
+            executable: &self.executable,
+        };
+        validation::wait_for_daemon(&mut validator, sections)
+    }
 }
 
 impl SetupExecutor for SetupBackend {
@@ -406,6 +430,7 @@ impl SetupExecutor for SetupBackend {
                     .module_id()
                     .expect("only modules are enabled by setup"),
             ]),
+            SetupOperation::RestartRuntime { sections } => self.restart_runtime(sections),
             SetupOperation::RegisterRuntime => runtime::ensure(
                 self.platform,
                 &self.paths.runtime_paths,
@@ -473,6 +498,14 @@ impl SetupExecutor for SetupBackend {
                 .remove_owned_path("configuration", &self.paths.config_path);
         }
         self.inventory.save()
+    }
+
+    fn runtime_was_live(&self) -> bool {
+        self.runtime_status.live
+    }
+
+    fn preview_restart_required(&mut self) -> Result<Vec<String>, Self::Error> {
+        crate::preview_rescan_restart_required()
     }
 }
 

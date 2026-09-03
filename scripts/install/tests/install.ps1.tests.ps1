@@ -101,6 +101,14 @@ Describe 'native ck installer' {
         Test-Path -LiteralPath $destination | Should -BeTrue
         Test-Path -LiteralPath $manifest | Should -BeTrue
         Test-Path -LiteralPath $setupMarker | Should -BeFalse
+        # Two digests of two files, asserted by value: the archive the index
+        # carried (currency) and the placed binary's bytes (ownership).
+        $placement = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).mutations |
+            Where-Object { $_.kind -eq 'binary-placement' }
+        $binaryDigest = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        $archiveDigest | Should -Not -Be $binaryDigest
+        $placement.archive_sha256 | Should -Be $archiveDigest
+        $placement.sha256 | Should -Be $binaryDigest
     }
 
     It 'installs the arm64 archive on Windows on ARM and records the tuple' {

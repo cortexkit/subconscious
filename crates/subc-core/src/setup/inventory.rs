@@ -130,6 +130,34 @@ impl Inventory {
         Ok(())
     }
 
+    /// Drop a field from an owned entry. Used when a rollback restores a row
+    /// that never recorded an archive digest.
+    pub fn remove_owned_string(
+        &mut self,
+        kind: &str,
+        path: &Path,
+        key: &str,
+    ) -> Result<(), String> {
+        let path_text = path.to_string_lossy();
+        let entry = self.mutations_mut().iter_mut().find(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some(kind)
+                && entry.get("path").and_then(Value::as_str) == Some(path_text.as_ref())
+        });
+        let Some(entry) = entry else {
+            return Err(format!(
+                "inventory has no {kind} entry for managed path {}",
+                path.display()
+            ));
+        };
+        let object = entry
+            .as_object_mut()
+            .expect("inventory mutation entries are objects written by record");
+        if object.remove(key).is_some() {
+            self.changed = true;
+        }
+        Ok(())
+    }
+
     pub fn save(&mut self) -> Result<(), String> {
         if !self.changed {
             return Ok(());

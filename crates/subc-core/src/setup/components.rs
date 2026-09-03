@@ -15,13 +15,26 @@ use super::{
     release_index::{self, IndexAsset, IndexRefusal, ReleaseIndex},
 };
 
+/// Digests of the two files involved in a managed placement.
+///
+/// `binary_sha256` is the extracted executable on disk and is the ownership
+/// proof uninstall checks before deleting. `archive_sha256` is the zip the
+/// binary was extracted from and is what currency compares to the release
+/// index asset digest. They are hashes of different files and must not be
+/// substituted for each other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementDigests {
+    pub binary_sha256: String,
+    pub archive_sha256: String,
+}
+
 pub trait ArtifactSource {
     fn install(
         &mut self,
         component: Component,
         binary: &str,
         destination: &Path,
-    ) -> Result<String, String>;
+    ) -> Result<PlacementDigests, String>;
 
     /// What `binary` of `component` must prove on its `--version` line.
     fn acceptance(&mut self, component: Component, binary: &str) -> Result<Acceptance, String>;
@@ -141,7 +154,7 @@ impl ArtifactSource for ReleaseArtifactSource {
         component: Component,
         binary: &str,
         destination: &Path,
-    ) -> Result<String, String> {
+    ) -> Result<PlacementDigests, String> {
         let binary_name = platform_binary(binary);
         let archive_name = format!("{}-{}.zip", binary, self.target.label());
         let asset = self.lookup_asset(component, binary)?;
@@ -213,9 +226,12 @@ impl ArtifactSource for ReleaseArtifactSource {
                 destination.display()
             )
         })?;
-        let digest = digest_file(destination)?;
+        let binary_sha256 = digest_file(destination)?;
         let _ = fs::remove_dir_all(temp);
-        Ok(digest)
+        Ok(PlacementDigests {
+            binary_sha256,
+            archive_sha256: expected,
+        })
     }
 
     fn acceptance(&mut self, component: Component, binary: &str) -> Result<Acceptance, String> {
@@ -322,7 +338,7 @@ pub fn install_component<S: ArtifactSource>(
                 destination.display()
             ));
         }
-        let digest = source.install(component, binary, &destination)?;
+        let digests = source.install(component, binary, &destination)?;
         // Acceptance runs between placement and the inventory record. If it
         // refuses, the placed file must not survive: it is owned by nobody, so
         // the next `ck setup` would refuse it as a foreign binary at the
@@ -347,10 +363,14 @@ pub fn install_component<S: ArtifactSource>(
             "component".to_string(),
             Value::String(component.label().to_string()),
         );
-        fields.insert("sha256".to_string(), Value::String(digest));
-        // Version text helps operators identify an update, but the digest is the
-        // only authority for currency because sibling binaries may not share the
-        // source release's crate version.
+        fields.insert("sha256".to_string(), Value::String(digests.binary_sha256));
+        fields.insert(
+            "archive_sha256".to_string(),
+            Value::String(digests.archive_sha256),
+        );
+        // Version text helps operators identify an update, but currency compares
+        // the archive digest to the index asset. The extracted-binary digest is
+        // a different file and is kept as the ownership proof for uninstall.
         if let Ok(version) = super::upgrade::binary_version(&destination) {
             fields.insert("version".to_string(), Value::String(version));
         }
@@ -576,7 +596,7 @@ mod tests {
             _component: Component,
             binary: &str,
             destination: &Path,
-        ) -> Result<String, String> {
+        ) -> Result<PlacementDigests, String> {
             fs::write(destination, format!("#!/bin/sh\necho {binary} 1.2.3\n"))
                 .map_err(|error| error.to_string())?;
             #[cfg(unix)]
@@ -585,7 +605,7 @@ mod tests {
                 fs::set_permissions(destination, fs::Permissions::from_mode(0o755))
                     .map_err(|error| error.to_string())?;
             }
-            digest_file(destination)
+            fake_placement_digests(destination)
         }
 
         fn acceptance(
@@ -612,6 +632,14 @@ mod tests {
 
     fn fixture_dir(name: &str) -> TestTempDir {
         TestTempDir::new(name)
+    }
+
+    fn fake_placement_digests(destination: &Path) -> Result<PlacementDigests, String> {
+        Ok(PlacementDigests {
+            binary_sha256: digest_file(destination)?,
+            // Distinct from the extracted bytes so tests cannot confuse the two.
+            archive_sha256: format!("{:x}", Sha256::digest(b"fake-archive")),
+        })
     }
 
     /// The program table and the per-target binary table encode one fact
@@ -656,6 +684,18 @@ mod tests {
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
         assert_eq!(inventory.paths_for_kind("managed-binary").len(), 2);
+        let placed = binary_home.join(platform_binary("ck-subc"));
+        let entry = inventory
+            .entry_for_path("managed-binary", &placed)
+            .expect("owned ck-subc");
+        let binary = entry.get("sha256").and_then(Value::as_str);
+        let archive = entry.get("archive_sha256").and_then(Value::as_str);
+        assert!(binary.is_some(), "ownership digest of the extracted binary");
+        assert!(
+            archive.is_some(),
+            "archive digest currency compares to the index"
+        );
+        assert_ne!(binary, archive, "the two hashes are of two different files");
     }
 
     /// A source whose placed bytes never satisfy acceptance: the binary says
@@ -668,7 +708,7 @@ mod tests {
             component: Component,
             binary: &str,
             destination: &Path,
-        ) -> Result<String, String> {
+        ) -> Result<PlacementDigests, String> {
             FakeSource.install(component, binary, destination)
         }
 
@@ -738,7 +778,7 @@ mod tests {
             component: Component,
             binary: &str,
             destination: &Path,
-        ) -> Result<String, String> {
+        ) -> Result<PlacementDigests, String> {
             FakeSource.install(component, binary, destination)
         }
 

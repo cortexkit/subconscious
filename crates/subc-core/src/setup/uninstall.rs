@@ -165,4 +165,47 @@ mod tests {
             .any(|line| line.contains("configuration")));
         assert!(report.retained.iter().any(|line| line.contains("store")));
     }
+
+    #[test]
+    fn uninstall_retains_modified_bytes_even_when_archive_digest_matches() {
+        let root = fixture_dir("archive-digest-is-not-ownership");
+        let managed = root.join("ck-subc");
+        fs::write(&managed, "placed-bytes").expect("managed binary");
+        let runtime_paths = RuntimePaths {
+            definition: root.join("unit"),
+            daemon: managed.clone(),
+        };
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        let on_disk = digest_file(&managed).expect("on-disk digest");
+        let mut fields = Map::new();
+        fields.insert(
+            "sha256".to_string(),
+            serde_json::Value::String("ff".repeat(32)),
+        );
+        fields.insert(
+            "archive_sha256".to_string(),
+            serde_json::Value::String(on_disk),
+        );
+        inventory.record("managed-binary", &managed, fields);
+
+        let report = uninstall(
+            RuntimePlatform::Linux,
+            &runtime_paths,
+            &mut SuccessfulRunner,
+            &mut inventory,
+            &root.join("subc.jsonc"),
+            &[],
+        )
+        .expect("uninstall");
+
+        assert!(
+            managed.exists(),
+            "ownership uses the extracted-binary digest; a matching archive digest must not delete changed bytes"
+        );
+        assert!(report
+            .retained
+            .iter()
+            .any(|line| line.contains("modified managed destination retained")));
+    }
 }

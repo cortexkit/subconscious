@@ -38,8 +38,8 @@ pub struct ManagedUpgradeTarget {
     pub destination: PathBuf,
     /// Display-only version text from the binary or daemon catalog.
     pub installed_version: String,
-    /// Digest recorded at placement. Currency is undecidable without it.
-    pub installed_sha256: Option<String>,
+    /// Archive digest recorded at placement. Currency is undecidable without it.
+    pub installed_archive_sha256: Option<String>,
 }
 
 /// Load the ownership record from the per-user data directory before discovery.
@@ -69,9 +69,14 @@ pub fn dashboard_installed_binaries() -> Result<BTreeMap<String, InstalledBinary
         let version =
             inventory_string(&inventory, &path, "version").unwrap_or_else(|| "unknown".to_string());
         let sha256 = inventory_string(&inventory, &path, "sha256");
+        let archive_sha256 = inventory_string(&inventory, &path, "archive_sha256");
         installed.insert(
             target.label().to_string(),
-            InstalledBinary { version, sha256 },
+            InstalledBinary {
+                version,
+                sha256,
+                archive_sha256,
+            },
         );
     }
     Ok(installed)
@@ -161,12 +166,12 @@ pub fn discover_managed_upgrade_targets(
                 .clone(),
             _ => binary_version(&destination)?,
         };
-        let installed_sha256 = inventory_string(inventory, &destination, "sha256");
+        let installed_archive_sha256 = inventory_string(inventory, &destination, "archive_sha256");
         targets.push(ManagedUpgradeTarget {
             target,
             destination,
             installed_version,
-            installed_sha256,
+            installed_archive_sha256,
         });
     }
     Ok(targets)
@@ -184,7 +189,8 @@ pub fn observed_upgrade_targets(
                 item.target.label().to_string(),
                 InstalledBinary {
                     version: item.installed_version.clone(),
-                    sha256: item.installed_sha256.clone(),
+                    sha256: None,
+                    archive_sha256: item.installed_archive_sha256.clone(),
                 },
             )
         })
@@ -213,6 +219,7 @@ pub struct SystemUpgradeBackend {
     inventory: Inventory,
     prepared: BTreeMap<String, PreparedUpgradeAsset>,
     rollback_paths: BTreeMap<String, PathBuf>,
+    rollback_archive_sha256: BTreeMap<String, Option<String>>,
     expected_versions: BTreeMap<String, String>,
 }
 
@@ -255,6 +262,7 @@ impl SystemUpgradeBackend {
             inventory,
             prepared: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
+            rollback_archive_sha256: BTreeMap::new(),
             expected_versions,
         })
     }
@@ -391,11 +399,13 @@ impl SystemUpgradeBackend {
         &mut self,
         target: UpgradeTarget,
         destination: &Path,
+        archive_sha256: Option<&str>,
     ) -> Result<(), String> {
         let digest = sha256_file(destination)?;
-        // A replacement changes the inode, so retain both its proof digest and
-        // its self-reported version for the next dashboard without treating the
-        // latter as an update decision.
+        // A replacement changes the inode, so retain the extracted-binary
+        // ownership digest, the archive digest currency compares to the index,
+        // and the self-reported version for the next dashboard. Version text is
+        // not an update decision.
         let version = binary_version(destination).ok();
         let kinds = ["managed-binary", "binary-placement"]
             .into_iter()
@@ -410,6 +420,17 @@ impl SystemUpgradeBackend {
         for kind in kinds {
             self.inventory
                 .update_owned_string(kind, destination, "sha256", digest.clone())?;
+            match archive_sha256 {
+                Some(archive) => self.inventory.update_owned_string(
+                    kind,
+                    destination,
+                    "archive_sha256",
+                    archive.to_string(),
+                )?,
+                None => self
+                    .inventory
+                    .remove_owned_string(kind, destination, "archive_sha256")?,
+            }
             if let Some(version) = &version {
                 self.inventory.update_owned_string(
                     kind,
@@ -451,6 +472,10 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         })?;
         self.rollback_paths
             .insert(target.label().to_string(), rollback);
+        self.rollback_archive_sha256.insert(
+            target.label().to_string(),
+            inventory_string(&self.inventory, &destination, "archive_sha256"),
+        );
         Ok(format!("rollback copy created; prior inode={prior_inode}"))
     }
 
@@ -464,6 +489,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             let result = self_update::replace_verified_candidate(
                 &destination,
                 &prepared.candidate,
+                &prepared.archive_sha256,
                 &mut self.inventory,
             );
             prepared.cleanup();
@@ -496,8 +522,9 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 destination.display()
             )
         })?;
+        let archive_sha256 = prepared.archive_sha256.clone();
         prepared.cleanup();
-        self.record_replacement_digest(target, &destination)?;
+        self.record_replacement_digest(target, &destination, Some(&archive_sha256))?;
         Ok(format!(
             "destination replaced; inode={}",
             destination_inode(&destination)?
@@ -650,7 +677,11 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 destination.display()
             )
         })?;
-        self.record_replacement_digest(target, &destination)?;
+        let previous_archive = self
+            .rollback_archive_sha256
+            .remove(target.label())
+            .flatten();
+        self.record_replacement_digest(target, &destination, previous_archive.as_deref())?;
         Ok(format!(
             "accepted; restored prior inode={}",
             destination_inode(&destination)?
@@ -721,7 +752,7 @@ fn process_id() -> u32 {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use serde_json::Map;
+    use serde_json::{Map, Value};
 
     use super::*;
     #[cfg(unix)]
@@ -781,13 +812,45 @@ mod tests {
         assert_eq!(targets[3].installed_version, "1.0.0");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn discovery_reads_archive_digest_for_currency_not_binary_digest() {
+        let root = fixture_dir("currency-digest");
+        let ck = root.join("ck");
+        let mcp = root.join("ck-subc-mcp");
+        version_binary(&ck, "1.0.0");
+        version_binary(&mcp, "0.1.0");
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        let mut fields = Map::new();
+        fields.insert("sha256".to_string(), Value::String("ab".repeat(32)));
+        fields.insert("archive_sha256".to_string(), Value::String("cd".repeat(32)));
+        inventory.record("managed-binary", &mcp, fields);
+
+        let targets = discover_managed_upgrade_targets(&inventory, &ck, None).expect("discover");
+        let mcp_target = targets
+            .iter()
+            .find(|item| item.target == UpgradeTarget::SubcMcp)
+            .expect("ck-subc-mcp");
+        let archive = "cd".repeat(32);
+        let binary = "ab".repeat(32);
+        assert_eq!(
+            mcp_target.installed_archive_sha256.as_deref(),
+            Some(archive.as_str())
+        );
+        assert_ne!(
+            mcp_target.installed_archive_sha256.as_deref(),
+            Some(binary.as_str())
+        );
+    }
+
     #[test]
     fn missing_aft_archive_is_typed_release_incomplete() {
         let target = ManagedUpgradeTarget {
             target: UpgradeTarget::Aft,
             destination: PathBuf::from("/managed/ck-aft"),
             installed_version: "1.0.0".to_string(),
-            installed_sha256: Some("ab".repeat(32)),
+            installed_archive_sha256: Some("ab".repeat(32)),
         };
         let mut metadata = UpdateMetadata {
             format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,

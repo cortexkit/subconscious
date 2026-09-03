@@ -80,6 +80,8 @@ impl std::error::Error for UpgradeAssetError {}
 pub struct PreparedUpgradeAsset {
     pub names: UpgradeAssetNames,
     pub candidate: PathBuf,
+    /// Digest of the verified zip. Currency records this, not the extracted binary.
+    pub archive_sha256: String,
     workspace: PathBuf,
 }
 
@@ -173,6 +175,7 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
     Ok(PreparedUpgradeAsset {
         names,
         candidate,
+        archive_sha256: expected,
         workspace,
     })
 }

@@ -96,6 +96,7 @@ function Write-InstallerManifest {
         [Parameter(Mandatory = $true)][string]$Manifest,
         [Parameter(Mandatory = $true)][string]$Binary,
         [Parameter(Mandatory = $true)][string]$BinaryDigest,
+        [Parameter(Mandatory = $true)][string]$ArchiveDigest,
         [Parameter(Mandatory = $true)][string]$BinDir,
         [Parameter(Mandatory = $true)][string]$Arch
     )
@@ -108,7 +109,10 @@ function Write-InstallerManifest {
             [ordered]@{
                 kind = 'binary-placement'
                 path = $Binary
+                # The binary's bytes (ownership proof) and the archive it came
+                # from (what currency checks compare against the index).
                 sha256 = $BinaryDigest
+                archive_sha256 = $ArchiveDigest
             },
             [ordered]@{
                 kind = 'user-path-registry'
@@ -238,7 +242,7 @@ try {
     }
 
     Ensure-UserPath -BinDir $binDir
-    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -BinDir $binDir -Arch $arch
+    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -ArchiveDigest $expectedDigest -BinDir $binDir -Arch $arch
     Write-Output 'Next: ck setup'
 }
 finally {

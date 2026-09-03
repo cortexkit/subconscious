@@ -133,6 +133,15 @@ grep -Fq 'Next: ck setup' "$linux_output" || fail 'installer did not print the s
 [[ -x "$linux_home/.local/share/cortexkit/bin/ck" ]] || fail 'installer did not place ck'
 [[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'PATH block was not recorded exactly once'
 grep -Fq 'installer-manifest.json' "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'installer manifest did not record itself'
+# The two digests must be the two different files: the archive digest the
+# index carried (currency) and the extracted binary's own bytes (ownership).
+# Asserting both by value, not just presence, is what catches a copy of one
+# into the other.
+archive_digest=$(printf 'fixture archive\n' | shasum -a 256 | awk '{print $1}')
+binary_digest=$(shasum -a 256 "$linux_home/.local/share/cortexkit/bin/ck" | awk '{print $1}')
+[[ "$archive_digest" != "$binary_digest" ]] || fail 'fixture cannot discriminate: archive and binary digests coincide'
+grep -Fq "\"archive_sha256\": \"$archive_digest\"" "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'manifest did not record the archive digest the index carried'
+grep -Fq "\"sha256\": \"$binary_digest\"" "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'manifest did not record the placed binary digest'
 
 rerun_output="$test_root/linux-rerun-output"
 run_installer "$linux_home" "$rerun_output" \

@@ -160,15 +160,22 @@ ensure_profile_path() {
   fi
 }
 
+# Two digests, two meanings: `sha256` is the placed binary's bytes (the
+# ownership proof uninstall compares before deleting), `archive_sha256` is
+# the release archive the binary came from (the digest the index carries,
+# which currency checks compare against). Recording only the first made
+# every release-placed binary read as an available update forever.
 write_manifest() {
   local manifest="$1"
   local binary="$2"
   local binary_digest="$3"
   local profile="$4"
+  local archive_digest="$5"
   local manifest_tmp
   local escaped_manifest
   local escaped_binary
   local escaped_digest
+  local escaped_archive_digest
   local escaped_profile
 
   if ! manifest_tmp=$(mktemp "${manifest}.XXXXXX"); then
@@ -178,6 +185,7 @@ write_manifest() {
   escaped_manifest=$(json_escape "$manifest")
   escaped_binary=$(json_escape "$binary")
   escaped_digest=$(json_escape "$binary_digest")
+  escaped_archive_digest=$(json_escape "$archive_digest")
   escaped_profile=$(json_escape "$profile")
   if ! cat >"$manifest_tmp" <<EOF
 {
@@ -188,7 +196,8 @@ write_manifest() {
     {
       "kind": "binary-placement",
       "path": "$escaped_binary",
-      "sha256": "$escaped_digest"
+      "sha256": "$escaped_digest",
+      "archive_sha256": "$escaped_archive_digest"
     },
     {
       "kind": "shell-profile-path",
@@ -400,6 +409,6 @@ export PATH=\"\$HOME/.local/share/cortexkit/bin:\$PATH\"
 $PATH_BLOCK_END"
 fi
 ensure_profile_path "$profile_path" "$path_block"
-write_manifest "$manifest" "$destination" "$candidate_digest" "$profile_path"
+write_manifest "$manifest" "$destination" "$candidate_digest" "$profile_path" "$expected_digest"
 
 printf 'Next: ck setup\n'

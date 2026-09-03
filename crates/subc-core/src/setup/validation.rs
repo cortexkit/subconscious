@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::model::Component;
@@ -19,21 +18,29 @@ pub trait Validator {
 /// connection file before `ck daemon triage` can find anything but the
 /// stale file of a previous run. Same contract as post-upgrade verification.
 pub const DAEMON_SETTLE_DEADLINE: Duration = Duration::from_secs(15);
-const DAEMON_SETTLE_PAUSE: Duration = Duration::from_millis(500);
+
+/// How long a module's health probe may wait after `ck module start`. The
+/// start acknowledges the spawn, not the registration: the module has to
+/// execute (first exec on macOS can carry an assessment toll), connect, and
+/// send HELLO before `ck health <module>` sees anything but
+/// `unknown_module`. Longer than the daemon's budget because a module's
+/// HELLO trails its spawn by more than a daemon's bind trails its exec.
+pub const MODULE_SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+const SETTLE_PAUSE: Duration = Duration::from_millis(500);
 
 /// Existing ck interfaces are the post-setup evidence. Runtime registration and
 /// current liveness are intentionally validated separately by the runtime layer.
 ///
-/// `configured_modules` is the number of modules the config declares AFTER
-/// this setup's configuration step — read from the config, not from the
-/// request, because a later `ck setup aft` selects one component while the
-/// config already holds others, and a bare `ck setup` selects core alone
-/// while the config may hold many.
+/// `ck fleet lint` is deliberately not a setup validator: it is the OFFLINE
+/// capability linter, examining each configured binary through `--manifest`,
+/// and a module binary that does not emit one (aft does not) is
+/// `manifest_unparsable` to it — which its vacuity floor correctly refuses
+/// to call clean. For a running install the daemon's live catalog is the
+/// authority, and `ck health <module>` reading that catalog is the evidence
+/// that the module registered and answers.
 pub fn validate_selected<V: Validator>(
     validator: &mut V,
     selected: &[Component],
-    config_path: &Path,
-    configured_modules: usize,
 ) -> Result<(), String> {
     require_settled(
         validator,
@@ -50,45 +57,22 @@ pub fn validate_selected<V: Validator>(
             Component::Claustrum => vec!["health".to_string(), "claustrum".to_string()],
             Component::Synapse => vec!["health".to_string(), "synapse".to_string()],
         };
-        require(validator, "ck", &args)?;
+        // Core's `ck health` reads the daemon, already settled above; a
+        // module's probe settles on its own registration.
+        let deadline = match component {
+            Component::Core => Duration::ZERO,
+            _ => MODULE_SETTLE_DEADLINE,
+        };
+        require_settled(validator, "ck", &args, deadline)?;
     }
-    // `ck fleet lint` refuses to report clean over an empty module set (its
-    // vacuity floor, exit 2), and that refusal is correct for the operator
-    // verb. But core alone is a valid end state — a daemon with no modules
-    // is what `ck setup` with no extras produces by design — so asking the
-    // lint to bless it asks a question the lint cannot answer. Skip it by
-    // name and reason; never silently.
-    if configured_modules == 0 {
-        println!(
-            "validation: ck fleet lint skipped — no modules configured yet (core-only install); \
-             it runs on the first `ck setup <module>`"
-        );
-        return Ok(());
-    }
-    require(
-        validator,
-        "ck",
-        &[
-            "fleet".to_string(),
-            "lint".to_string(),
-            config_path.to_string_lossy().into_owned(),
-        ],
-    )
+    Ok(())
 }
 
 pub const MCP_HARNESS_SNIPPET: &str = "MCP harness snippet:\n  ck-subc-mcp --harness ck";
 
-fn require<V: Validator>(validator: &mut V, label: &str, args: &[String]) -> Result<(), String> {
-    if validator.run(label, args)? {
-        Ok(())
-    } else {
-        Err(format!("validation failed: {label} {}", args.join(" ")))
-    }
-}
-
-/// Like `require`, but a failing probe is retried until `deadline` elapses.
-/// The last attempt's verdict is the verdict: a daemon that never comes up
-/// fails exactly as before, just later.
+/// A failing probe is retried until `deadline` elapses (a zero deadline is
+/// a single read). The last attempt's verdict is the verdict: a daemon or
+/// module that never comes up fails, just later.
 fn require_settled<V: Validator>(
     validator: &mut V,
     label: &str,
@@ -107,7 +91,7 @@ fn require_settled<V: Validator>(
                 args.join(" ")
             ));
         }
-        validator.settle_pause(DAEMON_SETTLE_PAUSE);
+        validator.settle_pause(SETTLE_PAUSE);
     }
 }
 
@@ -127,24 +111,24 @@ mod tests {
     }
 
     #[test]
-    fn validation_uses_triage_health_and_fleet_lint_interfaces() {
+    fn validation_uses_triage_and_health_and_never_fleet_lint() {
         let mut validator = RecordingValidator::default();
-        validate_selected(
-            &mut validator,
-            &[Component::Core, Component::Aft],
-            Path::new("/config/subc.jsonc"),
-            1,
-        )
-        .expect("healthy fixture");
+        validate_selected(&mut validator, &[Component::Core, Component::Aft])
+            .expect("healthy fixture");
         assert_eq!(validator.calls[0], ["daemon", "triage"]);
         assert!(validator
             .calls
             .contains(&vec!["health".to_string(), "aft".to_string()]));
-        assert!(validator
-            .calls
-            .last()
-            .expect("fleet lint")
-            .starts_with(&["fleet".to_string(), "lint".to_string()]));
+        // The offline linter cannot examine a module binary that does not
+        // emit --manifest; the live catalog is the authority for an install.
+        assert!(
+            !validator
+                .calls
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("fleet")),
+            "fleet lint is not a setup validator: {:?}",
+            validator.calls
+        );
     }
 
     /// A daemon that answers on its Nth probe. Pauses are counted, never
@@ -179,7 +163,7 @@ mod tests {
             triage_probes: 0,
             pauses: 0,
         };
-        validate_selected(&mut daemon, &[Component::Core], Path::new("/c"), 0).expect("settles");
+        validate_selected(&mut daemon, &[Component::Core]).expect("settles");
         assert_eq!(daemon.triage_probes, 4);
         assert_eq!(
             daemon.pauses, 3,
@@ -187,34 +171,53 @@ mod tests {
         );
     }
 
-    /// Tenth finding of the macOS operator drive: a core-only install failed
-    /// validation on `ck fleet lint`'s own vacuity floor ("examined 0 of 0
-    /// configured", exit 2). The floor is right for the lint; the validation
-    /// was wrong to ask it about a config with no modules. The gate reads the
-    /// configured count, not the selection.
-    #[test]
-    fn fleet_lint_is_skipped_by_name_for_a_core_only_config_and_run_once_a_module_exists() {
-        let mut none = RecordingValidator::default();
-        validate_selected(&mut none, &[Component::Core], Path::new("/c"), 0).expect("core-only");
-        assert!(
-            !none
-                .calls
-                .iter()
-                .any(|args| args.first().map(String::as_str) == Some("fleet")),
-            "lint must not run over zero modules: {:?}",
-            none.calls
-        );
+    /// A module that registers on its Nth health probe; the daemon and core
+    /// answer at once. Distinguishes the module settle from the daemon's.
+    struct LateModule {
+        registers_on_probe: usize,
+        module_probes: usize,
+        core_probes: usize,
+        pauses: usize,
+    }
+    impl Validator for LateModule {
+        fn run(&mut self, _label: &str, args: &[String]) -> Result<bool, String> {
+            match (args.first().map(String::as_str), args.get(1)) {
+                (Some("health"), Some(_)) => {
+                    self.module_probes += 1;
+                    Ok(self.module_probes >= self.registers_on_probe)
+                }
+                (Some("health"), None) => {
+                    self.core_probes += 1;
+                    Ok(true)
+                }
+                _ => Ok(true),
+            }
+        }
+        fn settle_pause(&mut self, _pause: Duration) {
+            self.pauses += 1;
+        }
+    }
 
-        // Selection is core alone, but the config already holds a module
-        // (this is a re-run on an installed host): the lint must run.
-        let mut some = RecordingValidator::default();
-        validate_selected(&mut some, &[Component::Core], Path::new("/c"), 1).expect("with modules");
-        assert!(
-            some.calls
-                .iter()
-                .any(|args| args.first().map(String::as_str) == Some("fleet")),
-            "lint must run once a module is configured: {:?}",
-            some.calls
+    /// Twelfth finding of the macOS operator drive: `ck health aft` ran the
+    /// instant `ck module start` acknowledged and read `unknown_module` —
+    /// the module had not sent HELLO yet (it did within the next second).
+    /// A module's probe settles on its registration, same contract as the
+    /// daemon's first probe; core's own probe reads the already-settled
+    /// daemon once.
+    #[test]
+    fn module_health_probe_settles_on_registration_and_core_reads_once() {
+        let mut module = LateModule {
+            registers_on_probe: 3,
+            module_probes: 0,
+            core_probes: 0,
+            pauses: 0,
+        };
+        validate_selected(&mut module, &[Component::Core, Component::Aft]).expect("settles");
+        assert_eq!(module.module_probes, 3, "probed until aft registered");
+        assert_eq!(module.core_probes, 1, "core reads the settled daemon once");
+        assert_eq!(
+            module.pauses, 2,
+            "one pause between each failed module probe"
         );
     }
 

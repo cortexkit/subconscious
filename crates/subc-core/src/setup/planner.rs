@@ -157,9 +157,6 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         SetupOperation::Validate {
             instrument: "ck health",
         },
-        SetupOperation::Validate {
-            instrument: "ck fleet lint",
-        },
     ]);
     plan
 }

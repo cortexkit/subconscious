@@ -223,17 +223,7 @@ impl SetupBackend {
         let mut validator = CkValidator {
             executable: &self.executable,
         };
-        // Read the config as configured by this run, not as requested.
-        let configured_modules = subc_core::daemon_config::load(&self.paths.config_path)
-            .map_err(|error| format!("could not read the configuration just written: {error}"))?
-            .map(|config| config.modules.len())
-            .unwrap_or(0);
-        validation::validate_selected(
-            &mut validator,
-            &selected,
-            &self.paths.config_path,
-            configured_modules,
-        )?;
+        validation::validate_selected(&mut validator, &selected)?;
         println!("{}", validation::MCP_HARNESS_SNIPPET);
         Ok(())
     }

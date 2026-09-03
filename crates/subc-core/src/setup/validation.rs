@@ -23,10 +23,17 @@ const DAEMON_SETTLE_PAUSE: Duration = Duration::from_millis(500);
 
 /// Existing ck interfaces are the post-setup evidence. Runtime registration and
 /// current liveness are intentionally validated separately by the runtime layer.
+///
+/// `configured_modules` is the number of modules the config declares AFTER
+/// this setup's configuration step — read from the config, not from the
+/// request, because a later `ck setup aft` selects one component while the
+/// config already holds others, and a bare `ck setup` selects core alone
+/// while the config may hold many.
 pub fn validate_selected<V: Validator>(
     validator: &mut V,
     selected: &[Component],
     config_path: &Path,
+    configured_modules: usize,
 ) -> Result<(), String> {
     require_settled(
         validator,
@@ -44,6 +51,19 @@ pub fn validate_selected<V: Validator>(
             Component::Synapse => vec!["health".to_string(), "synapse".to_string()],
         };
         require(validator, "ck", &args)?;
+    }
+    // `ck fleet lint` refuses to report clean over an empty module set (its
+    // vacuity floor, exit 2), and that refusal is correct for the operator
+    // verb. But core alone is a valid end state — a daemon with no modules
+    // is what `ck setup` with no extras produces by design — so asking the
+    // lint to bless it asks a question the lint cannot answer. Skip it by
+    // name and reason; never silently.
+    if configured_modules == 0 {
+        println!(
+            "validation: ck fleet lint skipped — no modules configured yet (core-only install); \
+             it runs on the first `ck setup <module>`"
+        );
+        return Ok(());
     }
     require(
         validator,
@@ -113,6 +133,7 @@ mod tests {
             &mut validator,
             &[Component::Core, Component::Aft],
             Path::new("/config/subc.jsonc"),
+            1,
         )
         .expect("healthy fixture");
         assert_eq!(validator.calls[0], ["daemon", "triage"]);
@@ -158,11 +179,42 @@ mod tests {
             triage_probes: 0,
             pauses: 0,
         };
-        validate_selected(&mut daemon, &[Component::Core], Path::new("/c")).expect("settles");
+        validate_selected(&mut daemon, &[Component::Core], Path::new("/c"), 0).expect("settles");
         assert_eq!(daemon.triage_probes, 4);
         assert_eq!(
             daemon.pauses, 3,
             "one pause between each failed probe and the next"
+        );
+    }
+
+    /// Tenth finding of the macOS operator drive: a core-only install failed
+    /// validation on `ck fleet lint`'s own vacuity floor ("examined 0 of 0
+    /// configured", exit 2). The floor is right for the lint; the validation
+    /// was wrong to ask it about a config with no modules. The gate reads the
+    /// configured count, not the selection.
+    #[test]
+    fn fleet_lint_is_skipped_by_name_for_a_core_only_config_and_run_once_a_module_exists() {
+        let mut none = RecordingValidator::default();
+        validate_selected(&mut none, &[Component::Core], Path::new("/c"), 0).expect("core-only");
+        assert!(
+            !none
+                .calls
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("fleet")),
+            "lint must not run over zero modules: {:?}",
+            none.calls
+        );
+
+        // Selection is core alone, but the config already holds a module
+        // (this is a re-run on an installed host): the lint must run.
+        let mut some = RecordingValidator::default();
+        validate_selected(&mut some, &[Component::Core], Path::new("/c"), 1).expect("with modules");
+        assert!(
+            some.calls
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("fleet")),
+            "lint must run once a module is configured: {:?}",
+            some.calls
         );
     }
 

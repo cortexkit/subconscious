@@ -434,6 +434,19 @@ pub fn install_component<S: ArtifactSource>(
         );
         fields.insert("sha256".to_string(), Value::String(digest));
         inventory.record("managed-binary", &destination, fields);
+        // The ownership record must be durable the moment the binary it
+        // describes is. Deferring the save to the end of the whole plan meant
+        // a refusal anywhere later left every already-accepted binary on disk
+        // with its record lost — and the next `ck setup` refused them as
+        // foreign files at managed destinations. A binary placed, accepted,
+        // and recorded is a completed mutation regardless of what the plan
+        // does next.
+        inventory.save().map_err(|error| {
+            format!(
+                "placed and accepted {} but could not record ownership: {error}",
+                destination.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -930,6 +943,89 @@ mod tests {
         )
         .expect("re-run after a refused acceptance installs cleanly");
         assert!(is_installed(Component::Core, &binary_home, &inventory));
+    }
+
+    /// Accepts the first binary of a component and refuses the second. Stands
+    /// in for the real macOS drive shape: `ck-subc` accepted, `ck-subc-mcp`
+    /// refused, then a re-run.
+    struct SecondBinaryRefusesSource;
+
+    impl ArtifactSource for SecondBinaryRefusesSource {
+        fn install(
+            &mut self,
+            component: Component,
+            binary: &str,
+            destination: &Path,
+        ) -> Result<String, String> {
+            FakeSource.install(component, binary, destination)
+        }
+
+        fn acceptance(
+            &mut self,
+            _component: Component,
+            binary: &str,
+        ) -> Result<Acceptance, String> {
+            Ok(Acceptance::Version(
+                if binary == "ck-subc" {
+                    "1.2.3"
+                } else {
+                    "9.9.9"
+                }
+                .to_string(),
+            ))
+        }
+
+        #[cfg(windows)]
+        fn verify(&mut self, destination: &Path, acceptance: &Acceptance) -> Result<(), String> {
+            FakeSource.verify(destination, acceptance)
+        }
+    }
+
+    /// Sixth finding of the macOS drive, the parent of the third: ownership
+    /// was saved once at the end of the whole plan, so a refusal on the
+    /// second binary lost the record for the first, already-accepted one —
+    /// on disk, unowned, refused as foreign on the re-run. The record must
+    /// survive on disk the moment the binary does; proven by reloading the
+    /// inventory from disk between the refused run and the re-run.
+    #[test]
+    fn accepted_binaries_stay_owned_on_disk_when_a_later_one_is_refused() {
+        let root = fixture_dir("partial-refusal");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).expect("binary home");
+        let manifest_path = root.join("installer-manifest.json");
+        {
+            let mut inventory =
+                Inventory::load(manifest_path.clone(), "linux-x64").expect("inventory");
+            install_component(
+                Component::Core,
+                &binary_home,
+                &mut inventory,
+                &mut SecondBinaryRefusesSource,
+            )
+            .expect_err("second binary must be refused");
+            // Deliberately NOT saving here: the record must already be on disk.
+        }
+        assert!(binary_home.join(platform_binary("ck-subc")).is_file());
+        assert!(!binary_home.join(platform_binary("ck-subc-mcp")).exists());
+
+        let mut reloaded = Inventory::load(manifest_path, "linux-x64").expect("reload from disk");
+        assert!(
+            reloaded.owns_path(
+                "managed-binary",
+                &binary_home.join(platform_binary("ck-subc"))
+            ),
+            "the accepted binary's ownership record must have survived on disk"
+        );
+        // Re-run with a source that accepts both: first is a no-op, second installs.
+        install_component(
+            Component::Core,
+            &binary_home,
+            &mut reloaded,
+            &mut FakeSource,
+        )
+        .expect("re-run after a partial refusal installs the rest cleanly");
+        assert!(is_installed(Component::Core, &binary_home, &reloaded));
+        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 2);
     }
 
     #[test]

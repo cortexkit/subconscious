@@ -70,6 +70,24 @@ pub fn validate_selected<V: Validator>(
 
 pub const MCP_HARNESS_SNIPPET: &str = "MCP harness snippet:\n  ck-subc-mcp --harness ck";
 
+/// Wait until `ck daemon triage` reports the daemon live, bounded by the
+/// same settle deadline used after registration. A daemon that does not
+/// come back is a setup failure naming the sections that required the restart.
+pub fn wait_for_daemon<V: Validator>(validator: &mut V, sections: &[String]) -> Result<(), String> {
+    require_settled(
+        validator,
+        "ck",
+        &["daemon".to_string(), "triage".to_string()],
+        DAEMON_SETTLE_DEADLINE,
+    )
+    .map_err(|error| {
+        format!(
+            "daemon did not come back after restart required for {}: {error}",
+            sections.join(", ")
+        )
+    })
+}
+
 /// A failing probe is retried until `deadline` elapses (a zero deadline is
 /// a single read). The last attempt's verdict is the verdict: a daemon or
 /// module that never comes up fails, just later.

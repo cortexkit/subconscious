@@ -37,6 +37,7 @@ use crate::{
         log_duplicate_claim_events, log_requirement_events, CapabilityRequirementEvaluator,
         DuplicateClaimSource, RegisteredModule, RequirementStatus, RuntimeModule,
     },
+    daemon_config::RestartRequiredSection,
     forwarding::{
         CloseReason, EndpointRoute, ForwardingError, ForwardingTable, GoodbyeTarget,
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
@@ -2377,17 +2378,20 @@ impl ControlHandler {
         // changed" sends the operator back to diffing their own file, which is
         // the work this is meant to save.
         let mut restart_required = Vec::new();
-        if configured_port != context.configured_port {
-            restart_required.push("port".to_string());
-        }
-        if storage_config != context.storage_config {
-            restart_required.push("storage".to_string());
-        }
-        if admission_facts_carrier_module_id != context.admission_facts_carrier_module_id {
-            restart_required.push("admission_facts_carrier_module_id".to_string());
-        }
-        if admission_facts_targets != context.admission_facts_targets {
-            restart_required.push("admission_facts_targets".to_string());
+        for section in RestartRequiredSection::ALL {
+            let changed = match section {
+                RestartRequiredSection::Port => configured_port != context.configured_port,
+                RestartRequiredSection::Storage => storage_config != context.storage_config,
+                RestartRequiredSection::AdmissionFactsCarrierModuleId => {
+                    admission_facts_carrier_module_id != context.admission_facts_carrier_module_id
+                }
+                RestartRequiredSection::AdmissionFactsTargets => {
+                    admission_facts_targets != context.admission_facts_targets
+                }
+            };
+            if changed {
+                restart_required.push(section.label().to_string());
+            }
         }
         if !restart_required.is_empty() {
             warn!(

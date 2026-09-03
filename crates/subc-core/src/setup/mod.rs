@@ -25,6 +25,8 @@ mod validation;
 
 pub use apply::{default_claustrum_key_path, SetupBackend};
 pub use model::{Component, SetupRequest, UpgradeState, UpgradeTarget};
+#[cfg(test)]
+pub use model::{PlanOutcome, SetupOperation};
 pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
 #[cfg(windows)]
 pub(crate) use self_update::cleanup_replaced_windows_ck;

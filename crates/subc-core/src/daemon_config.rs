@@ -16,6 +16,38 @@ use crate::{HealthAction, HealthConfig, ModuleSpec};
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
+/// Top-level daemon config sections that rescan cannot apply. The daemon
+/// snapshots these sections at start and reports later rescan changes as
+/// `restart_required`. Setup intersects this set with sections core
+/// configuration would write so a dry-run can flag a restart before the
+/// config file exists on disk. Match this enum exhaustively so a new section
+/// cannot be added without a comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestartRequiredSection {
+    Port,
+    Storage,
+    AdmissionFactsCarrierModuleId,
+    AdmissionFactsTargets,
+}
+
+impl RestartRequiredSection {
+    pub const ALL: [Self; 4] = [
+        Self::Port,
+        Self::Storage,
+        Self::AdmissionFactsCarrierModuleId,
+        Self::AdmissionFactsTargets,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Port => "port",
+            Self::Storage => "storage",
+            Self::AdmissionFactsCarrierModuleId => "admission_facts_carrier_module_id",
+            Self::AdmissionFactsTargets => "admission_facts_targets",
+        }
+    }
+}
+
 /// Refused at parse time by both layers (daemon-wide and per-module) — `0`
 /// would turn every affected bind into an instant failure, which is not a
 /// posture anyone deliberately configures. The asymmetry with
@@ -794,6 +826,19 @@ mod tests {
                 None => env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn restart_required_sections_are_the_rescan_cannot_apply_set() {
+        assert_eq!(
+            RestartRequiredSection::ALL.map(RestartRequiredSection::label),
+            [
+                "port",
+                "storage",
+                "admission_facts_carrier_module_id",
+                "admission_facts_targets",
+            ]
+        );
     }
 
     #[test]

@@ -3,6 +3,15 @@
 # and configuration work, so this script must never invoke `ck setup`. The
 # index signature is not checked here: bootstrap trust is TLS to the index
 # host, and the placed `ck` verifies the signed index on its first setup.
+#
+# This is a bash script and the documented invocation pipes it into bash.
+# Piped into `sh` on Debian and Ubuntu it runs under dash, where the very
+# next line (`set -o pipefail`) is a fatal "Illegal option" before anything
+# else executes, so the guard must come first and must itself be POSIX.
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf 'refusal: wrong-shell: this installer needs bash; run: curl -fsSL https://cortexkit.io/install | bash\n' >&2
+  exit 64
+fi
 set -euo pipefail
 
 readonly INDEX_URL_DEFAULT="https://cortexkit.io/releases/v1/index.json"

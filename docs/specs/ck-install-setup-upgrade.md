@@ -32,7 +32,7 @@ not conflict with this amendment.
 ## Flow
 
 ```text
-curl -fsSL https://cortexkit.io/install | sh
+curl -fsSL https://cortexkit.io/install | bash
 irm https://cortexkit.io/install/win | iex
 ck setup
 ck upgrade

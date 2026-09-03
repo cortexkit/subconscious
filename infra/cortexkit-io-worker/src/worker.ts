@@ -51,7 +51,7 @@ export default {
 async function handleInstall(path: string): Promise<Response> {
   if (path === "") {
     return new Response(
-      "CortexKit installer\n\n  macOS/Linux:  curl -fsSL https://cortexkit.io/install | sh\n  Windows:      irm https://cortexkit.io/install/win | iex\n",
+      "CortexKit installer\n\n  macOS/Linux:  curl -fsSL https://cortexkit.io/install | bash\n  Windows:      irm https://cortexkit.io/install/win | iex\n",
       { headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   }

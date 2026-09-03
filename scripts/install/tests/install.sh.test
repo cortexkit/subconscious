@@ -150,6 +150,19 @@ run_installer "$darwin_home" "$darwin_output" \
 grep -Fq 'ck-darwin-arm64.zip' "$darwin_home/requests.log" || fail 'Darwin archive name was not requested'
 [[ ! -e "$darwin_home/setup-called" ]] || fail 'Darwin installer started the extracted ck process'
 
+# The documented invocation pipes into bash. On Debian and Ubuntu /bin/sh is
+# dash, where `set -o pipefail` is fatal before any line of the script runs;
+# the guard ahead of it must refuse by name under a POSIX shell. Run the arm
+# under dash when the host has one, else under `sh -o posix`-less plain sh.
+posix_shell=$(command -v dash || command -v sh)
+if out=$("$posix_shell" "$installer" 2>&1); then
+  echo "test failure: wrong-shell run unexpectedly succeeded" >&2; exit 1
+fi
+case "$out" in
+  *"refusal: wrong-shell"*"| bash"*) ;;
+  *) echo "test failure: wrong-shell refusal missing or unnamed: $out" >&2; exit 1 ;;
+esac
+
 expect_refusal() {
   local name="$1"
   local expected="$2"

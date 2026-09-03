@@ -47,10 +47,18 @@ jobs:
             exit 1
           fi
 
+          # Created as a DRAFT and published only after every platform leg has
+          # uploaded. A release that is public while legs are still running is
+          # ingested by the release index the moment the first asset lands,
+          # and a leg that fails leaves a public release missing a platform —
+          # which the index then serves as "not yet published" for that
+          # platform, honestly and wrongly. Draft until complete means a failed
+          # leg leaves nothing an installer can see.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release ${TAG} already exists"
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft \
               --title "$TAG" \
               --notes "Subconscious alpha archives: ck, ck-subc, and ck-subc-mcp."
           fi
@@ -97,9 +105,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # An explicit --target puts every build under target/<triple>/, the
+          # host triple included; target/release is only where an untargeted
+          # build lands.
           - arch: x64
             target: x86_64-pc-windows-msvc
-            source: target/release
+            source: target/x86_64-pc-windows-msvc/release
           # Windows on ARM (every Windows VM on Apple silicon, and the Snapdragon
           # laptops) cannot install from an x64 archive: the bootstrap refuses
           # by tuple rather than relying on emulation. Cross-built on the x64
@@ -235,6 +246,39 @@ jobs:
 
   # ck-aft is intentionally absent: its publication is a named cross-repository
   # dependency owned by the AFT repository's release lane.
+  publish-subconscious-release:
+    name: Publish subconscious release (all legs uploaded)
+    if: startsWith(github.ref_name, 'subc-core-v')
+    needs: [linux-binaries, windows-binaries, macos-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Verify the asset inventory, then undraft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Every tuple the lanes above build, times the three binaries, plus
+          # a sidecar each. A missing name refuses the publish by name; the
+          # draft stays for inspection and nothing reaches an installer.
+          expected=0; missing=""
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for tuple in darwin-arm64 linux-x64 linux-arm64 windows-x64 windows-arm64; do
+            for bin in ck ck-subc ck-subc-mcp; do
+              for name in "$bin-$tuple.zip" "$bin-$tuple.zip.sha256"; do
+                expected=$((expected+1))
+                if ! printf '%s\n' "$assets" | grep -qxF "$name"; then missing="$missing $name"; fi
+              done
+            done
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::release ${TAG} is missing assets:${missing}"
+            exit 1
+          fi
+          echo "inventory complete: ${expected} assets"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
   publish:
     name: Publish to crates.io
     # subc-core tags cut binary releases (above), never a crates.io publish.
